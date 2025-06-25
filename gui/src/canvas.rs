@@ -1,6 +1,6 @@
 use gpui::{
-    div, App, BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity,
-    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
+    div, pattern_slash, App, BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element,
+    Entity, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
     Style, Styled, Window,
 };
@@ -95,28 +95,30 @@ impl Element for CanvasElement {
             .bg_style
             .clone()
             .paint(bounds, window, cx, |window, cx| {
-                for r in rects {
-                    let bounds = Bounds::new(
-                        Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
-                            + offset
-                            + bounds.origin.clone(),
-                        Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
-                    );
-                    let color = Rgba {
-                        r: 1.,
-                        g: 0.,
-                        b: 0.,
-                        a: 1.,
-                    };
-                    window.paint_quad(PaintQuad {
-                        bounds,
-                        corner_radii: Corners::all(Pixels(0.)),
-                        background: color.into(),
-                        border_widths: Edges::all(Pixels(0.)),
-                        border_color: color.into(),
-                        border_style: BorderStyle::Solid,
-                    });
-                }
+                window.paint_layer(bounds, |window| {
+                    for r in rects {
+                        let bounds = Bounds::new(
+                            Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
+                                + offset
+                                + bounds.origin.clone(),
+                            Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+                        );
+                        let color = Rgba {
+                            r: 1.,
+                            g: 0.,
+                            b: 0.,
+                            a: 1.,
+                        };
+                        window.paint_quad(PaintQuad {
+                            bounds,
+                            corner_radii: Corners::all(Pixels(0.)),
+                            background: pattern_slash(color.into(), 1., 4.),
+                            border_widths: Edges::all(Pixels(0.)),
+                            border_color: color.into(),
+                            border_style: BorderStyle::Solid,
+                        });
+                    }
+                })
             });
     }
 }
@@ -142,12 +144,26 @@ impl Render for LayoutCanvas {
 
 pub(crate) fn test_canvas() -> LayoutCanvas {
     LayoutCanvas {
-        rects: vec![Rect {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 100.,
-            y1: 40.,
-        }],
+        rects: vec![
+            Rect {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 100.,
+                y1: 40.,
+            },
+            Rect {
+                x0: 60.,
+                y0: 0.,
+                x1: 100.,
+                y1: 100.,
+            },
+            Rect {
+                x0: 70.,
+                y0: 60.,
+                x1: 90.,
+                y1: 80.,
+            },
+        ],
         offset: Point::new(Pixels(0.), Pixels(0.)),
         bg_style: Style {
             size: Size {
@@ -171,7 +187,6 @@ impl LayoutCanvas {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        println!("mouse down");
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
@@ -195,7 +210,6 @@ impl LayoutCanvas {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        println!("mouse up");
         self.is_dragging = false;
     }
 
@@ -205,7 +219,6 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        println!("scroll wheel");
         if self.is_dragging {
             // Do not allow zooming during a drag.
             return;
