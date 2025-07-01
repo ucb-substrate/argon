@@ -77,7 +77,6 @@ impl Render for Project {
             .text_color(rgb(0xffffff))
             .whitespace_nowrap()
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .child(cx.new(|_cx| TitleBar))
             .child(cx.new(|_cx| ToolBar))
             .child(
