@@ -70,26 +70,13 @@ cell simple(y_enclosure: int) {
         let cell = compile(CompileInput {
             cell: "simple",
             ast: &ast,
-            params: HashMap::from_iter([("y_enclosure", 20)]),
+            params: HashMap::from_iter([("y_enclosure", 20.)]),
         })
         .expect("failed to compile Cadlang cell");
         println!("cell: {cell:?}");
     }
 
-    const CADLANG_VIA: &str = r#"enum Layer {
-	Met2,
-	Via1,
-	Met1,
-}
-
-cell vias() {
-    let met2 = Rect!(Layer::Met2, x0=0, x1=100, y0=0, y1=100);
-    let via = Rect(Layer::Via1, x0=0, x1=20, y0=0, y1=20);
-    let array = MaxArray!(via, met2, 10, 10);
-    Eq!(array.bbox.x0 + array.bbox.x1, 100);
-    Eq!(array.bbox.y0 + array.bbox.y1, 100);
-    let met1 = Rect!(Layer::Met1, x0=array.bbox.x0-20, x1=array.bbox.x1+20, y0=array.bbox.y0-10, y1=array.bbox.y1+10);
-}"#;
+    const CADLANG_VIA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via.cl"));
 
     #[test]
     fn cadlang_via() {
@@ -112,7 +99,7 @@ cell vias() {
         let cell = compile(CompileInput {
             cell: "inverter",
             ast: &ast,
-            params: HashMap::from_iter([("nw", 1_200), ("pw", 2_000)]),
+            params: HashMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
         })
         .expect("failed to solve compile Cadlang cell");
         println!("cell: {cell:?}");
@@ -133,14 +120,18 @@ cell vias() {
                     "Li1" => (67, 20),
                     _ => unreachable!(),
                 };
+                let x0 = rect.x0 as i32;
+                let x1 = rect.x1 as i32;
+                let y0 = rect.y0 as i32;
+                let y1 = rect.y1 as i32;
                 ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                     layer,
                     datatype,
                     xy: vec![
-                        GdsPoint::new(rect.x0, rect.y0),
-                        GdsPoint::new(rect.x0, rect.y1),
-                        GdsPoint::new(rect.x1, rect.y1),
-                        GdsPoint::new(rect.x1, rect.y0),
+                        GdsPoint::new(x0, y0),
+                        GdsPoint::new(x0, y1),
+                        GdsPoint::new(x1, y1),
+                        GdsPoint::new(x1, y0),
                     ],
                     ..Default::default()
                 }));

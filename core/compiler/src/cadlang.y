@@ -22,7 +22,7 @@ Ident -> Result<Ident<'input>, ()>
 FloatLiteral -> Result<FloatLiteral, ()>
   : 'FLOATLIT' {
   let v = $1.map_err(|_| ())?;
-  Ok(FloatLiteral { span: v.span(), value: parse_int($lexer.span_str(v.span()))?, }) }
+  Ok(FloatLiteral { span: v.span(), value: parse_float($lexer.span_str(v.span()))?, }) }
   ;
 
 EnumDecl -> Result<EnumDecl<'input>, ()>
@@ -237,7 +237,7 @@ pub struct Ident<'a> {
 #[derive(Debug, Clone)]
 pub struct FloatLiteral {
   span: Span,
-  pub value: i64,
+  pub value: f64,
 }
 
 #[derive(Debug, Clone)]

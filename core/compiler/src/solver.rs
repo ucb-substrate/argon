@@ -140,15 +140,14 @@ impl Cell {
         let y0 = self.var();
         let x1 = self.var();
         let y1 = self.var();
-        self.rects.push(Rect {
+        Rect {
             layer: None,
             x0,
             y0,
             x1,
             y1,
             attrs,
-        });
-        self.rects.last().unwrap().clone()
+        }
     }
 
     pub fn physical_rect(&mut self, layer: Layer, attrs: Attrs) -> Rect<Var> {
@@ -166,6 +165,10 @@ impl Cell {
         }
     }
 
+    pub fn emit_rect(&mut self, rect: Rect<Var>) {
+        self.emitted_rects.push(rect);
+    }
+
     pub fn add_constraint(&mut self, constraint: Constraint) {
         self.constraints.push(constraint);
     }
@@ -173,7 +176,7 @@ impl Cell {
     pub fn solve(self) -> Result<SolvedCell> {
         let Cell {
             mut vars,
-            rects,
+            emitted_rects,
             constraints,
             ..
         } = self;
@@ -374,7 +377,7 @@ impl Cell {
         Ok(SolvedCell {
             rects: solved_rects
                 .into_iter()
-                .chain(rects.into_iter().map(
+                .chain(emitted_rects.into_iter().map(
                     |Rect {
                          layer,
                          x0,
@@ -384,10 +387,10 @@ impl Cell {
                          attrs,
                      }| Rect {
                         layer,
-                        x0: val_map[&x0] as f64,
-                        y0: val_map[&y0] as f64,
-                        x1: val_map[&x1] as f64,
-                        y1: val_map[&y1] as f64,
+                        x0: val_map[&x0],
+                        y0: val_map[&y0],
+                        x1: val_map[&x1],
+                        y1: val_map[&y1],
                         attrs,
                     },
                 ))

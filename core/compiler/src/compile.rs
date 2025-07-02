@@ -243,6 +243,12 @@ impl<'a> CellCtx<'a> {
                 }
             }
             Expr::EnumValue(v) => Ok(Value::EnumValue(v.clone())),
+            Expr::Emit(v) => {
+                let value = self.eval(&v.value)?;
+                let rect = value.try_rect(v.span)?;
+                self.cell.emit_rect(rect.clone());
+                Ok(Value::Rect(rect))
+            }
             expr => bail!("cannot evaluate the expression at {:?}", expr.span()),
         }
     }
