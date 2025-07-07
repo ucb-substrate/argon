@@ -1,9 +1,12 @@
+use compiler::solver::SolvedCell;
 use gpui::{
     div, pattern_slash, rgb, solid_background, BorderStyle, Bounds, Context, Corners,
     DefiniteLength, Edges, Element, Entity, InteractiveElement, IntoElement, Length, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, Size, Style, Styled, Window,
+    Rgba, ScrollWheelEvent, Size, Style, Styled, Subscription, Window,
 };
+
+use crate::project::ProjectState;
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ShapeFill {
@@ -48,6 +51,7 @@ pub struct LayoutCanvas {
     // zoom state
     scale: f32,
     screen_origin: Point<Pixels>,
+    subscriptions: Vec<Subscription>,
 }
 
 impl IntoElement for CanvasElement {
@@ -223,10 +227,71 @@ pub(crate) fn test_canvas() -> LayoutCanvas {
         offset_start: Point::default(),
         scale: 1.0,
         screen_origin: Point::default(),
+        subscriptions: Vec::new(),
     }
 }
 
 impl LayoutCanvas {
+    fn get_rects(cx: &mut Context<Self>, state: Entity<ProjectState>) -> Vec<Rect> {
+        let proj_state = state.read(cx);
+        proj_state
+            .solved_cell
+            .rects
+            .iter()
+            .filter_map(|rect| {
+                let layer = proj_state
+                    .layers
+                    .iter()
+                    .map(|layer| layer.read(cx))
+                    .find(|layer| {
+                        if let Some(rect_layer) = &rect.layer {
+                            &layer.name == rect_layer
+                        } else {
+                            false
+                        }
+                    });
+                if let Some(layer) = layer {
+                    if layer.visible {
+                        return Some(Rect {
+                            x0: rect.x0 as f32,
+                            y0: rect.y0 as f32,
+                            x1: rect.x1 as f32,
+                            y1: rect.y1 as f32,
+                            color: layer.color,
+                            fill: layer.fill,
+                            border_color: layer.border_color,
+                        });
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+    pub fn new(cx: &mut Context<Self>, state: Entity<ProjectState>) -> Self {
+        let subscriptions = vec![cx.observe(&state, |this, state, cx| {
+            println!("canvas notified");
+            this.rects = LayoutCanvas::get_rects(cx, state);
+            cx.notify();
+        })];
+        LayoutCanvas {
+            rects: LayoutCanvas::get_rects(cx, state),
+            offset: Point::new(Pixels(0.), Pixels(0.)),
+            bg_style: Style {
+                size: Size {
+                    width: Length::Definite(DefiniteLength::Fraction(1.)),
+                    height: Length::Definite(DefiniteLength::Fraction(1.)),
+                },
+                ..Style::default()
+            },
+            is_dragging: false,
+            drag_start: Point::default(),
+            offset_start: Point::default(),
+            scale: 1.0,
+            screen_origin: Point::default(),
+            subscriptions,
+        }
+    }
+
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,

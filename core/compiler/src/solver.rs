@@ -478,6 +478,8 @@ mod tests {
         let mut cell = Cell::new();
         let r1 = cell.physical_rect(arcstr::literal!("met1"), Attrs { source: None });
         let r2 = cell.physical_rect(arcstr::literal!("met1"), Attrs { source: None });
+        cell.emit_rect(r1.clone());
+        cell.emit_rect(r2.clone());
         cell.add_constraint(Constraint::Linear(LinearConstraint {
             coeffs: vec![(1., r1.x0)],
             constant: 0.,

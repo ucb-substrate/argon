@@ -71,6 +71,7 @@ impl LayerControl {
     fn on_click(&mut self, _event: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.visible = !state.visible;
+            println!("Update layer state");
             cx.notify();
         });
     }

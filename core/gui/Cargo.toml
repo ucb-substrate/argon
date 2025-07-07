@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+compiler = { path = "../compiler" }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
 smallvec = "1"
 rust-embed = "8"
 lazy_static = "1"
 itertools = "0.14"
+clap = { version = "4", features = ["derive"] }
+arcstr = "1"
