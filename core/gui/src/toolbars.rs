@@ -52,7 +52,7 @@ pub struct LayerControl {
 }
 
 impl SideBar {
-    pub fn new(cx: &mut Context<Self>, state: Entity<ProjectState>) -> Self {
+    pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
         let layers = state.read(cx).layers.iter().cloned().collect_vec();
 
         let layers = layers
@@ -71,6 +71,7 @@ impl LayerControl {
     fn on_click(&mut self, _event: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.visible = !state.visible;
+            println!("Update layer state");
             cx.notify();
         });
     }

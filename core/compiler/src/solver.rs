@@ -400,7 +400,7 @@ impl Cell {
 }
 
 impl SolvedCell {
-    fn width(&self) -> f64 {
+    pub fn width(&self) -> f64 {
         let mut min = f64::MAX;
         let mut max = f64::MIN;
         for rect in &self.rects {
@@ -416,7 +416,7 @@ impl SolvedCell {
         max - min
     }
 
-    fn height(&self) -> f64 {
+    pub fn height(&self) -> f64 {
         let mut min = f64::MAX;
         let mut max = f64::MIN;
         for rect in &self.rects {
@@ -432,7 +432,7 @@ impl SolvedCell {
         max - min
     }
 
-    fn bbox(&self) -> Rect<f64> {
+    pub fn bbox(&self) -> Rect<f64> {
         let mut min_x = f64::MAX;
         let mut max_x = f64::MIN;
         let mut min_y = f64::MAX;
@@ -478,6 +478,8 @@ mod tests {
         let mut cell = Cell::new();
         let r1 = cell.physical_rect(arcstr::literal!("met1"), Attrs { source: None });
         let r2 = cell.physical_rect(arcstr::literal!("met1"), Attrs { source: None });
+        cell.emit_rect(r1.clone());
+        cell.emit_rect(r2.clone());
         cell.add_constraint(Constraint::Linear(LinearConstraint {
             coeffs: vec![(1., r1.x0)],
             constant: 0.,
