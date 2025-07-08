@@ -21,6 +21,7 @@ pub struct LayerState {
     pub fill: ShapeFill,
     pub border_color: Rgba,
     pub visible: bool,
+    pub z: usize,
 }
 
 pub struct ProjectState {
@@ -65,7 +66,8 @@ impl Project {
         let layers: Vec<_> = layers
             .into_iter()
             .sorted()
-            .map(|name| {
+            .enumerate()
+            .map(|(z, name)| {
                 let mut s = DefaultHasher::new();
                 name.hash(&mut s);
                 let hash = s.finish() as usize;
@@ -75,6 +77,7 @@ impl Project {
                     fill: ShapeFill::Stippling,
                     border_color: rgb([0xff0000, 0x00ff00, 0x0000ff][hash % 3]),
                     visible: true,
+                    z,
                 })
             })
             .collect();

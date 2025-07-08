@@ -12,3 +12,4 @@ lazy_static = "1"
 itertools = "0.14"
 clap = { version = "4", features = ["derive"] }
 arcstr = "1"
+cfgrammar = { version = "0.13", features = ["serde"] }

@@ -21,7 +21,6 @@ struct CellCtx<'a> {
     cell: Cell,
     bindings: HashMap<&'a str, Value<'a>>,
     next_id: u64,
-    id_bindings: HashMap<f64, Rect<Var>>,
 }
 
 impl<'a> CellCtx<'a> {
@@ -30,7 +29,6 @@ impl<'a> CellCtx<'a> {
             cell: Cell::new(),
             bindings: HashMap::new(),
             next_id: 0,
-            id_bindings: HashMap::new(),
         }
     }
 

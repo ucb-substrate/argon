@@ -1,12 +1,12 @@
-use compiler::solver::SolvedCell;
 use gpui::{
     div, pattern_slash, rgb, rgba, solid_background, BorderStyle, Bounds, Context, Corners,
     DefiniteLength, Edges, Element, Entity, InteractiveElement, IntoElement, Length, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
     Rgba, ScrollWheelEvent, Size, Style, Styled, Subscription, Window,
 };
+use itertools::Itertools;
 
-use crate::project::ProjectState;
+use crate::project::{LayerState, ProjectState};
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ShapeFill {
@@ -14,7 +14,7 @@ pub enum ShapeFill {
     Solid,
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Rect {
     pub x0: f32,
     pub x1: f32,
@@ -23,7 +23,8 @@ pub struct Rect {
     pub color: Rgba,
     pub fill: ShapeFill,
     pub border_color: Rgba,
-    pub z: usize,
+    pub layer: Entity<LayerState>,
+    pub span: Option<cfgrammar::Span>,
 }
 
 pub fn intersect(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> Option<Bounds<Pixels>> {
@@ -53,6 +54,7 @@ pub struct LayoutCanvas {
     // zoom state
     scale: f32,
     screen_origin: Point<Pixels>,
+    #[allow(unused)]
     subscriptions: Vec<Subscription>,
 }
 
@@ -112,16 +114,22 @@ impl Element for CanvasElement {
         self.inner
             .update(cx, |inner, _cx| inner.screen_origin = bounds.origin);
         let inner = self.inner.read(cx);
-        let mut rects = inner.rects.clone();
-        rects.sort_by_key(|rect| rect.z);
+        let rects = inner
+            .rects
+            .clone()
+            .into_iter()
+            .enumerate()
+            .sorted_by_key(|(_, rect)| rect.layer.read(cx).z)
+            .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
         inner
             .bg_style
             .clone()
-            .paint(bounds, window, cx, |window, _cx| {
+            .paint(bounds, window, cx, |window, cx| {
                 window.paint_layer(bounds, |window| {
-                    for r in rects {
+                    let mut selected_quad = None;
+                    for (i, r) in rects {
                         let rect_bounds = Bounds::new(
                             Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
                                 + offset
@@ -145,7 +153,24 @@ impl Element for CanvasElement {
                                 border_color: r.border_color.into(),
                                 border_style: BorderStyle::Solid,
                             });
+                            if let Some(selected_rect) =
+                                self.inner.read(cx).state.read(cx).selected_rect
+                            {
+                                if selected_rect == i {
+                                    selected_quad = Some(PaintQuad {
+                                        bounds: clipped,
+                                        corner_radii: Corners::all(Pixels(0.)),
+                                        background: solid_background(rgba(0)),
+                                        border_widths,
+                                        border_color: rgb(0xffff00).into(),
+                                        border_style: BorderStyle::Solid,
+                                    });
+                                }
+                            }
                         }
+                    }
+                    if let Some(selected_quad) = selected_quad {
+                        window.paint_quad(selected_quad);
                     }
                 })
             });
@@ -182,14 +207,12 @@ impl LayoutCanvas {
             .solved_cell
             .rects
             .iter()
-            .enumerate()
-            .flat_map(|(i, rect)| {
+            .flat_map(|rect| {
                 let mut rects = Vec::new();
                 let layer = proj_state
                     .layers
                     .iter()
-                    .map(|layer| layer.read(cx))
-                    .enumerate()
+                    .map(|layer| (layer.clone(), layer.read(cx)))
                     .find(|(_, layer)| {
                         if let Some(rect_layer) = &rect.layer {
                             &layer.name == rect_layer
@@ -197,7 +220,7 @@ impl LayoutCanvas {
                             false
                         }
                     });
-                if let Some((z, layer)) = layer {
+                if let Some((id, layer)) = layer {
                     if layer.visible {
                         rects.push(Rect {
                             x0: rect.x0 as f32,
@@ -207,21 +230,8 @@ impl LayoutCanvas {
                             color: layer.color,
                             fill: layer.fill,
                             border_color: layer.border_color,
-                            z,
-                        });
-                    }
-                }
-                if let Some(selected_rect) = proj_state.selected_rect {
-                    if selected_rect == i {
-                        rects.push(Rect {
-                            x0: rect.x0 as f32,
-                            y0: rect.y0 as f32,
-                            x1: rect.x1 as f32,
-                            y1: rect.y1 as f32,
-                            color: rgba(0x00000000),
-                            fill: ShapeFill::Solid,
-                            border_color: rgb(0xffff00),
-                            z: usize::MAX,
+                            layer: id.clone(),
+                            span: rect.attrs.source.clone().map(|info| info.span),
                         });
                     }
                 }
@@ -230,7 +240,7 @@ impl LayoutCanvas {
             .collect()
     }
     pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
-        let subscriptions = vec![cx.observe(&state, |this, state, cx| {
+        let subscriptions = vec![cx.observe(state, |this, state, cx| {
             this.rects = LayoutCanvas::get_rects(cx, &state);
             cx.notify();
         })];
@@ -257,42 +267,45 @@ impl LayoutCanvas {
     pub(crate) fn on_left_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        println!("mouse down");
-        let mut rects = self.rects.clone();
-        rects.sort_by_key(|rect| usize::MAX - rect.z);
+        let rects = self
+            .rects
+            .iter()
+            .enumerate()
+            .filter(|(_, rect)| rect.layer.read(cx).visible)
+            .sorted_by_key(|(_, rect)| usize::MAX - rect.layer.read(cx).z);
         let scale = self.scale;
         let offset = self.offset;
-        for (i, r) in rects.iter().enumerate() {
+        for (i, r) in rects {
             let rect_bounds = Bounds::new(
                 Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
                     + offset
-                    + window.bounds().origin,
+                    + self.screen_origin,
                 Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
             );
-            println!("bounds: {:?}, mouse: {:?}", rect_bounds, event.position);
             if rect_bounds.contains(&event.position) {
-                println!("selected rect");
-                self.state.update(cx, |state, _cx| {
+                self.state.update(cx, |state, cx| {
                     state.selected_rect = Some(i);
+                    cx.notify();
                 });
                 return;
             }
         }
-        self.state.update(cx, |state, _cx| {
+        self.state.update(cx, |state, cx| {
             state.selected_rect = None;
+            cx.notify();
         });
     }
 
+    #[allow(unused)]
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
-        println!("mouse down");
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
@@ -310,6 +323,7 @@ impl LayoutCanvas {
         cx.notify();
     }
 
+    #[allow(unused)]
     pub(crate) fn on_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
@@ -325,7 +339,6 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        println!("scroll wheel");
         if self.is_dragging {
             // Do not allow zooming during a drag.
             return;
