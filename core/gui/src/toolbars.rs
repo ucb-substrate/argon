@@ -52,7 +52,7 @@ pub struct LayerControl {
 }
 
 impl SideBar {
-    pub fn new(cx: &mut Context<Self>, state: Entity<ProjectState>) -> Self {
+    pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
         let layers = state.read(cx).layers.iter().cloned().collect_vec();
 
         let layers = layers

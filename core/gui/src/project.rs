@@ -6,9 +6,10 @@ use compiler::compile::{compile, CompileInput};
 use compiler::parse::parse;
 use compiler::solver::{Rect, SolvedCell};
 use gpui::*;
+use itertools::Itertools;
 
 use crate::{
-    canvas::{test_canvas, LayoutCanvas, ShapeFill},
+    canvas::{LayoutCanvas, ShapeFill},
     text::TextDisplay,
     theme::THEME,
     toolbars::{SideBar, TitleBar, ToolBar},
@@ -28,6 +29,7 @@ pub struct ProjectState {
     pub cell: String,
     pub params: HashMap<String, f64>,
     pub solved_cell: SolvedCell,
+    pub selected_rect: Option<usize>,
     pub layers: Vec<Entity<LayerState>>,
     pub subscriptions: Vec<Subscription>,
 }
@@ -36,6 +38,7 @@ pub struct Project {
     pub state: Entity<ProjectState>,
     pub sidebar: Entity<SideBar>,
     pub canvas: Entity<LayoutCanvas>,
+    pub text: Entity<TextDisplay>,
 }
 
 impl Project {
@@ -61,6 +64,7 @@ impl Project {
             .collect();
         let layers: Vec<_> = layers
             .into_iter()
+            .sorted()
             .map(|name| {
                 let mut s = DefaultHasher::new();
                 name.hash(&mut s);
@@ -90,18 +94,21 @@ impl Project {
                 cell,
                 params,
                 solved_cell: solved_cell.clone(),
+                selected_rect: None,
                 layers,
                 subscriptions,
             }
         });
 
-        let sidebar = cx.new(|cx| SideBar::new(cx, state.clone()));
-        let canvas = cx.new(|cx| LayoutCanvas::new(cx, state.clone()));
+        let sidebar = cx.new(|cx| SideBar::new(cx, &state));
+        let canvas = cx.new(|cx| LayoutCanvas::new(cx, &state));
+        let text = cx.new(|cx| TextDisplay::new(cx, &state));
 
         Self {
             state,
             sidebar,
             canvas,
+            text,
         }
     }
 }
@@ -116,11 +123,6 @@ impl Project {
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
         cx.notify();
-    }
-
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.canvas
-            .update(cx, |canvas, cx| canvas.on_mouse_up(event, window, cx));
     }
 }
 
@@ -148,12 +150,9 @@ impl Render for Project {
                     .flex_1()
                     .min_h_0()
                     .child(self.sidebar.clone())
-                    .child(self.canvas.clone()),
+                    .child(self.canvas.clone())
+                    .child(self.text.clone()),
             )
-            .child(cx.new(|_cx| TextDisplay {
-                text: "cell via {\n  let x = Rect(0, 0, 100, 100)!\n}\n".to_string(),
-                highlight_span: Some(5..8),
-            }))
     }
 }
 

@@ -1,13 +1,31 @@
 use std::ops::Range;
 
 use gpui::{
-    div, green, Context, HighlightStyle, IntoElement, ParentElement, Render, Styled, StyledText,
-    Window,
+    div, green, Context, Entity, HighlightStyle, IntoElement, ParentElement, Render, Styled,
+    StyledText, Subscription, Window,
 };
+
+use crate::project::ProjectState;
 
 pub struct TextDisplay {
     pub text: String,
     pub highlight_span: Option<Range<usize>>,
+    pub subscriptions: Vec<Subscription>,
+}
+
+impl TextDisplay {
+    pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
+        let subscriptions = vec![cx.observe(&state, |this, state, cx| {
+            this.text = state.read(cx).code.clone();
+            cx.notify();
+        })];
+        let proj_state = state.read(cx);
+        Self {
+            text: proj_state.code.clone(),
+            highlight_span: None,
+            subscriptions,
+        }
+    }
 }
 
 impl Render for TextDisplay {
@@ -15,9 +33,9 @@ impl Render for TextDisplay {
         if let Some(span) = self.highlight_span.clone() {
             let highlight = HighlightStyle::color(green());
             let text = StyledText::new(&self.text).with_highlights([(span, highlight)]);
-            div().w_full().child(text)
+            div().w_1_3().child(text)
         } else {
-            div().w_full().child(self.text.clone())
+            div().w_1_3().child(self.text.clone())
         }
     }
 }

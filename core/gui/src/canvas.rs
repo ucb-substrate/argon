@@ -1,6 +1,6 @@
 use compiler::solver::SolvedCell;
 use gpui::{
-    div, pattern_slash, rgb, solid_background, BorderStyle, Bounds, Context, Corners,
+    div, pattern_slash, rgb, rgba, solid_background, BorderStyle, Bounds, Context, Corners,
     DefiniteLength, Edges, Element, Entity, InteractiveElement, IntoElement, Length, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
     Rgba, ScrollWheelEvent, Size, Style, Styled, Subscription, Window,
@@ -23,6 +23,7 @@ pub struct Rect {
     pub color: Rgba,
     pub fill: ShapeFill,
     pub border_color: Rgba,
+    pub z: usize,
 }
 
 pub fn intersect(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> Option<Bounds<Pixels>> {
@@ -44,6 +45,7 @@ pub struct LayoutCanvas {
     pub offset: Point<Pixels>,
     pub rects: Vec<Rect>,
     pub bg_style: Style,
+    pub state: Entity<ProjectState>,
     // drag state
     is_dragging: bool,
     drag_start: Point<Pixels>,
@@ -110,7 +112,8 @@ impl Element for CanvasElement {
         self.inner
             .update(cx, |inner, _cx| inner.screen_origin = bounds.origin);
         let inner = self.inner.read(cx);
-        let rects = inner.rects.clone();
+        let mut rects = inner.rects.clone();
+        rects.sort_by_key(|rect| rect.z);
         let scale = inner.scale;
         let offset = inner.offset;
         inner
@@ -159,10 +162,12 @@ impl Render for LayoutCanvas {
             .flex()
             .flex_1()
             .size_full()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
+            // TODO: Uncomment once GPUI mouse movement is fixed.
+            // .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            // .on_mouse_move(cx.listener(Self::on_mouse_move))
+            // .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            // .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(CanvasElement {
                 inner: cx.entity().clone(),
@@ -170,89 +175,31 @@ impl Render for LayoutCanvas {
     }
 }
 
-pub(crate) fn test_canvas() -> LayoutCanvas {
-    let mut rects = Vec::new();
-    for i in 0..1000 {
-        rects.push(Rect {
-            x0: (i as f32) * 40.,
-            y0: 0.0,
-            x1: (i as f32) * 40. + 20.,
-            y1: 200.,
-            color: rgb(0x00ff00),
-            fill: ShapeFill::Stippling,
-            border_color: rgb(0x00ff00),
-        });
-    }
-    rects.extend([
-        Rect {
-            x0: 0.0,
-            y0: 0.0,
-            x1: 100.,
-            y1: 40.,
-            color: rgb(0xff),
-            fill: ShapeFill::Stippling,
-            border_color: rgb(0xff),
-        },
-        Rect {
-            x0: 70.,
-            y0: 10.,
-            x1: 90.,
-            y1: 30.,
-            color: rgb(0x5e00e6),
-            fill: ShapeFill::Solid,
-            border_color: rgb(0x5e00e6),
-        },
-        Rect {
-            x0: 60.,
-            y0: 0.,
-            x1: 100.,
-            y1: 100.,
-            color: rgb(0xff00ff),
-            fill: ShapeFill::Stippling,
-            border_color: rgb(0xff00ff),
-        },
-    ]);
-    LayoutCanvas {
-        rects,
-        offset: Point::new(Pixels(0.), Pixels(0.)),
-        bg_style: Style {
-            size: Size {
-                width: Length::Definite(DefiniteLength::Fraction(1.)),
-                height: Length::Definite(DefiniteLength::Fraction(1.)),
-            },
-            ..Style::default()
-        },
-        is_dragging: false,
-        drag_start: Point::default(),
-        offset_start: Point::default(),
-        scale: 1.0,
-        screen_origin: Point::default(),
-        subscriptions: Vec::new(),
-    }
-}
-
 impl LayoutCanvas {
-    fn get_rects(cx: &mut Context<Self>, state: Entity<ProjectState>) -> Vec<Rect> {
+    fn get_rects(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Vec<Rect> {
         let proj_state = state.read(cx);
         proj_state
             .solved_cell
             .rects
             .iter()
-            .filter_map(|rect| {
+            .enumerate()
+            .flat_map(|(i, rect)| {
+                let mut rects = Vec::new();
                 let layer = proj_state
                     .layers
                     .iter()
                     .map(|layer| layer.read(cx))
-                    .find(|layer| {
+                    .enumerate()
+                    .find(|(_, layer)| {
                         if let Some(rect_layer) = &rect.layer {
                             &layer.name == rect_layer
                         } else {
                             false
                         }
                     });
-                if let Some(layer) = layer {
+                if let Some((z, layer)) = layer {
                     if layer.visible {
-                        return Some(Rect {
+                        rects.push(Rect {
                             x0: rect.x0 as f32,
                             y0: rect.y0 as f32,
                             x1: rect.x1 as f32,
@@ -260,17 +207,31 @@ impl LayoutCanvas {
                             color: layer.color,
                             fill: layer.fill,
                             border_color: layer.border_color,
+                            z,
                         });
                     }
                 }
-                None
+                if let Some(selected_rect) = proj_state.selected_rect {
+                    if selected_rect == i {
+                        rects.push(Rect {
+                            x0: rect.x0 as f32,
+                            y0: rect.y0 as f32,
+                            x1: rect.x1 as f32,
+                            y1: rect.y1 as f32,
+                            color: rgba(0x00000000),
+                            fill: ShapeFill::Solid,
+                            border_color: rgb(0xffff00),
+                            z: usize::MAX,
+                        });
+                    }
+                }
+                rects
             })
             .collect()
     }
-    pub fn new(cx: &mut Context<Self>, state: Entity<ProjectState>) -> Self {
+    pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
         let subscriptions = vec![cx.observe(&state, |this, state, cx| {
-            println!("canvas notified");
-            this.rects = LayoutCanvas::get_rects(cx, state);
+            this.rects = LayoutCanvas::get_rects(cx, &state);
             cx.notify();
         })];
         LayoutCanvas {
@@ -289,7 +250,40 @@ impl LayoutCanvas {
             scale: 1.0,
             screen_origin: Point::default(),
             subscriptions,
+            state: state.clone(),
         }
+    }
+
+    pub(crate) fn on_left_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        println!("mouse down");
+        let mut rects = self.rects.clone();
+        rects.sort_by_key(|rect| usize::MAX - rect.z);
+        let scale = self.scale;
+        let offset = self.offset;
+        for (i, r) in rects.iter().enumerate() {
+            let rect_bounds = Bounds::new(
+                Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
+                    + offset
+                    + window.bounds().origin,
+                Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+            );
+            println!("bounds: {:?}, mouse: {:?}", rect_bounds, event.position);
+            if rect_bounds.contains(&event.position) {
+                println!("selected rect");
+                self.state.update(cx, |state, _cx| {
+                    state.selected_rect = Some(i);
+                });
+                return;
+            }
+        }
+        self.state.update(cx, |state, _cx| {
+            state.selected_rect = None;
+        });
     }
 
     pub(crate) fn on_mouse_down(
@@ -298,6 +292,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        println!("mouse down");
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
@@ -330,6 +325,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        println!("scroll wheel");
         if self.is_dragging {
             // Do not allow zooming during a drag.
             return;
