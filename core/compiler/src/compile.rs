@@ -1,22 +1,28 @@
 //! # Argon compiler
-//! 
+//!
 //! Pass 1: assign variable IDs
 //! Pass 2: type checking
 //! Pass 3: solving
-use std::{collections::{HashMap, HashSet}, ops::ControlFlow};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::ControlFlow,
+};
 
 use anyhow::{anyhow, bail, Result};
 use enumify::enumify;
+use serde::{Deserialize, Serialize};
 
 use crate::parse::{ArgonAst, BinOp, CellDecl, Decl, EnumValue, Expr, Ident, IfExpr, Statement};
 
 #[derive(Default)]
-struct VarAssignState<'a> {
+struct CompileState<'a> {
+    deferred: Vec<PartialEval<'a>>,
     next_id: VarId,
     active_bindings: HashMap<&'a str, VarId>,
+    bindings: HashMap<VarId, Value<'a>>,
 }
 
-impl<'a> VarAssignState<'a> {
+impl CompileState {
     fn allocate_id(&mut self) -> VarId {
         let id = self.next_id;
         self.next_id += 1;
@@ -24,22 +30,36 @@ impl<'a> VarAssignState<'a> {
     }
 }
 
-#[derive(Default)]
-struct SolveState<'a> {
-    deferred: Vec<PartialEval<'a>>,
-    bindings: HashMap<VarId, Value<'a>>,
-}
-
-pub struct SolveInput<'a> {
+pub struct CompileInput<'a> {
     pub ast: &'a ArgonAst<'a>,
     pub cell: &'a str,
     pub params: HashMap<&'a str, f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceInfo {
+    pub span: cfgrammar::Span,
+    pub id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rect<T> {
+    pub layer: String,
+    pub x0: T,
+    pub y0: T,
+    pub x1: T,
+    pub y1: T,
+    pub source: Option<SourceInfo>,
+}
+
+pub struct CompiledCell {
+    rects: Vec<Rect<f64>>,
+}
+
 pub type VarId = u64;
 pub type ConstraintVarId = u64;
 
-type FutureValue<'a> = ControlFlow<HashSet<ConstraintVarId>, Value<'a>>;
+type FutureValue<'a> = ControlFlow<Value<'a>, Expr<'a>>;
 
 enum PartialEval<'a> {
     If(Box<PartialIfExpr<'a>>),
@@ -56,58 +76,42 @@ pub enum IfExprState<'a> {
     Else(PartialEval<'a>),
 }
 
-fn assign_var_ids(mut ast: ArgonAst<'_>) -> ArgonAst<'_> {
-    let mut state = VarAssignState::default();
-    for decl in &mut ast.decls {
-        match decl {
-            Decl::Cell(cell) => {
-                for arg in &mut cell.args {
-                    if state.active_bindings.contains_key(arg.name.name) {
-                        panic!("detected duplicate argument name")
-                    }
-                    let id = state.allocate_id();
-                    state.active_bindings.insert(arg.name.name, id);
-                    arg.name.id = Some(id);
-                }
-                for stmt in &mut cell.stmts {
-                    match stmt {
-                        Statement::LetBinding { name, value } => {
-                            let id = state.allocate_id();
-                            state.active_bindings.insert(arg.name.name, id);
-                            name.name.id = Some(id);
-                        }
-                        Statement::Expr(expr) => {
-
-                        }
-                    }
-
-                }
+fn solve(input: CompileInput<'_>) -> CompiledCell {
+    let mut state = CompileState::default();
+    let cell = input
+        .ast
+        .decls
+        .iter()
+        .find_map(|d| match d {
+            Decl::Cell(
+                v @ CellDecl {
+                    name: Ident { name, .. },
+                    ..
+                },
+            ) if *name == input.cell => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    for arg in cell.args {
+        if state.active_bindings.contains_key(arg.name.name) {
+            panic!("detected duplicate argument name")
+        }
+        let id = state.allocate_id();
+        state.active_bindings.insert(arg.name.name, id);
+    }
+    for stmt in &mut cell.stmts {
+        match stmt {
+            Statement::LetBinding { name, value } => {
+                let id = state.allocate_id();
+                state.active_bindings.insert(name.name, id);
             }
-            _ => {}
+            Statement::Expr(expr) => {}
         }
     }
-
-    ast
-}
-
-fn solve(input: SolveInput<'_>) -> SolvedCell {
-    let mut state = SolveState::default();
-        let cell = input
-            .ast
-            .decls
-            .iter()
-            .find_map(|d| match d {
-                Decl::Cell(
-                    v @ CellDecl {
-                        name: Ident { name, .. },
-                        ..
-                    },
-                ) if *name == input.cell => Some(v),
-                _ => None,
-            })
-            .unwrap();
     todo!()
 }
+
+fn 
 
 struct CellCtx<'a> {
     cell: Cell,
@@ -129,7 +133,7 @@ impl<'a> CellCtx<'a> {
         self.next_id
     }
 
-    fn compile(mut self, input: CompileInput<'a>) -> Result<SolvedCell> {
+    fn compile(mut self, input: CompileInput<'a>) -> Result<CompiledCell> {
         let cell = input
             .ast
             .decls
