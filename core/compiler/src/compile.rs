@@ -3,7 +3,7 @@
 //! Pass 1: assign variable IDs
 //! Pass 2: type checking
 //! Pass 3: solving
-use std::{collections::HashMap, ops::ControlFlow};
+use std::{collections::{HashMap, HashSet}, ops::ControlFlow};
 
 use anyhow::{anyhow, bail, Result};
 use enumify::enumify;
@@ -37,8 +37,9 @@ pub struct SolveInput<'a> {
 }
 
 pub type VarId = u64;
+pub type ConstraintVarId = u64;
 
-type FutureValue<'a> = ControlFlow<VarId, Value<'a>>;
+type FutureValue<'a> = ControlFlow<HashSet<ConstraintVarId>, Value<'a>>;
 
 enum PartialEval<'a> {
     If(Box<PartialIfExpr<'a>>),
