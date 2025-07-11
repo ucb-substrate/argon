@@ -16,7 +16,7 @@ Decl -> Result<Decl<'input>, ()>
   ;
 
 Ident -> Result<Ident<'input>, ()>
-  : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), }) }
+  : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), id: None }) }
   ;
 
 FloatLiteral -> Result<FloatLiteral, ()>
@@ -96,6 +96,7 @@ Expr -> Result<Expr<'input>, ()>
   | Expr '>' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Gt, left: $1?, right: $3?, span: $span, }))) }
   | Expr '<=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Leq, left: $1?, right: $3?, span: $span, }))) }
   | Expr '<' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Lt, left: $1?, right: $3?, span: $span, }))) }
+  | 'IF' Expr '{' Expr '}' 'ELSE' '{' Expr '}' { Ok(Expr::If(Box::new(IfExpr { cond: $2?, left: $4?, right: $8?, span: $span, }))) }
   | NonComparisonExpr { $1 }
   ;
 
@@ -232,6 +233,7 @@ pub enum Decl<'a> {
 pub struct Ident<'a> {
   pub span: Span,
   pub name: &'a str,
+  pub id: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +291,7 @@ pub enum ComparisonOp {
 
 #[derive(Debug, Clone)]
 pub enum Expr<'a> {
+  If(Box<IfExpr<'a>>),
   Comparison(Box<ComparisonExpr<'a>>),
   BinOp(Box<BinOpExpr<'a>>),
   Call(CallExpr<'a>),
@@ -297,6 +300,14 @@ pub enum Expr<'a> {
   FieldAccess(Box<FieldAccessExpr<'a>>),
   Var(Ident<'a>),
   FloatLiteral(FloatLiteral),
+}
+
+#[derive(Debug, Clone)]
+pub struct IfExpr<'a> {
+    pub cond: Expr<'a>,
+    pub left: Expr<'a>,
+    pub right: Expr<'a>,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +399,7 @@ fn flatten<T>(lhs: Result<Vec<T>, ()>, rhs: Result<T, ()>)
 impl<'a> Expr<'a> {
     pub fn span(&self) -> Span {
         match self {
+            Self::If(x) => x.span,
             Self::Comparison(x) => x.span,
             Self::BinOp(x) => x.span,
             Self::Call(x) => x.span,

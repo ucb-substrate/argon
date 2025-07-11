@@ -1,20 +1,111 @@
-use std::collections::HashMap;
+//! # Argon compiler
+//! 
+//! Pass 1: assign variable IDs
+//! Pass 2: type checking
+//! Pass 3: solving
+use std::{collections::HashMap, ops::ControlFlow};
 
 use anyhow::{anyhow, bail, Result};
 use enumify::enumify;
 
-use crate::{
-    parse::{BinOp, CadlangAst, CellDecl, Decl, EnumValue, Expr, Ident, Statement},
-    solver::{
-        Attrs, Cell, Constraint, ConstraintAttrs, MaxArrayConstraint, Rect, SolvedCell, SourceInfo,
-        Var,
-    },
-};
+use crate::parse::{ArgonAst, BinOp, CellDecl, Decl, EnumValue, Expr, Ident, IfExpr, Statement};
 
-pub struct CompileInput<'a> {
-    pub ast: &'a CadlangAst<'a>,
+#[derive(Default)]
+struct VarAssignState<'a> {
+    next_id: VarId,
+    active_bindings: HashMap<&'a str, VarId>,
+}
+
+impl<'a> VarAssignState<'a> {
+    fn allocate_id(&mut self) -> VarId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+}
+
+#[derive(Default)]
+struct SolveState<'a> {
+    deferred: Vec<PartialEval<'a>>,
+    bindings: HashMap<VarId, Value<'a>>,
+}
+
+pub struct SolveInput<'a> {
+    pub ast: &'a ArgonAst<'a>,
     pub cell: &'a str,
     pub params: HashMap<&'a str, f64>,
+}
+
+pub type VarId = u64;
+
+type FutureValue<'a> = ControlFlow<VarId, Value<'a>>;
+
+enum PartialEval<'a> {
+    If(Box<PartialIfExpr<'a>>),
+}
+
+struct PartialIfExpr<'a> {
+    expr: IfExpr<'a>,
+    state: IfExprState<'a>,
+}
+
+pub enum IfExprState<'a> {
+    Cond(PartialEval<'a>),
+    Then(PartialEval<'a>),
+    Else(PartialEval<'a>),
+}
+
+fn assign_var_ids(mut ast: ArgonAst<'_>) -> ArgonAst<'_> {
+    let mut state = VarAssignState::default();
+    for decl in &mut ast.decls {
+        match decl {
+            Decl::Cell(cell) => {
+                for arg in &mut cell.args {
+                    if state.active_bindings.contains_key(arg.name.name) {
+                        panic!("detected duplicate argument name")
+                    }
+                    let id = state.allocate_id();
+                    state.active_bindings.insert(arg.name.name, id);
+                    arg.name.id = Some(id);
+                }
+                for stmt in &mut cell.stmts {
+                    match stmt {
+                        Statement::LetBinding { name, value } => {
+                            let id = state.allocate_id();
+                            state.active_bindings.insert(arg.name.name, id);
+                            name.name.id = Some(id);
+                        }
+                        Statement::Expr(expr) => {
+
+                        }
+                    }
+
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ast
+}
+
+fn solve(input: SolveInput<'_>) -> SolvedCell {
+    let mut state = SolveState::default();
+        let cell = input
+            .ast
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::Cell(
+                    v @ CellDecl {
+                        name: Ident { name, .. },
+                        ..
+                    },
+                ) if *name == input.cell => Some(v),
+                _ => None,
+            })
+            .unwrap();
+    todo!()
 }
 
 struct CellCtx<'a> {
@@ -148,45 +239,7 @@ impl<'a> CellCtx<'a> {
                     }
                     Ok(Value::Rect(rect))
                 }
-                // "MaxArray" => {
-                //     assert_eq!(expr.args.posargs.len(), 4);
-                //     let array_cell = self
-                //         .eval(&expr.args.posargs[0])?
-                //         .try_rect(expr.args.posargs[0].span())?;
-                //     let input_rect = self
-                //         .eval(&expr.args.posargs[1])?
-                //         .try_rect(expr.args.posargs[1].span())?;
-                //     let x_spacing = self
-                //         .eval(&expr.args.posargs[2])?
-                //         .try_linear(expr.args.posargs[2].span())?;
-                //     let y_spacing = self
-                //         .eval(&expr.args.posargs[3])?
-                //         .try_linear(expr.args.posargs[3].span())?;
-                //     assert!(x_spacing.coeffs.is_empty());
-                //     assert!(y_spacing.coeffs.is_empty());
-                //     let attrs = Attrs {
-                //         emit: false,
-                //         source: Some(SourceInfo {
-                //             id: self.alloc_id(),
-                //             span: expr.span,
-                //         }),
-                //     };
-                //     let output_rect = self.cell.rect(attrs);
-                //     let constraint = MaxArrayConstraint {
-                //         input_rect,
-                //         array_cell,
-                //         x_spacing: x_spacing.constant,
-                //         y_spacing: y_spacing.constant,
-                //         output_rect,
-                //         attrs: ConstraintAttrs {
-                //             span: Some(expr.span),
-                //         },
-                //     };
-                //     self.cell
-                //         .add_constraint(Constraint::MaxArray(constraint.clone()));
-                //     Ok(Value::MaxArrayConstraint(constraint))
-                // }
-                "Eq" => {
+                "eq" => {
                     assert_eq!(expr.args.posargs.len(), 2);
                     let lhs = self
                         .eval(&expr.args.posargs[0])?
@@ -226,13 +279,6 @@ impl<'a> CellCtx<'a> {
                             expr.field.span
                         ),
                     }))),
-                    Value::MaxArrayConstraint(c) => match expr.field.name {
-                        "bbox" => Ok(Value::Rect(c.output_rect)),
-                        f => bail!(
-                            "type MaxArrayConstraint has no field `{f}` (encountered at {:?})",
-                            expr.field.span
-                        ),
-                    },
                     _ => bail!(
                         "object no field `{}` (encountered at {:?})",
                         expr.field.name,
@@ -257,7 +303,6 @@ impl<'a> CellCtx<'a> {
 pub enum Value<'a> {
     EnumValue(EnumValue<'a>),
     Linear(LinearExpr),
-    MaxArrayConstraint(MaxArrayConstraint),
     Rect(Rect<Var>),
     None,
 }
@@ -270,10 +315,6 @@ impl<'a> Value<'a> {
     pub fn try_linear(self, espan: cfgrammar::Span) -> Result<LinearExpr> {
         self.into_linear()
             .ok_or_else(|| anyhow!("expected value to be of type LinearExpr at {espan:?}"))
-    }
-    pub fn try_max_array_constraint(self, espan: cfgrammar::Span) -> Result<MaxArrayConstraint> {
-        self.into_max_array_constraint()
-            .ok_or_else(|| anyhow!("expected value to be of type MaxArrayConstraint at {espan:?}"))
     }
     pub fn try_rect(self, espan: cfgrammar::Span) -> Result<Rect<Var>> {
         self.into_rect()
