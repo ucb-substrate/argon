@@ -1,6 +1,6 @@
 %start Decls
 %%
-Decls -> Result<Vec<Decl<'input>>, ()>:
+Decls -> Result<Vec<Decl<'input, ParseMetadata>>, ()>:
   Decls Decl {
     let mut __tmp = $1?;
     __tmp.push($2?);
@@ -9,14 +9,14 @@ Decls -> Result<Vec<Decl<'input>>, ()>:
   | { Ok(Vec::new()) }
   ;
 
-Decl -> Result<Decl<'input>, ()>
+Decl -> Result<Decl<'input, ParseMetadata>, ()>
   : EnumDecl { Ok(Decl::Enum($1?)) }
   | CellDecl { Ok(Decl::Cell($1?)) }
   | ConstantDecl { Ok(Decl::Constant($1?)) }
   ;
 
-Ident -> Result<Ident<'input>, ()>
-  : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), id: None }) }
+Ident -> Result<Ident<'input, ParseMetadata>, ()>
+  : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), metadata: () }) }
   ;
 
 FloatLiteral -> Result<FloatLiteral, ()>
@@ -25,28 +25,30 @@ FloatLiteral -> Result<FloatLiteral, ()>
   Ok(FloatLiteral { span: v.span(), value: parse_float($lexer.span_str(v.span()))?, }) }
   ;
 
-EnumDecl -> Result<EnumDecl<'input>, ()>
+EnumDecl -> Result<EnumDecl<'input, ParseMetadata>, ()>
   : 'ENUM' Ident '{' EnumVariants '}'
   {
     Ok(EnumDecl {
       name: $2?,
       variants: $4?,
+      metadata: (),
     })
   }
   ;
 
-ConstantDecl -> Result<ConstantDecl<'input>, ()>
+ConstantDecl -> Result<ConstantDecl<'input, ParseMetadata>, ()>
   : 'CONST' Ident ':' Ident '=' Expr ';'
   {
     Ok(ConstantDecl {
       name: $2?,
       ty: $4?,
       value: $6?,
+      metadata: (),
     })
   }
   ;
 
-EnumVariants -> Result<Vec<Ident<'input>>, ()>:
+EnumVariants -> Result<Vec<Ident<'input, ParseMetadata>>, ()>:
   EnumVariants Ident ',' {
     let mut __tmp = $1?;
     __tmp.push($2?);
@@ -55,18 +57,19 @@ EnumVariants -> Result<Vec<Ident<'input>>, ()>:
   | { Ok(Vec::new()) }
   ;
 
-CellDecl -> Result<CellDecl<'input>, ()>
+CellDecl -> Result<CellDecl<'input, ParseMetadata>, ()>
   : 'CELL' Ident '(' ArgDecls ')' '{' Statements '}'
   {
     Ok(CellDecl {
       name: $2?,
       args: $4?,
       stmts: $7?,
+      metadata: (),
     })
   }
   ;
 
-Statements -> Result<Vec<Statement<'input>>, ()>:
+Statements -> Result<Vec<Statement<'input, ParseMetadata>>, ()>:
   Statements Statement {
     let mut __tmp = $1?;
     __tmp.push($2?);
@@ -75,10 +78,10 @@ Statements -> Result<Vec<Statement<'input>>, ()>:
   | { Ok(Vec::new()) }
   ;
 
-Statement -> Result<Statement<'input>, ()>
+Statement -> Result<Statement<'input, ParseMetadata>, ()>
   : Expr ';'
   {
-    Ok(Statement::Expr($1?))
+    Ok(Statement::Expr { value: $1?, semicolon: true, })
   }
   | 'LET' Ident '=' Expr ';'
   {
@@ -87,95 +90,140 @@ Statement -> Result<Statement<'input>, ()>
       value: $4?,
     })
   }
+  | BlockExpr
+  {
+    Ok(Statement::Expr { value: $1?, semicolon: false, })
+  }
   ;
 
-Expr -> Result<Expr<'input>, ()>
-  : Expr '==' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Eq, left: $1?, right: $3?, span: $span, }))) }
-  | Expr '!=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Ne, left: $1?, right: $3?, span: $span, }))) }
-  | Expr '>=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Geq, left: $1?, right: $3?, span: $span, }))) }
-  | Expr '>' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Gt, left: $1?, right: $3?, span: $span, }))) }
-  | Expr '<=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Leq, left: $1?, right: $3?, span: $span, }))) }
-  | Expr '<' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Lt, left: $1?, right: $3?, span: $span, }))) }
-  | 'IF' Expr '{' Expr '}' 'ELSE' '{' Expr '}' { Ok(Expr::If(Box::new(IfExpr { cond: $2?, left: $4?, right: $8?, span: $span, }))) }
+Scope -> Result<Scope<'input, ParseMetadata>, ()>
+  : '{' Statements '}'
+  {
+    let mut __stmts = $2?;
+    if let Some(Statement::Expr { value, semicolon }) = __stmts.last().cloned() {
+      if !semicolon {
+        __stmts.pop().unwrap();
+        return Ok(Scope {
+          span: $span,
+          stmts: __stmts,
+          tail: Some(value),
+        })
+      }
+    }
+    Ok(Scope {
+      span: $span,
+      stmts: __stmts,
+      tail: None,
+    })
+  }
+  | '{' Statements NonBlockExpr '}'
+  {
+    Ok(Scope {
+      span: $span,
+      stmts: $2?,
+      tail: Some($3?),
+    })
+  }
+  ;
+
+Expr -> Result<Expr<'input, ParseMetadata>, ()>
+  : NonBlockExpr { $1 }
+  | BlockExpr { $1 }
+  ;
+
+BlockExpr -> Result<Expr<'input, ParseMetadata>, ()>
+  : 'IF' Expr '{' Expr '}' 'ELSE' '{' Expr '}' { Ok(Expr::If(Box::new(IfExpr { cond: $2?, then: $4?, else_: $8?, span: $span, metadata: (), }))) }
+  | Scope { Ok(Expr::Scope(Box::new($1?))) }
+  ;
+
+NonBlockExpr -> Result<Expr<'input, ParseMetadata>, ()>
+  : NonBlockExpr '==' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Eq, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | NonBlockExpr '!=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Ne, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | NonBlockExpr '>=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Geq, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | NonBlockExpr '>' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Gt, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | NonBlockExpr '<=' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Leq, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | NonBlockExpr '<' NonComparisonExpr { Ok(Expr::Comparison(Box::new(ComparisonExpr { op: ComparisonOp::Lt, left: $1?, right: $3?, span: $span, metadata: (), }))) }
   | NonComparisonExpr { $1 }
   ;
 
-NonComparisonExpr -> Result<Expr<'input>, ()>
-  : NonComparisonExpr '+' Term { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Add, left: $1?, right: $3?, span: $span, }))) }
-  | NonComparisonExpr '-' Term { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Sub, left: $1?, right: $3?, span: $span, }))) }
+NonComparisonExpr -> Result<Expr<'input, ParseMetadata>, ()>
+  : NonComparisonExpr '+' Term { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Add, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | NonComparisonExpr '-' Term { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Sub, left: $1?, right: $3?, span: $span, metadata: (), }))) }
   | Term { $1 }
   ;
 
-Term -> Result<Expr<'input>, ()>
-  : Term '*' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Mul, left: $1?, right: $3?, span: $span, }))) }
-  | Term '/' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Div, left: $1?, right: $3?, span: $span, }))) }
+Term -> Result<Expr<'input, ParseMetadata>, ()>
+  : Term '*' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Mul, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | Term '/' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Div, left: $1?, right: $3?, span: $span, metadata: (), }))) }
   | Factor { $1 }
   ;
 
-Factor -> Result<Expr<'input>, ()>
+Factor -> Result<Expr<'input, ParseMetadata>, ()>
   : '(' Expr ')' { $2 }
-  | Factor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, }))) }
+  | Factor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
   | CallExpr { Ok(Expr::Call($1?)) }
-  | Factor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, }))) }
-  | Ident '::' Ident { Ok(Expr::EnumValue(EnumValue {name: $1?, variant: $3?, span: $span, } )) }
-  | Ident { Ok(Expr::Var($1?)) }
+  | Factor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
+  | Ident '::' Ident { Ok(Expr::EnumValue(EnumValue {name: $1?, variant: $3?, span: $span, metadata: (), } )) }
+  | Ident { Ok(Expr::Var(VarExpr { name: $1?, metadata: (), })) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   ;
 
 
-CallExpr -> Result<CallExpr<'input>, ()>
+CallExpr -> Result<CallExpr<'input, ParseMetadata>, ()>
   : Ident '(' Args ')'
     {
       Ok(CallExpr {
         func: $1?,
         args: $3?,
         span: $span,
+        metadata: (),
       })
     }
   ;
 
-ArgDecls -> Result<Vec<ArgDecl<'input>>, ()>
+ArgDecls -> Result<Vec<ArgDecl<'input, ParseMetadata>>, ()>
   : { Ok(Vec::new()) }
   | ArgDecls1 { $1 }
   | ArgDecls1 ',' { $1 }
   ;
 
-ArgDecls1 -> Result<Vec<ArgDecl<'input>>, ()>
+ArgDecls1 -> Result<Vec<ArgDecl<'input, ParseMetadata>>, ()>
   : ArgDecls1 ',' ArgDecl { flatten($1, $3) }
   | ArgDecl { Ok(vec![$1?]) }
   ;
 
-ArgDecl -> Result<ArgDecl<'input>, ()>
-  : Ident ':' Typ { Ok(ArgDecl { name: $1?, ty: $3? }) }
+ArgDecl -> Result<ArgDecl<'input, ParseMetadata>, ()>
+  : Ident ':' Typ { Ok(ArgDecl { name: $1?, ty: $3?, metadata: () }) }
   ;
 
-Typ -> Result<Typ<'input>, ()>
+Typ -> Result<Typ<'input, ParseMetadata>, ()>
   : 'FLOAT' { Ok(Typ::Float) }
   | Ident { Ok(Typ::Ident($1?)) }
   ;
 
-Args -> Result<Args<'input>, ()>
-  : PosArgsTrailingComma KwArgs { Ok(Args { posargs: $1?, kwargs: $2? }) }
-  | PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new() }) }
+Args -> Result<Args<'input, ParseMetadata>, ()>
+  : PosArgsTrailingComma KwArgs { Ok(Args { posargs: $1?, kwargs: $2?, metadata: (), }) }
+  | PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), metadata: (), }) }
   ;
 
-KwArgValue -> Result<KwArgValue<'input>, ()>
+KwArgValue -> Result<KwArgValue<'input, ParseMetadata>, ()>
   : Ident '=' Expr
       {
         Ok(KwArgValue {
           name: $1?,
           value: $3?,
           span: $span,
+          metadata: ()
         })
       }
   ;
 
-KwArgs -> Result<Vec<KwArgValue<'input>>, ()>
+KwArgs -> Result<Vec<KwArgValue<'input, ParseMetadata>>, ()>
   : KwArgsTrailingComma { $1 }
   | KwArgsNoComma { $1 }
   ;
 
-KwArgsTrailingComma -> Result<Vec<KwArgValue<'input>>, ()>
+KwArgsTrailingComma -> Result<Vec<KwArgValue<'input, ParseMetadata>>, ()>
   : KwArgValue ',' { Ok(vec![$1?]) }
   | KwArgsTrailingComma KwArgValue ',' {
       let mut __tmp = $1?;
@@ -184,7 +232,7 @@ KwArgsTrailingComma -> Result<Vec<KwArgValue<'input>>, ()>
     }
   ;
 
-KwArgsNoComma -> Result<Vec<KwArgValue<'input>>, ()>
+KwArgsNoComma -> Result<Vec<KwArgValue<'input, ParseMetadata>>, ()>
   : KwArgValue { Ok(vec![$1?]) }
   | KwArgsTrailingComma KwArgValue {
       let mut __tmp = $1?;
@@ -194,12 +242,12 @@ KwArgsNoComma -> Result<Vec<KwArgValue<'input>>, ()>
   ;
 
 
-PosArgs -> Result<Vec<Expr<'input>>, ()>
+PosArgs -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
   : PosArgsTrailingComma { $1 }
   | PosArgsNoComma { $1 }
   ;
 
-PosArgsTrailingComma -> Result<Vec<Expr<'input>>, ()>
+PosArgsTrailingComma -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
   : Expr ',' { Ok(vec![$1?]) }
   | PosArgsTrailingComma Expr ',' {
       let mut __tmp = $1?;
@@ -208,7 +256,7 @@ PosArgsTrailingComma -> Result<Vec<Expr<'input>>, ()>
   }
   ;
 
-PosArgsNoComma -> Result<Vec<Expr<'input>>, ()>
+PosArgsNoComma -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
   : { Ok(Vec::new()) }
   | Expr { Ok(vec![$1?]) }
   | PosArgsTrailingComma Expr
@@ -221,193 +269,5 @@ PosArgsNoComma -> Result<Vec<Expr<'input>>, ()>
 %%
 
 use cfgrammar::Span;
-
-#[derive(Debug, Clone)]
-pub enum Decl<'a> {
-  Enum(EnumDecl<'a>),
-  Constant(ConstantDecl<'a>),
-  Cell(CellDecl<'a>),
-}
-
-#[derive(Debug, Clone)]
-pub struct Ident<'a> {
-  pub span: Span,
-  pub name: &'a str,
-  pub id: Option<usize>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FloatLiteral {
-  span: Span,
-  pub value: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct EnumDecl<'a> {
-  pub name: Ident<'a>,
-  pub variants: Vec<Ident<'a>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CellDecl<'a> {
-  pub name: Ident<'a>,
-  pub args: Vec<ArgDecl<'a>>,
-  pub stmts: Vec<Statement<'a>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ConstantDecl<'a> {
-  pub name: Ident<'a>,
-  pub ty: Ident<'a>,
-  pub value: Expr<'a>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Statement<'a> {
-  Expr(Expr<'a>),
-  LetBinding {
-    name: Ident<'a>,
-    value: Expr<'a>,
-  },
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum BinOp {
-  Add,
-  Sub,
-  Mul,
-  Div,
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum ComparisonOp {
-  Eq,
-  Ne,
-  Geq,
-  Gt,
-  Leq,
-  Lt,
-}
-
-#[derive(Debug, Clone)]
-pub enum Expr<'a> {
-  If(Box<IfExpr<'a>>),
-  Comparison(Box<ComparisonExpr<'a>>),
-  BinOp(Box<BinOpExpr<'a>>),
-  Call(CallExpr<'a>),
-  Emit(Box<EmitExpr<'a>>),
-  EnumValue(EnumValue<'a>),
-  FieldAccess(Box<FieldAccessExpr<'a>>),
-  Var(Ident<'a>),
-  FloatLiteral(FloatLiteral),
-}
-
-#[derive(Debug, Clone)]
-pub struct IfExpr<'a> {
-    pub cond: Expr<'a>,
-    pub left: Expr<'a>,
-    pub right: Expr<'a>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct BinOpExpr<'a> {
-    pub op: BinOp,
-    pub left: Expr<'a>,
-    pub right: Expr<'a>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct ComparisonExpr<'a> {
-    pub op: ComparisonOp,
-    pub left: Expr<'a>,
-    pub right: Expr<'a>,
-    pub span: Span,
-}
-
-
-#[derive(Debug, Clone)]
-pub struct FieldAccessExpr<'a> {
-    pub base: Expr<'a>,
-    pub field: Ident<'a>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct EnumValue<'a> {
-    pub name: Ident<'a>,
-    pub variant: Ident<'a>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct CallExpr<'a> {
-  pub func: Ident<'a>,
-  pub args: Args<'a>,
-  pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmitExpr<'a> {
-  pub value: Expr<'a>,
-  pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct Args<'a> {
-  pub posargs: Vec<Expr<'a>>,
-  pub kwargs: Vec<KwArgValue<'a>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct KwArgValue<'a> {
-  pub name: Ident<'a>,
-  pub value: Expr<'a>,
-  pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct ArgDecl<'a> {
-  pub name: Ident<'a>,
-  pub ty: Typ<'a>,
-}
-
-#[derive(Debug, Clone)]
-pub enum Typ<'a> {
-  Float,
-  Ident(Ident<'a>),
-}
-
-fn parse_float(s: &str) -> Result<f64, ()> {
-    match s.parse::<f64>() {
-        Ok(val) => Ok(val),
-        Err(_) => {
-            Err(())
-        }
-    }
-}
-
-fn flatten<T>(lhs: Result<Vec<T>, ()>, rhs: Result<T, ()>)
-           -> Result<Vec<T>, ()>
-{
-    let mut flt = lhs?;
-    flt.push(rhs?);
-    Ok(flt)
-}
-
-impl<'a> Expr<'a> {
-    pub fn span(&self) -> Span {
-        match self {
-            Self::If(x) => x.span,
-            Self::Comparison(x) => x.span,
-            Self::BinOp(x) => x.span,
-            Self::Call(x) => x.span,
-            Self::Emit(x) => x.span,
-            Self::EnumValue(x) => x.span,
-            Self::FieldAccess(x) => x.span,
-            Self::Var(x) => x.span,
-            Self::FloatLiteral(x) => x.span,
-        }
-    }
-}
+use crate::ast::*;
+use crate::parse::ParseMetadata;

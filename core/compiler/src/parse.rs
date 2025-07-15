@@ -4,17 +4,35 @@ use anyhow::{bail, Context};
 use lrlex::lrlex_mod;
 use lrpar::lrpar_mod;
 
+use crate::ast::{Ast, AstMetadata};
+
 lrlex_mod!("argon.l");
 lrpar_mod!("argon.y");
 
-pub use argon_y::*;
+pub struct ParseMetadata;
+pub type ParseAst<'a> = Ast<'a, ParseMetadata>;
 
-#[derive(Debug, Clone)]
-pub struct ArgonAst<'a> {
-    pub decls: Vec<Decl<'a>>,
+impl AstMetadata for ParseMetadata {
+    type Ident = ();
+    type EnumDecl = ();
+    type CellDecl = ();
+    type ConstantDecl = ();
+    type Statement = ();
+    type IfExpr = ();
+    type BinOpExpr = ();
+    type ComparisonExpr = ();
+    type FieldAccessExpr = ();
+    type EnumValue = ();
+    type CallExpr = ();
+    type EmitExpr = ();
+    type Args = ();
+    type KwArgValue = ();
+    type ArgDecl = ();
+    type Typ = ();
+    type VarExpr = ();
 }
 
-pub fn parse(input: &str) -> Result<ArgonAst<'_>, anyhow::Error> {
+pub fn parse(input: &str) -> Result<Ast<'_, ParseMetadata>, anyhow::Error> {
     // Get the `LexerDef` for the `argon` language.
     let lexerdef = argon_l::lexerdef();
     // Now we create a lexer with the `lexer` method with which
@@ -31,7 +49,7 @@ pub fn parse(input: &str) -> Result<ArgonAst<'_>, anyhow::Error> {
         bail!("{err}");
     }
     match res {
-        Some(Ok(decls)) => Ok(ArgonAst { decls }),
+        Some(Ok(decls)) => Ok(Ast { decls }),
         _ => bail!("Unable to evaluate expression."),
     }
 }

@@ -18,6 +18,7 @@ enumify = { version = "0.2.1", registry = "substrate" }
 gds21 = "0.2"
 arcstr = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
+derive-where = "1"
 
 [build-dependencies]
 cfgrammar = "0.13"

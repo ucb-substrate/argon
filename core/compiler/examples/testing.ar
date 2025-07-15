@@ -1,0 +1,24 @@
+let x
+let y
+eq(y, 1)
+let z = (int)(x / y) + {
+  eq(x, 1);
+  1
+};
+
+fn rect(x0, y0, w, h) {
+  Rect { x0, y0, w, h }
+}
+
+Rect(x0=0, y0=0, w=(int)(x/y.x), h=100)!
+let w
+eq(w, r.w)
+
+let w
+let r
+print(r.w)
+
+let r = 1;
+asdfasdf r asdfadsf
+let r = 2;
+asdfasdfdsf r asdfadsfas
