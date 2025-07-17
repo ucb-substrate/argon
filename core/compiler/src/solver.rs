@@ -4,416 +4,197 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
+use approx::{assert_relative_eq, relative_eq};
 use arcstr::ArcStr;
 use ena::unify::{InPlaceUnificationTable, UnifyKey};
-use good_lp::{default_solver, ProblemVariables, Solution, SolverModel};
+use itertools::{Either, Itertools};
+use nalgebra::{DMatrix, DVector, MatrixMN};
 use serde::{Deserialize, Serialize};
 
 type Layer = ArcStr;
 
+const EPSILON: f64 = 1e-10;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct Var(u32);
-
-impl UnifyKey for Var {
-    type Value = ();
-
-    fn index(&self) -> u32 {
-        self.0
-    }
-    fn from_index(u: u32) -> Self {
-        Self(u)
-    }
-    fn tag() -> &'static str {
-        "var"
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Attrs {
-    pub source: Option<SourceInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceInfo {
-    pub span: cfgrammar::Span,
-    pub id: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Rect<T> {
-    pub layer: Option<Layer>,
-    pub x0: T,
-    pub y0: T,
-    pub x1: T,
-    pub y1: T,
-    pub attrs: Attrs,
-}
-
-impl<T: Sub + Clone> Rect<T> {
-    fn width(&self) -> T::Output {
-        self.x1.clone() - self.x0.clone()
-    }
-    fn height(&self) -> T::Output {
-        self.y1.clone() - self.y0.clone()
-    }
-}
-
-impl Rect<Var> {
-    fn vars(&self) -> [Var; 4] {
-        [self.x0, self.y0, self.x1, self.y1]
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ConstraintAttrs {
-    pub span: Option<cfgrammar::Span>,
-}
-
-#[derive(Clone, Debug)]
-pub struct LinearConstraint {
-    pub coeffs: Vec<(f64, Var)>,
-    pub constant: f64,
-    pub is_equality: bool,
-    pub attrs: ConstraintAttrs,
-}
-
-#[derive(Clone, Debug)]
-pub struct MaxArrayConstraint {
-    // Must be fixed before the array is solved.
-    pub array_cell: Rect<Var>,
-    // Must be fixed before the array is solved.
-    pub input_rect: Rect<Var>,
-    pub x_spacing: f64,
-    pub y_spacing: f64,
-    /// Solved after the nx and ny of the array is solved (width/height fixed).
-    pub output_rect: Rect<Var>,
-    pub attrs: ConstraintAttrs,
-}
-
-#[derive(Clone, Debug)]
-pub enum Constraint {
-    Linear(LinearConstraint),
-}
+pub struct Var(u64);
 
 #[derive(Clone, Default)]
-struct Vars {
-    uf: InPlaceUnificationTable<Var>,
-    vars: Vec<Var>,
+pub struct Solver {
+    next_id: u64,
+    constraints: Vec<LinearExpr>,
+    solved_vars: HashMap<Var, f64>,
 }
 
-impl Vars {
-    fn new_var(&mut self) -> Var {
-        let var = self.uf.new_key(());
-        self.vars.push(var);
+impl Solver {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn new_var(&mut self) -> Var {
+        let var = Var(self.next_id);
+        self.next_id += 1;
         var
     }
 
-    fn vars(&self) -> Vec<Var> {
-        self.vars.clone()
+    /// Constrains the value of `expr` to 0.
+    /// TODO: Check if added constraints conflict with existing solution.
+    pub fn constrain_eq0(&mut self, expr: LinearExpr) {
+        self.constraints.push(expr);
+    }
+
+    /// Solves for as many variables as possible and substitutes their values into existing constraints.
+    /// Deletes constraints that no longer contain unsolved variables.
+    pub fn solve(&mut self) {
+        let n_vars = self.next_id as usize;
+        if n_vars == 0 || self.constraints.is_empty() {
+            return;
+        }
+        let a = DMatrix::from_row_iterator(
+            self.constraints.len(),
+            n_vars,
+            self.constraints
+                .iter()
+                .flat_map(|expr| expr.coeff_vec(n_vars)),
+        );
+        let b = DVector::from_iterator(
+            self.constraints.len(),
+            self.constraints.iter().map(|expr| -expr.constant),
+        );
+        let p = a.clone().svd(true, true).pseudo_inverse(EPSILON).unwrap();
+        assert_relative_eq!(&(&a * &p * &b), &b, epsilon = EPSILON);
+        let sol = &p * b;
+        println!("{:?}", a);
+        println!("{:?}", p);
+        let variation = DMatrix::identity(n_vars, n_vars) - &p * a;
+        println!("{:?}", variation);
+        let zeros = DVector::zeros(n_vars);
+        for i in 0..self.next_id {
+            if relative_eq!(
+                &variation.row(i as usize).transpose(),
+                &zeros,
+                epsilon = EPSILON
+            ) {
+                self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
+            }
+        }
+        for constraint in self.constraints.iter_mut() {
+            let (l, r): (Vec<f64>, Vec<_>) =
+                constraint.coeffs.iter().partition_map(|a @ (coeff, var)| {
+                    if let Some(s) = self.solved_vars.get(var) {
+                        Either::Left(coeff * s)
+                    } else {
+                        Either::Right(*a)
+                    }
+                });
+            constraint.coeffs = r;
+            constraint.constant -= l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
+        }
+        self.constraints
+            .retain(|constraint| !constraint.coeffs.is_empty());
+    }
+
+    pub fn value_of(&self, var: Var) -> Option<f64> {
+        self.solved_vars.get(&var).copied()
+    }
+
+    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(
+            expr.coeffs
+                .iter()
+                .map(|(coeff, var)| self.value_of(*var).map(|val| val * coeff))
+                .fold_options(0., |a, b| a + b)?
+                + expr.constant,
+        )
     }
 }
 
-#[derive(Clone, Default)]
-pub struct Cell {
-    vars: Vars,
-    emitted_rects: Vec<Rect<Var>>,
-    constraints: Vec<Constraint>,
+#[derive(Debug, Clone)]
+pub struct LinearExpr {
+    pub coeffs: Vec<(f64, Var)>,
+    pub constant: f64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SolvedCell {
-    pub rects: Vec<Rect<f64>>,
+impl LinearExpr {
+    pub fn coeff_vec(&self, n_vars: usize) -> Vec<f64> {
+        let mut out = vec![0.; n_vars];
+        for (val, var) in &self.coeffs {
+            out[var.0 as usize] = *val;
+        }
+        out
+    }
 }
 
-impl Cell {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn var(&mut self) -> Var {
-        self.vars.new_var()
-    }
-
-    pub fn rect(&mut self, attrs: Attrs) -> Rect<Var> {
-        let x0 = self.var();
-        let y0 = self.var();
-        let x1 = self.var();
-        let y1 = self.var();
-        Rect {
-            layer: None,
-            x0,
-            y0,
-            x1,
-            y1,
-            attrs,
+impl std::ops::Add<LinearExpr> for LinearExpr {
+    type Output = Self;
+    fn add(self, rhs: LinearExpr) -> Self::Output {
+        Self {
+            coeffs: self.coeffs.into_iter().chain(rhs.coeffs).collect(),
+            constant: self.constant + rhs.constant,
         }
     }
+}
 
-    pub fn physical_rect(&mut self, layer: Layer, attrs: Attrs) -> Rect<Var> {
-        let x0 = self.var();
-        let y0 = self.var();
-        let x1 = self.var();
-        let y1 = self.var();
-        Rect {
-            layer: Some(layer),
-            x0,
-            y0,
-            x1,
-            y1,
-            attrs,
-        }
-    }
-
-    pub fn emit_rect(&mut self, rect: Rect<Var>) {
-        self.emitted_rects.push(rect);
-    }
-
-    pub fn add_constraint(&mut self, constraint: Constraint) {
-        self.constraints.push(constraint);
-    }
-
-    pub fn solve(self) -> Result<SolvedCell> {
-        let Cell {
-            mut vars,
-            emitted_rects,
-            constraints,
-            ..
-        } = self;
-
-        Ok(SolvedCell {
-            rects: solved_rects
+impl std::ops::Sub<LinearExpr> for LinearExpr {
+    type Output = Self;
+    fn sub(self, rhs: LinearExpr) -> Self::Output {
+        Self {
+            coeffs: self
+                .coeffs
                 .into_iter()
-                .chain(emitted_rects.into_iter().map(
-                    |Rect {
-                         layer,
-                         x0,
-                         y0,
-                         x1,
-                         y1,
-                         attrs,
-                     }| Rect {
-                        layer,
-                        x0: val_map[&x0],
-                        y0: val_map[&y0],
-                        x1: val_map[&x1],
-                        y1: val_map[&y1],
-                        attrs,
-                    },
-                ))
+                .chain(rhs.coeffs.into_iter().map(|(c, v)| (-c, v)))
                 .collect(),
-        })
+            constant: self.constant - rhs.constant,
+        }
     }
 }
 
-impl SolvedCell {
-    pub fn width(&self) -> f64 {
-        let mut min = f64::MAX;
-        let mut max = f64::MIN;
-        for rect in &self.rects {
-            min = *[min, rect.x0, rect.x1]
-                .iter()
-                .min_by(|a, b| a.total_cmp(b))
-                .unwrap();
-            max = *[max, rect.x0, rect.x1]
-                .iter()
-                .max_by(|a, b| a.total_cmp(b))
-                .unwrap();
+impl From<Var> for LinearExpr {
+    fn from(value: Var) -> Self {
+        Self {
+            coeffs: vec![(1., value)],
+            constant: 0.,
         }
-        max - min
     }
+}
 
-    pub fn height(&self) -> f64 {
-        let mut min = f64::MAX;
-        let mut max = f64::MIN;
-        for rect in &self.rects {
-            min = *[min, rect.y0, rect.y1]
-                .iter()
-                .min_by(|a, b| a.total_cmp(b))
-                .unwrap();
-            max = *[max, rect.y0, rect.y1]
-                .iter()
-                .max_by(|a, b| a.total_cmp(b))
-                .unwrap();
-        }
-        max - min
-    }
-
-    pub fn bbox(&self) -> Rect<f64> {
-        let mut min_x = f64::MAX;
-        let mut max_x = f64::MIN;
-        let mut min_y = f64::MAX;
-        let mut max_y = f64::MIN;
-        for rect in &self.rects {
-            min_x = *[min_x, rect.x0, rect.x1]
-                .iter()
-                .min_by(|a, b| a.total_cmp(b))
-                .unwrap();
-            max_x = *[max_x, rect.x0, rect.x1]
-                .iter()
-                .max_by(|a, b| a.total_cmp(b))
-                .unwrap();
-            min_y = *[min_y, rect.y0, rect.y1]
-                .iter()
-                .min_by(|a, b| a.total_cmp(b))
-                .unwrap();
-            max_y = *[max_y, rect.y0, rect.y1]
-                .iter()
-                .max_by(|a, b| a.total_cmp(b))
-                .unwrap();
-        }
-        Rect {
-            layer: None,
-            x0: min_x,
-            y0: min_y,
-            x1: max_x,
-            y1: max_y,
-            attrs: Attrs { source: None },
+impl From<f64> for LinearExpr {
+    fn from(value: f64) -> Self {
+        Self {
+            coeffs: vec![],
+            constant: value,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
     #[test]
     fn linear_constraints_solved_correctly() {
-        let mut cell = Cell::new();
-        let r1 = cell.physical_rect(arcstr::literal!("met1"), Attrs { source: None });
-        let r2 = cell.physical_rect(arcstr::literal!("met1"), Attrs { source: None });
-        cell.emit_rect(r1.clone());
-        cell.emit_rect(r2.clone());
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r1.x0)],
-            constant: 0.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r1.y0)],
-            constant: 0.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r1.x1), (-1., r1.x0)],
-            constant: -50.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r2.x0), (-1., r1.x1)],
-            constant: -100.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r2.x1), (-1., r2.x0)],
-            constant: -200.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r1.y1), (-1., r1.y0)],
-            constant: -20.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r2.y0), (-1., r1.y1)],
-            constant: -40.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., r2.y1), (-1., r2.y0)],
-            constant: -80.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        let via_rect = cell.physical_rect(arcstr::literal!("via"), Attrs { source: None });
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., via_rect.x1), (-1., via_rect.x0)],
-            constant: -5.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., via_rect.y1), (-1., via_rect.y0)],
-            constant: -5.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        let output_rect = cell.rect(Attrs { source: None });
-        cell.add_constraint(Constraint::MaxArray(MaxArrayConstraint {
-            array_cell: via_rect,
-            input_rect: r2,
-            x_spacing: 5.,
-            y_spacing: 5.,
-            output_rect: output_rect.clone(),
-            attrs: Default::default(),
-        }));
-
-        let via_enclosure = cell.physical_rect(arcstr::literal!("met2"), Attrs { source: None });
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., via_enclosure.x1), (-1., output_rect.x1)],
-            constant: -40.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(-1., via_enclosure.x0), (1., output_rect.x0)],
-            constant: -40.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(1., via_enclosure.y1), (-1., output_rect.y1)],
-            constant: -100.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-        cell.add_constraint(Constraint::Linear(LinearConstraint {
-            coeffs: vec![(-1., via_enclosure.y0), (1., output_rect.y0)],
-            constant: -100.,
-            is_equality: true,
-            attrs: Default::default(),
-        }));
-
-        let solved_cell = cell.solve().expect("failed to solve cell");
-
-        let mut gds = GdsLibrary::new("TOP");
-        let mut cell = GdsStruct::new("cell");
-        for rect in &solved_cell.rects {
-            if let Some(layer) = &rect.layer {
-                let layer = match layer.as_str() {
-                    "met1" => 10,
-                    "via" => 11,
-                    "met2" => 20,
-                    _ => unreachable!(),
-                };
-                cell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
-                    layer,
-                    datatype: 0,
-                    xy: vec![
-                        GdsPoint::new(rect.x0 as i32, rect.y0 as i32),
-                        GdsPoint::new(rect.x0 as i32, rect.y1 as i32),
-                        GdsPoint::new(rect.x1 as i32, rect.y1 as i32),
-                        GdsPoint::new(rect.x1 as i32, rect.y0 as i32),
-                    ],
-                    ..Default::default()
-                }));
-            }
-        }
-        gds.structs.push(cell);
-        let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("build/linear_constraints_solved_correctly");
-        std::fs::create_dir_all(&work_dir).expect("failed to create dirs");
-        gds.save(work_dir.join("layout.gds"))
-            .expect("failed to write GDS");
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+        let z = solver.new_var();
+        solver.constrain_eq0(LinearExpr {
+            coeffs: vec![(1., x), (1., y)],
+            constant: 5.,
+        });
+        solver.constrain_eq0(LinearExpr {
+            coeffs: vec![(1., x), (-1., y)],
+            constant: 2.,
+        });
+        solver.solve();
+        assert_relative_eq!(
+            *solver.solved_vars.get(&x).unwrap(),
+            -3.5,
+            epsilon = EPSILON
+        );
+        assert_relative_eq!(
+            *solver.solved_vars.get(&y).unwrap(),
+            -1.5,
+            epsilon = EPSILON
+        );
+        assert!(solver.solved_vars.get(&z).is_none());
     }
 }

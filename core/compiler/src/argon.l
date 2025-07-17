@@ -8,6 +8,7 @@ else "ELSE"
 let "LET"
 f64 "FLOAT"
 [_a-zA-Z][_a-zA-Z0-9]* "IDENT"
+//[^\r\n]* ;
 [0-9]+ "FLOATLIT"
 \+ "+"
 \* "*"

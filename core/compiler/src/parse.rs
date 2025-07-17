@@ -17,7 +17,7 @@ impl AstMetadata for ParseMetadata {
     type EnumDecl = ();
     type CellDecl = ();
     type ConstantDecl = ();
-    type Statement = ();
+    type LetBinding = ();
     type IfExpr = ();
     type BinOpExpr = ();
     type ComparisonExpr = ();

@@ -5,14 +5,47 @@ enum Layer {
 }
 
 cell vias() {
-    let met2 = Rect(Layer::Met2, x0=0, x1=100, y0=0, y1=100)!;
-    let met1 = Rect(Layer::Met1, x0=met2.x0 - 5, x1=met2.x1 + 5, y0=0, y1=100)!;
+    let met2 = Rect(Layer::Met2)!;
+    let met1 = Rect(Layer::Met1)!;
+
+    // Create via.
     let via = Rect(Layer::Via1)!;
     eq(via.x1 - via.x0, if met1.x1 - met1.x0 < 40 {
         20
     } else {
         40
     });
+    let intersection_x0 = if met1.x0 > met2.x0 {
+        met1.x0
+    } else {
+        met2.x0
+    };
+    let intersection_y0 = if met1.y0 > met2.y0 {
+        met1.y0
+    } else {
+        met2.y0
+    };
+    let intersection_x1 = if met1.x1 < met2.x1 {
+        met1.x1
+    } else {
+        met2.x1
+    };
+    let intersection_y1 = if met1.y1 < met2.y1 {
+        met1.y1
+    } else {
+        met2.y1
+    };
     eq(via.y1 - via.y0, 20);
-    eq(via.x0 - met1.x0, met1.x1 - via.x1);
+    eq(via.x0 - intersection_x0, met1.x1 - intersection_x1);
+    eq(via.y0 - intersection_y0, met1.y1 - intersection_y1);
+
+    // Constrain metals.
+    eq(met2.x0, 0);
+    eq(met2.y0, 0);
+    eq(met2.x1, 100);
+    eq(met2.y1, 100);
+    eq(met1.x0, 5);
+    eq(met1.y0, 5);
+    eq(met1.x1, 95);
+    eq(met1.y1, 95);
 }

@@ -19,6 +19,10 @@ gds21 = "0.2"
 arcstr = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 derive-where = "1"
+nalgebra = "0.33.2"
+approx = "0.5"
+rust_decimal = "1"
+rust_decimal_macros = "1"
 
 [build-dependencies]
 cfgrammar = "0.13"

@@ -1,6 +1,6 @@
-use std::fmt::{Debug, Write};
+use std::fmt::Debug;
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use cfgrammar::Span;
 use derive_where::derive_where;
 
@@ -61,14 +61,16 @@ pub struct Scope<'a, T: AstMetadata> {
 
 #[derive_where(Debug, Clone)]
 pub enum Statement<'a, T: AstMetadata> {
-    Expr {
-        value: Expr<'a, T>,
-        semicolon: bool,
-    },
-    LetBinding {
-        name: Ident<'a, T>,
-        value: Expr<'a, T>,
-    },
+    Expr { value: Expr<'a, T>, semicolon: bool },
+    LetBinding(LetBinding<'a, T>),
+}
+
+#[derive_where(Debug, Clone)]
+pub struct LetBinding<'a, T: AstMetadata> {
+    pub name: Ident<'a, T>,
+    pub value: Expr<'a, T>,
+    pub metadata: T::LetBinding,
+    pub span: Span,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -231,7 +233,7 @@ pub trait AstMetadata {
     type EnumDecl: Debug + Clone;
     type CellDecl: Debug + Clone;
     type ConstantDecl: Debug + Clone;
-    type Statement: Debug + Clone;
+    type LetBinding: Debug + Clone;
     type IfExpr: Debug + Clone;
     type BinOpExpr: Debug + Clone;
     type ComparisonExpr: Debug + Clone;
@@ -278,6 +280,12 @@ pub trait AstTransformer<'a> {
         ty: &Ident<'a, Self::Output>,
         value: &Expr<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::ConstantDecl;
+    fn dispatch_let_binding(
+        &mut self,
+        input: &LetBinding<'a, Self::Input>,
+        name: &Ident<'a, Self::Output>,
+        value: &Expr<'a, Self::Output>,
+    ) -> <Self::Output as AstMetadata>::LetBinding;
     fn dispatch_if_expr(
         &mut self,
         input: &IfExpr<'a, Self::Input>,
@@ -421,11 +429,21 @@ pub trait AstTransformer<'a> {
                 value: self.transform_expr(value),
                 semicolon: *semicolon,
             },
-            Statement::LetBinding { name, value } => {
-                let name = self.transform_ident(name);
-                let value = self.transform_expr(value);
-                Statement::LetBinding { name, value }
-            }
+            Statement::LetBinding(l) => Statement::LetBinding(self.transform_let_binding(l)),
+        }
+    }
+    fn transform_let_binding(
+        &mut self,
+        input: &LetBinding<'a, Self::Input>,
+    ) -> LetBinding<'a, Self::Output> {
+        let name = self.transform_ident(&input.name);
+        let value = self.transform_expr(&input.value);
+        let metadata = self.dispatch_let_binding(input, &name, &value);
+        LetBinding {
+            name,
+            value,
+            metadata,
+            span: input.span,
         }
     }
     fn transform_if_expr(&mut self, input: &IfExpr<'a, Self::Input>) -> IfExpr<'a, Self::Output> {

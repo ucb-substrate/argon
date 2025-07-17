@@ -6,6 +6,7 @@ use lrpar::lrpar_mod;
 pub mod ast;
 pub mod compile;
 pub mod parse;
+pub mod solver;
 
 pub fn main() {
     let stdin = io::stdin();
@@ -35,7 +36,7 @@ mod tests {
     use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
     use parse::parse;
 
-    use crate::compile::{CompileInput, VarIdPass};
+    use crate::compile::{compile, CompileInput, VarIdTyPass};
 
     use super::*;
 
@@ -53,6 +54,11 @@ cell simple(y_enclosure: int) {
 }"#;
     const ARGON_SCOPES: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes.ar"));
+    const ARGON_IMMEDIATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/immediate.ar"
+    ));
+    const ARGON_IF: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if.ar"));
     const ARGON_VIA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via.ar"));
     const ARGON_VIA_ARRAY: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -66,13 +72,46 @@ cell simple(y_enclosure: int) {
     #[test]
     fn argon_scopes() {
         let ast = parse(ARGON_SCOPES).expect("failed to parse Argon");
-        let pass = VarIdPass::new();
+        let pass = VarIdTyPass::new();
         let x = pass.execute(CompileInput {
             cell: "scopes",
             ast: &ast,
             params: HashMap::new(),
         });
         println!("{x:?}");
+    }
+
+    #[test]
+    fn argon_immediate() {
+        let ast = parse(ARGON_IMMEDIATE).expect("failed to parse Argon");
+        let cell = compile(CompileInput {
+            cell: "immediate",
+            ast: &ast,
+            params: HashMap::new(),
+        });
+        println!("{cell:?}");
+    }
+
+    #[test]
+    fn argon_if() {
+        let ast = parse(ARGON_IF).expect("failed to parse Argon");
+        let cell = compile(CompileInput {
+            cell: "if_test",
+            ast: &ast,
+            params: HashMap::new(),
+        });
+        println!("{cell:?}");
+    }
+
+    #[test]
+    fn argon_via_array() {
+        let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
+        let cell = compile(CompileInput {
+            cell: "immediate",
+            ast: &ast,
+            params: HashMap::new(),
+        });
+        println!("{cell:?}");
     }
 
     // #[test]

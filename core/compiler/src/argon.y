@@ -85,10 +85,12 @@ Statement -> Result<Statement<'input, ParseMetadata>, ()>
   }
   | 'LET' Ident '=' Expr ';'
   {
-    Ok(Statement::LetBinding {
+    Ok(Statement::LetBinding(LetBinding {
       name: $2?,
       value: $4?,
-    })
+      span: $span,
+      metadata: (),
+    }))
   }
   | BlockExpr
   {
@@ -132,7 +134,7 @@ Expr -> Result<Expr<'input, ParseMetadata>, ()>
   ;
 
 BlockExpr -> Result<Expr<'input, ParseMetadata>, ()>
-  : 'IF' Expr '{' Expr '}' 'ELSE' '{' Expr '}' { Ok(Expr::If(Box::new(IfExpr { cond: $2?, then: $4?, else_: $8?, span: $span, metadata: (), }))) }
+  : 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { cond: $2?, then: Expr::Scope(Box::new($3?)), else_: Expr::Scope(Box::new($5?)), span: $span, metadata: (), }))) }
   | Scope { Ok(Expr::Scope(Box::new($1?))) }
   ;
 
