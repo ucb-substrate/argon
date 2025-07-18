@@ -14,6 +14,7 @@ pub enum Decl<'a, T: AstMetadata> {
     Enum(EnumDecl<'a, T>),
     Constant(ConstantDecl<'a, T>),
     Cell(CellDecl<'a, T>),
+    Fn(FnDecl<'a, T>),
 }
 
 #[derive_where(Debug, Clone)]
@@ -45,6 +46,14 @@ pub struct CellDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+pub struct FnDecl<'a, T: AstMetadata> {
+    pub name: Ident<'a, T>,
+    pub args: Vec<ArgDecl<'a, T>>,
+    pub scope: Scope<'a, T>,
+    pub metadata: T::FnDecl,
+}
+
+#[derive_where(Debug, Clone)]
 pub struct ConstantDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub ty: Ident<'a, T>,
@@ -57,6 +66,7 @@ pub struct Scope<'a, T: AstMetadata> {
     pub span: Span,
     pub stmts: Vec<Statement<'a, T>>,
     pub tail: Option<Expr<'a, T>>,
+    pub metadata: T::Scope,
 }
 
 #[derive_where(Debug, Clone)]
@@ -187,14 +197,8 @@ pub struct KwArgValue<'a, T: AstMetadata> {
 #[derive_where(Debug, Clone)]
 pub struct ArgDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
-    pub ty: Typ<'a, T>,
+    pub ty: Ident<'a, T>,
     pub metadata: T::ArgDecl,
-}
-
-#[derive_where(Debug, Clone)]
-pub enum Typ<'a, T: AstMetadata> {
-    Float,
-    Ident(Ident<'a, T>),
 }
 
 pub(crate) fn parse_float(s: &str) -> Result<f64, ()> {
@@ -232,6 +236,7 @@ pub trait AstMetadata {
     type VarExpr: Debug + Clone;
     type EnumDecl: Debug + Clone;
     type CellDecl: Debug + Clone;
+    type FnDecl: Debug + Clone;
     type ConstantDecl: Debug + Clone;
     type LetBinding: Debug + Clone;
     type IfExpr: Debug + Clone;
@@ -244,6 +249,7 @@ pub trait AstMetadata {
     type Args: Debug + Clone;
     type KwArgValue: Debug + Clone;
     type ArgDecl: Debug + Clone;
+    type Scope: Debug + Clone;
     type Typ: Debug + Clone;
 }
 
@@ -273,6 +279,13 @@ pub trait AstTransformer<'a> {
         args: &Vec<ArgDecl<'a, Self::Output>>,
         stmts: &Vec<Statement<'a, Self::Output>>,
     ) -> <Self::Output as AstMetadata>::CellDecl;
+    fn dispatch_fn_decl(
+        &mut self,
+        input: &FnDecl<'a, Self::Input>,
+        name: &Ident<'a, Self::Output>,
+        args: &Vec<ArgDecl<'a, Self::Output>>,
+        scope: &Scope<'a, Self::Output>,
+    ) -> <Self::Output as AstMetadata>::FnDecl;
     fn dispatch_constant_decl(
         &mut self,
         input: &ConstantDecl<'a, Self::Input>,
@@ -344,8 +357,14 @@ pub trait AstTransformer<'a> {
         &mut self,
         input: &ArgDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
-        ty: &Typ<'a, Self::Output>,
+        ty: &Ident<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::ArgDecl;
+    fn dispatch_scope(
+        &mut self,
+        input: &Scope<'a, Self::Input>,
+        stmts: &Vec<Statement<'a, Self::Output>>,
+        tail: &Option<Expr<'a, Self::Output>>,
+    ) -> <Self::Output as AstMetadata>::Scope;
     fn enter_scope(&mut self, input: &Scope<'a, Self::Input>);
     fn exit_scope(&mut self, input: &Scope<'a, Self::Input>, output: &Scope<'a, Self::Output>);
 
@@ -402,6 +421,22 @@ pub trait AstTransformer<'a> {
             name,
             args,
             stmts,
+            metadata,
+        }
+    }
+    fn transform_fn_decl(&mut self, input: &FnDecl<'a, Self::Input>) -> FnDecl<'a, Self::Output> {
+        let name = self.transform_ident(&input.name);
+        let args = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
+        let scope = self.transform_scope(&input.scope);
+        let metadata = self.dispatch_fn_decl(input, &name, &args, &scope);
+        FnDecl {
+            name,
+            args,
+            scope,
             metadata,
         }
     }
@@ -582,15 +617,9 @@ pub trait AstTransformer<'a> {
         input: &ArgDecl<'a, Self::Input>,
     ) -> ArgDecl<'a, Self::Output> {
         let name = self.transform_ident(&input.name);
-        let ty = self.transform_typ(&input.ty);
+        let ty = self.transform_ident(&input.ty);
         let metadata = self.dispatch_arg_decl(input, &name, &ty);
         ArgDecl { name, ty, metadata }
-    }
-    fn transform_typ(&mut self, input: &Typ<'a, Self::Input>) -> Typ<'a, Self::Output> {
-        match input {
-            Typ::Float => Typ::Float,
-            Typ::Ident(ident) => Typ::Ident(self.transform_ident(ident)),
-        }
     }
     fn transform_scope(&mut self, input: &Scope<'a, Self::Input>) -> Scope<'a, Self::Output> {
         self.enter_scope(input);
@@ -600,10 +629,12 @@ pub trait AstTransformer<'a> {
             .map(|stmt| self.transform_statement(stmt))
             .collect();
         let tail = input.tail.as_ref().map(|stmt| self.transform_expr(stmt));
+        let metadata = self.dispatch_scope(input, &stmts, &tail);
         let output = Scope {
             span: input.span,
             stmts,
             tail,
+            metadata,
         };
         self.exit_scope(input, &output);
         output

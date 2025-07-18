@@ -9,7 +9,7 @@ use derive_where::derive_where;
 use enumify::enumify;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{FieldAccessExpr, Typ};
+use crate::ast::{ConstantDecl, FieldAccessExpr, Scope};
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -35,6 +35,7 @@ pub(crate) struct VarIdTyPass<'a> {
     bindings: Vec<HashMap<&'a str, (VarId, Ty)>>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct VarIdTyMetadata;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -53,6 +54,7 @@ impl AstMetadata for VarIdTyMetadata {
     type CellDecl = ();
     type ConstantDecl = ();
     type LetBinding = VarId;
+    type FnDecl = Ty;
     type IfExpr = Ty;
     type BinOpExpr = Ty;
     type ComparisonExpr = Ty;
@@ -63,6 +65,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Args = ();
     type KwArgValue = Ty;
     type ArgDecl = ();
+    type Scope = Ty;
     type Typ = ();
     type VarExpr = (VarId, Ty);
 }
@@ -142,10 +145,7 @@ impl<'a> Expr<'a, VarIdTyMetadata> {
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata,
             Expr::Var(var_expr) => var_expr.metadata.1,
             Expr::FloatLiteral(_float_literal) => Ty::Float,
-            Expr::Scope(scope) => match &scope.tail {
-                Some(expr) => expr.ty(),
-                None => Ty::Nil,
-            },
+            Expr::Scope(scope) => scope.metadata,
         }
     }
 }
@@ -186,9 +186,19 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     ) -> <Self::Output as AstMetadata>::CellDecl {
     }
 
+    fn dispatch_fn_decl(
+        &mut self,
+        input: &crate::ast::FnDecl<'a, Self::Input>,
+        name: &Ident<'a, Self::Output>,
+        args: &Vec<ArgDecl<'a, Self::Output>>,
+        scope: &Scope<'a, Self::Output>,
+    ) -> <Self::Output as AstMetadata>::FnDecl {
+        scope.metadata
+    }
+
     fn dispatch_constant_decl(
         &mut self,
-        input: &crate::ast::ConstantDecl<'a, Self::Input>,
+        input: &ConstantDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
         ty: &Ident<'a, Self::Output>,
         value: &Expr<'a, Self::Output>,
@@ -263,7 +273,19 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         args: &crate::ast::Args<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::CallExpr {
         match func.name {
-            "rect" => Ty::Rect,
+            "crect" | "rect" => {
+                if func.name == "crect" {
+                    assert_eq!(args.posargs.len(), 0);
+                } else {
+                    assert_eq!(args.posargs.len(), 1);
+                }
+                assert_eq!(args.posargs[0].ty(), Ty::Enum);
+                for kwarg in &args.kwargs {
+                    assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&kwarg.name.name));
+                    assert_eq!(kwarg.value.ty(), Ty::Float);
+                }
+                Ty::Rect
+            }
             "float" => {
                 assert!(args.posargs.is_empty());
                 assert!(args.kwargs.is_empty());
@@ -310,34 +332,29 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         &mut self,
         input: &ArgDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
-        ty: &Typ<'a, Self::Output>,
+        ty: &Ident<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::ArgDecl {
-    }
-
-    fn transform_arg_decl(
-        &mut self,
-        input: &ArgDecl<'a, Self::Input>,
-    ) -> ArgDecl<'a, Self::Output> {
         assert!(
             self.lookup(input.name.name).is_none(),
             "argument should not already be declared"
         );
         self.alloc(
             input.name.name,
-            match &input.ty {
-                Typ::Float => Ty::Float,
-                Typ::Ident(ident) => {
-                    unimplemented!()
-                }
+            match input.ty.name {
+                "Float" => Ty::Float,
+                "Rect" => Ty::Rect,
+                _ => panic!("invalid type"),
             },
         );
-        let name = self.transform_ident(&input.name);
-        let ty = self.transform_typ(&input.ty);
-        ArgDecl {
-            name,
-            ty,
-            metadata: (),
-        }
+    }
+
+    fn dispatch_scope(
+        &mut self,
+        input: &Scope<'a, Self::Input>,
+        stmts: &Vec<Statement<'a, Self::Output>>,
+        tail: &Option<Expr<'a, Self::Output>>,
+    ) -> <Self::Output as AstMetadata>::Scope {
+        tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
     fn enter_scope(&mut self, _input: &crate::ast::Scope<'a, Self::Input>) {
@@ -381,7 +398,7 @@ pub struct SourceInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rect<T> {
-    pub layer: String,
+    pub layer: Option<String>,
     pub x0: T,
     pub y0: T,
     pub x1: T,
@@ -436,10 +453,12 @@ impl<'a> ExecPass<'a> {
         self.solve();
         while !self.deferred.is_empty() {
             let deferred = self.deferred.clone();
+            let mut progress = false;
             for vid in deferred.iter().copied() {
-                self.eval_partial(vid);
+                progress = progress || self.eval_partial(vid);
             }
-            if self.deferred == deferred {
+
+            if !progress {
                 panic!("no progress");
             }
             self.solve();
@@ -512,7 +531,7 @@ impl<'a> ExecPass<'a> {
     fn eval_stmt(&mut self, frame: FrameId, stmt: &'a Statement<'_, VarIdTyMetadata>) {
         match stmt {
             Statement::LetBinding(binding) => {
-                let value = self.eval_expr(frame, &binding.value);
+                let value = self.visit_expr(frame, &binding.value);
                 println!("binding vid: {} {value:?}", binding.name.name);
                 self.frames
                     .get_mut(&frame)
@@ -521,250 +540,309 @@ impl<'a> ExecPass<'a> {
                     .insert(binding.metadata, value);
             }
             Statement::Expr { value, .. } => {
-                self.eval_expr(frame, value);
+                self.visit_expr(frame, value);
             }
         }
     }
 
-    fn eval_expr(&mut self, frame: FrameId, expr: &'a Expr<'_, VarIdTyMetadata>) -> ValueId {
-        match expr {
+    fn visit_expr(&mut self, frame: FrameId, expr: &'a Expr<'_, VarIdTyMetadata>) -> ValueId {
+        let partial_eval_state = match expr {
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
                 self.values
                     .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(f.value))));
-                vid
-            }
-            Expr::Emit(e) => {
-                let vid = self.eval_expr(frame, &e.value);
-                self.emit.push(vid);
-                vid
+                return vid;
             }
             Expr::Var(v) => {
                 let var_id = v.metadata.0;
-                self.frames[&frame].bindings[&var_id]
+                return self.frames[&frame].bindings[&var_id];
             }
-            Expr::Call(c) => match c.func.name {
-                "rect" => todo!(),
-                "float" => {
-                    let vid = self.value_id();
-                    println!("float vid: {vid:?}");
-                    self.values.insert(
-                        vid,
-                        Defer::Ready(Value::Linear(LinearExpr::from(self.solver.new_var()))),
-                    );
-                    vid
-                }
-                "eq" => {
-                    assert_eq!(c.args.posargs.len(), 2);
-                    assert_eq!(c.args.kwargs.len(), 0);
-                    let left = self.eval_expr(frame, &c.args.posargs[0]);
-                    let right = self.eval_expr(frame, &c.args.posargs[1]);
-                    if let (Defer::Ready(vl), Defer::Ready(vr)) =
-                        (&self.values[&left], &self.values[&right])
-                    {
-                        let expr = vl.as_ref().unwrap_linear().clone()
-                            - vr.as_ref().unwrap_linear().clone();
-                        self.solver.constrain_eq0(expr);
-                        return self.nil_value;
-                    }
-                    panic!("unsolved argument");
-                }
-                _ => panic!("invalid function"),
-            },
+            Expr::Emit(e) => {
+                let vid = self.visit_expr(frame, &e.value);
+                self.emit.push(vid);
+                return vid;
+            }
+            Expr::Call(c) => PartialEvalState::Call(Box::new(PartialCallExpr {
+                expr: c,
+                state: CallExprState {
+                    posargs: c
+                        .args
+                        .posargs
+                        .iter()
+                        .map(|arg| self.visit_expr(frame, arg))
+                        .collect(),
+                    kwargs: c
+                        .args
+                        .kwargs
+                        .iter()
+                        .map(|arg| self.visit_expr(frame, &arg.value))
+                        .collect(),
+                },
+            })),
             Expr::If(if_expr) => {
-                let cond = self.eval_expr(frame, &if_expr.cond);
-                match &self.values[&cond] {
-                    Defer::Ready(v) => {
-                        if *v.as_ref().unwrap_bool() {
-                            self.eval_expr(frame, &if_expr.then)
-                        } else {
-                            self.eval_expr(frame, &if_expr.else_)
-                        }
-                    }
-                    Defer::Deferred(_) => {
-                        // defer
-                        let vid = self.value_id();
-                        self.deferred.insert(vid);
-                        self.values.insert(
-                            vid,
-                            DeferValue::Deferred(PartialEval {
-                                state: PartialEvalState::If(Box::new(PartialIfExpr {
-                                    expr: if_expr,
-                                    state: IfExprState::Cond(cond),
-                                })),
-                                assign_to: None,
-                                frame,
-                            }),
-                        );
-                        vid
-                    }
-                }
+                let cond = self.visit_expr(frame, &if_expr.cond);
+                PartialEvalState::If(Box::new(PartialIfExpr {
+                    expr: if_expr,
+                    state: IfExprState::Cond(cond),
+                }))
             }
             Expr::Comparison(comparison_expr) => {
-                let left = self.eval_expr(frame, &comparison_expr.left);
-                let right = self.eval_expr(frame, &comparison_expr.right);
-                if let (Defer::Ready(vl), Defer::Ready(vr)) =
-                    (&self.values[&left], &self.values[&right])
-                {
-                    let lin_vl = vl.as_ref().unwrap_linear();
-                    let lin_vr = vr.as_ref().unwrap_linear();
-                    if let (Some(vl), Some(vr)) =
-                        (self.solver.eval_expr(lin_vl), self.solver.eval_expr(lin_vr))
-                    {
-                        let res = match comparison_expr.op {
-                            crate::ast::ComparisonOp::Eq => {
-                                panic!("cannot check equality between floats")
-                            }
-                            crate::ast::ComparisonOp::Ne => {
-                                panic!("cannot check inequality between floats")
-                            }
-                            crate::ast::ComparisonOp::Geq => vl >= vr,
-                            crate::ast::ComparisonOp::Gt => vl > vr,
-                            crate::ast::ComparisonOp::Leq => vl <= vr,
-                            crate::ast::ComparisonOp::Lt => vl < vr,
-                        };
-                        return if res {
-                            self.true_value
-                        } else {
-                            self.false_value
-                        };
-                    }
-                    // use solver .solved vars to see if linvlr cud b evaled to a float
-                    // if yes => return value bool
-                    // else => defer
-                }
-                let vid = self.value_id();
-                self.deferred.insert(vid);
-                self.values.insert(
-                    vid,
-                    DeferValue::Deferred(PartialEval {
-                        state: PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
-                            expr: comparison_expr,
-                            state: ComparisonExprState { left, right },
-                        })),
-                        assign_to: None,
-                        frame,
-                    }),
-                );
-                vid
+                let left = self.visit_expr(frame, &comparison_expr.left);
+                let right = self.visit_expr(frame, &comparison_expr.right);
+                PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
+                    expr: comparison_expr,
+                    state: ComparisonExprState { left, right },
+                }))
             }
             Expr::Scope(s) => {
                 for stmt in &s.stmts {
                     self.eval_stmt(frame, stmt);
                 }
-                s.tail
+                return s
+                    .tail
                     .as_ref()
-                    .map(|tail| self.eval_expr(frame, tail))
-                    .unwrap_or(self.nil_value)
+                    .map(|tail| self.visit_expr(frame, tail))
+                    .unwrap_or(self.nil_value);
+            }
+            Expr::EnumValue(e) => {
+                let vid = self.value_id();
+                self.values
+                    .insert(vid, Defer::Ready(Value::EnumValue(e.clone())));
+                return vid;
+            }
+            Expr::FieldAccess(f) => {
+                let base = self.visit_expr(frame, &f.base);
+                PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
+                    expr: f,
+                    state: FieldAccessExprState { base },
+                }))
             }
             x => todo!("{x:?}"),
-        }
+        };
+        let vid = self.value_id();
+        self.deferred.insert(vid);
+        self.values.insert(
+            vid,
+            DeferValue::Deferred(PartialEval {
+                state: partial_eval_state,
+                assign_to: None,
+                frame,
+            }),
+        );
+        vid
     }
 
-    fn eval_partial(&mut self, vid: ValueId) {
+    fn eval_partial(&mut self, vid: ValueId) -> bool {
         let v = self.values.remove(&vid);
         if v.is_none() {
-            return;
+            return false;
         }
         let mut v = v.unwrap();
         let vref = v.as_mut();
         if vref.is_ready() {
             self.values.insert(vid, v);
-            return;
+            return false;
         }
         let vref = vref.unwrap_deferred();
-        match &mut vref.state {
-            PartialEvalState::If(if_) => {
-                match if_.state {
-                    IfExprState::Cond(cond) => {
-                        self.eval_partial(cond);
-                        match &self.values[&cond] {
-                            Defer::Ready(val) => {
-                                if *val.as_ref().unwrap_bool() {
-                                    let then = self.eval_expr(vref.frame, &if_.expr.then);
-                                    match &self.values[&then] {
-                                        Defer::Ready(v) => {
-                                            self.values.insert(vid, Defer::Ready(v.clone()));
-                                        }
-                                        Defer::Deferred(_) => {
-                                            if_.state = IfExprState::Then(then);
-                                        }
-                                    };
-                                } else {
-                                    let else_ = self.eval_expr(vref.frame, &if_.expr.else_);
-                                    match &self.values[&else_] {
-                                        Defer::Ready(v) => {
-                                            self.values.insert(vid, Defer::Ready(v.clone()));
-                                        }
-                                        Defer::Deferred(_) => {
-                                            if_.state = IfExprState::Else(else_);
-                                        }
-                                    };
+        let progress = match &mut vref.state {
+            PartialEvalState::Call(c) => match c.expr.func.name {
+                "crect" | "rect" => {
+                    let layer = c
+                        .state
+                        .posargs
+                        .get(0)
+                        .map(|vid| self.values[vid].as_ref().get_ready());
+                    if layer == Some(None) {}
+                    if let Defer::Ready(layer) = &self.values[&c.state.posargs[0]] {
+                        let rect = Rect {
+                            layer: layer.as_ref().unwrap_enum_value().name.name.to_string(),
+                            x0: self.solver.new_var(),
+                            y0: self.solver.new_var(),
+                            x1: self.solver.new_var(),
+                            y1: self.solver.new_var(),
+                            source: None,
+                        };
+                        self.values
+                            .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
+                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
+                            let lhs = self.value_id();
+                            match kwarg.name.name {
+                                "x0" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.x0))),
+                                    );
                                 }
-                            }
-                            Defer::Deferred(_) => {
-                                // nothing to do
-                            }
+                                "x1" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.x1))),
+                                    );
+                                }
+                                "y0" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.y0))),
+                                    );
+                                }
+                                "y1" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.y1))),
+                                    );
+                                }
+                                "w" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(
+                                            LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
+                                        )),
+                                    );
+                                }
+                                "h" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(
+                                            LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
+                                        )),
+                                    );
+                                }
+                                x => panic!("unsupported kwarg `{x}`"),
+                            };
+                            let defer = self.value_id();
+                            self.values.insert(
+                                defer,
+                                DeferValue::Deferred(PartialEval {
+                                    state: PartialEvalState::Constraint(PartialConstraint {
+                                        lhs,
+                                        rhs: *rhs,
+                                    }),
+                                    assign_to: None,
+                                    frame: vref.frame,
+                                }),
+                            );
+                            self.deferred.insert(defer);
                         }
-                    }
-                    IfExprState::Then(then) => {
-                        self.eval_partial(then);
-                        match &self.values[&then] {
-                            Defer::Ready(val) => {
-                                self.values.insert(vid, Defer::Ready(val.clone()));
-                            }
-                            Defer::Deferred(_) => {
-                                // nothing to do
-                            }
-                        }
-                    }
-                    IfExprState::Else(else_) => {
-                        self.eval_partial(else_);
-                        match &self.values[&else_] {
-                            Defer::Ready(val) => {
-                                self.values.insert(vid, Defer::Ready(val.clone()));
-                            }
-                            Defer::Deferred(_) => {
-                                // nothing to do
-                            }
-                        }
+                        true
+                    } else {
+                        false
                     }
                 }
-            }
+                "float" => {
+                    self.values.insert(
+                        vid,
+                        Defer::Ready(Value::Linear(LinearExpr::from(self.solver.new_var()))),
+                    );
+                    true
+                }
+                "eq" => {
+                    if let (Defer::Ready(vl), Defer::Ready(vr)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let expr = vl.as_ref().unwrap_linear().clone()
+                            - vr.as_ref().unwrap_linear().clone();
+                        self.solver.constrain_eq0(expr);
+                        self.values.insert(vid, Defer::Ready(Value::None));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => panic!("invalid function"),
+            },
+            PartialEvalState::If(if_) => match if_.state {
+                IfExprState::Cond(cond) => {
+                    if let Defer::Ready(val) = &self.values[&cond] {
+                        if *val.as_ref().unwrap_bool() {
+                            let then = self.visit_expr(vref.frame, &if_.expr.then);
+                            if_.state = IfExprState::Then(then);
+                        } else {
+                            let else_ = self.visit_expr(vref.frame, &if_.expr.else_);
+                            if_.state = IfExprState::Else(else_);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                IfExprState::Then(then) => {
+                    if let Defer::Ready(val) = &self.values[&then] {
+                        self.values.insert(vid, Defer::Ready(val.clone()));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                IfExprState::Else(else_) => {
+                    if let Defer::Ready(val) = &self.values[&else_] {
+                        self.values.insert(vid, Defer::Ready(val.clone()));
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
             PartialEvalState::Comparison(comparison_expr) => {
-                self.eval_partial(comparison_expr.state.left);
-                self.eval_partial(comparison_expr.state.right);
-                println!(
-                    "left vid {:?}, right vid {:?}",
-                    comparison_expr.state.left, comparison_expr.state.right
-                );
                 if let (Defer::Ready(vl), Defer::Ready(vr)) = (
                     &self.values[&comparison_expr.state.left],
                     &self.values[&comparison_expr.state.right],
+                ) && let (Some(vl), Some(vr)) = (
+                    self.solver.eval_expr(vl.as_ref().unwrap_linear()),
+                    self.solver.eval_expr(vr.as_ref().unwrap_linear()),
                 ) {
-                    let lin_vl = vl.as_ref().unwrap_linear();
-                    let lin_vr = vr.as_ref().unwrap_linear();
-                    if let (Some(vl), Some(vr)) =
-                        (self.solver.eval_expr(lin_vl), self.solver.eval_expr(lin_vr))
-                    {
-                        let res = match comparison_expr.expr.op {
-                            crate::ast::ComparisonOp::Eq => {
-                                panic!("cannot check equality between floats")
-                            }
-                            crate::ast::ComparisonOp::Ne => {
-                                panic!("cannot check inequality between floats")
-                            }
-                            crate::ast::ComparisonOp::Geq => vl >= vr,
-                            crate::ast::ComparisonOp::Gt => vl > vr,
-                            crate::ast::ComparisonOp::Leq => vl <= vr,
-                            crate::ast::ComparisonOp::Lt => vl < vr,
-                        };
-                        self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                    }
+                    let res = match comparison_expr.expr.op {
+                        crate::ast::ComparisonOp::Eq => {
+                            panic!("cannot check equality between floats")
+                        }
+                        crate::ast::ComparisonOp::Ne => {
+                            panic!("cannot check inequality between floats")
+                        }
+                        crate::ast::ComparisonOp::Geq => vl >= vr,
+                        crate::ast::ComparisonOp::Gt => vl > vr,
+                        crate::ast::ComparisonOp::Leq => vl <= vr,
+                        crate::ast::ComparisonOp::Lt => vl < vr,
+                    };
+                    self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                    true
+                } else {
+                    false
+                }
+            }
+            PartialEvalState::FieldAccess(field_access_expr) => {
+                if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
+                    let rect = base.as_ref().unwrap_rect();
+                    let val = match field_access_expr.expr.field.name {
+                        "x0" => LinearExpr::from(rect.x0),
+                        "x1" => LinearExpr::from(rect.x1),
+                        "y0" => LinearExpr::from(rect.y0),
+                        "y1" => LinearExpr::from(rect.y1),
+                        "w" => LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
+                        "h" => LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
+                        f => panic!("invalid field `{f}`"),
+                    };
+                    self.values
+                        .insert(vid, DeferValue::Ready(Value::Linear(val)));
+                    true
+                } else {
+                    false
+                }
+            }
+            PartialEvalState::Constraint(c) => {
+                if let (Defer::Ready(vl), Defer::Ready(vr)) =
+                    (&self.values[&c.lhs], &self.values[&c.rhs])
+                {
+                    let lhs = vl.as_ref().unwrap_linear();
+                    let rhs = vr.as_ref().unwrap_linear();
+                    self.solver.constrain_eq0(lhs.clone() - rhs.clone());
+                    self.values.insert(vid, DeferValue::Ready(Value::None));
+                    true
+                } else {
+                    false
                 }
             }
             _ => todo!(),
-        }
+        };
 
         if !self.values.contains_key(&vid) {
             self.values.insert(vid, v);
@@ -772,6 +850,7 @@ impl<'a> ExecPass<'a> {
         if self.values[&vid].is_ready() {
             self.deferred.remove(&vid);
         }
+        progress
     }
 }
 
@@ -797,6 +876,7 @@ pub struct CompiledCell {
 }
 
 #[enumify(generics_only)]
+#[derive(Clone, Debug)]
 enum Defer<R, D> {
     Ready(R),
     Deferred(D),
@@ -804,6 +884,7 @@ enum Defer<R, D> {
 
 type DeferValue<'a, T: AstMetadata> = Defer<Value<'a>, PartialEval<'a, T>>;
 
+#[derive(Debug, Clone)]
 struct PartialEval<'a, T: AstMetadata> {
     state: PartialEvalState<'a, T>,
     assign_to: Option<ValueId>,
@@ -816,52 +897,76 @@ struct ProgressPredicate {
     terms: Vec<Vec<ConstraintVarId>>,
 }
 
+#[derive(Debug, Clone)]
 enum PartialEvalState<'a, T: AstMetadata> {
     If(Box<PartialIfExpr<'a, T>>),
     Comparison(Box<PartialComparisonExpr<'a, T>>),
     BinOp(Box<BinOpExpr<'a, T>>),
     Call(Box<PartialCallExpr<'a, T>>),
-    Emit(Box<EmitExpr<'a, T>>),
+    Emit(ValueId),
     EnumValue(EnumValue<'a, T>),
-    FieldAccess(Box<FieldAccessExpr<'a, T>>),
-    Var(Ident<'a, T>),
-    FloatLiteral(FloatLiteral),
+    FieldAccess(Box<PartialFieldAccessExpr<'a, T>>),
+    Constraint(PartialConstraint),
 }
 
+#[derive(Debug, Clone)]
+struct PartialConstraint {
+    lhs: ValueId,
+    rhs: ValueId,
+}
+
+#[derive(Debug, Clone)]
 struct PartialIfExpr<'a, T: AstMetadata> {
     expr: &'a IfExpr<'a, T>,
     state: IfExprState,
 }
 
+#[derive(Debug, Clone)]
 pub enum IfExprState {
     Cond(ValueId),
     Then(ValueId),
     Else(ValueId),
 }
 
+#[derive(Debug, Clone)]
 struct PartialCallExpr<'a, T: AstMetadata> {
     expr: &'a CallExpr<'a, T>,
     state: CallExprState,
 }
 
+#[derive(Debug, Clone)]
 pub struct CallExprState {
     posargs: Vec<ValueId>,
     kwargs: Vec<ValueId>,
 }
 
+#[derive(Debug, Clone)]
 pub struct BinOpExprState<'a, T: AstMetadata> {
     left: PartialEval<'a, T>,
     right: PartialEval<'a, T>,
 }
 
+#[derive(Debug, Clone)]
 struct PartialComparisonExpr<'a, T: AstMetadata> {
     expr: &'a ComparisonExpr<'a, T>,
     state: ComparisonExprState,
 }
 
+#[derive(Debug, Clone)]
 pub struct ComparisonExprState {
     left: ValueId,
     right: ValueId,
+}
+
+#[derive(Debug, Clone)]
+struct PartialFieldAccessExpr<'a, T: AstMetadata> {
+    expr: &'a FieldAccessExpr<'a, T>,
+    state: FieldAccessExprState,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldAccessExprState {
+    base: ValueId,
 }
 
 // impl<'a> Scope<'a> {

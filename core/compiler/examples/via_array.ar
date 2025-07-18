@@ -4,40 +4,45 @@ enum Layer {
 	Met2,
 }
 
+fn max(x0: float, x1: float) {
+  if x0 < x1 {
+    x1
+  } else {
+    x0
+  }
+}
+
+fn min(x0: float, x1: float) {
+  if x0 < x1 {
+    x0
+  } else {
+    x1
+  }
+}
+
+fn intersection(rect1: Rect, rect2: Rect) {
+    let intersection_x0 = max(rect1.x0, rect2.x0);
+    let intersection_y0 = max(rect1.y0, rect2.y0);
+    let intersection_x1 = min(rect1.x1, rect2.x1);
+    let intersection_y1 = min(rect1.y1, rect2.y1);
+    crect(x0=intersection_x0, y0=intersection_y0, x1=intersection_x1, y1=intersection_y1)
+}
+
 cell vias() {
-    let met2 = Rect(Layer::Met2)!;
-    let met1 = Rect(Layer::Met1)!;
+    let met2 = rect(Layer::Met2)!;
+    let met1 = rect(Layer::Met1)!;
 
     // Create via.
-    let via = Rect(Layer::Via1)!;
+    let via = rect(Layer::Via1)!;
     eq(via.x1 - via.x0, if met1.x1 - met1.x0 < 40 {
         20
     } else {
         40
     });
-    let intersection_x0 = if met1.x0 > met2.x0 {
-        met1.x0
-    } else {
-        met2.x0
-    };
-    let intersection_y0 = if met1.y0 > met2.y0 {
-        met1.y0
-    } else {
-        met2.y0
-    };
-    let intersection_x1 = if met1.x1 < met2.x1 {
-        met1.x1
-    } else {
-        met2.x1
-    };
-    let intersection_y1 = if met1.y1 < met2.y1 {
-        met1.y1
-    } else {
-        met2.y1
-    };
+    let intersection = intersection(met1, met2);
     eq(via.y1 - via.y0, 20);
-    eq(via.x0 - intersection_x0, met1.x1 - intersection_x1);
-    eq(via.y0 - intersection_y0, met1.y1 - intersection_y1);
+    eq(via.x0 - intersection.x0, met1.x1 - intersection.x1);
+    eq(via.y0 - intersection.y0, met1.y1 - intersection.y1);
 
     // Constrain metals.
     eq(met2.x0, 0);

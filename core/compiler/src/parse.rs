@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use lrlex::lrlex_mod;
 use lrpar::lrpar_mod;
 
@@ -28,8 +28,10 @@ impl AstMetadata for ParseMetadata {
     type Args = ();
     type KwArgValue = ();
     type ArgDecl = ();
+    type Scope = ();
     type Typ = ();
     type VarExpr = ();
+    type FnDecl = ();
 }
 
 pub fn parse(input: &str) -> Result<Ast<'_, ParseMetadata>, anyhow::Error> {

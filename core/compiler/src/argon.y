@@ -12,6 +12,7 @@ Decls -> Result<Vec<Decl<'input, ParseMetadata>>, ()>:
 Decl -> Result<Decl<'input, ParseMetadata>, ()>
   : EnumDecl { Ok(Decl::Enum($1?)) }
   | CellDecl { Ok(Decl::Cell($1?)) }
+  | FnDecl { Ok(Decl::Fn($1?)) }
   | ConstantDecl { Ok(Decl::Constant($1?)) }
   ;
 
@@ -69,6 +70,18 @@ CellDecl -> Result<CellDecl<'input, ParseMetadata>, ()>
   }
   ;
 
+FnDecl -> Result<FnDecl<'input, ParseMetadata>, ()>
+  : 'FN' Ident '(' ArgDecls ')' Scope
+  {
+    Ok(FnDecl {
+      name: $2?,
+      args: $4?,
+      scope: $6?,
+      metadata: (),
+    })
+  }
+  ;
+
 Statements -> Result<Vec<Statement<'input, ParseMetadata>>, ()>:
   Statements Statement {
     let mut __tmp = $1?;
@@ -109,6 +122,7 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
           span: $span,
           stmts: __stmts,
           tail: Some(value),
+          metadata: (),
         })
       }
     }
@@ -116,6 +130,7 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
       span: $span,
       stmts: __stmts,
       tail: None,
+      metadata: (),
     })
   }
   | '{' Statements NonBlockExpr '}'
@@ -124,6 +139,7 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
       span: $span,
       stmts: $2?,
       tail: Some($3?),
+      metadata: (),
     })
   }
   ;
@@ -195,16 +211,12 @@ ArgDecls1 -> Result<Vec<ArgDecl<'input, ParseMetadata>>, ()>
   ;
 
 ArgDecl -> Result<ArgDecl<'input, ParseMetadata>, ()>
-  : Ident ':' Typ { Ok(ArgDecl { name: $1?, ty: $3?, metadata: () }) }
-  ;
-
-Typ -> Result<Typ<'input, ParseMetadata>, ()>
-  : 'FLOAT' { Ok(Typ::Float) }
-  | Ident { Ok(Typ::Ident($1?)) }
+  : Ident ':' Ident { Ok(ArgDecl { name: $1?, ty: $3?, metadata: () }) }
   ;
 
 Args -> Result<Args<'input, ParseMetadata>, ()>
   : PosArgsTrailingComma KwArgs { Ok(Args { posargs: $1?, kwargs: $2?, metadata: (), }) }
+  | KwArgs { Ok(Args { posargs: Vec::new(), kwargs: $1?, metadata: (), }) }
   | PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), metadata: (), }) }
   ;
 

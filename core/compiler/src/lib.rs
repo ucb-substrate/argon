@@ -36,7 +36,7 @@ mod tests {
     use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
     use parse::parse;
 
-    use crate::compile::{compile, CompileInput, VarIdTyPass};
+    use crate::compile::{CompileInput, VarIdTyPass, compile};
 
     use super::*;
 
@@ -59,6 +59,10 @@ cell simple(y_enclosure: int) {
         "/examples/immediate.ar"
     ));
     const ARGON_IF: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if.ar"));
+    const ARGON_IF_INCONSISTENT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/if_inconsistent.ar"
+    ));
     const ARGON_VIA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via.ar"));
     const ARGON_VIA_ARRAY: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -104,10 +108,21 @@ cell simple(y_enclosure: int) {
     }
 
     #[test]
+    fn argon_if_inconsistent() {
+        let ast = parse(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
+        let cell = compile(CompileInput {
+            cell: "if_test",
+            ast: &ast,
+            params: HashMap::new(),
+        });
+        println!("{cell:?}");
+    }
+
+    #[test]
     fn argon_via_array() {
         let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
         let cell = compile(CompileInput {
-            cell: "immediate",
+            cell: "vias",
             ast: &ast,
             params: HashMap::new(),
         });
