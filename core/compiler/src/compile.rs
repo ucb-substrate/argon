@@ -9,7 +9,7 @@ use derive_where::derive_where;
 use enumify::enumify;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{ConstantDecl, FieldAccessExpr, Scope};
+use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope};
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -38,7 +38,8 @@ pub(crate) struct VarIdTyPass<'a> {
 #[derive(Debug, Clone)]
 pub(crate) struct VarIdTyMetadata;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[enumify]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum Ty {
     Bool,
     Float,
@@ -46,6 +47,13 @@ pub enum Ty {
     Rect,
     Enum,
     Nil,
+    Fn(Box<FnTy>),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct FnTy {
+    args: Vec<Ty>,
+    ret: Ty,
 }
 
 impl AstMetadata for VarIdTyMetadata {
@@ -54,17 +62,17 @@ impl AstMetadata for VarIdTyMetadata {
     type CellDecl = ();
     type ConstantDecl = ();
     type LetBinding = VarId;
-    type FnDecl = Ty;
+    type FnDecl = VarId;
     type IfExpr = Ty;
     type BinOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
     type EnumValue = ();
-    type CallExpr = Ty;
+    type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
     type Args = ();
     type KwArgValue = Ty;
-    type ArgDecl = ();
+    type ArgDecl = (VarId, Ty);
     type Scope = Ty;
     type Typ = ();
     type VarExpr = (VarId, Ty);
@@ -82,7 +90,7 @@ impl<'a> VarIdTyPass<'a> {
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
         for map in self.bindings.iter().rev() {
             if let Some(info) = map.get(name) {
-                return Some(*info);
+                return Some(info.clone());
             }
         }
         None
@@ -99,6 +107,11 @@ impl<'a> VarIdTyPass<'a> {
         mut self,
         input: CompileInput<'a, ParseMetadata>,
     ) -> Ast<'a, VarIdTyMetadata> {
+        for decl in &input.ast.decls {
+            if let Decl::Fn(f) = decl {
+                self.transform_fn_decl(f);
+            }
+        }
         let cell = input
             .ast
             .decls
@@ -136,16 +149,16 @@ impl<'a> VarIdTyPass<'a> {
 impl<'a> Expr<'a, VarIdTyMetadata> {
     fn ty(&self) -> Ty {
         match self {
-            Expr::If(if_expr) => if_expr.metadata,
-            Expr::Comparison(comparison_expr) => comparison_expr.metadata,
-            Expr::BinOp(bin_op_expr) => bin_op_expr.metadata,
-            Expr::Call(call_expr) => call_expr.metadata,
-            Expr::Emit(emit_expr) => emit_expr.metadata,
+            Expr::If(if_expr) => if_expr.metadata.clone(),
+            Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
+            Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
+            Expr::Call(call_expr) => call_expr.metadata.1.clone(),
+            Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::EnumValue(_enum_value) => Ty::Enum,
-            Expr::FieldAccess(field_access_expr) => field_access_expr.metadata,
-            Expr::Var(var_expr) => var_expr.metadata.1,
+            Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::Var(var_expr) => var_expr.metadata.1.clone(),
             Expr::FloatLiteral(_float_literal) => Ty::Float,
-            Expr::Scope(scope) => scope.metadata,
+            Expr::Scope(scope) => scope.metadata.clone(),
         }
     }
 }
@@ -193,7 +206,12 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         args: &Vec<ArgDecl<'a, Self::Output>>,
         scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FnDecl {
-        scope.metadata
+        assert!(!["crect", "rect", "float"].contains(&name.name));
+        let ty = Ty::Fn(Box::new(FnTy {
+            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            ret: scope.metadata.clone(),
+        }));
+        self.alloc(name.name, ty)
     }
 
     fn dispatch_constant_decl(
@@ -278,27 +296,36 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                     assert_eq!(args.posargs.len(), 0);
                 } else {
                     assert_eq!(args.posargs.len(), 1);
+                    assert_eq!(args.posargs[0].ty(), Ty::Enum);
                 }
-                assert_eq!(args.posargs[0].ty(), Ty::Enum);
                 for kwarg in &args.kwargs {
                     assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&kwarg.name.name));
                     assert_eq!(kwarg.value.ty(), Ty::Float);
                 }
-                Ty::Rect
+                (None, Ty::Rect)
             }
             "float" => {
                 assert!(args.posargs.is_empty());
                 assert!(args.kwargs.is_empty());
-                Ty::Float
+                (None, Ty::Float)
             }
             "eq" => {
                 assert_eq!(args.posargs.len(), 2);
                 assert!(args.kwargs.is_empty());
                 assert_eq!(args.posargs[0].ty(), Ty::Float);
                 assert_eq!(args.posargs[1].ty(), Ty::Float);
-                Ty::Nil
+                (None, Ty::Nil)
             }
-            _ => panic!("invalid function"),
+            name => {
+                let (varid, ty) = self.lookup(name).unwrap();
+                let ty = ty.unwrap_fn();
+                assert_eq!(args.posargs.len(), ty.args.len());
+                for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
+                    assert_eq!(&arg.ty(), arg_ty);
+                }
+                assert!(args.kwargs.is_empty());
+                (Some(varid), ty.ret.clone())
+            }
         }
     }
 
@@ -338,14 +365,12 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             self.lookup(input.name.name).is_none(),
             "argument should not already be declared"
         );
-        self.alloc(
-            input.name.name,
-            match input.ty.name {
-                "Float" => Ty::Float,
-                "Rect" => Ty::Rect,
-                _ => panic!("invalid type"),
-            },
-        );
+        let ty = match input.ty.name {
+            "Float" => Ty::Float,
+            "Rect" => Ty::Rect,
+            _ => panic!("invalid type"),
+        };
+        (self.alloc(input.name.name, ty.clone()), ty)
     }
 
     fn dispatch_scope(
@@ -507,7 +532,25 @@ impl<'a> ExecPass<'a> {
         id
     }
 
+    fn frame_id(&mut self) -> FrameId {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
     fn execute_start(&mut self, input: CompileInput<'a, VarIdTyMetadata>) {
+        for decl in &input.ast.decls {
+            if let Decl::Fn(f) = decl {
+                let vid = self.value_id();
+                self.values
+                    .insert(vid, DeferValue::Ready(Value::Fn(f.clone())));
+                self.frames
+                    .get_mut(&self.global_frame)
+                    .unwrap()
+                    .bindings
+                    .insert(f.metadata, vid);
+            }
+        }
         let cell = input
             .ast
             .decls
@@ -528,7 +571,7 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    fn eval_stmt(&mut self, frame: FrameId, stmt: &'a Statement<'_, VarIdTyMetadata>) {
+    fn eval_stmt(&mut self, frame: FrameId, stmt: &Statement<'a, VarIdTyMetadata>) {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(frame, &binding.value);
@@ -545,7 +588,7 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    fn visit_expr(&mut self, frame: FrameId, expr: &'a Expr<'_, VarIdTyMetadata>) -> ValueId {
+    fn visit_expr(&mut self, frame: FrameId, expr: &Expr<'a, VarIdTyMetadata>) -> ValueId {
         let partial_eval_state = match expr {
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
@@ -563,7 +606,7 @@ impl<'a> ExecPass<'a> {
                 return vid;
             }
             Expr::Call(c) => PartialEvalState::Call(Box::new(PartialCallExpr {
-                expr: c,
+                expr: c.clone(),
                 state: CallExprState {
                     posargs: c
                         .args
@@ -582,7 +625,7 @@ impl<'a> ExecPass<'a> {
             Expr::If(if_expr) => {
                 let cond = self.visit_expr(frame, &if_expr.cond);
                 PartialEvalState::If(Box::new(PartialIfExpr {
-                    expr: if_expr,
+                    expr: (**if_expr).clone(),
                     state: IfExprState::Cond(cond),
                 }))
             }
@@ -590,7 +633,7 @@ impl<'a> ExecPass<'a> {
                 let left = self.visit_expr(frame, &comparison_expr.left);
                 let right = self.visit_expr(frame, &comparison_expr.right);
                 PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
-                    expr: comparison_expr,
+                    expr: (**comparison_expr).clone(),
                     state: ComparisonExprState { left, right },
                 }))
             }
@@ -613,9 +656,14 @@ impl<'a> ExecPass<'a> {
             Expr::FieldAccess(f) => {
                 let base = self.visit_expr(frame, &f.base);
                 PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
-                    expr: f,
+                    expr: (**f).clone(),
                     state: FieldAccessExprState { base },
                 }))
+            }
+            Expr::BinOp(b) => {
+                let lhs = self.visit_expr(frame, &b.left);
+                let rhs = self.visit_expr(frame, &b.right);
+                PartialEvalState::BinOp(PartialBinOp { lhs, rhs, op: b.op })
             }
             x => todo!("{x:?}"),
         };
@@ -647,15 +695,20 @@ impl<'a> ExecPass<'a> {
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.name {
                 "crect" | "rect" => {
-                    let layer = c
-                        .state
-                        .posargs
-                        .get(0)
-                        .map(|vid| self.values[vid].as_ref().get_ready());
-                    if layer == Some(None) {}
-                    if let Defer::Ready(layer) = &self.values[&c.state.posargs[0]] {
+                    let layer = c.state.posargs.get(0).map(|vid| {
+                        self.values[vid]
+                            .as_ref()
+                            .get_ready()
+                            .map(|layer| layer.as_ref().unwrap_enum_value().name.name.to_string())
+                    });
+                    let layer = match layer {
+                        None => Some(None),
+                        Some(None) => None,
+                        Some(Some(l)) => Some(Some(l)),
+                    };
+                    if let Some(layer) = layer {
                         let rect = Rect {
-                            layer: layer.as_ref().unwrap_enum_value().name.name.to_string(),
+                            layer,
                             x0: self.solver.new_var(),
                             y0: self.solver.new_var(),
                             x1: self.solver.new_var(),
@@ -749,7 +802,26 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
-                _ => panic!("invalid function"),
+                f => {
+                    let val = &self.values
+                        [&self.frames[&vref.frame].bindings[&c.expr.metadata.0.unwrap()]]
+                        .as_ref()
+                        .unwrap_ready()
+                        .as_ref()
+                        .unwrap_fn();
+                    let mut call_frame = Frame {
+                        bindings: Default::default(),
+                        parent: Some(self.global_frame),
+                    };
+                    for (arg_val, arg_decl) in c.state.posargs.iter().zip(&val.args) {
+                        call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
+                    }
+                    let scope = val.scope.clone();
+                    let fid = self.frame_id();
+                    self.frames.insert(fid, call_frame);
+                    self.visit_expr(fid, &Expr::Scope(Box::new(scope)));
+                    true
+                }
             },
             PartialEvalState::If(if_) => match if_.state {
                 IfExprState::Cond(cond) => {
@@ -861,6 +933,7 @@ pub enum Value<'a> {
     Linear(LinearExpr),
     Rect(Rect<Var>),
     Bool(bool),
+    Fn(FnDecl<'a, VarIdTyMetadata>),
     None,
 }
 
@@ -901,7 +974,7 @@ struct ProgressPredicate {
 enum PartialEvalState<'a, T: AstMetadata> {
     If(Box<PartialIfExpr<'a, T>>),
     Comparison(Box<PartialComparisonExpr<'a, T>>),
-    BinOp(Box<BinOpExpr<'a, T>>),
+    BinOp(PartialBinOp),
     Call(Box<PartialCallExpr<'a, T>>),
     Emit(ValueId),
     EnumValue(EnumValue<'a, T>),
@@ -916,8 +989,15 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
+struct PartialBinOp {
+    lhs: ValueId,
+    rhs: ValueId,
+    op: BinOp,
+}
+
+#[derive(Debug, Clone)]
 struct PartialIfExpr<'a, T: AstMetadata> {
-    expr: &'a IfExpr<'a, T>,
+    expr: IfExpr<'a, T>,
     state: IfExprState,
 }
 
@@ -930,7 +1010,7 @@ pub enum IfExprState {
 
 #[derive(Debug, Clone)]
 struct PartialCallExpr<'a, T: AstMetadata> {
-    expr: &'a CallExpr<'a, T>,
+    expr: CallExpr<'a, T>,
     state: CallExprState,
 }
 
@@ -948,7 +1028,7 @@ pub struct BinOpExprState<'a, T: AstMetadata> {
 
 #[derive(Debug, Clone)]
 struct PartialComparisonExpr<'a, T: AstMetadata> {
-    expr: &'a ComparisonExpr<'a, T>,
+    expr: ComparisonExpr<'a, T>,
     state: ComparisonExprState,
 }
 
@@ -960,7 +1040,7 @@ pub struct ComparisonExprState {
 
 #[derive(Debug, Clone)]
 struct PartialFieldAccessExpr<'a, T: AstMetadata> {
-    expr: &'a FieldAccessExpr<'a, T>,
+    expr: FieldAccessExpr<'a, T>,
     state: FieldAccessExprState,
 }
 

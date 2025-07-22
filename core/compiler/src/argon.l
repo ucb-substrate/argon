@@ -9,7 +9,7 @@ else "ELSE"
 let "LET"
 [_a-zA-Z][_a-zA-Z0-9]* "IDENT"
 //[^\r\n]* ;
-[0-9]+ "FLOATLIT"
+-?[0-9]+ "FLOATLIT"
 \+ "+"
 \* "*"
 - "-"

@@ -119,6 +119,17 @@ cell simple(y_enclosure: int) {
     }
 
     #[test]
+    fn argon_via() {
+        let ast = parse(ARGON_VIA).expect("failed to parse Argon");
+        let cell = compile(CompileInput {
+            cell: "via",
+            ast: &ast,
+            params: HashMap::new(),
+        });
+        println!("{cell:?}");
+    }
+
+    #[test]
     fn argon_via_array() {
         let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
         let cell = compile(CompileInput {
@@ -139,19 +150,6 @@ cell simple(y_enclosure: int) {
     //     })
     //     .expect("failed to compile Argon cell");
     //     println!("cell: {cell:?}");
-    // }
-
-    // #[test]
-    // fn argon_via() {
-    //     let ast = parse(ARGON_VIA).expect("failed to parse Argon");
-    //     let cell = compile(CompileInput {
-    //         cell: "vias",
-    //         ast: &ast,
-    //         params: HashMap::new(),
-    //     })
-    //     .expect("failed to compile Argon cell");
-    //     println!("cell: {cell:?}");
-    //     assert_eq!(cell.rects.len(), 11);
     // }
 
     // #[test]
