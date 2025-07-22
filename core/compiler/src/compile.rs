@@ -7,6 +7,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use derive_where::derive_where;
 use enumify::enumify;
+use indexmap::IndexSet;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope};
@@ -107,9 +109,10 @@ impl<'a> VarIdTyPass<'a> {
         mut self,
         input: CompileInput<'a, ParseMetadata>,
     ) -> Ast<'a, VarIdTyMetadata> {
+        let mut decls = Vec::new();
         for decl in &input.ast.decls {
             if let Decl::Fn(f) = decl {
-                self.transform_fn_decl(f);
+                decls.push(Decl::Fn(self.transform_fn_decl(f)));
             }
         }
         let cell = input
@@ -127,22 +130,22 @@ impl<'a> VarIdTyPass<'a> {
             })
             .expect("top cell not found");
 
-        Ast {
-            decls: vec![Decl::Cell(CellDecl {
-                name: self.transform_ident(&cell.name),
-                args: cell
-                    .args
-                    .iter()
-                    .map(|arg| self.transform_arg_decl(arg))
-                    .collect(),
-                stmts: cell
-                    .stmts
-                    .iter()
-                    .map(|stmt| self.transform_statement(stmt))
-                    .collect(),
-                metadata: (),
-            })],
-        }
+        decls.push(Decl::Cell(CellDecl {
+            name: self.transform_ident(&cell.name),
+            args: cell
+                .args
+                .iter()
+                .map(|arg| self.transform_arg_decl(arg))
+                .collect(),
+            stmts: cell
+                .stmts
+                .iter()
+                .map(|stmt| self.transform_statement(stmt))
+                .collect(),
+            metadata: (),
+        }));
+
+        Ast { decls }
     }
 }
 
@@ -213,7 +216,9 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             ret: scope.metadata.clone(),
         }));
-        self.alloc(name.name, ty)
+        let vid = self.alloc(name.name, ty);
+        println!("{} {}", name.name, vid);
+        vid
     }
 
     fn dispatch_constant_decl(
@@ -441,7 +446,7 @@ struct Frame {
 struct ExecPass<'a> {
     solver: Solver,
     values: HashMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
-    deferred: HashSet<ValueId>,
+    deferred: IndexSet<ValueId>,
     emit: Vec<ValueId>,
     frames: HashMap<FrameId, Frame>,
     nil_value: ValueId,
@@ -468,6 +473,15 @@ impl<'a> ExecPass<'a> {
             false_value: 3,
             global_frame: 0,
             next_id: 4,
+        }
+    }
+
+    pub(crate) fn lookup(&self, frame: FrameId, var: VarId) -> Option<ValueId> {
+        let frame = self.frames.get(&frame).expect("no frame found");
+        if let Some(val) = frame.bindings.get(&var) {
+            Some(*val)
+        } else {
+            frame.parent.and_then(|frame| self.lookup(frame, var))
         }
     }
 
@@ -540,6 +554,7 @@ impl<'a> ExecPass<'a> {
         for decl in &input.ast.decls {
             if let Decl::Fn(f) = decl {
                 let vid = self.value_id();
+                println!("register fn {}", f.name.name);
                 self.values
                     .insert(vid, DeferValue::Ready(Value::Fn(f.clone())));
                 self.frames
@@ -603,23 +618,53 @@ impl<'a> ExecPass<'a> {
                 self.emit.push(vid);
                 return vid;
             }
-            Expr::Call(c) => PartialEvalState::Call(Box::new(PartialCallExpr {
-                expr: c.clone(),
-                state: CallExprState {
-                    posargs: c
+            Expr::Call(c) => {
+                for (var, vid) in self.frames[&self.global_frame].bindings.iter() {
+                    println!("{var:?}: {:?}", &self.values[&vid]);
+                }
+                if ["rect", "crect", "float", "eq"].contains(&c.func.name) {
+                    PartialEvalState::Call(Box::new(PartialCallExpr {
+                        expr: c.clone(),
+                        state: CallExprState {
+                            posargs: c
+                                .args
+                                .posargs
+                                .iter()
+                                .map(|arg| self.visit_expr(frame, arg))
+                                .collect(),
+                            kwargs: c
+                                .args
+                                .kwargs
+                                .iter()
+                                .map(|arg| self.visit_expr(frame, &arg.value))
+                                .collect(),
+                        },
+                    }))
+                } else {
+                    let arg_vals = c
                         .args
                         .posargs
                         .iter()
                         .map(|arg| self.visit_expr(frame, arg))
-                        .collect(),
-                    kwargs: c
-                        .args
-                        .kwargs
-                        .iter()
-                        .map(|arg| self.visit_expr(frame, &arg.value))
-                        .collect(),
-                },
-            })),
+                        .collect_vec();
+                    let val = &self.values[&self.lookup(frame, c.metadata.0.unwrap()).unwrap()]
+                        .as_ref()
+                        .unwrap_ready()
+                        .as_ref()
+                        .unwrap_fn();
+                    let mut call_frame = Frame {
+                        bindings: Default::default(),
+                        parent: Some(self.global_frame),
+                    };
+                    for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
+                        call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
+                    }
+                    let scope = val.scope.clone();
+                    let fid = self.frame_id();
+                    self.frames.insert(fid, call_frame);
+                    return self.visit_expr(fid, &Expr::Scope(Box::new(scope)));
+                }
+            }
             Expr::If(if_expr) => {
                 let cond = self.visit_expr(frame, &if_expr.cond);
                 PartialEvalState::If(Box::new(PartialIfExpr {
@@ -717,6 +762,7 @@ impl<'a> ExecPass<'a> {
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
+                            println!("kwarg = {}", kwarg.name.name);
                             match kwarg.name.name {
                                 "x0" => {
                                     self.values.insert(
@@ -801,24 +847,10 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 f => {
-                    let val = &self.values
-                        [&self.frames[&vref.frame].bindings[&c.expr.metadata.0.unwrap()]]
-                        .as_ref()
-                        .unwrap_ready()
-                        .as_ref()
-                        .unwrap_fn();
-                    let mut call_frame = Frame {
-                        bindings: Default::default(),
-                        parent: Some(self.global_frame),
-                    };
-                    for (arg_val, arg_decl) in c.state.posargs.iter().zip(&val.args) {
-                        call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
-                    }
-                    let scope = val.scope.clone();
-                    let fid = self.frame_id();
-                    self.frames.insert(fid, call_frame);
-                    self.visit_expr(fid, &Expr::Scope(Box::new(scope)));
-                    true
+                    panic!(
+                        "user function calls should never be deferred: attempted to partial_eval {}",
+                        f
+                    );
                 }
             },
             PartialEvalState::BinOp(bin_op) => {
@@ -828,20 +860,25 @@ impl<'a> ExecPass<'a> {
                     let vl = vl.as_ref().unwrap_linear();
                     let vr = vr.as_ref().unwrap_linear();
                     let res = match bin_op.op {
-                        BinOp::Add => vl.clone() + vr.clone(),
-                        BinOp::Sub => vl.clone() - vr.clone(),
+                        BinOp::Add => Some(vl.clone() + vr.clone()),
+                        BinOp::Sub => Some(vl.clone() - vr.clone()),
                         BinOp::Mul => {
-                            if let (Some(vl), Some(vr)) =
-                                (self.solver.eval_expr(vl), self.solver.eval_expr(vr))
-                            {
+                            match (self.solver.eval_expr(vl), self.solver.eval_expr(vr)) {
+                                (Some(vl), Some(vr)) => Some((vl * vr).into()),
+                                (Some(vl), None) => Some(vr.clone() * vl),
+                                (None, Some(vr)) => Some(vl.clone() * vr),
+                                (None, None) => None,
                             }
-                            todo!()
                         }
-                        BinOp::Div => todo!(),
+                        BinOp::Div => self.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs),
                     };
-                    self.values
-                        .insert(vid, DeferValue::Ready(Value::Linear(res)));
-                    true
+                    if let Some(res) = res {
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::Linear(res)));
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -929,7 +966,8 @@ impl<'a> ExecPass<'a> {
                 {
                     let lhs = vl.as_ref().unwrap_linear();
                     let rhs = vr.as_ref().unwrap_linear();
-                    self.solver.constrain_eq0(lhs.clone() - rhs.clone());
+                    let expr = lhs.clone() - rhs.clone();
+                    self.solver.constrain_eq0(expr);
                     self.values.insert(vid, DeferValue::Ready(Value::None));
                     true
                 } else {

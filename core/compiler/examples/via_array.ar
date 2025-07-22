@@ -34,15 +34,16 @@ cell vias() {
 
     // Create via.
     let via = rect(Layer::Via1)!;
-    eq(via.x1 - via.x0, if met1.x1 - met1.x0 < 40 {
-        20
-    } else {
-        40
-    });
+    // eq(via.x1 - via.x0, if met1.x1 - met1.x0 < 40 {
+    //     20
+    // } else {
+    //     40
+    // });
+    eq(via.x1 - via.x0, 40);
     let intersection = intersection(met1, met2);
     eq(via.y1 - via.y0, 20);
-    eq(via.x0 - intersection.x0, met1.x1 - intersection.x1);
-    eq(via.y0 - intersection.y0, met1.y1 - intersection.y1);
+    eq(via.x0 - intersection.x0 + 10, intersection.x1 - via.x1);
+    eq(via.y0 - intersection.y0, intersection.y1 - via.y1);
 
     // Constrain metals.
     eq(met2.x0, 0);

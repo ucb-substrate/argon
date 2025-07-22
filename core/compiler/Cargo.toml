@@ -23,6 +23,7 @@ nalgebra = "0.33.2"
 approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
+indexmap = "2.10.0"
 
 [build-dependencies]
 cfgrammar = "0.13"
