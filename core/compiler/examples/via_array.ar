@@ -4,7 +4,7 @@ enum Layer {
 	Met2,
 }
 
-fn max(x0: float, x1: float) {
+fn max(x0: Float, x1: Float) {
   if x0 < x1 {
     x1
   } else {
@@ -12,7 +12,7 @@ fn max(x0: float, x1: float) {
   }
 }
 
-fn min(x0: float, x1: float) {
+fn min(x0: Float, x1: Float) {
   if x0 < x1 {
     x0
   } else {

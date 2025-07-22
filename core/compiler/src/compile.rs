@@ -197,6 +197,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         args: &Vec<ArgDecl<'a, Self::Output>>,
         stmts: &Vec<Statement<'a, Self::Output>>,
     ) -> <Self::Output as AstMetadata>::CellDecl {
+        // TODO: Argument checks
     }
 
     fn dispatch_fn_decl(
@@ -206,6 +207,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         args: &Vec<ArgDecl<'a, Self::Output>>,
         scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FnDecl {
+        // TODO: Argument checks
         assert!(!["crect", "rect", "float"].contains(&name.name));
         let ty = Ty::Fn(Box::new(FnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
@@ -361,10 +363,6 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         name: &Ident<'a, Self::Output>,
         ty: &Ident<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::ArgDecl {
-        assert!(
-            self.lookup(input.name.name).is_none(),
-            "argument should not already be declared"
-        );
         let ty = match input.ty.name {
             "Float" => Ty::Float,
             "Rect" => Ty::Rect,
@@ -823,6 +821,31 @@ impl<'a> ExecPass<'a> {
                     true
                 }
             },
+            PartialEvalState::BinOp(bin_op) => {
+                if let (Defer::Ready(vl), Defer::Ready(vr)) =
+                    (&self.values[&bin_op.lhs], &self.values[&bin_op.rhs])
+                {
+                    let vl = vl.as_ref().unwrap_linear();
+                    let vr = vr.as_ref().unwrap_linear();
+                    let res = match bin_op.op {
+                        BinOp::Add => vl.clone() + vr.clone(),
+                        BinOp::Sub => vl.clone() - vr.clone(),
+                        BinOp::Mul => {
+                            if let (Some(vl), Some(vr)) =
+                                (self.solver.eval_expr(vl), self.solver.eval_expr(vr))
+                            {
+                            }
+                            todo!()
+                        }
+                        BinOp::Div => todo!(),
+                    };
+                    self.values
+                        .insert(vid, DeferValue::Ready(Value::Linear(res)));
+                    true
+                } else {
+                    false
+                }
+            }
             PartialEvalState::If(if_) => match if_.state {
                 IfExprState::Cond(cond) => {
                     if let Defer::Ready(val) = &self.values[&cond] {
