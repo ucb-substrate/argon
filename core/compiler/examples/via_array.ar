@@ -107,7 +107,7 @@ cell vias() {
     eq(via.x0, 0.);
     eq(via.y0, 0.);
     let intersection = intersection(met1, met2);
-    let via_array = array(via, 1, 2, 10., 10.);
+    let via_array = array(via, 2, 10., 0.);
     eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
     eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
 
