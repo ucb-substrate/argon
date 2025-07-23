@@ -29,7 +29,9 @@ pub fn compile(input: CompileInput<'_, ParseMetadata>) -> CompiledCell {
         cell: input.cell,
         params: input.params,
     };
-    ExecPass::new().execute(input)
+    let cell = ExecPass::new().execute(input);
+    println!("{:?}", cell);
+    cell
 }
 
 pub(crate) struct VarIdTyPass<'a> {
@@ -575,22 +577,23 @@ impl<'a> ExecPass<'a> {
                 let value = &self.values[vid];
                 let value = value.as_ref().unwrap_ready();
                 match value {
-                    Value::Linear(l) => SolvedValue::Float(
-                        l.coeffs
-                            .iter()
-                            .map(|(coeff, var)| coeff * self.solver.value_of(*var).unwrap())
-                            .reduce(|a, b| a + b)
-                            .unwrap_or(0.)
-                            + l.constant,
-                    ),
-                    Value::Rect(rect) => SolvedValue::Rect(Rect {
-                        layer: rect.layer.clone(),
-                        x0: self.solver.value_of(rect.x0).unwrap(),
-                        y0: self.solver.value_of(rect.y0).unwrap(),
-                        x1: self.solver.value_of(rect.x1).unwrap(),
-                        y1: self.solver.value_of(rect.y1).unwrap(),
-                        source: rect.source.clone(),
-                    }),
+                    Value::Linear(l) => SolvedValue::Float(self.solver.eval_expr(l).unwrap()),
+                    Value::Rect(rect) => {
+                        println!("{:?}", rect.x0);
+                        println!("{:?}", rect.y0);
+                        println!("{:?}", rect.x1);
+                        println!("{:?}", rect.y1);
+                        let rect = SolvedValue::Rect(Rect {
+                            layer: rect.layer.clone(),
+                            x0: self.solver.value_of(rect.x0).unwrap(),
+                            y0: self.solver.value_of(rect.y0).unwrap(),
+                            x1: self.solver.value_of(rect.x1).unwrap(),
+                            y1: self.solver.value_of(rect.y1).unwrap(),
+                            source: rect.source.clone(),
+                        });
+                        println!("{:?}", rect);
+                        rect
+                    }
                     _ => unimplemented!(),
                 }
             })
