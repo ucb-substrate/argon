@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use approx::{assert_relative_eq, relative_eq};
+use approx::{assert_abs_diff_eq, assert_relative_eq, relative_eq};
 use arcstr::ArcStr;
 use ena::unify::{InPlaceUnificationTable, UnifyKey};
 use itertools::{Either, Itertools};
@@ -51,7 +51,6 @@ impl Solver {
     /// Constrains the value of `expr` to 0.
     /// TODO: Check if added constraints conflict with existing solution.
     pub fn constrain_eq0(&mut self, mut expr: LinearExpr) {
-        println!("{expr:?} = 0");
         substitute_expr(&self.solved_vars, &mut expr);
         self.constraints.push(expr);
     }
@@ -74,20 +73,28 @@ impl Solver {
             self.constraints.len(),
             self.constraints.iter().map(|expr| -expr.constant),
         );
-        // println!("a = {a}, b = {b}");
-        let p = a.clone().svd(true, true).pseudo_inverse(EPSILON).unwrap();
-        assert_relative_eq!(&(&a * &p * &b), &b, epsilon = EPSILON);
-        let sol = &p * b;
-        let variation = DMatrix::identity(n_vars, n_vars) - &p * a;
-        let zeros = DVector::zeros(n_vars);
+        let svd = a.clone().svd(true, true);
+        let vt = svd.v_t.as_ref().expect("No V^T matrix");
+        let s = &svd.singular_values;
+        let sol = svd.solve(&b, EPSILON).unwrap();
+
+        let mut row_space = Vec::new();
+
+        for i in 0..self.constraints.len() {
+            if s[i as usize] > EPSILON {
+                // i-th singular value is small ⇒ null space component
+                let vec = vt.row(i as usize); // Row of V^T = column of V
+                row_space.push(vec);
+            }
+        }
+
         for i in 0..self.next_id {
-            if relative_eq!(
-                &variation.row(i as usize).transpose(),
-                &zeros,
-                epsilon = EPSILON
-            ) {
+            if !self.solved_vars.contains_key(&Var(i))
+                && !row_space
+                    .iter()
+                    .all(|row| relative_eq!(row[i as usize], 0., epsilon = EPSILON))
+            {
                 self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
-                println!("solved {i} = {}", sol[(i as usize, 0)]);
             }
         }
         for constraint in self.constraints.iter_mut() {

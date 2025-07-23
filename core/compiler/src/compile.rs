@@ -11,7 +11,7 @@ use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope};
+use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope, UnaryOp};
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -52,6 +52,17 @@ pub enum Ty {
     Fn(Box<FnTy>),
 }
 
+impl Ty {
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "Float" => Ty::Float,
+            "Rect" => Ty::Rect,
+            "Int" => Ty::Int,
+            name => panic!("invalid type: {name}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FnTy {
     args: Vec<Ty>,
@@ -67,6 +78,7 @@ impl AstMetadata for VarIdTyMetadata {
     type FnDecl = VarId;
     type IfExpr = Ty;
     type BinOpExpr = Ty;
+    type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
     type EnumValue = ();
@@ -78,6 +90,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Scope = Ty;
     type Typ = ();
     type VarExpr = (VarId, Ty);
+    type CastExpr = Ty;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -161,7 +174,10 @@ impl<'a> Expr<'a, VarIdTyMetadata> {
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
             Expr::Var(var_expr) => var_expr.metadata.1.clone(),
             Expr::FloatLiteral(_float_literal) => Ty::Float,
+            Expr::IntLiteral(_int_literal) => Ty::Int,
             Expr::Scope(scope) => scope.metadata.clone(),
+            Expr::Cast(cast) => cast.metadata.clone(),
+            Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
         }
     }
 }
@@ -205,20 +221,38 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_fn_decl(
         &mut self,
-        input: &crate::ast::FnDecl<'a, Self::Input>,
+        input: &FnDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
         args: &Vec<ArgDecl<'a, Self::Output>>,
+        return_ty: &Ident<'a, Self::Output>,
         scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FnDecl {
-        // TODO: Argument checks
-        assert!(!["crect", "rect", "float"].contains(&name.name));
+        // UNUSED
+        self.lookup(name.name).unwrap().0
+    }
+
+    fn transform_fn_decl(&mut self, input: &FnDecl<'a, Self::Input>) -> FnDecl<'a, Self::Output> {
+        assert!(!["crect", "rect", "float"].contains(&input.name.name));
+        let args: Vec<_> = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
         let ty = Ty::Fn(Box::new(FnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            ret: scope.metadata.clone(),
+            ret: Ty::from_name(input.return_ty.name),
         }));
-        let vid = self.alloc(name.name, ty);
-        println!("{} {}", name.name, vid);
-        vid
+        let vid = self.alloc(input.name.name, ty);
+        let name = self.transform_ident(&input.name);
+        let return_ty = self.transform_ident(&input.return_ty);
+        let scope = self.transform_scope(&input.scope);
+        FnDecl {
+            name,
+            args,
+            return_ty,
+            scope,
+            metadata: vid,
+        }
     }
 
     fn dispatch_constant_decl(
@@ -253,9 +287,28 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     ) -> <Self::Output as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        assert_eq!(left_ty, Ty::Float);
-        assert_eq!(right_ty, Ty::Float);
-        Ty::Float
+        assert_eq!(left_ty, right_ty);
+        assert!([Ty::Float, Ty::Int].contains(&left_ty));
+        assert!([Ty::Float, Ty::Int].contains(&right_ty));
+        left_ty
+    }
+
+    fn dispatch_unary_op_expr(
+        &mut self,
+        input: &crate::ast::UnaryOpExpr<'a, Self::Input>,
+        operand: &Expr<'a, Self::Output>,
+    ) -> <Self::Output as AstMetadata>::UnaryOpExpr {
+        match input.op {
+            UnaryOp::Not => {
+                assert_eq!(operand.ty(), Ty::Bool);
+                Ty::Bool
+            }
+            UnaryOp::Neg => {
+                let operand_ty = operand.ty();
+                assert!([Ty::Float, Ty::Int].contains(&operand_ty));
+                operand_ty
+            }
+        }
     }
 
     fn dispatch_comparison_expr(
@@ -279,7 +332,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         // TODO: For now, only rects can have their float fields accessed.
         let base_ty = base.ty();
         assert_eq!(base_ty, Ty::Rect);
-        assert!(["x0", "x1", "y0", "y1"].contains(&field.name));
+        assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&field.name));
         Ty::Float
     }
 
@@ -324,7 +377,9 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                 (None, Ty::Nil)
             }
             name => {
-                let (varid, ty) = self.lookup(name).unwrap();
+                let (varid, ty) = self
+                    .lookup(name)
+                    .unwrap_or_else(|| panic!("no function named `{name}`"));
                 let ty = ty.unwrap_fn();
                 assert_eq!(args.posargs.len(), ty.args.len());
                 for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
@@ -353,6 +408,15 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     ) -> <Self::Output as AstMetadata>::Args {
     }
 
+    fn dispatch_cast(
+        &mut self,
+        input: &crate::ast::CastExpr<'a, Self::Input>,
+        value: &Expr<'a, Self::Output>,
+        ty: &Ident<'a, Self::Output>,
+    ) -> <Self::Output as AstMetadata>::CastExpr {
+        Ty::from_name(ty.name)
+    }
+
     fn dispatch_kw_arg_value(
         &mut self,
         input: &crate::ast::KwArgValue<'a, Self::Input>,
@@ -368,11 +432,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         name: &Ident<'a, Self::Output>,
         ty: &Ident<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::ArgDecl {
-        let ty = match input.ty.name {
-            "Float" => Ty::Float,
-            "Rect" => Ty::Rect,
-            _ => panic!("invalid type"),
-        };
+        let ty = Ty::from_name(input.ty.name);
         (self.alloc(input.name.name, ty.clone()), ty)
     }
 
@@ -554,7 +614,6 @@ impl<'a> ExecPass<'a> {
         for decl in &input.ast.decls {
             if let Decl::Fn(f) = decl {
                 let vid = self.value_id();
-                println!("register fn {}", f.name.name);
                 self.values
                     .insert(vid, DeferValue::Ready(Value::Fn(f.clone())));
                 self.frames
@@ -588,7 +647,6 @@ impl<'a> ExecPass<'a> {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(frame, &binding.value);
-                println!("binding vid: {} {value:?}", binding.name.name);
                 self.frames
                     .get_mut(&frame)
                     .unwrap()
@@ -609,6 +667,11 @@ impl<'a> ExecPass<'a> {
                     .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(f.value))));
                 return vid;
             }
+            Expr::IntLiteral(i) => {
+                let vid = self.value_id();
+                self.values.insert(vid, Defer::Ready(Value::Int(i.value)));
+                return vid;
+            }
             Expr::Var(v) => {
                 let var_id = v.metadata.0;
                 return self.frames[&frame].bindings[&var_id];
@@ -619,9 +682,6 @@ impl<'a> ExecPass<'a> {
                 return vid;
             }
             Expr::Call(c) => {
-                for (var, vid) in self.frames[&self.global_frame].bindings.iter() {
-                    println!("{var:?}: {:?}", &self.values[&vid]);
-                }
                 if ["rect", "crect", "float", "eq"].contains(&c.func.name) {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
@@ -708,6 +768,13 @@ impl<'a> ExecPass<'a> {
                 let rhs = self.visit_expr(frame, &b.right);
                 PartialEvalState::BinOp(PartialBinOp { lhs, rhs, op: b.op })
             }
+            Expr::Cast(cast) => {
+                let value = self.visit_expr(frame, &cast.value);
+                PartialEvalState::Cast(PartialCast {
+                    value,
+                    ty: cast.metadata.clone(),
+                })
+            }
             x => todo!("{x:?}"),
         };
         let vid = self.value_id();
@@ -716,7 +783,6 @@ impl<'a> ExecPass<'a> {
             vid,
             DeferValue::Deferred(PartialEval {
                 state: partial_eval_state,
-                assign_to: None,
                 frame,
             }),
         );
@@ -762,7 +828,6 @@ impl<'a> ExecPass<'a> {
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            println!("kwarg = {}", kwarg.name.name);
                             match kwarg.name.name {
                                 "x0" => {
                                     self.values.insert(
@@ -814,7 +879,6 @@ impl<'a> ExecPass<'a> {
                                         lhs,
                                         rhs: *rhs,
                                     }),
-                                    assign_to: None,
                                     frame: vref.frame,
                                 }),
                             );
@@ -857,27 +921,40 @@ impl<'a> ExecPass<'a> {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
                     (&self.values[&bin_op.lhs], &self.values[&bin_op.rhs])
                 {
-                    let vl = vl.as_ref().unwrap_linear();
-                    let vr = vr.as_ref().unwrap_linear();
-                    let res = match bin_op.op {
-                        BinOp::Add => Some(vl.clone() + vr.clone()),
-                        BinOp::Sub => Some(vl.clone() - vr.clone()),
-                        BinOp::Mul => {
-                            match (self.solver.eval_expr(vl), self.solver.eval_expr(vr)) {
-                                (Some(vl), Some(vr)) => Some((vl * vr).into()),
-                                (Some(vl), None) => Some(vr.clone() * vl),
-                                (None, Some(vr)) => Some(vl.clone() * vr),
-                                (None, None) => None,
+                    match (vl, vr) {
+                        (Value::Linear(vl), Value::Linear(vr)) => {
+                            let res = match bin_op.op {
+                                BinOp::Add => Some(vl.clone() + vr.clone()),
+                                BinOp::Sub => Some(vl.clone() - vr.clone()),
+                                BinOp::Mul => {
+                                    match (self.solver.eval_expr(vl), self.solver.eval_expr(vr)) {
+                                        (Some(vl), Some(vr)) => Some((vl * vr).into()),
+                                        (Some(vl), None) => Some(vr.clone() * vl),
+                                        (None, Some(vr)) => Some(vl.clone() * vr),
+                                        (None, None) => None,
+                                    }
+                                }
+                                BinOp::Div => self.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs),
+                            };
+                            if let Some(res) = res {
+                                self.values
+                                    .insert(vid, DeferValue::Ready(Value::Linear(res)));
+                                true
+                            } else {
+                                false
                             }
                         }
-                        BinOp::Div => self.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs),
-                    };
-                    if let Some(res) = res {
-                        self.values
-                            .insert(vid, DeferValue::Ready(Value::Linear(res)));
-                        true
-                    } else {
-                        false
+                        (Value::Int(vl), Value::Int(vr)) => {
+                            let res = match bin_op.op {
+                                BinOp::Add => vl + vr,
+                                BinOp::Sub => vl - vr,
+                                BinOp::Mul => vl * vr,
+                                BinOp::Div => vl / vr,
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
+                            true
+                        }
+                        _ => unreachable!(),
                     }
                 } else {
                     false
@@ -919,24 +996,44 @@ impl<'a> ExecPass<'a> {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) = (
                     &self.values[&comparison_expr.state.left],
                     &self.values[&comparison_expr.state.right],
-                ) && let (Some(vl), Some(vr)) = (
-                    self.solver.eval_expr(vl.as_ref().unwrap_linear()),
-                    self.solver.eval_expr(vr.as_ref().unwrap_linear()),
                 ) {
-                    let res = match comparison_expr.expr.op {
-                        crate::ast::ComparisonOp::Eq => {
-                            panic!("cannot check equality between floats")
+                    match (vl, vr) {
+                        (Value::Linear(vl), Value::Linear(vr)) => {
+                            if let (Some(vl), Some(vr)) =
+                                (self.solver.eval_expr(vl), self.solver.eval_expr(vr))
+                            {
+                                let res = match comparison_expr.expr.op {
+                                    crate::ast::ComparisonOp::Eq => {
+                                        panic!("cannot check equality between floats")
+                                    }
+                                    crate::ast::ComparisonOp::Ne => {
+                                        panic!("cannot check inequality between floats")
+                                    }
+                                    crate::ast::ComparisonOp::Geq => vl >= vr,
+                                    crate::ast::ComparisonOp::Gt => vl > vr,
+                                    crate::ast::ComparisonOp::Leq => vl <= vr,
+                                    crate::ast::ComparisonOp::Lt => vl < vr,
+                                };
+                                self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                                true
+                            } else {
+                                false
+                            }
                         }
-                        crate::ast::ComparisonOp::Ne => {
-                            panic!("cannot check inequality between floats")
+                        (Value::Int(vl), Value::Int(vr)) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => vl == vr,
+                                crate::ast::ComparisonOp::Ne => vl != vr,
+                                crate::ast::ComparisonOp::Geq => vl >= vr,
+                                crate::ast::ComparisonOp::Gt => vl > vr,
+                                crate::ast::ComparisonOp::Leq => vl <= vr,
+                                crate::ast::ComparisonOp::Lt => vl < vr,
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
                         }
-                        crate::ast::ComparisonOp::Geq => vl >= vr,
-                        crate::ast::ComparisonOp::Gt => vl > vr,
-                        crate::ast::ComparisonOp::Leq => vl <= vr,
-                        crate::ast::ComparisonOp::Lt => vl < vr,
-                    };
-                    self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                    true
+                        _ => unreachable!(),
+                    }
                 } else {
                     false
                 }
@@ -974,6 +1071,33 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::Cast(c) => {
+                if let Defer::Ready(val) = &self.values[&c.value] {
+                    let value = match (val, &c.ty) {
+                        (Value::Int(x), Ty::Float) => {
+                            Some(Value::Linear(LinearExpr::from(*x as f64)))
+                        }
+                        (x @ Value::Int(_), Ty::Int) => Some(x.clone()),
+                        (Value::Linear(expr), Ty::Int) => {
+                            if let Some(val) = self.solver.eval_expr(expr) {
+                                Some(Value::Int(val as i64))
+                            } else {
+                                None
+                            }
+                        }
+                        (expr @ Value::Linear(_), Ty::Float) => Some(expr.clone()),
+                        _ => panic!("invalid cast"),
+                    };
+                    if let Some(value) = value {
+                        self.values.insert(vid, DeferValue::Ready(value));
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
             _ => todo!(),
         };
 
@@ -992,6 +1116,7 @@ impl<'a> ExecPass<'a> {
 pub enum Value<'a> {
     EnumValue(EnumValue<'a, VarIdTyMetadata>),
     Linear(LinearExpr),
+    Int(i64),
     Rect(Rect<Var>),
     Bool(bool),
     Fn(FnDecl<'a, VarIdTyMetadata>),
@@ -1021,7 +1146,6 @@ type DeferValue<'a, T: AstMetadata> = Defer<Value<'a>, PartialEval<'a, T>>;
 #[derive(Debug, Clone)]
 struct PartialEval<'a, T: AstMetadata> {
     state: PartialEvalState<'a, T>,
-    assign_to: Option<ValueId>,
     frame: FrameId,
 }
 
@@ -1041,6 +1165,13 @@ enum PartialEvalState<'a, T: AstMetadata> {
     EnumValue(EnumValue<'a, T>),
     FieldAccess(Box<PartialFieldAccessExpr<'a, T>>),
     Constraint(PartialConstraint),
+    Cast(PartialCast),
+}
+
+#[derive(Debug, Clone)]
+struct PartialCast {
+    value: ValueId,
+    ty: Ty,
 }
 
 #[derive(Debug, Clone)]

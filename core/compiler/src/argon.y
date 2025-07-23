@@ -26,6 +26,12 @@ FloatLiteral -> Result<FloatLiteral, ()>
   Ok(FloatLiteral { span: v.span(), value: parse_float($lexer.span_str(v.span()))?, }) }
   ;
 
+IntLiteral -> Result<IntLiteral, ()>
+  : 'INTLIT' {
+  let v = $1.map_err(|_| ())?;
+  Ok(IntLiteral { span: v.span(), value: parse_int($lexer.span_str(v.span()))?, }) }
+  ;
+
 EnumDecl -> Result<EnumDecl<'input, ParseMetadata>, ()>
   : 'ENUM' Ident '{' EnumVariants '}'
   {
@@ -71,12 +77,13 @@ CellDecl -> Result<CellDecl<'input, ParseMetadata>, ()>
   ;
 
 FnDecl -> Result<FnDecl<'input, ParseMetadata>, ()>
-  : 'FN' Ident '(' ArgDecls ')' Scope
+  : 'FN' Ident '(' ArgDecls ')' '->' Ident Scope
   {
     Ok(FnDecl {
       name: $2?,
       args: $4?,
-      scope: $6?,
+      scope: $8?,
+      return_ty: $7?,
       metadata: (),
     })
   }
@@ -177,13 +184,21 @@ Term -> Result<Expr<'input, ParseMetadata>, ()>
   ;
 
 Factor -> Result<Expr<'input, ParseMetadata>, ()>
+  : '!' Factor { Ok(Expr::UnaryOp(Box::new(UnaryOpExpr { op: UnaryOp::Not, operand: $2?, span: $span, metadata: () }))) }
+  | '-' Factor { Ok(Expr::UnaryOp(Box::new(UnaryOpExpr { op: UnaryOp::Neg, operand: $2?, span: $span, metadata: () }))) }
+  | SubFactor { Ok($1?) }
+  ;
+
+SubFactor -> Result<Expr<'input, ParseMetadata>, ()>
   : '(' Expr ')' { $2 }
-  | Factor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
   | CallExpr { Ok(Expr::Call($1?)) }
-  | Factor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
+  | SubFactor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
+  | SubFactor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
   | Ident '::' Ident { Ok(Expr::EnumValue(EnumValue {name: $1?, variant: $3?, span: $span, metadata: (), } )) }
   | Ident { Ok(Expr::Var(VarExpr { name: $1?, metadata: (), })) }
+  | IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
+  | SubFactor 'AS' Ident { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
   ;
 
 

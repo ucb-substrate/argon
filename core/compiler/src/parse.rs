@@ -20,6 +20,7 @@ impl AstMetadata for ParseMetadata {
     type LetBinding = ();
     type IfExpr = ();
     type BinOpExpr = ();
+    type UnaryOpExpr = ();
     type ComparisonExpr = ();
     type FieldAccessExpr = ();
     type EnumValue = ();
@@ -32,6 +33,7 @@ impl AstMetadata for ParseMetadata {
     type Typ = ();
     type VarExpr = ();
     type FnDecl = ();
+    type CastExpr = ();
 }
 
 pub fn parse(input: &str) -> Result<Ast<'_, ParseMetadata>, anyhow::Error> {

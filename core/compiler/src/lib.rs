@@ -132,7 +132,6 @@ cell simple(y_enclosure: int) {
     #[test]
     fn argon_via_array() {
         let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
-        println!("ast: {ast:?}");
         let cell = compile(CompileInput {
             cell: "vias",
             ast: &ast,
