@@ -3,7 +3,7 @@ use std::{
     ops::Sub,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use approx::{assert_abs_diff_eq, assert_relative_eq, relative_eq};
 use arcstr::ArcStr;
 use ena::unify::{InPlaceUnificationTable, UnifyKey};
@@ -76,23 +76,18 @@ impl Solver {
         let svd = a.clone().svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let s = &svd.singular_values;
-        let sol = svd.solve(&b, EPSILON).unwrap();
-
-        let mut row_space = Vec::new();
-
-        for i in 0..self.constraints.len() {
-            if s[i as usize] > EPSILON {
-                // i-th singular value is small ⇒ null space component
-                let vec = vt.row(i as usize); // Row of V^T = column of V
-                row_space.push(vec);
-            }
+        if s[0] < EPSILON {
+            return;
         }
+        let sol = svd.solve(&b, EPSILON).unwrap();
 
         for i in 0..self.next_id {
             if !self.solved_vars.contains_key(&Var(i))
-                && !row_space
-                    .iter()
-                    .all(|row| relative_eq!(row[i as usize], 0., epsilon = EPSILON))
+                && relative_eq!(
+                    (vt.transpose() * vt.column(i as usize))[((i as usize), 0)],
+                    1.,
+                    epsilon = EPSILON
+                )
             {
                 self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
             }
