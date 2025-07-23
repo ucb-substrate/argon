@@ -332,8 +332,11 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         // TODO: For now, only rects can have their float fields accessed.
         let base_ty = base.ty();
         assert_eq!(base_ty, Ty::Rect);
-        assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&field.name));
-        Ty::Float
+        match field.name {
+            "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
+            "layer" => Ty::Enum,
+            _ => panic!("invalid field access"),
+        }
     }
 
     fn dispatch_enum_value(
@@ -752,8 +755,10 @@ impl<'a> ExecPass<'a> {
             }
             Expr::EnumValue(e) => {
                 let vid = self.value_id();
-                self.values
-                    .insert(vid, Defer::Ready(Value::EnumValue(e.clone())));
+                self.values.insert(
+                    vid,
+                    Defer::Ready(Value::EnumValue(e.variant.name.to_string())),
+                );
                 return vid;
             }
             Expr::FieldAccess(f) => {
@@ -808,7 +813,7 @@ impl<'a> ExecPass<'a> {
                         self.values[vid]
                             .as_ref()
                             .get_ready()
-                            .map(|layer| layer.as_ref().unwrap_enum_value().name.name.to_string())
+                            .map(|layer| layer.as_ref().unwrap_enum_value().clone())
                     });
                     let layer = match layer {
                         None => Some(None),
@@ -1042,16 +1047,16 @@ impl<'a> ExecPass<'a> {
                 if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
                     let rect = base.as_ref().unwrap_rect();
                     let val = match field_access_expr.expr.field.name {
-                        "x0" => LinearExpr::from(rect.x0),
-                        "x1" => LinearExpr::from(rect.x1),
-                        "y0" => LinearExpr::from(rect.y0),
-                        "y1" => LinearExpr::from(rect.y1),
-                        "w" => LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
-                        "h" => LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
+                        "x0" => Value::Linear(LinearExpr::from(rect.x0)),
+                        "x1" => Value::Linear(LinearExpr::from(rect.x1)),
+                        "y0" => Value::Linear(LinearExpr::from(rect.y0)),
+                        "y1" => Value::Linear(LinearExpr::from(rect.y1)),
+                        "w" => Value::Linear(LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0)),
+                        "h" => Value::Linear(LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0)),
+                        "layer" => Value::EnumValue(rect.layer.clone().unwrap()),
                         f => panic!("invalid field `{f}`"),
                     };
-                    self.values
-                        .insert(vid, DeferValue::Ready(Value::Linear(val)));
+                    self.values.insert(vid, DeferValue::Ready(val));
                     true
                 } else {
                     false
@@ -1114,7 +1119,7 @@ impl<'a> ExecPass<'a> {
 #[enumify]
 #[derive(Debug, Clone)]
 pub enum Value<'a> {
-    EnumValue(EnumValue<'a, VarIdTyMetadata>),
+    EnumValue(String),
     Linear(LinearExpr),
     Int(i64),
     Rect(Rect<Var>),
@@ -1123,6 +1128,7 @@ pub enum Value<'a> {
     None,
 }
 
+#[enumify]
 #[derive(Debug, Clone)]
 pub enum SolvedValue {
     Float(f64),
@@ -1131,7 +1137,7 @@ pub enum SolvedValue {
 
 #[derive(Debug, Clone)]
 pub struct CompiledCell {
-    values: Vec<SolvedValue>,
+    pub values: Vec<SolvedValue>,
 }
 
 #[enumify(generics_only)]

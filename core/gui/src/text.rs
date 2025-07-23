@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use gpui::{
-    div, yellow, Context, Entity, HighlightStyle, IntoElement, ParentElement, Render, Styled,
-    StyledText, Subscription, Window,
+    Context, Entity, HighlightStyle, IntoElement, ParentElement, Render, Styled, StyledText,
+    Subscription, Window, div, yellow,
 };
 
 use crate::project::ProjectState;
@@ -17,10 +17,11 @@ impl TextDisplay {
     pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
         let subscriptions = vec![cx.observe(state, |this, state, cx| {
             let proj_state = state.read(cx);
+            let canvas = state.read(cx);
             this.text = proj_state.code.clone();
             this.highlight_span = proj_state
                 .selected_rect
-                .and_then(|i| Some(proj_state.solved_cell.rects[i].attrs.source.as_ref()?.span))
+                .and_then(|i| proj_state.rects[i].span)
                 .map(|span| span.start()..span.end());
             cx.notify();
         })];

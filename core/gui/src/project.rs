@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::PathBuf;
 
-use compiler::compile::{compile, CompileInput};
+use compiler::compile::{CompileInput, CompiledCell, SolvedValue, compile};
 use compiler::parse::parse;
-use compiler::solver::{Rect, SolvedCell};
 use gpui::*;
 use itertools::Itertools;
 
+use crate::canvas::Rect;
 use crate::{
     canvas::{LayoutCanvas, ShapeFill},
     text::TextDisplay,
@@ -29,7 +29,8 @@ pub struct ProjectState {
     pub code: String,
     pub cell: String,
     pub params: HashMap<String, f64>,
-    pub solved_cell: SolvedCell,
+    pub solved_cell: CompiledCell,
+    pub rects: Vec<Rect>,
     pub selected_rect: Option<usize>,
     pub layers: Vec<Entity<LayerState>>,
     pub subscriptions: Vec<Subscription>,
@@ -40,6 +41,45 @@ pub struct Project {
     pub sidebar: Entity<SideBar>,
     pub canvas: Entity<LayoutCanvas>,
     pub text: Entity<TextDisplay>,
+}
+
+fn get_rects(
+    cx: &mut App,
+    solved_cell: &CompiledCell,
+    layers: &Vec<Entity<LayerState>>,
+) -> Vec<Rect> {
+    solved_cell
+        .values
+        .iter()
+        .filter_map(|v| v.get_rect().cloned())
+        .flat_map(|rect| {
+            let mut rects = Vec::new();
+            let layer = layers
+                .iter()
+                .map(|layer| (layer.clone(), layer.read(cx)))
+                .find(|(_, layer)| {
+                    if let Some(rect_layer) = &rect.layer {
+                        &layer.name == rect_layer
+                    } else {
+                        false
+                    }
+                });
+            if let Some((id, layer)) = layer {
+                rects.push(Rect {
+                    x0: rect.x0 as f32,
+                    y0: rect.y0 as f32,
+                    x1: rect.x1 as f32,
+                    y1: rect.y1 as f32,
+                    color: layer.color,
+                    fill: layer.fill,
+                    border_color: layer.border_color,
+                    layer: id.clone(),
+                    span: rect.source.clone().map(|info| info.span),
+                });
+            }
+            rects
+        })
+        .collect()
 }
 
 impl Project {
@@ -56,12 +96,11 @@ impl Project {
             cell: &cell,
             ast: &ast,
             params: params_ref,
-        })
-        .expect("failed to compiler Argon");
+        });
         let layers: HashSet<_> = solved_cell
-            .rects
+            .values
             .iter()
-            .map(|Rect { layer, .. }| layer.clone().unwrap().to_string())
+            .filter_map(|value| value.get_rect()?.layer.clone())
             .collect();
         let layers: Vec<_> = layers
             .into_iter()
@@ -81,6 +120,7 @@ impl Project {
                 })
             })
             .collect();
+        let rects = get_rects(cx, &solved_cell, &layers);
         let state = cx.new(|cx| {
             let subscriptions = layers
                 .iter()
@@ -97,6 +137,7 @@ impl Project {
                 cell,
                 params,
                 solved_cell: solved_cell.clone(),
+                rects,
                 selected_rect: None,
                 layers,
                 subscriptions,

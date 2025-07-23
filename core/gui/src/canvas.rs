@@ -1,8 +1,8 @@
 use gpui::{
-    div, pattern_slash, rgb, rgba, solid_background, BorderStyle, Bounds, Context, Corners,
-    DefiniteLength, Edges, Element, Entity, InteractiveElement, IntoElement, Length, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, Size, Style, Styled, Subscription, Window,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
+    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
+    Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
 };
 use itertools::Itertools;
 
@@ -44,7 +44,6 @@ pub struct CanvasElement {
 // ~TextInput
 pub struct LayoutCanvas {
     pub offset: Point<Pixels>,
-    pub rects: Vec<Rect>,
     pub bg_style: Style,
     pub state: Entity<ProjectState>,
     // drag state
@@ -115,10 +114,13 @@ impl Element for CanvasElement {
             .update(cx, |inner, _cx| inner.screen_origin = bounds.origin);
         let inner = self.inner.read(cx);
         let rects = inner
+            .state
+            .read(cx)
             .rects
             .clone()
             .into_iter()
             .enumerate()
+            .filter(|(_, rect)| rect.layer.read(cx).visible)
             .sorted_by_key(|(_, rect)| rect.layer.read(cx).z)
             .collect_vec();
         let scale = inner.scale;
@@ -189,10 +191,11 @@ impl Render for LayoutCanvas {
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
             // TODO: Uncomment once GPUI mouse movement is fixed.
-            // .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             // .on_mouse_move(cx.listener(Self::on_mouse_move))
-            // .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-            // .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_drag_move(cx.listener(Self::on_drag_move))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(CanvasElement {
                 inner: cx.entity().clone(),
@@ -201,51 +204,8 @@ impl Render for LayoutCanvas {
 }
 
 impl LayoutCanvas {
-    fn get_rects(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Vec<Rect> {
-        let proj_state = state.read(cx);
-        proj_state
-            .solved_cell
-            .rects
-            .iter()
-            .flat_map(|rect| {
-                let mut rects = Vec::new();
-                let layer = proj_state
-                    .layers
-                    .iter()
-                    .map(|layer| (layer.clone(), layer.read(cx)))
-                    .find(|(_, layer)| {
-                        if let Some(rect_layer) = &rect.layer {
-                            &layer.name == rect_layer
-                        } else {
-                            false
-                        }
-                    });
-                if let Some((id, layer)) = layer {
-                    if layer.visible {
-                        rects.push(Rect {
-                            x0: rect.x0 as f32,
-                            y0: rect.y0 as f32,
-                            x1: rect.x1 as f32,
-                            y1: rect.y1 as f32,
-                            color: layer.color,
-                            fill: layer.fill,
-                            border_color: layer.border_color,
-                            layer: id.clone(),
-                            span: rect.attrs.source.clone().map(|info| info.span),
-                        });
-                    }
-                }
-                rects
-            })
-            .collect()
-    }
     pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
-        let subscriptions = vec![cx.observe(state, |this, state, cx| {
-            this.rects = LayoutCanvas::get_rects(cx, &state);
-            cx.notify();
-        })];
         LayoutCanvas {
-            rects: LayoutCanvas::get_rects(cx, state),
             offset: Point::new(Pixels(0.), Pixels(0.)),
             bg_style: Style {
                 size: Size {
@@ -259,7 +219,7 @@ impl LayoutCanvas {
             offset_start: Point::default(),
             scale: 1.0,
             screen_origin: Point::default(),
-            subscriptions,
+            subscriptions: Vec::new(),
             state: state.clone(),
         }
     }
@@ -271,6 +231,8 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         let rects = self
+            .state
+            .read(cx)
             .rects
             .iter()
             .enumerate()
@@ -306,6 +268,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        println!("mouse down, starting drag");
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
@@ -318,9 +281,21 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         if self.is_dragging {
+            println!("mouse move in drag");
             self.offset = self.offset_start + (event.position - self.drag_start);
         }
         cx.notify();
+    }
+
+    #[allow(unused)]
+    pub(crate) fn on_drag_move(
+        &mut self,
+        _event: &DragMoveEvent<()>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.is_dragging = false;
+        println!("mouse up, ending drag");
     }
 
     #[allow(unused)]
@@ -331,6 +306,7 @@ impl LayoutCanvas {
         _cx: &mut Context<Self>,
     ) {
         self.is_dragging = false;
+        println!("mouse up, ending drag");
     }
 
     pub(crate) fn on_scroll_wheel(
