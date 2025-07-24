@@ -15,7 +15,6 @@ pub mod assets;
 pub mod canvas;
 pub mod project;
 pub mod socket;
-pub mod text;
 pub mod theme;
 pub mod toolbars;
 

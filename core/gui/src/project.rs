@@ -44,11 +44,7 @@ pub struct Project {
     pub canvas: Entity<LayoutCanvas>,
 }
 
-fn get_rects(
-    cx: &mut App,
-    solved_cell: &CompiledCell,
-    layers: &Vec<Entity<LayerState>>,
-) -> Vec<Rect> {
+fn get_rects(cx: &mut App, solved_cell: &CompiledCell, layers: &[Entity<LayerState>]) -> Vec<Rect> {
     solved_cell
         .values
         .iter()
