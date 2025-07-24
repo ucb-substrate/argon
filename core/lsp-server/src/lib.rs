@@ -17,7 +17,7 @@ struct Backend {
     gui_w: OnceCell<LspToGui<OwnedWriteHalf>>,
 }
 
-async fn handle_gui_r(client: Client, uri: Url, mut gui_r: OwnedReadHalf) {
+async fn handle_gui_r(client: Client, uri: Url, gui_r: OwnedReadHalf) {
     let mut sock = LspFromGui::new(gui_r);
     let src = tokio::fs::read_to_string(uri.to_file_path().unwrap())
         .await
@@ -31,9 +31,7 @@ async fn handle_gui_r(client: Client, uri: Url, mut gui_r: OwnedReadHalf) {
     let char2pos = |c: usize| {
         let line_idx = match line_lengths.binary_search(&c) {
             Ok(index) | Err(index) => index,
-        }
-        .checked_sub(1)
-        .unwrap_or(0);
+        }.saturating_sub(1);
         Position::new(line_idx as u32, (c - line_lengths[line_idx]) as u32)
     };
     loop {

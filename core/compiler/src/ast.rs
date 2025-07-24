@@ -1,6 +1,5 @@
 use std::fmt::Debug;
 
-use anyhow::Context;
 use cfgrammar::Span;
 use derive_where::derive_where;
 
@@ -537,7 +536,7 @@ pub trait AstTransformer<'a> {
         let cond = self.transform_expr(&input.cond);
         let then = self.transform_expr(&input.then);
         let else_ = self.transform_expr(&input.else_);
-        let metadata = self.dispatch_if_expr(&input, &cond, &then, &else_);
+        let metadata = self.dispatch_if_expr(input, &cond, &then, &else_);
         IfExpr {
             span: input.span,
             metadata,
@@ -552,7 +551,7 @@ pub trait AstTransformer<'a> {
     ) -> BinOpExpr<'a, Self::Output> {
         let left = self.transform_expr(&input.left);
         let right = self.transform_expr(&input.right);
-        let metadata = self.dispatch_bin_op_expr(&input, &left, &right);
+        let metadata = self.dispatch_bin_op_expr(input, &left, &right);
         BinOpExpr {
             op: input.op,
             span: input.span,
@@ -566,7 +565,7 @@ pub trait AstTransformer<'a> {
         input: &UnaryOpExpr<'a, Self::Input>,
     ) -> UnaryOpExpr<'a, Self::Output> {
         let operand = self.transform_expr(&input.operand);
-        let metadata = self.dispatch_unary_op_expr(&input, &operand);
+        let metadata = self.dispatch_unary_op_expr(input, &operand);
         UnaryOpExpr {
             op: input.op,
             span: input.span,
@@ -580,7 +579,7 @@ pub trait AstTransformer<'a> {
     ) -> ComparisonExpr<'a, Self::Output> {
         let left = self.transform_expr(&input.left);
         let right = self.transform_expr(&input.right);
-        let metadata = self.dispatch_comparison_expr(&input, &left, &right);
+        let metadata = self.dispatch_comparison_expr(input, &left, &right);
         ComparisonExpr {
             op: input.op,
             span: input.span,
@@ -710,7 +709,7 @@ pub trait AstTransformer<'a> {
     fn transform_cast(&mut self, input: &CastExpr<'a, Self::Input>) -> CastExpr<'a, Self::Output> {
         let value = self.transform_expr(&input.value);
         let ty = self.transform_ident(&input.ty);
-        let metadata = self.dispatch_cast(&input, &value, &ty);
+        let metadata = self.dispatch_cast(input, &value, &ty);
         CastExpr {
             span: input.span,
             value,

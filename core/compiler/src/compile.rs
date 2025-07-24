@@ -2,9 +2,8 @@
 //!
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use anyhow::Result;
 use derive_where::derive_where;
 use enumify::enumify;
 use indexmap::IndexSet;
@@ -15,7 +14,7 @@ use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope, UnaryOp};
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
-        Decl, EmitExpr, EnumValue, Expr, FloatLiteral, Ident, IfExpr, LetBinding, Statement,
+        Decl, EnumValue, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
     solver::{LinearExpr, Solver, Var},
@@ -29,8 +28,8 @@ pub fn compile(input: CompileInput<'_, ParseMetadata>) -> CompiledCell {
         cell: input.cell,
         params: input.params,
     };
-    let cell = ExecPass::new().execute(input);
-    cell
+    
+    ExecPass::new().execute(input)
 }
 
 pub(crate) struct VarIdTyPass<'a> {
@@ -400,8 +399,8 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         input: &crate::ast::EmitExpr<'a, Self::Input>,
         value: &Expr<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::EmitExpr {
-        let ty = value.ty();
-        ty
+        
+        value.ty()
     }
 
     fn dispatch_args(
@@ -582,15 +581,15 @@ impl<'a> ExecPass<'a> {
                 match value {
                     Value::Linear(l) => SolvedValue::Float(self.solver.eval_expr(l).unwrap()),
                     Value::Rect(rect) => {
-                        let rect = SolvedValue::Rect(Rect {
+                        
+                        SolvedValue::Rect(Rect {
                             layer: rect.layer.clone(),
                             x0: self.solver.value_of(rect.x0).unwrap(),
                             y0: self.solver.value_of(rect.y0).unwrap(),
                             x1: self.solver.value_of(rect.x1).unwrap(),
                             y1: self.solver.value_of(rect.y1).unwrap(),
                             source: rect.source.clone(),
-                        });
-                        rect
+                        })
                     }
                     _ => unimplemented!(),
                 }
@@ -817,7 +816,7 @@ impl<'a> ExecPass<'a> {
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.name {
                 "crect" | "rect" => {
-                    let layer = c.state.posargs.get(0).map(|vid| {
+                    let layer = c.state.posargs.first().map(|vid| {
                         self.values[vid]
                             .as_ref()
                             .get_ready()
@@ -928,8 +927,7 @@ impl<'a> ExecPass<'a> {
                 }
                 f => {
                     panic!(
-                        "user function calls should never be deferred: attempted to partial_eval {}",
-                        f
+                        "user function calls should never be deferred: attempted to partial_eval {f}"
                     );
                 }
             },
@@ -1095,11 +1093,7 @@ impl<'a> ExecPass<'a> {
                         }
                         (x @ Value::Int(_), Ty::Int) => Some(x.clone()),
                         (Value::Linear(expr), Ty::Int) => {
-                            if let Some(val) = self.solver.eval_expr(expr) {
-                                Some(Value::Int(val as i64))
-                            } else {
-                                None
-                            }
+                            self.solver.eval_expr(expr).map(|val| Value::Int(val as i64))
                         }
                         (expr @ Value::Linear(_), Ty::Float) => Some(expr.clone()),
                         _ => panic!("invalid cast"),
@@ -1117,9 +1111,7 @@ impl<'a> ExecPass<'a> {
             _ => todo!(),
         };
 
-        if !self.values.contains_key(&vid) {
-            self.values.insert(vid, v);
-        }
+        self.values.entry(vid).or_insert(v);
         if self.values[&vid].is_ready() {
             self.deferred.remove(&vid);
         }

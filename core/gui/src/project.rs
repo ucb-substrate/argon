@@ -3,7 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::TcpStream;
 use std::path::PathBuf;
 
-use compiler::compile::{CompileInput, CompiledCell, SolvedValue, compile};
+use compiler::compile::{CompileInput, CompiledCell, compile};
 use compiler::parse::parse;
 use gpui::*;
 use itertools::Itertools;
@@ -12,7 +12,6 @@ use crate::canvas::Rect;
 use crate::socket::GuiToLsp;
 use crate::{
     canvas::{LayoutCanvas, ShapeFill},
-    text::TextDisplay,
     theme::THEME,
     toolbars::{SideBar, TitleBar, ToolBar},
 };

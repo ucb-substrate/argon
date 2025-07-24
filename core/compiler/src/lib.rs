@@ -1,7 +1,5 @@
 use std::io::{self, BufRead, Write};
 
-use lrlex::lrlex_mod;
-use lrpar::lrpar_mod;
 
 pub mod ast;
 pub mod compile;
@@ -20,7 +18,7 @@ pub fn main() {
                 }
                 let res = parse::parse(l);
                 match res {
-                    Ok(r) => println!("Result: {:?}", r),
+                    Ok(r) => println!("Result: {r:?}"),
                     _ => eprintln!("Unable to evaluate expression."),
                 }
             }
@@ -31,9 +29,9 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::PathBuf};
+    use std::collections::HashMap;
 
-    use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
+    
     use parse::parse;
 
     use crate::compile::{CompileInput, VarIdTyPass, compile};

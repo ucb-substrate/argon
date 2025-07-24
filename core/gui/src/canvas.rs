@@ -1,4 +1,3 @@
-use std::io::Write;
 
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,

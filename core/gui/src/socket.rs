@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
 
-use bytes::{BufMut, BytesMut};
 use lsp_server::socket::{GuiToLspMessage, LspToGuiMessage};
 
 #[derive(Debug)]

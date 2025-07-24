@@ -1,15 +1,8 @@
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    ops::Sub,
-};
+use std::collections::HashMap;
 
-use anyhow::{Result, anyhow};
 use approx::relative_eq;
-use arcstr::ArcStr;
-use ena::unify::{InPlaceUnificationTable, UnifyKey};
 use itertools::{Either, Itertools};
-use nalgebra::{DMatrix, DVector, MatrixMN};
-use serde::{Deserialize, Serialize};
+use nalgebra::{DMatrix, DVector};
 
 const EPSILON: f64 = 1e-10;
 

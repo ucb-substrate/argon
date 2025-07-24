@@ -38,7 +38,7 @@ impl<T: AsyncWrite + Unpin> LspToGui<T> {
     }
 
     pub async fn send(&mut self, msg: LspToGuiMessage) {
-        let mut b = BytesMut::new();
+        let b = BytesMut::new();
         let mut writer = b.writer();
         serde_json::to_writer(&mut writer, &msg).unwrap();
         let msg = writer.into_inner().freeze();
