@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::TcpStream;
 use std::path::PathBuf;
 
-use compiler::compile::{CompileInput, CompiledCell, SolvedValue, compile};
+use compiler::compile::{compile, CompileInput, CompiledCell, SolvedValue};
 use compiler::parse::parse;
 use gpui::*;
 use itertools::Itertools;
@@ -34,6 +35,7 @@ pub struct ProjectState {
     pub selected_rect: Option<usize>,
     pub layers: Vec<Entity<LayerState>>,
     pub subscriptions: Vec<Subscription>,
+    pub lsp_client: Option<TcpStream>,
 }
 
 pub struct Project {
@@ -88,6 +90,7 @@ impl Project {
         path: PathBuf,
         cell: String,
         params: HashMap<String, f64>,
+        lsp_client: Option<TcpStream>,
     ) -> Self {
         let code = std::fs::read_to_string(&path).expect("failed to read file");
         let ast = parse(&code).expect("failed to parse Argon");
@@ -141,6 +144,7 @@ impl Project {
                 selected_rect: None,
                 layers,
                 subscriptions,
+                lsp_client,
             }
         });
 

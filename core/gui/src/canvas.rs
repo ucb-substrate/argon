@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
     InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -250,6 +252,13 @@ impl LayoutCanvas {
             if rect_bounds.contains(&event.position) {
                 self.state.update(cx, |state, cx| {
                     state.selected_rect = Some(i);
+                    println!("write?");
+                    if let Some(client) = &mut state.lsp_client {
+                        println!("write");
+                        client.write_all("selected rect\n".as_bytes()).unwrap();
+                        client.flush().unwrap();
+                        println!("finished write");
+                    }
                     cx.notify();
                 });
                 return;

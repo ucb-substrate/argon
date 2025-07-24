@@ -1,6 +1,7 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
+use std::net::TcpStream;
 use std::path::PathBuf;
+use std::{borrow::Cow, net::SocketAddr};
 
 use clap::Parser;
 use gpui::*;
@@ -22,6 +23,8 @@ struct Args {
     file: PathBuf,
     cell: String,
     params: Vec<String>,
+    #[arg(long)]
+    lsp_addr: Option<SocketAddr>,
 }
 
 pub fn main() {
@@ -39,6 +42,7 @@ pub fn main() {
             .expect("failed to parse param value as i64");
         params.insert(terms[0].to_string(), v);
     }
+    let lsp_client = args.lsp_addr.map(|addr| TcpStream::connect(addr).unwrap());
 
     Application::new().run(|cx: &mut App| {
         // Load fonts.
@@ -71,7 +75,7 @@ pub fn main() {
             },
             |window, cx| {
                 window.replace_root(cx, |_window, cx| {
-                    Project::new(cx, args.file, args.cell, params)
+                    Project::new(cx, args.file, args.cell, params, lsp_client)
                 })
             },
         )
