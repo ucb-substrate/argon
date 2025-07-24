@@ -30,7 +30,6 @@ pub fn compile(input: CompileInput<'_, ParseMetadata>) -> CompiledCell {
         params: input.params,
     };
     let cell = ExecPass::new().execute(input);
-    println!("{:?}", cell);
     cell
 }
 
@@ -519,6 +518,7 @@ struct ExecPass<'a> {
     false_value: ValueId,
     global_frame: FrameId,
     next_id: u64,
+    solve_iters: u64,
 }
 
 impl<'a> ExecPass<'a> {
@@ -538,6 +538,7 @@ impl<'a> ExecPass<'a> {
             false_value: 3,
             global_frame: 0,
             next_id: 4,
+            solve_iters: 0,
         }
     }
 
@@ -552,17 +553,27 @@ impl<'a> ExecPass<'a> {
 
     pub(crate) fn execute(mut self, input: CompileInput<'a, VarIdTyMetadata>) -> CompiledCell {
         self.execute_start(input);
-        self.solve();
+        let mut require_progress = false;
+        let mut progress = false;
         while !self.deferred.is_empty() {
             let deferred = self.deferred.clone();
-            let mut progress = false;
+            progress = false;
             for vid in deferred.iter().copied() {
                 progress = progress || self.eval_partial(vid);
             }
 
-            if !progress {
+            if require_progress && !progress {
                 panic!("no progress");
             }
+
+            require_progress = false;
+
+            if !progress {
+                self.solve();
+                require_progress = true;
+            }
+        }
+        if progress {
             self.solve();
         }
         CompiledCell {
@@ -579,10 +590,6 @@ impl<'a> ExecPass<'a> {
                 match value {
                     Value::Linear(l) => SolvedValue::Float(self.solver.eval_expr(l).unwrap()),
                     Value::Rect(rect) => {
-                        println!("{:?}", rect.x0);
-                        println!("{:?}", rect.y0);
-                        println!("{:?}", rect.x1);
-                        println!("{:?}", rect.y1);
                         let rect = SolvedValue::Rect(Rect {
                             layer: rect.layer.clone(),
                             x0: self.solver.value_of(rect.x0).unwrap(),
@@ -591,7 +598,6 @@ impl<'a> ExecPass<'a> {
                             y1: self.solver.value_of(rect.y1).unwrap(),
                             source: rect.source.clone(),
                         });
-                        println!("{:?}", rect);
                         rect
                     }
                     _ => unimplemented!(),
@@ -601,6 +607,7 @@ impl<'a> ExecPass<'a> {
     }
 
     fn solve(&mut self) {
+        self.solve_iters += 1;
         self.solver.solve();
     }
 
