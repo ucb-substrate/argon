@@ -1,4 +1,4 @@
 [workspace]
 
 resolver = "2"
-members = ["core/compiler", "core/gui", "core/lsp"]
+members = ["core/compiler", "core/gui", "core/lsp-server"]

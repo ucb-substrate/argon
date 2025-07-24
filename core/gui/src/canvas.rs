@@ -7,6 +7,7 @@ use gpui::{
     Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
 };
 use itertools::Itertools;
+use lsp_server::socket::{GuiToLspMessage, SelectedRectMessage};
 
 use crate::project::{LayerState, ProjectState};
 
@@ -147,8 +148,20 @@ impl Element for CanvasElement {
                         if let Some(clipped) = intersect(&rect_bounds, &bounds) {
                             let left_border =
                                 f32::clamp((rect_bounds.left().0 + 2.) - bounds.left().0, 0., 2.);
+                            let right_border =
+                                f32::clamp(bounds.right().0 - (rect_bounds.right().0 - 2.), 0., 2.);
+                            let top_border =
+                                f32::clamp((rect_bounds.top().0 + 2.) - bounds.top().0, 0., 2.);
+                            let bot_border = f32::clamp(
+                                bounds.bottom().0 - (rect_bounds.bottom().0 - 2.),
+                                0.,
+                                2.,
+                            );
                             let mut border_widths = Edges::all(Pixels(2.));
                             border_widths.left = Pixels(left_border);
+                            border_widths.right = Pixels(right_border);
+                            border_widths.top = Pixels(top_border);
+                            border_widths.bottom = Pixels(bot_border);
                             window.paint_quad(PaintQuad {
                                 bounds: clipped,
                                 corner_radii: Corners::all(Pixels(0.)),
@@ -239,7 +252,9 @@ impl LayoutCanvas {
             .iter()
             .enumerate()
             .filter(|(_, rect)| rect.layer.read(cx).visible)
-            .sorted_by_key(|(_, rect)| usize::MAX - rect.layer.read(cx).z);
+            .sorted_by_key(|(_, rect)| usize::MAX - rect.layer.read(cx).z)
+            .map(|(i, r)| (i, r.clone()))
+            .collect_vec();
         let scale = self.scale;
         let offset = self.offset;
         for (i, r) in rects {
@@ -254,9 +269,12 @@ impl LayoutCanvas {
                     state.selected_rect = Some(i);
                     println!("write?");
                     if let Some(client) = &mut state.lsp_client {
-                        println!("write");
-                        client.write_all("selected rect\n".as_bytes()).unwrap();
-                        client.flush().unwrap();
+                        let msg = GuiToLspMessage::SelectedRect(SelectedRectMessage {
+                            rect: i as u64,
+                            span: r.span,
+                        });
+                        println!("sending message {msg:?}");
+                        client.send(msg);
                         println!("finished write");
                     }
                     cx.notify();

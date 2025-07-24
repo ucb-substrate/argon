@@ -7,12 +7,14 @@ use clap::Parser;
 use gpui::*;
 use itertools::Itertools;
 use project::Project;
+use socket::GuiToLsp;
 
 use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
 
 pub mod assets;
 pub mod canvas;
 pub mod project;
+pub mod socket;
 pub mod text;
 pub mod theme;
 pub mod toolbars;
@@ -42,7 +44,9 @@ pub fn main() {
             .expect("failed to parse param value as i64");
         params.insert(terms[0].to_string(), v);
     }
-    let lsp_client = args.lsp_addr.map(|addr| TcpStream::connect(addr).unwrap());
+    let lsp_client = args
+        .lsp_addr
+        .map(|addr| GuiToLsp::new(TcpStream::connect(addr).unwrap()));
 
     Application::new().run(|cx: &mut App| {
         // Load fonts.

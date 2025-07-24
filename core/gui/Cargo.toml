@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+lsp-server = { path = "../lsp-server" }
 compiler = { path = "../compiler" }
 # gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
 gpui = { path = "../../../zed/crates/gpui" }
@@ -15,3 +16,6 @@ clap = { version = "4", features = ["derive"] }
 arcstr = "1"
 cfgrammar = { version = "0.13", features = ["serde"] }
 enumify = { version = "0.2.1", registry = "substrate" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"

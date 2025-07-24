@@ -3,15 +3,13 @@ use std::{
     ops::Sub,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use approx::{assert_abs_diff_eq, assert_relative_eq, relative_eq};
 use arcstr::ArcStr;
 use ena::unify::{InPlaceUnificationTable, UnifyKey};
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector, MatrixMN};
 use serde::{Deserialize, Serialize};
-
-type Layer = ArcStr;
 
 const EPSILON: f64 = 1e-10;
 
