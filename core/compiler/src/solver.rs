@@ -205,6 +205,6 @@ mod tests {
         solver.solve();
         assert_relative_eq!(*solver.solved_vars.get(&x).unwrap(), 5., epsilon = EPSILON);
         assert_relative_eq!(*solver.solved_vars.get(&y).unwrap(), 5., epsilon = EPSILON);
-        assert!(solver.solved_vars.get(&z).is_none());
+        assert!(!solver.solved_vars.contains_key(&z));
     }
 }

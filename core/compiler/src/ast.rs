@@ -2,6 +2,7 @@ use std::fmt::Debug;
 
 use cfgrammar::Span;
 use derive_where::derive_where;
+use itertools::Itertools;
 
 #[derive_where(Default, Debug, Clone)]
 pub struct Ast<'a, T: AstMetadata> {
@@ -307,20 +308,20 @@ pub trait AstTransformer<'a> {
         &mut self,
         input: &EnumDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
-        variants: &Vec<Ident<'a, Self::Output>>,
+        variants: &[Ident<'a, Self::Output>],
     ) -> <Self::Output as AstMetadata>::EnumDecl;
     fn dispatch_cell_decl(
         &mut self,
         input: &CellDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
-        args: &Vec<ArgDecl<'a, Self::Output>>,
-        stmts: &Vec<Statement<'a, Self::Output>>,
+        args: &[ArgDecl<'a, Self::Output>],
+        stmts: &[Statement<'a, Self::Output>],
     ) -> <Self::Output as AstMetadata>::CellDecl;
     fn dispatch_fn_decl(
         &mut self,
         input: &FnDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
-        args: &Vec<ArgDecl<'a, Self::Output>>,
+        args: &[ArgDecl<'a, Self::Output>],
         return_ty: &Ident<'a, Self::Output>,
         scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FnDecl;
@@ -393,8 +394,8 @@ pub trait AstTransformer<'a> {
     fn dispatch_args(
         &mut self,
         input: &Args<'a, Self::Input>,
-        posargs: &Vec<Expr<'a, Self::Output>>,
-        kwargs: &Vec<KwArgValue<'a, Self::Output>>,
+        posargs: &[Expr<'a, Self::Output>],
+        kwargs: &[KwArgValue<'a, Self::Output>],
     ) -> <Self::Output as AstMetadata>::Args;
     fn dispatch_kw_arg_value(
         &mut self,
@@ -411,7 +412,7 @@ pub trait AstTransformer<'a> {
     fn dispatch_scope(
         &mut self,
         input: &Scope<'a, Self::Input>,
-        stmts: &Vec<Statement<'a, Self::Output>>,
+        stmts: &[Statement<'a, Self::Output>],
         tail: &Option<Expr<'a, Self::Output>>,
     ) -> <Self::Output as AstMetadata>::Scope;
     fn enter_scope(&mut self, input: &Scope<'a, Self::Input>);
@@ -442,7 +443,7 @@ pub trait AstTransformer<'a> {
             .variants
             .iter()
             .map(|variant| self.transform_ident(variant))
-            .collect();
+            .collect_vec();
         let metadata = self.dispatch_enum_decl(input, &name, &variants);
         EnumDecl {
             name,
@@ -459,12 +460,12 @@ pub trait AstTransformer<'a> {
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
-            .collect();
+            .collect_vec();
         let stmts = input
             .stmts
             .iter()
             .map(|stmt| self.transform_statement(stmt))
-            .collect();
+            .collect_vec();
         let metadata = self.dispatch_cell_decl(input, &name, &args, &stmts);
         CellDecl {
             name,
@@ -479,7 +480,7 @@ pub trait AstTransformer<'a> {
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
-            .collect();
+            .collect_vec();
         let return_ty = self.transform_ident(&input.return_ty);
         let scope = self.transform_scope(&input.scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
@@ -649,12 +650,12 @@ pub trait AstTransformer<'a> {
             .posargs
             .iter()
             .map(|arg| self.transform_expr(arg))
-            .collect();
+            .collect_vec();
         let kwargs = input
             .kwargs
             .iter()
             .map(|arg| self.transform_kw_arg_value(arg))
-            .collect();
+            .collect_vec();
         let metadata = self.dispatch_args(input, &posargs, &kwargs);
         Args {
             posargs,
@@ -693,7 +694,7 @@ pub trait AstTransformer<'a> {
             .stmts
             .iter()
             .map(|stmt| self.transform_statement(stmt))
-            .collect();
+            .collect_vec();
         let tail = input.tail.as_ref().map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(input, &stmts, &tail);
         let output = Scope {
