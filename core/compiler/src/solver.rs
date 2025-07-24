@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use approx::{assert_abs_diff_eq, assert_relative_eq, relative_eq};
+use approx::relative_eq;
 use arcstr::ArcStr;
 use ena::unify::{InPlaceUnificationTable, UnifyKey};
 use itertools::{Either, Itertools};
@@ -193,6 +193,7 @@ impl From<f64> for LinearExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_relative_eq;
 
     #[test]
     fn linear_constraints_solved_correctly() {
