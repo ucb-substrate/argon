@@ -12,6 +12,7 @@ pub struct Ast<'a, T: AstMetadata> {
 #[derive_where(Debug, Clone)]
 pub enum Decl<'a, T: AstMetadata> {
     Enum(EnumDecl<'a, T>),
+    Struct(StructDecl<'a, T>),
     Constant(ConstantDecl<'a, T>),
     Cell(CellDecl<'a, T>),
     Fn(FnDecl<'a, T>),
