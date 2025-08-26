@@ -1,6 +1,7 @@
 %%
 
 enum "ENUM"
+struct "STRUCT"
 const "CONST"
 cell "CELL"
 if "IF"

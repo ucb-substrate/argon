@@ -15,6 +15,8 @@ pub type ParseAst<'a> = Ast<'a, ParseMetadata>;
 impl AstMetadata for ParseMetadata {
     type Ident = ();
     type EnumDecl = ();
+    type StructDecl = ();
+    type StructField = ();
     type CellDecl = ();
     type ConstantDecl = ();
     type LetBinding = ();

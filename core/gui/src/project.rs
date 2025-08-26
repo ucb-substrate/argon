@@ -80,13 +80,7 @@ fn get_rects(cx: &mut App, solved_cell: &CompiledCell, layers: &[Entity<LayerSta
 }
 
 impl Project {
-    pub fn new(
-        cx: &mut Context<Self>,
-        path: PathBuf,
-        cell: String,
-        params: HashMap<String, f64>,
-        lsp_client: Option<GuiToLsp<TcpStream>>,
-    ) -> Self {
+    pub fn new(cx: &mut Context<Self>, lsp_client: Option<GuiToLsp<TcpStream>>) -> Self {
         let code = std::fs::read_to_string(&path).expect("failed to read file");
         let ast = parse(&code).expect("failed to parse Argon");
         let params_ref = params.iter().map(|(k, v)| (k.as_str(), *v)).collect();

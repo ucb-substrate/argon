@@ -11,6 +11,7 @@ Decls -> Result<Vec<Decl<'input, ParseMetadata>>, ()>:
 
 Decl -> Result<Decl<'input, ParseMetadata>, ()>
   : EnumDecl { Ok(Decl::Enum($1?)) }
+  | StructDecl { Ok(Decl::Struct($1?)) }
   | CellDecl { Ok(Decl::Cell($1?)) }
   | FnDecl { Ok(Decl::Fn($1?)) }
   | ConstantDecl { Ok(Decl::Constant($1?)) }
@@ -43,6 +44,18 @@ EnumDecl -> Result<EnumDecl<'input, ParseMetadata>, ()>
   }
   ;
 
+StructDecl -> Result<StructDecl<'input, ParseMetadata>, ()>
+  : 'STRUCT' Ident '{' StructFields '}'
+  {
+    Ok(StructDecl {
+      name: $2?,
+      fields: $4?,
+      span: $span,
+      metadata: (),
+    })
+  }
+  ;
+
 ConstantDecl -> Result<ConstantDecl<'input, ParseMetadata>, ()>
   : 'CONST' Ident ':' Ident '=' Expr ';'
   {
@@ -62,6 +75,27 @@ EnumVariants -> Result<Vec<Ident<'input, ParseMetadata>>, ()>:
     Ok(__tmp)
   }
   | { Ok(Vec::new()) }
+  ;
+
+StructFields -> Result<Vec<Ident<'input, ParseMetadata>>, ()>:
+  StructFields StructField ',' {
+    let mut __tmp = $1?;
+    __tmp.push($2?);
+    Ok(__tmp)
+  }
+  | { Ok(Vec::new()) }
+  ;
+
+StructField -> Result<StructField<'input, ParseMetadata>, ()>
+  : Ident ':' Ident
+  {
+    Ok(StructField {
+        name: $1?,
+        ty: $3?,
+        span: $span,
+        metadata: (),
+    })
+  }
   ;
 
 CellDecl -> Result<CellDecl<'input, ParseMetadata>, ()>

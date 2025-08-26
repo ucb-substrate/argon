@@ -72,6 +72,8 @@ pub struct FnTy {
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type EnumDecl = ();
+    type StructDecl = ();
+    type StructField = ();
     type CellDecl = ();
     type ConstantDecl = ();
     type LetBinding = VarId;
