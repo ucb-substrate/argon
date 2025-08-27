@@ -77,7 +77,7 @@ EnumVariants -> Result<Vec<Ident<'input, ParseMetadata>>, ()>:
   | { Ok(Vec::new()) }
   ;
 
-StructFields -> Result<Vec<Ident<'input, ParseMetadata>>, ()>:
+StructFields -> Result<Vec<StructField<'input, ParseMetadata>>, ()>:
   StructFields StructField ',' {
     let mut __tmp = $1?;
     __tmp.push($2?);
