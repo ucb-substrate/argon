@@ -5,9 +5,8 @@ use gpui::{
     Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
 };
 use itertools::Itertools;
-use lsp_server::socket::{GuiToLspMessage, SelectedRectMessage};
 
-use crate::project::{LayerState, ProjectState};
+use crate::editor::{EditorState, LayerState};
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ShapeFill {
@@ -46,7 +45,7 @@ pub struct CanvasElement {
 pub struct LayoutCanvas {
     pub offset: Point<Pixels>,
     pub bg_style: Style,
-    pub state: Entity<ProjectState>,
+    pub state: Entity<EditorState>,
     // drag state
     is_dragging: bool,
     drag_start: Point<Pixels>,
@@ -217,7 +216,7 @@ impl Render for LayoutCanvas {
 }
 
 impl LayoutCanvas {
-    pub fn new(_cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
+    pub fn new(_cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
         LayoutCanvas {
             offset: Point::new(Pixels(0.), Pixels(0.)),
             bg_style: Style {
@@ -265,13 +264,14 @@ impl LayoutCanvas {
             if rect_bounds.contains(&event.position) {
                 self.state.update(cx, |state, cx| {
                     state.selected_rect = Some(i);
-                    if let Some(client) = &mut state.lsp_client {
-                        let msg = GuiToLspMessage::SelectedRect(SelectedRectMessage {
-                            rect: i as u64,
-                            span: r.span,
-                        });
-                        client.send(msg);
-                    }
+                    // TODO: Send message
+                    // if let Some(client) = &mut state.lsp_client {
+                    //     let msg = GuiToLspMessage::SelectedRect(SelectedRectMessage {
+                    //         rect: i as u64,
+                    //         span: r.span,
+                    //     });
+                    //     client.send(msg);
+                    // }
                     cx.notify();
                 });
                 return;

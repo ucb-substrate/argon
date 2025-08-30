@@ -4,33 +4,29 @@ use std::path::PathBuf;
 use std::{borrow::Cow, net::SocketAddr};
 
 use clap::Parser;
+use editor::Editor;
 use gpui::*;
 use itertools::Itertools;
-use project::Project;
-use socket::GuiToLsp;
+use lsp_server::rpc::GuiToLspClient;
 
 use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
 
 pub mod assets;
 pub mod editor;
 pub mod project;
-pub mod socket;
+pub mod rpc;
 pub mod theme;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    #[arg(long)]
-    lsp_addr: Option<SocketAddr>,
+    lsp_addr: SocketAddr,
 }
 
 pub fn main() {
     let args = Args::parse();
-    let lsp_client = args
-        .lsp_addr
-        .map(|addr| GuiToLsp::new(TcpStream::connect(addr).unwrap()));
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().run(move |cx: &mut App| {
         // Load fonts.
         cx.text_system()
             .add_fonts(vec![
@@ -59,7 +55,7 @@ pub fn main() {
                 }),
                 ..Default::default()
             },
-            |window, cx| window.replace_root(cx, |_window, cx| Project::new(cx, lsp_client)),
+            |window, cx| window.replace_root(cx, |_window, cx| Editor::new(cx, args.lsp_addr)),
         )
         .unwrap();
     });

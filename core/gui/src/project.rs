@@ -1,21 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 
-use compiler::compile::{CompileInput, CompiledCell, compile};
+use async_compat::CompatExt;
+use compiler::compile::{CompileInput, CompiledCell, Rect, compile};
 use compiler::parse::parse;
 use compiler::solver::Var;
 use gpui::*;
 use itertools::Itertools;
+use lsp_server::rpc::GuiToLspClient;
+use tarpc::tokio_serde::formats::Json;
 
-use crate::canvas::Rect;
-use crate::socket::GuiToLsp;
-use crate::{
-    canvas::{LayoutCanvas, ShapeFill},
-    theme::THEME,
-    toolbars::{SideBar, TitleBar, ToolBar},
-};
+use crate::rpc::SyncGuiToLspClient;
 
 type Params = Vec<(String, f64)>;
 
@@ -26,7 +23,7 @@ struct CellId {
 }
 
 /// Persistent state associated with a specific parametrization of a p-cell in a project.
-pub struct CellState {
+pub struct Cell {
     pub rects: Vec<Rect<Var>>,
     pub solved_values: Vec<(Var, f64)>,
     // TODO: Use null space vectors to allow dragging coordinates.
@@ -37,67 +34,23 @@ pub struct CellState {
 /// Persistent state of project (i.e. anything that is saved in GUI project file).
 ///
 /// GUI project file is saved in root directory of the associated Argon project.
-pub struct ProjectState {
+pub struct Project {
     pub root: PathBuf,
     pub code: String,
     /// Specific parametrizations of p-cells that have been compiled.
-    pub cells: HashMap<CellId, CellData>,
+    pub cells: HashMap<CellId, Cell>,
     /// Cells that are open in the GUI.
     pub open_cells: Vec<CellId>,
-    pub lsp_client: GuiToLsp<TcpStream>,
 }
 
 impl Project {
-    pub fn new(cx: &mut Context<Self>, lsp_client: GuiToLsp<TcpStream>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        // TODO: Get project metadata from lsp.
         Self {
-            state,
-            sidebar,
-            canvas,
+            root: PathBuf::from(""),
+            code: "".to_string(),
+            cells: HashMap::default(),
+            open_cells: Vec::new(),
         }
     }
 }
-
-impl Project {
-    fn on_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.canvas
-            .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
-        cx.notify();
-    }
-}
-
-impl Render for Project {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .font_family("Zed Plex Sans")
-            .size_full()
-            .flex()
-            .flex_col()
-            .justify_start()
-            .border_1()
-            .border_color(THEME.divider)
-            .rounded(px(10.))
-            .text_sm()
-            .text_color(rgb(0xffffff))
-            .whitespace_nowrap()
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(cx.new(|_cx| TitleBar))
-            .child(cx.new(|_cx| ToolBar))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.sidebar.clone())
-                    .child(self.canvas.clone()),
-            )
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum Event {}

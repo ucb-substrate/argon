@@ -3,10 +3,9 @@ use gpui::*;
 
 use itertools::Itertools;
 
-use crate::{
-    project::{LayerState, ProjectState},
-    theme::THEME,
-};
+use crate::theme::THEME;
+
+use super::{EditorState, LayerState};
 
 pub struct TitleBar;
 
@@ -52,7 +51,7 @@ pub struct LayerControl {
 }
 
 impl SideBar {
-    pub fn new(cx: &mut Context<Self>, state: &Entity<ProjectState>) -> Self {
+    pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
         let layers = state.read(cx).layers.iter().cloned().collect_vec();
 
         let layers = layers
