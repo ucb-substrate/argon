@@ -21,3 +21,5 @@ serde_json = "1"
 bytes = "1"
 tarpc = { version = "0.37", features = ["full"] }
 async-compat = "0.2"
+portpicker = "0.1"
+futures = "0.3"

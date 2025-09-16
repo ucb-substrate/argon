@@ -55,6 +55,13 @@ M.buf_request = function(bufnr, method, params, handler)
   return client_found
 end
 
+M.print_error = function(err)
+    if err then
+        vim.notify(tostring(err), vim.log.levels.ERROR)
+        return
+    end
+end
+
 ---@param file_path string Search for clients with a root_dir matching this file path
 ---@param method string LSP method name
 ---@return vim.lsp.Client|nil
