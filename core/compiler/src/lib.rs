@@ -32,7 +32,7 @@ mod tests {
 
     use parse::parse;
 
-    use crate::compile::{CompileInput, VarIdTyPass, compile};
+    use crate::compile::{compile, CompileInput, VarIdTyPass};
 
     use super::*;
 
@@ -64,6 +64,10 @@ cell simple(y_enclosure: int) {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/via_array.ar"
     ));
+    const ARGON_HIERARCHY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/hierarchy.ar"
+    ));
     const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
@@ -72,12 +76,14 @@ cell simple(y_enclosure: int) {
     #[test]
     fn argon_scopes() {
         let ast = parse(ARGON_SCOPES).expect("failed to parse Argon");
-        let pass = VarIdTyPass::new(&ast);
-        let x = pass.execute(CompileInput {
-            cell: "scopes",
-            params: HashMap::new(),
-        });
-        println!("{x:?}");
+        let cell = compile(
+            &ast,
+            CompileInput {
+                cell: "scopes",
+                params: HashMap::new(),
+            },
+        );
+        println!("{cell:?}");
     }
 
     #[test]
@@ -139,6 +145,19 @@ cell simple(y_enclosure: int) {
             &ast,
             CompileInput {
                 cell: "vias",
+                params: HashMap::new(),
+            },
+        );
+        println!("{cell:?}");
+    }
+
+    #[test]
+    fn argon_hierarchy() {
+        let ast = parse(ARGON_HIERARCHY).expect("failed to parse Argon");
+        let cell = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
                 params: HashMap::new(),
             },
         );

@@ -1,12 +1,13 @@
 
 cell top() {
-  let left = bot()!;
-  let right = bot()!;
+  let bot_cell = bot();
+  let left = inst(bot_cell)!;
+  let right = inst(bot_cell)!;
   eq(left.x, 0);
   eq(left.y, 0);
   eq(right.x, 100);
   eq(right.y, 0);
-  let met2 = rect(Layer::Met2, x0=left.via.x0, y0=20, x1=right.via.x1, y1=80)!;
+  let met2 = rect(Layer::Met2, x0=left.data.via.x0, y0=20, x1=right.data.via.x1, y1=80)!;
 }
 
 cell bot() {

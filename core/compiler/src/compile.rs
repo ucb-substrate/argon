@@ -22,7 +22,7 @@ use crate::{
 
 pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> CompiledCell {
     let pass = VarIdTyPass::new(ast);
-    let ast = pass.execute(input.clone());
+    let ast = pass.execute();
     let input = CompileInput {
         cell: input.cell,
         params: input.params,
@@ -48,8 +48,11 @@ pub enum Ty {
     Int,
     Rect,
     Enum,
+    Cell,
+    Inst,
     Nil,
     Fn(Box<FnTy>),
+    CellFn(Box<CellFnTy>),
 }
 
 impl Ty {
@@ -58,6 +61,8 @@ impl Ty {
             "Float" => Ty::Float,
             "Rect" => Ty::Rect,
             "Int" => Ty::Int,
+            "Cell" => Ty::Cell,
+            "Inst" => Ty::Inst,
             name => panic!("invalid type: {name}"),
         }
     }
@@ -67,6 +72,11 @@ impl Ty {
 pub struct FnTy {
     args: Vec<Ty>,
     ret: Ty,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct CellFnTy {
+    args: Vec<Ty>,
 }
 
 impl AstMetadata for VarIdTyMetadata {
@@ -121,42 +131,32 @@ impl<'a> VarIdTyPass<'a> {
         id
     }
 
-    pub(crate) fn execute(mut self, input: CompileInput<'a>) -> Ast<'a, VarIdTyMetadata> {
+    pub(crate) fn execute(mut self) -> Ast<'a, VarIdTyMetadata> {
         let mut decls = Vec::new();
         for decl in &self.ast.decls {
-            if let Decl::Fn(f) = decl {
-                decls.push(Decl::Fn(self.transform_fn_decl(f)));
+            match decl {
+                Decl::Fn(f) => {
+                    decls.push(Decl::Fn(self.transform_fn_decl(f)));
+                }
+                Decl::Cell(c) => {
+                    decls.push(Decl::Cell(CellDecl {
+                        name: self.transform_ident(&c.name),
+                        args: c
+                            .args
+                            .iter()
+                            .map(|arg| self.transform_arg_decl(arg))
+                            .collect(),
+                        stmts: c
+                            .stmts
+                            .iter()
+                            .map(|stmt| self.transform_statement(stmt))
+                            .collect(),
+                        metadata: (),
+                    }));
+                }
+                _ => todo!(),
             }
         }
-        let cell = self
-            .ast
-            .decls
-            .iter()
-            .find_map(|d| match d {
-                Decl::Cell(
-                    v @ CellDecl {
-                        name: Ident { name, .. },
-                        ..
-                    },
-                ) if *name == input.cell => Some(v),
-                _ => None,
-            })
-            .expect("top cell not found");
-
-        decls.push(Decl::Cell(CellDecl {
-            name: self.transform_ident(&cell.name),
-            args: cell
-                .args
-                .iter()
-                .map(|arg| self.transform_arg_decl(arg))
-                .collect(),
-            stmts: cell
-                .stmts
-                .iter()
-                .map(|stmt| self.transform_statement(stmt))
-                .collect(),
-            metadata: (),
-        }));
 
         Ast { decls }
     }
@@ -497,7 +497,7 @@ pub struct Rect<T> {
 
 type FrameId = u64;
 type ValueId = u64;
-type CellId = u64;
+pub type CellId = u64;
 type CellValueId = (CellId, ValueId);
 
 #[derive(Clone, Default)]
@@ -565,17 +565,16 @@ impl<'a> ExecPass<'a> {
     ) -> CompiledCell {
         let cell_id = self.alloc_id();
         self.partial_cells.push_back(cell_id);
-        assert!(
-            self.cell_states
-                .insert(
-                    cell_id,
-                    CellState {
-                        solve_iters: 0,
-                        solver: Solver::new()
-                    }
-                )
-                .is_none()
-        );
+        assert!(self
+            .cell_states
+            .insert(
+                cell_id,
+                CellState {
+                    solve_iters: 0,
+                    solver: Solver::new()
+                }
+            )
+            .is_none());
         self.execute_start(cell_id, cell, params);
         let mut require_progress = false;
         let mut progress = false;
@@ -1173,7 +1172,53 @@ pub enum Value<'a> {
     Rect(Rect<Var>),
     Bool(bool),
     Fn(FnDecl<'a, VarIdTyMetadata>),
+    /// A cell generator.
+    ///
+    /// Example:
+    /// ```
+    /// cell mycell() {
+    ///   // ...
+    /// }
+    /// ```
+    ///
+    /// `mycell` is a value of type `CellFn`.
+    CellFn(CellDecl<'a, VarIdTyMetadata>),
+    /// A particular parameterization of a cell.
+    ///
+    /// Example:
+    /// ```
+    /// cell mycell() {
+    ///   // ...
+    /// }
+    ///
+    /// let val = mycell();
+    /// ```
+    ///
+    /// `val` is a value of type `CellValue`.
+    CellValue,
+    /// An instantiation of a cell value.
+    ///
+    /// Example:
+    /// ```
+    /// cell mycell() {
+    ///   // ...
+    /// }
+    ///
+    /// let mycell_inst = inst(mycell(), x=0, y=0);
+    /// ```
+    ///
+    /// `mycell_inst` is a value of type `Instance`.
+    Instance,
     None,
+}
+
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub x: f64,
+    pub y: f64,
+    pub angle: f64,
+    pub reflect: bool,
+    pub cell: CellId,
 }
 
 #[enumify]
@@ -1181,6 +1226,7 @@ pub enum Value<'a> {
 pub enum SolvedValue {
     Float(f64),
     Rect(Rect<f64>),
+    Instance(Instance),
 }
 
 #[derive(Debug, Clone)]
