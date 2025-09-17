@@ -1,40 +1,49 @@
-use std::io::{self, BufRead, Write};
-
+use clap::Parser;
+use compile::CompileInput;
+use std::path::PathBuf;
 
 pub mod ast;
 pub mod compile;
 pub mod parse;
 pub mod solver;
 
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    file: PathBuf,
+    cell: String,
+}
+
 pub fn main() {
-    let stdin = io::stdin();
-    loop {
-        print!(">>> ");
-        io::stdout().flush().ok();
-        match stdin.lock().lines().next() {
-            Some(Ok(ref l)) => {
-                if l.trim().is_empty() {
-                    continue;
-                }
-                let res = parse::parse(l);
-                match res {
-                    Ok(r) => println!("Result: {r:?}"),
-                    _ => eprintln!("Unable to evaluate expression."),
-                }
-            }
-            _ => break,
-        }
-    }
+    let args = Args::parse();
+    let f = std::fs::read_to_string(&args.file).unwrap();
+    let ast = parse::parse(&f).unwrap();
+    let cell_ast = parse::parse_cell(&args.cell).unwrap();
+    let o = compile::compile(CompileInput {
+        ast: &ast,
+        cell: cell_ast.func.name,
+        params: cell_ast
+            .args
+            .posargs
+            .iter()
+            .map(|arg| match arg {
+                ast::Expr::FloatLiteral(float_literal) => float_literal.value,
+                ast::Expr::IntLiteral(int_literal) => int_literal.value as f64,
+                _ => panic!("must be int or float literal for now"),
+            })
+            .collect(),
+    });
+    println!("{}", serde_json::to_string(&o).unwrap());
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    
     use parse::parse;
 
-    use crate::compile::{CompileInput, VarIdTyPass, compile};
+    use crate::compile::{compile, CompileInput, VarIdTyPass};
 
     use super::*;
 

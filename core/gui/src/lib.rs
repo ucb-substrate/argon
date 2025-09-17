@@ -53,6 +53,7 @@ pub fn main() {
                     appears_transparent: true,
                     traffic_light_position: None,
                 }),
+                focus: false,
                 ..Default::default()
             },
             |window, cx| window.replace_root(cx, |_window, cx| Editor::new(cx, args.lsp_addr)),

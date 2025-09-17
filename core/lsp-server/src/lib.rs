@@ -2,26 +2,21 @@ pub mod rpc;
 
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
     process::Command,
     sync::Arc,
 };
 
-use futures::{future, prelude::*};
+use compiler::compile::CompiledCell;
+use futures::prelude::*;
 use portpicker::pick_unused_port;
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use tarpc::{
-    context,
     server::{self, incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
-use tokio::net::TcpListener;
-use tokio::sync::OnceCell;
-use tokio::time;
-use tokio::{
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
-    sync::Mutex,
-};
+use tokio::sync::Mutex;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -111,30 +106,59 @@ impl LanguageServer for Backend {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct OpenCellParams {
+    file: PathBuf,
+    cell: String,
+}
+
 impl Backend {
     async fn start_gui(&self) -> Result<()> {
         self.state
             .editor_client
             .show_message(MessageType::INFO, "Starting the GUI...")
             .await;
-        let server_addr = self.state.server_addr.clone();
+        let server_addr = self.state.server_addr;
+
         tokio::spawn(async move {
             Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../target/debug/gui"
             ))
-            .arg(format!("{}", server_addr))
+            .arg(format!("{server_addr}"))
             .spawn()
             .unwrap()
-            .wait();
+            .wait()
+            .unwrap();
         });
+
         Ok(())
     }
-    async fn open_cell(&self, cell: String) -> Result<()> {
+    async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
         self.state
             .editor_client
-            .show_message(MessageType::INFO, format!("Opening cell {cell}"))
+            .show_message(MessageType::INFO, format!("Opening cell {}", params.cell))
             .await;
+        let editor_client = self.state.editor_client.clone();
+        tokio::spawn(async move {
+            let o = Command::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/debug/compiler"
+            ))
+            .arg(params.file)
+            .arg(params.cell)
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+            let o_str = String::from_utf8(o.stdout).unwrap();
+            let stderr_str = String::from_utf8(o.stderr).unwrap();
+            editor_client.show_message(MessageType::INFO, &o_str).await;
+            editor_client
+                .show_message(MessageType::ERROR, &stderr_str)
+                .await;
+            let o: CompiledCell = serde_json::from_str(&o_str).unwrap();
+        });
         Ok(())
     }
 }

@@ -1,20 +1,16 @@
-
-
 cell via() {
     let via = rect(Layer::Via1)!;
     let met1 = rect(Layer::Met1)!;
-    eq(via.h, 40);
-    eq(via.w, if met1.w < 20 {
-        10
+    eq(via.h, 40.);
+    eq(via.w, if met1.w < 20. {
+        10.
     } else {
-        20
+        20.
     });
-    eq(met1.x0, 0);
-    eq(met1.x1, 100);
-    eq(met1.y0, 0);
-    eq(met1.y1, 100);
+    eq(met1.x0, 0.);
+    eq(met1.x1, 100.);
+    eq(met1.y0, 0.);
+    eq(met1.y1, 100.);
     eq(via.x0 - met1.x0, met1.x1 - via.x1);
     eq(via.y0 - met1.y0, met1.y1 - via.y1);
 }
-
-

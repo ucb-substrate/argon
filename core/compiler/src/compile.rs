@@ -475,7 +475,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 pub struct CompileInput<'a, T: AstMetadata> {
     pub ast: &'a Ast<'a, T>,
     pub cell: &'a str,
-    pub params: HashMap<&'a str, f64>,
+    pub params: Vec<f64>,
 }
 
 pub type ScopeId = u64;
@@ -1130,13 +1130,13 @@ pub enum Value<'a> {
 }
 
 #[enumify]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Float(f64),
     Rect(Rect<f64>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCell {
     pub values: Vec<SolvedValue>,
 }

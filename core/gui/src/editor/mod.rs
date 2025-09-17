@@ -15,6 +15,7 @@ use crate::{project::Project, rpc::SyncGuiToLspClient, theme::THEME};
 pub mod canvas;
 pub mod toolbars;
 
+#[derive(Clone)]
 pub struct LayerState {
     pub name: String,
     pub color: Rgba,
@@ -28,7 +29,7 @@ pub struct EditorState {
     pub solved_cell: CompiledCell,
     pub rects: Vec<canvas::Rect>,
     pub selected_rect: Option<usize>,
-    pub layers: Vec<Entity<LayerState>>,
+    pub layers: Entity<Vec<LayerState>>,
     pub lsp_client: SyncGuiToLspClient,
     pub subscriptions: Vec<Subscription>,
 }
@@ -40,37 +41,27 @@ pub struct Editor {
     pub canvas: Entity<LayoutCanvas>,
 }
 
-fn get_rects(
-    cx: &mut App,
-    solved_cell: &CompiledCell,
-    layers: &[Entity<LayerState>],
-) -> Vec<canvas::Rect> {
+fn get_rects(solved_cell: &CompiledCell, layers: &[LayerState]) -> Vec<canvas::Rect> {
     solved_cell
         .values
         .iter()
         .filter_map(|v| v.get_rect().cloned())
         .flat_map(|rect| {
             let mut rects = Vec::new();
-            let layer = layers
-                .iter()
-                .map(|layer| (layer.clone(), layer.read(cx)))
-                .find(|(_, layer)| {
-                    if let Some(rect_layer) = &rect.layer {
-                        &layer.name == rect_layer
-                    } else {
-                        false
-                    }
-                });
-            if let Some((id, layer)) = layer {
+            let layer = layers.iter().enumerate().find(|(_, layer)| {
+                if let Some(rect_layer) = &rect.layer {
+                    &layer.name == rect_layer
+                } else {
+                    false
+                }
+            });
+            if let Some((id, _)) = layer {
                 rects.push(canvas::Rect {
                     x0: rect.x0 as f32,
                     y0: rect.y0 as f32,
                     x1: rect.x1 as f32,
                     y1: rect.y1 as f32,
-                    color: layer.color,
-                    fill: layer.fill,
-                    border_color: layer.border_color,
-                    layer: id.clone(),
+                    layer: id,
                     span: rect.source.clone().map(|info| info.span),
                 });
             }
@@ -81,7 +72,7 @@ fn get_rects(
 
 impl Editor {
     pub fn new(cx: &mut Context<Self>, lsp_addr: SocketAddr) -> Self {
-        let lsp_client = SyncGuiToLspClient::new(cx.background_executor().clone(), lsp_addr);
+        let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
         let solved_cell = CompiledCell {
             values: vec![
                 SolvedValue::Rect(Rect {
@@ -124,27 +115,20 @@ impl Editor {
                 name.hash(&mut s);
                 let hash = s.finish() as usize;
                 let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-                cx.new(|_cx| LayerState {
+                LayerState {
                     name,
                     color,
                     fill: ShapeFill::Stippling,
                     border_color: color,
                     visible: true,
                     z,
-                })
+                }
             })
             .collect();
-        let rects = get_rects(cx, &solved_cell, &layers);
+        let rects = get_rects(&solved_cell, &layers);
+        let layers = cx.new(|_cx| layers);
         let state = cx.new(|cx| {
-            let subscriptions = layers
-                .iter()
-                .map(|layer| {
-                    cx.observe(layer, |_, _, cx| {
-                        println!("project notified");
-                        cx.notify();
-                    })
-                })
-                .collect();
+            let subscriptions = vec![cx.observe(&layers, |_, _, cx| cx.notify())];
             EditorState {
                 solved_cell: solved_cell.clone(),
                 rects,

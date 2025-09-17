@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 
 use async_compat::CompatExt;
-use compiler::compile::{CompileInput, CompiledCell, Rect, compile};
+use compiler::compile::{compile, CompileInput, CompiledCell, Rect};
 use compiler::parse::parse;
 use compiler::solver::Var;
 use gpui::*;

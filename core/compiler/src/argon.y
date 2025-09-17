@@ -331,6 +331,5 @@ PosArgsNoComma -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
   ;
 %%
 
-use cfgrammar::Span;
 use crate::ast::*;
 use crate::parse::ParseMetadata;

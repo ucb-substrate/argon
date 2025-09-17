@@ -1,8 +1,9 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use async_compat::CompatExt;
+use compiler::compile::CompiledCell;
 use futures::{future, prelude::*};
-use gpui::{BackgroundExecutor, ForegroundExecutor};
+use gpui::{AsyncApp, BackgroundExecutor, ForegroundExecutor};
 use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
@@ -12,13 +13,13 @@ use tarpc::{
 };
 
 pub struct SyncGuiToLspClient {
-    executor: BackgroundExecutor,
+    app: AsyncApp,
     client: GuiToLspClient,
 }
 
 impl SyncGuiToLspClient {
-    pub fn new(executor: BackgroundExecutor, lsp_addr: SocketAddr) -> Self {
-        let client = executor.block(
+    pub fn new(app: AsyncApp, lsp_addr: SocketAddr) -> Self {
+        let client = app.background_executor().block(
             async move {
                 let mut transport = tarpc::serde_transport::tcp::connect(lsp_addr, Json::default);
                 transport.config_mut().max_frame_length(usize::MAX);
@@ -34,8 +35,8 @@ impl SyncGuiToLspClient {
             }
         };
         let server_addr = (IpAddr::V6(Ipv6Addr::LOCALHOST), port).into();
-        let executor_clone = executor.clone();
-        executor
+        let background_executor = app.background_executor().clone();
+        app.background_executor()
             .spawn(
                 async move {
                     let mut listener =
@@ -55,7 +56,7 @@ impl SyncGuiToLspClient {
                             let server = GuiServer;
                             channel
                                 .execute(server.serve())
-                                .for_each(|t| executor_clone.spawn(t))
+                                .for_each(|t| background_executor.spawn(t))
                         })
                         // Max 10 channels.
                         .buffer_unordered(10)
@@ -66,7 +67,7 @@ impl SyncGuiToLspClient {
             )
             .detach();
         let client_clone = client.clone();
-        executor.block(
+        app.background_executor().block(
             async move {
                 client_clone
                     .register(context::current(), server_addr)
@@ -75,7 +76,7 @@ impl SyncGuiToLspClient {
             }
             .compat(),
         );
-        Self { executor, client }
+        Self { app, client }
     }
 }
 
@@ -83,7 +84,5 @@ impl SyncGuiToLspClient {
 pub struct GuiServer;
 
 impl LspToGui for GuiServer {
-    async fn bye(self, _: context::Context, name: String) -> String {
-        format!("Bye, {name}!")
-    }
+    async fn open_cell(self, _: context::Context, cell: CompiledCell) {}
 }

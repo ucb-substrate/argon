@@ -1,8 +1,8 @@
 use gpui::{
-    BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
-    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
-    Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
+    div, pattern_slash, rgb, rgba, solid_background, BorderStyle, Bounds, Context, Corners,
+    DefiniteLength, DragMoveEvent, Edges, Element, Entity, InteractiveElement, IntoElement, Length,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels,
+    Point, Render, Rgba, ScrollWheelEvent, Size, Style, Styled, Subscription, Window,
 };
 use itertools::Itertools;
 
@@ -20,10 +20,7 @@ pub struct Rect {
     pub x1: f32,
     pub y0: f32,
     pub y1: f32,
-    pub color: Rgba,
-    pub fill: ShapeFill,
-    pub border_color: Rgba,
-    pub layer: Entity<LayerState>,
+    pub layer: usize,
     pub span: Option<cfgrammar::Span>,
 }
 
@@ -119,9 +116,13 @@ impl Element for CanvasElement {
             .rects
             .clone()
             .into_iter()
+            .map(|rect| {
+                let layer = inner.state.read(cx).layers.read(cx)[rect.layer].clone();
+                (rect, layer)
+            })
             .enumerate()
-            .filter(|(_, rect)| rect.layer.read(cx).visible)
-            .sorted_by_key(|(_, rect)| rect.layer.read(cx).z)
+            .filter(|(_, (_, layer))| layer.visible)
+            .sorted_by_key(|(_, (_, layer))| layer.z)
             .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
@@ -131,16 +132,16 @@ impl Element for CanvasElement {
             .paint(bounds, window, cx, |window, cx| {
                 window.paint_layer(bounds, |window| {
                     let mut selected_quad = None;
-                    for (i, r) in rects {
+                    for (i, (r, l)) in rects {
                         let rect_bounds = Bounds::new(
                             Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
                                 + offset
                                 + bounds.origin,
                             Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
                         );
-                        let background = match r.fill {
-                            ShapeFill::Solid => solid_background(r.color),
-                            ShapeFill::Stippling => pattern_slash(r.color.into(), 1., 9.),
+                        let background = match l.fill {
+                            ShapeFill::Solid => solid_background(l.color),
+                            ShapeFill::Stippling => pattern_slash(l.color.into(), 1., 9.),
                         };
                         if let Some(clipped) = intersect(&rect_bounds, &bounds) {
                             let left_border =
@@ -164,7 +165,7 @@ impl Element for CanvasElement {
                                 corner_radii: Corners::all(Pixels(0.)),
                                 background,
                                 border_widths,
-                                border_color: r.border_color.into(),
+                                border_color: l.border_color.into(),
                                 border_style: BorderStyle::Solid,
                             });
                             if let Some(selected_rect) =
@@ -247,14 +248,18 @@ impl LayoutCanvas {
             .read(cx)
             .rects
             .iter()
+            .map(|rect| {
+                let layer = self.state.read(cx).layers.read(cx)[rect.layer].clone();
+                (rect, layer)
+            })
             .enumerate()
-            .filter(|(_, rect)| rect.layer.read(cx).visible)
-            .sorted_by_key(|(_, rect)| usize::MAX - rect.layer.read(cx).z)
+            .filter(|(_, (_, layer))| layer.visible)
+            .sorted_by_key(|(_, (_, layer))| usize::MAX - layer.z)
             .map(|(i, r)| (i, r.clone()))
             .collect_vec();
         let scale = self.scale;
         let offset = self.offset;
-        for (i, r) in rects {
+        for (i, (r, _)) in rects {
             let rect_bounds = Bounds::new(
                 Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
                     + offset
