@@ -1,0 +1,15 @@
+fn first(x: Float) -> Float {
+    x + second(x)
+}
+
+fn second(x: Float) -> Float {
+    2 * x
+}
+
+cell test() {
+    let shape = rect(Layer::Met1)!;
+    eq(shape.x0, 0.);
+    eq(shape.y0, 0.);
+    eq(shape.y1, 100);
+    eq(shape.x1, first(shape.y1));
+}

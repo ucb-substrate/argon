@@ -32,7 +32,7 @@ mod tests {
 
     use parse::parse;
 
-    use crate::compile::{compile, CompileInput, VarIdTyPass};
+    use crate::compile::{CompileInput, VarIdTyPass, compile};
 
     use super::*;
 
@@ -63,6 +63,10 @@ cell simple(y_enclosure: int) {
     const ARGON_VIA_ARRAY: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/via_array.ar"
+    ));
+    const ARGON_FUNC_OUT_OF_ORDER: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/func_out_of_order.ar"
     ));
     const ARGON_HIERARCHY: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -145,6 +149,19 @@ cell simple(y_enclosure: int) {
             &ast,
             CompileInput {
                 cell: "vias",
+                params: HashMap::new(),
+            },
+        );
+        println!("{cell:?}");
+    }
+
+    #[test]
+    fn argon_func_out_of_order() {
+        let ast = parse(ARGON_FUNC_OUT_OF_ORDER).expect("failed to parse Argon");
+        let cell = compile(
+            &ast,
+            CompileInput {
+                cell: "test",
                 params: HashMap::new(),
             },
         );

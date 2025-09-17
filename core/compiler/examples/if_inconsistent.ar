@@ -1,17 +1,17 @@
 cell if_test() {
-  let x = 1.0;
-  let y = float();
+  let x0 = 1.0;
+  let y0 = float();
   let z = float();
-  let w = if y < 2.0 {
+  let w = if y0 < 2.0 {
     eq(z, 5.0);
-    let tmp = if y < 2.0 { x } else { 2.0 };
+    let tmp = if y0 < 2.0 { x0 } else { 2.0 };
     1.0
   } else {
     eq(z, 3.0);
     2.0
   };
-  eq(x, y);
+  eq(x0, y0);
 
-  let a = if x < 2.0 { 3.0 } else { 4.0 };
+  let a = if x0 < 2.0 { 3.0 } else { 4.0 };
   eq(a, 5.0);
 }

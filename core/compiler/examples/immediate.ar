@@ -1,4 +1,4 @@
 cell immediate() {
-  let x = 1;
-  let y = 2;
+  let x0 = 1;
+  let y0 = 2;
 }

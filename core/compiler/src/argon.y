@@ -99,12 +99,12 @@ StructField -> Result<StructField<'input, ParseMetadata>, ()>
   ;
 
 CellDecl -> Result<CellDecl<'input, ParseMetadata>, ()>
-  : 'CELL' Ident '(' ArgDecls ')' '{' Statements '}'
+  : 'CELL' Ident '(' ArgDecls ')' Scope
   {
     Ok(CellDecl {
       name: $2?,
       args: $4?,
-      stmts: $7?,
+      scope: $6?,
       metadata: (),
     })
   }
