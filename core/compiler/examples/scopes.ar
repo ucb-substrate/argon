@@ -1,10 +1,10 @@
 cell scopes() {
-  let x = 1;
-  let y = 2;
-  let z = x + y;
+  let x0 = 1.0;
+  let y0 = 2.0;
+  let z = x0 + y0;
   let w = {
-    let tmp = z + x;
+    let tmp = z + x0;
     tmp
   };
-  Rect(Layer::Met1, x0=x, y0=y, w=z, h=w)!;
+  rect(Layer::Met1, x0=x0, y0=y0, w=z, h=w)!;
 }

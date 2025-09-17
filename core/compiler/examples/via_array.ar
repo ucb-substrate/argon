@@ -1,9 +1,3 @@
-enum Layer {
-	Met1,
-	Via1,
-	Met2,
-}
-
 fn max(x0: Float, x1: Float) -> Float {
   if x0 < x1 {
     x1

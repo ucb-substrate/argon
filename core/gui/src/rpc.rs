@@ -8,7 +8,7 @@ use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
     context,
-    server::{self, incoming::Incoming, Channel},
+    server::{self, Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
 

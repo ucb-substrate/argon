@@ -121,6 +121,26 @@ impl LinearExpr {
     }
 }
 
+impl std::ops::Add<f64> for LinearExpr {
+    type Output = Self;
+    fn add(self, rhs: f64) -> Self::Output {
+        Self {
+            coeffs: self.coeffs,
+            constant: self.constant + rhs,
+        }
+    }
+}
+
+impl std::ops::Sub<f64> for LinearExpr {
+    type Output = Self;
+    fn sub(self, rhs: f64) -> Self::Output {
+        Self {
+            coeffs: self.coeffs,
+            constant: self.constant - rhs,
+        }
+    }
+}
+
 impl std::ops::Add<LinearExpr> for LinearExpr {
     type Output = Self;
     fn add(self, rhs: LinearExpr) -> Self::Output {

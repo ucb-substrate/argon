@@ -100,6 +100,7 @@ impl Editor {
                     source: None,
                 }),
             ],
+            fields: Default::default(),
         };
         let layers: HashSet<_> = solved_cell
             .values

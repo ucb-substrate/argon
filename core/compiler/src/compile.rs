@@ -2,9 +2,8 @@
 //!
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
-use derive_where::derive_where;
 use enumify::enumify;
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -20,19 +19,19 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-pub fn compile(input: CompileInput<'_, ParseMetadata>) -> CompiledCell {
-    let pass = VarIdTyPass::new();
-    let ast = pass.execute(input.clone());
+pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> CompiledCell {
+    let pass = VarIdTyPass::new(ast);
+    let ast = pass.execute();
     let input = CompileInput {
-        ast: &ast,
         cell: input.cell,
         params: input.params,
     };
 
-    ExecPass::new().execute(input)
+    ExecPass::new(&ast).execute(input)
 }
 
 pub(crate) struct VarIdTyPass<'a> {
+    ast: &'a Ast<'a, ParseMetadata>,
     next_id: VarId,
     bindings: Vec<HashMap<&'a str, (VarId, Ty)>>,
 }
@@ -41,15 +40,18 @@ pub(crate) struct VarIdTyPass<'a> {
 pub struct VarIdTyMetadata;
 
 #[enumify]
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ty {
     Bool,
     Float,
     Int,
     Rect,
     Enum,
+    Cell(Box<CellTy>),
+    Inst(Box<CellTy>),
     Nil,
     Fn(Box<FnTy>),
+    CellFn(Box<CellFnTy>),
 }
 
 impl Ty {
@@ -63,10 +65,21 @@ impl Ty {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnTy {
     args: Vec<Ty>,
     ret: Ty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellFnTy {
+    args: Vec<Ty>,
+    data: HashMap<String, Ty>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellTy {
+    data: HashMap<String, Ty>,
 }
 
 impl AstMetadata for VarIdTyMetadata {
@@ -74,7 +87,7 @@ impl AstMetadata for VarIdTyMetadata {
     type EnumDecl = ();
     type StructDecl = ();
     type StructField = ();
-    type CellDecl = ();
+    type CellDecl = VarId;
     type ConstantDecl = ();
     type LetBinding = VarId;
     type FnDecl = VarId;
@@ -96,8 +109,9 @@ impl AstMetadata for VarIdTyMetadata {
 }
 
 impl<'a> VarIdTyPass<'a> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ast: &'a Ast<'a, ParseMetadata>) -> Self {
         Self {
+            ast,
             // allocate space for the global namespace
             bindings: vec![HashMap::new()],
             next_id: 1,
@@ -120,45 +134,19 @@ impl<'a> VarIdTyPass<'a> {
         id
     }
 
-    pub(crate) fn execute(
-        mut self,
-        input: CompileInput<'a, ParseMetadata>,
-    ) -> Ast<'a, VarIdTyMetadata> {
+    pub(crate) fn execute(mut self) -> Ast<'a, VarIdTyMetadata> {
         let mut decls = Vec::new();
-        for decl in &input.ast.decls {
-            if let Decl::Fn(f) = decl {
-                decls.push(Decl::Fn(self.transform_fn_decl(f)));
+        for decl in &self.ast.decls {
+            match decl {
+                Decl::Fn(f) => {
+                    decls.push(Decl::Fn(self.transform_fn_decl(f)));
+                }
+                Decl::Cell(c) => {
+                    decls.push(Decl::Cell(self.transform_cell_decl(c)));
+                }
+                _ => todo!(),
             }
         }
-        let cell = input
-            .ast
-            .decls
-            .iter()
-            .find_map(|d| match d {
-                Decl::Cell(
-                    v @ CellDecl {
-                        name: Ident { name, .. },
-                        ..
-                    },
-                ) if *name == input.cell => Some(v),
-                _ => None,
-            })
-            .expect("top cell not found");
-
-        decls.push(Decl::Cell(CellDecl {
-            name: self.transform_ident(&cell.name),
-            args: cell
-                .args
-                .iter()
-                .map(|arg| self.transform_arg_decl(arg))
-                .collect(),
-            stmts: cell
-                .stmts
-                .iter()
-                .map(|stmt| self.transform_statement(stmt))
-                .collect(),
-            metadata: (),
-        }));
 
         Ast { decls }
     }
@@ -214,11 +202,13 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     fn dispatch_cell_decl(
         &mut self,
         _input: &CellDecl<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
+        name: &Ident<'a, Self::Output>,
         _args: &[ArgDecl<'a, Self::Output>],
-        _stmts: &[Statement<'a, Self::Output>],
+        _scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::CellDecl {
         // TODO: Argument checks
+        // UNUSED
+        self.lookup(name.name).unwrap().0
     }
 
     fn dispatch_fn_decl(
@@ -234,7 +224,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     }
 
     fn transform_fn_decl(&mut self, input: &FnDecl<'a, Self::Input>) -> FnDecl<'a, Self::Output> {
-        assert!(!["crect", "rect", "float"].contains(&input.name.name));
+        assert!(!["crect", "rect", "float", "eq", "inst"].contains(&input.name.name));
         let args: Vec<_> = input
             .args
             .iter()
@@ -253,6 +243,48 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             args,
             return_ty,
             scope,
+            metadata: vid,
+        }
+    }
+
+    fn transform_cell_decl(
+        &mut self,
+        input: &CellDecl<'a, Self::Input>,
+    ) -> CellDecl<'a, Self::Output> {
+        assert!(!["crect", "rect", "float", "inst"].contains(&input.name.name));
+        let args: Vec<_> = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
+        let scope = self.transform_scope(&input.scope);
+        assert!(
+            scope.tail.is_none(),
+            "cells must not have an expression in tail position"
+        );
+        let ty = Ty::CellFn(Box::new(CellFnTy {
+            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            data: scope
+                .stmts
+                .iter()
+                .filter_map(|stmt| {
+                    if let Statement::LetBinding(lt) = stmt {
+                        if ["x", "y"].contains(&lt.name.name) {
+                            panic!("duplicate declaration of name `{}` (fields x and y are built-ins for cells)", lt.name.name);
+                        }
+                        Some((lt.name.name.to_string(), lt.value.ty()))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }));
+        let vid = self.alloc(input.name.name, ty);
+        let name = self.transform_ident(&input.name);
+        CellDecl {
+            name,
+            scope,
+            args,
             metadata: vid,
         }
     }
@@ -331,13 +363,22 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         base: &Expr<'a, Self::Output>,
         field: &Ident<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FieldAccessExpr {
-        // TODO: For now, only rects can have their float fields accessed.
         let base_ty = base.ty();
-        assert_eq!(base_ty, Ty::Rect);
-        match field.name {
-            "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
-            "layer" => Ty::Enum,
-            _ => panic!("invalid field access"),
+        match base_ty {
+            Ty::Rect => match field.name {
+                "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
+                "layer" => Ty::Enum,
+                _ => panic!("invalid field access"),
+            },
+            Ty::Inst(c) => match field.name {
+                "x" | "y" => Ty::Float,
+                name => c
+                    .data
+                    .get(name)
+                    .unwrap_or_else(|| panic!("no field `{name}` on cell instance"))
+                    .clone(),
+            },
+            ty => panic!("cannot access fields of object of type {ty:?}"),
         }
     }
 
@@ -381,17 +422,44 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                 assert_eq!(args.posargs[1].ty(), Ty::Float);
                 (None, Ty::Nil)
             }
+            "inst" => {
+                assert_eq!(args.posargs.len(), 1);
+                assert!(args.kwargs.is_empty());
+                assert!(matches!(args.posargs[0].ty(), Ty::Cell(_)));
+                if let Ty::Cell(c) = args.posargs[0].ty() {
+                    (None, Ty::Inst(c.clone()))
+                } else {
+                    panic!("the argument to inst must be a cell");
+                }
+            }
             name => {
                 let (varid, ty) = self
                     .lookup(name)
-                    .unwrap_or_else(|| panic!("no function named `{name}`"));
-                let ty = ty.unwrap_fn();
-                assert_eq!(args.posargs.len(), ty.args.len());
-                for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                    assert_eq!(&arg.ty(), arg_ty);
+                    .unwrap_or_else(|| panic!("no function or cell named `{name}`"));
+                match ty {
+                    Ty::Fn(ty) => {
+                        assert_eq!(args.posargs.len(), ty.args.len());
+                        for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
+                            assert_eq!(&arg.ty(), arg_ty);
+                        }
+                        assert!(args.kwargs.is_empty());
+                        (Some(varid), ty.ret.clone())
+                    }
+                    Ty::CellFn(ty) => {
+                        assert_eq!(args.posargs.len(), ty.args.len());
+                        for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
+                            assert_eq!(&arg.ty(), arg_ty);
+                        }
+                        assert!(args.kwargs.is_empty());
+                        (
+                            Some(varid),
+                            Ty::Cell(Box::new(CellTy {
+                                data: ty.data.clone(),
+                            })),
+                        )
+                    }
+                    ty => panic!("cannot invoke an object of type {ty:?}"),
                 }
-                assert!(args.kwargs.is_empty());
-                (Some(varid), ty.ret.clone())
             }
         }
     }
@@ -471,9 +539,8 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     }
 }
 
-#[derive_where(Debug, Clone)]
-pub struct CompileInput<'a, T: AstMetadata> {
-    pub ast: &'a Ast<'a, T>,
+#[derive(Debug, Clone)]
+pub struct CompileInput<'a> {
     pub cell: &'a str,
     pub params: Vec<f64>,
 }
@@ -500,6 +567,8 @@ pub struct Rect<T> {
 
 type FrameId = u64;
 type ValueId = u64;
+pub type CellId = u64;
+type CellValueId = (CellId, ValueId);
 
 #[derive(Clone, Default)]
 struct Frame {
@@ -507,35 +576,51 @@ struct Frame {
     parent: Option<FrameId>,
 }
 
-struct ExecPass<'a> {
+struct CellState {
+    solve_iters: u64,
     solver: Solver,
-    values: HashMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
-    deferred: IndexSet<ValueId>,
+    fields: HashMap<String, ValueId>,
     emit: Vec<ValueId>,
+    deferred: IndexSet<ValueId>,
+}
+
+struct ExecPass<'a> {
+    ast: &'a Ast<'a, VarIdTyMetadata>,
+    cell_states: HashMap<CellId, CellState>,
+    values: HashMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
+    // emit: Vec<CellValueId>,
     frames: HashMap<FrameId, Frame>,
     nil_value: ValueId,
     global_frame: FrameId,
     next_id: u64,
-    solve_iters: u64,
+    // A stack of cells being evaluated.
+    //
+    // The first element of this stack is the root cell.
+    // the last element of this stack is the current cell.
+    partial_cells: VecDeque<CellId>,
+    compiled_cells: HashMap<CellId, CompiledCell>,
 }
 
 impl<'a> ExecPass<'a> {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(ast: &'a Ast<'a, VarIdTyMetadata>) -> Self {
         Self {
-            solver: Solver::new(),
+            ast,
+            cell_states: HashMap::new(),
             values: HashMap::from_iter([(1, DeferValue::Ready(Value::None))]),
-            deferred: Default::default(),
             frames: HashMap::from_iter([(0, Frame::default())]),
-            emit: Default::default(),
             nil_value: 1,
             global_frame: 0,
             next_id: 2,
-            solve_iters: 0,
+            partial_cells: VecDeque::new(),
+            compiled_cells: HashMap::new(),
         }
     }
 
     pub(crate) fn lookup(&self, frame: FrameId, var: VarId) -> Option<ValueId> {
-        let frame = self.frames.get(&frame).expect("no frame found");
+        let frame = self
+            .frames
+            .get(&frame)
+            .expect("no frame found for frame ID");
         if let Some(val) = frame.bindings.get(&var) {
             Some(*val)
         } else {
@@ -543,14 +628,39 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    pub(crate) fn execute(mut self, input: CompileInput<'a, VarIdTyMetadata>) -> CompiledCell {
-        self.execute_start(input);
+    pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompiledCell {
+        self.declare_globals();
+        let cell_id = self.execute_cell(input.cell, input.params);
+        self.compiled_cells
+            .remove(&cell_id)
+            .expect("desired cell not solved")
+    }
+
+    pub(crate) fn execute_cell(&mut self, cell: &'a str, params: HashMap<&'a str, f64>) -> CellId {
+        println!("executing cell {cell}");
+        let cell_id = self.alloc_id();
+        self.partial_cells.push_back(cell_id);
+        assert!(
+            self.cell_states
+                .insert(
+                    cell_id,
+                    CellState {
+                        solve_iters: 0,
+                        solver: Solver::new(),
+                        fields: HashMap::new(),
+                        emit: Vec::new(),
+                        deferred: Default::default(),
+                    }
+                )
+                .is_none()
+        );
+        self.visit_cell_body(cell_id, cell, params);
         let mut require_progress = false;
         let mut progress = false;
-        while !self.deferred.is_empty() {
-            let deferred = self.deferred.clone();
+        while !self.cell_state(cell_id).deferred.is_empty() {
+            let deferred = self.cell_state(cell_id).deferred.clone();
             progress = false;
-            for vid in deferred.iter().copied() {
+            for vid in deferred {
                 progress = progress || self.eval_partial(vid);
             }
 
@@ -561,43 +671,70 @@ impl<'a> ExecPass<'a> {
             require_progress = false;
 
             if !progress {
-                self.solve();
+                let state = self.cell_state_mut(cell_id);
+                state.solve_iters += 1;
+                state.solver.solve();
                 require_progress = true;
             }
         }
         if progress {
-            self.solve();
+            let state = self.cell_state_mut(cell_id);
+            state.solve_iters += 1;
+            state.solver.solve();
         }
-        CompiledCell {
-            values: self.emit(),
-        }
+        self.partial_cells
+            .pop_back()
+            .expect("failed to pop cell id");
+
+        println!("done");
+        let cell = self.emit(cell_id);
+        assert!(self.compiled_cells.insert(cell_id, cell).is_none());
+        cell_id
     }
 
-    fn emit(&mut self) -> Vec<SolvedValue> {
-        self.emit
+    fn emit(&mut self, cell: CellId) -> CompiledCell {
+        let state = self.cell_states.get(&cell).expect("cell not found");
+        let emit_val = |vid: ValueId| {
+            let value = &self.values[&vid];
+            let value = value.as_ref().unwrap_ready();
+            match value {
+                Value::Linear(l) => Some(SolvedValue::Float(state.solver.eval_expr(l).unwrap())),
+                Value::Rect(rect) => Some(SolvedValue::Rect(Rect {
+                    layer: rect.layer.clone(),
+                    x0: state.solver.value_of(rect.x0).unwrap(),
+                    y0: state.solver.value_of(rect.y0).unwrap(),
+                    x1: state.solver.value_of(rect.x1).unwrap(),
+                    y1: state.solver.value_of(rect.y1).unwrap(),
+                    source: rect.source.clone(),
+                })),
+                Value::Int(x) => Some(SolvedValue::Int(*x)),
+                Value::Inst(inst) => Some(SolvedValue::Instance(SolvedInstance {
+                    x: state.solver.value_of(inst.x).unwrap(),
+                    y: state.solver.value_of(inst.y).unwrap(),
+                    angle: 0.,
+                    reflect: false,
+                    cell: *self.values[&inst.cell]
+                        .as_ref()
+                        .unwrap_ready()
+                        .as_ref()
+                        .unwrap_cell(),
+                })),
+                _ => None,
+            }
+        };
+        let values = state
+            .emit
             .iter()
-            .map(|vid| {
-                let value = &self.values[vid];
-                let value = value.as_ref().unwrap_ready();
-                match value {
-                    Value::Linear(l) => SolvedValue::Float(self.solver.eval_expr(l).unwrap()),
-                    Value::Rect(rect) => SolvedValue::Rect(Rect {
-                        layer: rect.layer.clone(),
-                        x0: self.solver.value_of(rect.x0).unwrap(),
-                        y0: self.solver.value_of(rect.y0).unwrap(),
-                        x1: self.solver.value_of(rect.x1).unwrap(),
-                        y1: self.solver.value_of(rect.y1).unwrap(),
-                        source: rect.source.clone(),
-                    }),
-                    _ => unimplemented!(),
-                }
-            })
-            .collect()
-    }
-
-    fn solve(&mut self) {
-        self.solve_iters += 1;
-        self.solver.solve();
+            .copied()
+            .map(|v| emit_val(v).unwrap())
+            .collect();
+        let fields = state
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), emit_val(*v)))
+            .filter_map(|(k, v)| v.map(|v| (k, v)))
+            .collect();
+        CompiledCell { values, fields }
     }
 
     fn value_id(&mut self) -> ValueId {
@@ -618,20 +755,61 @@ impl<'a> ExecPass<'a> {
         id
     }
 
-    fn execute_start(&mut self, input: CompileInput<'a, VarIdTyMetadata>) {
-        for decl in &input.ast.decls {
-            if let Decl::Fn(f) = decl {
-                let vid = self.value_id();
-                self.values
-                    .insert(vid, DeferValue::Ready(Value::Fn(f.clone())));
-                self.frames
-                    .get_mut(&self.global_frame)
-                    .unwrap()
-                    .bindings
-                    .insert(f.metadata, vid);
+    fn cell_state(&self, cell_id: CellId) -> &CellState {
+        self.cell_states
+            .get(&cell_id)
+            .expect("no cell state found for cell ID")
+    }
+
+    fn cell_state_mut(&mut self, cell_id: CellId) -> &mut CellState {
+        self.cell_states
+            .get_mut(&cell_id)
+            .expect("no cell state found for cell ID")
+    }
+
+    fn declare_globals(&mut self) {
+        for decl in &self.ast.decls {
+            match decl {
+                Decl::Fn(f) => {
+                    let vid = self.value_id();
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(f.metadata, vid)
+                            .is_none()
+                    );
+                }
+                Decl::Cell(c) => {
+                    let vid = self.value_id();
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(c.metadata, vid)
+                            .is_none()
+                    );
+                }
+                _ => (),
             }
         }
-        let cell = input
+    }
+
+    fn visit_cell_body(&mut self, cell_id: CellId, cell: &'a str, params: HashMap<&'a str, f64>) {
+        // TODO: use params
+        let cell = self
             .ast
             .decls
             .iter()
@@ -641,20 +819,44 @@ impl<'a> ExecPass<'a> {
                         name: Ident { name, .. },
                         ..
                     },
-                ) if *name == input.cell => Some(v),
+                ) if *name == cell => Some(v),
                 _ => None,
             })
-            .expect("top cell not found");
+            .expect("cell not found");
 
-        for stmt in cell.stmts.iter() {
-            self.eval_stmt(self.global_frame, stmt);
+        let frame = Frame {
+            bindings: Default::default(),
+            parent: Some(self.global_frame),
+        };
+        let fid = self.frame_id();
+        self.frames.insert(fid, frame);
+
+        for stmt in cell.scope.stmts.iter() {
+            match stmt {
+                Statement::LetBinding(binding) => {
+                    let value = self.visit_expr(cell_id, fid, &binding.value);
+                    self.frames
+                        .get_mut(&fid)
+                        .unwrap()
+                        .bindings
+                        .insert(binding.metadata, value);
+                    self.cell_states
+                        .get_mut(&cell_id)
+                        .unwrap()
+                        .fields
+                        .insert(binding.name.name.to_string(), value);
+                }
+                Statement::Expr { value, .. } => {
+                    self.visit_expr(cell_id, fid, value);
+                }
+            }
         }
     }
 
-    fn eval_stmt(&mut self, frame: FrameId, stmt: &Statement<'a, VarIdTyMetadata>) {
+    fn eval_stmt(&mut self, cell: CellId, frame: FrameId, stmt: &Statement<'a, VarIdTyMetadata>) {
         match stmt {
             Statement::LetBinding(binding) => {
-                let value = self.visit_expr(frame, &binding.value);
+                let value = self.visit_expr(cell, frame, &binding.value);
                 self.frames
                     .get_mut(&frame)
                     .unwrap()
@@ -662,12 +864,17 @@ impl<'a> ExecPass<'a> {
                     .insert(binding.metadata, value);
             }
             Statement::Expr { value, .. } => {
-                self.visit_expr(frame, value);
+                self.visit_expr(cell, frame, value);
             }
         }
     }
 
-    fn visit_expr(&mut self, frame: FrameId, expr: &Expr<'a, VarIdTyMetadata>) -> ValueId {
+    fn visit_expr(
+        &mut self,
+        cell_id: CellId,
+        frame: FrameId,
+        expr: &Expr<'a, VarIdTyMetadata>,
+    ) -> ValueId {
         let partial_eval_state = match expr {
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
@@ -685,26 +892,27 @@ impl<'a> ExecPass<'a> {
                 return self.frames[&frame].bindings[&var_id];
             }
             Expr::Emit(e) => {
-                let vid = self.visit_expr(frame, &e.value);
-                self.emit.push(vid);
+                let vid = self.visit_expr(cell_id, frame, &e.value);
+                self.cell_state_mut(cell_id).emit.push(vid);
                 return vid;
             }
             Expr::Call(c) => {
-                if ["rect", "crect", "float", "eq"].contains(&c.func.name) {
+                if ["rect", "crect", "float", "inst", "eq"].contains(&c.func.name) {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
                         state: CallExprState {
+                            func: None,
                             posargs: c
                                 .args
                                 .posargs
                                 .iter()
-                                .map(|arg| self.visit_expr(frame, arg))
+                                .map(|arg| self.visit_expr(cell_id, frame, arg))
                                 .collect(),
                             kwargs: c
                                 .args
                                 .kwargs
                                 .iter()
-                                .map(|arg| self.visit_expr(frame, &arg.value))
+                                .map(|arg| self.visit_expr(cell_id, frame, &arg.value))
                                 .collect(),
                         },
                     }))
@@ -713,36 +921,62 @@ impl<'a> ExecPass<'a> {
                         .args
                         .posargs
                         .iter()
-                        .map(|arg| self.visit_expr(frame, arg))
+                        .map(|arg| self.visit_expr(cell_id, frame, arg))
                         .collect_vec();
-                    let val = &self.values[&self.lookup(frame, c.metadata.0.unwrap()).unwrap()]
+                    let val = &self.values[&self
+                        .lookup(
+                            frame,
+                            c.metadata
+                                .0
+                                .expect("no var ID assigned to function being called"),
+                        )
+                        .unwrap()]
                         .as_ref()
                         .unwrap_ready()
-                        .as_ref()
-                        .unwrap_fn();
-                    let mut call_frame = Frame {
-                        bindings: Default::default(),
-                        parent: Some(self.global_frame),
-                    };
-                    for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
-                        call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
+                        .as_ref();
+                    match val {
+                        ValueRef::Fn(val) => {
+                            let mut call_frame = Frame {
+                                bindings: Default::default(),
+                                parent: Some(self.global_frame),
+                            };
+                            for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
+                                call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
+                            }
+                            let scope = val.scope.clone();
+                            let fid = self.frame_id();
+                            self.frames.insert(fid, call_frame);
+                            return self.visit_expr(cell_id, fid, &Expr::Scope(Box::new(scope)));
+                        }
+                        ValueRef::CellFn(val) => {
+                            PartialEvalState::Call(Box::new(PartialCallExpr {
+                                expr: c.clone(),
+                                state: CallExprState {
+                                    func: Some(val.metadata),
+                                    posargs: arg_vals,
+                                    kwargs: c
+                                        .args
+                                        .kwargs
+                                        .iter()
+                                        .map(|arg| self.visit_expr(cell_id, frame, &arg.value))
+                                        .collect(),
+                                },
+                            }))
+                        }
+                        _ => todo!("cannot call value: not a function or cell generator"),
                     }
-                    let scope = val.scope.clone();
-                    let fid = self.frame_id();
-                    self.frames.insert(fid, call_frame);
-                    return self.visit_expr(fid, &Expr::Scope(Box::new(scope)));
                 }
             }
             Expr::If(if_expr) => {
-                let cond = self.visit_expr(frame, &if_expr.cond);
+                let cond = self.visit_expr(cell_id, frame, &if_expr.cond);
                 PartialEvalState::If(Box::new(PartialIfExpr {
                     expr: (**if_expr).clone(),
                     state: IfExprState::Cond(cond),
                 }))
             }
             Expr::Comparison(comparison_expr) => {
-                let left = self.visit_expr(frame, &comparison_expr.left);
-                let right = self.visit_expr(frame, &comparison_expr.right);
+                let left = self.visit_expr(cell_id, frame, &comparison_expr.left);
+                let right = self.visit_expr(cell_id, frame, &comparison_expr.right);
                 PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
                     expr: (**comparison_expr).clone(),
                     state: ComparisonExprState { left, right },
@@ -750,12 +984,12 @@ impl<'a> ExecPass<'a> {
             }
             Expr::Scope(s) => {
                 for stmt in &s.stmts {
-                    self.eval_stmt(frame, stmt);
+                    self.eval_stmt(cell_id, frame, stmt);
                 }
                 return s
                     .tail
                     .as_ref()
-                    .map(|tail| self.visit_expr(frame, tail))
+                    .map(|tail| self.visit_expr(cell_id, frame, tail))
                     .unwrap_or(self.nil_value);
             }
             Expr::EnumValue(e) => {
@@ -767,19 +1001,19 @@ impl<'a> ExecPass<'a> {
                 return vid;
             }
             Expr::FieldAccess(f) => {
-                let base = self.visit_expr(frame, &f.base);
+                let base = self.visit_expr(cell_id, frame, &f.base);
                 PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
                     expr: (**f).clone(),
                     state: FieldAccessExprState { base },
                 }))
             }
             Expr::BinOp(b) => {
-                let lhs = self.visit_expr(frame, &b.left);
-                let rhs = self.visit_expr(frame, &b.right);
+                let lhs = self.visit_expr(cell_id, frame, &b.left);
+                let rhs = self.visit_expr(cell_id, frame, &b.right);
                 PartialEvalState::BinOp(PartialBinOp { lhs, rhs, op: b.op })
             }
             Expr::Cast(cast) => {
-                let value = self.visit_expr(frame, &cast.value);
+                let value = self.visit_expr(cell_id, frame, &cast.value);
                 PartialEvalState::Cast(PartialCast {
                     value,
                     ty: cast.metadata.clone(),
@@ -788,12 +1022,13 @@ impl<'a> ExecPass<'a> {
             x => todo!("{x:?}"),
         };
         let vid = self.value_id();
-        self.deferred.insert(vid);
+        self.cell_state_mut(cell_id).deferred.insert(vid);
         self.values.insert(
             vid,
             DeferValue::Deferred(PartialEval {
                 state: partial_eval_state,
                 frame,
+                cell: cell_id,
             }),
         );
         vid
@@ -811,6 +1046,7 @@ impl<'a> ExecPass<'a> {
             return false;
         }
         let vref = vref.unwrap_deferred();
+        let state = self.cell_states.get_mut(&vref.cell).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.name {
                 "crect" | "rect" => {
@@ -828,10 +1064,10 @@ impl<'a> ExecPass<'a> {
                     if let Some(layer) = layer {
                         let rect = Rect {
                             layer,
-                            x0: self.solver.new_var(),
-                            y0: self.solver.new_var(),
-                            x1: self.solver.new_var(),
-                            y1: self.solver.new_var(),
+                            x0: state.solver.new_var(),
+                            y0: state.solver.new_var(),
+                            x1: state.solver.new_var(),
+                            y1: state.solver.new_var(),
                             source: Some(SourceInfo {
                                 span: c.expr.span,
                                 id: self.alloc_id(),
@@ -893,9 +1129,10 @@ impl<'a> ExecPass<'a> {
                                         rhs: *rhs,
                                     }),
                                     frame: vref.frame,
+                                    cell: vref.cell,
                                 }),
                             );
-                            self.deferred.insert(defer);
+                            self.cell_state_mut(vref.cell).deferred.insert(defer);
                         }
                         true
                     } else {
@@ -905,7 +1142,7 @@ impl<'a> ExecPass<'a> {
                 "float" => {
                     self.values.insert(
                         vid,
-                        Defer::Ready(Value::Linear(LinearExpr::from(self.solver.new_var()))),
+                        Defer::Ready(Value::Linear(LinearExpr::from(state.solver.new_var()))),
                     );
                     true
                 }
@@ -916,17 +1153,61 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let expr = vl.as_ref().unwrap_linear().clone()
                             - vr.as_ref().unwrap_linear().clone();
-                        self.solver.constrain_eq0(expr);
+                        state.solver.constrain_eq0(expr);
                         self.values.insert(vid, Defer::Ready(Value::None));
                         true
                     } else {
                         false
                     }
                 }
-                f => {
-                    panic!(
-                        "user function calls should never be deferred: attempted to partial_eval {f}"
-                    );
+                "inst" => {
+                    let inst = Instance {
+                        x: state.solver.new_var(),
+                        y: state.solver.new_var(),
+                        cell: *c.state.posargs.first().unwrap(),
+                    };
+                    self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
+                    true
+                }
+                cell => {
+                    // Must be calling a cell generator.
+                    // User functions are never deferred.
+                    let arg_vals = c
+                        .state
+                        .posargs
+                        .iter()
+                        .map(|v| {
+                            self.values[v]
+                                .get_ready()
+                                .and_then(|v| state.solver.eval_expr(v.as_ref().unwrap_linear()))
+                        })
+                        .collect::<Option<Vec<f64>>>();
+                    if let Some(arg_vals) = arg_vals {
+                        let val = &self.values[&self
+                            .lookup(
+                                vref.frame,
+                                c.expr
+                                    .metadata
+                                    .0
+                                    .expect("no var ID assigned to cell generator being called"),
+                            )
+                            .unwrap()]
+                            .as_ref()
+                            .unwrap_ready()
+                            .as_ref()
+                            .unwrap_cell_fn();
+                        let params = val
+                            .args
+                            .iter()
+                            .map(|v| v.name.name)
+                            .zip(arg_vals.into_iter())
+                            .collect();
+                        let cell = self.execute_cell(cell, params);
+                        self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
+                        true
+                    } else {
+                        false
+                    }
                 }
             },
             PartialEvalState::BinOp(bin_op) => {
@@ -939,14 +1220,16 @@ impl<'a> ExecPass<'a> {
                                 BinOp::Add => Some(vl.clone() + vr.clone()),
                                 BinOp::Sub => Some(vl.clone() - vr.clone()),
                                 BinOp::Mul => {
-                                    match (self.solver.eval_expr(vl), self.solver.eval_expr(vr)) {
+                                    match (state.solver.eval_expr(vl), state.solver.eval_expr(vr)) {
                                         (Some(vl), Some(vr)) => Some((vl * vr).into()),
                                         (Some(vl), None) => Some(vr.clone() * vl),
                                         (None, Some(vr)) => Some(vl.clone() * vr),
                                         (None, None) => None,
                                     }
                                 }
-                                BinOp::Div => self.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs),
+                                BinOp::Div => {
+                                    state.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs)
+                                }
                             };
                             if let Some(res) = res {
                                 self.values
@@ -976,10 +1259,10 @@ impl<'a> ExecPass<'a> {
                 IfExprState::Cond(cond) => {
                     if let Defer::Ready(val) = &self.values[&cond] {
                         if *val.as_ref().unwrap_bool() {
-                            let then = self.visit_expr(vref.frame, &if_.expr.then);
+                            let then = self.visit_expr(vref.cell, vref.frame, &if_.expr.then);
                             if_.state = IfExprState::Then(then);
                         } else {
-                            let else_ = self.visit_expr(vref.frame, &if_.expr.else_);
+                            let else_ = self.visit_expr(vref.cell, vref.frame, &if_.expr.else_);
                             if_.state = IfExprState::Else(else_);
                         }
                         true
@@ -1012,7 +1295,7 @@ impl<'a> ExecPass<'a> {
                     match (vl, vr) {
                         (Value::Linear(vl), Value::Linear(vr)) => {
                             if let (Some(vl), Some(vr)) =
-                                (self.solver.eval_expr(vl), self.solver.eval_expr(vr))
+                                (state.solver.eval_expr(vl), state.solver.eval_expr(vr))
                             {
                                 let res = match comparison_expr.expr.op {
                                     crate::ast::ComparisonOp::Eq => {
@@ -1052,19 +1335,85 @@ impl<'a> ExecPass<'a> {
             }
             PartialEvalState::FieldAccess(field_access_expr) => {
                 if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
-                    let rect = base.as_ref().unwrap_rect();
-                    let val = match field_access_expr.expr.field.name {
-                        "x0" => Value::Linear(LinearExpr::from(rect.x0)),
-                        "x1" => Value::Linear(LinearExpr::from(rect.x1)),
-                        "y0" => Value::Linear(LinearExpr::from(rect.y0)),
-                        "y1" => Value::Linear(LinearExpr::from(rect.y1)),
-                        "w" => Value::Linear(LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0)),
-                        "h" => Value::Linear(LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0)),
-                        "layer" => Value::EnumValue(rect.layer.clone().unwrap()),
-                        f => panic!("invalid field `{f}`"),
-                    };
-                    self.values.insert(vid, DeferValue::Ready(val));
-                    true
+                    match base.as_ref() {
+                        ValueRef::Rect(rect) => {
+                            let val = match field_access_expr.expr.field.name {
+                                "x0" => Value::Linear(LinearExpr::from(rect.x0)),
+                                "x1" => Value::Linear(LinearExpr::from(rect.x1)),
+                                "y0" => Value::Linear(LinearExpr::from(rect.y0)),
+                                "y1" => Value::Linear(LinearExpr::from(rect.y1)),
+                                "w" => Value::Linear(
+                                    LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
+                                ),
+                                "h" => Value::Linear(
+                                    LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
+                                ),
+                                "layer" => Value::EnumValue(rect.layer.clone().unwrap()),
+                                f => panic!("invalid field `{f}`"),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
+                        ValueRef::Inst(inst) => {
+                            let val = match field_access_expr.expr.field.name {
+                                "x" => Some(Value::Linear(LinearExpr::from(inst.x))),
+                                "y" => Some(Value::Linear(LinearExpr::from(inst.y))),
+                                field => {
+                                    if let Defer::Ready(cell) = &self.values[&inst.cell] {
+                                        let cell_id = *cell.as_ref().unwrap_cell();
+                                        // When a cell is ready, it must have been fully
+                                        // solved/compiled, and therefore it will be in the
+                                        // compiled cell map.
+                                        let cell = &self.compiled_cells[&cell_id];
+                                        match &cell.fields[field] {
+                                            SolvedValue::Rect(rect) => {
+                                                let xrect = Rect {
+                                                    layer: rect.layer.clone(),
+                                                    x0: state.solver.new_var(),
+                                                    y0: state.solver.new_var(),
+                                                    x1: state.solver.new_var(),
+                                                    y1: state.solver.new_var(),
+                                                    source: None, // TODO
+                                                };
+                                                let dx0 = LinearExpr::from(xrect.x0)
+                                                    - rect.x0
+                                                    - LinearExpr::from(inst.x);
+                                                let dx1 = LinearExpr::from(xrect.x1)
+                                                    - rect.x1
+                                                    - LinearExpr::from(inst.x);
+                                                let dy0 = LinearExpr::from(xrect.y0)
+                                                    - rect.y0
+                                                    - LinearExpr::from(inst.y);
+                                                let dy1 = LinearExpr::from(xrect.y1)
+                                                    - rect.y1
+                                                    - LinearExpr::from(inst.y);
+                                                let state = self.cell_state_mut(vref.cell);
+                                                state.solver.constrain_eq0(dx0);
+                                                state.solver.constrain_eq0(dx1);
+                                                state.solver.constrain_eq0(dy0);
+                                                state.solver.constrain_eq0(dy1);
+                                                Some(Value::Rect(xrect))
+                                            }
+                                            _ => todo!(),
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some(val) = val {
+                                self.values.insert(vid, DeferValue::Ready(val));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => {
+                            panic!(
+                                "field access expressions only supported on objects of type Rect or Inst"
+                            )
+                        }
+                    }
                 } else {
                     false
                 }
@@ -1076,7 +1425,7 @@ impl<'a> ExecPass<'a> {
                     let lhs = vl.as_ref().unwrap_linear();
                     let rhs = vr.as_ref().unwrap_linear();
                     let expr = lhs.clone() - rhs.clone();
-                    self.solver.constrain_eq0(expr);
+                    state.solver.constrain_eq0(expr);
                     self.values.insert(vid, DeferValue::Ready(Value::None));
                     true
                 } else {
@@ -1090,7 +1439,7 @@ impl<'a> ExecPass<'a> {
                             Some(Value::Linear(LinearExpr::from(*x as f64)))
                         }
                         (x @ Value::Int(_), Ty::Int) => Some(x.clone()),
-                        (Value::Linear(expr), Ty::Int) => self
+                        (Value::Linear(expr), Ty::Int) => state
                             .solver
                             .eval_expr(expr)
                             .map(|val| Value::Int(val as i64)),
@@ -1109,9 +1458,10 @@ impl<'a> ExecPass<'a> {
             }
         };
 
+        let cell_id = vref.cell;
         self.values.entry(vid).or_insert(v);
         if self.values[&vid].is_ready() {
-            self.deferred.swap_remove(&vid);
+            self.cell_state_mut(cell_id).deferred.swap_remove(&vid);
         }
         progress
     }
@@ -1126,19 +1476,75 @@ pub enum Value<'a> {
     Rect(Rect<Var>),
     Bool(bool),
     Fn(FnDecl<'a, VarIdTyMetadata>),
+    /// A cell generator.
+    ///
+    /// Example:
+    /// ```
+    /// cell mycell() {
+    ///   // ...
+    /// }
+    /// ```
+    ///
+    /// `mycell` is a value of type `CellFn`.
+    CellFn(CellDecl<'a, VarIdTyMetadata>),
+    /// A particular parameterization of a cell.
+    ///
+    /// Example:
+    /// ```
+    /// cell mycell() {
+    ///   // ...
+    /// }
+    ///
+    /// let val = mycell();
+    /// ```
+    ///
+    /// `val` is a value of type `Cell`.
+    Cell(CellId),
+    /// An instantiation of a cell value.
+    ///
+    /// Example:
+    /// ```
+    /// cell mycell() {
+    ///   // ...
+    /// }
+    ///
+    /// let mycell_inst = inst(mycell(), x=0, y=0);
+    /// ```
+    ///
+    /// `mycell_inst` is a value of type `Inst`.
+    Inst(Instance),
     None,
+}
+
+#[derive(Debug, Clone)]
+pub struct Instance {
+    pub x: Var,
+    pub y: Var,
+    pub cell: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct SolvedInstance {
+    pub x: f64,
+    pub y: f64,
+    pub angle: f64,
+    pub reflect: bool,
+    pub cell: CellId,
 }
 
 #[enumify]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
+    Int(i64),
     Float(f64),
     Rect(Rect<f64>),
+    Instance(SolvedInstance),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCell {
     pub values: Vec<SolvedValue>,
+    pub fields: HashMap<String, SolvedValue>,
 }
 
 #[enumify(generics_only)]
@@ -1154,6 +1560,7 @@ type DeferValue<'a, T> = Defer<Value<'a>, PartialEval<'a, T>>;
 struct PartialEval<'a, T: AstMetadata> {
     state: PartialEvalState<'a, T>,
     frame: FrameId,
+    cell: CellId,
 }
 
 #[derive(Debug, Clone)]
@@ -1207,6 +1614,9 @@ struct PartialCallExpr<'a, T: AstMetadata> {
 
 #[derive(Debug, Clone)]
 pub struct CallExprState {
+    /// Should be Some for cell functions or None for built-ins.
+    /// Not applicable to user defined functions, which are never deferred.
+    func: Option<ValueId>,
     posargs: Vec<ValueId>,
     kwargs: Vec<ValueId>,
 }

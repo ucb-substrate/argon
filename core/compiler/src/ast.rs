@@ -64,7 +64,7 @@ pub struct StructField<'a, T: AstMetadata> {
 pub struct CellDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub args: Vec<ArgDecl<'a, T>>,
-    pub stmts: Vec<Statement<'a, T>>,
+    pub scope: Scope<'a, T>,
     pub metadata: T::CellDecl,
 }
 
@@ -334,7 +334,7 @@ pub trait AstTransformer<'a> {
         input: &CellDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
         args: &[ArgDecl<'a, Self::Output>],
-        stmts: &[Statement<'a, Self::Output>],
+        scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::CellDecl;
     fn dispatch_fn_decl(
         &mut self,
@@ -480,16 +480,12 @@ pub trait AstTransformer<'a> {
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect_vec();
-        let stmts = input
-            .stmts
-            .iter()
-            .map(|stmt| self.transform_statement(stmt))
-            .collect_vec();
-        let metadata = self.dispatch_cell_decl(input, &name, &args, &stmts);
+        let scope = self.transform_scope(&input.scope);
+        let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
             name,
             args,
-            stmts,
+            scope,
             metadata,
         }
     }
