@@ -24,6 +24,7 @@ approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
 indexmap = "2.10.0"
+geometry = { version = "0.7.1", registry = "substrate" }
 
 [build-dependencies]
 cfgrammar = "0.13"

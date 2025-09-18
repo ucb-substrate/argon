@@ -171,14 +171,14 @@ cell simple(y_enclosure: int) {
     #[test]
     fn argon_hierarchy() {
         let ast = parse(ARGON_HIERARCHY).expect("failed to parse Argon");
-        let cell = compile(
+        let cells = compile(
             &ast,
             CompileInput {
                 cell: "top",
                 params: HashMap::new(),
             },
         );
-        println!("{cell:?}");
+        println!("{cells:#?}");
     }
 
     // #[test]
