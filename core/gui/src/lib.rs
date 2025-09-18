@@ -34,8 +34,6 @@ pub fn main() {
                 Cow::Borrowed(ZED_PLEX_SANS),
             ])
             .unwrap();
-        // Bring the menu bar to the foreground (so you can see the menu bar)
-        cx.activate(true);
         // Bind keys must happen before menus to get the keybindings to show up next to menu items.
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         // Register the `quit` function so it can be referenced by the `MenuItem::action` in the menu bar

@@ -1,9 +1,10 @@
 pub mod rpc;
 
 use std::{
+    fs::File,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::PathBuf,
-    process::Command,
+    process::Stdio,
     sync::Arc,
 };
 
@@ -13,10 +14,11 @@ use portpicker::pick_unused_port;
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
 use tarpc::{
+    context,
     server::{self, incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
-use tokio::sync::Mutex;
+use tokio::{process::Command, sync::Mutex};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -126,20 +128,27 @@ impl Backend {
                 "/../../target/debug/gui"
             ))
             .arg(format!("{server_addr}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap()
             .wait()
+            .await
             .unwrap();
         });
 
         Ok(())
     }
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
-        self.state
+        let state = self.state.clone();
+        state
             .editor_client
-            .show_message(MessageType::INFO, format!("Opening cell {}", params.cell))
+            .show_message(
+                MessageType::INFO,
+                &format!("file {:?}, cell {}", params.file, params.cell),
+            )
             .await;
-        let editor_client = self.state.editor_client.clone();
         tokio::spawn(async move {
             let o = Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -147,17 +156,24 @@ impl Backend {
             ))
             .arg(params.file)
             .arg(params.cell)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap()
             .wait_with_output()
+            .await
             .unwrap();
             let o_str = String::from_utf8(o.stdout).unwrap();
-            let stderr_str = String::from_utf8(o.stderr).unwrap();
-            editor_client.show_message(MessageType::INFO, &o_str).await;
-            editor_client
-                .show_message(MessageType::ERROR, &stderr_str)
-                .await;
             let o: CompiledCell = serde_json::from_str(&o_str).unwrap();
+            if let Some(client) = state.gui_client.lock().await.as_mut() {
+                client.open_cell(context::current(), o);
+            } else {
+                state
+                    .editor_client
+                    .show_message(MessageType::ERROR, "No GUI connected")
+                    .await;
+            }
         });
         Ok(())
     }
@@ -174,6 +190,7 @@ pub async fn main() {
             break port;
         }
     };
+    let port = 12345; // for debugging
     let server_addr = (IpAddr::V6(Ipv6Addr::LOCALHOST), port).into();
 
     // Construct actual LSP server.

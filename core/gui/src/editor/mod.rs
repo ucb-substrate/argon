@@ -6,6 +6,7 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{CompiledCell, Rect, SolvedValue};
+use futures::channel::mpsc::{self, Receiver};
 use gpui::*;
 use itertools::Itertools;
 use toolbars::{SideBar, TitleBar, ToolBar};
@@ -70,6 +71,45 @@ fn get_rects(solved_cell: &CompiledCell, layers: &[LayerState]) -> Vec<canvas::R
         .collect()
 }
 
+fn get_layers(solved_cell: &CompiledCell) -> Vec<LayerState> {
+    let layers: HashSet<_> = solved_cell
+        .values
+        .iter()
+        .filter_map(|value| value.get_rect()?.layer.clone())
+        .collect();
+    layers
+        .into_iter()
+        .sorted()
+        .enumerate()
+        .map(|(z, name)| {
+            let mut s = DefaultHasher::new();
+            name.hash(&mut s);
+            let hash = s.finish() as usize;
+            let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+            LayerState {
+                name,
+                color,
+                fill: ShapeFill::Stippling,
+                border_color: color,
+                visible: true,
+                z,
+            }
+        })
+        .collect()
+}
+
+impl EditorState {
+    pub fn update(&mut self, cx: &mut impl AppContext, solved_cell: CompiledCell) {
+        let layers = get_layers(&solved_cell);
+        let rects = get_rects(&solved_cell, &layers);
+        self.rects = rects;
+        self.layers.update(cx, |old_layers, cx| {
+            *old_layers = layers;
+            cx.notify();
+        });
+    }
+}
+
 impl Editor {
     pub fn new(cx: &mut Context<Self>, lsp_addr: SocketAddr) -> Self {
         let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
@@ -102,30 +142,7 @@ impl Editor {
             ],
             fields: Default::default(),
         };
-        let layers: HashSet<_> = solved_cell
-            .values
-            .iter()
-            .filter_map(|value| value.get_rect()?.layer.clone())
-            .collect();
-        let layers: Vec<_> = layers
-            .into_iter()
-            .sorted()
-            .enumerate()
-            .map(|(z, name)| {
-                let mut s = DefaultHasher::new();
-                name.hash(&mut s);
-                let hash = s.finish() as usize;
-                let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-                LayerState {
-                    name,
-                    color,
-                    fill: ShapeFill::Stippling,
-                    border_color: color,
-                    visible: true,
-                    z,
-                }
-            })
-            .collect();
+        let layers = get_layers(&solved_cell);
         let rects = get_rects(&solved_cell, &layers);
         let layers = cx.new(|_cx| layers);
         let state = cx.new(|cx| {
@@ -136,10 +153,10 @@ impl Editor {
                 selected_rect: None,
                 layers,
                 subscriptions,
-                lsp_client,
+                lsp_client: lsp_client.clone(),
             }
         });
-
+        lsp_client.register_server(state.clone());
         let sidebar = cx.new(|cx| SideBar::new(cx, &state));
         let canvas = cx.new(|cx| LayoutCanvas::new(cx, &state));
 
