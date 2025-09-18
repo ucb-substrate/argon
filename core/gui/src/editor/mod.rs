@@ -1,11 +1,11 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
 };
 
 use canvas::{LayoutCanvas, ShapeFill};
-use compiler::compile::{CompiledCell, Rect, SolvedValue};
+use compiler::compile::{CompileOutput, CompiledCell, Rect, SolvedValue};
 use futures::channel::mpsc::{self, Receiver};
 use gpui::*;
 use itertools::Itertools;
@@ -27,7 +27,7 @@ pub struct LayerState {
 }
 
 pub struct EditorState {
-    pub solved_cell: CompiledCell,
+    pub solved_cell: CompileOutput,
     pub rects: Vec<canvas::Rect>,
     pub selected_rect: Option<usize>,
     pub layers: Entity<Vec<LayerState>>,
@@ -42,8 +42,8 @@ pub struct Editor {
     pub canvas: Entity<LayoutCanvas>,
 }
 
-fn get_rects(solved_cell: &CompiledCell, layers: &[LayerState]) -> Vec<canvas::Rect> {
-    solved_cell
+fn get_rects(solved_cell: &CompileOutput, layers: &[LayerState]) -> Vec<canvas::Rect> {
+    solved_cell.cells[&solved_cell.top]
         .values
         .iter()
         .filter_map(|v| v.get_rect().cloned())
@@ -71,8 +71,8 @@ fn get_rects(solved_cell: &CompiledCell, layers: &[LayerState]) -> Vec<canvas::R
         .collect()
 }
 
-fn get_layers(solved_cell: &CompiledCell) -> Vec<LayerState> {
-    let layers: HashSet<_> = solved_cell
+fn get_layers(solved_cell: &CompileOutput) -> Vec<LayerState> {
+    let layers: HashSet<_> = solved_cell.cells[&solved_cell.top]
         .values
         .iter()
         .filter_map(|value| value.get_rect()?.layer.clone())
@@ -99,7 +99,7 @@ fn get_layers(solved_cell: &CompiledCell) -> Vec<LayerState> {
 }
 
 impl EditorState {
-    pub fn update(&mut self, cx: &mut impl AppContext, solved_cell: CompiledCell) {
+    pub fn update(&mut self, cx: &mut impl AppContext, solved_cell: CompileOutput) {
         let layers = get_layers(&solved_cell);
         let rects = get_rects(&solved_cell, &layers);
         self.rects = rects;
@@ -113,34 +113,40 @@ impl EditorState {
 impl Editor {
     pub fn new(cx: &mut Context<Self>, lsp_addr: SocketAddr) -> Self {
         let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
-        let solved_cell = CompiledCell {
-            values: vec![
-                SolvedValue::Rect(Rect {
-                    layer: Some("Met1".to_string()),
-                    x0: 0.,
-                    y0: 0.,
-                    x1: 100.,
-                    y1: 100.,
-                    source: None,
-                }),
-                SolvedValue::Rect(Rect {
-                    layer: Some("Via1".to_string()),
-                    x0: 10.,
-                    y0: 10.,
-                    x1: 90.,
-                    y1: 90.,
-                    source: None,
-                }),
-                SolvedValue::Rect(Rect {
-                    layer: Some("Met2".to_string()),
-                    x0: 5.,
-                    y0: 5.,
-                    x1: 95.,
-                    y1: 95.,
-                    source: None,
-                }),
-            ],
-            fields: Default::default(),
+        let solved_cell = CompileOutput {
+            cells: HashMap::from([(
+                0,
+                CompiledCell {
+                    values: vec![
+                        SolvedValue::Rect(Rect {
+                            layer: Some("Met1".to_string()),
+                            x0: 0.,
+                            y0: 0.,
+                            x1: 100.,
+                            y1: 100.,
+                            source: None,
+                        }),
+                        SolvedValue::Rect(Rect {
+                            layer: Some("Via1".to_string()),
+                            x0: 10.,
+                            y0: 10.,
+                            x1: 90.,
+                            y1: 90.,
+                            source: None,
+                        }),
+                        SolvedValue::Rect(Rect {
+                            layer: Some("Met2".to_string()),
+                            x0: 5.,
+                            y0: 5.,
+                            x1: 95.,
+                            y1: 95.,
+                            source: None,
+                        }),
+                    ],
+                    fields: Default::default(),
+                },
+            )]),
+            top: 0,
         };
         let layers = get_layers(&solved_cell);
         let rects = get_rects(&solved_cell, &layers);

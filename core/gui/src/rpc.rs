@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use async_compat::CompatExt;
-use compiler::compile::CompiledCell;
+use compiler::compile::{CompileOutput, CompiledCell};
 use futures::{
     channel::mpsc::{self, Receiver, Sender},
     future,
@@ -12,7 +12,7 @@ use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
     context,
-    server::{self, Channel, incoming::Incoming},
+    server::{self, incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
 
@@ -93,16 +93,14 @@ impl SyncGuiToLspClient {
             .compat(),
         );
         self.app
-            .spawn(async move |app| {
-                loop {
-                    if let Ok(Some(cell)) = rx.try_next() {
-                        state
-                            .update(app, |state, cx| {
-                                state.update(cx, cell);
-                                cx.notify();
-                            })
-                            .unwrap();
-                    }
+            .spawn(async move |app| loop {
+                if let Some(cell) = rx.next().await {
+                    state
+                        .update(app, |state, cx| {
+                            state.update(cx, cell);
+                            cx.notify();
+                        })
+                        .unwrap();
                 }
             })
             .detach();
@@ -111,12 +109,11 @@ impl SyncGuiToLspClient {
 
 #[derive(Clone)]
 pub struct GuiServer {
-    opened_cells: Sender<CompiledCell>,
+    opened_cells: Sender<CompileOutput>,
 }
 
 impl LspToGui for GuiServer {
-    async fn open_cell(mut self, _: context::Context, cell: CompiledCell) {
-        println!("opening cell {cell:?}");
+    async fn open_cell(mut self, _: context::Context, cell: CompileOutput) {
         self.opened_cells.send(cell).await.unwrap();
     }
 }

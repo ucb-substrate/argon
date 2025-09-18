@@ -5,6 +5,9 @@
 use std::collections::{HashMap, VecDeque};
 
 use enumify::enumify;
+use geometry::point::Point;
+use geometry::prelude::Transform;
+use geometry::transform::{Rotation, TransformationBuilder, TransformationMatrix};
 use indexmap::IndexSet;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -19,7 +22,7 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> CompiledCell {
+pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> CompileOutput {
     let pass = VarIdTyPass::new(ast);
     let ast = pass.execute();
     let input = CompileInput {
@@ -137,6 +140,11 @@ impl<'a> VarIdTyPass<'a> {
     pub(crate) fn execute(mut self) -> Ast<'a, VarIdTyMetadata> {
         let mut decls = Vec::new();
         for decl in &self.ast.decls {
+            if let Decl::Fn(f) = decl {
+                self.declare_fn_decl(f);
+            }
+        }
+        for decl in &self.ast.decls {
             match decl {
                 Decl::Fn(f) => {
                     decls.push(Decl::Fn(self.transform_fn_decl(f)));
@@ -149,6 +157,20 @@ impl<'a> VarIdTyPass<'a> {
         }
 
         Ast { decls }
+    }
+
+    fn declare_fn_decl(&mut self, input: &FnDecl<'a, ParseMetadata>) {
+        assert!(!["crect", "rect", "float", "eq", "inst"].contains(&input.name.name));
+        let args: Vec<_> = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
+        let ty = Ty::Fn(Box::new(FnTy {
+            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            ret: Ty::from_name(input.return_ty.name),
+        }));
+        self.alloc(input.name.name, ty);
     }
 }
 
@@ -224,17 +246,12 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     }
 
     fn transform_fn_decl(&mut self, input: &FnDecl<'a, Self::Input>) -> FnDecl<'a, Self::Output> {
-        assert!(!["crect", "rect", "float", "eq", "inst"].contains(&input.name.name));
+        let (varid, _) = self.lookup(input.name.name).unwrap();
         let args: Vec<_> = input
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
-        let ty = Ty::Fn(Box::new(FnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            ret: Ty::from_name(input.return_ty.name),
-        }));
-        let vid = self.alloc(input.name.name, ty);
         let name = self.transform_ident(&input.name);
         let return_ty = self.transform_ident(&input.return_ty);
         let scope = self.transform_scope(&input.scope);
@@ -243,7 +260,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             args,
             return_ty,
             scope,
-            metadata: vid,
+            metadata: varid,
         }
     }
 
@@ -424,7 +441,14 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             }
             "inst" => {
                 assert_eq!(args.posargs.len(), 1);
-                assert!(args.kwargs.is_empty());
+                for kwarg in &args.kwargs {
+                    assert!(["reflect", "angle"].contains(&kwarg.name.name));
+                    if kwarg.name.name == "reflect" {
+                        assert_eq!(kwarg.value.ty(), Ty::Bool);
+                    } else if kwarg.name.name == "angle" {
+                        assert_eq!(kwarg.value.ty(), Ty::Int);
+                    }
+                }
                 assert!(matches!(args.posargs[0].ty(), Ty::Cell(_)));
                 if let Ty::Cell(c) = args.posargs[0].ty() {
                     (None, Ty::Inst(c.clone()))
@@ -628,30 +652,32 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompiledCell {
+    pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
         let cell_id = self.execute_cell(input.cell, input.params);
-        self.compiled_cells
-            .remove(&cell_id)
-            .expect("desired cell not solved")
+        CompileOutput {
+            cells: self.compiled_cells,
+            top: cell_id,
+        }
     }
 
     pub(crate) fn execute_cell(&mut self, cell: &'a str, params: Vec<f64>) -> CellId {
         let cell_id = self.alloc_id();
         self.partial_cells.push_back(cell_id);
-        assert!(self
-            .cell_states
-            .insert(
-                cell_id,
-                CellState {
-                    solve_iters: 0,
-                    solver: Solver::new(),
-                    fields: HashMap::new(),
-                    emit: Vec::new(),
-                    deferred: Default::default(),
-                }
-            )
-            .is_none());
+        assert!(
+            self.cell_states
+                .insert(
+                    cell_id,
+                    CellState {
+                        solve_iters: 0,
+                        solver: Solver::new(),
+                        fields: HashMap::new(),
+                        emit: Vec::new(),
+                        deferred: Default::default(),
+                    }
+                )
+                .is_none()
+        );
         self.visit_cell_body(cell_id, cell, params);
         let mut require_progress = false;
         let mut progress = false;
@@ -708,7 +734,7 @@ impl<'a> ExecPass<'a> {
                 Value::Inst(inst) => Some(SolvedValue::Instance(SolvedInstance {
                     x: state.solver.value_of(inst.x).unwrap(),
                     y: state.solver.value_of(inst.y).unwrap(),
-                    angle: 0.,
+                    angle: inst.angle,
                     reflect: false,
                     cell: *self.values[&inst.cell]
                         .as_ref()
@@ -769,31 +795,35 @@ impl<'a> ExecPass<'a> {
             match decl {
                 Decl::Fn(f) => {
                     let vid = self.value_id();
-                    assert!(self
-                        .values
-                        .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
-                        .is_none());
-                    assert!(self
-                        .frames
-                        .get_mut(&self.global_frame)
-                        .unwrap()
-                        .bindings
-                        .insert(f.metadata, vid)
-                        .is_none());
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(f.metadata, vid)
+                            .is_none()
+                    );
                 }
                 Decl::Cell(c) => {
                     let vid = self.value_id();
-                    assert!(self
-                        .values
-                        .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
-                        .is_none());
-                    assert!(self
-                        .frames
-                        .get_mut(&self.global_frame)
-                        .unwrap()
-                        .bindings
-                        .insert(c.metadata, vid)
-                        .is_none());
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(c.metadata, vid)
+                            .is_none()
+                    );
                 }
                 _ => (),
             }
@@ -1154,13 +1184,68 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "inst" => {
-                    let inst = Instance {
-                        x: state.solver.new_var(),
-                        y: state.solver.new_var(),
-                        cell: *c.state.posargs.first().unwrap(),
+                    let refl = c
+                        .expr
+                        .args
+                        .kwargs
+                        .iter()
+                        .zip(c.state.kwargs.iter())
+                        .find_map(|(kwarg, vid)| {
+                            if kwarg.name.name == "reflect" {
+                                Some(
+                                    self.values[vid]
+                                        .as_ref()
+                                        .get_ready()
+                                        .map(|refl| *refl.as_ref().unwrap_bool()),
+                                )
+                            } else {
+                                None
+                            }
+                        });
+                    let refl = match refl {
+                        None => Some(None),
+                        Some(None) => None,
+                        Some(Some(l)) => Some(Some(l)),
                     };
-                    self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
-                    true
+                    let angle = c
+                        .expr
+                        .args
+                        .kwargs
+                        .iter()
+                        .zip(c.state.kwargs.iter())
+                        .find_map(|(kwarg, vid)| {
+                            if kwarg.name.name == "angle" {
+                                Some(self.values[vid].as_ref().get_ready().map(|refl| {
+                                    match (*refl.as_ref().unwrap_int() + 360) % 360 {
+                                        0 => Rotation::R0,
+                                        90 => Rotation::R90,
+                                        180 => Rotation::R180,
+                                        270 => Rotation::R270,
+                                        x => panic!("angle {x} must be a multiple of 90 degrees between 0 and 360 degrees"),
+                                    }
+                                }))
+                            } else {
+                                None
+                            }
+                        });
+                    let angle = match angle {
+                        None => Some(None),
+                        Some(None) => None,
+                        Some(Some(l)) => Some(Some(l)),
+                    };
+                    if let (Some(refl), Some(angle)) = (refl, angle) {
+                        let inst = Instance {
+                            x: state.solver.new_var(),
+                            y: state.solver.new_var(),
+                            cell: *c.state.posargs.first().unwrap(),
+                            reflect: refl.unwrap_or_default(),
+                            angle: angle.unwrap_or_default(),
+                        };
+                        self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
+                        true
+                    } else {
+                        false
+                    }
                 }
                 cell => {
                     // Must be calling a cell generator.
@@ -1349,6 +1434,7 @@ impl<'a> ExecPass<'a> {
                                                     y1: state.solver.new_var(),
                                                     source: None, // TODO
                                                 };
+                                                let rect = rect.transform(inst.reflect, inst.angle);
                                                 let dx0 = LinearExpr::from(xrect.x0)
                                                     - rect.x0
                                                     - LinearExpr::from(inst.x);
@@ -1495,13 +1581,15 @@ pub struct Instance {
     pub x: Var,
     pub y: Var,
     pub cell: ValueId,
+    pub reflect: bool,
+    pub angle: Rotation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolvedInstance {
     pub x: f64,
     pub y: f64,
-    pub angle: f64,
+    pub angle: Rotation,
     pub reflect: bool,
     pub cell: CellId,
 }
@@ -1519,6 +1607,12 @@ pub enum SolvedValue {
 pub struct CompiledCell {
     pub values: Vec<SolvedValue>,
     pub fields: HashMap<String, SolvedValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompileOutput {
+    pub cells: HashMap<CellId, CompiledCell>,
+    pub top: CellId,
 }
 
 #[enumify(generics_only)]
@@ -1616,4 +1710,35 @@ struct PartialFieldAccessExpr<'a, T: AstMetadata> {
 #[derive(Debug, Clone)]
 pub struct FieldAccessExprState {
     base: ValueId,
+}
+
+fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
+    (
+        mat[0][0] as f64 * pt.0 + mat[0][1] as f64 * pt.1,
+        mat[1][0] as f64 * pt.0 + mat[1][1] as f64 * pt.1,
+    )
+}
+
+impl Rect<f64> {
+    fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
+        let trans = TransformationBuilder::default()
+            .reflect_vert(reflect_vert)
+            .angle(angle)
+            .build();
+        let mut mat = TransformationMatrix::identity();
+        if reflect_vert {
+            mat = mat.reflect_vert()
+        }
+        mat = mat.rotate(angle);
+        let p0p = ifmatvec(mat, (self.x0, self.y0));
+        let p1p = ifmatvec(mat, (self.x1, self.y1));
+        Self {
+            layer: self.layer.clone(),
+            x0: p0p.0.min(p1p.0),
+            y0: p0p.1.min(p1p.1),
+            x1: p0p.0.max(p1p.0),
+            y1: p0p.1.max(p1p.1),
+            source: self.source.clone(),
+        }
+    }
 }

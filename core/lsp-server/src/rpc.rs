@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use compiler::compile::CompiledCell;
+use compiler::compile::{CompileOutput, CompiledCell};
 
 use tarpc::tokio_serde::formats::Json;
 
@@ -13,7 +13,7 @@ pub trait GuiToLsp {
 
 #[tarpc::service]
 pub trait LspToGui {
-    async fn open_cell(cell: CompiledCell);
+    async fn open_cell(cell: CompileOutput);
 }
 
 #[derive(Clone)]

@@ -8,14 +8,14 @@ use std::{
     sync::Arc,
 };
 
-use compiler::compile::CompiledCell;
+use compiler::compile::{CompileOutput, CompiledCell};
 use futures::prelude::*;
 use portpicker::pick_unused_port;
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
 use tarpc::{
     context,
-    server::{self, incoming::Incoming, Channel},
+    server::{self, Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
@@ -165,9 +165,9 @@ impl Backend {
             .await
             .unwrap();
             let o_str = String::from_utf8(o.stdout).unwrap();
-            let o: CompiledCell = serde_json::from_str(&o_str).unwrap();
+            let o: CompileOutput = serde_json::from_str(&o_str).unwrap();
             if let Some(client) = state.gui_client.lock().await.as_mut() {
-                client.open_cell(context::current(), o);
+                client.open_cell(context::current(), o).await.unwrap();
             } else {
                 state
                     .editor_client

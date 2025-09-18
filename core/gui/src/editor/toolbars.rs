@@ -89,10 +89,8 @@ impl Render for SideBar {
                                 .id(SharedString::from(format!("layer_control_{i}"))) // TODO: does this need to be unique? seems to work as is
                                 .flex()
                                 .on_click(move |_event, _window, cx| {
-                                    println!("On click {i}");
                                     layers_clone.update(cx, |state, cx| {
                                         state[i].visible = !state[i].visible;
-                                        println!("Update layer state {i}");
                                         cx.notify();
                                     })
                                 })
