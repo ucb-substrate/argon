@@ -140,6 +140,11 @@ impl<'a> VarIdTyPass<'a> {
     pub(crate) fn execute(mut self) -> Ast<'a, VarIdTyMetadata> {
         let mut decls = Vec::new();
         for decl in &self.ast.decls {
+            if let Decl::Fn(f) = decl {
+                self.declare_fn_decl(f);
+            }
+        }
+        for decl in &self.ast.decls {
             match decl {
                 Decl::Fn(f) => {
                     decls.push(Decl::Fn(self.transform_fn_decl(f)));
@@ -152,6 +157,20 @@ impl<'a> VarIdTyPass<'a> {
         }
 
         Ast { decls }
+    }
+
+    fn declare_fn_decl(&mut self, input: &FnDecl<'a, ParseMetadata>) {
+        assert!(!["crect", "rect", "float", "eq", "inst"].contains(&input.name.name));
+        let args: Vec<_> = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
+        let ty = Ty::Fn(Box::new(FnTy {
+            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            ret: Ty::from_name(input.return_ty.name),
+        }));
+        self.alloc(input.name.name, ty);
     }
 }
 
@@ -227,17 +246,12 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     }
 
     fn transform_fn_decl(&mut self, input: &FnDecl<'a, Self::Input>) -> FnDecl<'a, Self::Output> {
-        assert!(!["crect", "rect", "float", "eq", "inst"].contains(&input.name.name));
+        let (varid, _) = self.lookup(input.name.name).unwrap();
         let args: Vec<_> = input
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
-        let ty = Ty::Fn(Box::new(FnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            ret: Ty::from_name(input.return_ty.name),
-        }));
-        let vid = self.alloc(input.name.name, ty);
         let name = self.transform_ident(&input.name);
         let return_ty = self.transform_ident(&input.return_ty);
         let scope = self.transform_scope(&input.scope);
@@ -246,7 +260,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             args,
             return_ty,
             scope,
-            metadata: vid,
+            metadata: varid,
         }
     }
 
@@ -648,7 +662,6 @@ impl<'a> ExecPass<'a> {
     }
 
     pub(crate) fn execute_cell(&mut self, cell: &'a str, params: HashMap<&'a str, f64>) -> CellId {
-        println!("executing cell {cell}");
         let cell_id = self.alloc_id();
         self.partial_cells.push_back(cell_id);
         assert!(self
@@ -696,7 +709,6 @@ impl<'a> ExecPass<'a> {
             .pop_back()
             .expect("failed to pop cell id");
 
-        println!("done");
         let cell = self.emit(cell_id);
         assert!(self.compiled_cells.insert(cell_id, cell).is_none());
         cell_id
