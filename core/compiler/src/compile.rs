@@ -35,6 +35,7 @@ pub(crate) struct VarIdTyPass<'a> {
     ast: &'a Ast<'a, ParseMetadata>,
     next_id: VarId,
     bindings: Vec<HashMap<&'a str, (VarId, Ty)>>,
+    errors: Vec<StaticError>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +117,7 @@ impl<'a> VarIdTyPass<'a> {
             // allocate space for the global namespace
             bindings: vec![HashMap::new()],
             next_id: 1,
+            errors: Vec::new(),
         }
     }
 
@@ -158,7 +160,13 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_fn_decl(&mut self, input: &FnDecl<'a, ParseMetadata>) {
-        assert!(!["crect", "rect", "float", "eq", "inst"].contains(&input.name.name));
+        if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
+            self.errors.push(StaticError {
+                span: input.name.span,
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+            return;
+        }
         let args: Vec<_> = input
             .args
             .iter()
@@ -266,17 +274,24 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         &mut self,
         input: &CellDecl<'a, Self::Input>,
     ) -> CellDecl<'a, Self::Output> {
-        assert!(!["crect", "rect", "float", "inst"].contains(&input.name.name));
+        if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
+            self.errors.push(StaticError {
+                span: input.name.span,
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+        }
         let args: Vec<_> = input
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
         let scope = self.transform_scope(&input.scope);
-        assert!(
-            scope.tail.is_none(),
-            "cells must not have an expression in tail position"
-        );
+        if let Some(tail) = scope.tail.as_ref() {
+            self.errors.push(StaticError {
+                span: tail.span(),
+                kind: StaticErrorKind::CellWithTailExpr,
+            });
+        }
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             data: scope
@@ -285,7 +300,10 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                 .filter_map(|stmt| {
                     if let Statement::LetBinding(lt) = stmt {
                         if ["x", "y"].contains(&lt.name.name) {
-                            panic!("duplicate declaration of name `{}` (fields x and y are built-ins for cells)", lt.name.name);
+                            self.errors.push(StaticError {
+                                span: lt.name.span,
+                                kind: StaticErrorKind::RedeclarationOfBuiltin,
+                            });
                         }
                         Some((lt.name.name.to_string(), lt.value.ty()))
                     } else {
@@ -315,7 +333,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_if_expr(
         &mut self,
-        _input: &IfExpr<'a, Self::Input>,
+        input: &IfExpr<'a, Self::Input>,
         cond: &Expr<'a, Self::Output>,
         then: &Expr<'a, Self::Output>,
         else_: &Expr<'a, Self::Output>,
@@ -324,21 +342,47 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         let then_ty = then.ty();
         let else_ty = else_.ty();
         assert_eq!(cond_ty, Ty::Bool);
-        assert_eq!(then_ty, else_ty);
+        if cond_ty != Ty::Bool {
+            self.errors.push(StaticError {
+                span: cond.span(),
+                kind: StaticErrorKind::IfCondNotBool,
+            });
+        }
+        if then_ty != else_ty {
+            self.errors.push(StaticError {
+                span: input.span,
+                kind: StaticErrorKind::BranchesDifferentTypes,
+            });
+        }
         then_ty
     }
 
     fn dispatch_bin_op_expr(
         &mut self,
-        _input: &BinOpExpr<'a, Self::Input>,
+        input: &BinOpExpr<'a, Self::Input>,
         left: &Expr<'a, Self::Output>,
         right: &Expr<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        assert_eq!(left_ty, right_ty);
-        assert!([Ty::Float, Ty::Int].contains(&left_ty));
-        assert!([Ty::Float, Ty::Int].contains(&right_ty));
+        if left_ty != right_ty {
+            self.errors.push(StaticError {
+                span: input.span,
+                kind: StaticErrorKind::BinOpMismatchedTypes,
+            });
+        }
+        if ![Ty::Float, Ty::Int].contains(&left_ty) {
+            self.errors.push(StaticError {
+                span: left.span(),
+                kind: StaticErrorKind::BinOpInvalidType,
+            });
+        }
+        if ![Ty::Float, Ty::Int].contains(&right_ty) {
+            self.errors.push(StaticError {
+                span: right.span(),
+                kind: StaticErrorKind::BinOpInvalidType,
+            });
+        }
         left_ty
     }
 
@@ -349,12 +393,22 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
     ) -> <Self::Output as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
-                assert_eq!(operand.ty(), Ty::Bool);
+                if operand.ty() != Ty::Bool {
+                    self.errors.push(StaticError {
+                        span: operand.span(),
+                        kind: StaticErrorKind::UnaryOpInvalidType,
+                    });
+                }
                 Ty::Bool
             }
             UnaryOp::Neg => {
                 let operand_ty = operand.ty();
-                assert!([Ty::Float, Ty::Int].contains(&operand_ty));
+                if ![Ty::Float, Ty::Int].contains(&operand_ty) {
+                    self.errors.push(StaticError {
+                        span: operand.span(),
+                        kind: StaticErrorKind::UnaryOpInvalidType,
+                    });
+                }
                 operand_ty
             }
         }
@@ -362,13 +416,18 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_comparison_expr(
         &mut self,
-        _input: &ComparisonExpr<'a, Self::Input>,
+        input: &ComparisonExpr<'a, Self::Input>,
         left: &Expr<'a, Self::Output>,
         right: &Expr<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::ComparisonExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        assert_eq!(left_ty, right_ty);
+        if left_ty != right_ty {
+            self.errors.push(StaticError {
+                span: input.span,
+                kind: StaticErrorKind::BinOpMismatchedTypes,
+            });
+        }
         Ty::Bool
     }
 
@@ -651,28 +710,29 @@ impl<'a> ExecPass<'a> {
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
         let cell_id = self.execute_cell(input.cell, input.params);
-        CompileOutput {
+        CompileOutput::Valid(ValidCompileOutput {
             cells: self.compiled_cells,
             top: cell_id,
-        }
+        })
     }
 
     pub(crate) fn execute_cell(&mut self, cell: &'a str, params: Vec<f64>) -> CellId {
         let cell_id = self.alloc_id();
         self.partial_cells.push_back(cell_id);
-        assert!(self
-            .cell_states
-            .insert(
-                cell_id,
-                CellState {
-                    solve_iters: 0,
-                    solver: Solver::new(),
-                    fields: HashMap::new(),
-                    emit: Vec::new(),
-                    deferred: Default::default(),
-                }
-            )
-            .is_none());
+        assert!(
+            self.cell_states
+                .insert(
+                    cell_id,
+                    CellState {
+                        solve_iters: 0,
+                        solver: Solver::new(),
+                        fields: HashMap::new(),
+                        emit: Vec::new(),
+                        deferred: Default::default(),
+                    }
+                )
+                .is_none()
+        );
         self.visit_cell_body(cell_id, cell, params);
         let mut require_progress = false;
         let mut progress = false;
@@ -736,6 +796,7 @@ impl<'a> ExecPass<'a> {
                         .unwrap_ready()
                         .as_ref()
                         .unwrap_cell(),
+                    cell_vid: inst.cell,
                 })),
                 _ => None,
             }
@@ -790,31 +851,35 @@ impl<'a> ExecPass<'a> {
             match decl {
                 Decl::Fn(f) => {
                     let vid = self.value_id();
-                    assert!(self
-                        .values
-                        .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
-                        .is_none());
-                    assert!(self
-                        .frames
-                        .get_mut(&self.global_frame)
-                        .unwrap()
-                        .bindings
-                        .insert(f.metadata, vid)
-                        .is_none());
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(f.metadata, vid)
+                            .is_none()
+                    );
                 }
                 Decl::Cell(c) => {
                     let vid = self.value_id();
-                    assert!(self
-                        .values
-                        .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
-                        .is_none());
-                    assert!(self
-                        .frames
-                        .get_mut(&self.global_frame)
-                        .unwrap()
-                        .bindings
-                        .insert(c.metadata, vid)
-                        .is_none());
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(c.metadata, vid)
+                            .is_none()
+                    );
                 }
                 _ => (),
             }
@@ -1441,6 +1506,30 @@ impl<'a> ExecPass<'a> {
                                                 state.solver.constrain_eq0(dy1);
                                                 Some(Value::Rect(xrect))
                                             }
+                                            SolvedValue::Instance(cinst) => {
+                                                let (angle, reflect, cx, cy) = cascade(
+                                                    inst.angle,
+                                                    inst.reflect,
+                                                    cinst.angle,
+                                                    cinst.reflect,
+                                                    cinst.x,
+                                                    cinst.y,
+                                                );
+                                                let oinst = Instance {
+                                                    cell: cinst.cell_vid,
+                                                    x: state.solver.new_var(),
+                                                    y: state.solver.new_var(),
+                                                    angle,
+                                                    reflect,
+                                                };
+                                                let dx = LinearExpr::from(inst.x) + cx
+                                                    - LinearExpr::from(oinst.x);
+                                                let dy = LinearExpr::from(inst.y) + cy
+                                                    - LinearExpr::from(oinst.y);
+                                                state.solver.constrain_eq0(dx);
+                                                state.solver.constrain_eq0(dy);
+                                                Some(Value::Inst(oinst))
+                                            }
                                             _ => todo!(),
                                         }
                                     } else {
@@ -1579,6 +1668,10 @@ pub struct SolvedInstance {
     pub angle: Rotation,
     pub reflect: bool,
     pub cell: CellId,
+    /// The value ID of the cell being instantiated.
+    ///
+    /// For compiler internal use only.
+    cell_vid: ValueId,
 }
 
 #[enumify]
@@ -1597,7 +1690,48 @@ pub struct CompiledCell {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompileOutput {
+pub struct StaticError {
+    pub span: cfgrammar::Span,
+    pub kind: StaticErrorKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StaticErrorKind {
+    /// Multiple declarations with the same name.
+    ///
+    /// For example, two cells named `my_cell`.
+    DuplicateNameDeclaration,
+    /// Attempted to declare an object with the same name as a built-in object.
+    ///
+    /// For example, users cannot declare cells or functions named `rect`.
+    RedeclarationOfBuiltin,
+    /// A cell had an expression in tail position, which is not permitted.
+    CellWithTailExpr,
+    /// If conditions must have type bool.
+    IfCondNotBool,
+    /// Branches in expresssions must evaluate to the same type.
+    BranchesDifferentTypes,
+    /// The operands in a binary expression must have the same type.
+    BinOpMismatchedTypes,
+    /// A type cannot be used in a binary expression.
+    BinOpInvalidType,
+    /// A type cannot be used in a unary operation.
+    UnaryOpInvalidType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CompileOutput {
+    StaticErrors(StaticErrorCompileOutput),
+    Valid(ValidCompileOutput),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticErrorCompileOutput {
+    pub errors: Vec<StaticError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidCompileOutput {
     pub cells: HashMap<CellId, CompiledCell>,
     pub top: CellId,
 }
@@ -1703,13 +1837,30 @@ fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
     )
 }
 
+fn tmat(rot: Rotation, refv: bool) -> TransformationMatrix {
+    let mut mat = TransformationMatrix::identity();
+    if refv {
+        mat = mat.reflect_vert()
+    }
+    mat = mat.rotate(rot);
+    mat
+}
+
+fn imat(mat: TransformationMatrix) -> (Rotation, bool) {
+    let refv = mat[1][0] == mat[0][1] && mat[0][0] == -mat[1][1];
+    let rot = match (mat[0][0], mat[1][0]) {
+        (1, 0) => Rotation::R0,
+        (0, 1) => Rotation::R90,
+        (-1, 0) => Rotation::R180,
+        (0, -1) => Rotation::R270,
+        _ => panic!("invalid rotation matrix"),
+    };
+    (rot, refv)
+}
+
 impl Rect<f64> {
     fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
-        let mut mat = TransformationMatrix::identity();
-        if reflect_vert {
-            mat = mat.reflect_vert()
-        }
-        mat = mat.rotate(angle);
+        let mat = tmat(angle, reflect_vert);
         let p0p = ifmatvec(mat, (self.x0, self.y0));
         let p1p = ifmatvec(mat, (self.x1, self.y1));
         Self {
@@ -1721,4 +1872,19 @@ impl Rect<f64> {
             source: self.source.clone(),
         }
     }
+}
+
+fn cascade(
+    rot: Rotation,
+    refv: bool,
+    crot: Rotation,
+    crefv: bool,
+    cx: f64,
+    cy: f64,
+) -> (Rotation, bool, f64, f64) {
+    let mat = tmat(rot, refv);
+    let cmat = tmat(crot, crefv);
+    let (x, y) = ifmatvec(mat, (cx, cy));
+    let (rot, refv) = imat(mat * cmat);
+    (rot, refv, x, y)
 }
