@@ -1696,7 +1696,7 @@ pub struct FieldAccessExprState {
     base: ValueId,
 }
 
-fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
+pub fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
     (
         mat[0][0] as f64 * pt.0 + mat[0][1] as f64 * pt.1,
         mat[1][0] as f64 * pt.0 + mat[1][1] as f64 * pt.1,
@@ -1704,7 +1704,7 @@ fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
 }
 
 impl Rect<f64> {
-    fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
+    pub fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
         let mut mat = TransformationMatrix::identity();
         if reflect_vert {
             mat = mat.reflect_vert()

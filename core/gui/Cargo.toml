@@ -23,3 +23,4 @@ tarpc = { version = "0.37", features = ["full"] }
 async-compat = "0.2"
 portpicker = "0.1"
 futures = "0.3"
+geometry = { version = "0.7.1", registry = "substrate" }
