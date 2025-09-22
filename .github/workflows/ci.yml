@@ -23,6 +23,6 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Check format
-        run: cargo fmt --check --locked
+        run: cargo fmt --check
       - name: Check lint
         run: cargo clippy --locked -- -D warnings
