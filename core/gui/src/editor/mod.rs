@@ -59,6 +59,7 @@ pub struct Editor {
 
 impl EditorState {
     pub fn update(&mut self, cx: &mut impl AppContext, file: PathBuf, solved_cell: CompileOutput) {
+        let solved_cell = solved_cell.unwrap_valid();
         self.file = Some(file);
         let mut z = 0;
         let mut queue =
@@ -145,7 +146,7 @@ impl EditorState {
             cx.notify();
         });
         self.rects = rects;
-        self.solved_cell = Some(solved_cell);
+        self.solved_cell = Some(CompileOutput::Valid(solved_cell));
     }
 }
 
