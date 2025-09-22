@@ -719,19 +719,20 @@ impl<'a> ExecPass<'a> {
     pub(crate) fn execute_cell(&mut self, cell: &'a str, params: Vec<f64>) -> CellId {
         let cell_id = self.alloc_id();
         self.partial_cells.push_back(cell_id);
-        assert!(self
-            .cell_states
-            .insert(
-                cell_id,
-                CellState {
-                    solve_iters: 0,
-                    solver: Solver::new(),
-                    fields: HashMap::new(),
-                    emit: Vec::new(),
-                    deferred: Default::default(),
-                }
-            )
-            .is_none());
+        assert!(
+            self.cell_states
+                .insert(
+                    cell_id,
+                    CellState {
+                        solve_iters: 0,
+                        solver: Solver::new(),
+                        fields: HashMap::new(),
+                        emit: Vec::new(),
+                        deferred: Default::default(),
+                    }
+                )
+                .is_none()
+        );
         self.visit_cell_body(cell_id, cell, params);
         let mut require_progress = false;
         let mut progress = false;
@@ -850,31 +851,35 @@ impl<'a> ExecPass<'a> {
             match decl {
                 Decl::Fn(f) => {
                     let vid = self.value_id();
-                    assert!(self
-                        .values
-                        .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
-                        .is_none());
-                    assert!(self
-                        .frames
-                        .get_mut(&self.global_frame)
-                        .unwrap()
-                        .bindings
-                        .insert(f.metadata, vid)
-                        .is_none());
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(f.metadata, vid)
+                            .is_none()
+                    );
                 }
                 Decl::Cell(c) => {
                     let vid = self.value_id();
-                    assert!(self
-                        .values
-                        .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
-                        .is_none());
-                    assert!(self
-                        .frames
-                        .get_mut(&self.global_frame)
-                        .unwrap()
-                        .bindings
-                        .insert(c.metadata, vid)
-                        .is_none());
+                    assert!(
+                        self.values
+                            .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
+                            .is_none()
+                    );
+                    assert!(
+                        self.frames
+                            .get_mut(&self.global_frame)
+                            .unwrap()
+                            .bindings
+                            .insert(c.metadata, vid)
+                            .is_none()
+                    );
                 }
                 _ => (),
             }

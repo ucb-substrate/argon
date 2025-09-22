@@ -1,9 +1,9 @@
 use compiler::compile::CellId;
 use gpui::{
-    div, pattern_slash, rgb, rgba, solid_background, BorderStyle, Bounds, Context, Corners,
-    DefiniteLength, DragMoveEvent, Edges, Element, Entity, InteractiveElement, IntoElement, Length,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
+    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
+    Size, Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
 };
 use itertools::Itertools;
 
