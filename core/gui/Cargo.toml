@@ -6,8 +6,7 @@ edition = "2024"
 [dependencies]
 lsp-server = { path = "../lsp-server" }
 compiler = { path = "../compiler" }
-# gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
-gpui = { path = "../../../zed/crates/gpui" }
+gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
 smallvec = "1"
 rust-embed = "8"
 lazy_static = "1"
