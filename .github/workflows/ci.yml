@@ -14,9 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - run: sudo apt update && sudo apt install xorg
+      - run: sudo apt update && sudo apt install pkg-config
       - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache_on_failure: true
       - name: Check format
         run: cargo fmt --check
       - name: Check lint
