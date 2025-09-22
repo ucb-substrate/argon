@@ -45,7 +45,7 @@ mod tests {
 
     use parse::parse;
 
-    use crate::compile::{compile, CompileInput, VarIdTyPass};
+    use crate::compile::{CompileInput, VarIdTyPass, compile};
 
     use super::*;
 
@@ -84,6 +84,10 @@ cell simple(y_enclosure: int) {
     const ARGON_HIERARCHY: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/hierarchy.ar"
+    ));
+    const ARGON_NESTED_INST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/nested_inst.ar"
     ));
     const ARGON_CELL_OUT_OF_ORDER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -188,6 +192,19 @@ cell simple(y_enclosure: int) {
     #[test]
     fn argon_hierarchy() {
         let ast = parse(ARGON_HIERARCHY).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                params: Vec::new(),
+            },
+        );
+        println!("{cells:#?}");
+    }
+
+    #[test]
+    fn argon_nested_inst() {
+        let ast = parse(ARGON_NESTED_INST).expect("failed to parse Argon");
         let cells = compile(
             &ast,
             CompileInput {

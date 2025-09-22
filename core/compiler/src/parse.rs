@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use lrlex::lrlex_mod;
 use lrpar::lrpar_mod;
 

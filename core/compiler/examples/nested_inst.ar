@@ -1,0 +1,22 @@
+cell bot() {
+    let met1 = rect(Layer::Met1, x0=0., y0=0., x1=100., y1=100.)!;
+    let met2 = rect(Layer::Met1, x0=100., y0=0., x1=200., y1=100.)!;
+}
+
+cell middle() {
+    let bot = inst(bot())!;
+    eq(bot.x, 0.);
+    eq(bot.y, 0.);
+}
+
+cell top() {
+  let mid_cell = middle();
+  let left = inst(mid_cell)!;
+  let right = inst(mid_cell, angle=90)!;
+  eq(left.x, 0.);
+  eq(left.y, 0.);
+  eq(right.x, 300.);
+  eq(right.y, 0.);
+  let met3 = rect(Layer::Met3, x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.)!;
+}
+
