@@ -1715,6 +1715,7 @@ pub enum StaticErrorKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[enumify]
 pub enum CompileOutput {
     StaticErrors(StaticErrorCompileOutput),
     Valid(ValidCompileOutput),
