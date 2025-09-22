@@ -37,11 +37,9 @@ impl SyncGuiToLspClient {
                 GuiToLspClient::new(tarpc::client::Config::default(), transport.await.unwrap())
                     .spawn()
             }
-            
             .compat(),
         );
-        Self { app, 
-            client }
+        Self { app, client }
     }
 
     pub fn register_server(&self, state: Entity<EditorState>) {
