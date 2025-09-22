@@ -15,7 +15,7 @@ use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
     context,
-    server::{Channel, incoming::Incoming},
+    server::{incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
 
@@ -39,8 +39,7 @@ impl SyncGuiToLspClient {
             }
             .compat(),
         );
-        let client = Self { app, client };
-        client
+        Self { app, client }
     }
 
     pub fn register_server(&self, state: Entity<EditorState>) {
@@ -96,15 +95,13 @@ impl SyncGuiToLspClient {
             .compat(),
         );
         self.app
-            .spawn(async move |app| {
-                loop {
-                    if let Some(exec) = rx.next().await {
-                        state
-                            .update(app, |state, cx| {
-                                exec(state, cx);
-                            })
-                            .unwrap();
-                    }
+            .spawn(async move |app| loop {
+                if let Some(exec) = rx.next().await {
+                    state
+                        .update(app, |state, cx| {
+                            exec(state, cx);
+                        })
+                        .unwrap();
                 }
             })
             .detach();
@@ -124,9 +121,11 @@ impl SyncGuiToLspClient {
     }
 }
 
+type StateMutFn = Box<dyn FnOnce(&mut EditorState, &mut Context<EditorState>) + Send>;
+
 #[derive(Clone)]
 pub struct GuiServer {
-    to_exec: Sender<Box<dyn FnOnce(&mut EditorState, &mut Context<EditorState>) + Send>>,
+    to_exec: Sender<StateMutFn>,
 }
 
 impl LspToGui for GuiServer {

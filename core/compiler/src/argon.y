@@ -220,7 +220,7 @@ Term -> Result<Expr<'input, ParseMetadata>, ()>
 Factor -> Result<Expr<'input, ParseMetadata>, ()>
   : '!' Factor { Ok(Expr::UnaryOp(Box::new(UnaryOpExpr { op: UnaryOp::Not, operand: $2?, span: $span, metadata: () }))) }
   | '-' Factor { Ok(Expr::UnaryOp(Box::new(UnaryOpExpr { op: UnaryOp::Neg, operand: $2?, span: $span, metadata: () }))) }
-  | SubFactor { Ok($1?) }
+  | SubFactor { $1 }
   ;
 
 SubFactor -> Result<Expr<'input, ParseMetadata>, ()>
