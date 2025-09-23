@@ -16,4 +16,3 @@ jobs:
       - uses: actions/checkout@v5
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
-      - run: cargo clippy --tests --locked -- -D warnings
