@@ -4,9 +4,10 @@ use cfgrammar::Span;
 use derive_where::derive_where;
 use itertools::Itertools;
 
-#[derive_where(Default, Debug, Clone)]
+#[derive_where(Debug, Clone)]
 pub struct Ast<'a, T: AstMetadata> {
     pub decls: Vec<Decl<'a, T>>,
+    pub span: Span,
 }
 
 #[derive_where(Debug, Clone)]
@@ -65,6 +66,7 @@ pub struct CellDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub args: Vec<ArgDecl<'a, T>>,
     pub scope: Scope<'a, T>,
+    pub span: Span,
     pub metadata: T::CellDecl,
 }
 
@@ -74,6 +76,7 @@ pub struct FnDecl<'a, T: AstMetadata> {
     pub args: Vec<ArgDecl<'a, T>>,
     pub return_ty: Ident<'a, T>,
     pub scope: Scope<'a, T>,
+    pub span: Span,
     pub metadata: T::FnDecl,
 }
 
@@ -486,6 +489,7 @@ pub trait AstTransformer<'a> {
             name,
             args,
             scope,
+            span: input.span,
             metadata,
         }
     }
@@ -504,6 +508,7 @@ pub trait AstTransformer<'a> {
             args,
             return_ty,
             scope,
+            span: input.span,
             metadata,
         }
     }

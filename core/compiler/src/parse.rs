@@ -57,7 +57,7 @@ pub fn parse(input: &str) -> Result<Ast<'_, ParseMetadata>, anyhow::Error> {
         bail!("{err}");
     }
     match res {
-        Some(Ok(decls)) => Ok(Ast { decls }),
+        Some(Ok(ast)) => Ok(ast),
         _ => bail!("Unable to evaluate expression."),
     }
 }

@@ -6,7 +6,7 @@ use std::{
 };
 
 use canvas::{LayoutCanvas, ShapeFill};
-use compiler::compile::{ifmatvec, CellId, CompileOutput, SolvedValue};
+use compiler::compile::{CellId, CompileOutput, SolvedValue, ifmatvec};
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use itertools::Itertools;
