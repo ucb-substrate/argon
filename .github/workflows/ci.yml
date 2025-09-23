@@ -18,5 +18,4 @@ jobs:
         with:
           cache-on-failure: true
       - run: sudo apt update && sudo apt install libx11-dev
-      - name: Check lint
-        run: cargo clippy --locked -- -D warnings
+      - run: cargo clippy --locked -- -D warnings
