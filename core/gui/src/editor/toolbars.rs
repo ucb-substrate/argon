@@ -123,6 +123,7 @@ impl Render for LayerSideBar {
 
 pub struct HierarchySideBar {
     scopes: Entity<ScopeTree>,
+    selected_scope: Entity<Option<CellId>>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
@@ -130,9 +131,14 @@ pub struct HierarchySideBar {
 impl HierarchySideBar {
     pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
         let scopes = state.read(cx).scopes.clone();
-        let subscriptions = vec![cx.observe(&scopes, |_, _, cx| cx.notify())];
+        let selected_scope = state.read(cx).selected_scope.clone();
+        let subscriptions = vec![
+            cx.observe(&scopes, |_, _, cx| cx.notify()),
+            cx.observe(&selected_scope, |_, _, cx| cx.notify()),
+        ];
         Self {
             scopes,
+            selected_scope,
             subscriptions,
         }
     }
@@ -140,28 +146,52 @@ impl HierarchySideBar {
     fn render_scopes_helper(
         &mut self,
         cx: &mut gpui::Context<Self>,
-        scopes: &mut Vec<Stateful<Div>>,
+        scopes: &mut Vec<Div>,
         scope: CellId,
         depth: usize,
     ) {
         let scopes_clone = self.scopes.clone();
         let scope_state = &self.scopes.read(cx).state[&scope];
+        let selected_scope_clone = self.selected_scope.clone();
+        let selected_scope_state = self.selected_scope.read(cx);
         scopes.push(
             div()
-                .id(SharedString::from(format!("scope_control_{scope}",)))
                 .flex()
-                .on_click(move |_event, _window, cx| {
-                    scopes_clone.update(cx, |state, cx| {
-                        state.state.get_mut(&scope).unwrap().visible = !state.state[&scope].visible;
-                        cx.notify();
-                    })
+                .w_full()
+                .bg(if &Some(scope) == selected_scope_state {
+                    rgba(0x00000099)
+                } else {
+                    rgba(0)
                 })
-                .child(format!(
-                    "{}{} - {}",
-                    std::iter::repeat_n("  ", depth).collect::<String>(),
-                    &scope_state.name,
-                    if scope_state.visible { "V" } else { "NV" }
-                )),
+                .child(
+                    div()
+                        .id(SharedString::from(format!("test_{scope}")))
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(format!(
+                            "{}{}",
+                            std::iter::repeat_n("  ", depth).collect::<String>(),
+                            &scope_state.name,
+                        ))
+                        .on_click(move |_event, _window, cx| {
+                            selected_scope_clone.update(cx, |state, cx| {
+                                *state = Some(scope);
+                                cx.notify();
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .child(if scope_state.visible { "--V" } else { "NV" })
+                        .id(SharedString::from(format!("scope_control_{scope}",)))
+                        .on_click(move |_event, _window, cx| {
+                            scopes_clone.update(cx, |state, cx| {
+                                state.state.get_mut(&scope).unwrap().visible =
+                                    !state.state[&scope].visible;
+                                cx.notify();
+                            })
+                        }),
+                ),
         );
         for scope in scope_state.children.clone() {
             self.render_scopes_helper(cx, scopes, scope, depth + 1);
@@ -173,7 +203,13 @@ impl HierarchySideBar {
         if let Some(root) = self.scopes.read(cx).root {
             self.render_scopes_helper(cx, &mut scopes, root, 0);
         }
-        div().flex().flex_col().children(scopes)
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .id("layers_scroll_vert")
+            .overflow_y_scroll()
+            .children(scopes)
     }
 }
 
@@ -193,14 +229,6 @@ impl Render for HierarchySideBar {
             .bg(THEME.sidebar)
             .min_h_0()
             .child("Scopes")
-            .child(
-                div()
-                    .flex()
-                    .size_full()
-                    .items_start()
-                    .id("layers_scroll_vert")
-                    .overflow_scroll()
-                    .child(div().flex().child(self.render_scopes(cx))),
-            )
+            .child(self.render_scopes(cx))
     }
 }
