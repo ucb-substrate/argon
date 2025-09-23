@@ -47,6 +47,7 @@ pub struct EditorState {
     pub selected_rect: Option<usize>,
     pub layers: Entity<HashMap<SharedString, LayerState>>,
     pub scopes: Entity<ScopeTree>,
+    pub selected_scope: Entity<Option<CellId>>,
     pub lsp_client: SyncGuiToLspClient,
     pub subscriptions: Vec<Subscription>,
 }
@@ -134,7 +135,7 @@ impl EditorState {
             scopes.insert(
                 cell,
                 ScopeState {
-                    name: "tmp".into(),
+                    name: format!("scope_{cell}"),
                     visible: true,
                     parent,
                     children: children.into_iter().dedup().collect(),
@@ -152,6 +153,10 @@ impl EditorState {
             };
             cx.notify();
         });
+        self.selected_scope.update(cx, |old_scope, cx| {
+            *old_scope = Some(solved_cell.top);
+            cx.notify();
+        });
         self.rects = rects;
         self.solved_cell = Some(CompileOutput::Valid(solved_cell));
     }
@@ -165,6 +170,7 @@ impl Editor {
             root: None,
             state: HashMap::new(),
         });
+        let selected_scope = cx.new(|_cx| None);
         let state = cx.new(|cx| {
             let subscriptions = vec![cx.observe(&layers, |_, _, cx| cx.notify())];
             EditorState {
@@ -174,6 +180,7 @@ impl Editor {
                 selected_rect: None,
                 layers,
                 scopes,
+                selected_scope,
                 subscriptions,
                 lsp_client: lsp_client.clone(),
             }
