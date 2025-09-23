@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: bwrc
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          clean: false
+      - run: cargo fmt --check
+      - run: cargo clippy --locked -- -D warnings

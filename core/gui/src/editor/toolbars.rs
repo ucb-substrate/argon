@@ -132,46 +132,62 @@ impl HierarchySideBar {
 
     fn render_scopes_helper(
         &mut self,
-        cx: &mut gpui::Context<Self>,
         solved_cell: &CompileOutputState,
-        scopes: &mut Vec<Stateful<Div>>,
+        scopes: &mut Vec<Div>,
         scope: ScopeAddress,
         depth: usize,
     ) {
-        let solved_cell_clone = self.solved_cell.clone();
+        let solved_cell_clone_1 = self.solved_cell.clone();
+        let solved_cell_clone_2 = self.solved_cell.clone();
         let scope_state = &solved_cell.state[&scope];
         scopes.push(
             div()
-                .id(SharedString::from(format!(
-                    "scope_control_{}",
-                    scopes.len()
-                )))
                 .flex()
-                .on_click(move |_event, _window, cx| {
-                    solved_cell_clone.update(cx, |state, cx| {
-                        state
-                            .as_mut()
-                            .unwrap()
-                            .state
-                            .get_mut(&scope)
-                            .unwrap()
-                            .visible = !state.as_ref().unwrap().state[&scope].visible;
-                        cx.notify();
-                    })
+                .w_full()
+                .bg(if scope == solved_cell.selected_scope {
+                    rgba(0x00000099)
+                } else {
+                    rgba(0)
                 })
-                .child(format!(
-                    "{}{} - {}",
-                    std::iter::repeat_n("  ", depth).collect::<String>(),
-                    &scope_state.name,
-                    if scope_state.visible { "V" } else { "NV" }
-                )),
+                .child(
+                    div()
+                        .id(SharedString::from(format!("test_{scope:?}")))
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(format!(
+                            "{}{}",
+                            std::iter::repeat_n("  ", depth).collect::<String>(),
+                            &scope_state.name,
+                        ))
+                        .on_click(move |_event, _window, cx| {
+                            solved_cell_clone_1.update(cx, |state, cx| {
+                                if let Some(state) = state.as_mut() {
+                                    state.selected_scope = scope;
+                                    cx.notify();
+                                }
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .child(if scope_state.visible { "--V" } else { "NV" })
+                        .id(SharedString::from(format!("scope_control_{scope:?}",)))
+                        .on_click(move |_event, _window, cx| {
+                            solved_cell_clone_2.update(cx, |state, cx| {
+                                if let Some(state) = state.as_mut() {
+                                    state.state.get_mut(&scope).unwrap().visible =
+                                        !state.state[&scope].visible;
+                                    cx.notify();
+                                }
+                            })
+                        }),
+                ),
         );
         let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
         for elt in scope_info.elts.clone() {
             if let SolvedValue::Instance(inst) = &elt {
                 let scope = solved_cell.output.cells[&inst.cell].root;
                 self.render_scopes_helper(
-                    cx,
                     solved_cell,
                     scopes,
                     ScopeAddress {
@@ -184,7 +200,6 @@ impl HierarchySideBar {
         }
         for child_scope in scope_info.children.clone() {
             self.render_scopes_helper(
-                cx,
                 solved_cell,
                 scopes,
                 ScopeAddress {
@@ -198,11 +213,10 @@ impl HierarchySideBar {
 
     fn render_scopes(&mut self, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
         let mut scopes = Vec::new();
-        if let Some(state) = self.solved_cell.read(cx).clone() {
+        if let Some(state) = self.solved_cell.read(cx) {
             let scope = state.output.cells[&state.output.top].root;
             self.render_scopes_helper(
-                cx,
-                &state,
+                state,
                 &mut scopes,
                 ScopeAddress {
                     scope,
@@ -211,7 +225,13 @@ impl HierarchySideBar {
                 0,
             );
         }
-        div().flex().flex_col().children(scopes)
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .id("layers_scroll_vert")
+            .overflow_y_scroll()
+            .children(scopes)
     }
 }
 
@@ -231,14 +251,6 @@ impl Render for HierarchySideBar {
             .bg(THEME.sidebar)
             .min_h_0()
             .child("Scopes")
-            .child(
-                div()
-                    .flex()
-                    .size_full()
-                    .items_start()
-                    .id("layers_scroll_vert")
-                    .overflow_scroll()
-                    .child(div().flex().child(self.render_scopes(cx))),
-            )
+            .child(self.render_scopes(cx))
     }
 }

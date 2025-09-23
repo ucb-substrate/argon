@@ -39,8 +39,7 @@ impl SyncGuiToLspClient {
             }
             .compat(),
         );
-        let client = Self { app, client };
-        client
+        Self { app, client }
     }
 
     pub fn register_server(&self, state: Entity<EditorState>) {
@@ -124,9 +123,11 @@ impl SyncGuiToLspClient {
     }
 }
 
+type StateMutFn = Box<dyn FnOnce(&mut EditorState, &mut Context<EditorState>) + Send>;
+
 #[derive(Clone)]
 pub struct GuiServer {
-    to_exec: Sender<Box<dyn FnOnce(&mut EditorState, &mut Context<EditorState>) + Send>>,
+    to_exec: Sender<StateMutFn>,
 }
 
 impl LspToGui for GuiServer {
