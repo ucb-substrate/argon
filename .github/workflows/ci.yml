@@ -18,4 +18,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: cargo clippy --locked -- -D warnings
+      - name: Cargo clippy
+        run: cargo clippy --locked -- -D warnings
