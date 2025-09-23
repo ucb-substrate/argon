@@ -6,6 +6,9 @@ on:
       - main
   pull_request:
 
+  env:
+    CARGO_INCREMENTAL: 1
+
 jobs:
   lint:
     runs-on: ubuntu-latest
