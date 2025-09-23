@@ -6,16 +6,12 @@ on:
       - main
   pull_request:
 
-env:
-    CARGO_TERM_COLOR: always
-
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - run: sudo apt update && sudo apt install libx11-dev
-      - run: rustup toolchain install stable --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
