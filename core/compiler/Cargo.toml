@@ -14,19 +14,19 @@ good_lp = { version = "1", features = [
 ], default-features = false }
 itertools = "0.14"
 ena = "0.14"
-enumify = { version = "0.2.1", registry = "substrate" }
+enumify = { version = "0.2", registry = "substrate" }
 gds21 = "0.2"
 arcstr = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 derive-where = "1"
-nalgebra = "0.33.2"
+nalgebra = "0"
 approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
-indexmap = { version = "2.10.0", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-geometry = { version = "0.7.1", registry = "substrate" }
+geometry = { version = "0.7", registry = "substrate" }
 
 [build-dependencies]
 cfgrammar = "0.13"

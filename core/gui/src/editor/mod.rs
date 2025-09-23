@@ -6,9 +6,12 @@ use std::{
 };
 
 use canvas::{LayoutCanvas, ShapeFill};
-use compiler::compile::{CellId, CompileOutput, SolvedValue, ifmatvec};
+use compiler::compile::{
+    CellId, CompileOutput, ScopeId, SolvedValue, ValidCompileOutput, ifmatvec,
+};
 use geometry::transform::TransformationMatrix;
 use gpui::*;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 
@@ -36,16 +39,27 @@ pub struct ScopeTree {
 pub struct ScopeState {
     pub name: String,
     pub visible: bool,
-    pub children: Vec<CellId>,
+    pub parent: Option<ScopeAddress>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub struct ScopeAddress {
+    pub scope: ScopeId,
+    pub cell: CellId,
+}
+
+pub struct CompileOutputState {
+    pub file: PathBuf,
+    pub output: ValidCompileOutput,
+    pub selected_scope: ScopeAddress,
+    pub state: IndexMap<ScopeAddress, ScopeState>,
 }
 
 pub struct EditorState {
-    pub file: Option<PathBuf>,
-    pub solved_cell: Option<CompileOutput>,
+    pub solved_cell: Entity<Option<CompileOutputState>>,
     pub rects: Vec<canvas::Rect>,
     pub selected_rect: Option<usize>,
-    pub layers: Entity<HashMap<SharedString, LayerState>>,
-    pub scopes: Entity<ScopeTree>,
+    pub layers: Entity<IndexMap<SharedString, LayerState>>,
     pub lsp_client: SyncGuiToLspClient,
     pub subscriptions: Vec<Subscription>,
 }
@@ -60,16 +74,29 @@ pub struct Editor {
 impl EditorState {
     pub fn update(&mut self, cx: &mut impl AppContext, file: PathBuf, solved_cell: CompileOutput) {
         let solved_cell = solved_cell.unwrap_valid();
-        self.file = Some(file);
+        let selected_scope = ScopeAddress {
+            scope: solved_cell.cells[&solved_cell.top].root,
+            cell: solved_cell.top,
+        };
         let mut z = 0;
         let mut queue =
-            VecDeque::from_iter([(solved_cell.top, TransformationMatrix::identity(), (0., 0.))]);
-        let mut layers = HashMap::new();
-        let mut scopes = HashMap::new();
+            VecDeque::from_iter([(selected_scope, TransformationMatrix::identity(), (0., 0.))]);
+        let mut layers = IndexMap::new();
+        let mut state = IndexMap::new();
+        let mut parent = IndexMap::new();
         let mut rects = Vec::new();
-        while let Some((cell, mat, ofs)) = queue.pop_front() {
-            let mut children = Vec::new();
-            for value in &solved_cell.cells[&cell].values {
+        while let Some((curr_address @ ScopeAddress { scope, cell }, mat, ofs)) = queue.pop_front()
+        {
+            let scope_info = &solved_cell.cells[&cell].scopes[&scope];
+            state.insert(
+                curr_address,
+                ScopeState {
+                    name: scope_info.name,
+                    visible: true,
+                    parent: parent.get(curr_address),
+                },
+            );
+            for value in &scope_info.elts {
                 match value {
                     SolvedValue::Rect(rect) => {
                         let p0p = ifmatvec(mat, (rect.x0, rect.y0));
@@ -115,58 +142,62 @@ impl EditorState {
                         inst_mat = inst_mat.rotate(inst.angle);
                         let inst_ofs = ifmatvec(mat, (inst.x, inst.y));
 
+                        let inst_address = ScopeAddress {
+                            scope: solved_cell.cells[&inst.cell].root,
+                            cell: inst.cell,
+                        };
+                        parent.insert(inst_address, curr_address);
                         queue.push_back((
-                            inst.cell,
+                            inst_address,
                             mat * inst_mat,
                             (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1),
                         ));
-                        children.push(inst.cell);
                     }
                     _ => {}
                 }
             }
-            scopes.insert(
-                cell,
-                ScopeState {
-                    name: "tmp".into(),
-                    visible: true,
-                    children: children.into_iter().dedup().collect(),
-                },
-            );
+            for child in &scope_info.children {
+                let scope_address = ScopeAddress {
+                    scope: *child,
+                    cell,
+                };
+                parent.insert(scope_address, curr_address);
+                queue.push_back((scope_address, mat, ofs));
+            }
         }
         self.layers.update(cx, |old_layers, cx| {
             *old_layers = layers;
             cx.notify();
         });
-        self.scopes.update(cx, |old_scopes, cx| {
-            *old_scopes = ScopeTree {
-                root: Some(solved_cell.top),
-                state: scopes,
-            };
+        self.solved_cell.update(cx, |old_cell, cx| {
+            *old_cell = Some(CompileOutputState {
+                file,
+                output: solved_cell,
+                selected_scope,
+                parent,
+            });
             cx.notify();
         });
         self.rects = rects;
-        self.solved_cell = Some(CompileOutput::Valid(solved_cell));
+        self.selected_rect = None;
     }
 }
 
 impl Editor {
     pub fn new(cx: &mut Context<Self>, lsp_addr: SocketAddr) -> Self {
         let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
-        let layers = cx.new(|_cx| HashMap::new());
-        let scopes = cx.new(|_cx| ScopeTree {
-            root: None,
-            state: HashMap::new(),
-        });
+        let solved_cell = cx.new(|_cx| None);
+        let layers = cx.new(|_cx| IndexMap::new());
         let state = cx.new(|cx| {
-            let subscriptions = vec![cx.observe(&layers, |_, _, cx| cx.notify())];
+            let subscriptions = vec![
+                cx.observe(&solved_cell, |_, _, cx| cx.notify()),
+                cx.observe(&layers, |_, _, cx| cx.notify()),
+            ];
             EditorState {
-                file: None,
-                solved_cell: None,
+                solved_cell,
                 rects: Vec::new(),
                 selected_rect: None,
                 layers,
-                scopes,
                 subscriptions,
                 lsp_client: lsp_client.clone(),
             }

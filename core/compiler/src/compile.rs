@@ -1838,9 +1838,9 @@ pub enum SolvedValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledScope {
-    children: IndexSet<ScopeId>,
-    elts: Vec<SolvedValue>,
-    span: cfgrammar::Span,
+    pub children: IndexSet<ScopeId>,
+    pub elts: Vec<SolvedValue>,
+    pub span: cfgrammar::Span,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
