@@ -36,6 +36,7 @@ pub struct ScopeTree {
 pub struct ScopeState {
     pub name: String,
     pub visible: bool,
+    pub parent: Option<CellId>,
     pub children: Vec<CellId>,
 }
 
@@ -62,12 +63,16 @@ impl EditorState {
         let solved_cell = solved_cell.unwrap_valid();
         self.file = Some(file);
         let mut z = 0;
-        let mut queue =
-            VecDeque::from_iter([(solved_cell.top, TransformationMatrix::identity(), (0., 0.))]);
+        let mut queue = VecDeque::from_iter([(
+            solved_cell.top,
+            None,
+            TransformationMatrix::identity(),
+            (0., 0.),
+        )]);
         let mut layers = HashMap::new();
         let mut scopes = HashMap::new();
         let mut rects = Vec::new();
-        while let Some((cell, mat, ofs)) = queue.pop_front() {
+        while let Some((cell, parent, mat, ofs)) = queue.pop_front() {
             let mut children = Vec::new();
             for value in &solved_cell.cells[&cell].values {
                 match value {
@@ -117,6 +122,7 @@ impl EditorState {
 
                         queue.push_back((
                             inst.cell,
+                            Some(cell),
                             mat * inst_mat,
                             (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1),
                         ));
@@ -130,6 +136,7 @@ impl EditorState {
                 ScopeState {
                     name: "tmp".into(),
                     visible: true,
+                    parent,
                     children: children.into_iter().dedup().collect(),
                 },
             );

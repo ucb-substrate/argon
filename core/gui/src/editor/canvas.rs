@@ -119,12 +119,25 @@ impl Element for CanvasElement {
             .clone()
             .into_iter()
             .map(|rect| {
-                let layer = inner.state.read(cx).layers.read(cx)[&rect.layer].clone();
-                let scope = inner.state.read(cx).scopes.read(cx).state[&rect.scope].clone();
-                (rect, layer, scope)
+                let state = inner.state.read(cx);
+                let layer = state.layers.read(cx)[&rect.layer].clone();
+                let scopes = state.scopes.read(cx);
+                let mut scope = &scopes.state[&rect.scope];
+                let visible = layer.visible
+                    && loop {
+                        if !scope.visible {
+                            break false;
+                        }
+                        if let Some(parent) = &scope.parent {
+                            scope = &scopes.state[parent];
+                        } else {
+                            break true;
+                        }
+                    };
+                (rect, layer, visible)
             })
-            .filter(|(_, layer, scope)| layer.visible && scope.visible)
-            .sorted_by_key(|(_, layer, _)| layer.z)
+            .filter(|x| x.2)
+            .sorted_by_key(|x| x.1.z)
             .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
