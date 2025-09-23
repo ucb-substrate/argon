@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use compiler::compile::CellId;
+use compiler::compile::{CellId, SolvedValue};
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::IndexMap;
@@ -133,19 +133,29 @@ impl HierarchySideBar {
     fn render_scopes_helper(
         &mut self,
         cx: &mut gpui::Context<Self>,
+        solved_cell: &CompileOutputState,
         scopes: &mut Vec<Stateful<Div>>,
         scope: ScopeAddress,
         depth: usize,
     ) {
-        let solved_cell_clone = self.scopes.clone();
-        let scope_state = &self.scopes.read(cx).state[&scope];
+        let solved_cell_clone = self.solved_cell.clone();
+        let scope_state = &solved_cell.state[&scope];
         scopes.push(
             div()
-                .id(SharedString::from(format!("scope_control_{scope}",)))
+                .id(SharedString::from(format!(
+                    "scope_control_{}",
+                    scopes.len()
+                )))
                 .flex()
                 .on_click(move |_event, _window, cx| {
-                    scopes_clone.update(cx, |state, cx| {
-                        state.state.get_mut(&scope).unwrap().visible = !state.state[&scope].visible;
+                    solved_cell_clone.update(cx, |state, cx| {
+                        state
+                            .as_mut()
+                            .unwrap()
+                            .state
+                            .get_mut(&scope)
+                            .unwrap()
+                            .visible = !state.as_ref().unwrap().state[&scope].visible;
                         cx.notify();
                     })
                 })
@@ -156,15 +166,50 @@ impl HierarchySideBar {
                     if scope_state.visible { "V" } else { "NV" }
                 )),
         );
-        for scope in scope_state.children.clone() {
-            self.render_scopes_helper(cx, scopes, scope, depth + 1);
+        let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
+        for elt in scope_info.elts.clone() {
+            if let SolvedValue::Instance(inst) = &elt {
+                let scope = solved_cell.output.cells[&inst.cell].root;
+                self.render_scopes_helper(
+                    cx,
+                    solved_cell,
+                    scopes,
+                    ScopeAddress {
+                        scope,
+                        cell: inst.cell,
+                    },
+                    depth + 1,
+                );
+            }
+        }
+        for child_scope in scope_info.children.clone() {
+            self.render_scopes_helper(
+                cx,
+                solved_cell,
+                scopes,
+                ScopeAddress {
+                    scope: child_scope,
+                    cell: scope.cell,
+                },
+                depth + 1,
+            );
         }
     }
 
     fn render_scopes(&mut self, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
         let mut scopes = Vec::new();
-        if let Some(root) = self.scopes.read(cx).root {
-            self.render_scopes_helper(cx, &mut scopes, root, 0);
+        if let Some(state) = self.solved_cell.read(cx).clone() {
+            let scope = state.output.cells[&state.output.top].root;
+            self.render_scopes_helper(
+                cx,
+                &state,
+                &mut scopes,
+                ScopeAddress {
+                    scope,
+                    cell: state.output.top,
+                },
+                0,
+            );
         }
         div().flex().flex_col().children(scopes)
     }

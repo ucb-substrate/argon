@@ -15,7 +15,7 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 
-use crate::{rpc::SyncGuiToLspClient, theme::THEME};
+use crate::{editor::canvas::RectId, rpc::SyncGuiToLspClient, theme::THEME};
 
 pub mod canvas;
 pub mod toolbars;
@@ -35,30 +35,30 @@ pub struct ScopeTree {
     state: HashMap<CellId, ScopeState>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ScopeState {
     pub name: String,
     pub visible: bool,
     pub parent: Option<ScopeAddress>,
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct ScopeAddress {
     pub scope: ScopeId,
     pub cell: CellId,
 }
 
+#[derive(Clone, Debug)]
 pub struct CompileOutputState {
     pub file: PathBuf,
     pub output: ValidCompileOutput,
     pub selected_scope: ScopeAddress,
+    pub selected_rect: Option<RectId>,
     pub state: IndexMap<ScopeAddress, ScopeState>,
 }
 
 pub struct EditorState {
     pub solved_cell: Entity<Option<CompileOutputState>>,
-    pub rects: Vec<canvas::Rect>,
-    pub selected_rect: Option<usize>,
     pub layers: Entity<IndexMap<SharedString, LayerState>>,
     pub lsp_client: SyncGuiToLspClient,
     pub subscriptions: Vec<Subscription>,
@@ -84,34 +84,22 @@ impl EditorState {
         let mut layers = IndexMap::new();
         let mut state = IndexMap::new();
         let mut parent = IndexMap::new();
-        let mut rects = Vec::new();
         while let Some((curr_address @ ScopeAddress { scope, cell }, mat, ofs)) = queue.pop_front()
         {
             let scope_info = &solved_cell.cells[&cell].scopes[&scope];
             state.insert(
                 curr_address,
                 ScopeState {
-                    name: scope_info.name,
+                    name: scope_info.name.clone(),
                     visible: true,
-                    parent: parent.get(curr_address),
+                    parent: parent.get(&curr_address).copied(),
                 },
             );
             for value in &scope_info.elts {
                 match value {
                     SolvedValue::Rect(rect) => {
-                        let p0p = ifmatvec(mat, (rect.x0, rect.y0));
-                        let p1p = ifmatvec(mat, (rect.x1, rect.y1));
                         if let Some(layer) = &rect.layer {
                             let layer = SharedString::from(layer);
-                            rects.push(canvas::Rect {
-                                x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                                y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                                x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                                y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                                layer: layer.clone(),
-                                scope: cell,
-                                span: rect.source.clone().map(|info| info.span),
-                            });
                             if !layers.contains_key(&layer) {
                                 let mut s = DefaultHasher::new();
                                 layer.hash(&mut s);
@@ -174,12 +162,11 @@ impl EditorState {
                 file,
                 output: solved_cell,
                 selected_scope,
-                parent,
+                selected_rect: None,
+                state,
             });
             cx.notify();
         });
-        self.rects = rects;
-        self.selected_rect = None;
     }
 }
 
@@ -195,8 +182,6 @@ impl Editor {
             ];
             EditorState {
                 solved_cell,
-                rects: Vec::new(),
-                selected_rect: None,
                 layers,
                 subscriptions,
                 lsp_client: lsp_client.clone(),

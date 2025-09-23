@@ -1,4 +1,7 @@
-use compiler::compile::CellId;
+use std::collections::VecDeque;
+
+use compiler::compile::{CellId, SolvedValue, ifmatvec};
+use geometry::transform::TransformationMatrix;
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
     InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
@@ -7,12 +10,18 @@ use gpui::{
 };
 use itertools::Itertools;
 
-use crate::editor::EditorState;
+use crate::editor::{EditorState, LayerState, ScopeAddress};
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ShapeFill {
     Stippling,
     Solid,
+}
+
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub struct RectId {
+    scope: ScopeAddress,
+    idx: usize,
 }
 
 #[derive(Clone, PartialEq)]
@@ -21,9 +30,7 @@ pub struct Rect {
     pub x1: f32,
     pub y0: f32,
     pub y1: f32,
-    pub layer: SharedString,
-    pub scope: CellId,
-    pub span: Option<cfgrammar::Span>,
+    pub id: RectId,
 }
 
 pub fn intersect(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> Option<Bounds<Pixels>> {
@@ -54,6 +61,7 @@ pub struct LayoutCanvas {
     screen_origin: Point<Pixels>,
     #[allow(unused)]
     subscriptions: Vec<Subscription>,
+    rects: Vec<(Rect, LayerState)>,
 }
 
 impl IntoElement for CanvasElement {
@@ -112,19 +120,86 @@ impl Element for CanvasElement {
         self.inner
             .update(cx, |inner, _cx| inner.screen_origin = bounds.origin);
         let inner = self.inner.read(cx);
-        let rects = inner
-            .state
-            .read(cx)
-            .rects
-            .clone()
+        let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
+        let selected_rect = solved_cell.as_ref().and_then(|cell| cell.selected_rect);
+        let layers = &inner.state.read(cx).layers.read(cx);
+
+        let mut rects = Vec::new();
+        if let Some(solved_cell) = solved_cell {
+            let mut queue = VecDeque::from_iter([(
+                solved_cell.selected_scope,
+                TransformationMatrix::identity(),
+                (0., 0.),
+            )]);
+            while let Some((curr_address @ ScopeAddress { scope, cell }, mat, ofs)) =
+                queue.pop_front()
+            {
+                let scope_info = &solved_cell.output.cells[&cell].scopes[&scope];
+                let visible = solved_cell.state[&curr_address].visible;
+                if !visible {
+                    continue;
+                }
+                for (i, value) in scope_info.elts.iter().enumerate() {
+                    match value {
+                        SolvedValue::Rect(rect) => {
+                            let p0p = ifmatvec(mat, (rect.x0, rect.y0));
+                            let p1p = ifmatvec(mat, (rect.x1, rect.y1));
+                            let layer = rect
+                                .layer
+                                .as_ref()
+                                .and_then(|layer| layers.get(layer.as_str()));
+                            if let Some(layer) = layer
+                                && layer.visible
+                            {
+                                rects.push((
+                                    Rect {
+                                        x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                                        y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                                        x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                                        y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                                        id: RectId {
+                                            scope: curr_address,
+                                            idx: i,
+                                        },
+                                    },
+                                    layer.clone(),
+                                ));
+                            }
+                        }
+                        SolvedValue::Instance(inst) => {
+                            let mut inst_mat = TransformationMatrix::identity();
+                            if inst.reflect {
+                                inst_mat = inst_mat.reflect_vert()
+                            }
+                            inst_mat = inst_mat.rotate(inst.angle);
+                            let inst_ofs = ifmatvec(mat, (inst.x, inst.y));
+
+                            let inst_address = ScopeAddress {
+                                scope: solved_cell.output.cells[&inst.cell].root,
+                                cell: inst.cell,
+                            };
+                            queue.push_back((
+                                inst_address,
+                                mat * inst_mat,
+                                (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                for child in &scope_info.children {
+                    let scope_address = ScopeAddress {
+                        scope: *child,
+                        cell,
+                    };
+                    queue.push_back((scope_address, mat, ofs));
+                }
+            }
+        }
+
+        let rects = rects
             .into_iter()
-            .map(|rect| {
-                let layer = inner.state.read(cx).layers.read(cx)[&rect.layer].clone();
-                let scope = inner.state.read(cx).scopes.read(cx).state[&rect.scope].clone();
-                (rect, layer, scope)
-            })
-            .filter(|(_, layer, scope)| layer.visible && scope.visible)
-            .sorted_by_key(|(_, layer, _)| layer.z)
+            .sorted_by_key(|(_, layer)| layer.z)
             .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
@@ -133,7 +208,7 @@ impl Element for CanvasElement {
             .clone()
             .paint(bounds, window, cx, |window, cx| {
                 window.paint_layer(bounds, |window| {
-                    for (r, l, _) in rects {
+                    for (r, l) in &rects {
                         let rect_bounds = Bounds::new(
                             Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
                                 + offset
@@ -169,45 +244,26 @@ impl Element for CanvasElement {
                                 border_color: l.border_color.into(),
                                 border_style: BorderStyle::Solid,
                             });
-                        }
-                    }
-                    if let Some(selected_rect) = self.inner.read(cx).state.read(cx).selected_rect {
-                        let r = &self.inner.read(cx).state.read(cx).rects[selected_rect];
-                        let rect_bounds = Bounds::new(
-                            Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
-                                + offset
-                                + bounds.origin,
-                            Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
-                        );
-                        if let Some(clipped) = intersect(&rect_bounds, &bounds) {
-                            let left_border =
-                                f32::clamp((rect_bounds.left().0 + 2.) - bounds.left().0, 0., 2.);
-                            let right_border =
-                                f32::clamp(bounds.right().0 - (rect_bounds.right().0 - 2.), 0., 2.);
-                            let top_border =
-                                f32::clamp((rect_bounds.top().0 + 2.) - bounds.top().0, 0., 2.);
-                            let bot_border = f32::clamp(
-                                bounds.bottom().0 - (rect_bounds.bottom().0 - 2.),
-                                0.,
-                                2.,
-                            );
-                            let mut border_widths = Edges::all(Pixels(2.));
-                            border_widths.left = Pixels(left_border);
-                            border_widths.right = Pixels(right_border);
-                            border_widths.top = Pixels(top_border);
-                            border_widths.bottom = Pixels(bot_border);
-                            window.paint_quad(PaintQuad {
-                                bounds: clipped,
-                                corner_radii: Corners::all(Pixels(0.)),
-                                background: solid_background(rgba(0)),
-                                border_widths,
-                                border_color: rgb(0xffff00).into(),
-                                border_style: BorderStyle::Solid,
-                            });
+                            if let Some(selected_rect) = selected_rect
+                                && r.id == selected_rect
+                            {
+                                window.paint_quad(PaintQuad {
+                                    bounds: clipped,
+                                    corner_radii: Corners::all(Pixels(0.)),
+                                    background: solid_background(rgba(0)),
+                                    border_widths,
+                                    border_color: rgb(0xffff00).into(),
+                                    border_style: BorderStyle::Solid,
+                                });
+                            }
                         }
                     }
                 })
             });
+        self.inner.update(cx, |inner, cx| {
+            inner.rects = rects;
+            cx.notify();
+        });
     }
 }
 
@@ -236,7 +292,7 @@ impl Render for LayoutCanvas {
 }
 
 impl LayoutCanvas {
-    pub fn new(_cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
+    pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
         LayoutCanvas {
             offset: Point::new(Pixels(0.), Pixels(0.)),
             bg_style: Style {
@@ -251,8 +307,9 @@ impl LayoutCanvas {
             offset_start: Point::default(),
             scale: 1.0,
             screen_origin: Point::default(),
-            subscriptions: Vec::new(),
+            subscriptions: vec![cx.observe(&state, |_, _, cx| cx.notify())],
             state: state.clone(),
+            rects: Vec::new(),
         }
     }
 
@@ -263,24 +320,14 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         let rects = self
-            .state
-            .read(cx)
             .rects
             .iter()
             .cloned()
-            .map(|rect| {
-                let layer = self.state.read(cx).layers.read(cx)[&rect.layer].clone();
-                let scope = self.state.read(cx).scopes.read(cx).state[&rect.scope].clone();
-                (rect, layer, scope)
-            })
-            .enumerate()
-            .filter(|(_, (_, layer, scope))| layer.visible && scope.visible)
-            .sorted_by_key(|(_, (_, layer, _))| usize::MAX - layer.z)
-            .map(|(i, r)| (i, r.clone()))
+            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
             .collect_vec();
         let scale = self.scale;
         let offset = self.offset;
-        for (i, (r, _, _)) in rects {
+        for (r, _) in rects {
             let rect_bounds = Bounds::new(
                 Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
                     + offset
@@ -289,22 +336,32 @@ impl LayoutCanvas {
             );
             if rect_bounds.contains(&event.position) {
                 self.state.update(cx, |state, cx| {
-                    state.selected_rect = Some(i);
-                    // TODO: Send message
-                    state
-                        .lsp_client
-                        .select_rect(match (state.file.as_ref(), r.span) {
-                            (Some(f), Some(s)) => Some((f.clone(), s)),
-                            _ => None,
-                        });
-                    cx.notify();
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.selected_rect = Some(r.id);
+                            state.lsp_client.select_rect(
+                                cell.output.cells[&r.id.scope.cell].scopes[&r.id.scope.scope].elts
+                                    [r.id.idx]
+                                    .as_ref()
+                                    .unwrap_rect()
+                                    .source
+                                    .as_ref()
+                                    .map(|source| (cell.file.clone(), source.span)),
+                            );
+                            cx.notify();
+                        }
+                    });
                 });
                 return;
             }
         }
         self.state.update(cx, |state, cx| {
-            state.selected_rect = None;
-            cx.notify();
+            state.solved_cell.update(cx, |cell, cx| {
+                if let Some(cell) = cell.as_mut() {
+                    cell.selected_rect = None;
+                    cx.notify();
+                }
+            });
         });
     }
 

@@ -166,16 +166,14 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
   : '{' Statements '}'
   {
     let mut __stmts = $2?;
-    if let Some(Statement::Expr { value, semicolon }) = __stmts.last().cloned() {
-      if !semicolon {
-        __stmts.pop().unwrap();
-        return Ok(Scope {
-          span: $span,
-          stmts: __stmts,
-          tail: Some(value),
-          metadata: (),
-        })
-      }
+    if let Some(Statement::Expr { value, semicolon }) = __stmts.last().cloned() && !semicolon {
+      __stmts.pop().unwrap();
+      return Ok(Scope {
+        span: $span,
+        stmts: __stmts,
+        tail: Some(value),
+        metadata: (),
+      })
     }
     Ok(Scope {
       span: $span,
@@ -230,7 +228,7 @@ Term -> Result<Expr<'input, ParseMetadata>, ()>
 Factor -> Result<Expr<'input, ParseMetadata>, ()>
   : '!' Factor { Ok(Expr::UnaryOp(Box::new(UnaryOpExpr { op: UnaryOp::Not, operand: $2?, span: $span, metadata: () }))) }
   | '-' Factor { Ok(Expr::UnaryOp(Box::new(UnaryOpExpr { op: UnaryOp::Neg, operand: $2?, span: $span, metadata: () }))) }
-  | SubFactor { Ok($1?) }
+  | SubFactor { $1 }
   ;
 
 SubFactor -> Result<Expr<'input, ParseMetadata>, ()>
