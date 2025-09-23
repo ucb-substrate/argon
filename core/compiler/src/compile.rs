@@ -935,7 +935,7 @@ impl<'a> ExecPass<'a> {
                     y0: state.solver.value_of(rect.y0).unwrap(),
                     x1: state.solver.value_of(rect.x1).unwrap(),
                     y1: state.solver.value_of(rect.y1).unwrap(),
-                    source: rect.source.clone(),
+                    source: Some(emit.source.clone()),
                 })),
                 Value::Int(x) => Some(SolvedValue::Int(*x)),
                 Value::Inst(inst) => Some(SolvedValue::Instance(SolvedInstance {
