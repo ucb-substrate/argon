@@ -14,8 +14,8 @@ jobs:
       CARGO_INCREMENTAL: 1
     steps:
       - uses: actions/checkout@v5
+      - run: sudo apt update && sudo apt install libx11-dev
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - run: sudo apt update && sudo apt install libx11-dev
       - run: cargo clippy --locked -- -D warnings
