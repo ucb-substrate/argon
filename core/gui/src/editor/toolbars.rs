@@ -132,6 +132,7 @@ impl HierarchySideBar {
         solved_cell: &CompileOutputState,
         scopes: &mut Vec<Div>,
         scope: ScopeAddress,
+        count: usize,
         depth: usize,
     ) {
         let solved_cell_clone_1 = self.solved_cell.clone();
@@ -152,9 +153,14 @@ impl HierarchySideBar {
                         .flex_1()
                         .overflow_hidden()
                         .child(format!(
-                            "{}{}",
+                            "{}{}{}",
                             std::iter::repeat_n("  ", depth).collect::<String>(),
                             &scope_state.name,
+                            if count > 1 {
+                                format!(" ({count})")
+                            } else {
+                                "".to_string()
+                            }
                         ))
                         .on_click(move |_event, _window, cx| {
                             solved_cell_clone_1.update(cx, |state, cx| {
@@ -181,19 +187,22 @@ impl HierarchySideBar {
                 ),
         );
         let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
+        let mut cells = IndexMap::new();
         for elt in scope_info.elts.clone() {
             if let SolvedValue::Instance(inst) = &elt {
-                let scope = solved_cell.output.cells[&inst.cell].root;
-                self.render_scopes_helper(
-                    solved_cell,
-                    scopes,
-                    ScopeAddress {
-                        scope,
-                        cell: inst.cell,
-                    },
-                    depth + 1,
-                );
+                *cells.entry(inst.cell).or_insert(0) += 1;
             }
+        }
+
+        for (cell, count) in cells {
+            let scope = solved_cell.output.cells[&cell].root;
+            self.render_scopes_helper(
+                solved_cell,
+                scopes,
+                ScopeAddress { scope, cell: cell },
+                count,
+                depth + 1,
+            );
         }
         for child_scope in scope_info.children.clone() {
             self.render_scopes_helper(
@@ -203,6 +212,7 @@ impl HierarchySideBar {
                     scope: child_scope,
                     cell: scope.cell,
                 },
+                1,
                 depth + 1,
             );
         }
@@ -219,6 +229,7 @@ impl HierarchySideBar {
                     scope,
                     cell: state.output.top,
                 },
+                1,
                 0,
             );
         }
