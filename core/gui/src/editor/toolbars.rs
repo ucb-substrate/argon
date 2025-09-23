@@ -1,17 +1,14 @@
-use std::collections::HashMap;
-
-use compiler::compile::{CellId, SolvedValue};
+use compiler::compile::SolvedValue;
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::IndexMap;
-use itertools::Itertools;
 
 use crate::{
     editor::{CompileOutputState, ScopeAddress},
     theme::THEME,
 };
 
-use super::{EditorState, LayerState, ScopeTree};
+use super::{EditorState, LayerState};
 
 pub struct TitleBar;
 

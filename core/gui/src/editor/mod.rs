@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
@@ -12,7 +12,6 @@ use compiler::compile::{
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::IndexMap;
-use itertools::Itertools;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 
 use crate::{editor::canvas::RectId, rpc::SyncGuiToLspClient, theme::THEME};
@@ -28,11 +27,6 @@ pub struct LayerState {
     pub border_color: Rgba,
     pub visible: bool,
     pub z: usize,
-}
-
-pub struct ScopeTree {
-    root: Option<CellId>,
-    state: HashMap<CellId, ScopeState>,
 }
 
 #[derive(Clone, Debug)]

@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
-use compiler::compile::{CellId, SolvedValue, ifmatvec};
+use compiler::compile::{SolvedValue, ifmatvec};
 use geometry::transform::TransformationMatrix;
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
     InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    Size, Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
+    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, ScrollWheelEvent, Size, Style,
+    Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
 };
 use itertools::Itertools;
 
@@ -206,7 +206,7 @@ impl Element for CanvasElement {
         inner
             .bg_style
             .clone()
-            .paint(bounds, window, cx, |window, cx| {
+            .paint(bounds, window, cx, |window, _cx| {
                 window.paint_layer(bounds, |window| {
                     for (r, l) in &rects {
                         let rect_bounds = Bounds::new(
@@ -307,7 +307,7 @@ impl LayoutCanvas {
             offset_start: Point::default(),
             scale: 1.0,
             screen_origin: Point::default(),
-            subscriptions: vec![cx.observe(&state, |_, _, cx| cx.notify())],
+            subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
             state: state.clone(),
             rects: Vec::new(),
         }
