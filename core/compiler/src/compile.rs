@@ -3,6 +3,8 @@
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{HashMap, VecDeque};
+use std::io::BufReader;
+use std::path::Path;
 
 use enumify::enumify;
 use geometry::transform::{Rotation, TransformationMatrix};
@@ -11,6 +13,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope, UnaryOp};
+use crate::layer::LayerProperties;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -26,6 +29,7 @@ pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> Compile
     let input = CompileInput {
         cell: input.cell,
         params: input.params,
+        lyp_file: input.lyp_file,
     };
 
     ExecPass::new(&ast).execute(input)
@@ -629,6 +633,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 pub struct CompileInput<'a> {
     pub cell: &'a str,
     pub params: Vec<f64>,
+    pub lyp_file: &'a Path,
 }
 
 pub type VarId = u64;
@@ -739,9 +744,14 @@ impl<'a> ExecPass<'a> {
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
         let cell_id = self.execute_cell(input.cell, input.params);
+        let layers =
+            klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
+                .unwrap()
+                .into();
         CompileOutput::Valid(ValidCompileOutput {
             cells: self.compiled_cells,
             top: cell_id,
+            layers,
         })
     }
 
@@ -1912,6 +1922,7 @@ pub struct StaticErrorCompileOutput {
 pub struct ValidCompileOutput {
     pub cells: HashMap<CellId, CompiledCell>,
     pub top: CellId,
+    pub layers: LayerProperties,
 }
 
 #[enumify(generics_only)]

@@ -1195,9 +1195,11 @@ dependencies = [
  "good_lp",
  "indexmap 2.11.4",
  "itertools 0.14.0",
+ "klayout-lyp",
  "lrlex",
  "lrpar",
  "nalgebra",
+ "rgb",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
@@ -3347,6 +3349,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "klayout-lyp"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bbfdc3679b0b893e6888ceaac77ee6c8b01dbe9b840b199d3b387ac88720255"
+dependencies = [
+ "rgb",
+ "serde",
+ "serde-xml-rs",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4979,6 +4992,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6a884d2998352bb4daf0183589aec883f16a6da1f4dde84d8e2e9a5409a1ce"
 dependencies = [
  "bytemuck",
+ "serde",
 ]
 
 [[package]]
@@ -5386,6 +5400,18 @@ checksum = "0dca6411025b24b60bfa7ec1fe1f8e710ac09782dca409ee8237ba74b51295fd"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-xml-rs"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53630160a98edebde0123eb4dfd0fce6adff091b2305db3154a9e920206eb510"
+dependencies = [
+ "log",
+ "serde",
+ "thiserror 1.0.69",
+ "xml-rs",
 ]
 
 [[package]]
@@ -7769,6 +7795,12 @@ name = "xkeysym"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
+
+[[package]]
+name = "xml-rs"
+version = "0.8.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fd8403733700263c6eb89f192880191f1b83e332f7a20371ddcf421c4a337c7"
 
 [[package]]
 name = "xmlwriter"

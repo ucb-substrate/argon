@@ -27,6 +27,8 @@ rust_decimal_macros = "1"
 indexmap = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 geometry = { version = "0.7", registry = "substrate" }
+rgb = { version = "0.8", features = ["serde"] }
+klayout-lyp = "0.1.1"
 
 [build-dependencies]
 cfgrammar = "0.13"

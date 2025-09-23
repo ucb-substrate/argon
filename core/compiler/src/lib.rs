@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 pub mod ast;
 pub mod compile;
+pub mod layer;
 pub mod parse;
 pub mod solver;
 
@@ -11,8 +12,12 @@ pub mod solver;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// The Argon source code to compile.
     file: PathBuf,
+    /// The name of the cell to compile.
     cell: String,
+    /// Layer properties file.
+    lyp: PathBuf,
 }
 
 pub fn main() {
@@ -34,6 +39,7 @@ pub fn main() {
                     _ => panic!("must be int or float literal for now"),
                 })
                 .collect(),
+            lyp_file: &args.lyp,
         },
     );
     println!("{}", serde_json::to_string(&o).unwrap());
@@ -41,28 +47,16 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use parse::parse;
 
-    use crate::compile::{CompileInput, VarIdTyPass, compile};
+    use crate::compile::{CompileInput, compile};
 
     use super::*;
 
-    const ARGON_SIMPLE: &str = r#"enum Layer {
-	Met2,
-	Via1,
-	Met1,
-}
-
-cell simple(y_enclosure: int) {
-    let r = Rect!(Layer::Met1, y0=0, y1=100);
-    Eq!(r.x0, 0);
-    Eq!(r.x1, 100);
-    Rect!(Layer::Met2, x0=r.x0-10, x1=r.x1+10, y0=0-y_enclosure, y1=100+y_enclosure);
-}"#;
     const ARGON_SCOPES: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes.ar"));
+    const BASIC_LYP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lyp/basic.lyp");
     const ARGON_IMMEDIATE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/immediate.ar"
@@ -106,6 +100,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "scopes",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -119,6 +114,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "immediate",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -132,6 +128,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "if_test",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -145,6 +142,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "if_test",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -158,6 +156,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "via",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -171,6 +170,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "vias",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -184,6 +184,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "test",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -197,6 +198,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "top",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -210,6 +212,7 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "top",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -223,36 +226,11 @@ cell simple(y_enclosure: int) {
             CompileInput {
                 cell: "top",
                 params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
     }
-
-    // #[test]
-    // fn argon_simple() {
-    //     let ast = parse(ARGON_SIMPLE).expect("failed to parse Argon");
-    //     let cell = compile(CompileInput {
-    //         cell: "simple",
-    //         ast: &ast,
-    //         params: HashMap::from_iter([("y_enclosure", 20.)]),
-    //     })
-    //     .expect("failed to compile Argon cell");
-    //     println!("cell: {cell:?}");
-    // }
-
-    // #[test]
-    // fn argon_via_array() {
-    //     let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
-    //     println!("{:?}", &ast);
-    //     let cell = compile(CompileInput {
-    //         cell: "vias",
-    //         ast: &ast,
-    //         params: Vec::new(),
-    //     })
-    //     .expect("failed to compile Argon cell");
-    //     println!("cell: {cell:?}");
-    //     assert_eq!(cell.rects.len(), 11);
-    // }
 
     // #[test]
     // fn argon_sky130_inverter() {
