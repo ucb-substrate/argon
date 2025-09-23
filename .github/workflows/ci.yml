@@ -8,13 +8,14 @@ on:
 
 jobs:
   lint:
-    runs-on: bwrc
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Cargo clippy
+      - run: sudo apt update && sudo apt install libx11-dev
+      - name: Check lint
         env:
           CARGO_TERM_COLOR: always
           CARGO_INCREMENTAL: 1
