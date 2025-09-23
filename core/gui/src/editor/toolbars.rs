@@ -199,7 +199,7 @@ impl HierarchySideBar {
             self.render_scopes_helper(
                 solved_cell,
                 scopes,
-                ScopeAddress { scope, cell: cell },
+                ScopeAddress { scope, cell },
                 count,
                 depth + 1,
             );
