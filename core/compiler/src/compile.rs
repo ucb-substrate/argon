@@ -661,7 +661,6 @@ pub struct ScopeId(u64);
 struct Frame {
     bindings: HashMap<VarId, ValueId>,
     parent: Option<FrameId>,
-    span: cfgrammar::Span,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -674,6 +673,7 @@ struct Emit {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExecScope {
     parent: Option<ScopeId>,
+    name: String,
     span: cfgrammar::Span,
 }
 
@@ -714,7 +714,6 @@ impl<'a> ExecPass<'a> {
                 Frame {
                     bindings: Default::default(),
                     parent: None,
-                    span: ast.span,
                 },
             )]),
             nil_value: 1,
@@ -746,7 +745,7 @@ impl<'a> ExecPass<'a> {
         })
     }
 
-    pub(crate) fn execute_cell(&mut self, cell: &'a str, params: Vec<f64>) -> CellId {
+    pub(crate) fn execute_cell(&mut self, cell: &'a str, _params: Vec<f64>) -> CellId {
         // TODO: use params
         let cell_decl = self
             .ast
@@ -766,7 +765,6 @@ impl<'a> ExecPass<'a> {
         let frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
-            span: cell_decl.span,
         };
         let fid = self.frame_id();
         self.frames.insert(fid, frame);
@@ -774,6 +772,7 @@ impl<'a> ExecPass<'a> {
 
         let root_scope = ExecScope {
             span: cell_decl.span,
+            name: format!("cell {cell}"),
             parent: None,
         };
         let root_scope_id = self.scope_id();
@@ -901,6 +900,7 @@ impl<'a> ExecPass<'a> {
             CompiledScope {
                 children: Default::default(),
                 elts: Vec::new(),
+                name: state.scopes[&state.root_scope].name.clone(),
                 span: state.scopes[&state.root_scope].span,
             },
         );
@@ -912,6 +912,7 @@ impl<'a> ExecPass<'a> {
                 ccell.scopes.entry(scope).or_insert_with(|| CompiledScope {
                     span: state.scopes[&scope].span,
                     children: Default::default(),
+                    name: state.scopes[&scope].name.clone(),
                     elts: Default::default(),
                 });
                 let parent = state.scopes[&scope]
@@ -920,6 +921,7 @@ impl<'a> ExecPass<'a> {
                 let pf = ccell.scopes.entry(parent).or_insert_with(|| CompiledScope {
                     span: state.scopes[&parent].span,
                     children: Default::default(),
+                    name: state.scopes[&parent].name.clone(),
                     elts: Default::default(),
                 });
                 pf.children.insert(scope);
@@ -1063,6 +1065,7 @@ impl<'a> ExecPass<'a> {
         &mut self,
         cell_id: CellId,
         parent: ScopeId,
+        name: impl Into<String>,
         span: cfgrammar::Span,
     ) -> ScopeId {
         let id = self.scope_id();
@@ -1070,10 +1073,27 @@ impl<'a> ExecPass<'a> {
             id,
             ExecScope {
                 parent: Some(parent),
+                name: name.into(),
                 span,
             },
         );
         id
+    }
+
+    fn visit_scope_expr_inner(
+        &mut self,
+        cell_id: CellId,
+        frame: FrameId,
+        scope: ScopeId,
+        s: &Scope<'a, VarIdTyMetadata>,
+    ) -> ValueId {
+        for stmt in &s.stmts {
+            self.eval_stmt(cell_id, frame, scope, stmt);
+        }
+        s.tail
+            .as_ref()
+            .map(|tail| self.visit_expr(cell_id, frame, scope, tail))
+            .unwrap_or(self.nil_value)
     }
 
     fn visit_expr(
@@ -1151,21 +1171,20 @@ impl<'a> ExecPass<'a> {
                             let mut call_frame = Frame {
                                 bindings: Default::default(),
                                 parent: Some(self.global_frame),
-                                span: val.span,
                             };
                             for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
                                 call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
                             }
                             let new_scope = val.scope.clone();
-                            let scope = self.create_exec_scope(cell_id, scope, val.span);
+                            let scope = self.create_exec_scope(
+                                cell_id,
+                                scope,
+                                format!("fn {}", val.name.name),
+                                val.span,
+                            );
                             let fid = self.frame_id();
                             self.frames.insert(fid, call_frame);
-                            return self.visit_expr(
-                                cell_id,
-                                fid,
-                                scope,
-                                &Expr::Scope(Box::new(new_scope)),
-                            );
+                            return self.visit_scope_expr_inner(cell_id, fid, scope, &new_scope);
                         }
                         ValueRef::CellFn(_) => PartialEvalState::Call(Box::new(PartialCallExpr {
                             expr: c.clone(),
@@ -1199,15 +1218,8 @@ impl<'a> ExecPass<'a> {
                 }))
             }
             Expr::Scope(s) => {
-                let scope = self.create_exec_scope(cell_id, scope, s.span);
-                for stmt in &s.stmts {
-                    self.eval_stmt(cell_id, frame, scope, stmt);
-                }
-                return s
-                    .tail
-                    .as_ref()
-                    .map(|tail| self.visit_expr(cell_id, frame, scope, tail))
-                    .unwrap_or(self.nil_value);
+                let scope = self.create_exec_scope(cell_id, scope, "anonymous scope", s.span);
+                return self.visit_scope_expr_inner(cell_id, frame, scope, s);
             }
             Expr::EnumValue(e) => {
                 let vid = self.value_id();
@@ -1514,8 +1526,12 @@ impl<'a> ExecPass<'a> {
                 IfExprState::Cond(cond) => {
                     if let Defer::Ready(val) = &self.values[&cond] {
                         if *val.as_ref().unwrap_bool() {
-                            let scope =
-                                self.create_exec_scope(vref.cell, vref.scope, if_.expr.then.span());
+                            let scope = self.create_exec_scope(
+                                vref.cell,
+                                vref.scope,
+                                "if then",
+                                if_.expr.then.span(),
+                            );
                             let then =
                                 self.visit_expr(vref.cell, vref.frame, scope, &if_.expr.then);
                             if_.state = IfExprState::Then(then);
@@ -1523,6 +1539,7 @@ impl<'a> ExecPass<'a> {
                             let scope = self.create_exec_scope(
                                 vref.cell,
                                 vref.scope,
+                                "if else",
                                 if_.expr.else_.span(),
                             );
                             let else_ =
@@ -1840,6 +1857,7 @@ pub enum SolvedValue {
 pub struct CompiledScope {
     children: IndexSet<ScopeId>,
     elts: Vec<SolvedValue>,
+    name: String,
     span: cfgrammar::Span,
 }
 
