@@ -135,7 +135,7 @@ impl EditorState {
             scopes.insert(
                 cell,
                 ScopeState {
-                    name: "tmp".into(),
+                    name: format!("scope_{cell}"),
                     visible: true,
                     parent,
                     children: children.into_iter().dedup().collect(),
