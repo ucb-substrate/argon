@@ -14,5 +14,7 @@ jobs:
     runs-on: bwrc
     steps:
       - uses: actions/checkout@v5
+        with:
+          clean: false
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
