@@ -29,7 +29,10 @@ pub fn main() {
             ])
             .unwrap();
         // Bind keys must happen before menus to get the keybindings to show up next to menu items.
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("r", DrawRect, None),
+        ]);
         // Register the `quit` function so it can be referenced by the `MenuItem::action` in the menu bar
         cx.on_action(quit);
         // Add menu items
@@ -55,7 +58,7 @@ pub fn main() {
 }
 
 // Associate actions using the `actions!` macro (or `impl_actions!` macro)
-actions!(Argon, [Quit]);
+actions!(Argon, [Quit, DrawRect]);
 
 // Define the quit function that is registered with the App
 fn quit(_: &Quit, cx: &mut App) {

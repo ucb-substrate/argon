@@ -11,7 +11,10 @@ use gpui::{
 };
 use itertools::Itertools;
 
-use crate::editor::{EditorState, LayerState, ScopeAddress};
+use crate::{
+    DrawRect,
+    editor::{EditorState, LayerState, ScopeAddress},
+};
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ShapeFill {
@@ -55,6 +58,10 @@ pub struct CanvasElement {
     inner: Entity<LayoutCanvas>,
 }
 
+struct RectToolState {
+    p0: Option<Point<f32>>,
+}
+
 // ~TextInput
 pub struct LayoutCanvas {
     pub offset: Point<Pixels>,
@@ -64,6 +71,8 @@ pub struct LayoutCanvas {
     is_dragging: bool,
     drag_start: Point<Pixels>,
     offset_start: Point<Pixels>,
+    // rectangle drawing state
+    rect_tool: Option<RectToolState>,
     // zoom state
     scale: f32,
     screen_origin: Point<Pixels>,
@@ -362,6 +371,7 @@ impl Render for LayoutCanvas {
             // TODO: Uncomment once GPUI mouse movement is fixed.
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             // .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_action(cx.listener(Self::draw_rect))
             .on_drag_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -386,6 +396,7 @@ impl LayoutCanvas {
             is_dragging: false,
             drag_start: Point::default(),
             offset_start: Point::default(),
+            rect_tool: None,
             scale: 1.0,
             screen_origin: Point::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
@@ -401,62 +412,105 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rects = self
-            .rects
-            .iter()
-            .rev()
-            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-            .map(|(r, _)| r);
-        let scale = self.scale;
-        let offset = self.offset;
-        let mut selected_rect = None;
-        for r in rects.chain(self.scope_rects.iter()) {
-            let rect_bounds = Bounds::new(
-                Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
-                    + offset
-                    + self.screen_origin,
-                Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
-            );
-            if rect_bounds.contains(&event.position) {
-                selected_rect = Some(r);
+        if let Some(ref mut rect_tool) = self.rect_tool {
+            println!("rect tool click");
+            if let Some(p0) = rect_tool.p0 {
+                let p1 = self.px_to_layout(event.position);
+                let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
+                let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
+                self.rect_tool = None;
+                self.state.update(cx, |state, cx| {
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            // TODO modify cell.output
+                        }
+                    });
+                });
+            } else {
+                let p0 = self.px_to_layout(event.position);
+                self.rect_tool.as_mut().unwrap().p0 = Some(p0);
+            }
+        } else {
+            let rects = self
+                .rects
+                .iter()
+                .rev()
+                .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                .map(|(r, _)| r);
+            let scale = self.scale;
+            let offset = self.offset;
+            let mut selected_rect = None;
+            for r in rects.chain(self.scope_rects.iter()) {
+                let rect_bounds = Bounds::new(
+                    Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
+                        + offset
+                        + self.screen_origin,
+                    Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+                );
+                if rect_bounds.contains(&event.position) {
+                    selected_rect = Some(r);
+                }
+            }
+            if let Some(r) = selected_rect.cloned() {
+                self.state.update(cx, |state, cx| {
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.selected_rect = Some(r.id);
+                            let args = match r.id {
+                                RectId::Element(id) => {
+                                    match &cell.output.cells[&id.scope.cell].scopes[&id.scope.scope]
+                                        .elts[id.idx]
+                                    {
+                                        SolvedValue::Rect(r) => r
+                                            .source
+                                            .as_ref()
+                                            .map(|source| (cell.file.clone(), source.span)),
+                                        _ => None,
+                                    }
+                                }
+                                RectId::Scope(id) => Some((
+                                    cell.file.clone(),
+                                    cell.output.cells[&id.cell].scopes[&id.scope].span,
+                                )),
+                            };
+                            state.lsp_client.select_rect(args);
+                            cx.notify();
+                        }
+                    });
+                });
+            } else {
+                self.state.update(cx, |state, cx| {
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.selected_rect = None;
+                            cx.notify();
+                        }
+                    });
+                });
             }
         }
-        if let Some(r) = selected_rect.cloned() {
-            self.state.update(cx, |state, cx| {
-                state.solved_cell.update(cx, |cell, cx| {
-                    if let Some(cell) = cell.as_mut() {
-                        cell.selected_rect = Some(r.id);
-                        let args = match r.id {
-                            RectId::Element(id) => {
-                                match &cell.output.cells[&id.scope.cell].scopes[&id.scope.scope]
-                                    .elts[id.idx]
-                                {
-                                    SolvedValue::Rect(r) => r
-                                        .source
-                                        .as_ref()
-                                        .map(|source| (cell.file.clone(), source.span)),
-                                    _ => None,
-                                }
-                            }
-                            RectId::Scope(id) => Some((
-                                cell.file.clone(),
-                                cell.output.cells[&id.cell].scopes[&id.scope].span,
-                            )),
-                        };
-                        state.lsp_client.select_rect(args);
-                        cx.notify();
-                    }
-                });
-            });
-        } else {
-            self.state.update(cx, |state, cx| {
-                state.solved_cell.update(cx, |cell, cx| {
-                    if let Some(cell) = cell.as_mut() {
-                        cell.selected_rect = None;
-                        cx.notify();
-                    }
-                });
-            });
+    }
+
+    fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
+        Point::new(self.scale * Pixels(pt.x), self.scale * Pixels(pt.y))
+            + self.offset
+            + self.screen_origin
+    }
+
+    fn px_to_layout(&self, pt: Point<Pixels>) -> Point<f32> {
+        let pt = pt - self.offset - self.screen_origin;
+        Point::new(pt.x.0 / self.scale, pt.y.0 / self.scale)
+    }
+
+    pub(crate) fn draw_rect(
+        &mut self,
+        _: &DrawRect,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.rect_tool.is_none() {
+            println!("begin rect tool");
+            self.rect_tool = Some(RectToolState { p0: None });
         }
     }
 
