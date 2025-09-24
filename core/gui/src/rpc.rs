@@ -141,4 +141,21 @@ impl LspToGui for GuiServer {
             .await
             .unwrap();
     }
+    async fn set(mut self, _: tarpc::context::Context, key: String, value: String) -> () {
+        match key.as_str() {
+            "hierarchyDepth" => {
+                self.to_exec
+                    .send(Box::new(move |state, cx| {
+                        // TODO: Need better way to specify infinite hierarchy depth.
+                        state.hierarchy_depth = value.parse().unwrap_or(usize::MAX);
+                        cx.notify();
+                    }))
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                // TODO: handle errors.
+            }
+        }
+    }
 }

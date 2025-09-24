@@ -52,6 +52,7 @@ pub struct CompileOutputState {
 }
 
 pub struct EditorState {
+    pub hierarchy_depth: usize,
     pub solved_cell: Entity<Option<CompileOutputState>>,
     pub layers: Entity<IndexMap<SharedString, LayerState>>,
     pub lsp_client: SyncGuiToLspClient,
@@ -212,6 +213,7 @@ impl Editor {
                 cx.observe(&layers, |_, _, cx| cx.notify()),
             ];
             EditorState {
+                hierarchy_depth: usize::MAX,
                 solved_cell,
                 layers,
                 subscriptions,

@@ -4,6 +4,7 @@
 local M = {}
 
 local argon_lsp_cmd_name = 'ArgonLsp'
+local gui = require('argon_lsp.commands.gui')
 
 ---@class argon_lsp.command_tbl
 ---@field impl fun(args: string[], opts: vim.api.keyset.user_command) The command implementation
@@ -14,12 +15,17 @@ local argon_lsp_cmd_name = 'ArgonLsp'
 local argon_lsp_command_tbl = {
   startGui = {
     impl = function(_, opts)
-      require('argon_lsp.commands.gui').start_gui()
+      gui.start_gui()
     end,
   },
   openCell = {
     impl = function(args, opts)
-      require('argon_lsp.commands.gui').open_cell(table.concat(args, " "))
+      gui.open_cell(table.concat(args, " "))
+    end,
+  },
+  set = {
+    impl = function(args, opts)
+      gui.set(table.concat(args, " "))
     end,
   },
 }

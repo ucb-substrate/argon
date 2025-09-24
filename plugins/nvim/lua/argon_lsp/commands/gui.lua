@@ -15,4 +15,10 @@ function M.open_cell(cell)
     }, client.print_error)
 end
 
+function M.set(kv)
+    client.buf_request(0, "custom/set", {
+        kv = kv
+    }, client.print_error)
+end
+
 return M

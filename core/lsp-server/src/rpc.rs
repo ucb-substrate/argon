@@ -17,6 +17,7 @@ pub trait GuiToLsp {
 #[tarpc::service]
 pub trait LspToGui {
     async fn open_cell(file: PathBuf, cell: CompileOutput);
+    async fn set(key: String, value: String);
 }
 
 #[derive(Clone)]

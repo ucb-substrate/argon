@@ -171,7 +171,8 @@ impl Element for CanvasElement {
         let inner = self.inner.read(cx);
         let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
         let selected_rect = solved_cell.as_ref().and_then(|cell| cell.selected_rect);
-        let layers = &inner.state.read(cx).layers.read(cx);
+        let state = inner.state.read(cx);
+        let layers = state.layers.read(cx);
 
         let mut rects = Vec::new();
         let mut scope_rects = Vec::new();
@@ -180,14 +181,15 @@ impl Element for CanvasElement {
                 solved_cell.selected_scope,
                 TransformationMatrix::identity(),
                 (0., 0.),
+                0,
             )]);
-            while let Some((curr_address @ ScopeAddress { scope, cell }, mat, ofs)) =
+            while let Some((curr_address @ ScopeAddress { scope, cell }, mat, ofs, depth)) =
                 queue.pop_front()
             {
                 let cell_info = &solved_cell.output.cells[&cell];
                 let scope_info = &cell_info.scopes[&scope];
                 let scope_state = &solved_cell.state[&curr_address];
-                if !scope_state.visible {
+                if depth >= state.hierarchy_depth || !scope_state.visible {
                     if let Some(bbox) = &scope_state.bbox {
                         let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
                         let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
@@ -260,7 +262,7 @@ impl Element for CanvasElement {
                                 }
                                 continue;
                             }
-                            queue.push_back((inst_address, new_mat, new_ofs));
+                            queue.push_back((inst_address, new_mat, new_ofs, depth + 1));
                         }
                         _ => {}
                     }
@@ -270,7 +272,7 @@ impl Element for CanvasElement {
                         scope: *child,
                         cell,
                     };
-                    queue.push_back((scope_address, mat, ofs));
+                    queue.push_back((scope_address, mat, ofs, depth + 1));
                 }
             }
         }

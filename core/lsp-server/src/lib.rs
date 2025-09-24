@@ -71,6 +71,11 @@ struct OpenCellParams {
     cell: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SetParams {
+    kv: String,
+}
+
 impl Backend {
     async fn start_gui(&self) -> Result<()> {
         self.state
@@ -137,6 +142,19 @@ impl Backend {
         });
         Ok(())
     }
+
+    async fn set(&self, params: SetParams) -> Result<()> {
+        let state = self.state.clone();
+        // TODO: Error handling.
+        let (k, v) = params.kv.split_once(" ").unwrap();
+        let (k, v) = (k.to_string(), v.to_string());
+        tokio::spawn(async move {
+            if let Some(client) = state.gui_client.lock().await.as_mut() {
+                client.set(context::current(), k, v).await.unwrap();
+            }
+        });
+        Ok(())
+    }
 }
 
 async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
@@ -173,6 +191,7 @@ pub async fn main() {
     })
     .custom_method("custom/startGui", Backend::start_gui)
     .custom_method("custom/openCell", Backend::open_cell)
+    .custom_method("custom/set", Backend::set)
     .finish();
     let state = ext_state.unwrap();
 
