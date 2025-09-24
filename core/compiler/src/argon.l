@@ -14,6 +14,7 @@ as "AS"
 [_a-zA-Z][_a-zA-Z0-9]* "IDENT"
 [0-9]+\.[0-9]* "FLOATLIT"
 [0-9]+ "INTLIT"
+"[^"]*" "STRLIT"
 //[^\r\n]* ;
 \+ "+"
 \* "*"

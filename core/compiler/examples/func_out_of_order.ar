@@ -7,7 +7,7 @@ fn double(x: Float) -> Float {
 }
 
 cell test() {
-    let shape = rect(Layer::Met1)!;
+    let shape = rect("met1")!;
     eq(shape.x0, 0.);
     eq(shape.y0, 0.);
     eq(shape.y1, 100.);

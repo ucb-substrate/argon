@@ -3,6 +3,8 @@
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{HashMap, VecDeque};
+use std::io::BufReader;
+use std::path::Path;
 
 use enumify::enumify;
 use geometry::transform::{Rotation, TransformationMatrix};
@@ -11,6 +13,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope, UnaryOp};
+use crate::layer::LayerProperties;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -26,9 +29,33 @@ pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> Compile
     let input = CompileInput {
         cell: input.cell,
         params: input.params,
+        lyp_file: input.lyp_file,
     };
 
-    ExecPass::new(&ast).execute(input)
+    let res = ExecPass::new(&ast).execute(input);
+    check_layers(&res);
+    res
+}
+
+fn check_layers(output: &CompileOutput) {
+    if let CompileOutput::Valid(output) = output {
+        let mut layers = IndexSet::new();
+        for layer in output.layers.layers.iter() {
+            layers.insert(layer.name.clone());
+        }
+        for (_, cell) in output.cells.iter() {
+            for (_, scope) in cell.scopes.iter() {
+                for elt in scope.elts.iter() {
+                    if let SolvedValue::Rect(r) = elt
+                        && let Some(layer) = &r.layer
+                        && !layers.contains(layer)
+                    {
+                        panic!("unknown layer `{layer}`");
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct VarIdTyPass<'a> {
@@ -49,6 +76,7 @@ pub enum Ty {
     Int,
     Rect,
     Enum,
+    String,
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
     Nil,
@@ -194,8 +222,9 @@ impl<'a> Expr<'a, VarIdTyMetadata> {
             Expr::EnumValue(_enum_value) => Ty::Enum,
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
             Expr::Var(var_expr) => var_expr.metadata.1.clone(),
-            Expr::FloatLiteral(_float_literal) => Ty::Float,
-            Expr::IntLiteral(_int_literal) => Ty::Int,
+            Expr::FloatLiteral(_) => Ty::Float,
+            Expr::IntLiteral(_) => Ty::Int,
+            Expr::StringLiteral(_) => Ty::String,
             Expr::Scope(scope) => scope.metadata.clone(),
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
@@ -446,7 +475,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         match base_ty {
             Ty::Rect => match field.name {
                 "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
-                "layer" => Ty::Enum,
+                "layer" => Ty::String,
                 _ => panic!("invalid field access"),
             },
             Ty::Inst(c) => match field.name {
@@ -481,7 +510,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                     assert_eq!(args.posargs.len(), 0);
                 } else {
                     assert_eq!(args.posargs.len(), 1);
-                    assert_eq!(args.posargs[0].ty(), Ty::Enum);
+                    assert_eq!(args.posargs[0].ty(), Ty::String);
                 }
                 for kwarg in &args.kwargs {
                     assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&kwarg.name.name));
@@ -629,6 +658,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 pub struct CompileInput<'a> {
     pub cell: &'a str,
     pub params: Vec<f64>,
+    pub lyp_file: &'a Path,
 }
 
 pub type VarId = u64;
@@ -739,9 +769,14 @@ impl<'a> ExecPass<'a> {
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
         let cell_id = self.execute_cell(input.cell, input.params);
+        let layers =
+            klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
+                .unwrap()
+                .into();
         CompileOutput::Valid(ValidCompileOutput {
             cells: self.compiled_cells,
             top: cell_id,
+            layers,
         })
     }
 
@@ -1113,6 +1148,12 @@ impl<'a> ExecPass<'a> {
                 self.values.insert(vid, Defer::Ready(Value::Int(i.value)));
                 return vid;
             }
+            Expr::StringLiteral(s) => {
+                let vid = self.value_id();
+                self.values
+                    .insert(vid, Defer::Ready(Value::String(s.value.clone())));
+                return vid;
+            }
             Expr::Var(v) => {
                 let var_id = v.metadata.0;
                 return self.frames[&frame].bindings[&var_id];
@@ -1282,7 +1323,7 @@ impl<'a> ExecPass<'a> {
                         self.values[vid]
                             .as_ref()
                             .get_ready()
-                            .map(|layer| layer.as_ref().unwrap_enum_value().clone())
+                            .map(|layer| layer.as_ref().unwrap_string().clone())
                     });
                     let layer = match layer {
                         None => Some(None),
@@ -1627,7 +1668,7 @@ impl<'a> ExecPass<'a> {
                                 "h" => Value::Linear(
                                     LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
                                 ),
-                                "layer" => Value::EnumValue(rect.layer.clone().unwrap()),
+                                "layer" => Value::String(rect.layer.clone().unwrap()),
                                 f => panic!("invalid field `{f}`"),
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -1775,6 +1816,7 @@ impl<'a> ExecPass<'a> {
 #[derive(Debug, Clone)]
 pub enum Value<'a> {
     EnumValue(String),
+    String(String),
     Linear(LinearExpr),
     Int(i64),
     Rect(Rect<Var>),
@@ -1912,6 +1954,7 @@ pub struct StaticErrorCompileOutput {
 pub struct ValidCompileOutput {
     pub cells: HashMap<CellId, CompiledCell>,
     pub top: CellId,
+    pub layers: LayerProperties,
 }
 
 #[enumify(generics_only)]
