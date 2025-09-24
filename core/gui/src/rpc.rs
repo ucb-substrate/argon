@@ -109,6 +109,7 @@ impl SyncGuiToLspClient {
             .detach();
     }
 
+    // TODO: Improve API.
     pub fn select_rect(&self, span: Option<(PathBuf, Span)>) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
@@ -139,5 +140,22 @@ impl LspToGui for GuiServer {
             }))
             .await
             .unwrap();
+    }
+    async fn set(mut self, _: tarpc::context::Context, key: String, value: String) -> () {
+        match key.as_str() {
+            "hierarchyDepth" => {
+                self.to_exec
+                    .send(Box::new(move |state, cx| {
+                        // TODO: Need better way to specify infinite hierarchy depth.
+                        state.hierarchy_depth = value.parse().unwrap_or(usize::MAX);
+                        cx.notify();
+                    }))
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                // TODO: handle errors.
+            }
+        }
     }
 }
