@@ -2143,7 +2143,7 @@ fn imat(mat: TransformationMatrix) -> (Rotation, bool) {
 }
 
 impl Rect<(f64, Var)> {
-    fn to_float(&self) -> Rect<f64> {
+    pub fn to_float(&self) -> Rect<f64> {
         Rect {
             layer: self.layer.clone(),
             x0: self.x0.0,

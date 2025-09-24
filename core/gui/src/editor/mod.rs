@@ -6,7 +6,7 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, Rect, ScopeId, SolvedValue, ValidCompileOutput, ifmatvec,
+    ifmatvec, CellId, CompileOutput, Rect, ScopeId, SolvedValue, ValidCompileOutput,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -100,7 +100,7 @@ fn process_scope(
     for value in &scope_info.elts {
         match value {
             SolvedValue::Rect(rect) => {
-                bbox = bbox_union(bbox, Some(rect.clone()));
+                bbox = bbox_union(bbox, Some(rect.to_float()));
                 if let Some(layer) = &rect.layer {
                     let layer = SharedString::from(layer);
                     if !layers.contains_key(&layer) {

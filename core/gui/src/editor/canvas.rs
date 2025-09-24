@@ -206,8 +206,8 @@ impl Element for CanvasElement {
                 for (i, value) in scope_info.elts.iter().enumerate() {
                     match value {
                         SolvedValue::Rect(rect) => {
-                            let p0p = ifmatvec(mat, (rect.x0, rect.y0));
-                            let p1p = ifmatvec(mat, (rect.x1, rect.y1));
+                            let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                            let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
                             let layer = rect
                                 .layer
                                 .as_ref()
