@@ -104,7 +104,6 @@ struct RectToolState {
     p0: Option<Point<f32>>,
 }
 
-// ~TextInput
 pub struct LayoutCanvas {
     focus_handle: FocusHandle,
     pub offset: Point<Pixels>,
@@ -474,7 +473,6 @@ impl Render for LayoutCanvas {
         div()
             .flex()
             .flex_1()
-            .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
@@ -494,7 +492,7 @@ impl Render for LayoutCanvas {
 }
 
 impl Focusable for LayoutCanvas {
-    fn focus_handle(&self, cx: &gpui::App) -> FocusHandle {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
@@ -638,6 +636,7 @@ impl LayoutCanvas {
         }
     }
 
+    #[allow(dead_code)]
     fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
         Point::new(self.scale * Pixels(pt.x), self.scale * Pixels(pt.y))
             + self.offset
