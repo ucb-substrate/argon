@@ -5,9 +5,10 @@ use enumify::enumify;
 use geometry::transform::TransformationMatrix;
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
-    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
-    Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
+    ScrollWheelEvent, Size, Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba,
+    solid_background,
 };
 use itertools::Itertools;
 
@@ -64,6 +65,7 @@ struct RectToolState {
 
 // ~TextInput
 pub struct LayoutCanvas {
+    focus_handle: FocusHandle,
     pub offset: Point<Pixels>,
     pub bg_style: Style,
     pub state: Entity<EditorState>,
@@ -73,6 +75,7 @@ pub struct LayoutCanvas {
     offset_start: Point<Pixels>,
     // rectangle drawing state
     rect_tool: Option<RectToolState>,
+    mouse_position: Point<Pixels>,
     // zoom state
     scale: f32,
     screen_origin: Point<Pixels>,
@@ -286,6 +289,15 @@ impl Element for CanvasElement {
             }
         }
 
+        if let Some(RectToolState { p0: Some(p0) }) = &inner.rect_tool {
+            let p1 = inner.px_to_layout(inner.mouse_position);
+            rects.push(Rect {
+                x0: p0.x,
+                y0: p0.x,
+                x1: p1.x,
+                y0: p1.x,
+            });
+        }
         let rects = rects
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
@@ -366,6 +378,8 @@ impl Render for LayoutCanvas {
         div()
             .flex()
             .flex_1()
+            .key_context("TextInput")
+            .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
             // TODO: Uncomment once GPUI mouse movement is fixed.
@@ -382,9 +396,16 @@ impl Render for LayoutCanvas {
     }
 }
 
+impl Focusable for LayoutCanvas {
+    fn focus_handle(&self, cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl LayoutCanvas {
     pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
         LayoutCanvas {
+            focus_handle: cx.focus_handle(),
             offset: Point::new(Pixels(0.), Pixels(0.)),
             bg_style: Style {
                 size: Size {
@@ -396,6 +417,7 @@ impl LayoutCanvas {
             is_dragging: false,
             drag_start: Point::default(),
             offset_start: Point::default(),
+            mouse_position: Point::default(),
             rect_tool: None,
             scale: 1.0,
             screen_origin: Point::default(),
@@ -427,6 +449,11 @@ impl LayoutCanvas {
                     });
                 });
             } else {
+                // TODO: error handling.
+                if self.state.read(cx).layers.read(cx).selected_layer.is_none() {
+                    println!("no layer selected");
+                    self.rect_tool = None;
+                }
                 let p0 = self.px_to_layout(event.position);
                 self.rect_tool.as_mut().unwrap().p0 = Some(p0);
             }
@@ -532,6 +559,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_position = event.position;
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
         }

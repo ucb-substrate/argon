@@ -74,7 +74,7 @@ impl Render for LayerSideBar {
             .flex_col()
             .h_full()
             .w(px(200.))
-            .border_r_1()
+            .border_l_1()
             .border_color(THEME.divider)
             .bg(THEME.sidebar)
             .min_h_0()
