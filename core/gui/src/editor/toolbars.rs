@@ -4,11 +4,11 @@ use gpui::*;
 use indexmap::IndexMap;
 
 use crate::{
-    editor::{CompileOutputState, ScopeAddress},
+    editor::{CompileOutputState, Layers, ScopeAddress},
     theme::THEME,
 };
 
-use super::{EditorState, LayerState};
+use super::EditorState;
 
 pub struct TitleBar;
 
@@ -46,7 +46,7 @@ impl Render for ToolBar {
 }
 
 pub struct LayerSideBar {
-    layers: Entity<IndexMap<SharedString, LayerState>>,
+    layers: Entity<Layers>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
@@ -68,7 +68,7 @@ impl Render for LayerSideBar {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let layers_clone = self.layers.clone();
+        let layers = self.layers.read(cx);
         div()
             .flex()
             .flex_col()
@@ -82,31 +82,54 @@ impl Render for LayerSideBar {
             .child(
                 div()
                     .flex()
-                    .size_full()
+                    .flex_col()
+                    .w_full()
                     .items_start()
                     .id("layers_scroll_vert")
-                    .overflow_scroll()
-                    .child(div().flex().child(div().flex().flex_col().children(
-                        self.layers.read(cx).values().map(|layer| {
-                            let layers_clone = layers_clone.clone();
-                            let name = layer.name.clone();
-                            div()
-                                .id(SharedString::from(format!("layer_control_{}", layer.z))) // TODO: does this need to be unique? seems to work as is
-                                .flex()
-                                .on_click(move |_event, _window, cx| {
-                                    layers_clone.update(cx, |state, cx| {
-                                        state.get_mut(&name).unwrap().visible =
-                                            !state[&name].visible;
-                                        cx.notify();
-                                    })
-                                })
-                                .child(format!(
-                                    "{} - {}",
-                                    &layer.name,
-                                    if layer.visible { "V" } else { "NV" }
-                                ))
-                        }),
-                    ))),
+                    .overflow_y_scroll()
+                    .children(layers.layers.values().map(|layer| {
+                        div()
+                            .flex()
+                            .w_full()
+                            .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
+                                rgba(0x00000099)
+                            } else {
+                                rgba(0)
+                            })
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("layer_select_{}", layer.z)))
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .child(layer.name.clone())
+                                    .on_click({
+                                        let layers = self.layers.clone();
+                                        let name = layer.name.clone();
+                                        move |_event, _window, cx| {
+                                            layers.update(cx, |state, cx| {
+                                                state.selected_layer = Some(name.clone());
+                                                cx.notify();
+                                            })
+                                        }
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .child(if layer.visible { "--V" } else { "NV" })
+                                    .id(SharedString::from(format!("layer_control_{}", layer.z)))
+                                    .on_click({
+                                        let layers = self.layers.clone();
+                                        let name = layer.name.clone();
+                                        move |_event, _window, cx| {
+                                            layers.update(cx, |state, cx| {
+                                                state.layers.get_mut(&name).unwrap().visible =
+                                                    !state.layers[&name].visible;
+                                                cx.notify();
+                                            })
+                                        }
+                                    }),
+                            )
+                    })),
             )
     }
 }
@@ -149,7 +172,7 @@ impl HierarchySideBar {
                 })
                 .child(
                     div()
-                        .id(SharedString::from(format!("test_{scope:?}")))
+                        .id(SharedString::from(format!("scope_select_{scope:?}")))
                         .flex_1()
                         .overflow_hidden()
                         .child(format!(

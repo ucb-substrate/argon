@@ -2802,6 +2802,7 @@ dependencies = [
  "lazy_static",
  "lsp-server",
  "portpicker",
+ "rgb",
  "rust-embed",
  "serde",
  "serde_json",

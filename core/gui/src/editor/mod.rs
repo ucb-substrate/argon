@@ -11,6 +11,7 @@ use compiler::compile::{
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::IndexMap;
+use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 
 use crate::{editor::canvas::RectId, rpc::SyncGuiToLspClient, theme::THEME};
@@ -51,10 +52,15 @@ pub struct CompileOutputState {
     pub state: IndexMap<ScopeAddress, ScopeState>,
 }
 
+pub struct Layers {
+    pub layers: IndexMap<SharedString, LayerState>,
+    pub selected_layer: Option<SharedString>,
+}
+
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub solved_cell: Entity<Option<CompileOutputState>>,
-    pub layers: Entity<IndexMap<SharedString, LayerState>>,
+    pub layers: Entity<Layers>,
     pub lsp_client: SyncGuiToLspClient,
     pub subscriptions: Vec<Subscription>,
 }
@@ -167,6 +173,10 @@ fn process_scope(
     );
 }
 
+fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
+    rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
+}
+
 impl EditorState {
     pub fn update(&mut self, cx: &mut impl AppContext, file: PathBuf, solved_cell: CompileOutput) {
         let solved_cell = solved_cell.unwrap_valid();
@@ -174,8 +184,22 @@ impl EditorState {
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
         };
-        let mut z = 0;
         let mut layers = IndexMap::new();
+        for (z, layer) in solved_cell.layers.layers.iter().enumerate() {
+            let name = SharedString::from(layer.name.clone());
+            layers.insert(
+                name.clone(),
+                LayerState {
+                    name,
+                    color: rgb_to_rgba(layer.fill_color),
+                    fill: ShapeFill::Stippling,
+                    border_color: rgb_to_rgba(layer.border_color),
+                    visible: true,
+                    z,
+                },
+            );
+        }
+        let mut z = layers.len();
         let mut state = IndexMap::new();
         process_scope(
             &solved_cell,
@@ -186,7 +210,15 @@ impl EditorState {
             None,
         );
         self.layers.update(cx, |old_layers, cx| {
-            *old_layers = layers;
+            old_layers.layers = layers;
+            if old_layers
+                .selected_layer
+                .as_ref()
+                .map(|selected_layer| !old_layers.layers.contains_key(selected_layer))
+                .unwrap_or(true)
+            {
+                old_layers.selected_layer = None;
+            }
             cx.notify();
         });
         self.solved_cell.update(cx, |old_cell, cx| {
@@ -206,7 +238,10 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, lsp_addr: SocketAddr) -> Self {
         let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
         let solved_cell = cx.new(|_cx| None);
-        let layers = cx.new(|_cx| IndexMap::new());
+        let layers = cx.new(|_cx| Layers {
+            layers: IndexMap::new(),
+            selected_layer: None,
+        });
         let state = cx.new(|cx| {
             let subscriptions = vec![
                 cx.observe(&solved_cell, |_, _, cx| cx.notify()),
