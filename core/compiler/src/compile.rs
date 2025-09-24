@@ -513,7 +513,10 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                     assert_eq!(args.posargs[0].ty(), Ty::String);
                 }
                 for kwarg in &args.kwargs {
-                    assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&kwarg.name.name));
+                    assert!(
+                        ["x0", "x1", "y0", "y1", "x0i", "x1i", "y0i", "y1i", "w", "h"]
+                            .contains(&kwarg.name.name)
+                    );
                     assert_eq!(kwarg.value.ty(), Ty::Float);
                 }
                 (None, Ty::Rect)
@@ -533,12 +536,14 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             "inst" => {
                 assert_eq!(args.posargs.len(), 1);
                 for kwarg in &args.kwargs {
-                    assert!(["reflect", "angle"].contains(&kwarg.name.name));
-                    if kwarg.name.name == "reflect" {
-                        assert_eq!(kwarg.value.ty(), Ty::Bool);
-                    } else if kwarg.name.name == "angle" {
-                        assert_eq!(kwarg.value.ty(), Ty::Int);
-                    }
+                    assert!(["reflect", "angle", "x", "y", "xi", "yi"].contains(&kwarg.name.name));
+                    let expected_ty = match kwarg.name.name {
+                        "reflect" => Ty::Bool,
+                        "angle" => Ty::Int,
+                        "x" | "y" | "xi" | "yi" => Ty::Float,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(kwarg.value.ty(), expected_ty);
                 }
                 assert!(matches!(args.posargs[0].ty(), Ty::Cell(_)));
                 if let Ty::Cell(c) = args.posargs[0].ty() {
@@ -714,6 +719,8 @@ struct CellState {
     deferred: IndexSet<ValueId>,
     root_scope: ScopeId,
     scopes: HashMap<ScopeId, ExecScope>,
+    fallback_constraints: Vec<LinearExpr>,
+    fallback_constraints_used: Vec<LinearExpr>,
 }
 
 struct ExecPass<'a> {
@@ -823,6 +830,8 @@ impl<'a> ExecPass<'a> {
                         emit: Vec::new(),
                         deferred: Default::default(),
                         scopes: HashMap::from_iter([(root_scope_id, root_scope)]),
+                        fallback_constraints: Vec::new(),
+                        fallback_constraints_used: Vec::new(),
                         root_scope: root_scope_id,
                     }
                 )
@@ -852,7 +861,10 @@ impl<'a> ExecPass<'a> {
 
         let mut require_progress = false;
         let mut progress = false;
-        while !self.cell_state(cell_id).deferred.is_empty() {
+        while {
+            let state = self.cell_state(cell_id);
+            !state.deferred.is_empty() || !state.solver.fully_solved()
+        } {
             let deferred = self.cell_state(cell_id).deferred.clone();
             progress = false;
             for vid in deferred {
@@ -860,7 +872,13 @@ impl<'a> ExecPass<'a> {
             }
 
             if require_progress && !progress {
-                panic!("no progress");
+                let state = self.cell_state_mut(cell_id);
+                if let Some(expr) = state.fallback_constraints.pop() {
+                    state.fallback_constraints_used.push(expr.clone());
+                    state.solver.constrain_eq0(expr);
+                } else {
+                    panic!("no progress");
+                }
             }
 
             require_progress = false;
@@ -895,10 +913,10 @@ impl<'a> ExecPass<'a> {
                 Value::Linear(l) => Some(SolvedValue::Float(state.solver.eval_expr(l).unwrap())),
                 Value::Rect(rect) => Some(SolvedValue::Rect(Rect {
                     layer: rect.layer.clone(),
-                    x0: state.solver.value_of(rect.x0).unwrap(),
-                    y0: state.solver.value_of(rect.y0).unwrap(),
-                    x1: state.solver.value_of(rect.x1).unwrap(),
-                    y1: state.solver.value_of(rect.y1).unwrap(),
+                    x0: (state.solver.value_of(rect.x0).unwrap(), rect.x0),
+                    y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
+                    x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
+                    y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
                     source: rect.source.clone(),
                 })),
                 Value::Int(x) => Some(SolvedValue::Int(*x)),
@@ -928,6 +946,7 @@ impl<'a> ExecPass<'a> {
             scopes: HashMap::new(),
             root: state.root_scope,
             fields,
+            fallback_constraints_used: state.fallback_constraints_used.clone(),
         };
         ccell.scopes.insert(
             state.root_scope,
@@ -966,10 +985,10 @@ impl<'a> ExecPass<'a> {
                 Value::Linear(l) => Some(SolvedValue::Float(state.solver.eval_expr(l).unwrap())),
                 Value::Rect(rect) => Some(SolvedValue::Rect(Rect {
                     layer: rect.layer.clone(),
-                    x0: state.solver.value_of(rect.x0).unwrap(),
-                    y0: state.solver.value_of(rect.y0).unwrap(),
-                    x1: state.solver.value_of(rect.x1).unwrap(),
-                    y1: state.solver.value_of(rect.y1).unwrap(),
+                    x0: (state.solver.value_of(rect.x0).unwrap(), rect.x0),
+                    y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
+                    x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
+                    y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
                     source: Some(emit.source.clone()),
                 })),
                 Value::Int(x) => Some(SolvedValue::Int(*x)),
@@ -1344,25 +1363,25 @@ impl<'a> ExecPass<'a> {
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
                             match kwarg.name.name {
-                                "x0" => {
+                                "x0" | "x0i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.x0))),
                                     );
                                 }
-                                "x1" => {
+                                "x1" | "x1i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.x1))),
                                     );
                                 }
-                                "y0" => {
+                                "y0" | "y0i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.y0))),
                                     );
                                 }
-                                "y1" => {
+                                "y1" | "y1i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.y1))),
@@ -1393,6 +1412,7 @@ impl<'a> ExecPass<'a> {
                                     state: PartialEvalState::Constraint(PartialConstraint {
                                         lhs,
                                         rhs: *rhs,
+                                        fallback: kwarg.name.name.ends_with('i'),
                                     }),
                                     frame: vref.frame,
                                     scope: vref.scope,
@@ -1486,6 +1506,39 @@ impl<'a> ExecPass<'a> {
                             angle: angle.unwrap_or_default(),
                             source: SourceInfo { span: c.expr.span },
                         };
+                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
+                            let lhs = self.value_id();
+                            match kwarg.name.name {
+                                "x" | "xi" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(LinearExpr::from(inst.x))),
+                                    );
+                                }
+                                "y" | "yi" => {
+                                    self.values.insert(
+                                        lhs,
+                                        Defer::Ready(Value::Linear(LinearExpr::from(inst.y))),
+                                    );
+                                }
+                                _ => continue,
+                            };
+                            let defer = self.value_id();
+                            self.values.insert(
+                                defer,
+                                DeferValue::Deferred(PartialEval {
+                                    state: PartialEvalState::Constraint(PartialConstraint {
+                                        lhs,
+                                        rhs: *rhs,
+                                        fallback: kwarg.name.name.ends_with('i'),
+                                    }),
+                                    frame: vref.frame,
+                                    scope: vref.scope,
+                                    cell: vref.cell,
+                                }),
+                            );
+                            self.cell_state_mut(vref.cell).deferred.insert(defer);
+                        }
                         self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
                         true
                     } else {
@@ -1693,7 +1746,9 @@ impl<'a> ExecPass<'a> {
                                                     y1: state.solver.new_var(),
                                                     source: None, // TODO
                                                 };
-                                                let rect = rect.transform(inst.reflect, inst.angle);
+                                                let rect = rect
+                                                    .to_float()
+                                                    .transform(inst.reflect, inst.angle);
                                                 let dx0 = LinearExpr::from(xrect.x0)
                                                     - rect.x0
                                                     - LinearExpr::from(inst.x);
@@ -1769,7 +1824,11 @@ impl<'a> ExecPass<'a> {
                     let lhs = vl.as_ref().unwrap_linear();
                     let rhs = vr.as_ref().unwrap_linear();
                     let expr = lhs.clone() - rhs.clone();
-                    state.solver.constrain_eq0(expr);
+                    if c.fallback {
+                        state.fallback_constraints.push(expr);
+                    } else {
+                        state.solver.constrain_eq0(expr);
+                    }
                     self.values.insert(vid, DeferValue::Ready(Value::None));
                     true
                 } else {
@@ -1890,7 +1949,7 @@ pub struct SolvedInstance {
 pub enum SolvedValue {
     Int(i64),
     Float(f64),
-    Rect(Rect<f64>),
+    Rect(Rect<(f64, Var)>),
     Instance(SolvedInstance),
 }
 
@@ -1907,6 +1966,7 @@ pub struct CompiledCell {
     pub scopes: HashMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
     pub fields: HashMap<String, SolvedValue>,
+    pub fallback_constraints_used: Vec<LinearExpr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1996,6 +2056,7 @@ struct PartialCast {
 struct PartialConstraint {
     lhs: ValueId,
     rhs: ValueId,
+    fallback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2079,6 +2140,19 @@ fn imat(mat: TransformationMatrix) -> (Rotation, bool) {
         _ => panic!("invalid rotation matrix"),
     };
     (rot, refv)
+}
+
+impl Rect<(f64, Var)> {
+    fn to_float(&self) -> Rect<f64> {
+        Rect {
+            layer: self.layer.clone(),
+            x0: self.x0.0,
+            y0: self.y0.0,
+            x1: self.x1.0,
+            y1: self.y1.0,
+            source: self.source.clone(),
+        }
+    }
 }
 
 impl Rect<f64> {

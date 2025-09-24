@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use approx::relative_eq;
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
+use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-10;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Var(u64);
 
 #[derive(Clone, Default)]
@@ -37,6 +38,11 @@ impl Solver {
         let var = Var(self.next_id);
         self.next_id += 1;
         var
+    }
+
+    /// Returns true if all variables have been solved.
+    pub fn fully_solved(&self) -> bool {
+        self.solved_vars.len() == self.next_id as usize
     }
 
     /// Constrains the value of `expr` to 0.
@@ -105,7 +111,7 @@ impl Solver {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearExpr {
     pub coeffs: Vec<(f64, Var)>,
     pub constant: f64,
