@@ -8,7 +8,7 @@ use crate::{
     theme::THEME,
 };
 
-use super::{EditorState, LayerState};
+use super::EditorState;
 
 pub struct TitleBar;
 
