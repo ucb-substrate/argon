@@ -91,11 +91,11 @@ fn max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect 
 }
 
 cell vias() {
-    let met2 = rect(Layer::Met2)!;
-    let met1 = rect(Layer::Met1)!;
+    let met2 = rect("met2")!;
+    let met1 = rect("met1")!;
 
     // Create via.
-    let via = rect(Layer::Via1);
+    let via = rect("via1");
     eq(via.w, 10.);
     eq(via.h, 10.);
     eq(via.x0, 0.);

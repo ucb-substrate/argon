@@ -41,6 +41,12 @@ IntLiteral -> Result<IntLiteral, ()>
   Ok(IntLiteral { span: v.span(), value: parse_int($lexer.span_str(v.span()))?, }) }
   ;
 
+StringLiteral -> Result<StringLiteral, ()>
+  : 'STRLIT' {
+  let v = $1.map_err(|_| ())?;
+  Ok(StringLiteral { span: v.span(), value: parse_str($lexer.span_str(v.span()))?, }) }
+  ;
+
 EnumDecl -> Result<EnumDecl<'input, ParseMetadata>, ()>
   : 'ENUM' Ident '{' EnumVariants '}'
   {
@@ -240,6 +246,7 @@ SubFactor -> Result<Expr<'input, ParseMetadata>, ()>
   | Ident { Ok(Expr::Var(VarExpr { name: $1?, metadata: (), })) }
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
+  | StringLiteral { Ok(Expr::StringLiteral($1?)) }
   | SubFactor 'AS' Ident { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
   ;
 

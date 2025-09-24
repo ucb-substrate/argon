@@ -38,6 +38,12 @@ pub struct IntLiteral {
     pub value: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct StringLiteral {
+    pub span: Span,
+    pub value: String,
+}
+
 #[derive_where(Debug, Clone)]
 pub struct EnumDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
@@ -147,6 +153,7 @@ pub enum Expr<'a, T: AstMetadata> {
     Var(VarExpr<'a, T>),
     FloatLiteral(FloatLiteral),
     IntLiteral(IntLiteral),
+    StringLiteral(StringLiteral),
     Scope(Box<Scope<'a, T>>),
     Cast(Box<CastExpr<'a, T>>),
 }
@@ -261,6 +268,10 @@ pub(crate) fn parse_int(s: &str) -> Result<i64, ()> {
     s.parse::<i64>().map_err(|_| ())
 }
 
+pub(crate) fn parse_str(s: &str) -> Result<String, ()> {
+    Ok(s.trim_matches('"').to_string())
+}
+
 pub(crate) fn flatten<T>(lhs: Result<Vec<T>, ()>, rhs: Result<T, ()>) -> Result<Vec<T>, ()> {
     let mut flt = lhs?;
     flt.push(rhs?);
@@ -281,6 +292,7 @@ impl<'a, T: AstMetadata> Expr<'a, T> {
             Self::Var(x) => x.name.span,
             Self::FloatLiteral(x) => x.span,
             Self::IntLiteral(x) => x.span,
+            Self::StringLiteral(x) => x.span,
             Self::Scope(x) => x.span,
             Self::Cast(x) => x.span,
         }
@@ -760,6 +772,7 @@ pub trait AstTransformer<'a> {
             Expr::Var(var_expr) => Expr::Var(self.transform_var_expr(var_expr)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
+            Expr::StringLiteral(string_literal) => Expr::StringLiteral(string_literal.clone()),
             Expr::Scope(scope) => Expr::Scope(Box::new(self.transform_scope(scope))),
             Expr::Cast(cast) => Expr::Cast(Box::new(self.transform_cast(cast))),
         }

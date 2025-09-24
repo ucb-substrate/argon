@@ -32,7 +32,30 @@ pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> Compile
         lyp_file: input.lyp_file,
     };
 
-    ExecPass::new(&ast).execute(input)
+    let res = ExecPass::new(&ast).execute(input);
+    check_layers(&res);
+    res
+}
+
+fn check_layers(output: &CompileOutput) {
+    if let CompileOutput::Valid(output) = output {
+        let mut layers = IndexSet::new();
+        for layer in output.layers.layers.iter() {
+            layers.insert(layer.name.clone());
+        }
+        for (_, cell) in output.cells.iter() {
+            for (_, scope) in cell.scopes.iter() {
+                for elt in scope.elts.iter() {
+                    if let SolvedValue::Rect(r) = elt
+                        && let Some(layer) = &r.layer
+                        && !layers.contains(layer)
+                    {
+                        panic!("unknown layer `{layer}`");
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct VarIdTyPass<'a> {
@@ -53,6 +76,7 @@ pub enum Ty {
     Int,
     Rect,
     Enum,
+    String,
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
     Nil,
@@ -198,8 +222,9 @@ impl<'a> Expr<'a, VarIdTyMetadata> {
             Expr::EnumValue(_enum_value) => Ty::Enum,
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
             Expr::Var(var_expr) => var_expr.metadata.1.clone(),
-            Expr::FloatLiteral(_float_literal) => Ty::Float,
-            Expr::IntLiteral(_int_literal) => Ty::Int,
+            Expr::FloatLiteral(_) => Ty::Float,
+            Expr::IntLiteral(_) => Ty::Int,
+            Expr::StringLiteral(_) => Ty::String,
             Expr::Scope(scope) => scope.metadata.clone(),
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
@@ -450,7 +475,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         match base_ty {
             Ty::Rect => match field.name {
                 "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
-                "layer" => Ty::Enum,
+                "layer" => Ty::String,
                 _ => panic!("invalid field access"),
             },
             Ty::Inst(c) => match field.name {
@@ -485,7 +510,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
                     assert_eq!(args.posargs.len(), 0);
                 } else {
                     assert_eq!(args.posargs.len(), 1);
-                    assert_eq!(args.posargs[0].ty(), Ty::Enum);
+                    assert_eq!(args.posargs[0].ty(), Ty::String);
                 }
                 for kwarg in &args.kwargs {
                     assert!(["x0", "x1", "y0", "y1", "w", "h"].contains(&kwarg.name.name));
@@ -1123,6 +1148,12 @@ impl<'a> ExecPass<'a> {
                 self.values.insert(vid, Defer::Ready(Value::Int(i.value)));
                 return vid;
             }
+            Expr::StringLiteral(s) => {
+                let vid = self.value_id();
+                self.values
+                    .insert(vid, Defer::Ready(Value::String(s.value.clone())));
+                return vid;
+            }
             Expr::Var(v) => {
                 let var_id = v.metadata.0;
                 return self.frames[&frame].bindings[&var_id];
@@ -1292,7 +1323,7 @@ impl<'a> ExecPass<'a> {
                         self.values[vid]
                             .as_ref()
                             .get_ready()
-                            .map(|layer| layer.as_ref().unwrap_enum_value().clone())
+                            .map(|layer| layer.as_ref().unwrap_string().clone())
                     });
                     let layer = match layer {
                         None => Some(None),
@@ -1637,7 +1668,7 @@ impl<'a> ExecPass<'a> {
                                 "h" => Value::Linear(
                                     LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
                                 ),
-                                "layer" => Value::EnumValue(rect.layer.clone().unwrap()),
+                                "layer" => Value::String(rect.layer.clone().unwrap()),
                                 f => panic!("invalid field `{f}`"),
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -1785,6 +1816,7 @@ impl<'a> ExecPass<'a> {
 #[derive(Debug, Clone)]
 pub enum Value<'a> {
     EnumValue(String),
+    String(String),
     Linear(LinearExpr),
     Int(i64),
     Rect(Rect<Var>),
