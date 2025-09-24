@@ -211,7 +211,7 @@ impl Element for CanvasElement {
                             let layer = rect
                                 .layer
                                 .as_ref()
-                                .and_then(|layer| layers.get(layer.as_str()));
+                                .and_then(|layer| layers.layers.get(layer.as_str()));
                             if let Some(layer) = layer
                                 && layer.visible
                             {
