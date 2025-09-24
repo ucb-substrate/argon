@@ -1,0 +1,7 @@
+cell bot() {
+  let met1 = rect("met1", x0=0., y0=0., x1=160., y1=100.)!;
+}
+
+cell top() {
+  let bot_inst = inst(bot(), xi=40., y=0.)!;
+}

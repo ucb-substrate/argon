@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 
-use compiler::compile::{SolvedValue, ifmatvec};
+use compiler::{
+    compile::{SolvedValue, ifmatvec},
+    solver::Var,
+};
 use enumify::enumify;
 use geometry::transform::TransformationMatrix;
 use gpui::{
@@ -53,6 +56,17 @@ impl From<editor::Rect<f64>> for RectInner {
             x1: value.x1 as f32,
             y0: value.y0 as f32,
             y1: value.y1 as f32,
+        }
+    }
+}
+
+impl From<editor::Rect<(f64, Var)>> for RectInner {
+    fn from(value: editor::Rect<(f64, Var)>) -> Self {
+        Self {
+            x0: value.x0.0 as f32,
+            x1: value.x1.0 as f32,
+            y0: value.y0.0 as f32,
+            y1: value.y1.0 as f32,
         }
     }
 }
@@ -269,8 +283,8 @@ impl Element for CanvasElement {
                     match value {
                         SolvedValue::Rect(rect) => {
                             if show {
-                                let p0p = ifmatvec(mat, (rect.x0, rect.y0));
-                                let p1p = ifmatvec(mat, (rect.x1, rect.y1));
+                                let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                                let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
                                 let layer = rect
                                     .layer
                                     .as_ref()
@@ -520,6 +534,7 @@ impl LayoutCanvas {
             );
             if rect_bounds.contains(&event.position) {
                 selected_rect = Some(r);
+                break;
             }
         }
         if let Some(r) = selected_rect.cloned() {

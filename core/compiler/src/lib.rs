@@ -87,6 +87,14 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/cell_out_of_order.ar"
     ));
+    const ARGON_FALLBACK_BASIC: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/fallback_basic.ar"
+    ));
+    const ARGON_FALLBACK_INST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/fallback_inst.ar"
+    ));
     const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
@@ -229,6 +237,38 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
+        println!("{cells:#?}");
+    }
+
+    #[test]
+    fn argon_fallback_basic() {
+        let ast = parse(ARGON_FALLBACK_BASIC).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        )
+        .unwrap_valid();
+        assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
+        println!("{cells:#?}");
+    }
+
+    #[test]
+    fn argon_fallback_inst() {
+        let ast = parse(ARGON_FALLBACK_INST).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        )
+        .unwrap_valid();
+        assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
         println!("{cells:#?}");
     }
 
