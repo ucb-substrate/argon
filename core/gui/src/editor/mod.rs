@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
     path::PathBuf,
@@ -7,7 +6,7 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, ScopeId, SolvedValue, ValidCompileOutput, ifmatvec,
+    CellId, CompileOutput, Rect, ScopeId, SolvedValue, ValidCompileOutput, ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -33,6 +32,7 @@ pub struct LayerState {
 pub struct ScopeState {
     pub name: String,
     pub visible: bool,
+    pub bbox: Option<Rect<f64>>,
     pub parent: Option<ScopeAddress>,
 }
 
@@ -65,6 +65,107 @@ pub struct Editor {
     pub canvas: Entity<LayoutCanvas>,
 }
 
+fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>> {
+    match (b1, b2) {
+        (Some(r1), Some(r2)) => Some(Rect {
+            layer: None,
+            x0: r1.x0.min(r2.x0),
+            y0: r1.y0.min(r2.y0),
+            x1: r1.x1.max(r2.x1),
+            y1: r1.y1.max(r2.y1),
+            source: None,
+        }),
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
+}
+
+fn process_scope(
+    solved_cell: &ValidCompileOutput,
+    scope: ScopeAddress,
+    z: &mut usize,
+    layers: &mut IndexMap<SharedString, LayerState>,
+    state: &mut IndexMap<ScopeAddress, ScopeState>,
+    parent: Option<ScopeAddress>,
+) {
+    let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
+    let mut bbox = None;
+    for value in &scope_info.elts {
+        match value {
+            SolvedValue::Rect(rect) => {
+                bbox = bbox_union(bbox, Some(rect.clone()));
+                if let Some(layer) = &rect.layer {
+                    let layer = SharedString::from(layer);
+                    if !layers.contains_key(&layer) {
+                        let mut s = DefaultHasher::new();
+                        layer.hash(&mut s);
+                        let hash = s.finish() as usize;
+                        let color =
+                            rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+                        layers.insert(
+                            layer.clone(),
+                            LayerState {
+                                name: layer,
+                                color,
+                                fill: ShapeFill::Stippling,
+                                border_color: color,
+                                visible: true,
+                                z: *z,
+                            },
+                        );
+                        *z += 1;
+                    }
+                }
+            }
+            SolvedValue::Instance(inst) => {
+                let inst_address = ScopeAddress {
+                    scope: solved_cell.cells[&inst.cell].root,
+                    cell: inst.cell,
+                };
+                process_scope(solved_cell, inst_address, z, layers, state, Some(scope));
+                bbox = bbox_union(
+                    bbox,
+                    state[&inst_address].bbox.as_ref().map(|rect| {
+                        let mut inst_mat = TransformationMatrix::identity();
+                        if inst.reflect {
+                            inst_mat = inst_mat.reflect_vert()
+                        }
+                        inst_mat = inst_mat.rotate(inst.angle);
+                        let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
+                        let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
+                        Rect {
+                            layer: None,
+                            x0: p0p.0.min(p1p.0) + inst.x,
+                            y0: p0p.1.min(p1p.1) + inst.y,
+                            x1: p0p.0.max(p1p.0) + inst.x,
+                            y1: p0p.1.max(p1p.1) + inst.y,
+                            source: None,
+                        }
+                    }),
+                );
+            }
+            _ => {}
+        }
+    }
+    for child in &scope_info.children {
+        let scope_address = ScopeAddress {
+            scope: *child,
+            cell: scope.cell,
+        };
+        process_scope(solved_cell, scope_address, z, layers, state, Some(scope));
+        bbox = bbox_union(bbox, state[&scope_address].bbox.clone());
+    }
+    state.insert(
+        scope,
+        ScopeState {
+            name: scope_info.name.clone(),
+            visible: true,
+            bbox,
+            parent,
+        },
+    );
+}
+
 impl EditorState {
     pub fn update(&mut self, cx: &mut impl AppContext, file: PathBuf, solved_cell: CompileOutput) {
         let solved_cell = solved_cell.unwrap_valid();
@@ -73,80 +174,16 @@ impl EditorState {
             cell: solved_cell.top,
         };
         let mut z = 0;
-        let mut queue =
-            VecDeque::from_iter([(selected_scope, TransformationMatrix::identity(), (0., 0.))]);
         let mut layers = IndexMap::new();
         let mut state = IndexMap::new();
-        let mut parent = IndexMap::new();
-        while let Some((curr_address @ ScopeAddress { scope, cell }, mat, ofs)) = queue.pop_front()
-        {
-            let scope_info = &solved_cell.cells[&cell].scopes[&scope];
-            state.insert(
-                curr_address,
-                ScopeState {
-                    name: scope_info.name.clone(),
-                    visible: true,
-                    parent: parent.get(&curr_address).copied(),
-                },
-            );
-            for value in &scope_info.elts {
-                match value {
-                    SolvedValue::Rect(rect) => {
-                        if let Some(layer) = &rect.layer {
-                            let layer = SharedString::from(layer);
-                            if !layers.contains_key(&layer) {
-                                let mut s = DefaultHasher::new();
-                                layer.hash(&mut s);
-                                let hash = s.finish() as usize;
-                                let color =
-                                    rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff]
-                                        [hash % 5]);
-                                layers.insert(
-                                    layer.clone(),
-                                    LayerState {
-                                        name: layer,
-                                        color,
-                                        fill: ShapeFill::Stippling,
-                                        border_color: color,
-                                        visible: true,
-                                        z,
-                                    },
-                                );
-                                z += 1;
-                            }
-                        }
-                    }
-                    SolvedValue::Instance(inst) => {
-                        let mut inst_mat = TransformationMatrix::identity();
-                        if inst.reflect {
-                            inst_mat = inst_mat.reflect_vert()
-                        }
-                        inst_mat = inst_mat.rotate(inst.angle);
-                        let inst_ofs = ifmatvec(mat, (inst.x, inst.y));
-
-                        let inst_address = ScopeAddress {
-                            scope: solved_cell.cells[&inst.cell].root,
-                            cell: inst.cell,
-                        };
-                        parent.insert(inst_address, curr_address);
-                        queue.push_back((
-                            inst_address,
-                            mat * inst_mat,
-                            (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-            for child in &scope_info.children {
-                let scope_address = ScopeAddress {
-                    scope: *child,
-                    cell,
-                };
-                parent.insert(scope_address, curr_address);
-                queue.push_back((scope_address, mat, ofs));
-            }
-        }
+        process_scope(
+            &solved_cell,
+            selected_scope,
+            &mut z,
+            &mut layers,
+            &mut state,
+            None,
+        );
         self.layers.update(cx, |old_layers, cx| {
             *old_layers = layers;
             cx.notify();

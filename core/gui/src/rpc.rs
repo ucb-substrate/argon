@@ -109,6 +109,7 @@ impl SyncGuiToLspClient {
             .detach();
     }
 
+    // TODO: Improve API.
     pub fn select_rect(&self, span: Option<(PathBuf, Span)>) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
