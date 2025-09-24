@@ -14,7 +14,7 @@ use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
 use tarpc::{
     context,
-    server::{Channel, incoming::Incoming},
+    server::{incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
@@ -107,12 +107,18 @@ impl Backend {
             )
             .await;
         tokio::spawn(async move {
+            // TODO: un-hardcode this.
+            let lyp = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../core/compiler/examples/lyp/basic.lyp"
+            );
             let o = Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../target/debug/compiler"
             ))
             .arg(&params.file)
             .arg(params.cell)
+            .arg(lyp)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
