@@ -667,7 +667,6 @@ pub type ConstraintVarId = u64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceInfo {
     pub span: cfgrammar::Span,
-    pub id: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -913,6 +912,7 @@ impl<'a> ExecPass<'a> {
                         .unwrap_ready()
                         .as_ref()
                         .unwrap_cell(),
+                    source: inst.source.clone(),
                     cell_vid: inst.cell,
                 })),
                 _ => None,
@@ -983,6 +983,7 @@ impl<'a> ExecPass<'a> {
                         .unwrap_ready()
                         .as_ref()
                         .unwrap_cell(),
+                    source: emit.source.clone(),
                     cell_vid: inst.cell,
                 })),
                 _ => None,
@@ -1160,11 +1161,10 @@ impl<'a> ExecPass<'a> {
             }
             Expr::Emit(e) => {
                 let value = self.visit_expr(cell_id, frame, scope, &e.value);
-                let id = self.alloc_id();
                 self.cell_state_mut(cell_id).emit.push(Emit {
                     scope,
                     value,
-                    source: SourceInfo { span: e.span, id },
+                    source: SourceInfo { span: e.span },
                 });
                 return value;
             }
@@ -1337,10 +1337,7 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var(),
                             x1: state.solver.new_var(),
                             y1: state.solver.new_var(),
-                            source: Some(SourceInfo {
-                                span: c.expr.span,
-                                id: self.alloc_id(),
-                            }),
+                            source: Some(SourceInfo { span: c.expr.span }),
                         };
                         self.values
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
@@ -1487,6 +1484,7 @@ impl<'a> ExecPass<'a> {
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
+                            source: SourceInfo { span: c.expr.span },
                         };
                         self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
                         true
@@ -1730,6 +1728,7 @@ impl<'a> ExecPass<'a> {
                                                     y: state.solver.new_var(),
                                                     angle,
                                                     reflect,
+                                                    source: cinst.source.clone(),
                                                 };
                                                 let dx = LinearExpr::from(inst.x) + cx
                                                     - LinearExpr::from(oinst.x);
@@ -1869,6 +1868,7 @@ pub struct Instance {
     pub cell: ValueId,
     pub reflect: bool,
     pub angle: Rotation,
+    pub source: SourceInfo,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1878,6 +1878,7 @@ pub struct SolvedInstance {
     pub angle: Rotation,
     pub reflect: bool,
     pub cell: CellId,
+    pub source: SourceInfo,
     /// The value ID of the cell being instantiated.
     ///
     /// For compiler internal use only.
