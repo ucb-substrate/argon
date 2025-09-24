@@ -32,6 +32,7 @@ pub fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("r", DrawRect, None),
+            KeyBinding::new("escape", Cancel, None),
         ]);
         // Register the `quit` function so it can be referenced by the `MenuItem::action` in the menu bar
         cx.on_action(quit);
@@ -51,14 +52,20 @@ pub fn main() {
                 focus: false,
                 ..Default::default()
             },
-            |window, cx| window.replace_root(cx, |_window, cx| Editor::new(cx, args.lsp_addr)),
+            |window, cx| {
+                window.replace_root(cx, |window, cx| {
+                    let editor = Editor::new(cx, args.lsp_addr);
+                    window.focus(&editor.canvas.read(cx).focus_handle(cx));
+                    editor
+                })
+            },
         )
         .unwrap();
     });
 }
 
 // Associate actions using the `actions!` macro (or `impl_actions!` macro)
-actions!(Argon, [Quit, DrawRect]);
+actions!(Argon, [Quit, DrawRect, Cancel]);
 
 // Define the quit function that is registered with the App
 fn quit(_: &Quit, cx: &mut App) {
