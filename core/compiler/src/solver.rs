@@ -48,6 +48,7 @@ impl Solver {
 
     pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {
         let n_vars = self.next_id as usize;
+        let arr_shape = (self.constraints.len() + self.solved_vars.len(), n_vars);
         let arr = self
             .constraints
             .iter()
@@ -59,14 +60,18 @@ impl Solver {
                     .chain(std::iter::repeat_n(0., n_vars - var - 1))
             }))
             .collect::<Vec<_>>();
-        let arr = ndarray::Array::from_shape_vec((self.constraints.len(), n_vars), arr).unwrap();
+        let arr = ndarray::Array::from_shape_vec(arr_shape, arr).unwrap();
         let (_, s, vt) = arr.svd(false, true).unwrap();
         let vt = vt.unwrap();
-        if let Some(idx) = s.iter().position(|x| *x < 1e-10) {
-            (idx..n_vars).map(|i| vt.row(i).to_vec()).collect()
-        } else {
-            vec![]
-        }
+        let shape = vt.shape();
+        assert_eq!(shape.len(), 2);
+        assert_eq!(shape[0], n_vars);
+        assert_eq!(shape[1], n_vars);
+        let idx = s
+            .iter()
+            .position(|x| *x < 1e-10)
+            .unwrap_or_else(|| std::cmp::min(arr_shape.0, arr_shape.1));
+        (idx..n_vars).map(|i| vt.row(i).to_vec()).collect()
     }
 
     /// Constrains the value of `expr` to 0.
@@ -101,7 +106,6 @@ impl Solver {
             return;
         }
         let sol = svd.solve(&b, EPSILON).unwrap();
-        println!("vt shape = {:?}", vt.shape());
 
         for i in 0..self.next_id {
             if !self.solved_vars.contains_key(&Var(i))
