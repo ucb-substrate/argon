@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use approx::relative_eq;
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
+use ndarray_linalg::SVD;
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-10;
@@ -45,6 +46,29 @@ impl Solver {
         self.solved_vars.len() == self.next_id as usize
     }
 
+    pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {
+        let n_vars = self.next_id as usize;
+        let arr = self
+            .constraints
+            .iter()
+            .flat_map(|expr| expr.coeff_vec(n_vars))
+            .chain(self.solved_vars.iter().flat_map(|(var, _)| {
+                let var = var.0 as usize;
+                std::iter::repeat_n(0., var)
+                    .chain(std::iter::once(1.))
+                    .chain(std::iter::repeat_n(0., n_vars - var - 1))
+            }))
+            .collect::<Vec<_>>();
+        let arr = ndarray::Array::from_shape_vec((self.constraints.len(), n_vars), arr).unwrap();
+        let (_, s, vt) = arr.svd(false, true).unwrap();
+        let vt = vt.unwrap();
+        if let Some(idx) = s.iter().position(|x| *x < 1e-10) {
+            (idx..n_vars).map(|i| vt.row(i).to_vec()).collect()
+        } else {
+            vec![]
+        }
+    }
+
     /// Constrains the value of `expr` to 0.
     /// TODO: Check if added constraints conflict with existing solution.
     pub fn constrain_eq0(&mut self, mut expr: LinearExpr) {
@@ -77,6 +101,7 @@ impl Solver {
             return;
         }
         let sol = svd.solve(&b, EPSILON).unwrap();
+        println!("vt shape = {:?}", vt.shape());
 
         for i in 0..self.next_id {
             if !self.solved_vars.contains_key(&Var(i))
@@ -92,6 +117,7 @@ impl Solver {
         for constraint in self.constraints.iter_mut() {
             substitute_expr(&self.solved_vars, constraint);
         }
+        // TODO: detect inconsistent constraints
         self.constraints
             .retain(|constraint| !constraint.coeffs.is_empty());
     }

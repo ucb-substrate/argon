@@ -20,7 +20,7 @@ arcstr = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 derive-where = "1"
-nalgebra = "0"
+nalgebra = "0.34"
 approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive"] }
 geometry = { version = "0.7", registry = "substrate" }
 rgb = { version = "0.8", features = ["serde"] }
 klayout-lyp = "0.1.1"
+ndarray = "0.16.1"
+ndarray-linalg = { version = "0.17.0", default-features = false, features = ["openblas-system"] }
 
 [build-dependencies]
 cfgrammar = "0.13"

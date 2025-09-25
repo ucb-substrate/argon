@@ -721,6 +721,7 @@ struct CellState {
     scopes: HashMap<ScopeId, ExecScope>,
     fallback_constraints: Vec<LinearExpr>,
     fallback_constraints_used: Vec<LinearExpr>,
+    nullspace_vecs: Option<Vec<Vec<f64>>>,
 }
 
 struct ExecPass<'a> {
@@ -833,6 +834,7 @@ impl<'a> ExecPass<'a> {
                         fallback_constraints: Vec::new(),
                         fallback_constraints_used: Vec::new(),
                         root_scope: root_scope_id,
+                        nullspace_vecs: None,
                     }
                 )
                 .is_none()
@@ -873,6 +875,9 @@ impl<'a> ExecPass<'a> {
 
             if require_progress && !progress {
                 let state = self.cell_state_mut(cell_id);
+                if state.nullspace_vecs.is_none() {
+                    state.nullspace_vecs = Some(state.solver.nullspace_vecs());
+                }
                 if let Some(expr) = state.fallback_constraints.pop() {
                     state.fallback_constraints_used.push(expr.clone());
                     state.solver.constrain_eq0(expr);
@@ -947,6 +952,7 @@ impl<'a> ExecPass<'a> {
             root: state.root_scope,
             fields,
             fallback_constraints_used: state.fallback_constraints_used.clone(),
+            nullspace_vecs: state.nullspace_vecs.clone().unwrap_or_default(),
         };
         ccell.scopes.insert(
             state.root_scope,
@@ -1967,6 +1973,7 @@ pub struct CompiledCell {
     pub root: ScopeId,
     pub fields: HashMap<String, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
+    pub nullspace_vecs: Vec<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
