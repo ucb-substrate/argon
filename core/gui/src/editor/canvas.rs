@@ -1,20 +1,24 @@
 use std::collections::VecDeque;
 
 use compiler::{
-    compile::{SolvedValue, ifmatvec},
-    solver::Var,
+    compile::{self, SolvedValue, ifmatvec},
+    solver::{Solver, Var},
 };
 use enumify::enumify;
 use geometry::transform::TransformationMatrix;
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
-    InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba, ScrollWheelEvent, Size,
-    Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba, solid_background,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
+    ScrollWheelEvent, Size, Style, Styled, Subscription, Window, div, pattern_slash, rgb, rgba,
+    solid_background,
 };
 use itertools::Itertools;
 
-use crate::editor::{self, EditorState, LayerState, ScopeAddress};
+use crate::{
+    Cancel, DrawRect,
+    editor::{self, EditorState, LayerState, ScopeAddress},
+};
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum ShapeFill {
@@ -37,61 +41,47 @@ pub enum RectId {
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
-    pub inner: RectInner,
-    pub id: RectId,
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub struct RectInner {
     pub x0: f32,
     pub x1: f32,
     pub y0: f32,
     pub y1: f32,
+    pub id: Option<RectId>,
 }
 
-impl From<editor::Rect<f64>> for RectInner {
-    fn from(value: editor::Rect<f64>) -> Self {
+impl From<compile::Rect<f64>> for Rect {
+    fn from(value: compile::Rect<f64>) -> Self {
         Self {
             x0: value.x0 as f32,
             x1: value.x1 as f32,
             y0: value.y0 as f32,
             y1: value.y1 as f32,
+            id: None,
         }
     }
 }
 
-impl From<editor::Rect<(f64, Var)>> for RectInner {
+impl From<editor::Rect<(f64, Var)>> for Rect {
     fn from(value: editor::Rect<(f64, Var)>) -> Self {
         Self {
             x0: value.x0.0 as f32,
             x1: value.x1.0 as f32,
             y0: value.y0.0 as f32,
             y1: value.y1.0 as f32,
+            id: None,
         }
     }
 }
 
-impl AsRef<RectInner> for Rect {
-    fn as_ref(&self) -> &RectInner {
-        &self.inner
-    }
-}
-
-impl AsRef<RectInner> for RectInner {
-    fn as_ref(&self) -> &RectInner {
-        self
-    }
-}
-
-impl RectInner {
+impl Rect {
     pub fn transform(&self, mat: TransformationMatrix, ofs: (f64, f64)) -> Self {
         let p0p = ifmatvec(mat, (self.x0 as f64, self.y0 as f64));
         let p1p = ifmatvec(mat, (self.x1 as f64, self.y1 as f64));
-        RectInner {
+        Self {
             x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
             y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
             x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+            id: None,
         }
     }
 }
@@ -110,8 +100,12 @@ pub struct CanvasElement {
     inner: Entity<LayoutCanvas>,
 }
 
-// ~TextInput
+struct RectToolState {
+    p0: Option<Point<f32>>,
+}
+
 pub struct LayoutCanvas {
+    focus_handle: FocusHandle,
     pub offset: Point<Pixels>,
     pub bg_style: Style,
     pub state: Entity<EditorState>,
@@ -119,6 +113,9 @@ pub struct LayoutCanvas {
     is_dragging: bool,
     drag_start: Point<Pixels>,
     offset_start: Point<Pixels>,
+    // rectangle drawing state
+    rect_tool: Option<RectToolState>,
+    mouse_position: Point<Pixels>,
     // zoom state
     scale: f32,
     screen_origin: Point<Pixels>,
@@ -137,7 +134,7 @@ impl IntoElement for CanvasElement {
 }
 
 fn get_paint_quad(
-    r: impl AsRef<RectInner>,
+    r: &Rect,
     bounds: Bounds<Pixels>,
     scale: f32,
     offset: Point<Pixels>,
@@ -145,7 +142,6 @@ fn get_paint_quad(
     color: Rgba,
     border_color: Rgba,
 ) -> Option<PaintQuad> {
-    let r = r.as_ref();
     let rect_bounds = Bounds::new(
         Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0)) + offset + bounds.origin,
         Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
@@ -268,13 +264,11 @@ impl Element for CanvasElement {
                         let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
                         let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
                         scope_rects.push(Rect {
-                            inner: RectInner {
-                                x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                                y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                                x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                                y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                            },
-                            id: RectId::Scope(curr_address),
+                            x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                            y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                            x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                            y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                            id: Some(RectId::Scope(curr_address)),
                         });
                     }
                     show = false;
@@ -294,16 +288,14 @@ impl Element for CanvasElement {
                                 {
                                     rects.push((
                                         Rect {
-                                            inner: RectInner {
-                                                x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                                                y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                                                x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                                                y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                                            },
-                                            id: RectId::Element(ElementId {
+                                            x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                                            y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                                            x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                                            y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                                            id: Some(RectId::Element(ElementId {
                                                 scope: curr_address,
                                                 idx: i,
-                                            }),
+                                            })),
                                         },
                                         layer.clone(),
                                     ));
@@ -332,16 +324,14 @@ impl Element for CanvasElement {
                                     let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
                                     let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
                                     scope_rects.push(Rect {
-                                        inner: RectInner {
-                                            x0: (p0p.0.min(p1p.0) + new_ofs.0) as f32,
-                                            y0: (p0p.1.min(p1p.1) + new_ofs.1) as f32,
-                                            x1: (p0p.0.max(p1p.0) + new_ofs.0) as f32,
-                                            y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
-                                        },
-                                        id: RectId::Element(ElementId {
+                                        x0: (p0p.0.min(p1p.0) + new_ofs.0) as f32,
+                                        y0: (p0p.1.min(p1p.1) + new_ofs.1) as f32,
+                                        x1: (p0p.0.max(p1p.0) + new_ofs.0) as f32,
+                                        y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
+                                        id: Some(RectId::Element(ElementId {
                                             scope: curr_address,
                                             idx: i,
-                                        }),
+                                        })),
                                     });
                                 }
                                 show = false;
@@ -381,11 +371,12 @@ impl Element for CanvasElement {
                                 inst_mat = inst_mat.rotate(inst.angle);
                                 let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
                                 let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
-                                RectInner {
+                                Rect {
                                     x0: (p0p.0.min(p1p.0) + inst.x) as f32,
                                     y0: (p0p.1.min(p1p.1) + inst.y) as f32,
                                     x1: (p0p.0.max(p1p.0) + inst.x) as f32,
                                     y1: (p0p.1.max(p1p.1) + inst.y) as f32,
+                                    id: None,
                                 }
                             })
                         }
@@ -400,6 +391,19 @@ impl Element for CanvasElement {
             }
         }
 
+        if let Some(RectToolState { p0: Some(p0) }) = &inner.rect_tool {
+            let p1 = inner.px_to_layout(inner.mouse_position);
+            rects.push((
+                Rect {
+                    x0: p0.x.min(p1.x),
+                    y0: p0.y.min(p1.y),
+                    x1: p0.x.max(p1.x),
+                    y1: p0.y.max(p1.y),
+                    id: None,
+                },
+                layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
+            ));
+        }
         let rects = rects
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
@@ -469,11 +473,14 @@ impl Render for LayoutCanvas {
         div()
             .flex()
             .flex_1()
+            .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
             // TODO: Uncomment once GPUI mouse movement is fixed.
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             // .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_action(cx.listener(Self::draw_rect))
+            .on_action(cx.listener(Self::cancel))
             .on_drag_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -484,9 +491,16 @@ impl Render for LayoutCanvas {
     }
 }
 
+impl Focusable for LayoutCanvas {
+    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl LayoutCanvas {
     pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
         LayoutCanvas {
+            focus_handle: cx.focus_handle(),
             offset: Point::new(Pixels(0.), Pixels(0.)),
             bg_style: Style {
                 size: Size {
@@ -498,6 +512,8 @@ impl LayoutCanvas {
             is_dragging: false,
             drag_start: Point::default(),
             offset_start: Point::default(),
+            mouse_position: Point::default(),
+            rect_tool: None,
             scale: 1.0,
             screen_origin: Point::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
@@ -513,67 +529,145 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let rects = self
-            .rects
-            .iter()
-            .rev()
-            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-            .map(|(r, _)| r);
-        let scale = self.scale;
-        let offset = self.offset;
-        let mut selected_rect = None;
-        for r in rects.chain(self.scope_rects.iter()) {
-            let rect_bounds = Bounds::new(
-                Point::new(scale * Pixels(r.inner.x0), scale * Pixels(r.inner.y0))
-                    + offset
-                    + self.screen_origin,
-                Size::new(
-                    scale * Pixels(r.inner.x1 - r.inner.x0),
-                    scale * Pixels(r.inner.y1 - r.inner.y0),
-                ),
-            );
-            if rect_bounds.contains(&event.position) {
-                selected_rect = Some(r);
-                break;
+        if let Some(ref mut rect_tool) = self.rect_tool {
+            if let Some(p0) = rect_tool.p0 {
+                rect_tool.p0 = None;
+                let p1 = self.px_to_layout(event.position);
+                let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
+                let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
+                self.state.update(cx, |state, cx| {
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            // TODO update in memory representation of code
+                            // TODO add solver to gui
+                            let mut solver = Solver::new();
+                            cell.output
+                                .cells
+                                .get_mut(&cell.selected_scope.cell)
+                                .unwrap()
+                                .scopes
+                                .get_mut(&cell.selected_scope.scope)
+                                .unwrap()
+                                .elts
+                                .push(SolvedValue::Rect(compile::Rect {
+                                    layer: state
+                                        .layers
+                                        .read(cx)
+                                        .selected_layer
+                                        .clone()
+                                        .map(|s| s.to_string()),
+                                    x0: (p0p.x as f64, solver.new_var()),
+                                    y0: (p0p.y as f64, solver.new_var()),
+                                    x1: (p1p.x as f64, solver.new_var()),
+                                    y1: (p1p.y as f64, solver.new_var()),
+                                    source: None,
+                                }))
+                        }
+                    });
+                });
+            } else {
+                // TODO: error handling.
+                if self.state.read(cx).layers.read(cx).selected_layer.is_none() {
+                    self.rect_tool = None;
+                } else {
+                    let p0 = self.px_to_layout(event.position);
+                    self.rect_tool.as_mut().unwrap().p0 = Some(p0);
+                }
+            }
+        } else {
+            let rects = self
+                .rects
+                .iter()
+                .rev()
+                .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                .map(|(r, _)| r);
+            let scale = self.scale;
+            let offset = self.offset;
+            let mut selected_rect = None;
+            for r in rects.chain(self.scope_rects.iter()) {
+                let rect_bounds = Bounds::new(
+                    Point::new(scale * Pixels(r.x0), scale * Pixels(r.y0))
+                        + offset
+                        + self.screen_origin,
+                    Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+                );
+                if rect_bounds.contains(&event.position) && r.id.is_some() {
+                    selected_rect = Some(r);
+                    break;
+                }
+            }
+            if let Some(r) = selected_rect.cloned() {
+                self.state.update(cx, |state, cx| {
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.selected_rect = r.id;
+                            let args = r.id.and_then(|id| match id {
+                                RectId::Element(id) => {
+                                    match &cell.output.cells[&id.scope.cell].scopes[&id.scope.scope]
+                                        .elts[id.idx]
+                                    {
+                                        SolvedValue::Rect(r) => r
+                                            .source
+                                            .as_ref()
+                                            .map(|source| (cell.file.clone(), source.span)),
+                                        _ => None,
+                                    }
+                                }
+                                RectId::Scope(id) => Some((
+                                    cell.file.clone(),
+                                    cell.output.cells[&id.cell].scopes[&id.scope].span,
+                                )),
+                            });
+                            state.lsp_client.select_rect(args);
+                            cx.notify();
+                        }
+                    });
+                });
+            } else {
+                self.state.update(cx, |state, cx| {
+                    state.solved_cell.update(cx, |cell, cx| {
+                        if let Some(cell) = cell.as_mut() {
+                            cell.selected_rect = None;
+                            cx.notify();
+                        }
+                    });
+                });
             }
         }
-        if let Some(r) = selected_rect.cloned() {
-            self.state.update(cx, |state, cx| {
-                state.solved_cell.update(cx, |cell, cx| {
-                    if let Some(cell) = cell.as_mut() {
-                        cell.selected_rect = Some(r.id);
-                        let args = match r.id {
-                            RectId::Element(id) => {
-                                match &cell.output.cells[&id.scope.cell].scopes[&id.scope.scope]
-                                    .elts[id.idx]
-                                {
-                                    SolvedValue::Rect(r) => r
-                                        .source
-                                        .as_ref()
-                                        .map(|source| (cell.file.clone(), source.span)),
-                                    _ => None,
-                                }
-                            }
-                            RectId::Scope(id) => Some((
-                                cell.file.clone(),
-                                cell.output.cells[&id.cell].scopes[&id.scope].span,
-                            )),
-                        };
-                        state.lsp_client.select_rect(args);
-                        cx.notify();
-                    }
-                });
-            });
-        } else {
-            self.state.update(cx, |state, cx| {
-                state.solved_cell.update(cx, |cell, cx| {
-                    if let Some(cell) = cell.as_mut() {
-                        cell.selected_rect = None;
-                        cx.notify();
-                    }
-                });
-            });
+    }
+
+    #[allow(dead_code)]
+    fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
+        Point::new(self.scale * Pixels(pt.x), self.scale * Pixels(pt.y))
+            + self.offset
+            + self.screen_origin
+    }
+
+    fn px_to_layout(&self, pt: Point<Pixels>) -> Point<f32> {
+        let pt = pt - self.offset - self.screen_origin;
+        Point::new(pt.x.0 / self.scale, pt.y.0 / self.scale)
+    }
+
+    pub(crate) fn draw_rect(
+        &mut self,
+        _: &DrawRect,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.rect_tool.is_none() {
+            self.rect_tool = Some(RectToolState { p0: None });
         }
+    }
+
+    pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(rect_tool) = self.rect_tool.as_mut() {
+            if rect_tool.p0.is_none() {
+                self.rect_tool = None;
+            } else {
+                rect_tool.p0 = None;
+            }
+        }
+        cx.notify();
     }
 
     #[allow(unused)]
@@ -594,6 +688,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.mouse_position = event.position;
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
         }
