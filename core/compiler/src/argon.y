@@ -180,10 +180,7 @@ Statement -> Result<Statement<'input, ParseMetadata>, ()>
   ;
 
 ScopeAnnotation -> Result<Ident<'input, ParseMetadata>, ()>
-    : 'ANNOTATION'
-    {
-        { Ok(Ident { span: $span, name: &$lexer.span_str($span)[1..], metadata: () }) }
-    }
+    : 'ANNOTATION' { Ok(Ident { span: $span, name: &$lexer.span_str($span)[1..], metadata: () }) }
     ;
 
 UnannotatedScope -> Result<Scope<'input, ParseMetadata>, ()>
