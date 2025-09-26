@@ -2,7 +2,7 @@
 //!
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -25,7 +25,10 @@ use crate::{
 
 pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> CompileOutput {
     let pass = VarIdTyPass::new(ast);
-    let ast = pass.execute();
+    let (ast, errors) = pass.execute();
+    if !errors.is_empty() {
+        return CompileOutput::StaticErrors(StaticErrorCompileOutput { errors });
+    };
     let input = CompileInput {
         cell: input.cell,
         params: input.params,
@@ -58,10 +61,16 @@ fn check_layers(output: &CompileOutput) {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct VarIdTyFrame<'a> {
+    var_bindings: HashMap<&'a str, (VarId, Ty)>,
+    scope_bindings: HashSet<&'a str>,
+}
+
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a Ast<'a, ParseMetadata>,
     next_id: VarId,
-    bindings: Vec<HashMap<&'a str, (VarId, Ty)>>,
+    bindings: Vec<VarIdTyFrame<'a>>,
     errors: Vec<StaticError>,
 }
 
@@ -90,6 +99,7 @@ impl Ty {
             "Float" => Ty::Float,
             "Rect" => Ty::Rect,
             "Int" => Ty::Int,
+            "()" => Ty::Nil,
             name => panic!("invalid type: {name}"),
         }
     }
@@ -143,15 +153,15 @@ impl<'a> VarIdTyPass<'a> {
         Self {
             ast,
             // allocate space for the global namespace
-            bindings: vec![HashMap::new()],
+            bindings: vec![VarIdTyFrame::default()],
             next_id: 1,
             errors: Vec::new(),
         }
     }
 
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
-        for map in self.bindings.iter().rev() {
-            if let Some(info) = map.get(name) {
+        for frame in self.bindings.iter().rev() {
+            if let Some(info) = frame.var_bindings.get(name) {
                 return Some(info.clone());
             }
         }
@@ -160,12 +170,16 @@ impl<'a> VarIdTyPass<'a> {
 
     fn alloc(&mut self, name: &'a str, ty: Ty) -> VarId {
         let id = self.next_id;
-        self.bindings.last_mut().unwrap().insert(name, (id, ty));
+        self.bindings
+            .last_mut()
+            .unwrap()
+            .var_bindings
+            .insert(name, (id, ty));
         self.next_id += 1;
         id
     }
 
-    pub(crate) fn execute(mut self) -> Ast<'a, VarIdTyMetadata> {
+    pub(crate) fn execute(mut self) -> (Ast<'a, VarIdTyMetadata>, Vec<StaticError>) {
         let mut decls = Vec::new();
         for decl in &self.ast.decls {
             if let Decl::Fn(f) = decl {
@@ -184,10 +198,13 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
 
-        Ast {
-            decls,
-            span: self.ast.span,
-        }
+        (
+            Ast {
+                decls,
+                span: self.ast.span,
+            },
+            self.errors,
+        )
     }
 
     fn declare_fn_decl(&mut self, input: &FnDecl<'a, ParseMetadata>) {
@@ -205,7 +222,11 @@ impl<'a> VarIdTyPass<'a> {
             .collect();
         let ty = Ty::Fn(Box::new(FnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            ret: Ty::from_name(input.return_ty.name),
+            ret: if let Some(return_ty) = &input.return_ty {
+                Ty::from_name(return_ty.name)
+            } else {
+                Ty::Nil
+            },
         }));
         self.alloc(input.name.name, ty);
     }
@@ -276,7 +297,7 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         _input: &FnDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
         _args: &[ArgDecl<'a, Self::Output>],
-        _return_ty: &Ident<'a, Self::Output>,
+        _return_ty: &Option<Ident<'a, Self::Output>>,
         _scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FnDecl {
         // UNUSED
@@ -291,7 +312,10 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
         let name = self.transform_ident(&input.name);
-        let return_ty = self.transform_ident(&input.return_ty);
+        let return_ty = input
+            .return_ty
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
         let scope = self.transform_scope(&input.scope);
         FnDecl {
             name,
@@ -372,6 +396,16 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         then: &Expr<'a, Self::Output>,
         else_: &Expr<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::IfExpr {
+        if let Some(scope_annotation) = &input.scope_annotation {
+            let bindings = self.bindings.last_mut().unwrap();
+            if bindings.scope_bindings.contains(scope_annotation.name) {
+                self.errors.push(StaticError {
+                    span: scope_annotation.span,
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            bindings.scope_bindings.insert(scope_annotation.name);
+        }
         let cond_ty = cond.ty();
         let then_ty = then.ty();
         let else_ty = else_.ty();
@@ -637,7 +671,17 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
-    fn enter_scope(&mut self, _input: &crate::ast::Scope<'a, Self::Input>) {
+    fn enter_scope(&mut self, input: &crate::ast::Scope<'a, Self::Input>) {
+        if let Some(scope_annotation) = &input.scope_annotation {
+            let bindings = self.bindings.last_mut().unwrap();
+            if bindings.scope_bindings.contains(scope_annotation.name) {
+                self.errors.push(StaticError {
+                    span: scope_annotation.span,
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            bindings.scope_bindings.insert(scope_annotation.name);
+        }
         self.bindings.push(Default::default());
     }
 
@@ -737,6 +781,13 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: HashMap<CellId, CompiledCell>,
+}
+
+enum ExecScopeName {
+    // Exact name has been specified.
+    Specified(String),
+    // Exact name has not been specified, need to generate unique identifier based on prefix.
+    Prefix(String),
 }
 
 impl<'a> ExecPass<'a> {
@@ -1118,15 +1169,19 @@ impl<'a> ExecPass<'a> {
         &mut self,
         cell_id: CellId,
         parent: ScopeId,
-        name: impl Into<String>,
+        name: ExecScopeName,
         span: cfgrammar::Span,
     ) -> ScopeId {
         let id = self.scope_id();
+        let name = match name {
+            ExecScopeName::Specified(name) => name,
+            ExecScopeName::Prefix(prefix) => format!("{} {}", prefix, id.0),
+        };
         self.cell_state_mut(cell_id).scopes.insert(
             id,
             ExecScope {
                 parent: Some(parent),
-                name: name.into(),
+                name,
                 span,
             },
         );
@@ -1237,7 +1292,7 @@ impl<'a> ExecPass<'a> {
                             let scope = self.create_exec_scope(
                                 cell_id,
                                 scope,
-                                format!("fn {}", val.name.name),
+                                ExecScopeName::Specified(format!("fn {}", val.name.name)),
                                 val.span,
                             );
                             let fid = self.frame_id();
@@ -1276,7 +1331,16 @@ impl<'a> ExecPass<'a> {
                 }))
             }
             Expr::Scope(s) => {
-                let scope = self.create_exec_scope(cell_id, scope, "anonymous scope", s.span);
+                let scope = self.create_exec_scope(
+                    cell_id,
+                    scope,
+                    if let Some(scope_annotation) = &s.scope_annotation {
+                        ExecScopeName::Specified(scope_annotation.name.to_string())
+                    } else {
+                        ExecScopeName::Prefix("scope".to_string())
+                    },
+                    s.span,
+                );
                 return self.visit_scope_expr_inner(cell_id, frame, scope, s);
             }
             Expr::EnumValue(e) => {
@@ -1619,7 +1683,14 @@ impl<'a> ExecPass<'a> {
                             let scope = self.create_exec_scope(
                                 vref.cell,
                                 vref.scope,
-                                "if then",
+                                if let Some(scope_annotation) = &if_.expr.scope_annotation {
+                                    ExecScopeName::Specified(format!(
+                                        "if {}",
+                                        scope_annotation.name
+                                    ))
+                                } else {
+                                    ExecScopeName::Prefix("if".to_string())
+                                },
                                 if_.expr.then.span(),
                             );
                             let then =
@@ -1629,7 +1700,14 @@ impl<'a> ExecPass<'a> {
                             let scope = self.create_exec_scope(
                                 vref.cell,
                                 vref.scope,
-                                "if else",
+                                if let Some(scope_annotation) = &if_.expr.scope_annotation {
+                                    ExecScopeName::Specified(format!(
+                                        "else {}",
+                                        scope_annotation.name
+                                    ))
+                                } else {
+                                    ExecScopeName::Prefix("else".to_string())
+                                },
                                 if_.expr.else_.span(),
                             );
                             let else_ =

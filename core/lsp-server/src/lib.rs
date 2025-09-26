@@ -2,7 +2,7 @@ pub mod rpc;
 
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
@@ -29,7 +29,7 @@ pub struct SharedState {
     gui_client: Arc<Mutex<Option<LspToGuiClient>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Backend {
     state: SharedState,
 }
@@ -102,6 +102,32 @@ impl Backend {
 
         Ok(())
     }
+
+    async fn compile_cell(file: impl AsRef<Path>, cell: impl AsRef<str>) -> CompileOutput {
+        // TODO: un-hardcode this.
+        let lyp = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../core/compiler/examples/lyp/basic.lyp"
+        );
+        let o = Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/debug/compiler"
+        ))
+        .arg(file.as_ref())
+        .arg(cell.as_ref())
+        .arg(lyp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .await
+        .unwrap();
+        let o = String::from_utf8(o.stdout).unwrap();
+        serde_json::from_str(&o).unwrap()
+    }
+
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
         let state = self.state.clone();
         state
@@ -112,28 +138,7 @@ impl Backend {
             )
             .await;
         tokio::spawn(async move {
-            // TODO: un-hardcode this.
-            let lyp = concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../core/compiler/examples/lyp/basic.lyp"
-            );
-            let o = Command::new(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../target/debug/compiler"
-            ))
-            .arg(&params.file)
-            .arg(params.cell)
-            .arg(lyp)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-            .wait_with_output()
-            .await
-            .unwrap();
-            let o_str = String::from_utf8(o.stdout).unwrap();
-            let o: CompileOutput = serde_json::from_str(&o_str).unwrap();
+            let o = Backend::compile_cell(&params.file, params.cell).await;
             if let Some(client) = state.gui_client.lock().await.as_mut() {
                 client
                     .open_cell(context::current(), params.file, o)

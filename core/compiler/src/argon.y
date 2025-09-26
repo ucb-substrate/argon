@@ -132,7 +132,18 @@ FnDecl -> Result<FnDecl<'input, ParseMetadata>, ()>
       name: $2?,
       args: $4?,
       scope: $8?,
-      return_ty: $7?,
+      return_ty: Some($7?),
+      span: $span,
+      metadata: (),
+    })
+  }
+  | 'FN' Ident '(' ArgDecls ')' Scope
+  {
+    Ok(FnDecl {
+      name: $2?,
+      args: $4?,
+      scope: $6?,
+      return_ty: None,
       span: $span,
       metadata: (),
     })
@@ -168,13 +179,21 @@ Statement -> Result<Statement<'input, ParseMetadata>, ()>
   }
   ;
 
-Scope -> Result<Scope<'input, ParseMetadata>, ()>
+ScopeAnnotation -> Result<Ident<'input, ParseMetadata>, ()>
+    : '#' Ident
+    {
+        $2
+    }
+    ;
+
+UnannotatedScope -> Result<Scope<'input, ParseMetadata>, ()>
   : '{' Statements '}'
   {
     let mut __stmts = $2?;
     if let Some(Statement::Expr { value, semicolon }) = __stmts.last().cloned() && !semicolon {
       __stmts.pop().unwrap();
       return Ok(Scope {
+        scope_annotation: None,
         span: $span,
         stmts: __stmts,
         tail: Some(value),
@@ -182,6 +201,7 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
       })
     }
     Ok(Scope {
+      scope_annotation: None,
       span: $span,
       stmts: __stmts,
       tail: None,
@@ -191,6 +211,7 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
   | '{' Statements NonBlockExpr '}'
   {
     Ok(Scope {
+      scope_annotation: None,
       span: $span,
       stmts: $2?,
       tail: Some($3?),
@@ -199,13 +220,28 @@ Scope -> Result<Scope<'input, ParseMetadata>, ()>
   }
   ;
 
+Scope -> Result<Scope<'input, ParseMetadata>, ()>
+    : ScopeAnnotation UnannotatedScope
+    {
+        Ok(Scope {
+            scope_annotation: Some($1?),
+            ..$2?
+        })
+    }
+    | UnannotatedScope 
+    {
+        $1
+    }
+    ;
+
 Expr -> Result<Expr<'input, ParseMetadata>, ()>
   : NonBlockExpr { $1 }
   | BlockExpr { $1 }
   ;
 
 BlockExpr -> Result<Expr<'input, ParseMetadata>, ()>
-  : 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { cond: $2?, then: Expr::Scope(Box::new($3?)), else_: Expr::Scope(Box::new($5?)), span: $span, metadata: (), }))) }
+  : 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: None, cond: $2?, then: Expr::Scope(Box::new($3?)), else_: Expr::Scope(Box::new($5?)), span: $span, metadata: (), }))) }
+  | ScopeAnnotation 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: Some($1?), cond: $3?, then: Expr::Scope(Box::new($4?)), else_: Expr::Scope(Box::new($6?)), span: $span, metadata: (), }))) }
   | Scope { Ok(Expr::Scope(Box::new($1?))) }
   ;
 

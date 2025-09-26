@@ -80,7 +80,7 @@ pub struct CellDecl<'a, T: AstMetadata> {
 pub struct FnDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub args: Vec<ArgDecl<'a, T>>,
-    pub return_ty: Ident<'a, T>,
+    pub return_ty: Option<Ident<'a, T>>,
     pub scope: Scope<'a, T>,
     pub span: Span,
     pub metadata: T::FnDecl,
@@ -96,6 +96,7 @@ pub struct ConstantDecl<'a, T: AstMetadata> {
 
 #[derive_where(Debug, Clone)]
 pub struct Scope<'a, T: AstMetadata> {
+    pub scope_annotation: Option<Ident<'a, T>>,
     pub span: Span,
     pub stmts: Vec<Statement<'a, T>>,
     pub tail: Option<Expr<'a, T>>,
@@ -166,6 +167,7 @@ pub struct VarExpr<'a, T: AstMetadata> {
 
 #[derive_where(Debug, Clone)]
 pub struct IfExpr<'a, T: AstMetadata> {
+    pub scope_annotation: Option<Ident<'a, T>>,
     pub cond: Expr<'a, T>,
     pub then: Expr<'a, T>,
     pub else_: Expr<'a, T>,
@@ -356,7 +358,7 @@ pub trait AstTransformer<'a> {
         input: &FnDecl<'a, Self::Input>,
         name: &Ident<'a, Self::Output>,
         args: &[ArgDecl<'a, Self::Output>],
-        return_ty: &Ident<'a, Self::Output>,
+        return_ty: &Option<Ident<'a, Self::Output>>,
         scope: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::FnDecl;
     fn dispatch_constant_decl(
@@ -512,7 +514,10 @@ pub trait AstTransformer<'a> {
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect_vec();
-        let return_ty = self.transform_ident(&input.return_ty);
+        let return_ty = input
+            .return_ty
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
         let scope = self.transform_scope(&input.scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
@@ -566,11 +571,16 @@ pub trait AstTransformer<'a> {
         }
     }
     fn transform_if_expr(&mut self, input: &IfExpr<'a, Self::Input>) -> IfExpr<'a, Self::Output> {
+        let scope_annotation = input
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
         let cond = self.transform_expr(&input.cond);
         let then = self.transform_expr(&input.then);
         let else_ = self.transform_expr(&input.else_);
         let metadata = self.dispatch_if_expr(input, &cond, &then, &else_);
         IfExpr {
+            scope_annotation,
             span: input.span,
             metadata,
             cond,
@@ -722,6 +732,10 @@ pub trait AstTransformer<'a> {
 
     fn transform_scope(&mut self, input: &Scope<'a, Self::Input>) -> Scope<'a, Self::Output> {
         self.enter_scope(input);
+        let scope_annotation = input
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
         let stmts = input
             .stmts
             .iter()
@@ -730,6 +744,7 @@ pub trait AstTransformer<'a> {
         let tail = input.tail.as_ref().map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(input, &stmts, &tail);
         let output = Scope {
+            scope_annotation,
             span: input.span,
             stmts,
             tail,

@@ -138,7 +138,7 @@ syn match     rustArrowCharacter display "->"
 syn match     rustQuestionMark display "?\([a-zA-Z]\+\)\@!"
 
 syn match     rustMacro       '\w\(\w\)*!' contains=rustAssert,rustPanic
-syn match     rustMacro       '#\w\(\w\)*' contains=rustAssert,rustPanic
+syn match     rustGuiAnno       '#\w\(\w\)*'
 
 syn match     rustEscapeError   display contained /\\./
 syn match     rustEscape        display contained /\\\([nrt0\\'"]\|x\x\{2}\)/
@@ -339,6 +339,7 @@ hi def link rustModPathSep    Delimiter
 hi def link rustFunction      Function
 hi def link rustFuncName      Function
 hi def link rustFuncCall      Function
+hi def link rustGuiAnno       Comment
 hi def link rustShebang       Comment
 hi def link rustCommentLine   Comment
 hi def link rustCommentLineDoc SpecialComment
