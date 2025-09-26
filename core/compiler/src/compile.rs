@@ -1685,7 +1685,7 @@ impl<'a> ExecPass<'a> {
                                 vref.scope,
                                 if let Some(scope_annotation) = &if_.expr.scope_annotation {
                                     ExecScopeName::Specified(format!(
-                                        "if {}",
+                                        "{} if",
                                         scope_annotation.name
                                     ))
                                 } else {
@@ -1702,7 +1702,7 @@ impl<'a> ExecPass<'a> {
                                 vref.scope,
                                 if let Some(scope_annotation) = &if_.expr.scope_annotation {
                                     ExecScopeName::Specified(format!(
-                                        "else {}",
+                                        "{} else",
                                         scope_annotation.name
                                     ))
                                 } else {
