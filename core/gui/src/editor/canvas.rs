@@ -233,7 +233,10 @@ impl Element for CanvasElement {
         let mut select_rects = Vec::new();
         if let Some(solved_cell) = solved_cell {
             let mut queue = VecDeque::from_iter([(
-                solved_cell.selected_scope,
+                ScopeAddress {
+                    cell: solved_cell.selected_scope.cell,
+                    scope: solved_cell.output.cells[&solved_cell.selected_scope.cell].root,
+                },
                 TransformationMatrix::identity(),
                 (0., 0.),
                 0,
