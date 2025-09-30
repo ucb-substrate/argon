@@ -78,7 +78,7 @@ pub(crate) struct VarIdTyPass<'a> {
 pub struct VarIdTyMetadata;
 
 #[enumify]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ty {
     Bool,
     Float,
@@ -105,19 +105,19 @@ impl Ty {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
     args: Vec<Ty>,
     ret: Ty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
     args: Vec<Ty>,
     data: HashMap<String, Ty>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellTy {
     data: HashMap<String, Ty>,
 }
@@ -393,8 +393,8 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
         &mut self,
         input: &IfExpr<'a, Self::Input>,
         cond: &Expr<'a, Self::Output>,
-        then: &Expr<'a, Self::Output>,
-        else_: &Expr<'a, Self::Output>,
+        then: &Scope<'a, Self::Output>,
+        else_: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::IfExpr {
         if let Some(scope_annotation) = &input.scope_annotation {
             let bindings = self.bindings.last_mut().unwrap();
@@ -407,8 +407,8 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
             bindings.scope_bindings.insert(scope_annotation.name);
         }
         let cond_ty = cond.ty();
-        let then_ty = then.ty();
-        let else_ty = else_.ty();
+        let then_ty = then.metadata.clone();
+        let else_ty = else_.metadata.clone();
         assert_eq!(cond_ty, Ty::Bool);
         if cond_ty != Ty::Bool {
             self.errors.push(StaticError {
@@ -1697,10 +1697,14 @@ impl<'a> ExecPass<'a> {
                                 } else {
                                     ExecScopeName::Prefix("if".to_string())
                                 },
-                                if_.expr.then.span(),
+                                if_.expr.then.span,
                             );
-                            let then =
-                                self.visit_expr(vref.cell, vref.frame, scope, &if_.expr.then);
+                            let then = self.visit_scope_expr_inner(
+                                vref.cell,
+                                vref.frame,
+                                scope,
+                                &if_.expr.then,
+                            );
                             if_.state = IfExprState::Then(then);
                         } else {
                             let scope = self.create_exec_scope(
@@ -1714,10 +1718,14 @@ impl<'a> ExecPass<'a> {
                                 } else {
                                     ExecScopeName::Prefix("else".to_string())
                                 },
-                                if_.expr.else_.span(),
+                                if_.expr.else_.span,
                             );
-                            let else_ =
-                                self.visit_expr(vref.cell, vref.frame, scope, &if_.expr.else_);
+                            let else_ = self.visit_scope_expr_inner(
+                                vref.cell,
+                                vref.frame,
+                                scope,
+                                &if_.expr.else_,
+                            );
                             if_.state = IfExprState::Else(else_);
                         }
                         true

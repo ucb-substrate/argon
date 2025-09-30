@@ -8,41 +8,52 @@ pub mod layer;
 pub mod parse;
 pub mod solver;
 
-/// Simple program to greet a person
+/// Argon compiler.
+// TODO: Use subcommands for better API clarity.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// The Argon source code to compile.
     file: PathBuf,
     /// The name of the cell to compile.
-    cell: String,
+    #[arg(short, long)]
+    cell: Option<String>,
     /// Layer properties file.
-    lyp: PathBuf,
+    #[arg(short, long)]
+    lyp: Option<PathBuf>,
+    /// Outputs AST as JSON.
+    #[arg(short, long)]
+    ast: bool,
 }
 
 pub fn main() {
     let args = Args::parse();
     let f = std::fs::read_to_string(&args.file).unwrap();
     let ast = parse::parse(&f).unwrap();
-    let cell_ast = parse::parse_cell(&args.cell).unwrap();
-    let o = compile::compile(
-        &ast,
-        CompileInput {
-            cell: cell_ast.func.name,
-            params: cell_ast
-                .args
-                .posargs
-                .iter()
-                .map(|arg| match arg {
-                    ast::Expr::FloatLiteral(float_literal) => float_literal.value,
-                    ast::Expr::IntLiteral(int_literal) => int_literal.value as f64,
-                    _ => panic!("must be int or float literal for now"),
-                })
-                .collect(),
-            lyp_file: &args.lyp,
-        },
-    );
-    println!("{}", serde_json::to_string(&o).unwrap());
+    if args.ast {
+        println!("{}", serde_json::to_string(&ast).unwrap());
+    } else {
+        let cell = args.cell.unwrap();
+        let cell_ast = parse::parse_cell(&cell).unwrap();
+        let o = compile::compile(
+            &ast,
+            CompileInput {
+                cell: cell_ast.func.name,
+                params: cell_ast
+                    .args
+                    .posargs
+                    .iter()
+                    .map(|arg| match arg {
+                        ast::Expr::FloatLiteral(float_literal) => float_literal.value,
+                        ast::Expr::IntLiteral(int_literal) => int_literal.value as f64,
+                        _ => panic!("must be int or float literal for now"),
+                    })
+                    .collect(),
+                lyp_file: &args.lyp.unwrap(),
+            },
+        );
+        println!("{}", serde_json::to_string(&o).unwrap());
+    }
 }
 
 #[cfg(test)]
