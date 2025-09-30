@@ -24,7 +24,9 @@ pub enum Decl<'a, T: AstMetadata> {
     Fn(FnDecl<'a, T>),
 }
 
-#[derive_where(Debug, Clone, Serialize, Deserialize)]
+#[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = ""))]
 pub struct Ident<'a, T: AstMetadata> {
     pub span: Span,
     pub name: &'a str,
