@@ -211,8 +211,9 @@ impl HierarchySideBar {
         );
         let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
         let mut cells = IndexMap::new();
-        for elt in scope_info.elts.clone() {
-            if let SolvedValue::Instance(inst) = &elt {
+        for (obj, _) in scope_info.emit.iter() {
+            let elt = &solved_cell.output.cells[&scope.cell].objects[obj];
+            if let SolvedValue::Instance(inst) = elt {
                 *cells.entry(inst.cell).or_insert(0) += 1;
             }
         }

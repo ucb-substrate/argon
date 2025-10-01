@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use cfgrammar::Span;
-use compiler::compile::{CompileOutput, Rect};
+use compiler::compile::{BasicRect, CompileOutput};
 
 use tarpc::{context, tokio_serde::formats::Json};
 use tower_lsp::lsp_types::{
@@ -14,7 +14,7 @@ use crate::{State, document::DocumentChange};
 pub trait GuiToLsp {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Option<(PathBuf, Span)>);
-    async fn draw_rect(file: PathBuf, scope_span: Span, var_name: String, rect: Rect<f64>);
+    async fn draw_rect(file: PathBuf, scope_span: Span, var_name: String, rect: BasicRect<f64>);
 }
 
 #[tarpc::service]
@@ -72,7 +72,7 @@ impl GuiToLsp for LspServer {
         file: PathBuf,
         scope_span: Span,
         var_name: String,
-        rect: Rect<f64>,
+        rect: BasicRect<f64>,
     ) {
         let mut state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&file).unwrap();
