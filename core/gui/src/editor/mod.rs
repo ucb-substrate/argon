@@ -80,7 +80,7 @@ fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>>
             y0: r1.y0.min(r2.y0),
             x1: r1.x1.max(r2.x1),
             y1: r1.y1.max(r2.y1),
-            source: None,
+            id: r1.id,
         }),
         (Some(r), None) | (None, Some(r)) => Some(r),
         (None, None) => None,
@@ -97,7 +97,8 @@ fn process_scope(
 ) {
     let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
     let mut bbox = None;
-    for value in &scope_info.elts {
+    for (obj, _) in &scope_info.emit {
+        let value = &solved_cell.cells[&scope.cell].objects[obj];
         match value {
             SolvedValue::Rect(rect) => {
                 bbox = bbox_union(bbox, Some(rect.to_float()));
@@ -146,12 +147,11 @@ fn process_scope(
                             y0: p0p.1.min(p1p.1) + inst.y,
                             x1: p0p.0.max(p1p.0) + inst.x,
                             y1: p0p.1.max(p1p.1) + inst.y,
-                            source: None,
+                            id: inst.id,
                         }
                     }),
                 );
             }
-            _ => {}
         }
     }
     for child in &scope_info.children {

@@ -3,14 +3,19 @@ use std::fmt::Debug;
 use cfgrammar::Span;
 use derive_where::derive_where;
 use itertools::Itertools;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct Ast<'a, T: AstMetadata> {
     pub decls: Vec<Decl<'a, T>>,
     pub span: Span,
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub enum Decl<'a, T: AstMetadata> {
     Enum(EnumDecl<'a, T>),
     Struct(StructDecl<'a, T>),
@@ -20,31 +25,35 @@ pub enum Decl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = ""))]
 pub struct Ident<'a, T: AstMetadata> {
     pub span: Span,
     pub name: &'a str,
     pub metadata: T::Ident,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FloatLiteral {
     pub span: Span,
     pub value: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IntLiteral {
     pub span: Span,
     pub value: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StringLiteral {
     pub span: Span,
     pub value: String,
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct EnumDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub variants: Vec<Ident<'a, T>>,
@@ -52,6 +61,8 @@ pub struct EnumDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct StructDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub fields: Vec<StructField<'a, T>>,
@@ -60,6 +71,8 @@ pub struct StructDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct StructField<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub ty: Ident<'a, T>,
@@ -68,6 +81,8 @@ pub struct StructField<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct CellDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub args: Vec<ArgDecl<'a, T>>,
@@ -77,6 +92,8 @@ pub struct CellDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct FnDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub args: Vec<ArgDecl<'a, T>>,
@@ -87,6 +104,8 @@ pub struct FnDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct ConstantDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub ty: Ident<'a, T>,
@@ -95,6 +114,8 @@ pub struct ConstantDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct Scope<'a, T: AstMetadata> {
     pub scope_annotation: Option<Ident<'a, T>>,
     pub span: Span,
@@ -104,12 +125,16 @@ pub struct Scope<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub enum Statement<'a, T: AstMetadata> {
     Expr { value: Expr<'a, T>, semicolon: bool },
     LetBinding(LetBinding<'a, T>),
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct LetBinding<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub value: Expr<'a, T>,
@@ -117,7 +142,7 @@ pub struct LetBinding<'a, T: AstMetadata> {
     pub span: Span,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BinOp {
     Add,
     Sub,
@@ -125,13 +150,13 @@ pub enum BinOp {
     Div,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Not,
     Neg,
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOp {
     Eq,
     Ne,
@@ -142,6 +167,8 @@ pub enum ComparisonOp {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub enum Expr<'a, T: AstMetadata> {
     If(Box<IfExpr<'a, T>>),
     Comparison(Box<ComparisonExpr<'a, T>>),
@@ -160,22 +187,28 @@ pub enum Expr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct VarExpr<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub metadata: T::VarExpr,
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct IfExpr<'a, T: AstMetadata> {
     pub scope_annotation: Option<Ident<'a, T>>,
     pub cond: Expr<'a, T>,
-    pub then: Expr<'a, T>,
-    pub else_: Expr<'a, T>,
+    pub then: Scope<'a, T>,
+    pub else_: Scope<'a, T>,
     pub span: Span,
     pub metadata: T::IfExpr,
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct BinOpExpr<'a, T: AstMetadata> {
     pub op: BinOp,
     pub left: Expr<'a, T>,
@@ -185,6 +218,8 @@ pub struct BinOpExpr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct UnaryOpExpr<'a, T: AstMetadata> {
     pub op: UnaryOp,
     pub operand: Expr<'a, T>,
@@ -193,6 +228,8 @@ pub struct UnaryOpExpr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct ComparisonExpr<'a, T: AstMetadata> {
     pub op: ComparisonOp,
     pub left: Expr<'a, T>,
@@ -202,6 +239,8 @@ pub struct ComparisonExpr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct FieldAccessExpr<'a, T: AstMetadata> {
     pub base: Expr<'a, T>,
     pub field: Ident<'a, T>,
@@ -210,6 +249,8 @@ pub struct FieldAccessExpr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct EnumValue<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub variant: Ident<'a, T>,
@@ -218,6 +259,8 @@ pub struct EnumValue<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct CallExpr<'a, T: AstMetadata> {
     pub func: Ident<'a, T>,
     pub args: Args<'a, T>,
@@ -226,6 +269,8 @@ pub struct CallExpr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct EmitExpr<'a, T: AstMetadata> {
     pub value: Expr<'a, T>,
     pub span: Span,
@@ -233,6 +278,8 @@ pub struct EmitExpr<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct Args<'a, T: AstMetadata> {
     pub posargs: Vec<Expr<'a, T>>,
     pub kwargs: Vec<KwArgValue<'a, T>>,
@@ -240,6 +287,8 @@ pub struct Args<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct KwArgValue<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub value: Expr<'a, T>,
@@ -248,6 +297,8 @@ pub struct KwArgValue<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct ArgDecl<'a, T: AstMetadata> {
     pub name: Ident<'a, T>,
     pub ty: Ident<'a, T>,
@@ -255,6 +306,8 @@ pub struct ArgDecl<'a, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
+#[serde(bound(serialize = "", deserialize = "'de: 'a"))]
 pub struct CastExpr<'a, T: AstMetadata> {
     pub value: Expr<'a, T>,
     pub ty: Ident<'a, T>,
@@ -302,29 +355,29 @@ impl<'a, T: AstMetadata> Expr<'a, T> {
 }
 
 pub trait AstMetadata {
-    type Ident: Debug + Clone;
-    type VarExpr: Debug + Clone;
-    type EnumDecl: Debug + Clone;
-    type StructDecl: Debug + Clone;
-    type StructField: Debug + Clone;
-    type CellDecl: Debug + Clone;
-    type FnDecl: Debug + Clone;
-    type ConstantDecl: Debug + Clone;
-    type LetBinding: Debug + Clone;
-    type IfExpr: Debug + Clone;
-    type BinOpExpr: Debug + Clone;
-    type UnaryOpExpr: Debug + Clone;
-    type ComparisonExpr: Debug + Clone;
-    type FieldAccessExpr: Debug + Clone;
-    type EnumValue: Debug + Clone;
-    type CallExpr: Debug + Clone;
-    type EmitExpr: Debug + Clone;
-    type Args: Debug + Clone;
-    type KwArgValue: Debug + Clone;
-    type ArgDecl: Debug + Clone;
-    type Scope: Debug + Clone;
-    type Typ: Debug + Clone;
-    type CastExpr: Debug + Clone;
+    type Ident: Debug + Clone + Serialize + DeserializeOwned;
+    type VarExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type EnumDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type StructDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type StructField: Debug + Clone + Serialize + DeserializeOwned;
+    type CellDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type FnDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type ConstantDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type LetBinding: Debug + Clone + Serialize + DeserializeOwned;
+    type IfExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type EnumValue: Debug + Clone + Serialize + DeserializeOwned;
+    type CallExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type EmitExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type Args: Debug + Clone + Serialize + DeserializeOwned;
+    type KwArgValue: Debug + Clone + Serialize + DeserializeOwned;
+    type ArgDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type Scope: Debug + Clone + Serialize + DeserializeOwned;
+    type Typ: Debug + Clone + Serialize + DeserializeOwned;
+    type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
 }
 
 pub trait AstTransformer<'a> {
@@ -378,8 +431,8 @@ pub trait AstTransformer<'a> {
         &mut self,
         input: &IfExpr<'a, Self::Input>,
         cond: &Expr<'a, Self::Output>,
-        then: &Expr<'a, Self::Output>,
-        else_: &Expr<'a, Self::Output>,
+        then: &Scope<'a, Self::Output>,
+        else_: &Scope<'a, Self::Output>,
     ) -> <Self::Output as AstMetadata>::IfExpr;
     fn dispatch_bin_op_expr(
         &mut self,
@@ -576,8 +629,8 @@ pub trait AstTransformer<'a> {
             .as_ref()
             .map(|ident| self.transform_ident(ident));
         let cond = self.transform_expr(&input.cond);
-        let then = self.transform_expr(&input.then);
-        let else_ = self.transform_expr(&input.else_);
+        let then = self.transform_scope(&input.then);
+        let else_ = self.transform_scope(&input.else_);
         let metadata = self.dispatch_if_expr(input, &cond, &then, &else_);
         IfExpr {
             scope_annotation,

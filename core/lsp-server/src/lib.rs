@@ -1,6 +1,11 @@
+pub mod document;
+pub mod import;
 pub mod rpc;
 
 use std::{
+    cmp::Reverse,
+    collections::HashMap,
+    ffi::OsString,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -22,16 +27,40 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use crate::{
+    document::{Document, DocumentChange, DocumentMap},
+    import::ScopeAnnotationPass,
+};
+
+// TODO: finer-grained synchronization?
+// TODO: Verify synchronization between GUI and editor files when appropriate.
+#[derive(Debug, Clone, Default)]
+pub struct StateMut {
+    gui_client: Option<LspToGuiClient>,
+    gui_files: DocumentMap,
+    editor_files: DocumentMap,
+}
+
 #[derive(Debug, Clone)]
-pub struct SharedState {
+pub struct State {
     server_addr: SocketAddr,
     editor_client: Client,
-    gui_client: Arc<Mutex<Option<LspToGuiClient>>>,
+    state_mut: Arc<Mutex<StateMut>>,
+}
+
+impl State {
+    fn new(server_addr: SocketAddr, editor_client: Client) -> Self {
+        Self {
+            server_addr,
+            editor_client,
+            state_mut: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 struct Backend {
-    state: SharedState,
+    state: State,
 }
 
 #[tower_lsp::async_trait]
@@ -42,6 +71,7 @@ impl LanguageServer for Backend {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
+                        change: Some(TextDocumentSyncKind::INCREMENTAL),
                         ..Default::default()
                     },
                 )),
@@ -58,7 +88,36 @@ impl LanguageServer for Backend {
             .await;
     }
 
-    async fn did_open(&self, _params: DidOpenTextDocumentParams) {}
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let mut state_mut = self.state.state_mut.lock().await;
+        let doc = Document::new(params.text_document.text, params.text_document.version);
+        state_mut.editor_files.insert(params.text_document.uri, doc);
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let mut state_mut = self.state.state_mut.lock().await;
+        if let Some(doc) = state_mut.editor_files.get_mut(&params.text_document.uri) {
+            // apply each change
+            doc.apply_changes(
+                params
+                    .content_changes
+                    .into_iter()
+                    .map(|change| DocumentChange {
+                        range: change.range,
+                        patch: change.text,
+                    })
+                    .collect(),
+                params.text_document.version,
+            );
+        } else {
+            // optional: log error, or handle missing document
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        let mut state_mut = self.state.state_mut.lock().await;
+        state_mut.editor_files.remove(&params.text_document.uri);
+    }
 
     async fn shutdown(&self) -> Result<()> {
         Ok(())
@@ -74,6 +133,16 @@ struct OpenCellParams {
 #[derive(Serialize, Deserialize)]
 struct SetParams {
     kv: String,
+}
+
+fn make_tmp_file_path(file: impl AsRef<Path>) -> PathBuf {
+    let file = file.as_ref();
+    let mut tmp_file_name = OsString::from(".");
+    tmp_file_name.push(file.file_name().unwrap());
+    tmp_file_name.push(".gui");
+    let mut tmp_file = PathBuf::from(file.parent().unwrap());
+    tmp_file.push(tmp_file_name);
+    tmp_file
 }
 
 impl Backend {
@@ -103,7 +172,85 @@ impl Backend {
         Ok(())
     }
 
-    async fn compile_cell(file: impl AsRef<Path>, cell: impl AsRef<str>) -> CompileOutput {
+    async fn open_file_in_gui(&self, file: impl AsRef<Path>) {
+        let file = file.as_ref();
+        let tmp_file = make_tmp_file_path(file);
+
+        let mut state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(file).unwrap();
+        let mut doc = if let Some(doc) = state_mut.editor_files.get(&url).cloned() {
+            doc
+        } else {
+            // TODO: handle error
+            return;
+        };
+
+        tokio::fs::write(&tmp_file, doc.contents().as_bytes())
+            .await
+            .unwrap();
+
+        let o = Command::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/debug/compiler"
+        ))
+        .arg(tmp_file)
+        .arg("--ast")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .await
+        .unwrap();
+
+        let o = String::from_utf8(o.stdout).unwrap();
+        let ast = serde_json::from_str(&o).unwrap();
+        let scope_annotation = ScopeAnnotationPass::new(&doc, &ast).await;
+        let mut text_edits = scope_annotation.execute();
+        text_edits.sort_by_key(|edit| Reverse(edit.range.start));
+        doc.apply_changes(
+            text_edits
+                .iter()
+                .map(|text_edit| DocumentChange {
+                    range: Some(text_edit.range),
+                    patch: text_edit.new_text.clone(),
+                })
+                .collect(),
+            doc.version() + 1,
+        );
+        state_mut.gui_files.insert(url, doc);
+
+        self.state
+            .editor_client
+            .apply_edit(WorkspaceEdit {
+                changes: Some(HashMap::from_iter([(
+                    Url::from_file_path(file).unwrap(),
+                    text_edits,
+                )])),
+                document_changes: None,
+                change_annotations: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Compiles an **open** GUI cell.
+    async fn compile_gui_cell(
+        &self,
+        file: impl AsRef<Path>,
+        cell: impl AsRef<str>,
+    ) -> CompileOutput {
+        let file = file.as_ref();
+        let tmp_file = make_tmp_file_path(file);
+
+        let state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(file).unwrap();
+        let doc = &state_mut.gui_files[&url];
+        tokio::fs::write(&tmp_file, doc.contents().as_bytes())
+            .await
+            .unwrap();
+
         // TODO: un-hardcode this.
         let lyp = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -113,8 +260,10 @@ impl Backend {
             env!("CARGO_MANIFEST_DIR"),
             "/../../target/debug/compiler"
         ))
-        .arg(file.as_ref())
+        .arg(tmp_file)
+        .arg("-c")
         .arg(cell.as_ref())
+        .arg("-l")
         .arg(lyp)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -137,9 +286,11 @@ impl Backend {
                 &format!("file {:?}, cell {}", params.file, params.cell),
             )
             .await;
+        let self_clone = self.clone();
         tokio::spawn(async move {
-            let o = Backend::compile_cell(&params.file, params.cell).await;
-            if let Some(client) = state.gui_client.lock().await.as_mut() {
+            self_clone.open_file_in_gui(&params.file).await;
+            let o = self_clone.compile_gui_cell(&params.file, params.cell).await;
+            if let Some(client) = state.state_mut.lock().await.gui_client.as_mut() {
                 client
                     .open_cell(context::current(), params.file, o)
                     .await
@@ -160,7 +311,7 @@ impl Backend {
         let (k, v) = params.kv.split_once(" ").unwrap();
         let (k, v) = (k.to_string(), v.to_string());
         tokio::spawn(async move {
-            if let Some(client) = state.gui_client.lock().await.as_mut() {
+            if let Some(client) = state.state_mut.lock().await.gui_client.as_mut() {
                 client.set(context::current(), k, v).await.unwrap();
             }
         });
@@ -192,11 +343,7 @@ pub async fn main() {
 
     let mut ext_state = None;
     let (service, socket) = LspService::build(|client| {
-        let state = SharedState {
-            server_addr,
-            editor_client: client,
-            gui_client: Arc::new(Mutex::new(None)),
-        };
+        let state = State::new(server_addr, client);
         ext_state = Some(state.clone());
         Backend { state }
     })

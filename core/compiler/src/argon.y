@@ -237,8 +237,8 @@ Expr -> Result<Expr<'input, ParseMetadata>, ()>
   ;
 
 BlockExpr -> Result<Expr<'input, ParseMetadata>, ()>
-  : 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: None, cond: $2?, then: Expr::Scope(Box::new($3?)), else_: Expr::Scope(Box::new($5?)), span: $span, metadata: (), }))) }
-  | ScopeAnnotation 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: Some($1?), cond: $3?, then: Expr::Scope(Box::new($4?)), else_: Expr::Scope(Box::new($6?)), span: $span, metadata: (), }))) }
+  : 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: None, cond: $2?, then: $3?, else_: $5?, span: $span, metadata: (), }))) }
+  | ScopeAnnotation 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: Some($1?), cond: $3?, then: $4?, else_: $6?, span: $span, metadata: (), }))) }
   | Scope { Ok(Expr::Scope(Box::new($1?))) }
   ;
 

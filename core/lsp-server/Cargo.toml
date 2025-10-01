@@ -20,3 +20,4 @@ itertools = "0.14"
 tarpc = { version = "0.37", features = ["full"] }
 env_logger = "0.11"
 log = "0.4.27"
+lsp-document = "0.6"

@@ -233,7 +233,10 @@ impl Element for CanvasElement {
         let mut select_rects = Vec::new();
         if let Some(solved_cell) = solved_cell {
             let mut queue = VecDeque::from_iter([(
-                solved_cell.selected_scope,
+                ScopeAddress {
+                    cell: solved_cell.selected_scope.cell,
+                    scope: solved_cell.output.cells[&solved_cell.selected_scope.cell].root,
+                },
                 TransformationMatrix::identity(),
                 (0., 0.),
                 0,
@@ -273,7 +276,8 @@ impl Element for CanvasElement {
                     }
                     show = false;
                 }
-                for (i, value) in scope_info.elts.iter().enumerate() {
+                for (i, (obj, emit)) in scope_info.emit.iter().enumerate() {
+                    let value = &cell_info.objects[obj];
                     match value {
                         SolvedValue::Rect(rect) => {
                             if show {
@@ -352,9 +356,10 @@ impl Element for CanvasElement {
             if let Some(selected_rect) = selected_rect {
                 let r = match selected_rect {
                     RectId::Scope(id) => solved_cell.state[&id].bbox.clone().map(|r| r.into()),
-                    RectId::Element(id) => match &solved_cell.output.cells[&id.scope.cell].scopes
-                        [&id.scope.scope]
-                        .elts[id.idx]
+                    RectId::Element(id) => match &solved_cell.output.cells[&id.scope.cell].objects
+                        [&solved_cell.output.cells[&id.scope.cell].scopes[&id.scope.scope].emit
+                            [id.idx]
+                            .0]
                     {
                         SolvedValue::Rect(r) => Some(r.clone().into()),
                         SolvedValue::Instance(inst) => {
@@ -540,28 +545,7 @@ impl LayoutCanvas {
                         if let Some(cell) = cell.as_mut() {
                             // TODO update in memory representation of code
                             // TODO add solver to gui
-                            let mut solver = Solver::new();
-                            cell.output
-                                .cells
-                                .get_mut(&cell.selected_scope.cell)
-                                .unwrap()
-                                .scopes
-                                .get_mut(&cell.selected_scope.scope)
-                                .unwrap()
-                                .elts
-                                .push(SolvedValue::Rect(compile::Rect {
-                                    layer: state
-                                        .layers
-                                        .read(cx)
-                                        .selected_layer
-                                        .clone()
-                                        .map(|s| s.to_string()),
-                                    x0: (p0p.x as f64, solver.new_var()),
-                                    y0: (p0p.y as f64, solver.new_var()),
-                                    x1: (p1p.x as f64, solver.new_var()),
-                                    y1: (p1p.y as f64, solver.new_var()),
-                                    source: None,
-                                }))
+                            todo!()
                         }
                     });
                 });
@@ -603,13 +587,13 @@ impl LayoutCanvas {
                             cell.selected_rect = r.id;
                             let args = r.id.and_then(|id| match id {
                                 RectId::Element(id) => {
-                                    match &cell.output.cells[&id.scope.cell].scopes[&id.scope.scope]
-                                        .elts[id.idx]
-                                    {
-                                        SolvedValue::Rect(r) => r
-                                            .source
-                                            .as_ref()
-                                            .map(|source| (cell.file.clone(), source.span)),
+                                    let ccell = &cell.output.cells[&id.scope.cell];
+                                    let (obj, emit) = &ccell.scopes[&id.scope.scope].emit[id.idx];
+
+                                    match &ccell.objects[obj] {
+                                        SolvedValue::Rect(r) => {
+                                            Some((cell.file.clone(), emit.span))
+                                        }
                                         _ => None,
                                     }
                                 }

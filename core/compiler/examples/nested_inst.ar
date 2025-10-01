@@ -30,9 +30,7 @@ cell top() {
     eq(right.x, 300.);
     eq(right.y, 0.);
   }
-  #scope1
-  if 1 > 2 { } else { }
+  #scope1 if 1 > 2 { } else { }
   let met3 = rect("met3", x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.)!;
   let duplicate_rect = left.bot.met3!;
 }
-
