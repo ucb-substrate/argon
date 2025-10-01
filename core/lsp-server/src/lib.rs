@@ -28,9 +28,9 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
+use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tower_lsp::{jsonrpc::Result, lsp_types::notification::DidSaveTextDocument};
 
 use crate::{
     document::{Document, DocumentChange, GuiDocument},
@@ -160,7 +160,8 @@ impl LanguageServer for Backend {
                 file: params.text_document.uri.to_file_path().unwrap(),
                 cell: doc.cell.clone(),
             })
-            .await;
+            .await
+            .unwrap();
         }
     }
 

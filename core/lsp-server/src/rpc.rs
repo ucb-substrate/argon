@@ -1,12 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
-use arcstr::ArcStr;
 use cfgrammar::Span;
-use compiler::{
-    ast::annotated::AnnotatedAst,
-    compile::{CompileOutput, Rect},
-    parse,
-};
+use compiler::compile::{CompileOutput, Rect};
 
 use tarpc::{context, tokio_serde::formats::Json};
 use tower_lsp::lsp_types::{

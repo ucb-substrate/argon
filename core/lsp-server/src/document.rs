@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    ops::{Deref, DerefMut},
-};
+use std::ops::{Deref, DerefMut};
 
 use arcstr::ArcStr;
 use compiler::{
@@ -9,7 +6,7 @@ use compiler::{
     parse::{self, ParseMetadata},
 };
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
-use tower_lsp::lsp_types::{Position, Range, Url};
+use tower_lsp::lsp_types::{Position, Range};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Document {
