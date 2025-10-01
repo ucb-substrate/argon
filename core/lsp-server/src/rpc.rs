@@ -8,7 +8,7 @@ use compiler::{
     parse,
 };
 
-use tarpc::tokio_serde::formats::Json;
+use tarpc::{context, tokio_serde::formats::Json};
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, TextEdit, Url, WorkspaceEdit,
 };
@@ -79,25 +79,10 @@ impl GuiToLsp for LspServer {
         var_name: String,
         rect: Rect<f64>,
     ) {
-        if let Some(doc) = self
-            .state
-            .state_mut
-            .lock()
-            .await
-            .gui_files
-            .get_mut(&Url::from_file_path(&file).unwrap())
-            && let Some(ast) = &doc.ast
-            && let Some(scope) = {
-                self.state
-                    .editor_client
-                    .log_message(MessageType::WARNING, format!("{:?}", ast.span2scope.keys()))
-                    .await;
-                self.state
-                    .editor_client
-                    .log_message(MessageType::WARNING, format!("{:?}", scope_span))
-                    .await;
-                ast.span2scope.get(&scope_span)
-            }
+        let mut state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(&file).unwrap();
+        if let Some(doc) = state_mut.gui_files.get(&url)
+            && let Some(scope) = doc.ast.span2scope.get(&scope_span)
         {
             let edit = if let Some(tail) = &scope.tail {
                 let start = doc.offset_to_pos(tail.span().start());
@@ -143,28 +128,46 @@ impl GuiToLsp for LspServer {
                     ),
                 }
             };
-            doc.apply_changes(
+
+            if let Some(file) = state_mut.editor_files.get(&url)
+                && file.contents() != doc.contents()
+            {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        "Editor buffer state is inconsistent with GUI state.",
+                    )
+                    .await;
+                return;
+            }
+            let version = doc.version() + 1;
+            let cell = doc.cell.clone();
+            state_mut.gui_files.get_mut(&url).unwrap().apply_changes(
                 vec![DocumentChange {
                     range: Some(edit.range),
                     patch: edit.new_text.clone(),
                 }],
-                doc.version() + 1,
+                version,
             );
-            let ast = parse::parse(doc.contents()).unwrap();
-            doc.ast = Some(AnnotatedAst::new(ArcStr::from(doc.contents()), &ast));
 
             self.state
                 .editor_client
                 .apply_edit(WorkspaceEdit {
-                    changes: Some(HashMap::from_iter([(
-                        Url::from_file_path(file).unwrap(),
-                        vec![edit],
-                    )])),
+                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
                     document_changes: None,
                     change_annotations: None,
                 })
                 .await
                 .unwrap();
+
+            let o = state_mut.compile_gui_cell(&file, &cell);
+            if let Some(gui_client) = &mut state_mut.gui_client {
+                gui_client
+                    .open_cell(context::current(), file, o)
+                    .await
+                    .unwrap();
+            }
         }
     }
 }

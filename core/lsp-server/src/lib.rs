@@ -28,12 +28,12 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
-use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp::{jsonrpc::Result, lsp_types::notification::DidSaveTextDocument};
 
 use crate::{
-    document::{Document, DocumentChange, DocumentMap},
+    document::{Document, DocumentChange, GuiDocument},
     import::ScopeAnnotationPass,
 };
 
@@ -42,8 +42,41 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct StateMut {
     gui_client: Option<LspToGuiClient>,
-    gui_files: DocumentMap,
-    editor_files: DocumentMap,
+    gui_files: HashMap<Url, GuiDocument>,
+    editor_files: HashMap<Url, Document>,
+}
+
+impl StateMut {
+    fn compile_gui_cell(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) -> CompileOutput {
+        let file = file.as_ref();
+        let url = Url::from_file_path(file).unwrap();
+        let doc = &self.gui_files[&url];
+
+        // TODO: un-hardcode this.
+        let lyp = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../core/compiler/examples/lyp/basic.lyp"
+        );
+        let cell_ast = parse::parse_cell(cell.as_ref()).unwrap();
+        let ast = parse::parse(doc.contents()).unwrap();
+        compile::compile(
+            &ast,
+            CompileInput {
+                cell: cell_ast.func.name,
+                params: cell_ast
+                    .args
+                    .posargs
+                    .iter()
+                    .map(|arg| match arg {
+                        Expr::FloatLiteral(float_literal) => float_literal.value,
+                        Expr::IntLiteral(int_literal) => int_literal.value as f64,
+                        _ => panic!("must be int or float literal for now"),
+                    })
+                    .collect(),
+                lyp_file: &PathBuf::from(lyp),
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +110,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncOptions {
                         open_close: Some(true),
                         change: Some(TextDocumentSyncKind::INCREMENTAL),
+                        save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..Default::default()
                     },
                 )),
@@ -116,6 +150,17 @@ impl LanguageServer for Backend {
             );
         } else {
             // optional: log error, or handle missing document
+        }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        let state_mut = self.state.state_mut.lock().await;
+        if let Some(doc) = state_mut.gui_files.get(&params.text_document.uri) {
+            self.open_cell(OpenCellParams {
+                file: params.text_document.uri.to_file_path().unwrap(),
+                cell: doc.cell.clone(),
+            })
+            .await;
         }
     }
 
@@ -178,7 +223,7 @@ impl Backend {
         Ok(())
     }
 
-    async fn open_file_in_gui(&self, file: impl AsRef<Path>) {
+    async fn open_file_in_gui(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) {
         let file = file.as_ref();
         let mut state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(file).unwrap();
@@ -204,8 +249,15 @@ impl Backend {
             doc.version() + 1,
         );
         let ast = parse::parse(doc.contents()).unwrap();
-        doc.ast = Some(AnnotatedAst::new(ArcStr::from(doc.contents()), &ast));
-        state_mut.gui_files.insert(url, doc);
+        let ast = AnnotatedAst::new(ArcStr::from(doc.contents()), &ast);
+        state_mut.gui_files.insert(
+            url,
+            GuiDocument {
+                doc,
+                ast,
+                cell: cell.as_ref().to_string(),
+            },
+        );
 
         self.state
             .editor_client
@@ -227,36 +279,8 @@ impl Backend {
         file: impl AsRef<Path>,
         cell: impl AsRef<str>,
     ) -> CompileOutput {
-        let file = file.as_ref();
-
         let state_mut = self.state.state_mut.lock().await;
-        let url = Url::from_file_path(file).unwrap();
-        let doc = &state_mut.gui_files[&url];
-
-        // TODO: un-hardcode this.
-        let lyp = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../core/compiler/examples/lyp/basic.lyp"
-        );
-        let cell_ast = parse::parse_cell(cell.as_ref()).unwrap();
-        let ast = parse::parse(doc.contents()).unwrap();
-        compile::compile(
-            &ast,
-            CompileInput {
-                cell: cell_ast.func.name,
-                params: cell_ast
-                    .args
-                    .posargs
-                    .iter()
-                    .map(|arg| match arg {
-                        Expr::FloatLiteral(float_literal) => float_literal.value,
-                        Expr::IntLiteral(int_literal) => int_literal.value as f64,
-                        _ => panic!("must be int or float literal for now"),
-                    })
-                    .collect(),
-                lyp_file: &PathBuf::from(lyp),
-            },
-        )
+        state_mut.compile_gui_cell(file, cell)
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
@@ -270,7 +294,9 @@ impl Backend {
             .await;
         let self_clone = self.clone();
         tokio::spawn(async move {
-            self_clone.open_file_in_gui(&params.file).await;
+            self_clone
+                .open_file_in_gui(&params.file, &params.cell)
+                .await;
             let o = self_clone.compile_gui_cell(&params.file, params.cell).await;
             if let Some(client) = state.state_mut.lock().await.gui_client.as_mut() {
                 client

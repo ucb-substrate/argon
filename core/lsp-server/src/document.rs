@@ -1,6 +1,13 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    ops::{Deref, DerefMut},
+};
 
-use compiler::{ast::annotated::AnnotatedAst, parse::ParseMetadata};
+use arcstr::ArcStr;
+use compiler::{
+    ast::annotated::AnnotatedAst,
+    parse::{self, ParseMetadata},
+};
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
 use tower_lsp::lsp_types::{Position, Range, Url};
 
@@ -8,7 +15,27 @@ use tower_lsp::lsp_types::{Position, Range, Url};
 pub(crate) struct Document {
     contents: IndexedText<String>,
     version: i32,
-    pub(crate) ast: Option<AnnotatedAst<ParseMetadata>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GuiDocument {
+    pub(crate) doc: Document,
+    pub(crate) ast: AnnotatedAst<ParseMetadata>,
+    pub(crate) cell: String,
+}
+
+impl Deref for GuiDocument {
+    type Target = Document;
+
+    fn deref(&self) -> &Self::Target {
+        &self.doc
+    }
+}
+
+impl DerefMut for GuiDocument {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.doc
+    }
 }
 
 pub(crate) struct DocumentChange {
@@ -32,7 +59,6 @@ impl Document {
         Self {
             contents: IndexedText::new(contents.into()),
             version,
-            ast: None,
         }
     }
 
@@ -73,4 +99,14 @@ impl Document {
     }
 }
 
-pub(crate) type DocumentMap = HashMap<Url, Document>;
+impl GuiDocument {
+    pub(crate) fn apply_changes(&mut self, changes: Vec<DocumentChange>, version: i32) {
+        if version > self.version() {
+            self.doc.apply_changes(changes, version);
+            self.ast = AnnotatedAst::new(
+                ArcStr::from(self.contents()),
+                &parse::parse(self.contents()).unwrap(),
+            );
+        }
+    }
+}
