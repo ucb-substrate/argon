@@ -12,7 +12,7 @@ lrlex_mod!("cell.l");
 lrpar_mod!("cell.y");
 
 pub struct ParseMetadata;
-pub type ParseAst<'a> = Ast<'a, ParseMetadata>;
+pub type ParseAst<'a> = Ast<&'a str, ParseMetadata>;
 
 impl AstMetadata for ParseMetadata {
     type Ident = ();
@@ -40,7 +40,7 @@ impl AstMetadata for ParseMetadata {
     type CastExpr = ();
 }
 
-pub fn parse(input: &str) -> Result<Ast<'_, ParseMetadata>, anyhow::Error> {
+pub fn parse(input: &str) -> Result<ParseAst<'_>, anyhow::Error> {
     // Get the `LexerDef` for the `argon` language.
     let lexerdef = argon_l::lexerdef();
     // Now we create a lexer with the `lexer` method with which
@@ -62,7 +62,7 @@ pub fn parse(input: &str) -> Result<Ast<'_, ParseMetadata>, anyhow::Error> {
     }
 }
 
-pub fn parse_cell(input: &str) -> Result<CallExpr<'_, ParseMetadata>, anyhow::Error> {
+pub fn parse_cell(input: &str) -> Result<CallExpr<&'_ str, ParseMetadata>, anyhow::Error> {
     // Get the `LexerDef` for the `argon` language.
     let lexerdef = cell_l::lexerdef();
     // Now we create a lexer with the `lexer` method with which

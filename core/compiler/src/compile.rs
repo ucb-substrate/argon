@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope, UnaryOp};
 use crate::layer::LayerProperties;
+use crate::parse::ParseAst;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -23,7 +24,7 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-pub fn compile(ast: &Ast<'_, ParseMetadata>, input: CompileInput<'_>) -> CompileOutput {
+pub fn compile(ast: &ParseAst<'_>, input: CompileInput<'_>) -> CompileOutput {
     let pass = VarIdTyPass::new(ast);
     let (ast, errors) = pass.execute();
     if !errors.is_empty() {
@@ -68,7 +69,7 @@ pub(crate) struct VarIdTyFrame<'a> {
 }
 
 pub(crate) struct VarIdTyPass<'a> {
-    ast: &'a Ast<'a, ParseMetadata>,
+    ast: &'a ParseAst<'a>,
     next_id: VarId,
     bindings: Vec<VarIdTyFrame<'a>>,
     errors: Vec<StaticError>,
@@ -149,7 +150,7 @@ impl AstMetadata for VarIdTyMetadata {
 }
 
 impl<'a> VarIdTyPass<'a> {
-    pub(crate) fn new(ast: &'a Ast<'a, ParseMetadata>) -> Self {
+    pub(crate) fn new(ast: &'a ParseAst<'a>) -> Self {
         Self {
             ast,
             // allocate space for the global namespace
@@ -179,7 +180,7 @@ impl<'a> VarIdTyPass<'a> {
         id
     }
 
-    pub(crate) fn execute(mut self) -> (Ast<'a, VarIdTyMetadata>, Vec<StaticError>) {
+    pub(crate) fn execute(mut self) -> (Ast<&'a str, VarIdTyMetadata>, Vec<StaticError>) {
         let mut decls = Vec::new();
         for decl in &self.ast.decls {
             if let Decl::Fn(f) = decl {
@@ -207,7 +208,7 @@ impl<'a> VarIdTyPass<'a> {
         )
     }
 
-    fn declare_fn_decl(&mut self, input: &FnDecl<'a, ParseMetadata>) {
+    fn declare_fn_decl(&mut self, input: &FnDecl<&'a str, ParseMetadata>) {
         if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
             self.errors.push(StaticError {
                 span: input.name.span,
@@ -232,7 +233,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 }
 
-impl<'a> Expr<'a, VarIdTyMetadata> {
+impl<S> Expr<S, VarIdTyMetadata> {
     fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
@@ -253,40 +254,42 @@ impl<'a> Expr<'a, VarIdTyMetadata> {
     }
 }
 
-impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
-    type Input = ParseMetadata;
-    type Output = VarIdTyMetadata;
+impl<'a> AstTransformer for VarIdTyPass<'a> {
+    type InputMetadata = ParseMetadata;
+    type OutputMetadata = VarIdTyMetadata;
+    type InputS = &'a str;
+    type OutputS = &'a str;
 
     fn dispatch_ident(
         &mut self,
-        _input: &Ident<'a, Self::Input>,
-    ) -> <Self::Output as AstMetadata>::Ident {
+        _input: &Ident<&'a str, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
     fn dispatch_var_expr(
         &mut self,
-        input: &crate::ast::VarExpr<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::VarExpr {
+        input: &crate::ast::VarExpr<&'a str, Self::InputMetadata>,
+        _name: &Ident<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
         self.lookup(input.name.name)
             .expect("used variable before declaration")
     }
 
     fn dispatch_enum_decl(
         &mut self,
-        _input: &crate::ast::EnumDecl<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
-        _variants: &[Ident<'a, Self::Output>],
-    ) -> <Self::Output as AstMetadata>::EnumDecl {
+        _input: &crate::ast::EnumDecl<&'a str, Self::InputMetadata>,
+        _name: &Ident<&'a str, Self::OutputMetadata>,
+        _variants: &[Ident<&'a str, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
     }
 
     fn dispatch_cell_decl(
         &mut self,
-        _input: &CellDecl<'a, Self::Input>,
-        name: &Ident<'a, Self::Output>,
-        _args: &[ArgDecl<'a, Self::Output>],
-        _scope: &Scope<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::CellDecl {
+        _input: &CellDecl<&'a str, Self::InputMetadata>,
+        name: &Ident<&'a str, Self::OutputMetadata>,
+        _args: &[ArgDecl<&'a str, Self::OutputMetadata>],
+        _scope: &Scope<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
         // TODO: Argument checks
         // UNUSED
         self.lookup(name.name).unwrap().0
@@ -294,17 +297,20 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_fn_decl(
         &mut self,
-        _input: &FnDecl<'a, Self::Input>,
-        name: &Ident<'a, Self::Output>,
-        _args: &[ArgDecl<'a, Self::Output>],
-        _return_ty: &Option<Ident<'a, Self::Output>>,
-        _scope: &Scope<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::FnDecl {
+        _input: &FnDecl<&'a str, Self::InputMetadata>,
+        name: &Ident<&'a str, Self::OutputMetadata>,
+        _args: &[ArgDecl<&'a str, Self::OutputMetadata>],
+        _return_ty: &Option<Ident<&'a str, Self::OutputMetadata>>,
+        _scope: &Scope<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
         // UNUSED
         self.lookup(name.name).unwrap().0
     }
 
-    fn transform_fn_decl(&mut self, input: &FnDecl<'a, Self::Input>) -> FnDecl<'a, Self::Output> {
+    fn transform_fn_decl(
+        &mut self,
+        input: &FnDecl<&'a str, Self::InputMetadata>,
+    ) -> FnDecl<&'a str, Self::OutputMetadata> {
         let (varid, _) = self.lookup(input.name.name).unwrap();
         let args: Vec<_> = input
             .args
@@ -329,8 +335,8 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn transform_cell_decl(
         &mut self,
-        input: &CellDecl<'a, Self::Input>,
-    ) -> CellDecl<'a, Self::Output> {
+        input: &CellDecl<&'a str, Self::InputMetadata>,
+    ) -> CellDecl<&'a str, Self::OutputMetadata> {
         if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
             self.errors.push(StaticError {
                 span: input.name.span,
@@ -382,20 +388,20 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_constant_decl(
         &mut self,
-        _input: &ConstantDecl<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
-        _ty: &Ident<'a, Self::Output>,
-        _value: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::ConstantDecl {
+        _input: &ConstantDecl<&'a str, Self::InputMetadata>,
+        _name: &Ident<&'a str, Self::OutputMetadata>,
+        _ty: &Ident<&'a str, Self::OutputMetadata>,
+        _value: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ConstantDecl {
     }
 
     fn dispatch_if_expr(
         &mut self,
-        input: &IfExpr<'a, Self::Input>,
-        cond: &Expr<'a, Self::Output>,
-        then: &Scope<'a, Self::Output>,
-        else_: &Scope<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::IfExpr {
+        input: &IfExpr<&'a str, Self::InputMetadata>,
+        cond: &Expr<&'a str, Self::OutputMetadata>,
+        then: &Scope<&'a str, Self::OutputMetadata>,
+        else_: &Scope<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         if let Some(scope_annotation) = &input.scope_annotation {
             let bindings = self.bindings.last_mut().unwrap();
             if bindings.scope_bindings.contains(scope_annotation.name) {
@@ -427,10 +433,10 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_bin_op_expr(
         &mut self,
-        input: &BinOpExpr<'a, Self::Input>,
-        left: &Expr<'a, Self::Output>,
-        right: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::BinOpExpr {
+        input: &BinOpExpr<&'a str, Self::InputMetadata>,
+        left: &Expr<&'a str, Self::OutputMetadata>,
+        right: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
         if left_ty != right_ty {
@@ -456,9 +462,9 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_unary_op_expr(
         &mut self,
-        input: &crate::ast::UnaryOpExpr<'a, Self::Input>,
-        operand: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::UnaryOpExpr {
+        input: &crate::ast::UnaryOpExpr<&'a str, Self::InputMetadata>,
+        operand: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
                 if operand.ty() != Ty::Bool {
@@ -484,10 +490,10 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_comparison_expr(
         &mut self,
-        input: &ComparisonExpr<'a, Self::Input>,
-        left: &Expr<'a, Self::Output>,
-        right: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::ComparisonExpr {
+        input: &ComparisonExpr<&'a str, Self::InputMetadata>,
+        left: &Expr<&'a str, Self::OutputMetadata>,
+        right: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
         if left_ty != right_ty {
@@ -501,10 +507,10 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_field_access_expr(
         &mut self,
-        _input: &crate::ast::FieldAccessExpr<'a, Self::Input>,
-        base: &Expr<'a, Self::Output>,
-        field: &Ident<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::FieldAccessExpr {
+        _input: &crate::ast::FieldAccessExpr<&'a str, Self::InputMetadata>,
+        base: &Expr<&'a str, Self::OutputMetadata>,
+        field: &Ident<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
         let base_ty = base.ty();
         match base_ty {
             Ty::Rect => match field.name {
@@ -526,18 +532,18 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_enum_value(
         &mut self,
-        _input: &EnumValue<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
-        _variant: &Ident<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::EnumValue {
+        _input: &EnumValue<&'a str, Self::InputMetadata>,
+        _name: &Ident<&'a str, Self::OutputMetadata>,
+        _variant: &Ident<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
     }
 
     fn dispatch_call_expr(
         &mut self,
-        _input: &crate::ast::CallExpr<'a, Self::Input>,
-        func: &Ident<'a, Self::Output>,
-        args: &crate::ast::Args<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::CallExpr {
+        _input: &crate::ast::CallExpr<&'a str, Self::InputMetadata>,
+        func: &Ident<&'a str, Self::OutputMetadata>,
+        args: &crate::ast::Args<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         match func.name {
             "crect" | "rect" => {
                 if func.name == "crect" {
@@ -620,58 +626,58 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn dispatch_emit_expr(
         &mut self,
-        _input: &crate::ast::EmitExpr<'a, Self::Input>,
-        value: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::EmitExpr {
+        _input: &crate::ast::EmitExpr<&'a str, Self::InputMetadata>,
+        value: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
         value.ty()
     }
 
     fn dispatch_args(
         &mut self,
-        _input: &crate::ast::Args<'a, Self::Input>,
-        _posargs: &[Expr<'a, Self::Output>],
-        _kwargs: &[crate::ast::KwArgValue<'a, Self::Output>],
-    ) -> <Self::Output as AstMetadata>::Args {
+        _input: &crate::ast::Args<&'a str, Self::InputMetadata>,
+        _posargs: &[Expr<&'a str, Self::OutputMetadata>],
+        _kwargs: &[crate::ast::KwArgValue<&'a str, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::Args {
     }
 
     fn dispatch_cast(
         &mut self,
-        _input: &crate::ast::CastExpr<'a, Self::Input>,
-        _value: &Expr<'a, Self::Output>,
-        ty: &Ident<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::CastExpr {
+        _input: &crate::ast::CastExpr<&'a str, Self::InputMetadata>,
+        _value: &Expr<&'a str, Self::OutputMetadata>,
+        ty: &Ident<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
         Ty::from_name(ty.name)
     }
 
     fn dispatch_kw_arg_value(
         &mut self,
-        _input: &crate::ast::KwArgValue<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
-        value: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::KwArgValue {
+        _input: &crate::ast::KwArgValue<&'a str, Self::InputMetadata>,
+        _name: &Ident<&'a str, Self::OutputMetadata>,
+        value: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::KwArgValue {
         value.ty()
     }
 
     fn dispatch_arg_decl(
         &mut self,
-        input: &ArgDecl<'a, Self::Input>,
-        _name: &Ident<'a, Self::Output>,
-        _ty: &Ident<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::ArgDecl {
+        input: &ArgDecl<&'a str, Self::InputMetadata>,
+        _name: &Ident<&'a str, Self::OutputMetadata>,
+        _ty: &Ident<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         let ty = Ty::from_name(input.ty.name);
         (self.alloc(input.name.name, ty.clone()), ty)
     }
 
     fn dispatch_scope(
         &mut self,
-        _input: &Scope<'a, Self::Input>,
-        _stmts: &[Statement<'a, Self::Output>],
-        tail: &Option<Expr<'a, Self::Output>>,
-    ) -> <Self::Output as AstMetadata>::Scope {
+        _input: &Scope<&'a str, Self::InputMetadata>,
+        _stmts: &[Statement<&'a str, Self::OutputMetadata>],
+        tail: &Option<Expr<&'a str, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::Scope {
         tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
-    fn enter_scope(&mut self, input: &crate::ast::Scope<'a, Self::Input>) {
+    fn enter_scope(&mut self, input: &crate::ast::Scope<&'a str, Self::InputMetadata>) {
         if let Some(scope_annotation) = &input.scope_annotation {
             let bindings = self.bindings.last_mut().unwrap();
             if bindings.scope_bindings.contains(scope_annotation.name) {
@@ -687,19 +693,23 @@ impl<'a> AstTransformer<'a> for VarIdTyPass<'a> {
 
     fn exit_scope(
         &mut self,
-        _input: &crate::ast::Scope<'a, Self::Input>,
-        _output: &crate::ast::Scope<'a, Self::Output>,
+        _input: &crate::ast::Scope<&'a str, Self::InputMetadata>,
+        _output: &crate::ast::Scope<&'a str, Self::OutputMetadata>,
     ) {
         self.bindings.pop();
     }
 
     fn dispatch_let_binding(
         &mut self,
-        _input: &LetBinding<'a, Self::Input>,
-        name: &Ident<'a, Self::Output>,
-        value: &Expr<'a, Self::Output>,
-    ) -> <Self::Output as AstMetadata>::LetBinding {
+        _input: &LetBinding<&'a str, Self::InputMetadata>,
+        name: &Ident<&'a str, Self::OutputMetadata>,
+        value: &Expr<&'a str, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
         self.alloc(name.name, value.ty())
+    }
+
+    fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
+        *s
     }
 }
 
@@ -769,7 +779,7 @@ struct CellState {
 }
 
 struct ExecPass<'a> {
-    ast: &'a Ast<'a, VarIdTyMetadata>,
+    ast: &'a Ast<&'a str, VarIdTyMetadata>,
     cell_states: HashMap<CellId, CellState>,
     values: HashMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
     frames: HashMap<FrameId, Frame>,
@@ -792,7 +802,7 @@ enum ExecScopeName {
 }
 
 impl<'a> ExecPass<'a> {
-    pub(crate) fn new(ast: &'a Ast<'a, VarIdTyMetadata>) -> Self {
+    pub(crate) fn new(ast: &'a Ast<&'a str, VarIdTyMetadata>) -> Self {
         Self {
             ast,
             cell_states: HashMap::new(),
@@ -863,7 +873,7 @@ impl<'a> ExecPass<'a> {
         self.frames.insert(fid, frame);
 
         let root_scope = ExecScope {
-            span: cell_decl.span,
+            span: cell_decl.scope.span,
             name: format!("cell {cell}"),
             parent: None,
         };
@@ -1154,7 +1164,7 @@ impl<'a> ExecPass<'a> {
         cell: CellId,
         frame: FrameId,
         scope: ScopeId,
-        stmt: &Statement<'a, VarIdTyMetadata>,
+        stmt: &Statement<&'a str, VarIdTyMetadata>,
     ) {
         match stmt {
             Statement::LetBinding(binding) => {
@@ -1199,7 +1209,7 @@ impl<'a> ExecPass<'a> {
         cell_id: CellId,
         frame: FrameId,
         scope: ScopeId,
-        s: &Scope<'a, VarIdTyMetadata>,
+        s: &Scope<&'a str, VarIdTyMetadata>,
     ) -> ValueId {
         for stmt in &s.stmts {
             self.eval_stmt(cell_id, frame, scope, stmt);
@@ -1215,7 +1225,7 @@ impl<'a> ExecPass<'a> {
         cell_id: CellId,
         frame: FrameId,
         scope: ScopeId,
-        expr: &Expr<'a, VarIdTyMetadata>,
+        expr: &Expr<&'a str, VarIdTyMetadata>,
     ) -> ValueId {
         let partial_eval_state = match expr {
             Expr::FloatLiteral(f) => {
@@ -1232,7 +1242,7 @@ impl<'a> ExecPass<'a> {
             Expr::StringLiteral(s) => {
                 let vid = self.value_id();
                 self.values
-                    .insert(vid, Defer::Ready(Value::String(s.value.clone())));
+                    .insert(vid, Defer::Ready(Value::String(s.value.to_string())));
                 return vid;
             }
             Expr::Var(v) => {
@@ -1299,7 +1309,7 @@ impl<'a> ExecPass<'a> {
                                 cell_id,
                                 scope,
                                 ExecScopeName::Specified(format!("fn {}", val.name.name)),
-                                val.span,
+                                val.scope.span,
                             );
                             let fid = self.frame_id();
                             self.frames.insert(fid, call_frame);
@@ -1971,7 +1981,7 @@ pub enum Value<'a> {
     Int(i64),
     Rect(Rect<Var>),
     Bool(bool),
-    Fn(FnDecl<'a, VarIdTyMetadata>),
+    Fn(FnDecl<&'a str, VarIdTyMetadata>),
     /// A cell generator.
     ///
     /// Example:
@@ -1982,7 +1992,7 @@ pub enum Value<'a> {
     /// ```
     ///
     /// `mycell` is a value of type `CellFn`.
-    CellFn(CellDecl<'a, VarIdTyMetadata>),
+    CellFn(CellDecl<&'a str, VarIdTyMetadata>),
     /// A particular parameterization of a cell.
     ///
     /// Example:
@@ -2161,7 +2171,7 @@ struct PartialBinOp {
 
 #[derive(Debug, Clone)]
 struct PartialIfExpr<'a, T: AstMetadata> {
-    expr: IfExpr<'a, T>,
+    expr: IfExpr<&'a str, T>,
     state: IfExprState,
 }
 
@@ -2174,7 +2184,7 @@ pub enum IfExprState {
 
 #[derive(Debug, Clone)]
 struct PartialCallExpr<'a, T: AstMetadata> {
-    expr: CallExpr<'a, T>,
+    expr: CallExpr<&'a str, T>,
     state: CallExprState,
 }
 
@@ -2186,7 +2196,7 @@ pub struct CallExprState {
 
 #[derive(Debug, Clone)]
 struct PartialComparisonExpr<'a, T: AstMetadata> {
-    expr: ComparisonExpr<'a, T>,
+    expr: ComparisonExpr<&'a str, T>,
     state: ComparisonExprState,
 }
 
@@ -2198,7 +2208,7 @@ pub struct ComparisonExprState {
 
 #[derive(Debug, Clone)]
 struct PartialFieldAccessExpr<'a, T: AstMetadata> {
-    expr: FieldAccessExpr<'a, T>,
+    expr: FieldAccessExpr<&'a str, T>,
     state: FieldAccessExprState,
 }
 

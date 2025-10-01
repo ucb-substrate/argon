@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use compiler::{ast::annotated::AnnotatedAst, parse::ParseMetadata};
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
 use tower_lsp::lsp_types::{Position, Range, Url};
 
@@ -7,6 +8,7 @@ use tower_lsp::lsp_types::{Position, Range, Url};
 pub(crate) struct Document {
     contents: IndexedText<String>,
     version: i32,
+    pub(crate) ast: Option<AnnotatedAst<ParseMetadata>>,
 }
 
 pub(crate) struct DocumentChange {
@@ -30,11 +32,19 @@ impl Document {
         Self {
             contents: IndexedText::new(contents.into()),
             version,
+            ast: None,
         }
     }
 
     pub(crate) fn offset_to_pos(&self, offset: usize) -> Position {
         pos2position(self.contents.offset_to_pos(offset).unwrap())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn substr(&self, range: std::ops::Range<Position>) -> &str {
+        self.contents
+            .substr(position2pos(range.start)..position2pos(range.end))
+            .unwrap()
     }
 
     pub(crate) fn apply_changes(&mut self, changes: Vec<DocumentChange>, version: i32) {

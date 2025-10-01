@@ -5,7 +5,7 @@ use std::{
 
 use async_compat::CompatExt;
 use cfgrammar::Span;
-use compiler::compile::CompileOutput;
+use compiler::compile::{CompileOutput, Rect};
 use futures::{
     channel::mpsc::{self, Sender},
     prelude::*,
@@ -116,6 +116,20 @@ impl SyncGuiToLspClient {
             async move {
                 client_clone
                     .select_rect(context::current(), span)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        );
+    }
+
+    // TODO: Improve API.
+    pub fn draw_rect(&self, file: PathBuf, scope_span: Span, var_name: String, rect: Rect<f64>) {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .draw_rect(context::current(), file, scope_span, var_name, rect)
                     .await
                     .unwrap()
             }

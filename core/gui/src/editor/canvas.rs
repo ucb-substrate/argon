@@ -539,20 +539,21 @@ impl LayoutCanvas {
                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                 self.state.update(cx, |state, cx| {
-                    state.solved_cell.update(cx, |cell, cx| {
-                        if let Some(cell) = cell.as_mut() {
-                            // TODO update in memory representation of code
-                            // TODO add solver to gui
-                            let mut solver = Solver::new();
-                            cell.output
-                                .cells
-                                .get_mut(&cell.selected_scope.cell)
-                                .unwrap()
-                                .scopes
-                                .get_mut(&cell.selected_scope.scope)
-                                .unwrap()
-                                .elts
-                                .push(SolvedValue::Rect(compile::Rect {
+                    state.solved_cell.update(cx, {
+                        |cell, cx| {
+                            if let Some(cell) = cell.as_mut() {
+                                // TODO update in memory representation of code
+                                // TODO add solver to gui
+                                let mut solver = Solver::new();
+                                let scope = cell
+                                    .output
+                                    .cells
+                                    .get_mut(&cell.selected_scope.cell)
+                                    .unwrap()
+                                    .scopes
+                                    .get_mut(&cell.selected_scope.scope)
+                                    .unwrap();
+                                scope.elts.push(SolvedValue::Rect(compile::Rect {
                                     layer: state
                                         .layers
                                         .read(cx)
@@ -564,7 +565,26 @@ impl LayoutCanvas {
                                     x1: (p1p.x as f64, solver.new_var()),
                                     y1: (p1p.y as f64, solver.new_var()),
                                     source: None,
-                                }))
+                                }));
+                                state.lsp_client.draw_rect(
+                                    cell.file.clone(),
+                                    scope.span,
+                                    "rect0".to_string(),
+                                    compile::Rect {
+                                        layer: state
+                                            .layers
+                                            .read(cx)
+                                            .selected_layer
+                                            .clone()
+                                            .map(|s| s.to_string()),
+                                        x0: p0p.x as f64,
+                                        y0: p0p.y as f64,
+                                        x1: p1p.x as f64,
+                                        y1: p1p.y as f64,
+                                        source: None,
+                                    },
+                                );
+                            }
                         }
                     });
                 });
