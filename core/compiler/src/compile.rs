@@ -1768,23 +1768,19 @@ impl<'a> ExecPass<'a> {
                     match v {
                         Value::Linear(v) => {
                             let res = match unary_op.op {
-                                UnaryOp::Neg => Some(LinearExpr {
+                                UnaryOp::Neg => LinearExpr {
                                     coeffs: v
                                         .coeffs
                                         .iter()
                                         .map(|(coeff, var)| (-coeff, *var))
                                         .collect(),
                                     constant: -v.constant,
-                                }),
+                                },
                                 _ => unreachable!(),
                             };
-                            if let Some(res) = res {
-                                self.values
-                                    .insert(vid, DeferValue::Ready(Value::Linear(res)));
-                                true
-                            } else {
-                                false
-                            }
+                            self.values
+                                .insert(vid, DeferValue::Ready(Value::Linear(res)));
+                            true
                         }
                         Value::Int(v) => {
                             let res = match unary_op.op {
