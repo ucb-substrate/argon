@@ -1447,6 +1447,10 @@ impl<'a> ExecPass<'a> {
                 let rhs = self.visit_expr(loc, &b.right);
                 PartialEvalState::BinOp(PartialBinOp { lhs, rhs, op: b.op })
             }
+            Expr::UnaryOp(u) => {
+                let operand = self.visit_expr(loc, &u.operand);
+                PartialEvalState::UnaryOp(PartialUnaryOp { operand, op: u.op })
+            }
             Expr::Cast(cast) => {
                 let value = self.visit_expr(loc, &cast.value);
                 PartialEvalState::Cast(PartialCast {
@@ -1454,7 +1458,6 @@ impl<'a> ExecPass<'a> {
                     ty: cast.metadata.clone(),
                 })
             }
-            x => todo!("{x:?}"),
         };
         let vid = self.value_id();
         self.cell_state_mut(loc.cell).deferred.insert(vid);
@@ -1754,7 +1757,44 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
                         }
-                        _ => unreachable!(),
+                        _ => todo!(),
+                    }
+                } else {
+                    false
+                }
+            }
+            PartialEvalState::UnaryOp(unary_op) => {
+                if let Defer::Ready(v) = &self.values[&unary_op.operand] {
+                    match v {
+                        Value::Linear(v) => {
+                            let res = match unary_op.op {
+                                UnaryOp::Neg => Some(LinearExpr {
+                                    coeffs: v
+                                        .coeffs
+                                        .iter()
+                                        .map(|(coeff, var)| (-coeff, *var))
+                                        .collect(),
+                                    constant: -v.constant,
+                                }),
+                                _ => unreachable!(),
+                            };
+                            if let Some(res) = res {
+                                self.values
+                                    .insert(vid, DeferValue::Ready(Value::Linear(res)));
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Value::Int(v) => {
+                            let res = match unary_op.op {
+                                UnaryOp::Neg => -v,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
+                            true
+                        }
+                        _ => todo!(),
                     }
                 } else {
                     false
@@ -2266,6 +2306,7 @@ enum PartialEvalState<'a, T: AstMetadata> {
     If(Box<PartialIfExpr<'a, T>>),
     Comparison(Box<PartialComparisonExpr<'a, T>>),
     BinOp(PartialBinOp),
+    UnaryOp(PartialUnaryOp),
     Call(Box<PartialCallExpr<'a, T>>),
     FieldAccess(Box<PartialFieldAccessExpr<'a, T>>),
     Constraint(PartialConstraint),
@@ -2290,6 +2331,12 @@ struct PartialBinOp {
     lhs: ValueId,
     rhs: ValueId,
     op: BinOp,
+}
+
+#[derive(Debug, Clone)]
+struct PartialUnaryOp {
+    operand: ValueId,
+    op: UnaryOp,
 }
 
 #[derive(Debug, Clone)]
