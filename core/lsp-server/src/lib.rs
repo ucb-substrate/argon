@@ -12,7 +12,12 @@ use std::{
     sync::Arc,
 };
 
-use compiler::compile::CompileOutput;
+use arcstr::ArcStr;
+use compiler::{
+    ast::{Expr, annotated::AnnotatedAst},
+    compile::{self, CompileInput, CompileOutput},
+    parse,
+};
 use futures::prelude::*;
 use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
@@ -135,6 +140,7 @@ struct SetParams {
     kv: String,
 }
 
+#[allow(dead_code)]
 fn make_tmp_file_path(file: impl AsRef<Path>) -> PathBuf {
     let file = file.as_ref();
     let mut tmp_file_name = OsString::from(".");
@@ -174,8 +180,6 @@ impl Backend {
 
     async fn open_file_in_gui(&self, file: impl AsRef<Path>) {
         let file = file.as_ref();
-        let tmp_file = make_tmp_file_path(file);
-
         let mut state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(file).unwrap();
         let mut doc = if let Some(doc) = state_mut.editor_files.get(&url).cloned() {
@@ -185,27 +189,7 @@ impl Backend {
             return;
         };
 
-        tokio::fs::write(&tmp_file, doc.contents().as_bytes())
-            .await
-            .unwrap();
-
-        let o = Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/debug/compiler"
-        ))
-        .arg(tmp_file)
-        .arg("--ast")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
-        .wait_with_output()
-        .await
-        .unwrap();
-
-        let o = String::from_utf8(o.stdout).unwrap();
-        let ast = serde_json::from_str(&o).unwrap();
+        let ast = parse::parse(doc.contents()).unwrap();
         let scope_annotation = ScopeAnnotationPass::new(&doc, &ast).await;
         let mut text_edits = scope_annotation.execute();
         text_edits.sort_by_key(|edit| Reverse(edit.range.start));
@@ -219,6 +203,8 @@ impl Backend {
                 .collect(),
             doc.version() + 1,
         );
+        let ast = parse::parse(doc.contents()).unwrap();
+        doc.ast = Some(AnnotatedAst::new(ArcStr::from(doc.contents()), &ast));
         state_mut.gui_files.insert(url, doc);
 
         self.state
@@ -242,39 +228,35 @@ impl Backend {
         cell: impl AsRef<str>,
     ) -> CompileOutput {
         let file = file.as_ref();
-        let tmp_file = make_tmp_file_path(file);
 
         let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(file).unwrap();
         let doc = &state_mut.gui_files[&url];
-        tokio::fs::write(&tmp_file, doc.contents().as_bytes())
-            .await
-            .unwrap();
 
         // TODO: un-hardcode this.
         let lyp = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../core/compiler/examples/lyp/basic.lyp"
         );
-        let o = Command::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/debug/compiler"
-        ))
-        .arg(tmp_file)
-        .arg("-c")
-        .arg(cell.as_ref())
-        .arg("-l")
-        .arg(lyp)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
-        .wait_with_output()
-        .await
-        .unwrap();
-        let o = String::from_utf8(o.stdout).unwrap();
-        serde_json::from_str(&o).unwrap()
+        let cell_ast = parse::parse_cell(cell.as_ref()).unwrap();
+        let ast = parse::parse(doc.contents()).unwrap();
+        compile::compile(
+            &ast,
+            CompileInput {
+                cell: cell_ast.func.name,
+                params: cell_ast
+                    .args
+                    .posargs
+                    .iter()
+                    .map(|arg| match arg {
+                        Expr::FloatLiteral(float_literal) => float_literal.value,
+                        Expr::IntLiteral(int_literal) => int_literal.value as f64,
+                        _ => panic!("must be int or float literal for now"),
+                    })
+                    .collect(),
+                lyp_file: &PathBuf::from(lyp),
+            },
+        )
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {

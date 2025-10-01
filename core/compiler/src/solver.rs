@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use approx::relative_eq;
 use itertools::{Either, Itertools};
@@ -99,6 +99,10 @@ impl Solver {
             self.constraints.len(),
             self.constraints.iter().map(|expr| -expr.constant),
         );
+
+        println!("{a:?}");
+        println!("{b:?}");
+        let start_time = Instant::now();
         let svd = a.clone().svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let s = &svd.singular_values;
@@ -106,6 +110,7 @@ impl Solver {
             return;
         }
         let sol = svd.solve(&b, EPSILON).unwrap();
+        println!("elapsed time: {:?}", start_time.elapsed());
 
         for i in 0..self.next_id {
             if !self.solved_vars.contains_key(&Var(i))

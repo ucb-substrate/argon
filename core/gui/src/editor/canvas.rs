@@ -541,11 +541,37 @@ impl LayoutCanvas {
                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                 self.state.update(cx, |state, cx| {
-                    state.solved_cell.update(cx, |cell, cx| {
-                        if let Some(cell) = cell.as_mut() {
-                            // TODO update in memory representation of code
-                            // TODO add solver to gui
-                            todo!()
+                    state.solved_cell.update(cx, {
+                        |cell, cx| {
+                            if let Some(cell) = cell.as_mut() {
+                                // TODO update in memory representation of code
+                                // TODO add solver to gui
+                                let scope = cell
+                                    .output
+                                    .cells
+                                    .get_mut(&cell.selected_scope.cell)
+                                    .unwrap()
+                                    .scopes
+                                    .get_mut(&cell.selected_scope.scope)
+                                    .unwrap();
+                                state.lsp_client.draw_rect(
+                                    cell.file.clone(),
+                                    scope.span,
+                                    "rect0".to_string(),
+                                    compile::BasicRect {
+                                        layer: state
+                                            .layers
+                                            .read(cx)
+                                            .selected_layer
+                                            .clone()
+                                            .map(|s| s.to_string()),
+                                        x0: p0p.x as f64,
+                                        y0: p0p.y as f64,
+                                        x1: p1p.x as f64,
+                                        y1: p1p.y as f64,
+                                    },
+                                );
+                            }
                         }
                     });
                 });
