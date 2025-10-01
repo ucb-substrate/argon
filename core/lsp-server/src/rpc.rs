@@ -1,17 +1,25 @@
-use std::{net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
+use arcstr::ArcStr;
 use cfgrammar::Span;
-use compiler::compile::CompileOutput;
+use compiler::{
+    ast::annotated::AnnotatedAst,
+    compile::{CompileOutput, Rect},
+    parse,
+};
 
 use tarpc::tokio_serde::formats::Json;
-use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, Range, Url};
+use tower_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, MessageType, Position, Range, TextEdit, Url, WorkspaceEdit,
+};
 
-use crate::State;
+use crate::{State, document::DocumentChange};
 
 #[tarpc::service]
 pub trait GuiToLsp {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Option<(PathBuf, Span)>);
+    async fn draw_rect(file: PathBuf, scope_span: Span, var_name: String, rect: Rect<f64>);
 }
 
 #[tarpc::service]
@@ -60,6 +68,103 @@ impl GuiToLsp for LspServer {
                     .publish_diagnostics(Url::from_file_path(file).unwrap(), diagnostics, None)
                     .await;
             }
+        }
+    }
+
+    async fn draw_rect(
+        self,
+        _: tarpc::context::Context,
+        file: PathBuf,
+        scope_span: Span,
+        var_name: String,
+        rect: Rect<f64>,
+    ) {
+        if let Some(doc) = self
+            .state
+            .state_mut
+            .lock()
+            .await
+            .gui_files
+            .get_mut(&Url::from_file_path(&file).unwrap())
+            && let Some(ast) = &doc.ast
+            && let Some(scope) = {
+                self.state
+                    .editor_client
+                    .log_message(MessageType::WARNING, format!("{:?}", ast.span2scope.keys()))
+                    .await;
+                self.state
+                    .editor_client
+                    .log_message(MessageType::WARNING, format!("{:?}", scope_span))
+                    .await;
+                ast.span2scope.get(&scope_span)
+            }
+        {
+            let edit = if let Some(tail) = &scope.tail {
+                let start = doc.offset_to_pos(tail.span().start());
+                TextEdit {
+                    range: Range::new(start, start),
+                    new_text: format!(
+                        "let {var_name} = rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})!;\n{}",
+                        rect.layer
+                            .map(|layer| format!("{layer}, "))
+                            .unwrap_or_default(),
+                        rect.x0,
+                        rect.y0,
+                        rect.x1,
+                        rect.y1,
+                        // TODO: handle different types of indentation, or enforce that gui
+                        // reformats file before editing.
+                        std::iter::repeat_n(' ', start.character as usize).collect::<String>()
+                    ),
+                }
+            } else {
+                let start = doc.offset_to_pos(scope.span.start());
+                let stop = doc.offset_to_pos(scope.span.end());
+                let line = doc.substr(Position::new(stop.line, 0)..stop);
+                let trimmed = line.trim_start();
+                let whitespace = &line[..line.len() - trimmed.len()];
+                let insert_loc = doc.offset_to_pos(scope.span.end() - 1);
+                TextEdit {
+                    range: Range::new(insert_loc, insert_loc),
+                    new_text: format!(
+                        "{}let {var_name} = rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})!;\n{whitespace}",
+                        if start.line != stop.line {
+                            "    "
+                        } else {
+                            "\n"
+                        },
+                        rect.layer
+                            .map(|layer| format!("\"{layer}\", "))
+                            .unwrap_or_default(),
+                        rect.x0,
+                        rect.y0,
+                        rect.x1,
+                        rect.y1,
+                    ),
+                }
+            };
+            doc.apply_changes(
+                vec![DocumentChange {
+                    range: Some(edit.range),
+                    patch: edit.new_text.clone(),
+                }],
+                doc.version() + 1,
+            );
+            let ast = parse::parse(doc.contents()).unwrap();
+            doc.ast = Some(AnnotatedAst::new(ArcStr::from(doc.contents()), &ast));
+
+            self.state
+                .editor_client
+                .apply_edit(WorkspaceEdit {
+                    changes: Some(HashMap::from_iter([(
+                        Url::from_file_path(file).unwrap(),
+                        vec![edit],
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+                .await
+                .unwrap();
         }
     }
 }

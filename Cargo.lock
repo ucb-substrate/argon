@@ -3768,6 +3768,7 @@ dependencies = [
 name = "lsp-server"
 version = "0.1.0"
 dependencies = [
+ "arcstr",
  "bytes",
  "cfgrammar",
  "compiler",

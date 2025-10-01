@@ -1,7 +1,7 @@
 %start CallExpr
 %%
 
-Ident -> Result<Ident<'input, ParseMetadata>, ()>
+Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), metadata: () }) }
   ;
 
@@ -17,7 +17,7 @@ IntLiteral -> Result<IntLiteral, ()>
   Ok(IntLiteral { span: v.span(), value: parse_int($lexer.span_str(v.span()))?, }) }
   ;
 
-CallExpr -> Result<CallExpr<'input, ParseMetadata>, ()>
+CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
   : Ident '(' Args ')'
     {
       Ok(CallExpr {
@@ -29,22 +29,22 @@ CallExpr -> Result<CallExpr<'input, ParseMetadata>, ()>
     }
   ;
 
-Expr -> Result<Expr<'input, ParseMetadata>, ()>
+Expr -> Result<Expr<&'input str, ParseMetadata>, ()>
   : Ident '::' Ident { Ok(Expr::EnumValue(EnumValue {name: $1?, variant: $3?, span: $span, metadata: (), } )) }
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   ;
 
-Args -> Result<Args<'input, ParseMetadata>, ()>
+Args -> Result<Args<&'input str, ParseMetadata>, ()>
   : PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), metadata: (), }) }
   ;
 
-PosArgs -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
+PosArgs -> Result<Vec<Expr<&'input str, ParseMetadata>>, ()>
   : PosArgsTrailingComma { $1 }
   | PosArgsNoComma { $1 }
   ;
 
-PosArgsTrailingComma -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
+PosArgsTrailingComma -> Result<Vec<Expr<&'input str, ParseMetadata>>, ()>
   : Expr ',' { Ok(vec![$1?]) }
   | PosArgsTrailingComma Expr ',' {
       let mut __tmp = $1?;
@@ -53,7 +53,7 @@ PosArgsTrailingComma -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
   }
   ;
 
-PosArgsNoComma -> Result<Vec<Expr<'input, ParseMetadata>>, ()>
+PosArgsNoComma -> Result<Vec<Expr<&'input str, ParseMetadata>>, ()>
   : { Ok(Vec::new()) }
   | Expr { Ok(vec![$1?]) }
   | PosArgsTrailingComma Expr
