@@ -5,7 +5,7 @@ use std::{
 
 use async_compat::CompatExt;
 use cfgrammar::Span;
-use compiler::compile::{BasicRect, CompileOutput, Rect};
+use compiler::compile::{BasicRect, CompileOutput};
 use futures::{
     channel::mpsc::{self, Sender},
     prelude::*,
@@ -13,7 +13,6 @@ use futures::{
 use gpui::{AsyncApp, Context, Entity};
 use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
-use serde::{Deserialize, Serialize};
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},

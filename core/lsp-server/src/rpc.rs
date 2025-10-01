@@ -4,7 +4,7 @@ use arcstr::ArcStr;
 use cfgrammar::Span;
 use compiler::{
     ast::annotated::AnnotatedAst,
-    compile::{BasicRect, CompileOutput, Rect},
+    compile::{BasicRect, CompileOutput},
     parse,
 };
 

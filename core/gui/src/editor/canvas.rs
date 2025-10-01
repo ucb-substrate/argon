@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use compiler::{
     compile::{self, SolvedValue, ifmatvec},
-    solver::{Solver, Var},
+    solver::Var,
 };
 use enumify::enumify;
 use geometry::transform::TransformationMatrix;
@@ -276,7 +276,7 @@ impl Element for CanvasElement {
                     }
                     show = false;
                 }
-                for (i, (obj, emit)) in scope_info.emit.iter().enumerate() {
+                for (i, (obj, _)) in scope_info.emit.iter().enumerate() {
                     let value = &cell_info.objects[obj];
                     match value {
                         SolvedValue::Rect(rect) => {
@@ -342,7 +342,6 @@ impl Element for CanvasElement {
                             }
                             queue.push_back((inst_address, new_mat, new_ofs, depth + 1, show));
                         }
-                        _ => {}
                     }
                 }
                 for child in &scope_info.children {
@@ -385,7 +384,6 @@ impl Element for CanvasElement {
                                 }
                             })
                         }
-                        _ => None,
                     },
                 };
                 if let Some(r) = r {
@@ -617,7 +615,7 @@ impl LayoutCanvas {
                                     let (obj, emit) = &ccell.scopes[&id.scope.scope].emit[id.idx];
 
                                     match &ccell.objects[obj] {
-                                        SolvedValue::Rect(r) => {
+                                        SolvedValue::Rect(_) => {
                                             Some((cell.file.clone(), emit.span))
                                         }
                                         _ => None,
