@@ -735,7 +735,6 @@ pub struct BasicRect<T> {
     pub y1: T,
 }
 
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rect<T> {
     pub layer: Option<String>,
