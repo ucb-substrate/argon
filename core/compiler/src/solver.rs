@@ -101,9 +101,6 @@ impl Solver {
             self.constraints.iter().map(|expr| -expr.constant),
         );
 
-        println!("{a:?}");
-        println!("{b:?}");
-        let start_time = Instant::now();
         let svd = a.clone().svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let s = &svd.singular_values;
@@ -111,7 +108,6 @@ impl Solver {
             return;
         }
         let sol = svd.solve(&b, EPSILON).unwrap();
-        println!("elapsed time: {:?}", start_time.elapsed());
 
         for i in 0..self.next_id {
             if !self.solved_vars.contains_key(&Var(i))
@@ -126,6 +122,14 @@ impl Solver {
         }
         for constraint in self.constraints.iter_mut() {
             substitute_expr(&self.solved_vars, constraint);
+            if constraint.coeffs.is_empty()
+                && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
+            {
+                panic!(
+                    "inconsistent constraint, err = {}",
+                    constraint.constant.abs()
+                );
+            }
         }
         // TODO: detect inconsistent constraints
         self.constraints
@@ -161,7 +165,7 @@ impl LinearExpr {
     pub fn coeff_vec(&self, n_vars: usize) -> Vec<f64> {
         let mut out = vec![0.; n_vars];
         for (val, var) in &self.coeffs {
-            out[var.0 as usize] = *val;
+            out[var.0 as usize] += *val;
         }
         out
     }

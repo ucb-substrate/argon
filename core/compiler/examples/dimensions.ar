@@ -1,0 +1,7 @@
+cell top() {
+    let met1 = rect("met1")!;
+    dimension(met1.x1, met1.x0, 200., 100., 0., 0., true);
+    dimension(met1.y1, met1.y0, 100., 50., 0., 0., false);
+    eq(met1.x0, 0.);
+    eq(met1.y0, 0.);
+}

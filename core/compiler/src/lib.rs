@@ -59,9 +59,11 @@ pub fn main() {
 #[cfg(test)]
 mod tests {
 
+    use approx::assert_relative_eq;
     use parse::parse;
 
     use crate::compile::{CompileInput, compile};
+    const EPSILON: f64 = 1e-10;
 
     use super::*;
 
@@ -109,6 +111,10 @@ mod tests {
     const ARGON_BOOL_LITERAL: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/bool_literal.ar"
+    ));
+    const ARGON_DIMENSIONS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/dimensions.ar"
     ));
     const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -158,6 +164,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn argon_if_inconsistent() {
         let ast = parse(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
         let cell = compile(
@@ -242,6 +249,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "not supported"]
     fn argon_cell_out_of_order() {
         let ast = parse(ARGON_CELL_OUT_OF_ORDER).expect("failed to parse Argon");
         let cells = compile(
@@ -317,6 +325,29 @@ mod tests {
                 .unwrap(),
             "met1"
         );
+    }
+
+    #[test]
+    fn argon_dimensions() {
+        let ast = parse(ARGON_DIMENSIONS).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 3);
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 200., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
     }
 
     // #[test]

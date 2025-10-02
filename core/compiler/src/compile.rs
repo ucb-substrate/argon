@@ -1069,12 +1069,12 @@ impl<'a> ExecPass<'a> {
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
-                    p: state.solver.value_of(dim.p).unwrap(),
-                    n: state.solver.value_of(dim.n).unwrap(),
-                    value: state.solver.value_of(dim.value).unwrap(),
-                    coord: state.solver.value_of(dim.coord).unwrap(),
-                    pstop: state.solver.value_of(dim.pstop).unwrap(),
-                    nstop: state.solver.value_of(dim.nstop).unwrap(),
+                    p: (state.solver.value_of(dim.p).unwrap(), dim.p),
+                    n: (state.solver.value_of(dim.n).unwrap(), dim.n),
+                    value: (state.solver.value_of(dim.value).unwrap(), dim.value),
+                    coord: (state.solver.value_of(dim.coord).unwrap(), dim.coord),
+                    pstop: (state.solver.value_of(dim.pstop).unwrap(), dim.pstop),
+                    nstop: (state.solver.value_of(dim.nstop).unwrap(), dim.nstop),
                     horiz: dim.horiz,
                     span: dim.span,
                 }),
@@ -1666,6 +1666,7 @@ impl<'a> ExecPass<'a> {
                         .map(|vid| self.values[vid].get_ready())
                         .collect::<Option<Vec<_>>>();
                     if let Some(args) = args {
+                        assert_eq!(args.len(), 7);
                         let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let dim = Dimension {
@@ -1682,12 +1683,15 @@ impl<'a> ExecPass<'a> {
                         state.objects.insert(dim.id, dim.clone().into());
                         for (var, rhs) in [dim.p, dim.n, dim.value, dim.coord, dim.pstop, dim.nstop]
                             .iter()
-                            .zip(args.iter())
+                            .zip(args.iter().take(6))
                         {
-                            state.solver.constrain_eq0(
-                                LinearExpr::from(*var) - rhs.as_ref().unwrap_linear(),
-                            );
+                            let expr = LinearExpr::from(*var) - rhs.as_ref().unwrap_linear();
+                            state.solver.constrain_eq0(expr);
                         }
+                        let expr = LinearExpr::from(dim.p)
+                            - LinearExpr::from(dim.n)
+                            - LinearExpr::from(dim.value);
+                        state.solver.constrain_eq0(expr);
                         self.values.insert(vid, Defer::Ready(Value::None));
                         true
                     } else {
@@ -2200,7 +2204,7 @@ pub enum Value<'a> {
     /// A cell generator.
     ///
     /// Example:
-    /// ```
+    /// ```argon
     /// cell mycell() {
     ///   // ...
     /// }
@@ -2211,7 +2215,7 @@ pub enum Value<'a> {
     /// A particular parameterization of a cell.
     ///
     /// Example:
-    /// ```
+    /// ```argon
     /// cell mycell() {
     ///   // ...
     /// }
@@ -2224,7 +2228,7 @@ pub enum Value<'a> {
     /// An instantiation of a cell value.
     ///
     /// Example:
-    /// ```
+    /// ```argon
     /// cell mycell() {
     ///   // ...
     /// }
@@ -2275,7 +2279,7 @@ pub struct SolvedInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Rect(Rect<(f64, Var)>),
-    Dimension(Dimension<f64>),
+    Dimension(Dimension<(f64, Var)>),
     Instance(SolvedInstance),
 }
 
