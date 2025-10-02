@@ -609,6 +609,11 @@ impl LayoutCanvas {
                             if let Some(cell) = cell.as_mut() {
                                 // TODO update in memory representation of code
                                 // TODO add solver to gui
+                                let reachable_objs = cell.output.reachable_objs(
+                                    cell.selected_scope.cell,
+                                    cell.selected_scope.scope,
+                                );
+                                let names: IndexSet<_> = reachable_objs.values().collect();
                                 let scope = cell
                                     .output
                                     .cells
@@ -617,10 +622,15 @@ impl LayoutCanvas {
                                     .scopes
                                     .get_mut(&cell.selected_scope.scope)
                                     .unwrap();
+                                let rect_name = (0..)
+                                    .map(|i| format!("rect{i}"))
+                                    .find(|name| !names.contains(name))
+                                    .unwrap();
+
                                 state.lsp_client.draw_rect(
                                     cell.file.clone(),
                                     scope.span,
-                                    "rect0".to_string(),
+                                    rect_name,
                                     compile::BasicRect {
                                         layer: state
                                             .layers
