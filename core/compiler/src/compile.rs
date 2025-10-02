@@ -981,10 +981,16 @@ impl<'a> ExecPass<'a> {
                 if state.nullspace_vecs.is_none() {
                     state.nullspace_vecs = Some(state.solver.nullspace_vecs());
                 }
-                if let Some(expr) = state.fallback_constraints.pop() {
-                    state.fallback_constraints_used.push(expr.clone());
-                    state.solver.constrain_eq0(expr);
-                } else {
+                let mut constraint_added = false;
+                while let Some(expr) = state.fallback_constraints.pop() {
+                    if expr.coeffs.iter().any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v)) {
+                        state.fallback_constraints_used.push(expr.clone());
+                        state.solver.constrain_eq0(expr);
+                        constraint_added = true;
+                        break;
+                    }
+                }
+                if !constraint_added {
                     panic!("no progress");
                 }
             }

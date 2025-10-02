@@ -15,7 +15,7 @@ use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
     context,
-    server::{Channel, incoming::Incoming},
+    server::{incoming::Incoming, Channel},
     tokio_serde::formats::Json,
 };
 
@@ -95,15 +95,13 @@ impl SyncGuiToLspClient {
             .compat(),
         );
         self.app
-            .spawn(async move |app| {
-                loop {
-                    if let Some(exec) = rx.next().await {
-                        state
-                            .update(app, |state, cx| {
-                                exec(state, cx);
-                            })
-                            .unwrap();
-                    }
+            .spawn(async move |app| loop {
+                if let Some(exec) = rx.next().await {
+                    state
+                        .update(app, |state, cx| {
+                            exec(state, cx);
+                        })
+                        .unwrap();
                 }
             })
             .detach();
@@ -166,6 +164,7 @@ pub struct GuiServer {
 
 impl LspToGui for GuiServer {
     async fn open_cell(mut self, _: context::Context, file: PathBuf, cell: CompileOutput) {
+        println!("cell = {cell:#?}");
         self.to_exec
             .send(Box::new(|state, cx| {
                 state.update(cx, file, cell);

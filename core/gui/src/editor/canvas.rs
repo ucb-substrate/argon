@@ -732,12 +732,12 @@ impl LayoutCanvas {
                         *dim_tool = DimToolState::SelectEdge1 {
                             edge0: (r.object_path.clone(), edge.to_string()),
                         };
-                        println!("one dim tool edge selected");
+                        println!("one dim tool edge selected, path = {:?}", r.object_path);
                     }
                     DimToolState::SelectEdge1 {
                         edge0: (path0, edge0),
                     } => {
-                        println!("dim tool attempting to create constraint");
+                        println!("second edge selected, path = {:?}", r.object_path);
                         self.state.update(cx, |state, cx| {
                             state.solved_cell.update(cx, |cell, cx| {
                                 if let Some(cell) = cell.as_mut() {
@@ -745,7 +745,10 @@ impl LayoutCanvas {
                                         let mut current_scope = cell.selected_scope;
                                         let mut string_path = Vec::new();
                                         let mut reachable = true;
-                                        for obj in path {
+                                        if path.is_empty() {
+                                            panic!("need non-empty object path");
+                                        }
+                                        for obj in &path[0..path.len() - 1] {
                                             let mut reachable_objs = cell.output.reachable_objs(
                                                 current_scope.cell,
                                                 current_scope.scope,
@@ -766,6 +769,20 @@ impl LayoutCanvas {
                                                 break;
                                             }
                                         }
+                                        let obj = path.last().unwrap();
+                                        let mut reachable_objs = cell.output.reachable_objs(
+                                            current_scope.cell,
+                                            current_scope.scope,
+                                        );
+                                        if let Some(name) = reachable_objs.swap_remove(obj)
+                                            && let Some(rect) =
+                                                cell.output.cells[&current_scope.cell].objects[obj]
+                                                    .get_rect()
+                                        {
+                                            string_path.push(name);
+                                        } else {
+                                            reachable = false;
+                                        }
                                         (reachable, string_path)
                                     };
                                     cx.notify();
@@ -774,6 +791,7 @@ impl LayoutCanvas {
                                     {
                                         let path0 = path0.join(".");
                                         let path1 = path1.join(".");
+                                        println!("adding constraint");
                                         state.lsp_client.add_eq_constraint(
                                             cell.file.clone(),
                                             cell.output.cells[&cell.selected_scope.cell].scopes

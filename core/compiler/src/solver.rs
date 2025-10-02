@@ -135,6 +135,10 @@ impl Solver {
         self.solved_vars.get(&var).copied()
     }
 
+    pub fn is_solved(&self, var: Var) -> bool {
+        self.solved_vars.contains_key(&var)
+    }
+
     pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
         Some(
             expr.coeffs
