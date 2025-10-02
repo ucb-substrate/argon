@@ -658,7 +658,6 @@ impl LayoutCanvas {
                 }
             }
         } else if let Some(ref mut dim_tool) = self.dim_tool {
-            println!("dim tool handling mouse down");
             let rects = self
                 .rects
                 .iter()
@@ -720,7 +719,6 @@ impl LayoutCanvas {
                     let bounds = edge.select_bounds(Pixels(4.));
                     if bounds.contains(&event.position) && rect.id.is_some() {
                         selected = Some((rect, name));
-                        println!("dim tool selected edge");
                         break;
                     }
                 }
@@ -732,12 +730,10 @@ impl LayoutCanvas {
                         *dim_tool = DimToolState::SelectEdge1 {
                             edge0: (r.object_path.clone(), edge.to_string()),
                         };
-                        println!("one dim tool edge selected, path = {:?}", r.object_path);
                     }
                     DimToolState::SelectEdge1 {
                         edge0: (path0, edge0),
                     } => {
-                        println!("second edge selected, path = {:?}", r.object_path);
                         self.state.update(cx, |state, cx| {
                             state.solved_cell.update(cx, |cell, cx| {
                                 if let Some(cell) = cell.as_mut() {
@@ -775,9 +771,8 @@ impl LayoutCanvas {
                                             current_scope.scope,
                                         );
                                         if let Some(name) = reachable_objs.swap_remove(obj)
-                                            && let Some(rect) =
-                                                cell.output.cells[&current_scope.cell].objects[obj]
-                                                    .get_rect()
+                                            && cell.output.cells[&current_scope.cell].objects[obj]
+                                                .is_rect()
                                         {
                                             string_path.push(name);
                                         } else {
@@ -791,7 +786,6 @@ impl LayoutCanvas {
                                     {
                                         let path0 = path0.join(".");
                                         let path1 = path1.join(".");
-                                        println!("adding constraint");
                                         state.lsp_client.add_eq_constraint(
                                             cell.file.clone(),
                                             cell.output.cells[&cell.selected_scope.cell].scopes
@@ -800,8 +794,6 @@ impl LayoutCanvas {
                                             format!("{}.{}", path0, edge0),
                                             format!("{}.{}", path1, edge),
                                         );
-                                    } else {
-                                        println!("not reachable");
                                     }
                                 }
                             })
@@ -899,7 +891,6 @@ impl LayoutCanvas {
     pub(crate) fn draw_dim(&mut self, _: &DrawDim, _window: &mut Window, _cx: &mut Context<Self>) {
         self.rect_tool = None;
         if self.dim_tool.is_none() {
-            println!("open dim tool");
             self.dim_tool = Some(DimToolState::SelectEdge0);
         }
     }

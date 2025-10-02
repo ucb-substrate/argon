@@ -14,7 +14,7 @@ use std::{
 
 use arcstr::ArcStr;
 use compiler::{
-    ast::{annotated::AnnotatedAst, Expr},
+    ast::{Expr, annotated::AnnotatedAst},
     compile::{self, CompileInput, CompileOutput},
     parse,
 };
@@ -24,7 +24,7 @@ use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
 use tarpc::{
     context,
-    server::{incoming::Incoming, Channel},
+    server::{Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
