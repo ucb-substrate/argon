@@ -22,7 +22,7 @@ use itertools::Itertools;
 
 use crate::{
     Cancel, DrawDim, DrawRect,
-    editor::{self, EditorState, LayerState, ScopeAddress},
+    editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
 };
 
 #[derive(Copy, Clone, PartialEq)]
@@ -147,9 +147,7 @@ struct RectToolState {
 
 enum DimToolState {
     SelectEdge0,
-    SelectEdge1 {
-        edge0: (Vec<ObjectId>, String, Edge<f32>),
-    },
+    SelectEdge1 { edge0: (String, String, Edge<f32>) },
 }
 
 pub struct LayoutCanvas {
@@ -777,9 +775,27 @@ impl LayoutCanvas {
             if let Some((r, name, edge)) = selected {
                 match dim_tool {
                     DimToolState::SelectEdge0 => {
-                        *dim_tool = DimToolState::SelectEdge1 {
-                            edge0: (r.object_path.clone(), name.to_string(), edge),
-                        };
+                        let path = self.state.update(cx, |state, cx| {
+                            state.solved_cell.update(cx, |cell, cx| {
+                                if let Some(cell) = cell.as_mut() {
+                                    let selected_scope_addr =
+                                        cell.state[&cell.selected_scope].address;
+                                    cx.notify();
+                                    if let (true, path) =
+                                        find_obj_path(&r.object_path, cell, selected_scope_addr)
+                                    {
+                                        let path = path.join(".");
+                                        return Some(path);
+                                    }
+                                }
+                                None
+                            })
+                        });
+                        if let Some(path) = path {
+                            *dim_tool = DimToolState::SelectEdge1 {
+                                edge0: (path, name.to_string(), edge),
+                            };
+                        }
                     }
                     DimToolState::SelectEdge1 {
                         edge0: (path0, name0, _edge0),
@@ -789,54 +805,10 @@ impl LayoutCanvas {
                                 if let Some(cell) = cell.as_mut() {
                                     let selected_scope_addr =
                                         cell.state[&cell.selected_scope].address;
-                                    let find_obj_path = |path: &[ObjectId]| {
-                                        let mut current_scope = selected_scope_addr;
-                                        let mut string_path = Vec::new();
-                                        let mut reachable = true;
-                                        if path.is_empty() {
-                                            panic!("need non-empty object path");
-                                        }
-                                        for obj in &path[0..path.len() - 1] {
-                                            let mut reachable_objs = cell.output.reachable_objs(
-                                                current_scope.cell,
-                                                current_scope.scope,
-                                            );
-                                            if let Some(name) = reachable_objs.swap_remove(obj)
-                                                && let Some(inst) = cell.output.cells
-                                                    [&current_scope.cell]
-                                                    .objects[obj]
-                                                    .get_instance()
-                                            {
-                                                string_path.push(name);
-                                                current_scope = ScopeAddress {
-                                                    cell: inst.cell,
-                                                    scope: cell.output.cells[&inst.cell].root,
-                                                };
-                                            } else {
-                                                reachable = false;
-                                                break;
-                                            }
-                                        }
-                                        let obj = path.last().unwrap();
-                                        let mut reachable_objs = cell.output.reachable_objs(
-                                            current_scope.cell,
-                                            current_scope.scope,
-                                        );
-                                        if let Some(name) = reachable_objs.swap_remove(obj)
-                                            && cell.output.cells[&current_scope.cell].objects[obj]
-                                                .is_rect()
-                                        {
-                                            string_path.push(name);
-                                        } else {
-                                            reachable = false;
-                                        }
-                                        (reachable, string_path)
-                                    };
                                     cx.notify();
-                                    if let (true, path0) = find_obj_path(path0)
-                                        && let (true, path1) = find_obj_path(&r.object_path)
+                                    if let (true, path1) =
+                                        find_obj_path(&r.object_path, cell, selected_scope_addr)
                                     {
-                                        let path0 = path0.join(".");
                                         let path1 = path1.join(".");
                                         state.lsp_client.add_eq_constraint(
                                             cell.file.clone(),
@@ -1046,4 +1018,46 @@ impl LayoutCanvas {
 
         cx.notify();
     }
+}
+
+fn find_obj_path(
+    path: &[ObjectId],
+    cell: &CompileOutputState,
+    scope: ScopeAddress,
+) -> (bool, Vec<String>) {
+    let mut current_scope = scope;
+    let mut string_path = Vec::new();
+    let mut reachable = true;
+    if path.is_empty() {
+        panic!("need non-empty object path");
+    }
+    for obj in &path[0..path.len() - 1] {
+        let mut reachable_objs = cell
+            .output
+            .reachable_objs(current_scope.cell, current_scope.scope);
+        if let Some(name) = reachable_objs.swap_remove(obj)
+            && let Some(inst) = cell.output.cells[&current_scope.cell].objects[obj].get_instance()
+        {
+            string_path.push(name);
+            current_scope = ScopeAddress {
+                cell: inst.cell,
+                scope: cell.output.cells[&inst.cell].root,
+            };
+        } else {
+            reachable = false;
+            break;
+        }
+    }
+    let obj = path.last().unwrap();
+    let mut reachable_objs = cell
+        .output
+        .reachable_objs(current_scope.cell, current_scope.scope);
+    if let Some(name) = reachable_objs.swap_remove(obj)
+        && cell.output.cells[&current_scope.cell].objects[obj].is_rect()
+    {
+        string_path.push(name);
+    } else {
+        reachable = false;
+    }
+    (reachable, string_path)
 }
