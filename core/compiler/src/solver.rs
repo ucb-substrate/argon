@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use approx::relative_eq;
 use indexmap::IndexMap;
 use itertools::{Either, Itertools};

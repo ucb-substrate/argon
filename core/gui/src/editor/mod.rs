@@ -6,7 +6,7 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, Rect, ScopeId, SolvedValue, ValidCompileOutput, ifmatvec,
+    ifmatvec, CellId, CompileOutput, Rect, ScopeId, SolvedValue, ValidCompileOutput,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -177,6 +177,7 @@ impl EditorState {
                             }),
                     );
                 }
+                _ => (),
             }
         }
 

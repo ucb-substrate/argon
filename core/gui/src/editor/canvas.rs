@@ -407,6 +407,7 @@ impl Element for CanvasElement {
                                 object_path,
                             ));
                         }
+                        _ => (),
                     }
                 }
                 for child in &scope_info.children {
@@ -454,6 +455,7 @@ impl Element for CanvasElement {
                                 }
                             })
                         }
+                        _ => None,
                     },
                 };
                 if let Some(r) = r {
