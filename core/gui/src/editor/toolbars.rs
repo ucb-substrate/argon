@@ -160,16 +160,19 @@ impl HierarchySideBar {
     ) {
         let solved_cell_clone_1 = self.solved_cell.clone();
         let solved_cell_clone_2 = self.solved_cell.clone();
-        let scope_state = &solved_cell.state[&scope];
+        let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
+        let scope_path = solved_cell.scope_paths[&scope].clone();
         scopes.push(
             div()
                 .flex()
                 .w_full()
-                .bg(if scope == solved_cell.selected_scope {
-                    rgba(0x00000099)
-                } else {
-                    rgba(0)
-                })
+                .bg(
+                    if scope == solved_cell.state[&solved_cell.selected_scope].address {
+                        rgba(0x00000099)
+                    } else {
+                        rgba(0)
+                    },
+                )
                 .child(
                     div()
                         .id(SharedString::from(format!("scope_select_{scope:?}")))
@@ -185,27 +188,33 @@ impl HierarchySideBar {
                                 "".to_string()
                             }
                         ))
-                        .on_click(move |_event, _window, cx| {
-                            solved_cell_clone_1.update(cx, |state, cx| {
-                                if let Some(state) = state.as_mut() {
-                                    state.selected_scope = scope;
-                                    cx.notify();
-                                }
-                            })
+                        .on_click({
+                            let scope_path = scope_path.clone();
+                            move |_event, _window, cx| {
+                                solved_cell_clone_1.update(cx, |state, cx| {
+                                    if let Some(state) = state.as_mut() {
+                                        state.selected_scope = scope_path.clone();
+                                        cx.notify();
+                                    }
+                                })
+                            }
                         }),
                 )
                 .child(
                     div()
                         .child(if scope_state.visible { "--V" } else { "NV" })
                         .id(SharedString::from(format!("scope_control_{scope:?}",)))
-                        .on_click(move |_event, _window, cx| {
-                            solved_cell_clone_2.update(cx, |state, cx| {
-                                if let Some(state) = state.as_mut() {
-                                    state.state.get_mut(&scope).unwrap().visible =
-                                        !state.state[&scope].visible;
-                                    cx.notify();
-                                }
-                            })
+                        .on_click({
+                            let scope_path = scope_path.clone();
+                            move |_event, _window, cx| {
+                                solved_cell_clone_2.update(cx, |state, cx| {
+                                    if let Some(state) = state.as_mut() {
+                                        state.state.get_mut(&scope_path).unwrap().visible =
+                                            !state.state[&scope_path].visible;
+                                        cx.notify();
+                                    }
+                                })
+                            }
                         }),
                 ),
         );
