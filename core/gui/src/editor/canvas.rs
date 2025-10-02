@@ -55,6 +55,7 @@ pub struct Rect {
     pub object_path: Vec<ObjectId>,
 }
 
+#[derive(Clone, PartialEq, Debug)]
 struct Edge<T> {
     dir: Dir,
     coord: T,
@@ -145,11 +146,8 @@ struct RectToolState {
     p0: Option<Point<f32>>,
 }
 
-enum DimToolState {
-    SelectEdge0,
-    SelectEdge1 {
-        edge0: (Vec<ObjectId>, String, Edge<f32>),
-    },
+struct DimToolState {
+    edges: Vec<(Vec<ObjectId>, String, Edge<f32>)>,
 }
 
 pub struct LayoutCanvas {
@@ -466,37 +464,24 @@ impl Element for CanvasElement {
             }
         }
 
+        let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(RectToolState { p0: Some(p0) }) = &inner.rect_tool {
-            let p1 = inner.px_to_layout(inner.mouse_position);
             rects.push((
                 Rect {
                     object_path: Vec::new(),
-                    x0: p0.x.min(p1.x),
-                    y0: p0.y.min(p1.y),
-                    x1: p0.x.max(p1.x),
-                    y1: p0.y.max(p1.y),
+                    x0: p0.x.min(layout_mouse_position.x),
+                    y0: p0.y.min(layout_mouse_position.y),
+                    x1: p0.x.max(layout_mouse_position.x),
+                    y1: p0.y.max(layout_mouse_position.y),
                     id: None,
                 },
                 layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
             ));
         }
-        if let Some(DimToolState::SelectEdge1 {
-            edge0: (_, _, edge),
-        }) = &inner.dim_tool
-        {
-            let (x0, y0, x1, y1) = match edge.dir {
-                Dir::Horiz => (edge.start, edge.coord - 2., edge.stop, edge.coord + 2.),
-                Dir::Vert => (edge.coord - 2., edge.start, edge.coord + 2., edge.stop),
-            };
-            select_rects = vec![Rect {
-                object_path: Vec::new(),
-                x0,
-                y0,
-                x1,
-                y1,
-                id: None,
-            }];
-        }
+        let dim_edges = inner.dim_tool.as_ref().map(|state| {
+            select_rects = Vec::new();
+            state.edges.clone()
+        });
         let rects = rects
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
@@ -545,6 +530,121 @@ impl Element for CanvasElement {
                             rgb(0xffff00),
                         ) {
                             window.paint_quad(quad);
+                        }
+                    }
+
+                    // draw dimension lines
+                    if let Some(dim_edges) = dim_edges {
+                        // highlight selected edges
+                        for (_, _, edge) in &dim_edges {
+                            let (x0, y0, x1, y1) = match edge.dir {
+                                Dir::Horiz => {
+                                    (edge.start, edge.coord - 2., edge.stop, edge.coord + 2.)
+                                }
+                                Dir::Vert => {
+                                    (edge.coord - 2., edge.start, edge.coord + 2., edge.stop)
+                                }
+                            };
+                            if let Some(quad) = get_paint_quad(
+                                &Rect {
+                                    object_path: Vec::new(),
+                                    x0,
+                                    y0,
+                                    x1,
+                                    y1,
+                                    id: None,
+                                },
+                                bounds,
+                                scale,
+                                offset,
+                                ShapeFill::Solid,
+                                rgb(0xffff00),
+                                rgba(0),
+                            ) {
+                                window.paint_quad(quad);
+                            }
+                        }
+                        if dim_edges.len() == 1 {
+                            let edge = dim_edges[0].2;
+                            let (x0, y0, x1, y1) = match edge.dir {
+                                Dir::Horiz => (
+                                    edge.start - 2.,
+                                    edge.coord,
+                                    edge.start + 2.,
+                                    layout_mouse_position.y,
+                                ),
+                                Dir::Vert => (
+                                    edge.coord,
+                                    edge.start - 2.,
+                                    layout_mouse_position.x,
+                                    edge.start + 2.,
+                                ),
+                            };
+                            let start_line = Rect {
+                                object_path: Vec::new(),
+                                x0: x0.min(x1),
+                                y0: y0.min(y1),
+                                x1: x0.max(x1),
+                                y1: y0.max(y1),
+                                id: None,
+                            };
+                            let (x0, y0, x1, y1) = match edge.dir {
+                                Dir::Horiz => (
+                                    edge.stop - 2.,
+                                    edge.coord,
+                                    edge.stop + 2.,
+                                    layout_mouse_position.y,
+                                ),
+                                Dir::Vert => (
+                                    edge.coord,
+                                    edge.stop - 2.,
+                                    layout_mouse_position.x,
+                                    edge.stop + 2.,
+                                ),
+                            };
+                            let stop_line = Rect {
+                                object_path: Vec::new(),
+                                x0: x0.min(x1),
+                                y0: y0.min(y1),
+                                x1: x0.max(x1),
+                                y1: y0.max(y1),
+                                id: None,
+                            };
+                            let (x0, y0, x1, y1) = match edge.dir {
+                                Dir::Horiz => (
+                                    edge.start,
+                                    layout_mouse_position.y - 2.,
+                                    edge.stop,
+                                    layout_mouse_position.y + 2.,
+                                ),
+                                Dir::Vert => (
+                                    layout_mouse_position.x - 2.,
+                                    edge.start,
+                                    layout_mouse_position.x + 2.,
+                                    edge.stop,
+                                ),
+                            };
+                            let dim_line = Rect {
+                                object_path: Vec::new(),
+                                x0,
+                                y0,
+                                x1,
+                                y1,
+                                id: None,
+                            };
+                            for r in &[start_line, stop_line, dim_line] {
+                                if let Some(quad) = get_paint_quad(
+                                    r,
+                                    bounds,
+                                    scale,
+                                    offset,
+                                    ShapeFill::Solid,
+                                    rgb(0x0),
+                                    rgba(0),
+                                ) {
+                                    window.paint_quad(quad);
+                                }
+                            }
                         }
                     }
                 })
