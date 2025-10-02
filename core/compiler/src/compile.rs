@@ -2,7 +2,7 @@
 //!
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::BufReader;
 use std::path::Path;
 
@@ -62,8 +62,8 @@ fn check_layers(output: &CompileOutput) {
 
 #[derive(Default)]
 pub(crate) struct VarIdTyFrame<'a> {
-    var_bindings: HashMap<&'a str, (VarId, Ty)>,
-    scope_bindings: HashSet<&'a str>,
+    var_bindings: IndexMap<&'a str, (VarId, Ty)>,
+    scope_bindings: IndexSet<&'a str>,
 }
 
 pub(crate) struct VarIdTyPass<'a> {
@@ -113,12 +113,12 @@ pub struct FnTy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
     args: Vec<Ty>,
-    data: HashMap<String, Ty>,
+    data: IndexMap<String, Ty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellTy {
-    data: HashMap<String, Ty>,
+    data: IndexMap<String, Ty>,
 }
 
 impl AstMetadata for VarIdTyMetadata {
@@ -769,7 +769,7 @@ pub(crate) struct DynLoc {
 
 #[derive(Clone)]
 struct Frame {
-    bindings: HashMap<VarId, ValueId>,
+    bindings: IndexMap<VarId, ValueId>,
     parent: Option<FrameId>,
 }
 
@@ -805,9 +805,9 @@ struct CellState {
 
 struct ExecPass<'a> {
     ast: &'a Ast<&'a str, VarIdTyMetadata>,
-    cell_states: HashMap<CellId, CellState>,
-    values: HashMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
-    frames: HashMap<FrameId, Frame>,
+    cell_states: IndexMap<CellId, CellState>,
+    values: IndexMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
+    frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
     global_frame: FrameId,
     next_id: u64,
@@ -816,7 +816,7 @@ struct ExecPass<'a> {
     // The first element of this stack is the root cell.
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
-    compiled_cells: HashMap<CellId, CompiledCell>,
+    compiled_cells: IndexMap<CellId, CompiledCell>,
 }
 
 enum ExecScopeName {
@@ -830,9 +830,9 @@ impl<'a> ExecPass<'a> {
     pub(crate) fn new(ast: &'a Ast<&'a str, VarIdTyMetadata>) -> Self {
         Self {
             ast,
-            cell_states: HashMap::new(),
-            values: HashMap::from_iter([(1, DeferValue::Ready(Value::None))]),
-            frames: HashMap::from_iter([(
+            cell_states: IndexMap::new(),
+            values: IndexMap::from_iter([(1, DeferValue::Ready(Value::None))]),
+            frames: IndexMap::from_iter([(
                 0,
                 Frame {
                     bindings: Default::default(),
@@ -843,7 +843,7 @@ impl<'a> ExecPass<'a> {
             global_frame: 0,
             next_id: 2,
             partial_cells: VecDeque::new(),
-            compiled_cells: HashMap::new(),
+            compiled_cells: IndexMap::new(),
         }
     }
 
@@ -983,7 +983,11 @@ impl<'a> ExecPass<'a> {
                 }
                 let mut constraint_added = false;
                 while let Some(expr) = state.fallback_constraints.pop() {
-                    if expr.coeffs.iter().any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v)) {
+                    if expr
+                        .coeffs
+                        .iter()
+                        .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
+                    {
                         state.fallback_constraints_used.push(expr.clone());
                         state.solver.constrain_eq0(expr);
                         constraint_added = true;
@@ -1056,11 +1060,11 @@ impl<'a> ExecPass<'a> {
         };
 
         let mut ccell = CompiledCell {
-            scopes: HashMap::new(),
+            scopes: IndexMap::new(),
             root: state.root_scope,
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             nullspace_vecs: state.nullspace_vecs.clone().unwrap_or_default(),
-            objects: HashMap::new(),
+            objects: IndexMap::new(),
         };
         fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
             if cell.scopes.contains_key(&id) {
@@ -1478,7 +1482,7 @@ impl<'a> ExecPass<'a> {
     }
 
     fn eval_partial(&mut self, vid: ValueId) -> bool {
-        let v = self.values.remove(&vid);
+        let v = self.values.swap_remove(&vid);
         if v.is_none() {
             return false;
         }
@@ -2219,9 +2223,9 @@ pub struct CompiledScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCell {
-    pub scopes: HashMap<ScopeId, CompiledScope>,
+    pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
-    pub objects: HashMap<ObjectId, SolvedValue>,
+    pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
     pub nullspace_vecs: Vec<Vec<f64>>,
 }
@@ -2283,7 +2287,7 @@ pub struct StaticErrorCompileOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidCompileOutput {
-    pub cells: HashMap<CellId, CompiledCell>,
+    pub cells: IndexMap<CellId, CompiledCell>,
     pub top: CellId,
     pub layers: LayerProperties,
 }

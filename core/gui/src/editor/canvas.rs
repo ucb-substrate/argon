@@ -281,10 +281,11 @@ impl Element for CanvasElement {
         let mut scope_rects = Vec::new();
         let mut select_rects = Vec::new();
         if let Some(solved_cell) = solved_cell {
+            let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let mut queue = VecDeque::from_iter([(
                 ScopeAddress {
-                    cell: solved_cell.selected_scope.cell,
-                    scope: solved_cell.output.cells[&solved_cell.selected_scope.cell].root,
+                    cell: scope_address.cell,
+                    scope: solved_cell.output.cells[&scope_address.cell].root,
                 },
                 TransformationMatrix::identity(),
                 (0., 0.),
@@ -304,7 +305,9 @@ impl Element for CanvasElement {
                 if let Some(selected_rect) = selected_rect
                     && Some(curr_address)
                         == match selected_rect {
-                            RectId::Scope(id) => solved_cell.state[&id].parent,
+                            RectId::Scope(id) => {
+                                solved_cell.state[&solved_cell.scope_paths[&id]].parent
+                            }
                             RectId::Element(id) => Some(id.scope),
                         }
                 {
@@ -312,7 +315,7 @@ impl Element for CanvasElement {
                 }
                 let cell_info = &solved_cell.output.cells[&cell];
                 let scope_info = &cell_info.scopes[&scope];
-                let scope_state = &solved_cell.state[&curr_address];
+                let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
                 if show && (depth >= state.hierarchy_depth || !scope_state.visible) {
                     if let Some(bbox) = &scope_state.bbox {
                         let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
@@ -375,7 +378,8 @@ impl Element for CanvasElement {
                             };
                             let new_mat = mat * inst_mat;
                             let new_ofs = (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1);
-                            let scope_state = &solved_cell.state[&inst_address];
+                            let scope_state =
+                                &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
                             let mut show = show;
                             if show && (depth + 1 >= state.hierarchy_depth || !scope_state.visible)
                             {
@@ -417,7 +421,10 @@ impl Element for CanvasElement {
             }
             if let Some(selected_rect) = selected_rect {
                 let r = match selected_rect {
-                    RectId::Scope(id) => solved_cell.state[&id].bbox.clone().map(|r| r.into()),
+                    RectId::Scope(id) => solved_cell.state[&solved_cell.scope_paths[&id]]
+                        .bbox
+                        .clone()
+                        .map(|r| r.into()),
                     RectId::Element(id) => match &solved_cell.output.cells[&id.scope.cell].objects
                         [&solved_cell.output.cells[&id.scope.cell].scopes[&id.scope.scope].emit
                             [id.idx]
@@ -429,7 +436,8 @@ impl Element for CanvasElement {
                                 scope: solved_cell.output.cells[&inst.cell].root,
                                 cell: inst.cell,
                             };
-                            let scope_state = &solved_cell.state[&inst_address];
+                            let scope_state =
+                                &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
                             scope_state.bbox.as_ref().map(|rect| {
                                 let mut inst_mat = TransformationMatrix::identity();
                                 if inst.reflect {
@@ -476,7 +484,6 @@ impl Element for CanvasElement {
             edge0: (_, _, edge),
         }) = &inner.dim_tool
         {
-            let pos = inner.px_to_layout(inner.mouse_position);
             let (x0, y0, x1, y1) = match edge.dir {
                 Dir::Horiz => (edge.start, edge.coord - 2., edge.stop, edge.coord + 2.),
                 Dir::Vert => (edge.coord - 2., edge.start, edge.coord + 2., edge.stop),
@@ -629,18 +636,18 @@ impl LayoutCanvas {
                             if let Some(cell) = cell.as_mut() {
                                 // TODO update in memory representation of code
                                 // TODO add solver to gui
-                                let reachable_objs = cell.output.reachable_objs(
-                                    cell.selected_scope.cell,
-                                    cell.selected_scope.scope,
-                                );
+                                let scope_address = &cell.state[&cell.selected_scope].address;
+                                let reachable_objs = cell
+                                    .output
+                                    .reachable_objs(scope_address.cell, scope_address.scope);
                                 let names: IndexSet<_> = reachable_objs.values().collect();
                                 let scope = cell
                                     .output
                                     .cells
-                                    .get_mut(&cell.selected_scope.cell)
+                                    .get_mut(&scope_address.cell)
                                     .unwrap()
                                     .scopes
-                                    .get_mut(&cell.selected_scope.scope)
+                                    .get_mut(&scope_address.scope)
                                     .unwrap();
                                 let rect_name = (0..)
                                     .map(|i| format!("rect{i}"))
@@ -678,7 +685,6 @@ impl LayoutCanvas {
                 }
             }
         } else if let Some(ref mut dim_tool) = self.dim_tool {
-            println!("dim tool handling mouse down");
             let rects = self
                 .rects
                 .iter()
@@ -764,8 +770,6 @@ impl LayoutCanvas {
                     let bounds = edge_px.select_bounds(Pixels(4.));
                     if bounds.contains(&event.position) && rect.id.is_some() {
                         selected = Some((rect, name, edge_layout));
-                        println!("dim tool selected edge");
-                        break;
                     }
                 }
             }
@@ -776,17 +780,17 @@ impl LayoutCanvas {
                         *dim_tool = DimToolState::SelectEdge1 {
                             edge0: (r.object_path.clone(), name.to_string(), edge),
                         };
-                        println!("one dim tool edge selected, path = {:?}", r.object_path);
                     }
                     DimToolState::SelectEdge1 {
-                        edge0: (path0, name0, edge0),
+                        edge0: (path0, name0, _edge0),
                     } => {
-                        println!("second edge selected, path = {:?}", r.object_path);
                         self.state.update(cx, |state, cx| {
                             state.solved_cell.update(cx, |cell, cx| {
                                 if let Some(cell) = cell.as_mut() {
+                                    let selected_scope_addr =
+                                        cell.state[&cell.selected_scope].address;
                                     let find_obj_path = |path: &[ObjectId]| {
-                                        let mut current_scope = cell.selected_scope;
+                                        let mut current_scope = selected_scope_addr;
                                         let mut string_path = Vec::new();
                                         let mut reachable = true;
                                         if path.is_empty() {
@@ -819,9 +823,8 @@ impl LayoutCanvas {
                                             current_scope.scope,
                                         );
                                         if let Some(name) = reachable_objs.swap_remove(obj)
-                                            && let Some(rect) =
-                                                cell.output.cells[&current_scope.cell].objects[obj]
-                                                    .get_rect()
+                                            && cell.output.cells[&current_scope.cell].objects[obj]
+                                                .is_rect()
                                         {
                                             string_path.push(name);
                                         } else {
@@ -835,17 +838,14 @@ impl LayoutCanvas {
                                     {
                                         let path0 = path0.join(".");
                                         let path1 = path1.join(".");
-                                        println!("adding constraint");
                                         state.lsp_client.add_eq_constraint(
                                             cell.file.clone(),
-                                            cell.output.cells[&cell.selected_scope.cell].scopes
-                                                [&cell.selected_scope.scope]
+                                            cell.output.cells[&selected_scope_addr.cell].scopes
+                                                [&selected_scope_addr.scope]
                                                 .span,
                                             format!("{}.{}", path0, name0),
                                             format!("{}.{}", path1, name),
                                         );
-                                    } else {
-                                        println!("not reachable");
                                     }
                                 }
                             })
@@ -943,7 +943,6 @@ impl LayoutCanvas {
     pub(crate) fn draw_dim(&mut self, _: &DrawDim, _window: &mut Window, _cx: &mut Context<Self>) {
         self.rect_tool = None;
         if self.dim_tool.is_none() {
-            println!("open dim tool");
             self.dim_tool = Some(DimToolState::SelectEdge0);
         }
     }
@@ -964,7 +963,7 @@ impl LayoutCanvas {
             }
         }
         self.state.update(cx, |state, cx| {
-            state.solved_cell.update(cx, |cell, cx| {
+            state.solved_cell.update(cx, |cell, _cx| {
                 if let Some(cell) = cell.as_mut() {
                     cell.selected_rect = None;
                 }
