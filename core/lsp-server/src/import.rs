@@ -273,6 +273,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
             Expr::Var(var_expr) => Expr::Var(self.transform_var_expr(var_expr)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
+            Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),
             Expr::StringLiteral(string_literal) => Expr::StringLiteral(string_literal.clone()),
             Expr::Scope(scope) => {
                 if let Some(scope_annotation) = &scope.scope_annotation {

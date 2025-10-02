@@ -106,6 +106,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/fallback_inst.ar"
     ));
+    const ARGON_BOOL_LITERAL: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/bool_literal.ar"
+    ));
     const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
@@ -281,6 +285,38 @@ mod tests {
         .unwrap_valid();
         assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
         println!("{cells:#?}");
+    }
+
+    #[test]
+    fn argon_bool_literal() {
+        let ast = parse(ARGON_BOOL_LITERAL).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                params: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let emit = cell.scopes[&cell.root]
+            .children
+            .iter()
+            .flat_map(|s| cell.scopes[s].emit.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(emit.len(), 1);
+        let (obj, _) = emit.first().unwrap();
+        assert_eq!(
+            cell.objects[obj]
+                .as_ref()
+                .unwrap_rect()
+                .layer
+                .as_ref()
+                .unwrap(),
+            "met1"
+        );
     }
 
     // #[test]

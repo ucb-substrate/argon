@@ -244,6 +244,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Var(var_expr) => var_expr.metadata.1.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
+            Expr::BoolLiteral(_) => Ty::Bool,
             Expr::StringLiteral(_) => Ty::String,
             Expr::Scope(scope) => scope.metadata.clone(),
             Expr::Cast(cast) => cast.metadata.clone(),
@@ -809,6 +810,8 @@ struct ExecPass<'a> {
     values: IndexMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
+    true_value: ValueId,
+    false_value: ValueId,
     global_frame: FrameId,
     next_id: u64,
     // A stack of cells being evaluated.
@@ -831,7 +834,11 @@ impl<'a> ExecPass<'a> {
         Self {
             ast,
             cell_states: IndexMap::new(),
-            values: IndexMap::from_iter([(1, DeferValue::Ready(Value::None))]),
+            values: IndexMap::from_iter([
+                (1, DeferValue::Ready(Value::None)),
+                (2, DeferValue::Ready(Value::Bool(true))),
+                (3, DeferValue::Ready(Value::Bool(false))),
+            ]),
             frames: IndexMap::from_iter([(
                 0,
                 Frame {
@@ -840,8 +847,10 @@ impl<'a> ExecPass<'a> {
                 },
             )]),
             nil_value: 1,
+            true_value: 2,
+            false_value: 3,
             global_frame: 0,
-            next_id: 2,
+            next_id: 4,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
         }
@@ -1316,6 +1325,13 @@ impl<'a> ExecPass<'a> {
                 let vid = self.value_id();
                 self.values.insert(vid, Defer::Ready(Value::Int(i.value)));
                 return vid;
+            }
+            Expr::BoolLiteral(b) => {
+                return if b.value {
+                    self.true_value
+                } else {
+                    self.false_value
+                };
             }
             Expr::StringLiteral(s) => {
                 let vid = self.value_id();
