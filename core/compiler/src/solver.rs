@@ -211,6 +211,20 @@ impl std::ops::Sub<LinearExpr> for LinearExpr {
     }
 }
 
+impl std::ops::Sub<&LinearExpr> for LinearExpr {
+    type Output = Self;
+    fn sub(self, rhs: &LinearExpr) -> Self::Output {
+        Self {
+            coeffs: self
+                .coeffs
+                .into_iter()
+                .chain(rhs.coeffs.iter().map(|(c, v)| (-c, *v)))
+                .collect(),
+            constant: self.constant - rhs.constant,
+        }
+    }
+}
+
 impl std::ops::Mul<f64> for LinearExpr {
     type Output = Self;
     fn mul(self, rhs: f64) -> Self::Output {

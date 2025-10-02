@@ -207,7 +207,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_fn_decl(&mut self, input: &FnDecl<&'a str, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name) {
             self.errors.push(StaticError {
                 span: input.name.span,
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -336,7 +336,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CellDecl<&'a str, Self::InputMetadata>,
     ) -> CellDecl<&'a str, Self::OutputMetadata> {
-        if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name) {
             self.errors.push(StaticError {
                 span: input.name.span,
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -572,6 +572,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 assert_eq!(args.posargs[1].ty(), Ty::Float);
                 (None, Ty::Nil)
             }
+            "dimension" => {
+                assert_eq!(args.posargs.len(), 7);
+                for (i, arg) in args.posargs.iter().enumerate() {
+                    if i == 6 {
+                        assert_eq!(arg.ty(), Ty::Bool);
+                    } else {
+                        assert_eq!(arg.ty(), Ty::Float);
+                    }
+                }
+                (None, Ty::Nil)
+            }
             "inst" => {
                 assert_eq!(args.posargs.len(), 1);
                 for kwarg in &args.kwargs {
@@ -744,6 +755,19 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Dimension<T> {
+    pub id: ObjectId,
+    pub p: T,
+    pub n: T,
+    pub value: T,
+    pub coord: T,
+    pub pstop: T,
+    pub nstop: T,
+    pub horiz: bool,
+    pub span: Option<cfgrammar::Span>,
 }
 
 type FrameId = u64;
@@ -1042,6 +1066,17 @@ impl<'a> ExecPass<'a> {
                     y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
                     x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
                     y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
+                }),
+                Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
+                    id: dim.id,
+                    p: state.solver.value_of(dim.p).unwrap(),
+                    n: state.solver.value_of(dim.n).unwrap(),
+                    value: state.solver.value_of(dim.value).unwrap(),
+                    coord: state.solver.value_of(dim.coord).unwrap(),
+                    pstop: state.solver.value_of(dim.pstop).unwrap(),
+                    nstop: state.solver.value_of(dim.nstop).unwrap(),
+                    horiz: dim.horiz,
+                    span: dim.span,
                 }),
                 Object::Inst(inst) => SolvedValue::Instance(SolvedInstance {
                     id: inst.id,
@@ -1353,7 +1388,7 @@ impl<'a> ExecPass<'a> {
                 return value;
             }
             Expr::Call(c) => {
-                if ["rect", "crect", "float", "inst", "eq"].contains(&c.func.name) {
+                if ["rect", "crect", "float", "inst", "eq", "dimension"].contains(&c.func.name) {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
                         state: CallExprState {
@@ -1623,6 +1658,42 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                "dimension" => {
+                    let args = c
+                        .state
+                        .posargs
+                        .iter()
+                        .map(|vid| self.values[vid].get_ready())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(args) = args {
+                        let id = object_id(&mut self.next_id);
+                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let dim = Dimension {
+                            id,
+                            p: state.solver.new_var(),
+                            n: state.solver.new_var(),
+                            value: state.solver.new_var(),
+                            coord: state.solver.new_var(),
+                            pstop: state.solver.new_var(),
+                            nstop: state.solver.new_var(),
+                            horiz: *args[6].as_ref().unwrap_bool(),
+                            span: Some(c.expr.span),
+                        };
+                        state.objects.insert(dim.id, dim.clone().into());
+                        for (var, rhs) in [dim.p, dim.n, dim.value, dim.coord, dim.pstop, dim.nstop]
+                            .iter()
+                            .zip(args.iter())
+                        {
+                            state.solver.constrain_eq0(
+                                LinearExpr::from(*var) - rhs.as_ref().unwrap_linear(),
+                            );
+                        }
+                        self.values.insert(vid, Defer::Ready(Value::None));
+                        true
+                    } else {
+                        false
+                    }
+                }
                 "inst" => {
                     let refl = c
                         .expr
@@ -1674,7 +1745,7 @@ impl<'a> ExecPass<'a> {
                         Some(Some(l)) => Some(Some(l)),
                     };
                     if let (Some(refl), Some(angle)) = (refl, angle) {
-                        let id = self.object_id();
+                        let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let inst = Instance {
                             id,
@@ -2039,6 +2110,7 @@ impl<'a> ExecPass<'a> {
                                                 state.solver.constrain_eq0(dy);
                                                 Some(Value::Inst(oinst))
                                             }
+                                            _ => unreachable!(),
                                         }
                                     } else {
                                         None
@@ -2203,6 +2275,7 @@ pub struct SolvedInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Rect(Rect<(f64, Var)>),
+    Dimension(Dimension<f64>),
     Instance(SolvedInstance),
 }
 
@@ -2210,12 +2283,19 @@ pub enum SolvedValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Object {
     Rect(Rect<Var>),
+    Dimension(Dimension<Var>),
     Inst(Instance),
 }
 
 impl From<Rect<Var>> for Object {
     fn from(value: Rect<Var>) -> Self {
         Self::Rect(value)
+    }
+}
+
+impl From<Dimension<Var>> for Object {
+    fn from(value: Dimension<Var>) -> Self {
+        Self::Dimension(value)
     }
 }
 
@@ -2536,6 +2616,7 @@ impl ValidCompileOutput {
                     SolvedValue::Instance(inst) => {
                         set.insert(inst.id, format!("{}{}", name_prefix, name));
                     }
+                    _ => (),
                 }
             }
         }
