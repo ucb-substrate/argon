@@ -142,6 +142,19 @@ impl SyncGuiToLspClient {
             .compat(),
         );
     }
+
+    pub fn add_eq_constraint(&self, file: PathBuf, scope_span: Span, lhs: String, rhs: String) {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .add_eq_constraint(context::current(), file, scope_span, lhs, rhs)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        );
+    }
 }
 
 type StateMutFn = Box<dyn FnOnce(&mut EditorState, &mut Context<EditorState>) + Send>;

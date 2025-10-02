@@ -32,6 +32,7 @@ pub fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("r", DrawRect, None),
+            KeyBinding::new("d", DrawDim, None),
             KeyBinding::new("escape", Cancel, None),
         ]);
         // Register the `quit` function so it can be referenced by the `MenuItem::action` in the menu bar
@@ -65,7 +66,7 @@ pub fn main() {
 }
 
 // Associate actions using the `actions!` macro (or `impl_actions!` macro)
-actions!(Argon, [Quit, DrawRect, Cancel]);
+actions!(Argon, [Quit, DrawRect, DrawDim, Cancel]);
 
 // Define the quit function that is registered with the App
 fn quit(_: &Quit, cx: &mut App) {
