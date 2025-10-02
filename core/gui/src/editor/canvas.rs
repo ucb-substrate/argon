@@ -147,7 +147,9 @@ struct RectToolState {
 
 enum DimToolState {
     SelectEdge0,
-    SelectEdge1 { edge0: (Vec<ObjectId>, String) },
+    SelectEdge1 {
+        edge0: (Vec<ObjectId>, String, Edge<f32>),
+    },
 }
 
 pub struct LayoutCanvas {
@@ -470,6 +472,24 @@ impl Element for CanvasElement {
                 layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
             ));
         }
+        if let Some(DimToolState::SelectEdge1 {
+            edge0: (_, _, edge),
+        }) = &inner.dim_tool
+        {
+            let pos = inner.px_to_layout(inner.mouse_position);
+            let (x0, y0, x1, y1) = match edge.dir {
+                Dir::Horiz => (edge.start, edge.coord - 2., edge.stop, edge.coord + 2.),
+                Dir::Vert => (edge.coord - 2., edge.start, edge.coord + 2., edge.stop),
+            };
+            select_rects = vec![Rect {
+                object_path: Vec::new(),
+                x0,
+                y0,
+                x1,
+                y1,
+                id: None,
+            }];
+        }
         let rects = rects
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
@@ -679,9 +699,15 @@ impl LayoutCanvas {
                     ),
                 )
             }) {
-                for (name, edge) in [
+                for (name, edge_layout, edge_px) in [
                     (
                         "y0",
+                        Edge {
+                            dir: Dir::Horiz,
+                            coord: rect.y0,
+                            start: rect.x0,
+                            stop: rect.x1,
+                        },
                         Edge {
                             dir: Dir::Horiz,
                             coord: r.bottom(),
@@ -693,6 +719,12 @@ impl LayoutCanvas {
                         "y1",
                         Edge {
                             dir: Dir::Horiz,
+                            coord: rect.y1,
+                            start: rect.x0,
+                            stop: rect.x1,
+                        },
+                        Edge {
+                            dir: Dir::Horiz,
                             coord: r.top(),
                             start: r.left(),
                             stop: r.right(),
@@ -700,6 +732,12 @@ impl LayoutCanvas {
                     ),
                     (
                         "x0",
+                        Edge {
+                            dir: Dir::Vert,
+                            coord: rect.x0,
+                            start: rect.y0,
+                            stop: rect.y1,
+                        },
                         Edge {
                             dir: Dir::Vert,
                             coord: r.left(),
@@ -711,31 +749,37 @@ impl LayoutCanvas {
                         "x1",
                         Edge {
                             dir: Dir::Vert,
+                            coord: rect.x1,
+                            start: rect.y0,
+                            stop: rect.y1,
+                        },
+                        Edge {
+                            dir: Dir::Vert,
                             coord: r.right(),
                             start: r.top(),
                             stop: r.bottom(),
                         },
                     ),
                 ] {
-                    let bounds = edge.select_bounds(Pixels(4.));
+                    let bounds = edge_px.select_bounds(Pixels(4.));
                     if bounds.contains(&event.position) && rect.id.is_some() {
-                        selected = Some((rect, name));
+                        selected = Some((rect, name, edge_layout));
                         println!("dim tool selected edge");
                         break;
                     }
                 }
             }
 
-            if let Some((r, edge)) = selected {
+            if let Some((r, name, edge)) = selected {
                 match dim_tool {
                     DimToolState::SelectEdge0 => {
                         *dim_tool = DimToolState::SelectEdge1 {
-                            edge0: (r.object_path.clone(), edge.to_string()),
+                            edge0: (r.object_path.clone(), name.to_string(), edge),
                         };
                         println!("one dim tool edge selected, path = {:?}", r.object_path);
                     }
                     DimToolState::SelectEdge1 {
-                        edge0: (path0, edge0),
+                        edge0: (path0, name0, edge0),
                     } => {
                         println!("second edge selected, path = {:?}", r.object_path);
                         self.state.update(cx, |state, cx| {
@@ -797,8 +841,8 @@ impl LayoutCanvas {
                                             cell.output.cells[&cell.selected_scope.cell].scopes
                                                 [&cell.selected_scope.scope]
                                                 .span,
-                                            format!("{}.{}", path0, edge0),
-                                            format!("{}.{}", path1, edge),
+                                            format!("{}.{}", path0, name0),
+                                            format!("{}.{}", path1, name),
                                         );
                                     } else {
                                         println!("not reachable");
@@ -919,6 +963,13 @@ impl LayoutCanvas {
                 *dim_tool = DimToolState::SelectEdge0;
             }
         }
+        self.state.update(cx, |state, cx| {
+            state.solved_cell.update(cx, |cell, cx| {
+                if let Some(cell) = cell.as_mut() {
+                    cell.selected_rect = None;
+                }
+            })
+        });
         cx.notify();
     }
 
