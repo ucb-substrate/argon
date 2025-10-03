@@ -2,6 +2,8 @@ use clap::Parser;
 use compile::CompileInput;
 use std::path::PathBuf;
 
+use crate::compile::CellArg;
+
 pub mod ast;
 pub mod compile;
 pub mod layer;
@@ -39,13 +41,15 @@ pub fn main() {
             &ast,
             CompileInput {
                 cell: cell_ast.func.name,
-                params: cell_ast
+                args: cell_ast
                     .args
                     .posargs
                     .iter()
                     .map(|arg| match arg {
-                        ast::Expr::FloatLiteral(float_literal) => float_literal.value,
-                        ast::Expr::IntLiteral(int_literal) => int_literal.value as f64,
+                        ast::Expr::FloatLiteral(float_literal) => {
+                            CellArg::Float(float_literal.value)
+                        }
+                        ast::Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
                         _ => panic!("must be int or float literal for now"),
                     })
                     .collect(),
@@ -62,7 +66,7 @@ mod tests {
     use approx::assert_relative_eq;
     use parse::parse;
 
-    use crate::compile::{CompileInput, compile};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     use super::*;
@@ -120,6 +124,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/param_float.ar"
     ));
+    const ARGON_PARAM_INT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/param_int.ar"
+    ));
     const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
@@ -132,7 +140,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "scopes",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -146,7 +154,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "immediate",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -160,7 +168,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "if_test",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -175,7 +183,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "if_test",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -189,7 +197,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "via",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -203,7 +211,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "vias",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -217,7 +225,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "test",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -231,7 +239,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -245,7 +253,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -260,7 +268,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -274,7 +282,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
@@ -290,7 +298,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
@@ -306,7 +314,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -338,7 +346,7 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: Vec::new(),
+                args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
@@ -361,12 +369,27 @@ mod tests {
             &ast,
             CompileInput {
                 cell: "top",
-                params: vec![50., 20.],
+                args: vec![CellArg::Float(50.), CellArg::Float(20.)],
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
-        let cells = cells.unwrap_valid();
+        cells.unwrap_valid();
+    }
+
+    #[test]
+    fn argon_param_int() {
+        let ast = parse(ARGON_PARAM_INT).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                args: vec![CellArg::Int(50), CellArg::Int(20)],
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        cells.unwrap_valid();
     }
 
     // #[test]
@@ -375,7 +398,7 @@ mod tests {
     //     let cell = compile(CompileInput {
     //         cell: "inverter",
     //         ast: &ast,
-    //         params: HashMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
+    //         args: HashMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
     //     })
     //     .expect("failed to solve compile Argon cell");
     //     println!("cell: {cell:?}");

@@ -32,7 +32,7 @@ pub fn compile(ast: &ParseAst<'_>, input: CompileInput<'_>) -> CompileOutput {
     };
     let input = CompileInput {
         cell: input.cell,
-        params: input.params,
+        args: input.args,
         lyp_file: input.lyp_file,
     };
 
@@ -724,9 +724,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub enum CellArg {
+    Float(f64),
+    Int(i64),
+}
+
+#[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
     pub cell: &'a str,
-    pub params: Vec<f64>,
+    pub args: Vec<CellArg>,
     pub lyp_file: &'a Path,
 }
 
@@ -894,7 +900,7 @@ impl<'a> ExecPass<'a> {
 
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
-        let cell_id = self.execute_cell(input.cell, input.params);
+        let cell_id = self.execute_cell(input.cell, input.args);
         let layers =
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
@@ -906,7 +912,7 @@ impl<'a> ExecPass<'a> {
         })
     }
 
-    pub(crate) fn execute_cell(&mut self, cell: &'a str, args: Vec<f64>) -> CellId {
+    pub(crate) fn execute_cell(&mut self, cell: &'a str, args: Vec<CellArg>) -> CellId {
         let cell_decl = self
             .ast
             .decls
@@ -929,8 +935,11 @@ impl<'a> ExecPass<'a> {
         assert_eq!(args.len(), cell_decl.args.len());
         for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
-            self.values
-                .insert(vid, DeferValue::Ready(Value::Linear(LinearExpr::from(val))));
+            let val = match val {
+                CellArg::Int(i) => Value::Int(i),
+                CellArg::Float(f) => Value::Linear(LinearExpr::from(f)),
+            };
+            self.values.insert(vid, DeferValue::Ready(val));
             frame.bindings.insert(decl.metadata.0, vid);
         }
         let fid = self.frame_id();
@@ -1811,11 +1820,13 @@ impl<'a> ExecPass<'a> {
                         .posargs
                         .iter()
                         .map(|v| {
-                            self.values[v]
-                                .get_ready()
-                                .and_then(|v| state.solver.eval_expr(v.as_ref().unwrap_linear()))
+                            self.values[v].get_ready().and_then(|v| match v {
+                                Value::Linear(v) => state.solver.eval_expr(v).map(CellArg::Float),
+                                Value::Int(i) => Some(CellArg::Int(*i)),
+                                _ => unreachable!(),
+                            })
                         })
-                        .collect::<Option<Vec<f64>>>();
+                        .collect::<Option<Vec<CellArg>>>();
                     if let Some(arg_vals) = arg_vals {
                         let cell = self.execute_cell(cell, arg_vals);
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
