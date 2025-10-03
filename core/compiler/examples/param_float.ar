@@ -1,0 +1,11 @@
+cell bot(x: Float, y: Float) {
+    let met1 = rect("met1", x0=0., y0=0., x1=x, y1=y)!;
+}
+
+cell top(x: Float, y: Float) {
+    let bot_cell = bot(200., 100.);
+    let bot = inst(bot_cell)!;
+    eq(bot.x, x);
+    eq(bot.y, y);
+    let met2 = rect("met2", x0=0., y0=0., x1=200., y1=100.)!;
+}

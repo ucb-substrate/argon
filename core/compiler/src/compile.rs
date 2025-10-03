@@ -906,8 +906,7 @@ impl<'a> ExecPass<'a> {
         })
     }
 
-    pub(crate) fn execute_cell(&mut self, cell: &'a str, _params: Vec<f64>) -> CellId {
-        // TODO: use params
+    pub(crate) fn execute_cell(&mut self, cell: &'a str, args: Vec<f64>) -> CellId {
         let cell_decl = self
             .ast
             .decls
@@ -923,10 +922,17 @@ impl<'a> ExecPass<'a> {
             })
             .expect("cell not found");
 
-        let frame = Frame {
+        let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
         };
+        assert_eq!(args.len(), cell_decl.args.len());
+        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
+            let vid = self.value_id();
+            self.values
+                .insert(vid, DeferValue::Ready(Value::Linear(LinearExpr::from(val))));
+            frame.bindings.insert(decl.metadata.0, vid);
+        }
         let fid = self.frame_id();
         self.frames.insert(fid, frame);
 
