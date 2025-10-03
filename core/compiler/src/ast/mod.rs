@@ -47,6 +47,12 @@ pub struct StringLiteral<S> {
     pub value: S,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BoolLiteral {
+    pub span: Span,
+    pub value: bool,
+}
+
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct EnumDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
@@ -158,6 +164,7 @@ pub enum Expr<S, T: AstMetadata> {
     FloatLiteral(FloatLiteral),
     IntLiteral(IntLiteral),
     StringLiteral(StringLiteral<S>),
+    BoolLiteral(BoolLiteral),
     Scope(Box<Scope<S, T>>),
     Cast(Box<CastExpr<S, T>>),
 }
@@ -294,6 +301,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::FloatLiteral(x) => x.span,
             Self::IntLiteral(x) => x.span,
             Self::StringLiteral(x) => x.span,
+            Self::BoolLiteral(x) => x.span,
             Self::Scope(x) => x.span,
             Self::Cast(x) => x.span,
         }
@@ -829,6 +837,7 @@ pub trait AstTransformer {
             Expr::Var(var_expr) => Expr::Var(self.transform_var_expr(var_expr)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
+            Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),
             Expr::StringLiteral(string_literal) => {
                 Expr::StringLiteral(self.transform_string_literal(string_literal))
             }

@@ -32,7 +32,7 @@ pub fn compile(ast: &ParseAst<'_>, input: CompileInput<'_>) -> CompileOutput {
     };
     let input = CompileInput {
         cell: input.cell,
-        params: input.params,
+        args: input.args,
         lyp_file: input.lyp_file,
     };
 
@@ -207,7 +207,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_fn_decl(&mut self, input: &FnDecl<&'a str, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name) {
             self.errors.push(StaticError {
                 span: input.name.span,
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -244,6 +244,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Var(var_expr) => var_expr.metadata.1.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
+            Expr::BoolLiteral(_) => Ty::Bool,
             Expr::StringLiteral(_) => Ty::String,
             Expr::Scope(scope) => scope.metadata.clone(),
             Expr::Cast(cast) => cast.metadata.clone(),
@@ -335,7 +336,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CellDecl<&'a str, Self::InputMetadata>,
     ) -> CellDecl<&'a str, Self::OutputMetadata> {
-        if ["crect", "rect", "float", "eq", "inst"].contains(&input.name.name) {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name) {
             self.errors.push(StaticError {
                 span: input.name.span,
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -571,6 +572,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 assert_eq!(args.posargs[1].ty(), Ty::Float);
                 (None, Ty::Nil)
             }
+            "dimension" => {
+                assert_eq!(args.posargs.len(), 7);
+                for (i, arg) in args.posargs.iter().enumerate() {
+                    if i == 6 {
+                        assert_eq!(arg.ty(), Ty::Bool);
+                    } else {
+                        assert_eq!(arg.ty(), Ty::Float);
+                    }
+                }
+                (None, Ty::Nil)
+            }
             "inst" => {
                 assert_eq!(args.posargs.len(), 1);
                 for kwarg in &args.kwargs {
@@ -712,9 +724,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub enum CellArg {
+    Float(f64),
+    Int(i64),
+}
+
+#[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
     pub cell: &'a str,
-    pub params: Vec<f64>,
+    pub args: Vec<CellArg>,
     pub lyp_file: &'a Path,
 }
 
@@ -743,6 +761,19 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Dimension<T> {
+    pub id: ObjectId,
+    pub p: T,
+    pub n: T,
+    pub value: T,
+    pub coord: T,
+    pub pstop: T,
+    pub nstop: T,
+    pub horiz: bool,
+    pub span: Option<cfgrammar::Span>,
 }
 
 type FrameId = u64;
@@ -809,6 +840,8 @@ struct ExecPass<'a> {
     values: IndexMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
+    true_value: ValueId,
+    false_value: ValueId,
     global_frame: FrameId,
     next_id: u64,
     // A stack of cells being evaluated.
@@ -831,7 +864,11 @@ impl<'a> ExecPass<'a> {
         Self {
             ast,
             cell_states: IndexMap::new(),
-            values: IndexMap::from_iter([(1, DeferValue::Ready(Value::None))]),
+            values: IndexMap::from_iter([
+                (1, DeferValue::Ready(Value::None)),
+                (2, DeferValue::Ready(Value::Bool(true))),
+                (3, DeferValue::Ready(Value::Bool(false))),
+            ]),
             frames: IndexMap::from_iter([(
                 0,
                 Frame {
@@ -840,8 +877,10 @@ impl<'a> ExecPass<'a> {
                 },
             )]),
             nil_value: 1,
+            true_value: 2,
+            false_value: 3,
             global_frame: 0,
-            next_id: 2,
+            next_id: 4,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
         }
@@ -861,7 +900,7 @@ impl<'a> ExecPass<'a> {
 
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
-        let cell_id = self.execute_cell(input.cell, input.params);
+        let cell_id = self.execute_cell(input.cell, input.args);
         let layers =
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
@@ -873,8 +912,7 @@ impl<'a> ExecPass<'a> {
         })
     }
 
-    pub(crate) fn execute_cell(&mut self, cell: &'a str, _params: Vec<f64>) -> CellId {
-        // TODO: use params
+    pub(crate) fn execute_cell(&mut self, cell: &'a str, args: Vec<CellArg>) -> CellId {
         let cell_decl = self
             .ast
             .decls
@@ -890,10 +928,20 @@ impl<'a> ExecPass<'a> {
             })
             .expect("cell not found");
 
-        let frame = Frame {
+        let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
         };
+        assert_eq!(args.len(), cell_decl.args.len());
+        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
+            let vid = self.value_id();
+            let val = match val {
+                CellArg::Int(i) => Value::Int(i),
+                CellArg::Float(f) => Value::Linear(LinearExpr::from(f)),
+            };
+            self.values.insert(vid, DeferValue::Ready(val));
+            frame.bindings.insert(decl.metadata.0, vid);
+        }
         let fid = self.frame_id();
         self.frames.insert(fid, frame);
 
@@ -1033,6 +1081,17 @@ impl<'a> ExecPass<'a> {
                     y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
                     x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
                     y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
+                }),
+                Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
+                    id: dim.id,
+                    p: (state.solver.value_of(dim.p).unwrap(), dim.p),
+                    n: (state.solver.value_of(dim.n).unwrap(), dim.n),
+                    value: (state.solver.value_of(dim.value).unwrap(), dim.value),
+                    coord: (state.solver.value_of(dim.coord).unwrap(), dim.coord),
+                    pstop: (state.solver.value_of(dim.pstop).unwrap(), dim.pstop),
+                    nstop: (state.solver.value_of(dim.nstop).unwrap(), dim.nstop),
+                    horiz: dim.horiz,
+                    span: dim.span,
                 }),
                 Object::Inst(inst) => SolvedValue::Instance(SolvedInstance {
                     id: inst.id,
@@ -1317,6 +1376,13 @@ impl<'a> ExecPass<'a> {
                 self.values.insert(vid, Defer::Ready(Value::Int(i.value)));
                 return vid;
             }
+            Expr::BoolLiteral(b) => {
+                return if b.value {
+                    self.true_value
+                } else {
+                    self.false_value
+                };
+            }
             Expr::StringLiteral(s) => {
                 let vid = self.value_id();
                 self.values
@@ -1337,7 +1403,7 @@ impl<'a> ExecPass<'a> {
                 return value;
             }
             Expr::Call(c) => {
-                if ["rect", "crect", "float", "inst", "eq"].contains(&c.func.name) {
+                if ["rect", "crect", "float", "inst", "eq", "dimension"].contains(&c.func.name) {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
                         state: CallExprState {
@@ -1607,6 +1673,46 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                "dimension" => {
+                    let args = c
+                        .state
+                        .posargs
+                        .iter()
+                        .map(|vid| self.values[vid].get_ready())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(args) = args {
+                        assert_eq!(args.len(), 7);
+                        let id = object_id(&mut self.next_id);
+                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let dim = Dimension {
+                            id,
+                            p: state.solver.new_var(),
+                            n: state.solver.new_var(),
+                            value: state.solver.new_var(),
+                            coord: state.solver.new_var(),
+                            pstop: state.solver.new_var(),
+                            nstop: state.solver.new_var(),
+                            horiz: *args[6].as_ref().unwrap_bool(),
+                            span: Some(c.expr.span),
+                        };
+                        state.objects.insert(dim.id, dim.clone().into());
+                        for (var, rhs) in [dim.p, dim.n, dim.value, dim.coord, dim.pstop, dim.nstop]
+                            .iter()
+                            .zip(args.iter().take(6))
+                        {
+                            let expr = LinearExpr::from(*var) - rhs.as_ref().unwrap_linear();
+                            state.solver.constrain_eq0(expr);
+                        }
+                        let expr = LinearExpr::from(dim.p)
+                            - LinearExpr::from(dim.n)
+                            - LinearExpr::from(dim.value);
+                        state.solver.constrain_eq0(expr);
+                        self.values.insert(vid, Defer::Ready(Value::None));
+                        true
+                    } else {
+                        false
+                    }
+                }
                 "inst" => {
                     let refl = c
                         .expr
@@ -1658,7 +1764,7 @@ impl<'a> ExecPass<'a> {
                         Some(Some(l)) => Some(Some(l)),
                     };
                     if let (Some(refl), Some(angle)) = (refl, angle) {
-                        let id = self.object_id();
+                        let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let inst = Instance {
                             id,
@@ -1714,11 +1820,13 @@ impl<'a> ExecPass<'a> {
                         .posargs
                         .iter()
                         .map(|v| {
-                            self.values[v]
-                                .get_ready()
-                                .and_then(|v| state.solver.eval_expr(v.as_ref().unwrap_linear()))
+                            self.values[v].get_ready().and_then(|v| match v {
+                                Value::Linear(v) => state.solver.eval_expr(v).map(CellArg::Float),
+                                Value::Int(i) => Some(CellArg::Int(*i)),
+                                _ => unreachable!(),
+                            })
                         })
-                        .collect::<Option<Vec<f64>>>();
+                        .collect::<Option<Vec<CellArg>>>();
                     if let Some(arg_vals) = arg_vals {
                         let cell = self.execute_cell(cell, arg_vals);
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
@@ -2023,6 +2131,7 @@ impl<'a> ExecPass<'a> {
                                                 state.solver.constrain_eq0(dy);
                                                 Some(Value::Inst(oinst))
                                             }
+                                            _ => unreachable!(),
                                         }
                                     } else {
                                         None
@@ -2112,7 +2221,7 @@ pub enum Value<'a> {
     /// A cell generator.
     ///
     /// Example:
-    /// ```
+    /// ```argon
     /// cell mycell() {
     ///   // ...
     /// }
@@ -2123,7 +2232,7 @@ pub enum Value<'a> {
     /// A particular parameterization of a cell.
     ///
     /// Example:
-    /// ```
+    /// ```argon
     /// cell mycell() {
     ///   // ...
     /// }
@@ -2136,7 +2245,7 @@ pub enum Value<'a> {
     /// An instantiation of a cell value.
     ///
     /// Example:
-    /// ```
+    /// ```argon
     /// cell mycell() {
     ///   // ...
     /// }
@@ -2187,6 +2296,7 @@ pub struct SolvedInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Rect(Rect<(f64, Var)>),
+    Dimension(Dimension<(f64, Var)>),
     Instance(SolvedInstance),
 }
 
@@ -2194,12 +2304,19 @@ pub enum SolvedValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Object {
     Rect(Rect<Var>),
+    Dimension(Dimension<Var>),
     Inst(Instance),
 }
 
 impl From<Rect<Var>> for Object {
     fn from(value: Rect<Var>) -> Self {
         Self::Rect(value)
+    }
+}
+
+impl From<Dimension<Var>> for Object {
+    fn from(value: Dimension<Var>) -> Self {
+        Self::Dimension(value)
     }
 }
 
@@ -2520,6 +2637,7 @@ impl ValidCompileOutput {
                     SolvedValue::Instance(inst) => {
                         set.insert(inst.id, format!("{}{}", name_prefix, name));
                     }
+                    _ => (),
                 }
             }
         }

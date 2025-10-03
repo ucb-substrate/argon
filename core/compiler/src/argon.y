@@ -26,7 +26,10 @@ Decl -> Result<Decl<&'input str, ParseMetadata>, ()>
   ;
 
 Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
-  : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), metadata: () }) }
+  : 'IDENT' { 
+  let _ = $1.map_err(|_| ())?;
+  Ok(Ident { span: $span, name: $lexer.span_str($span), metadata: () })
+  }
   ;
 
 FloatLiteral -> Result<FloatLiteral, ()>
@@ -45,6 +48,17 @@ StringLiteral -> Result<StringLiteral<&'input str>, ()>
   : 'STRLIT' {
   let v = $1.map_err(|_| ())?;
   Ok(StringLiteral { span: v.span(), value: $lexer.span_str(v.span()).trim_matches('"'), }) }
+  ;
+
+BoolLiteral -> Result<BoolLiteral, ()>
+  : 'TRUE' {
+  let v = $1.map_err(|_| ())?;
+  Ok(BoolLiteral { span: v.span(), value: true, })
+  }
+  | 'FALSE' {
+  let v = $1.map_err(|_| ())?;
+  Ok(BoolLiteral { span: v.span(), value: false, })
+  }
   ;
 
 EnumDecl -> Result<EnumDecl<&'input str, ParseMetadata>, ()>
@@ -280,6 +294,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   | StringLiteral { Ok(Expr::StringLiteral($1?)) }
+  | BoolLiteral { Ok(Expr::BoolLiteral($1?)) }
   | SubFactor 'AS' Ident { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
   ;
 

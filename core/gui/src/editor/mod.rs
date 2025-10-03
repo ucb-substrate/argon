@@ -183,6 +183,7 @@ impl EditorState {
                             }),
                     );
                 }
+                _ => (),
             }
         }
 

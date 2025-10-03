@@ -15,7 +15,7 @@ use std::{
 use arcstr::ArcStr;
 use compiler::{
     ast::{Expr, annotated::AnnotatedAst},
-    compile::{self, CompileInput, CompileOutput},
+    compile::{self, CellArg, CompileInput, CompileOutput},
     parse,
 };
 use futures::prelude::*;
@@ -63,13 +63,13 @@ impl StateMut {
             &ast,
             CompileInput {
                 cell: cell_ast.func.name,
-                params: cell_ast
+                args: cell_ast
                     .args
                     .posargs
                     .iter()
                     .map(|arg| match arg {
-                        Expr::FloatLiteral(float_literal) => float_literal.value,
-                        Expr::IntLiteral(int_literal) => int_literal.value as f64,
+                        Expr::FloatLiteral(float_literal) => CellArg::Float(float_literal.value),
+                        Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
                         _ => panic!("must be int or float literal for now"),
                     })
                     .collect(),
