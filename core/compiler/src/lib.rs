@@ -116,6 +116,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/dimensions.ar"
     ));
+    const ARGON_PARAM_FLOAT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/param_float.ar"
+    ));
     const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
@@ -348,6 +352,21 @@ mod tests {
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 200., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_param_float() {
+        let ast = parse(ARGON_PARAM_FLOAT).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: "top",
+                params: vec![50., 20.],
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
     }
 
     // #[test]
