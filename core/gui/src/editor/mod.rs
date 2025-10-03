@@ -14,9 +14,14 @@ use indexmap::IndexMap;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 
-use crate::{editor::canvas::RectId, rpc::SyncGuiToLspClient, theme::THEME};
+use crate::{
+    editor::{canvas::RectId, input::TextInput},
+    rpc::SyncGuiToLspClient,
+    theme::THEME,
+};
 
 pub mod canvas;
+pub mod input;
 pub mod toolbars;
 
 #[derive(Clone)]
@@ -74,6 +79,7 @@ pub struct Editor {
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
+    pub(crate) text_input: Entity<TextInput>,
 }
 
 fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>> {
@@ -273,7 +279,7 @@ impl EditorState {
 }
 
 impl Editor {
-    pub fn new(cx: &mut Context<Self>, lsp_addr: SocketAddr) -> Self {
+    pub fn new(cx: &mut Context<Self>, window: &mut Window, lsp_addr: SocketAddr) -> Self {
         let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
         let solved_cell = cx.new(|_cx| None);
         let layers = cx.new(|_cx| Layers {
@@ -296,13 +302,34 @@ impl Editor {
         lsp_client.register_server(state.clone());
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state));
-        let canvas = cx.new(|cx| LayoutCanvas::new(cx, &state));
+        let canvas_focus_handle = cx.focus_handle();
+        let text_input_focus_handle = cx.focus_handle();
+        window.focus(&canvas_focus_handle);
+        let canvas = cx.new(|cx| {
+            LayoutCanvas::new(
+                cx,
+                &state,
+                canvas_focus_handle.clone(),
+                text_input_focus_handle.clone(),
+            )
+        });
+        let text_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                window,
+                text_input_focus_handle,
+                canvas_focus_handle,
+                canvas.read(cx).dim_tool.clone(),
+                &state,
+            )
+        });
 
         Self {
             state,
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
+            text_input,
         }
     }
 }
@@ -347,6 +374,7 @@ impl Render for Editor {
                     .child(self.canvas.clone())
                     .child(self.layer_sidebar.clone()),
             )
+            .child(self.text_input.clone())
     }
 }
 
