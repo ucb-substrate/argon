@@ -37,24 +37,40 @@ pub fn compile(ast: &ParseAst<'_>, input: CompileInput<'_>) -> CompileOutput {
     };
 
     let res = ExecPass::new(&ast).execute(input);
-    check_layers(&res);
-    res
+    let (data, mut errors) = match res {
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors,
+            output: Some(output),
+        }) => (output, errors),
+        CompileOutput::Valid(v) => (v, Vec::new()),
+        _ => unreachable!(),
+    };
+    check_layers(&data, &mut errors);
+    if errors.is_empty() {
+        CompileOutput::Valid(data)
+    } else {
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors,
+            output: Some(data),
+        })
+    }
 }
 
-fn check_layers(output: &CompileOutput) {
-    if let CompileOutput::Valid(output) = output {
-        let mut layers = IndexSet::new();
-        for layer in output.layers.layers.iter() {
-            layers.insert(layer.name.clone());
-        }
-        for (_, cell) in output.cells.iter() {
-            for (_, obj) in cell.objects.iter() {
-                if let SolvedValue::Rect(r) = obj
-                    && let Some(layer) = &r.layer
-                    && !layers.contains(layer)
-                {
-                    panic!("unknown layer `{layer}`");
-                }
+fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
+    let mut layers = IndexSet::new();
+    for layer in data.layers.layers.iter() {
+        layers.insert(layer.name.clone());
+    }
+    for (_, cell) in data.cells.iter() {
+        for (_, obj) in cell.objects.iter() {
+            if let SolvedValue::Rect(r) = obj
+                && let Some(layer) = &r.layer
+                && !layers.contains(layer)
+            {
+                errs.push(ExecError {
+                    span: r.span,
+                    kind: ExecErrorKind::IllegalLayer(layer.clone()),
+                })
             }
         }
     }
@@ -77,8 +93,13 @@ pub(crate) struct VarIdTyPass<'a> {
 pub struct VarIdTyMetadata;
 
 #[enumify]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ty {
+    /// A type that does not exist; usually encountered due to user error.
+    ///
+    /// Suppresses type checking of dependent properties.
+    #[default]
+    Unknown,
     Bool,
     Float,
     Int,
@@ -93,13 +114,13 @@ pub enum Ty {
 }
 
 impl Ty {
-    pub fn from_name(name: &str) -> Self {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
-            "Float" => Ty::Float,
-            "Rect" => Ty::Rect,
-            "Int" => Ty::Int,
-            "()" => Ty::Nil,
-            name => panic!("invalid type: {name}"),
+            "Float" => Some(Ty::Float),
+            "Rect" => Some(Ty::Rect),
+            "Int" => Some(Ty::Int),
+            "()" => Some(Ty::Nil),
+            _ => None,
         }
     }
 }
@@ -222,12 +243,22 @@ impl<'a> VarIdTyPass<'a> {
         let ty = Ty::Fn(Box::new(FnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             ret: if let Some(return_ty) = &input.return_ty {
-                Ty::from_name(return_ty.name)
+                self.ty_from_ident(return_ty)
             } else {
                 Ty::Nil
             },
         }));
         self.alloc(input.name.name, ty);
+    }
+
+    fn ty_from_ident<M: AstMetadata>(&mut self, ident: &Ident<&'a str, M>) -> Ty {
+        Ty::from_name(ident.name).unwrap_or_else(|| {
+            self.errors.push(StaticError {
+                span: ident.span,
+                kind: StaticErrorKind::UnknownType,
+            });
+            Ty::Unknown
+        })
     }
 }
 
@@ -656,7 +687,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _value: &Expr<&'a str, Self::OutputMetadata>,
         ty: &Ident<&'a str, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
-        Ty::from_name(ty.name)
+        self.ty_from_ident(ty)
     }
 
     fn dispatch_kw_arg_value(
@@ -674,7 +705,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _name: &Ident<&'a str, Self::OutputMetadata>,
         _ty: &Ident<&'a str, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
-        let ty = Ty::from_name(input.ty.name);
+        let ty = self.ty_from_ident(&input.ty);
         (self.alloc(input.name.name, ty.clone()), ty)
     }
 
@@ -761,6 +792,7 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+    pub span: Option<cfgrammar::Span>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -905,7 +937,7 @@ impl<'a> ExecPass<'a> {
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
                 .into();
-        CompileOutput::Valid(ValidCompileOutput {
+        CompileOutput::Valid(CompiledData {
             cells: self.compiled_cells,
             top: cell_id,
             layers,
@@ -1081,6 +1113,7 @@ impl<'a> ExecPass<'a> {
                     y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
                     x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
                     y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
+                    span: rect.span,
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
@@ -1584,6 +1617,7 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var(),
                             x1: state.solver.new_var(),
                             y1: state.solver.new_var(),
+                            span: Some(c.expr.span),
                         };
                         self.values
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
@@ -2072,6 +2106,7 @@ impl<'a> ExecPass<'a> {
                                                     y0: state.solver.new_var(),
                                                     x1: state.solver.new_var(),
                                                     y1: state.solver.new_var(),
+                                                    span: rect.span,
                                                 };
                                                 state
                                                     .objects
@@ -2388,13 +2423,32 @@ pub enum StaticErrorKind {
     BinOpInvalidType,
     /// A type cannot be used in a unary operation.
     UnaryOpInvalidType,
+    /// An unknown type, i.e. a type that has not been declared.
+    UnknownType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecError {
+    pub span: Option<cfgrammar::Span>,
+    pub kind: ExecErrorKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExecErrorKind {
+    /// A non-Manhattan rotation.
+    InvalidRotation,
+    /// A cell is underconstrained.
+    Underconstrained,
+    /// Illegal layer (not defined in layer properties).
+    IllegalLayer(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[enumify]
 pub enum CompileOutput {
     StaticErrors(StaticErrorCompileOutput),
-    Valid(ValidCompileOutput),
+    ExecErrors(ExecErrorCompileOutput),
+    Valid(CompiledData),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2403,7 +2457,13 @@ pub struct StaticErrorCompileOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidCompileOutput {
+pub struct ExecErrorCompileOutput {
+    pub errors: Vec<ExecError>,
+    pub output: Option<CompiledData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledData {
     pub cells: IndexMap<CellId, CompiledCell>,
     pub top: CellId,
     pub layers: LayerProperties,
@@ -2547,6 +2607,7 @@ impl Rect<(f64, Var)> {
             y0: self.y0.0,
             x1: self.x1.0,
             y1: self.y1.0,
+            span: self.span,
         }
     }
 }
@@ -2563,6 +2624,7 @@ impl Rect<f64> {
             y0: p0p.1.min(p1p.1),
             x1: p0p.0.max(p1p.0),
             y1: p0p.1.max(p1p.1),
+            span: self.span,
         }
     }
 }
@@ -2608,7 +2670,7 @@ fn object_id(id: &mut u64) -> ObjectId {
     ObjectId(next_id)
 }
 
-impl ValidCompileOutput {
+impl CompiledData {
     pub fn reachable_objs(&self, cell: CellId, scope: ScopeId) -> IndexMap<ObjectId, String> {
         let mut set = Default::default();
         self.reachable_objs_inner(cell, scope, SeqNum::end(), "", &mut set);
