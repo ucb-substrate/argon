@@ -260,6 +260,14 @@ impl<'a> VarIdTyPass<'a> {
             Ty::Unknown
         })
     }
+
+    fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<&'a str, M>, ty: Ty) -> Ty {
+            self.errors.push(StaticError {
+                span: field.span,
+                kind: StaticErrorKind::NoFieldOnTy { field: field.name.to_string(), ty },
+            });
+            Ty::Unknown
+    }
 }
 
 impl<S> Expr<S, VarIdTyMetadata> {
@@ -546,17 +554,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Rect => match field.name {
                 "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
                 "layer" => Ty::String,
-                _ => panic!("invalid field access"),
+                _ => self.no_field_on_ty(field, Ty::Rect),
             },
-            Ty::Inst(c) => match field.name {
+            Ty::Inst(ref c) => match field.name {
                 "x" | "y" => Ty::Float,
                 name => c
                     .data
                     .get(name)
-                    .unwrap_or_else(|| panic!("no field `{name}` on cell instance"))
-                    .clone(),
+                    .cloned()
+                    .unwrap_or_else(|| self.no_field_on_ty(field, base_ty.clone())),
             },
-            ty => panic!("cannot access fields of object of type {ty:?}"),
+            // Propagate unknown types without throwing an error.
+            Ty::Unknown => Ty::Unknown,
+            _ => self.no_field_on_ty(field, base_ty.clone()),
         }
     }
 
@@ -2425,6 +2435,8 @@ pub enum StaticErrorKind {
     UnaryOpInvalidType,
     /// An unknown type, i.e. a type that has not been declared.
     UnknownType,
+    /// No field on object of the given type.
+    NoFieldOnTy { field: String, ty: Ty },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
