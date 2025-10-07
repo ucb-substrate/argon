@@ -264,6 +264,7 @@ pub struct EmitExpr<S, T: AstMetadata> {
 pub struct Args<S, T: AstMetadata> {
     pub posargs: Vec<Expr<S, T>>,
     pub kwargs: Vec<KwArgValue<S, T>>,
+    pub span: Span,
     pub metadata: T::Args,
 }
 
@@ -775,6 +776,7 @@ pub trait AstTransformer {
             posargs,
             kwargs,
             metadata,
+            span: input.span,
         }
     }
     fn transform_kw_arg_value(

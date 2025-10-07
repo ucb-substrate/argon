@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, ModPath, Scope, UnaryOp, WorkspaceAst,
+    BinOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue, ModPath, Scope, UnaryOp,
+    WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -41,8 +42,23 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
     };
 
     let res = ExecPass::new(&ast).execute(input);
-    check_layers(&res);
-    res
+    let (data, mut errors) = match res {
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors,
+            output: Some(output),
+        }) => (output, errors),
+        CompileOutput::Valid(v) => (v, Vec::new()),
+        _ => unreachable!(),
+    };
+    check_layers(&data, &mut errors);
+    if errors.is_empty() {
+        CompileOutput::Valid(data)
+    } else {
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors,
+            output: Some(data),
+        })
+    }
 }
 
 type ModDag<'a> = HashMap<&'a ModPath, HashSet<&'a ModPath>>;
@@ -280,20 +296,21 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(output: &CompileOutput) {
-    if let CompileOutput::Valid(output) = output {
-        let mut layers = IndexSet::new();
-        for layer in output.layers.layers.iter() {
-            layers.insert(layer.name.clone());
-        }
-        for (_, cell) in output.cells.iter() {
-            for (_, obj) in cell.objects.iter() {
-                if let SolvedValue::Rect(r) = obj
-                    && let Some(layer) = &r.layer
-                    && !layers.contains(layer)
-                {
-                    panic!("unknown layer `{layer}`");
-                }
+fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
+    let mut layers = IndexSet::new();
+    for layer in data.layers.layers.iter() {
+        layers.insert(layer.name.clone());
+    }
+    for (_, cell) in data.cells.iter() {
+        for (_, obj) in cell.objects.iter() {
+            if let SolvedValue::Rect(r) = obj
+                && let Some(layer) = &r.layer
+                && !layers.contains(layer)
+            {
+                errs.push(ExecError {
+                    span: r.span,
+                    kind: ExecErrorKind::IllegalLayer(layer.clone()),
+                })
             }
         }
     }
@@ -390,8 +407,13 @@ pub(crate) fn execute_var_id_ty_pass_inner<'a>(
 pub struct VarIdTyMetadata;
 
 #[enumify]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ty {
+    /// A type that does not exist; usually encountered due to user error.
+    ///
+    /// Suppresses type checking of dependent properties.
+    #[default]
+    Unknown,
     Bool,
     Float,
     Int,
@@ -406,13 +428,13 @@ pub enum Ty {
 }
 
 impl Ty {
-    pub fn from_name(name: &str) -> Self {
+    pub fn from_name(name: &str) -> Option<Self> {
         match name {
-            "Float" => Ty::Float,
-            "Rect" => Ty::Rect,
-            "Int" => Ty::Int,
-            "()" => Ty::Nil,
-            name => panic!("invalid type: {name}"),
+            "Float" => Some(Ty::Float),
+            "Rect" => Some(Ty::Rect),
+            "Int" => Some(Ty::Int),
+            "()" => Some(Ty::Nil),
+            _ => None,
         }
     }
 }
@@ -529,12 +551,122 @@ impl<'a> VarIdTyPass<'a> {
         let ty = Ty::Fn(Box::new(FnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             ret: if let Some(return_ty) = &input.return_ty {
-                Ty::from_name(&return_ty.name)
+                self.ty_from_ident(return_ty)
             } else {
                 Ty::Nil
             },
         }));
         self.alloc(&input.name.name, ty);
+    }
+
+    fn ty_from_ident<M: AstMetadata>(&mut self, ident: &Ident<Substr, M>) -> Ty {
+        Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
+            self.errors.push(StaticError {
+                span: ident.span,
+                kind: StaticErrorKind::UnknownType,
+            });
+            Ty::Unknown
+        })
+    }
+
+    fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<Substr, M>, ty: Ty) -> Ty {
+        self.errors.push(StaticError {
+            span: field.span,
+            kind: StaticErrorKind::NoFieldOnTy {
+                field: field.name.to_string(),
+                ty,
+            },
+        });
+        Ty::Unknown
+    }
+
+    fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
+        if *found != *expected {
+            self.errors.push(StaticError {
+                span,
+                kind: StaticErrorKind::IncorrectTy {
+                    found: found.clone(),
+                    expected: expected.clone(),
+                },
+            });
+        }
+    }
+
+    fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
+        if !matches!(ty, Ty::Cell(_)) {
+            self.errors.push(StaticError {
+                span,
+                kind: StaticErrorKind::IncorrectTyCategory {
+                    found: ty.clone(),
+                    expected: "Cell".into(),
+                },
+            });
+        }
+    }
+
+    fn assert_eq_arity(&mut self, span: cfgrammar::Span, found: usize, expected: usize) {
+        if found != expected {
+            self.errors.push(StaticError {
+                span,
+                kind: StaticErrorKind::CallIncorrectPositionalArity { expected, found },
+            });
+        }
+    }
+
+    fn typecheck_kwargs(
+        &mut self,
+        kwargs: &[KwArgValue<Substr, VarIdTyMetadata>],
+        kwarg_defs: IndexMap<&str, Ty>,
+    ) {
+        let mut defined = IndexSet::new();
+        for kwarg in kwargs {
+            let mut cont = false;
+            if !kwarg_defs.contains_key(&kwarg.name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: kwarg.name.span,
+                    kind: StaticErrorKind::InvalidKwArg,
+                });
+                cont = true;
+            }
+            if defined.contains(&&kwarg.name.name) {
+                self.errors.push(StaticError {
+                    span: kwarg.name.span,
+                    kind: StaticErrorKind::DuplicateKwArg,
+                });
+                cont = true;
+            }
+            defined.insert(&kwarg.name.name);
+            if !cont {
+                self.assert_eq_ty(
+                    kwarg.value.span(),
+                    &kwarg.value.ty(),
+                    kwarg_defs.get(&kwarg.name.name.as_str()).unwrap(),
+                );
+            }
+        }
+    }
+
+    fn typecheck_posargs(
+        &mut self,
+        call_span: cfgrammar::Span,
+        args: &[Expr<Substr, VarIdTyMetadata>],
+        arg_defs: &[Ty],
+    ) {
+        self.assert_eq_arity(call_span, args.len(), arg_defs.len());
+        for (found, expected) in args.iter().zip(arg_defs) {
+            self.assert_eq_ty(found.span(), &found.ty(), expected);
+        }
+    }
+
+    fn typecheck_args(
+        &mut self,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+        arg_defs: &[Ty],
+        kwarg_defs: IndexMap<&str, Ty>,
+    ) {
+        self.typecheck_posargs(call_span, &args.posargs, arg_defs);
+        self.typecheck_kwargs(&args.kwargs, kwarg_defs);
     }
 }
 
@@ -810,6 +942,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 span: input.span,
                 kind: StaticErrorKind::BinOpMismatchedTypes,
             });
+        } else {
+            if left_ty == Ty::Float {
+                self.errors.push(StaticError {
+                    span: input.span,
+                    kind: StaticErrorKind::FloatEquality,
+                });
+            }
+            if left_ty != Ty::Float && left_ty != Ty::Int {
+                self.errors.push(StaticError {
+                    span: input.span,
+                    kind: StaticErrorKind::ComparisonInvalidType,
+                });
+            }
         }
         Ty::Bool
     }
@@ -825,17 +970,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Rect => match field.name.as_str() {
                 "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
                 "layer" => Ty::String,
-                _ => panic!("invalid field access"),
+                _ => self.no_field_on_ty(field, Ty::Rect),
             },
-            Ty::Inst(c) => match field.name.as_str() {
+            Ty::Inst(ref c) => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
                 name => c
                     .data
                     .get(name)
-                    .unwrap_or_else(|| panic!("no field `{name}` on cell instance"))
-                    .clone(),
+                    .cloned()
+                    .unwrap_or_else(|| self.no_field_on_ty(field, base_ty.clone())),
             },
-            ty => panic!("cannot access fields of object of type {ty:?}"),
+            // Propagate unknown types without throwing an error.
+            Ty::Unknown => Ty::Unknown,
+            _ => self.no_field_on_ty(field, base_ty.clone()),
         }
     }
 
@@ -849,7 +996,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_call_expr(
         &mut self,
-        _input: &crate::ast::CallExpr<Substr, Self::InputMetadata>,
+        input: &crate::ast::CallExpr<Substr, Self::InputMetadata>,
         func: &IdentPath<Substr, Self::OutputMetadata>,
         args: &crate::ast::Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
@@ -857,92 +1004,130 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
                     if name == "crect" {
-                        assert_eq!(args.posargs.len(), 0);
+                        self.typecheck_posargs(input.span, &args.posargs, &[]);
                     } else {
-                        assert_eq!(args.posargs.len(), 1);
-                        assert_eq!(args.posargs[0].ty(), Ty::String);
+                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
                     }
-                    for kwarg in &args.kwargs {
-                        assert!(
-                            ["x0", "x1", "y0", "y1", "x0i", "x1i", "y0i", "y1i", "w", "h"]
-                                .contains(&kwarg.name.name.as_str())
-                        );
-                        assert_eq!(kwarg.value.ty(), Ty::Float);
-                    }
+                    self.typecheck_kwargs(
+                        &args.kwargs,
+                        IndexMap::from_iter([
+                            ("x0", Ty::Float),
+                            ("x1", Ty::Float),
+                            ("y0", Ty::Float),
+                            ("y1", Ty::Float),
+                            ("x0i", Ty::Float),
+                            ("x1i", Ty::Float),
+                            ("y0i", Ty::Float),
+                            ("y1i", Ty::Float),
+                            ("w", Ty::Float),
+                            ("h", Ty::Float),
+                        ]),
+                    );
                     (None, Ty::Rect)
                 }
                 "float" => {
-                    assert!(args.posargs.is_empty());
-                    assert!(args.kwargs.is_empty());
+                    self.typecheck_args(input.span, args, &[], IndexMap::new());
                     (None, Ty::Float)
                 }
                 "eq" => {
-                    assert_eq!(args.posargs.len(), 2);
-                    assert!(args.kwargs.is_empty());
-                    assert_eq!(args.posargs[0].ty(), Ty::Float);
-                    assert_eq!(args.posargs[1].ty(), Ty::Float);
+                    self.typecheck_args(input.span, args, &[Ty::Float, Ty::Float], IndexMap::new());
                     (None, Ty::Nil)
                 }
                 "dimension" => {
-                    assert_eq!(args.posargs.len(), 7);
-                    for (i, arg) in args.posargs.iter().enumerate() {
-                        if i == 6 {
-                            assert_eq!(arg.ty(), Ty::Bool);
-                        } else {
-                            assert_eq!(arg.ty(), Ty::Float);
-                        }
-                    }
+                    self.typecheck_args(
+                        input.span,
+                        args,
+                        &[
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Bool,
+                        ],
+                        IndexMap::new(),
+                    );
                     (None, Ty::Nil)
                 }
                 "inst" => {
-                    assert_eq!(args.posargs.len(), 1);
-                    for kwarg in &args.kwargs {
-                        assert!(
-                            ["reflect", "angle", "x", "y", "xi", "yi"]
-                                .contains(&kwarg.name.name.as_str())
-                        );
-                        let expected_ty = match kwarg.name.name.as_str() {
-                            "reflect" => Ty::Bool,
-                            "angle" => Ty::Int,
-                            "x" | "y" | "xi" | "yi" => Ty::Float,
-                            _ => unreachable!(),
-                        };
-                        assert_eq!(kwarg.value.ty(), expected_ty);
-                    }
-                    assert!(matches!(args.posargs[0].ty(), Ty::Cell(_)));
-                    if let Ty::Cell(c) = args.posargs[0].ty() {
-                        (None, Ty::Inst(c.clone()))
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    self.typecheck_kwargs(
+                        &args.kwargs,
+                        IndexMap::from_iter([
+                            ("reflect", Ty::Bool),
+                            ("angle", Ty::Int),
+                            ("x", Ty::Float),
+                            ("y", Ty::Float),
+                            ("xi", Ty::Float),
+                            ("yi", Ty::Float),
+                        ]),
+                    );
+                    if let Some(ty) = args.posargs.first() {
+                        self.assert_ty_is_cell(ty.span(), &ty.ty());
+                        if let Ty::Cell(c) = ty.ty() {
+                            (None, Ty::Inst(c.clone()))
+                        } else {
+                            (None, Ty::Unknown)
+                        }
                     } else {
-                        panic!("the argument to inst must be a cell");
+                        (None, Ty::Unknown)
                     }
                 }
                 name => {
-                    let (varid, ty) = self
-                        .lookup(name)
-                        .unwrap_or_else(|| panic!("no function or cell named `{name}`"));
-                    match ty {
-                        Ty::Fn(ty) => {
-                            assert_eq!(args.posargs.len(), ty.args.len());
-                            for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                                assert_eq!(&arg.ty(), arg_ty);
+                    if let Some((varid, ty)) = self.lookup(name) {
+                        match ty {
+                            Ty::Fn(ty) => {
+                                if args.posargs.len() != ty.args.len() {
+                                    self.errors.push(StaticError {
+                                        span: args.span,
+                                        kind: StaticErrorKind::CallIncorrectPositionalArity {
+                                            expected: ty.args.len(),
+                                            found: args.posargs.len(),
+                                        },
+                                    });
+                                }
+                                for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
+                                    self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
+                                }
+                                assert!(args.kwargs.is_empty());
+                                (Some(varid), ty.ret.clone())
                             }
-                            assert!(args.kwargs.is_empty());
-                            (Some(varid), ty.ret.clone())
-                        }
-                        Ty::CellFn(ty) => {
-                            assert_eq!(args.posargs.len(), ty.args.len());
-                            for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                                assert_eq!(&arg.ty(), arg_ty);
+                            Ty::CellFn(ty) => {
+                                if args.posargs.len() != ty.args.len() {
+                                    self.errors.push(StaticError {
+                                        span: args.span,
+                                        kind: StaticErrorKind::CallIncorrectPositionalArity {
+                                            expected: ty.args.len(),
+                                            found: args.posargs.len(),
+                                        },
+                                    });
+                                }
+                                for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
+                                    self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
+                                }
+                                assert!(args.kwargs.is_empty());
+                                (
+                                    Some(varid),
+                                    Ty::Cell(Box::new(CellTy {
+                                        data: ty.data.clone(),
+                                    })),
+                                )
                             }
-                            assert!(args.kwargs.is_empty());
-                            (
-                                Some(varid),
-                                Ty::Cell(Box::new(CellTy {
-                                    data: ty.data.clone(),
-                                })),
-                            )
+                            ty => {
+                                self.errors.push(StaticError {
+                                    span: input.span,
+                                    kind: StaticErrorKind::CannotCall(ty),
+                                });
+                                (None, Ty::Unknown)
+                            }
                         }
-                        ty => panic!("cannot invoke an object of type {ty:?}"),
+                    } else {
+                        self.errors.push(StaticError {
+                            span: input.span,
+                            kind: StaticErrorKind::UndeclaredVar,
+                        });
+                        (None, Ty::Unknown)
                     }
                 }
             }
@@ -1020,11 +1205,25 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_cast(
         &mut self,
-        _input: &crate::ast::CastExpr<Substr, Self::InputMetadata>,
-        _value: &Expr<Substr, Self::OutputMetadata>,
+        input: &crate::ast::CastExpr<Substr, Self::InputMetadata>,
+        value: &Expr<Substr, Self::OutputMetadata>,
         ty: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
-        Ty::from_name(&ty.name)
+        let ty = self.ty_from_ident(ty);
+        match (value.ty(), &ty) {
+            (Ty::Int, Ty::Float)
+            | (Ty::Int, Ty::Int)
+            | (Ty::Float, Ty::Int)
+            | (Ty::Float, Ty::Float) => (),
+            (_, Ty::Unknown) => (),
+            _ => {
+                self.errors.push(StaticError {
+                    span: input.span,
+                    kind: StaticErrorKind::InvalidCast,
+                });
+            }
+        };
+        ty
     }
 
     fn dispatch_kw_arg_value(
@@ -1042,7 +1241,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _name: &Ident<Substr, Self::OutputMetadata>,
         _ty: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
-        let ty = Ty::from_name(&input.ty.name);
+        let ty = self.ty_from_ident(&input.ty);
         (self.alloc(&input.name.name, ty.clone()), ty)
     }
 
@@ -1132,6 +1331,7 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+    pub span: Option<cfgrammar::Span>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1308,7 +1508,7 @@ impl<'a> ExecPass<'a> {
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
                 .into();
-        CompileOutput::Valid(ValidCompileOutput {
+        CompileOutput::Valid(CompiledData {
             cells: self.compiled_cells,
             top: cell_id,
             layers,
@@ -1437,7 +1637,7 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 if !constraint_added {
-                    panic!("no progress");
+                    state.solver.force_solution();
                 }
             }
 
@@ -1475,6 +1675,7 @@ impl<'a> ExecPass<'a> {
                     y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
                     x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
                     y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
+                    span: rect.span,
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
@@ -1982,6 +2183,7 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var(),
                             x1: state.solver.new_var(),
                             y1: state.solver.new_var(),
+                            span: Some(c.expr.span),
                         };
                         self.values
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
@@ -2029,7 +2231,7 @@ impl<'a> ExecPass<'a> {
                                         )),
                                     );
                                 }
-                                x => panic!("unsupported kwarg `{x}`"),
+                                x => unreachable!("unsupported kwarg `{x}`"),
                             };
                             let defer = self.value_id();
                             self.values.insert(
@@ -2144,7 +2346,7 @@ impl<'a> ExecPass<'a> {
                         .find_map(|(kwarg, vid)| {
                             if kwarg.name.name == "angle" {
                                 Some(self.values[vid].as_ref().get_ready().map(|refl| {
-                                    match (*refl.as_ref().unwrap_int() + 360) % 360 {
+                                    match ((*refl.as_ref().unwrap_int() % 360) + 360) % 360 {
                                         0 => Rotation::R0,
                                         90 => Rotation::R90,
                                         180 => Rotation::R180,
@@ -2390,10 +2592,10 @@ impl<'a> ExecPass<'a> {
                             {
                                 let res = match comparison_expr.expr.op {
                                     crate::ast::ComparisonOp::Eq => {
-                                        panic!("cannot check equality between floats")
+                                        unreachable!("cannot check equality between floats")
                                     }
                                     crate::ast::ComparisonOp::Ne => {
-                                        panic!("cannot check inequality between floats")
+                                        unreachable!("cannot check inequality between floats")
                                     }
                                     crate::ast::ComparisonOp::Geq => vl >= vr,
                                     crate::ast::ComparisonOp::Gt => vl > vr,
@@ -2440,7 +2642,7 @@ impl<'a> ExecPass<'a> {
                                     LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
                                 ),
                                 "layer" => Value::String(rect.layer.clone().unwrap()),
-                                f => panic!("invalid field `{f}`"),
+                                f => unreachable!("invalid field `{f}`"),
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
@@ -2470,6 +2672,7 @@ impl<'a> ExecPass<'a> {
                                                     y0: state.solver.new_var(),
                                                     x1: state.solver.new_var(),
                                                     y1: state.solver.new_var(),
+                                                    span: rect.span,
                                                 };
                                                 state
                                                     .objects
@@ -2544,9 +2747,8 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                         _ => {
-                            panic!(
-                                "field access expressions only supported on objects of type Rect or Inst"
-                            )
+                            // Should abort compilation after VarIdTyPass; should not get here.
+                            unreachable!("field access expressions not supported on this type")
                         }
                     }
                 } else {
@@ -2583,7 +2785,7 @@ impl<'a> ExecPass<'a> {
                             .eval_expr(expr)
                             .map(|val| Value::Int(val as i64)),
                         (expr @ Value::Linear(_), Ty::Float) => Some(expr.clone()),
-                        _ => panic!("invalid cast"),
+                        _ => unreachable!("invalid cast"),
                     };
                     if let Some(value) = value {
                         self.values.insert(vid, DeferValue::Ready(value));
@@ -2782,17 +2984,58 @@ pub enum StaticErrorKind {
     BranchesDifferentTypes,
     /// The operands in a binary expression must have the same type.
     BinOpMismatchedTypes,
+    /// Cannot compare equality or inequality of floating point numbers.
+    FloatEquality,
     /// A type cannot be used in a binary expression.
     BinOpInvalidType,
     /// A type cannot be used in a unary operation.
     UnaryOpInvalidType,
+    /// A type cannot be used in a comparison expression.
+    ComparisonInvalidType,
+    /// An unknown type, i.e. a type that has not been declared.
+    UnknownType,
+    /// No field on object of the given type.
+    NoFieldOnTy { field: String, ty: Ty },
+    /// Incorrect type.
+    IncorrectTy { expected: Ty, found: Ty },
+    /// Incorrect type category.
+    IncorrectTyCategory { found: Ty, expected: String },
+    /// Called a function or cell with the wrong number of positional arguments.
+    CallIncorrectPositionalArity { expected: usize, found: usize },
+    /// Invalid keyword argument.
+    InvalidKwArg,
+    /// Duplicate keyword argument.
+    DuplicateKwArg,
+    /// Identifier used without being declared.
+    UndeclaredVar,
+    /// Attempted to use an object of the given type as the function of a call expression.
+    CannotCall(Ty),
+    /// Cannot perform the requested type cast.
+    InvalidCast,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecError {
+    pub span: Option<cfgrammar::Span>,
+    pub kind: ExecErrorKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ExecErrorKind {
+    /// A non-Manhattan rotation.
+    InvalidRotation,
+    /// A cell is underconstrained.
+    Underconstrained,
+    /// Illegal layer (not defined in layer properties).
+    IllegalLayer(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[enumify]
 pub enum CompileOutput {
     StaticErrors(StaticErrorCompileOutput),
-    Valid(ValidCompileOutput),
+    ExecErrors(ExecErrorCompileOutput),
+    Valid(CompiledData),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2801,7 +3044,13 @@ pub struct StaticErrorCompileOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidCompileOutput {
+pub struct ExecErrorCompileOutput {
+    pub errors: Vec<ExecError>,
+    pub output: Option<CompiledData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompiledData {
     pub cells: IndexMap<CellId, CompiledCell>,
     pub top: CellId,
     pub layers: LayerProperties,
@@ -2945,6 +3194,7 @@ impl Rect<(f64, Var)> {
             y0: self.y0.0,
             x1: self.x1.0,
             y1: self.y1.0,
+            span: self.span,
         }
     }
 }
@@ -2961,6 +3211,7 @@ impl Rect<f64> {
             y0: p0p.1.min(p1p.1),
             x1: p0p.0.max(p1p.0),
             y1: p0p.1.max(p1p.1),
+            span: self.span,
         }
     }
 }
@@ -3006,7 +3257,7 @@ fn object_id(id: &mut u64) -> ObjectId {
     ObjectId(next_id)
 }
 
-impl ValidCompileOutput {
+impl CompiledData {
     pub fn reachable_objs(&self, cell: CellId, scope: ScopeId) -> IndexMap<ObjectId, String> {
         let mut set = Default::default();
         self.reachable_objs_inner(cell, scope, SeqNum::end(), "", &mut set);

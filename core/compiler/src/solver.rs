@@ -45,6 +45,16 @@ impl Solver {
         self.solved_vars.len() == self.next_id as usize
     }
 
+    pub fn force_solution(&mut self) {
+        while !self.fully_solved() {
+            // Find any unsolved variable and constrain it to equal 0.
+            let v = (0..self.next_id)
+                .find(|&i| !self.solved_vars.contains_key(&Var(i)))
+                .unwrap();
+            self.constrain_eq0(LinearExpr::from(Var(v)));
+        }
+    }
+
     pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {
         let n_vars = self.next_id as usize;
         let arr_shape = (self.constraints.len() + self.solved_vars.len(), n_vars);

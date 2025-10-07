@@ -347,9 +347,9 @@ ArgDecl -> Result<ArgDecl<&'input str, ParseMetadata>, ()>
   ;
 
 Args -> Result<Args<&'input str, ParseMetadata>, ()>
-  : PosArgsTrailingComma KwArgs { Ok(Args { posargs: $1?, kwargs: $2?, metadata: (), }) }
-  | KwArgs { Ok(Args { posargs: Vec::new(), kwargs: $1?, metadata: (), }) }
-  | PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), metadata: (), }) }
+  : PosArgsTrailingComma KwArgs { Ok(Args { posargs: $1?, kwargs: $2?, span: $span, metadata: (), }) }
+  | KwArgs { Ok(Args { posargs: Vec::new(), kwargs: $1?, span: $span, metadata: (), }) }
+  | PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), span: $span, metadata: (), }) }
   ;
 
 KwArgValue -> Result<KwArgValue<&'input str, ParseMetadata>, ()>
