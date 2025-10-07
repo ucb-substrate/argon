@@ -15,6 +15,7 @@ pub struct Solver {
     next_id: u64,
     constraints: Vec<LinearExpr>,
     solved_vars: IndexMap<Var, f64>,
+    inconsistent: bool,
 }
 
 pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
@@ -53,6 +54,11 @@ impl Solver {
                 .unwrap();
             self.constrain_eq0(LinearExpr::from(Var(v)));
         }
+    }
+
+    #[inline]
+    pub fn is_inconsistent(&self) -> bool {
+        self.inconsistent
     }
 
     pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {
@@ -133,10 +139,7 @@ impl Solver {
             if constraint.coeffs.is_empty()
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
-                panic!(
-                    "inconsistent constraint, err = {}",
-                    constraint.constant.abs()
-                );
+                self.inconsistent = true;
             }
         }
         self.constraints

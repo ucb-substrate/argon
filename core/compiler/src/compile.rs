@@ -1628,10 +1628,17 @@ impl<'a> ExecPass<'a> {
                 require_progress = true;
             }
         }
+        let state = self.cell_state_mut(cell_id);
         if progress {
-            let state = self.cell_state_mut(cell_id);
             state.solve_iters += 1;
             state.solver.solve();
+        }
+        if state.solver.is_inconsistent() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::InconsistentConstraints,
+            });
         }
         self.partial_cells
             .pop_back()
@@ -3014,6 +3021,8 @@ pub enum ExecErrorKind {
     Underconstrained,
     /// Illegal layer (not defined in layer properties).
     IllegalLayer(String),
+    /// Conflicting constraints.
+    InconsistentConstraints,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

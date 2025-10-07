@@ -89,7 +89,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn argon_if_inconsistent() {
         let ast = parse_workspace(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
         let cell = compile(
@@ -99,7 +98,8 @@ mod tests {
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
-        );
+        )
+        .unwrap_exec_errors();
         println!("{cell:?}");
     }
 
