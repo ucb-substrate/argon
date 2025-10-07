@@ -51,7 +51,7 @@ impl AstMetadata for ParseMetadata {
 pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<String, anyhow::Error> {
     let root_lib = root_lib.as_ref();
     if path.is_empty() {
-        return Ok(std::fs::read_to_string(&root_lib)?);
+        return Ok(std::fs::read_to_string(root_lib)?);
     }
     let mut base_path = PathBuf::from(root_lib);
     base_path.pop();

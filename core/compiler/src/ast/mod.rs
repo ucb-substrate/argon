@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Debug, path::PathBuf};
+use std::{collections::HashMap, fmt::Debug};
 
 use cfgrammar::Span;
 use derive_where::derive_where;

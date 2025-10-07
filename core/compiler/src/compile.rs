@@ -107,109 +107,109 @@ impl<'a> AstTransformer for ImportPass<'a> {
 
     fn dispatch_enum_decl(
         &mut self,
-        input: &crate::ast::EnumDecl<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
+        _input: &crate::ast::EnumDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
     }
 
     fn dispatch_cell_decl(
         &mut self,
-        input: &CellDecl<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
-        scope: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _input: &CellDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
+        _scope: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
     }
 
     fn dispatch_fn_decl(
         &mut self,
-        input: &FnDecl<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
-        return_ty: &Option<Ident<Self::OutputS, Self::OutputMetadata>>,
-        scope: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _input: &FnDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
+        _return_ty: &Option<Ident<Self::OutputS, Self::OutputMetadata>>,
+        _scope: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
     }
 
     fn dispatch_constant_decl(
         &mut self,
-        input: &ConstantDecl<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        ty: &Ident<Self::OutputS, Self::OutputMetadata>,
-        value: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &ConstantDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ConstantDecl {
     }
 
     fn dispatch_let_binding(
         &mut self,
-        input: &LetBinding<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        value: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &LetBinding<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
     }
 
     fn dispatch_if_expr(
         &mut self,
-        input: &IfExpr<Self::InputS, Self::InputMetadata>,
-        cond: &Expr<Self::OutputS, Self::OutputMetadata>,
-        then: &Scope<Self::OutputS, Self::OutputMetadata>,
-        else_: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _input: &IfExpr<Self::InputS, Self::InputMetadata>,
+        _cond: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _then: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
     }
 
     fn dispatch_bin_op_expr(
         &mut self,
-        input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
-        left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        right: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
+        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
     }
 
     fn dispatch_unary_op_expr(
         &mut self,
-        input: &crate::ast::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
-        operand: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &crate::ast::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
+        _operand: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
     }
 
     fn dispatch_comparison_expr(
         &mut self,
-        input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        right: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
+        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
     }
 
     fn dispatch_cast(
         &mut self,
-        input: &crate::ast::CastExpr<Self::InputS, Self::InputMetadata>,
-        value: &Expr<Self::OutputS, Self::OutputMetadata>,
-        ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _input: &crate::ast::CastExpr<Self::InputS, Self::InputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
     fn dispatch_field_access_expr(
         &mut self,
-        input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
-        base: &Expr<Self::OutputS, Self::OutputMetadata>,
-        field: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
     }
 
     fn dispatch_enum_value(
         &mut self,
-        input: &EnumValue<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        variant: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _input: &EnumValue<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _variant: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
     }
 
     fn dispatch_call_expr(
         &mut self,
-        input: &CallExpr<Self::InputS, Self::InputMetadata>,
+        _input: &CallExpr<Self::InputS, Self::InputMetadata>,
         func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
-        args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
+        _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         if func.path[0].name != "std" {
             let path = if func.path[0].name == "crate" {
@@ -238,40 +238,40 @@ impl<'a> AstTransformer for ImportPass<'a> {
 
     fn dispatch_emit_expr(
         &mut self,
-        input: &crate::ast::EmitExpr<Self::InputS, Self::InputMetadata>,
-        value: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &crate::ast::EmitExpr<Self::InputS, Self::InputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
     }
 
     fn dispatch_args(
         &mut self,
-        input: &crate::ast::Args<Self::InputS, Self::InputMetadata>,
-        posargs: &[Expr<Self::OutputS, Self::OutputMetadata>],
-        kwargs: &[crate::ast::KwArgValue<Self::OutputS, Self::OutputMetadata>],
+        _input: &crate::ast::Args<Self::InputS, Self::InputMetadata>,
+        _posargs: &[Expr<Self::OutputS, Self::OutputMetadata>],
+        _kwargs: &[crate::ast::KwArgValue<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::Args {
     }
 
     fn dispatch_kw_arg_value(
         &mut self,
-        input: &crate::ast::KwArgValue<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        value: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _input: &crate::ast::KwArgValue<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::KwArgValue {
     }
 
     fn dispatch_arg_decl(
         &mut self,
-        input: &ArgDecl<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _input: &ArgDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
     fn dispatch_scope(
         &mut self,
-        input: &Scope<Self::InputS, Self::InputMetadata>,
-        stmts: &[Statement<Self::OutputS, Self::OutputMetadata>],
-        tail: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
+        _input: &Scope<Self::InputS, Self::InputMetadata>,
+        _stmts: &[Statement<Self::OutputS, Self::OutputMetadata>],
+        _tail: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::Scope {
     }
 
@@ -918,7 +918,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
                 name => {
                     let (varid, ty) = self
-                        .lookup(&name)
+                        .lookup(name)
                         .unwrap_or_else(|| panic!("no function or cell named `{name}`"));
                     match ty {
                         Ty::Fn(ty) => {
@@ -1296,7 +1296,7 @@ impl<'a> ExecPass<'a> {
             .find_map(|d| match d {
                 Decl::Cell(
                     v @ CellDecl {
-                        name: Ident { name, metadata, .. },
+                        name: Ident { name, .. },
                         ..
                     },
                 ) if name == input.cell.last().unwrap() => Some(v.metadata),
@@ -1615,7 +1615,7 @@ impl<'a> ExecPass<'a> {
     }
 
     fn declare_globals(&mut self) {
-        for (_, ast) in self.ast {
+        for ast in self.ast.values() {
             for decl in &ast.ast.decls {
                 match decl {
                     Decl::Fn(f) => {
