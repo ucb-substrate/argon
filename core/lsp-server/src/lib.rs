@@ -29,9 +29,9 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{request::Request, *};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp::{jsonrpc::Result, lsp_types::notification::Notification};
 
 use crate::{
     document::{Document, DocumentChange, GuiDocument},
@@ -105,6 +105,16 @@ impl State {
 #[derive(Debug, Clone)]
 struct Backend {
     state: State,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForceSave;
+
+impl Request for ForceSave {
+    type Params = ();
+    type Result = ();
+
+    const METHOD: &'static str = "custom/forceSave";
 }
 
 #[tower_lsp::async_trait]
@@ -242,7 +252,7 @@ impl Backend {
         };
 
         let ast = parse::parse(doc.contents()).unwrap();
-        let scope_annotation = ScopeAnnotationPass::new(&doc, &ast).await;
+        let scope_annotation = ScopeAnnotationPass::new(&doc, &ast);
         let mut text_edits = scope_annotation.execute();
         text_edits.sort_by_key(|edit| Reverse(edit.range.start));
         doc.apply_changes(
@@ -256,7 +266,6 @@ impl Backend {
             doc.version() + 1,
         );
         let ast = parse::parse(doc.contents()).unwrap();
-        let ast = AnnotatedAst::new(ArcStr::from(doc.contents()), &ast);
         state_mut.gui_files.insert(
             url,
             GuiDocument {
@@ -266,18 +275,20 @@ impl Backend {
             },
         );
 
-        self.state
-            .editor_client
-            .apply_edit(WorkspaceEdit {
-                changes: Some(HashMap::from_iter([(
-                    Url::from_file_path(file).unwrap(),
-                    text_edits,
-                )])),
-                document_changes: None,
-                change_annotations: None,
-            })
-            .await
-            .unwrap();
+        if !text_edits.is_empty() {
+            self.state
+                .editor_client
+                .apply_edit(WorkspaceEdit {
+                    changes: Some(HashMap::from_iter([(
+                        Url::from_file_path(file).unwrap(),
+                        text_edits,
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+                .await
+                .unwrap();
+        }
     }
 
     /// Compiles an **open** GUI cell.

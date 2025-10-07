@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 
+use arcstr::Substr;
 use compiler::{
     ast::{
         ArgDecl, Args, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
-        ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IfExpr, Scope,
-        UnaryOpExpr, VarExpr,
+        ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
+        Scope, UnaryOpExpr, VarExpr, annotated::AnnotatedAst,
     },
     parse::{ParseAst, ParseMetadata},
 };
@@ -13,7 +14,7 @@ use tower_lsp::lsp_types::{Range, TextEdit};
 use crate::document::Document;
 
 pub(crate) struct ScopeAnnotationPass<'a> {
-    ast: &'a ParseAst<'a>,
+    ast: &'a AnnotatedAst<ParseMetadata>,
     content: &'a Document,
     assigned_names: Vec<HashSet<String>>,
     ids: Vec<usize>,
@@ -21,7 +22,7 @@ pub(crate) struct ScopeAnnotationPass<'a> {
 }
 
 impl<'a> ScopeAnnotationPass<'a> {
-    pub(crate) fn new(content: &'a Document, ast: &'a ParseAst<'a>) -> Self {
+    pub(crate) fn new(content: &'a Document, ast: &'a AnnotatedAst<ParseMetadata>) -> Self {
         Self {
             ast,
             content,
@@ -32,7 +33,7 @@ impl<'a> ScopeAnnotationPass<'a> {
     }
 
     pub(crate) fn execute(mut self) -> Vec<TextEdit> {
-        for decl in &self.ast.decls {
+        for decl in &self.ast.ast.decls {
             match decl {
                 Decl::Fn(f) => {
                     self.transform_fn_decl(f);
@@ -51,64 +52,64 @@ impl<'a> ScopeAnnotationPass<'a> {
 impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     type InputMetadata = ParseMetadata;
     type OutputMetadata = ParseMetadata;
-    type InputS = &'a str;
-    type OutputS = &'a str;
+    type InputS = Substr;
+    type OutputS = Substr;
 
     fn dispatch_ident(
         &mut self,
-        _input: &Ident<&'a str, Self::InputMetadata>,
+        _input: &Ident<Substr, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
     fn dispatch_var_expr(
         &mut self,
-        _input: &VarExpr<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &VarExpr<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
     }
 
     fn dispatch_enum_decl(
         &mut self,
-        _input: &EnumDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _variants: &[Ident<&'a str, Self::OutputMetadata>],
+        _input: &EnumDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _variants: &[Ident<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
     }
 
     fn dispatch_cell_decl(
         &mut self,
-        _input: &CellDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _args: &[ArgDecl<&'a str, Self::OutputMetadata>],
-        _scope: &Scope<&'a str, Self::OutputMetadata>,
+        _input: &CellDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _args: &[ArgDecl<Substr, Self::OutputMetadata>],
+        _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
     }
 
     fn dispatch_fn_decl(
         &mut self,
-        _input: &FnDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _args: &[ArgDecl<&'a str, Self::OutputMetadata>],
-        _return_ty: &Option<Ident<&'a str, Self::OutputMetadata>>,
-        _scope: &Scope<&'a str, Self::OutputMetadata>,
+        _input: &FnDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _args: &[ArgDecl<Substr, Self::OutputMetadata>],
+        _return_ty: &Option<Ident<Substr, Self::OutputMetadata>>,
+        _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
     }
 
     fn dispatch_constant_decl(
         &mut self,
-        _input: &ConstantDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _ty: &Ident<&'a str, Self::OutputMetadata>,
-        _value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &ConstantDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &Ident<Substr, Self::OutputMetadata>,
+        _value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ConstantDecl {
     }
 
     fn dispatch_if_expr(
         &mut self,
-        input: &IfExpr<&'a str, Self::InputMetadata>,
-        _cond: &Expr<&'a str, Self::OutputMetadata>,
-        _then: &Scope<&'a str, Self::OutputMetadata>,
-        _else_: &Scope<&'a str, Self::OutputMetadata>,
+        input: &IfExpr<Substr, Self::InputMetadata>,
+        _cond: &Expr<Substr, Self::OutputMetadata>,
+        _then: &Scope<Substr, Self::OutputMetadata>,
+        _else_: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         if let Some(scope_annotation) = &input.scope_annotation {
             self.assigned_names
@@ -135,52 +136,52 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
 
     fn dispatch_bin_op_expr(
         &mut self,
-        _input: &BinOpExpr<&'a str, Self::InputMetadata>,
-        _left: &Expr<&'a str, Self::OutputMetadata>,
-        _right: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &BinOpExpr<Substr, Self::InputMetadata>,
+        _left: &Expr<Substr, Self::OutputMetadata>,
+        _right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
     }
 
     fn dispatch_unary_op_expr(
         &mut self,
-        _input: &UnaryOpExpr<&'a str, Self::InputMetadata>,
-        _operand: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &UnaryOpExpr<Substr, Self::InputMetadata>,
+        _operand: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
     }
 
     fn dispatch_comparison_expr(
         &mut self,
-        _input: &ComparisonExpr<&'a str, Self::InputMetadata>,
-        _left: &Expr<&'a str, Self::OutputMetadata>,
-        _right: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &ComparisonExpr<Substr, Self::InputMetadata>,
+        _left: &Expr<Substr, Self::OutputMetadata>,
+        _right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
     }
 
     fn dispatch_field_access_expr(
         &mut self,
-        _input: &FieldAccessExpr<&'a str, Self::InputMetadata>,
-        _base: &Expr<&'a str, Self::OutputMetadata>,
-        _field: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &FieldAccessExpr<Substr, Self::InputMetadata>,
+        _base: &Expr<Substr, Self::OutputMetadata>,
+        _field: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
     }
 
     fn dispatch_call_expr(
         &mut self,
-        _input: &CallExpr<&'a str, Self::InputMetadata>,
-        _func: &Ident<&'a str, Self::OutputMetadata>,
-        _args: &Args<&'a str, Self::OutputMetadata>,
+        _input: &CallExpr<Substr, Self::InputMetadata>,
+        _func: &IdentPath<Substr, Self::OutputMetadata>,
+        _args: &Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
     }
 
-    fn enter_scope(&mut self, _input: &Scope<&'a str, Self::InputMetadata>) {
+    fn enter_scope(&mut self, _input: &Scope<Substr, Self::InputMetadata>) {
         self.assigned_names.push(Default::default());
         self.ids.push(Default::default());
     }
 
     fn exit_scope(
         &mut self,
-        _input: &Scope<&'a str, Self::InputMetadata>,
-        _output: &Scope<&'a str, Self::OutputMetadata>,
+        _input: &Scope<Substr, Self::InputMetadata>,
+        _output: &Scope<Substr, Self::OutputMetadata>,
     ) {
         self.assigned_names.pop();
         self.ids.pop();
@@ -188,71 +189,71 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
 
     fn dispatch_let_binding(
         &mut self,
-        _input: &compiler::ast::LetBinding<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &compiler::ast::LetBinding<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
     }
 
     fn dispatch_cast(
         &mut self,
-        _input: &compiler::ast::CastExpr<&'a str, Self::InputMetadata>,
-        _value: &Expr<&'a str, Self::OutputMetadata>,
-        _ty: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &compiler::ast::CastExpr<Substr, Self::InputMetadata>,
+        _value: &Expr<Substr, Self::OutputMetadata>,
+        _ty: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
     fn dispatch_enum_value(
         &mut self,
-        _input: &compiler::ast::EnumValue<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _variant: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &compiler::ast::EnumValue<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _variant: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
     }
 
     fn dispatch_emit_expr(
         &mut self,
-        _input: &compiler::ast::EmitExpr<&'a str, Self::InputMetadata>,
-        _value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &compiler::ast::EmitExpr<Substr, Self::InputMetadata>,
+        _value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
     }
 
     fn dispatch_args(
         &mut self,
-        _input: &Args<&'a str, Self::InputMetadata>,
-        _posargs: &[Expr<&'a str, Self::OutputMetadata>],
-        _kwargs: &[compiler::ast::KwArgValue<&'a str, Self::OutputMetadata>],
+        _input: &Args<Substr, Self::InputMetadata>,
+        _posargs: &[Expr<Substr, Self::OutputMetadata>],
+        _kwargs: &[compiler::ast::KwArgValue<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::Args {
     }
 
     fn dispatch_kw_arg_value(
         &mut self,
-        _input: &compiler::ast::KwArgValue<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &compiler::ast::KwArgValue<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::KwArgValue {
     }
 
     fn dispatch_arg_decl(
         &mut self,
-        _input: &ArgDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _ty: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &ArgDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
     fn dispatch_scope(
         &mut self,
-        _input: &Scope<&'a str, Self::InputMetadata>,
-        _stmts: &[compiler::ast::Statement<&'a str, Self::OutputMetadata>],
-        _tail: &Option<Expr<&'a str, Self::OutputMetadata>>,
+        _input: &Scope<Substr, Self::InputMetadata>,
+        _stmts: &[compiler::ast::Statement<Substr, Self::OutputMetadata>],
+        _tail: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::Scope {
     }
 
     fn transform_expr(
         &mut self,
-        input: &Expr<&'a str, Self::InputMetadata>,
-    ) -> Expr<&'a str, Self::OutputMetadata> {
+        input: &Expr<Substr, Self::InputMetadata>,
+    ) -> Expr<Substr, Self::OutputMetadata> {
         match input {
             Expr::If(if_expr) => Expr::If(Box::new(self.transform_if_expr(if_expr))),
             Expr::BinOp(bin_op_expr) => {
@@ -304,6 +305,6 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     }
 
     fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
-        *s
+        s.clone()
     }
 }

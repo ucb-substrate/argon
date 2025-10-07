@@ -8,7 +8,7 @@ use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, TextEdit, Url, WorkspaceEdit,
 };
 
-use crate::{State, document::DocumentChange};
+use crate::{ForceSave, State, document::DocumentChange};
 
 #[tarpc::service]
 pub trait GuiToLsp {
@@ -157,6 +157,8 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
+            self.state.editor_client.send_request::<ForceSave>(()).await;
+
             let o = state_mut.compile_gui_cell(&file, &cell);
             if let Some(gui_client) = &mut state_mut.gui_client {
                 gui_client
@@ -246,6 +248,8 @@ impl GuiToLsp for LspServer {
                 })
                 .await
                 .unwrap();
+
+            self.state.editor_client.send_request::<ForceSave>(()).await;
 
             let o = state_mut.compile_gui_cell(&file, &cell);
             if let Some(gui_client) = &mut state_mut.gui_client {
