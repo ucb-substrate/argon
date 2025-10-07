@@ -139,7 +139,6 @@ impl Solver {
                 );
             }
         }
-        // TODO: detect inconsistent constraints
         self.constraints
             .retain(|constraint| !constraint.coeffs.is_empty());
     }

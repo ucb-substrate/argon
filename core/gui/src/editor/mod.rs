@@ -6,7 +6,8 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, CompiledData, Rect, ScopeId, SolvedValue, ifmatvec,
+    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
+    ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -218,8 +219,14 @@ impl EditorState {
             },
         );
     }
-    pub fn update(&mut self, cx: &mut App, file: PathBuf, solved_cell: CompileOutput) {
-        let solved_cell = solved_cell.unwrap_valid();
+    pub fn update(&mut self, cx: &mut App, file: PathBuf, output: CompileOutput) {
+        let solved_cell = match output {
+            CompileOutput::Valid(d) => d,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(d), ..
+            }) => d,
+            _ => todo!("handle compilation errors that prevent geometry production"),
+        };
         let root_scope = ScopeAddress {
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
