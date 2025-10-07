@@ -32,6 +32,15 @@ Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   }
   ;
 
+IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
+  : Ident { Ok(IdentPath { path: vec![$1?], span: $span }) }
+  | Ident '::' IdentPath { 
+    let mut path = vec![$1?];
+    path.extend($3?.path);
+    Ok(IdentPath { path, span: $span })
+  }
+  ;
+
 FloatLiteral -> Result<FloatLiteral, ()>
   : 'FLOATLIT' {
   let v = $1.map_err(|_| ())?;
@@ -300,7 +309,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
 
 
 CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
-  : Ident '(' Args ')'
+  : IdentPath '(' Args ')'
     {
       Ok(CallExpr {
         func: $1?,

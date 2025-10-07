@@ -187,7 +187,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
     fn dispatch_call_expr(
         &mut self,
         input: &super::CallExpr<Self::InputS, Self::InputMetadata>,
-        _func: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _func: &super::IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &super::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         input.metadata.clone()

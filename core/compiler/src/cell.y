@@ -5,6 +5,15 @@ Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   : 'IDENT' { Ok(Ident { span: $span, name: $lexer.span_str($span), metadata: () }) }
   ;
 
+IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
+  : Ident { Ok(IdentPath { path: vec![$1?], span: $span }) }
+  | Ident '::' IdentPath { 
+    let mut path = vec![$1?];
+    path.extend($3?.path);
+    Ok(IdentPath { path, span: $span })
+  }
+  ;
+
 FloatLiteral -> Result<FloatLiteral, ()>
   : 'FLOATLIT' {
   let v = $1.map_err(|_| ())?;
@@ -18,7 +27,7 @@ IntLiteral -> Result<IntLiteral, ()>
   ;
 
 CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
-  : Ident '(' Args ')'
+  : IdentPath '(' Args ')'
     {
       Ok(CallExpr {
         func: $1?,

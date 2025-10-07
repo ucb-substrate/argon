@@ -21,7 +21,7 @@ pub(crate) struct ScopeAnnotationPass<'a> {
 }
 
 impl<'a> ScopeAnnotationPass<'a> {
-    pub(crate) async fn new(content: &'a Document, ast: &'a ParseAst<'a>) -> Self {
+    pub(crate) fn new(content: &'a Document, ast: &'a ParseAst<'a>) -> Self {
         Self {
             ast,
             content,
