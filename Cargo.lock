@@ -2964,6 +2964,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tarpc",
+ "unicode-segmentation",
 ]
 
 [[package]]
