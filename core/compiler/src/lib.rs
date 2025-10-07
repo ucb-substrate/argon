@@ -235,7 +235,9 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
-        .unwrap_valid();
+        .unwrap_exec_errors()
+        .output
+        .unwrap();
         assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
         println!("{cells:#?}");
     }
@@ -251,7 +253,9 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
-        .unwrap_valid();
+        .unwrap_exec_errors()
+        .output
+        .unwrap();
         assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
         println!("{cells:#?}");
     }
