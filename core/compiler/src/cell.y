@@ -36,7 +36,7 @@ Expr -> Result<Expr<&'input str, ParseMetadata>, ()>
   ;
 
 Args -> Result<Args<&'input str, ParseMetadata>, ()>
-  : PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), metadata: (), }) }
+  : PosArgs { Ok(Args { posargs: $1?, kwargs: Vec::new(), span: $span, metadata: (), }) }
   ;
 
 PosArgs -> Result<Vec<Expr<&'input str, ParseMetadata>>, ()>

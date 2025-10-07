@@ -12,7 +12,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, Scope, UnaryOp};
+use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, KwArgValue, Scope, UnaryOp};
 use crate::layer::LayerProperties;
 use crate::parse::ParseAst;
 use crate::{
@@ -262,11 +262,103 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<&'a str, M>, ty: Ty) -> Ty {
+        self.errors.push(StaticError {
+            span: field.span,
+            kind: StaticErrorKind::NoFieldOnTy {
+                field: field.name.to_string(),
+                ty,
+            },
+        });
+        Ty::Unknown
+    }
+
+    fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
+        if *found != *expected {
             self.errors.push(StaticError {
-                span: field.span,
-                kind: StaticErrorKind::NoFieldOnTy { field: field.name.to_string(), ty },
+                span,
+                kind: StaticErrorKind::IncorrectTy {
+                    found: found.clone(),
+                    expected: expected.clone(),
+                },
             });
-            Ty::Unknown
+        }
+    }
+
+    fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
+        if !matches!(ty, Ty::Cell(_)) {
+            self.errors.push(StaticError {
+                span,
+                kind: StaticErrorKind::IncorrectTyCategory {
+                    found: ty.clone(),
+                    expected: "Cell".into(),
+                },
+            });
+        }
+    }
+
+    fn assert_eq_arity(&mut self, span: cfgrammar::Span, found: usize, expected: usize) {
+        if found != expected {
+            self.errors.push(StaticError {
+                span,
+                kind: StaticErrorKind::CallIncorrectPositionalArity { expected, found },
+            });
+        }
+    }
+
+    fn typecheck_posargs(
+        &mut self,
+        kwargs: &[KwArgValue<&'a str, VarIdTyMetadata>],
+        kwarg_defs: IndexMap<&'a str, Ty>,
+    ) {
+        let mut defined = IndexSet::new();
+        for kwarg in kwargs {
+            let mut cont = false;
+            if !kwarg_defs.contains_key(kwarg.name.name) {
+                self.errors.push(StaticError {
+                    span: kwarg.name.span,
+                    kind: StaticErrorKind::InvalidKwArg,
+                });
+                cont = true;
+            }
+            if defined.contains(kwarg.name.name) {
+                self.errors.push(StaticError {
+                    span: kwarg.name.span,
+                    kind: StaticErrorKind::DuplicateKwArg,
+                });
+                cont = true;
+            }
+            defined.insert(kwarg.name.name);
+            if !cont {
+                todo!()
+            } else {
+                continue;
+            }
+            todo!("actually type check");
+        }
+    }
+
+    fn typecheck_kwargs<M: AstMetadata>(
+        &mut self,
+        kwargs: &[KwArgValue<&'a str, M>],
+        kwarg_defs: IndexMap<&'a str, Ty>,
+    ) {
+        let mut defined = IndexSet::new();
+        for kwarg in kwargs {
+            if !kwarg_defs.contains_key(kwarg.name.name) {
+                self.errors.push(StaticError {
+                    span: kwarg.name.span,
+                    kind: StaticErrorKind::InvalidKwArg,
+                });
+            }
+            if defined.contains(kwarg.name.name) {
+                self.errors.push(StaticError {
+                    span: kwarg.name.span,
+                    kind: StaticErrorKind::DuplicateKwArg,
+                });
+            }
+            defined.insert(kwarg.name.name);
+        }
+        todo!()
     }
 }
 
@@ -587,18 +679,26 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         match func.name {
             "crect" | "rect" => {
                 if func.name == "crect" {
-                    assert_eq!(args.posargs.len(), 0);
+                    self.assert_eq_arity(args.span, args.posargs.len(), 0);
                 } else {
-                    assert_eq!(args.posargs.len(), 1);
-                    assert_eq!(args.posargs[0].ty(), Ty::String);
+                    self.assert_eq_arity(args.span, args.posargs.len(), 1);
+                    self.assert_eq_ty(args.posargs[0].span(), &args.posargs[0].ty(), &Ty::String);
                 }
-                for kwarg in &args.kwargs {
-                    assert!(
-                        ["x0", "x1", "y0", "y1", "x0i", "x1i", "y0i", "y1i", "w", "h"]
-                            .contains(&kwarg.name.name)
-                    );
-                    assert_eq!(kwarg.value.ty(), Ty::Float);
-                }
+                self.typecheck_kwargs(
+                    &args.kwargs,
+                    IndexMap::from_iter([
+                        ("x0", Ty::Float),
+                        ("x1", Ty::Float),
+                        ("y0", Ty::Float),
+                        ("y1", Ty::Float),
+                        ("x0i", Ty::Float),
+                        ("x1i", Ty::Float),
+                        ("y0i", Ty::Float),
+                        ("y1i", Ty::Float),
+                        ("w", Ty::Float),
+                        ("h", Ty::Float),
+                    ]),
+                );
                 (None, Ty::Rect)
             }
             "float" => {
@@ -640,7 +740,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 if let Ty::Cell(c) = args.posargs[0].ty() {
                     (None, Ty::Inst(c.clone()))
                 } else {
-                    panic!("the argument to inst must be a cell");
+                    self.assert_ty_is_cell(args.posargs[0].span(), &args.posargs[0].ty());
+                    (None, Ty::Unknown)
                 }
             }
             name => {
@@ -649,17 +750,33 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .unwrap_or_else(|| panic!("no function or cell named `{name}`"));
                 match ty {
                     Ty::Fn(ty) => {
-                        assert_eq!(args.posargs.len(), ty.args.len());
+                        if args.posargs.len() != ty.args.len() {
+                            self.errors.push(StaticError {
+                                span: args.span,
+                                kind: StaticErrorKind::CallIncorrectPositionalArity {
+                                    expected: ty.args.len(),
+                                    found: args.posargs.len(),
+                                },
+                            });
+                        }
                         for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                            assert_eq!(&arg.ty(), arg_ty);
+                            self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
                         }
                         assert!(args.kwargs.is_empty());
                         (Some(varid), ty.ret.clone())
                     }
                     Ty::CellFn(ty) => {
-                        assert_eq!(args.posargs.len(), ty.args.len());
+                        if args.posargs.len() != ty.args.len() {
+                            self.errors.push(StaticError {
+                                span: args.span,
+                                kind: StaticErrorKind::CallIncorrectPositionalArity {
+                                    expected: ty.args.len(),
+                                    found: args.posargs.len(),
+                                },
+                            });
+                        }
                         for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                            assert_eq!(&arg.ty(), arg_ty);
+                            self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
                         }
                         assert!(args.kwargs.is_empty());
                         (
@@ -2437,6 +2554,16 @@ pub enum StaticErrorKind {
     UnknownType,
     /// No field on object of the given type.
     NoFieldOnTy { field: String, ty: Ty },
+    /// Incorrect type.
+    IncorrectTy { expected: Ty, found: Ty },
+    /// Incorrect type category.
+    IncorrectTyCategory { found: Ty, expected: String },
+    /// Called a function or cell with the wrong number of positional arguments.
+    CallIncorrectPositionalArity { expected: usize, found: usize },
+    /// Invalid keyword argument.
+    InvalidKwArg,
+    /// Duplicate keyword argument.
+    DuplicateKwArg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
