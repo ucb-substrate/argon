@@ -61,7 +61,7 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
     for layer in data.layers.layers.iter() {
         layers.insert(layer.name.clone());
     }
-    for (_, cell) in data.cells.iter() {
+    for (cell_id, cell) in data.cells.iter() {
         for (_, obj) in cell.objects.iter() {
             if let SolvedValue::Rect(r) = obj
                 && let Some(layer) = &r.layer
@@ -69,6 +69,7 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
             {
                 errs.push(ExecError {
                     span: r.span,
+                    cell: *cell_id,
                     kind: ExecErrorKind::IllegalLayer(layer.clone()),
                 })
             }
@@ -545,7 +546,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let cond_ty = cond.ty();
         let then_ty = then.metadata.clone();
         let else_ty = else_.metadata.clone();
-        assert_eq!(cond_ty, Ty::Bool);
         if cond_ty != Ty::Bool {
             self.errors.push(StaticError {
                 span: cond.span(),
@@ -766,35 +766,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 if let Some((varid, ty)) = self.lookup(name) {
                     match ty {
                         Ty::Fn(ty) => {
-                            if args.posargs.len() != ty.args.len() {
-                                self.errors.push(StaticError {
-                                    span: args.span,
-                                    kind: StaticErrorKind::CallIncorrectPositionalArity {
-                                        expected: ty.args.len(),
-                                        found: args.posargs.len(),
-                                    },
-                                });
-                            }
-                            for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                                self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
-                            }
-                            assert!(args.kwargs.is_empty());
+                            self.typecheck_args(input.span, args, &ty.args, IndexMap::new());
                             (Some(varid), ty.ret.clone())
                         }
                         Ty::CellFn(ty) => {
-                            if args.posargs.len() != ty.args.len() {
-                                self.errors.push(StaticError {
-                                    span: args.span,
-                                    kind: StaticErrorKind::CallIncorrectPositionalArity {
-                                        expected: ty.args.len(),
-                                        found: args.posargs.len(),
-                                    },
-                                });
-                            }
-                            for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                                self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
-                            }
-                            assert!(args.kwargs.is_empty());
+                            self.typecheck_args(input.span, args, &ty.args, IndexMap::new());
                             (
                                 Some(varid),
                                 Ty::Cell(Box::new(CellTy {
@@ -1052,6 +1028,7 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
+    errors: Vec<ExecError>,
 }
 
 enum ExecScopeName {
@@ -1085,6 +1062,7 @@ impl<'a> ExecPass<'a> {
             next_id: 4,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -1107,11 +1085,22 @@ impl<'a> ExecPass<'a> {
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
                 .into();
-        CompileOutput::Valid(CompiledData {
-            cells: self.compiled_cells,
-            top: cell_id,
-            layers,
-        })
+        if self.errors.is_empty() {
+            CompileOutput::Valid(CompiledData {
+                cells: self.compiled_cells,
+                top: cell_id,
+                layers,
+            })
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: Some(CompiledData {
+                    cells: self.compiled_cells,
+                    top: cell_id,
+                    layers,
+                }),
+            })
+        }
     }
 
     pub(crate) fn execute_cell(&mut self, cell: &'a str, args: Vec<CellArg>) -> CellId {
@@ -1230,8 +1219,14 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 if state.nullspace_vecs.is_none() {
                     state.nullspace_vecs = Some(state.solver.nullspace_vecs());
+                    self.errors.push(ExecError {
+                        span: None,
+                        cell: cell_id,
+                        kind: ExecErrorKind::Underconstrained,
+                    });
                 }
                 let mut constraint_added = false;
+                let state = self.cell_state_mut(cell_id);
                 while let Some(expr) = state.fallback_constraints.pop() {
                     if expr
                         .coeffs
@@ -1955,7 +1950,14 @@ impl<'a> ExecPass<'a> {
                                         90 => Rotation::R90,
                                         180 => Rotation::R180,
                                         270 => Rotation::R270,
-                                        x => panic!("angle {x} must be a multiple of 90 degrees between 0 and 360 degrees"),
+                                        _ => {
+                                            self.errors.push(ExecError {
+                                                span: Some(kwarg.value.span()),
+                                                cell: vref.loc.cell,
+                                                kind: ExecErrorKind::InvalidRotation,
+                                            });
+                                            Rotation::R0
+                                        }
                                     }
                                 }))
                             } else {
@@ -2621,6 +2623,7 @@ pub enum StaticErrorKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecError {
     pub span: Option<cfgrammar::Span>,
+    pub cell: CellId,
     pub kind: ExecErrorKind,
 }
 
