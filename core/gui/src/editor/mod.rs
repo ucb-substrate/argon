@@ -6,7 +6,7 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, Rect, ScopeId, SolvedValue, ValidCompileOutput, ifmatvec,
+    CellId, CompileOutput, CompiledData, Rect, ScopeId, SolvedValue, ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -49,7 +49,7 @@ pub struct ScopeAddress {
 #[derive(Clone, Debug)]
 pub struct CompileOutputState {
     pub file: PathBuf,
-    pub output: ValidCompileOutput,
+    pub output: CompiledData,
     pub selected_scope: ScopePath,
     pub selected_rect: Option<RectId>,
     pub state: IndexMap<ScopePath, ScopeState>,
@@ -85,6 +85,7 @@ fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>>
             x1: r1.x1.max(r2.x1),
             y1: r1.y1.max(r2.y1),
             id: r1.id,
+            span: None,
         }),
         (Some(r), None) | (None, Some(r)) => Some(r),
         (None, None) => None,
@@ -106,7 +107,7 @@ impl EditorState {
     fn process_scope(
         &self,
         cx: &App,
-        solved_cell: &ValidCompileOutput,
+        solved_cell: &CompiledData,
         scope: ScopeAddress,
         state: &mut ProcessScopeState,
         parent: Option<ScopeAddress>,
@@ -173,6 +174,7 @@ impl EditorState {
                                     x1: p0p.0.max(p1p.0) + inst.x,
                                     y1: p0p.1.max(p1p.1) + inst.y,
                                     id: inst.id,
+                                    span: rect.span,
                                 }
                             }),
                     );
