@@ -12,7 +12,9 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use crate::ast::{BinOp, ConstantDecl, FieldAccessExpr, FnDecl, KwArgValue, Scope, UnaryOp};
+use crate::ast::{
+    BinOp, ComparisonOp, ConstantDecl, FieldAccessExpr, FnDecl, KwArgValue, Scope, UnaryOp,
+};
 use crate::layer::LayerProperties;
 use crate::parse::ParseAst;
 use crate::{
@@ -632,7 +634,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::BinOpMismatchedTypes,
             });
         } else {
-            if left_ty == Ty::Float {
+            if left_ty == Ty::Float
+                && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
+            {
                 self.errors.push(StaticError {
                     span: input.span,
                     kind: StaticErrorKind::FloatEquality,
