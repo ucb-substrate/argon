@@ -1245,7 +1245,7 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 if !constraint_added {
-                    panic!("no progress");
+                    state.solver.force_solution();
                 }
             }
 
@@ -2389,7 +2389,7 @@ impl<'a> ExecPass<'a> {
                             .eval_expr(expr)
                             .map(|val| Value::Int(val as i64)),
                         (expr @ Value::Linear(_), Ty::Float) => Some(expr.clone()),
-                        _ => panic!("invalid cast"),
+                        _ => unreachable!("invalid cast"),
                     };
                     if let Some(value) = value {
                         self.values.insert(vid, DeferValue::Ready(value));
