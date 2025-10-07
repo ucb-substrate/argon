@@ -48,12 +48,13 @@ impl AstMetadata for ParseMetadata {
     type CastExpr = ();
 }
 
-pub fn get_mod(root_dir: impl AsRef<Path>, path: &ModPath) -> Result<String, anyhow::Error> {
-    let mut base_path = PathBuf::from(root_dir.as_ref());
+pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<String, anyhow::Error> {
+    let root_lib = root_lib.as_ref();
     if path.is_empty() {
-        base_path.push("lib.ar");
-        return Ok(std::fs::read_to_string(&base_path)?);
+        return Ok(std::fs::read_to_string(&root_lib)?);
     }
+    let mut base_path = PathBuf::from(root_lib);
+    base_path.pop();
     for m in &path[0..path.len() - 1] {
         base_path.push(m);
     }
@@ -64,6 +65,9 @@ pub fn get_mod(root_dir: impl AsRef<Path>, path: &ModPath) -> Result<String, any
     if direct_path.exists() && base_path.exists() {
         bail!("both mod paths exists for mod {}", path.last().unwrap());
     }
+    if direct_path == root_lib {
+        bail!("circular mods: {}", path.last().unwrap());
+    }
     if let Ok(contents) = std::fs::read_to_string(&direct_path) {
         Ok(contents)
     } else {
@@ -71,14 +75,14 @@ pub fn get_mod(root_dir: impl AsRef<Path>, path: &ModPath) -> Result<String, any
     }
 }
 
-pub fn parse_workspace(root_dir: impl AsRef<Path>) -> Result<WorkspaceParseAst, anyhow::Error> {
-    let root_dir = root_dir.as_ref();
+pub fn parse_workspace(root_lib: impl AsRef<Path>) -> Result<WorkspaceParseAst, anyhow::Error> {
+    let root_lib = root_lib.as_ref();
 
     let mut stack = vec![vec![]];
     let mut workspace_ast = HashMap::new();
 
     while let Some(path) = stack.pop() {
-        let contents = get_mod(root_dir, &path)?;
+        let contents = get_mod(root_lib, &path)?;
         let ast = parse(contents)?;
         for decl in &ast.ast.decls {
             if let Decl::Mod(decl) = decl {

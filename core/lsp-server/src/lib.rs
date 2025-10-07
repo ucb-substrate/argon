@@ -19,6 +19,7 @@ use compiler::{
     parse,
 };
 use futures::prelude::*;
+use itertools::Itertools;
 use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
@@ -58,11 +59,16 @@ impl StateMut {
             "/../../core/compiler/examples/lyp/basic.lyp"
         );
         let cell_ast = parse::parse_cell(cell.as_ref()).unwrap();
-        let ast = parse::parse(doc.contents()).unwrap();
+        let ast = parse::parse_workspace(file).unwrap();
         compile::compile(
             &ast,
             CompileInput {
-                cell: cell_ast.func.name,
+                cell: &cell_ast
+                    .func
+                    .path
+                    .iter()
+                    .map(|ident| ident.name)
+                    .collect_vec(),
                 args: cell_ast
                     .args
                     .posargs

@@ -76,7 +76,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
     ));
-    const ARGON_WORKSPACE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/argon_workspace");
+    const ARGON_WORKSPACE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/argon_workspace/lib.ar"
+    );
 
     #[test]
     fn argon_scopes() {
@@ -121,6 +124,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn argon_if_inconsistent() {
         let ast = parse(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
         let cell = compile(
