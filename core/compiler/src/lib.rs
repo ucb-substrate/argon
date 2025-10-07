@@ -7,10 +7,11 @@ pub mod solver;
 #[cfg(test)]
 mod tests {
 
-    use std::{collections::HashMap, path::PathBuf};
+    use std::path::PathBuf;
 
     use crate::parse::{parse, parse_workspace};
     use approx::assert_relative_eq;
+    use indexmap::IndexMap;
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
@@ -85,7 +86,7 @@ mod tests {
     fn argon_scopes() {
         let ast = parse(ARGON_SCOPES).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["scopes"],
                 args: Vec::new(),
@@ -99,7 +100,7 @@ mod tests {
     fn argon_immediate() {
         let ast = parse(ARGON_IMMEDIATE).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["immediate"],
                 args: Vec::new(),
@@ -113,7 +114,7 @@ mod tests {
     fn argon_if() {
         let ast = parse(ARGON_IF).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
@@ -128,7 +129,7 @@ mod tests {
     fn argon_if_inconsistent() {
         let ast = parse(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
@@ -142,7 +143,7 @@ mod tests {
     fn argon_via() {
         let ast = parse(ARGON_VIA).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["via"],
                 args: Vec::new(),
@@ -156,7 +157,7 @@ mod tests {
     fn argon_via_array() {
         let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["vias"],
                 args: Vec::new(),
@@ -170,7 +171,7 @@ mod tests {
     fn argon_func_out_of_order() {
         let ast = parse(ARGON_FUNC_OUT_OF_ORDER).expect("failed to parse Argon");
         let cell = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
@@ -184,7 +185,7 @@ mod tests {
     fn argon_hierarchy() {
         let ast = parse(ARGON_HIERARCHY).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -198,7 +199,7 @@ mod tests {
     fn argon_nested_inst() {
         let ast = parse(ARGON_NESTED_INST).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -213,7 +214,7 @@ mod tests {
     fn argon_cell_out_of_order() {
         let ast = parse(ARGON_CELL_OUT_OF_ORDER).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -227,7 +228,7 @@ mod tests {
     fn argon_fallback_basic() {
         let ast = parse(ARGON_FALLBACK_BASIC).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -243,7 +244,7 @@ mod tests {
     fn argon_fallback_inst() {
         let ast = parse(ARGON_FALLBACK_INST).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -259,7 +260,7 @@ mod tests {
     fn argon_bool_literal() {
         let ast = parse(ARGON_BOOL_LITERAL).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -291,7 +292,7 @@ mod tests {
     fn argon_dimensions() {
         let ast = parse(ARGON_DIMENSIONS).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -314,7 +315,7 @@ mod tests {
     fn argon_param_float() {
         let ast = parse(ARGON_PARAM_FLOAT).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(50.), CellArg::Float(20.)],
@@ -329,7 +330,7 @@ mod tests {
     fn argon_param_int() {
         let ast = parse(ARGON_PARAM_INT).expect("failed to parse Argon");
         let cells = compile(
-            &HashMap::from_iter([(vec![], ast)]),
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Int(50), CellArg::Int(20)],
@@ -368,7 +369,7 @@ mod tests {
     //     let cell = compile(CompileInput {
     //         cell: "inverter",
     //         ast: &ast,
-    //         args: HashMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
+    //         args: IndexMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
     //     })
     //     .expect("failed to solve compile Argon cell");
     //     println!("cell: {cell:?}");

@@ -18,6 +18,7 @@ use compiler::{
     parse,
 };
 use futures::prelude::*;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
@@ -42,8 +43,8 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct StateMut {
     gui_client: Option<LspToGuiClient>,
-    gui_files: HashMap<Url, GuiDocument>,
-    editor_files: HashMap<Url, Document>,
+    gui_files: IndexMap<Url, GuiDocument>,
+    editor_files: IndexMap<Url, Document>,
 }
 
 impl StateMut {
@@ -180,7 +181,9 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let mut state_mut = self.state.state_mut.lock().await;
-        state_mut.editor_files.remove(&params.text_document.uri);
+        state_mut
+            .editor_files
+            .swap_remove(&params.text_document.uri);
     }
 
     async fn shutdown(&self) -> Result<()> {

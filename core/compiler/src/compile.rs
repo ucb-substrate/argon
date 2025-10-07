@@ -2,7 +2,7 @@
 //
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::BufReader;
 use std::path::Path;
 
@@ -61,12 +61,12 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
     }
 }
 
-type ModDag<'a> = HashMap<&'a ModPath, HashSet<&'a ModPath>>;
+type ModDag<'a> = IndexMap<&'a ModPath, IndexSet<&'a ModPath>>;
 
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
-    deps: HashSet<&'a ModPath>,
+    deps: IndexSet<&'a ModPath>,
 }
 
 pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> ModDag<'_> {
@@ -84,7 +84,7 @@ impl<'a> ImportPass<'a> {
         }
     }
 
-    pub(crate) fn execute(mut self) -> HashSet<&'a ModPath> {
+    pub(crate) fn execute(mut self) -> IndexSet<&'a ModPath> {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -324,7 +324,7 @@ pub(crate) struct VarIdTyFrame {
 
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
-    mod_bindings: &'a HashMap<&'a ModPath, VarIdTyFrame>,
+    mod_bindings: &'a IndexMap<&'a ModPath, VarIdTyFrame>,
     current_path: &'a ModPath,
     next_id: VarId,
     bindings: Vec<VarIdTyFrame>,
@@ -335,8 +335,8 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
 ) -> (WorkspaceAst<VarIdTyMetadata>, Vec<StaticError>) {
-    let mut mod_bindings = HashMap::new();
-    let mut workspace_ast = HashMap::new();
+    let mut mod_bindings = IndexMap::new();
+    let mut workspace_ast = IndexMap::new();
     let mut errors = Vec::new();
     let mut next_id = 1;
     let std_mod_path = vec!["std".to_string()];
@@ -359,7 +359,7 @@ pub(crate) fn execute_var_id_ty_pass_inner<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
     current_path: &'a ModPath,
-    mod_bindings: &mut HashMap<&'a ModPath, VarIdTyFrame>,
+    mod_bindings: &mut IndexMap<&'a ModPath, VarIdTyFrame>,
     workspace_ast: &mut WorkspaceAst<VarIdTyMetadata>,
     errors: &mut Vec<StaticError>,
     next_id: &mut VarId,

@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
     fmt::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, bail};
 use arcstr::ArcStr;
+use indexmap::IndexMap;
 use lrlex::lrlex_mod;
 use lrpar::lrpar_mod;
 
@@ -79,7 +79,7 @@ pub fn parse_workspace(root_lib: impl AsRef<Path>) -> Result<WorkspaceParseAst, 
     let root_lib = root_lib.as_ref();
 
     let mut stack = vec![vec![]];
-    let mut workspace_ast = HashMap::new();
+    let mut workspace_ast = IndexMap::new();
 
     while let Some(path) = stack.pop() {
         let contents = get_mod(root_lib, &path)?;

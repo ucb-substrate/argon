@@ -1,8 +1,9 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::marker::PhantomData;
 
 use arcstr::{ArcStr, Substr};
 use cfgrammar::Span;
 use derive_where::derive_where;
+use indexmap::IndexMap;
 
 use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, StringLiteral};
 
@@ -10,7 +11,7 @@ use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, StringLit
 pub struct AnnotatedAst<T: AstMetadata> {
     pub text: ArcStr,
     pub ast: Ast<Substr, T>,
-    pub span2scope: HashMap<Span, Scope<Substr, T>>,
+    pub span2scope: IndexMap<Span, Scope<Substr, T>>,
 }
 
 impl<T: AstMetadata> AnnotatedAst<T> {
@@ -50,7 +51,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
 
 struct AstAnnotationPass<S, T: AstMetadata> {
     text: ArcStr,
-    span2scope: HashMap<Span, Scope<Substr, T>>,
+    span2scope: IndexMap<Span, Scope<Substr, T>>,
     phantom: PhantomData<S>,
 }
 

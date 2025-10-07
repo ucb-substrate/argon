@@ -1,7 +1,8 @@
-use std::{collections::HashMap, fmt::Debug};
+use std::fmt::Debug;
 
 use cfgrammar::Span;
 use derive_where::derive_where;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -10,7 +11,7 @@ use crate::ast::annotated::AnnotatedAst;
 pub mod annotated;
 
 pub type ModPath = Vec<String>;
-pub type WorkspaceAst<T> = HashMap<ModPath, AnnotatedAst<T>>;
+pub type WorkspaceAst<T> = IndexMap<ModPath, AnnotatedAst<T>>;
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct Ast<S, T: AstMetadata> {
