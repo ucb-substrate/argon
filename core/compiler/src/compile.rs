@@ -2,7 +2,7 @@
 //
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -45,12 +45,12 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
     res
 }
 
-type ModDag<'a> = HashMap<&'a ModPath, Vec<&'a ModPath>>;
+type ModDag<'a> = HashMap<&'a ModPath, HashSet<&'a ModPath>>;
 
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
-    deps: Vec<&'a ModPath>,
+    deps: HashSet<&'a ModPath>,
 }
 
 pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> ModDag<'_> {
@@ -64,11 +64,11 @@ impl<'a> ImportPass<'a> {
         Self {
             ast,
             current_path,
-            deps: vec![],
+            deps: Default::default(),
         }
     }
 
-    pub(crate) fn execute(mut self) -> Vec<&'a ModPath> {
+    pub(crate) fn execute(mut self) -> HashSet<&'a ModPath> {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -231,7 +231,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
                     .collect_vec()
             };
             let (path_ref, _) = self.ast.get_key_value(&path).expect("module doesn't exist");
-            self.deps.push(path_ref);
+            self.deps.insert(path_ref);
         }
     }
 
