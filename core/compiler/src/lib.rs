@@ -16,67 +16,31 @@ mod tests {
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
-    const ARGON_SCOPES: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes.ar"));
+    const ARGON_SCOPES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes.ar");
     const BASIC_LYP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lyp/basic.lyp");
-    const ARGON_IMMEDIATE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/immediate.ar"
-    ));
-    const ARGON_IF: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if.ar"));
-    const ARGON_IF_INCONSISTENT: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/if_inconsistent.ar"
-    ));
-    const ARGON_VIA: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via.ar"));
-    const ARGON_VIA_ARRAY: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/via_array.ar"
-    ));
-    const ARGON_FUNC_OUT_OF_ORDER: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/func_out_of_order.ar"
-    ));
-    const ARGON_HIERARCHY: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/hierarchy.ar"
-    ));
-    const ARGON_NESTED_INST: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/nested_inst.ar"
-    ));
-    const ARGON_CELL_OUT_OF_ORDER: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/cell_out_of_order.ar"
-    ));
-    const ARGON_FALLBACK_BASIC: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/fallback_basic.ar"
-    ));
-    const ARGON_FALLBACK_INST: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/fallback_inst.ar"
-    ));
-    const ARGON_BOOL_LITERAL: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/bool_literal.ar"
-    ));
-    const ARGON_DIMENSIONS: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/dimensions.ar"
-    ));
-    const ARGON_PARAM_FLOAT: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/param_float.ar"
-    ));
-    const ARGON_PARAM_INT: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/param_int.ar"
-    ));
-    const ARGON_SKY130_INVERTER: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/sky130_inverter.ar"
-    ));
+    const ARGON_IMMEDIATE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/immediate.ar");
+    const ARGON_IF: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if.ar");
+    const ARGON_IF_INCONSISTENT: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if_inconsistent.ar");
+    const ARGON_VIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via.ar");
+    const ARGON_VIA_ARRAY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via_array.ar");
+    const ARGON_FUNC_OUT_OF_ORDER: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/func_out_of_order.ar");
+    const ARGON_HIERARCHY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/hierarchy.ar");
+    const ARGON_NESTED_INST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/nested_inst.ar");
+    const ARGON_CELL_OUT_OF_ORDER: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/cell_out_of_order.ar");
+    const ARGON_FALLBACK_BASIC: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fallback_basic.ar");
+    const ARGON_FALLBACK_INST: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fallback_inst.ar");
+    const ARGON_BOOL_LITERAL: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bool_literal.ar");
+    const ARGON_DIMENSIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/dimensions.ar");
+    const ARGON_PARAM_FLOAT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/param_float.ar");
+    const ARGON_PARAM_INT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/param_int.ar");
+    const ARGON_SKY130_INVERTER: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/sky130_inverter.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
@@ -84,9 +48,9 @@ mod tests {
 
     #[test]
     fn argon_scopes() {
-        let ast = parse(ARGON_SCOPES).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_SCOPES).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["scopes"],
                 args: Vec::new(),
@@ -98,9 +62,9 @@ mod tests {
 
     #[test]
     fn argon_immediate() {
-        let ast = parse(ARGON_IMMEDIATE).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_IMMEDIATE).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["immediate"],
                 args: Vec::new(),
@@ -112,9 +76,9 @@ mod tests {
 
     #[test]
     fn argon_if() {
-        let ast = parse(ARGON_IF).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_IF).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
@@ -127,9 +91,9 @@ mod tests {
     #[test]
     #[should_panic]
     fn argon_if_inconsistent() {
-        let ast = parse(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
@@ -141,9 +105,9 @@ mod tests {
 
     #[test]
     fn argon_via() {
-        let ast = parse(ARGON_VIA).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_VIA).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["via"],
                 args: Vec::new(),
@@ -155,9 +119,9 @@ mod tests {
 
     #[test]
     fn argon_via_array() {
-        let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_VIA_ARRAY).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["vias"],
                 args: Vec::new(),
@@ -169,9 +133,9 @@ mod tests {
 
     #[test]
     fn argon_func_out_of_order() {
-        let ast = parse(ARGON_FUNC_OUT_OF_ORDER).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_FUNC_OUT_OF_ORDER).expect("failed to parse Argon");
         let cell = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
@@ -183,9 +147,9 @@ mod tests {
 
     #[test]
     fn argon_hierarchy() {
-        let ast = parse(ARGON_HIERARCHY).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_HIERARCHY).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -197,9 +161,9 @@ mod tests {
 
     #[test]
     fn argon_nested_inst() {
-        let ast = parse(ARGON_NESTED_INST).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_NESTED_INST).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -212,9 +176,9 @@ mod tests {
     #[test]
     #[ignore = "not supported"]
     fn argon_cell_out_of_order() {
-        let ast = parse(ARGON_CELL_OUT_OF_ORDER).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_CELL_OUT_OF_ORDER).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -226,9 +190,9 @@ mod tests {
 
     #[test]
     fn argon_fallback_basic() {
-        let ast = parse(ARGON_FALLBACK_BASIC).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_FALLBACK_BASIC).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -242,9 +206,9 @@ mod tests {
 
     #[test]
     fn argon_fallback_inst() {
-        let ast = parse(ARGON_FALLBACK_INST).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_FALLBACK_INST).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -258,9 +222,9 @@ mod tests {
 
     #[test]
     fn argon_bool_literal() {
-        let ast = parse(ARGON_BOOL_LITERAL).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_BOOL_LITERAL).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -290,9 +254,9 @@ mod tests {
 
     #[test]
     fn argon_dimensions() {
-        let ast = parse(ARGON_DIMENSIONS).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_DIMENSIONS).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
@@ -313,9 +277,9 @@ mod tests {
 
     #[test]
     fn argon_param_float() {
-        let ast = parse(ARGON_PARAM_FLOAT).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_PARAM_FLOAT).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(50.), CellArg::Float(20.)],
@@ -328,9 +292,9 @@ mod tests {
 
     #[test]
     fn argon_param_int() {
-        let ast = parse(ARGON_PARAM_INT).expect("failed to parse Argon");
+        let ast = parse_workspace(ARGON_PARAM_INT).expect("failed to parse Argon");
         let cells = compile(
-            &IndexMap::from_iter([(vec![], ast)]),
+            &ast,
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Int(50), CellArg::Int(20)],
@@ -365,7 +329,7 @@ mod tests {
 
     // #[test]
     // fn argon_sky130_inverter() {
-    //     let ast = parse(ARGON_SKY130_INVERTER).expect("failed to parse Argon");
+    //     let ast = parse_workspace(ARGON_SKY130_INVERTER).expect("failed to parse Argon");
     //     let cell = compile(CompileInput {
     //         cell: "inverter",
     //         ast: &ast,
