@@ -13,7 +13,7 @@ mod tests {
     use approx::assert_relative_eq;
     use indexmap::IndexMap;
 
-    use crate::compile::{compile, CellArg, CompileInput};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const ARGON_SCOPES: &str =
