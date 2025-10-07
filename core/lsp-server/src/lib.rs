@@ -12,13 +12,14 @@ use std::{
     sync::Arc,
 };
 
-use arcstr::ArcStr;
 use compiler::{
-    ast::{Expr, annotated::AnnotatedAst},
+    ast::Expr,
     compile::{self, CellArg, CompileInput, CompileOutput},
     parse,
 };
 use futures::prelude::*;
+use indexmap::IndexMap;
+use itertools::Itertools;
 use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ use tarpc::{
 };
 use tokio::{process::Command, sync::Mutex};
 use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::*;
+use tower_lsp::lsp_types::{request::Request, *};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::{
@@ -42,15 +43,13 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct StateMut {
     gui_client: Option<LspToGuiClient>,
-    gui_files: HashMap<Url, GuiDocument>,
-    editor_files: HashMap<Url, Document>,
+    gui_files: IndexMap<Url, GuiDocument>,
+    editor_files: IndexMap<Url, Document>,
 }
 
 impl StateMut {
     fn compile_gui_cell(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) -> CompileOutput {
         let file = file.as_ref();
-        let url = Url::from_file_path(file).unwrap();
-        let doc = &self.gui_files[&url];
 
         // TODO: un-hardcode this.
         let lyp = concat!(
@@ -58,11 +57,16 @@ impl StateMut {
             "/../../core/compiler/examples/lyp/basic.lyp"
         );
         let cell_ast = parse::parse_cell(cell.as_ref()).unwrap();
-        let ast = parse::parse(doc.contents()).unwrap();
+        let ast = parse::parse_workspace(file).unwrap();
         compile::compile(
             &ast,
             CompileInput {
-                cell: cell_ast.func.name,
+                cell: &cell_ast
+                    .func
+                    .path
+                    .iter()
+                    .map(|ident| ident.name)
+                    .collect_vec(),
                 args: cell_ast
                     .args
                     .posargs
@@ -99,6 +103,16 @@ impl State {
 #[derive(Debug, Clone)]
 struct Backend {
     state: State,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForceSave;
+
+impl Request for ForceSave {
+    type Params = ();
+    type Result = ();
+
+    const METHOD: &'static str = "custom/forceSave";
 }
 
 #[tower_lsp::async_trait]
@@ -167,7 +181,9 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let mut state_mut = self.state.state_mut.lock().await;
-        state_mut.editor_files.remove(&params.text_document.uri);
+        state_mut
+            .editor_files
+            .swap_remove(&params.text_document.uri);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -236,7 +252,7 @@ impl Backend {
         };
 
         let ast = parse::parse(doc.contents()).unwrap();
-        let scope_annotation = ScopeAnnotationPass::new(&doc, &ast).await;
+        let scope_annotation = ScopeAnnotationPass::new(&doc, &ast);
         let mut text_edits = scope_annotation.execute();
         text_edits.sort_by_key(|edit| Reverse(edit.range.start));
         doc.apply_changes(
@@ -250,7 +266,6 @@ impl Backend {
             doc.version() + 1,
         );
         let ast = parse::parse(doc.contents()).unwrap();
-        let ast = AnnotatedAst::new(ArcStr::from(doc.contents()), &ast);
         state_mut.gui_files.insert(
             url,
             GuiDocument {
@@ -260,18 +275,20 @@ impl Backend {
             },
         );
 
-        self.state
-            .editor_client
-            .apply_edit(WorkspaceEdit {
-                changes: Some(HashMap::from_iter([(
-                    Url::from_file_path(file).unwrap(),
-                    text_edits,
-                )])),
-                document_changes: None,
-                change_annotations: None,
-            })
-            .await
-            .unwrap();
+        if !text_edits.is_empty() {
+            self.state
+                .editor_client
+                .apply_edit(WorkspaceEdit {
+                    changes: Some(HashMap::from_iter([(
+                        Url::from_file_path(file).unwrap(),
+                        text_edits,
+                    )])),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+                .await
+                .unwrap();
+        }
     }
 
     /// Compiles an **open** GUI cell.

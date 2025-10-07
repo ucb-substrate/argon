@@ -2,14 +2,26 @@ use std::fmt::Debug;
 
 use cfgrammar::Span;
 use derive_where::derive_where;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use crate::ast::annotated::AnnotatedAst;
+
 pub mod annotated;
+
+pub type ModPath = Vec<String>;
+pub type WorkspaceAst<T> = IndexMap<ModPath, AnnotatedAst<T>>;
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct Ast<S, T: AstMetadata> {
     pub decls: Vec<Decl<S, T>>,
+    pub span: Span,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct ModDecl<S, T: AstMetadata> {
+    pub ident: Ident<S, T>,
     pub span: Span,
 }
 
@@ -19,7 +31,14 @@ pub enum Decl<S, T: AstMetadata> {
     Struct(StructDecl<S, T>),
     Constant(ConstantDecl<S, T>),
     Cell(CellDecl<S, T>),
+    Mod(ModDecl<S, T>),
     Fn(FnDecl<S, T>),
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct IdentPath<S, T: AstMetadata> {
+    pub path: Vec<Ident<S, T>>,
+    pub span: Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -229,7 +248,7 @@ pub struct EnumValue<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct CallExpr<S, T: AstMetadata> {
-    pub func: Ident<S, T>,
+    pub func: IdentPath<S, T>,
     pub args: Args<S, T>,
     pub span: Span,
     pub metadata: T::CallExpr,
@@ -429,7 +448,7 @@ pub trait AstTransformer {
     fn dispatch_call_expr(
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
-        func: &Ident<Self::OutputS, Self::OutputMetadata>,
+        func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
         args: &Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr;
     fn dispatch_emit_expr(
@@ -481,6 +500,20 @@ pub trait AstTransformer {
             span: input.span,
             name,
             metadata,
+        }
+    }
+
+    fn transform_ident_path(
+        &mut self,
+        input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> IdentPath<Self::OutputS, Self::OutputMetadata> {
+        IdentPath {
+            path: input
+                .path
+                .iter()
+                .map(|ident| self.transform_ident(ident))
+                .collect(),
+            span: input.span,
         }
     }
 
@@ -552,6 +585,16 @@ pub trait AstTransformer {
             scope,
             span: input.span,
             metadata,
+        }
+    }
+    fn transform_mod_decl(
+        &mut self,
+        input: &ModDecl<Self::InputS, Self::InputMetadata>,
+    ) -> ModDecl<Self::OutputS, Self::OutputMetadata> {
+        let ident = self.transform_ident(&input.ident);
+        ModDecl {
+            ident,
+            span: input.span,
         }
     }
     fn transform_constant_decl(
@@ -693,7 +736,7 @@ pub trait AstTransformer {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
-        let func = self.transform_ident(&input.func);
+        let func = self.transform_ident_path(&input.func);
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {

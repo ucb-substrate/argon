@@ -23,12 +23,22 @@ Decl -> Result<Decl<&'input str, ParseMetadata>, ()>
   | CellDecl { Ok(Decl::Cell($1?)) }
   | FnDecl { Ok(Decl::Fn($1?)) }
   | ConstantDecl { Ok(Decl::Constant($1?)) }
+  | ModDecl { Ok(Decl::Mod($1?)) }
   ;
 
 Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   : 'IDENT' { 
   let _ = $1.map_err(|_| ())?;
   Ok(Ident { span: $span, name: $lexer.span_str($span), metadata: () })
+  }
+  ;
+
+IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
+  : Ident { Ok(IdentPath { path: vec![$1?], span: $span }) }
+  | Ident '::' IdentPath { 
+    let mut path = vec![$1?];
+    path.extend($3?.path);
+    Ok(IdentPath { path, span: $span })
   }
   ;
 
@@ -92,6 +102,16 @@ ConstantDecl -> Result<ConstantDecl<&'input str, ParseMetadata>, ()>
       ty: $4?,
       value: $6?,
       metadata: (),
+    })
+  }
+  ;
+
+ModDecl -> Result<ModDecl<&'input str, ParseMetadata>, ()>
+  : 'MOD' Ident ';'
+  {
+    Ok(ModDecl {
+      ident: $2?,
+      span: $span,
     })
   }
   ;
@@ -300,7 +320,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
 
 
 CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
-  : Ident '(' Args ')'
+  : IdentPath '(' Args ')'
     {
       Ok(CallExpr {
         func: $1?,

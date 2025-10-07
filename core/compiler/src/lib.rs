@@ -1,75 +1,20 @@
-use clap::Parser;
-use compile::CompileInput;
-use std::path::PathBuf;
-
-use crate::compile::CellArg;
-
 pub mod ast;
 pub mod compile;
 pub mod layer;
 pub mod parse;
 pub mod solver;
 
-/// Argon compiler.
-// TODO: Use subcommands for better API clarity.
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    /// The Argon source code to compile.
-    file: PathBuf,
-    /// The name of the cell to compile.
-    #[arg(short, long)]
-    cell: Option<String>,
-    /// Layer properties file.
-    #[arg(short, long)]
-    lyp: Option<PathBuf>,
-    /// Outputs AST as JSON.
-    #[arg(short, long)]
-    ast: bool,
-}
-
-pub fn main() {
-    let args = Args::parse();
-    let f = std::fs::read_to_string(&args.file).unwrap();
-    let ast = parse::parse(&f).unwrap();
-    if args.ast {
-        println!("{}", serde_json::to_string(&ast).unwrap());
-    } else {
-        let cell = args.cell.unwrap();
-        let cell_ast = parse::parse_cell(&cell).unwrap();
-        let o = compile::compile(
-            &ast,
-            CompileInput {
-                cell: cell_ast.func.name,
-                args: cell_ast
-                    .args
-                    .posargs
-                    .iter()
-                    .map(|arg| match arg {
-                        ast::Expr::FloatLiteral(float_literal) => {
-                            CellArg::Float(float_literal.value)
-                        }
-                        ast::Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
-                        _ => panic!("must be int or float literal for now"),
-                    })
-                    .collect(),
-                lyp_file: &args.lyp.unwrap(),
-            },
-        );
-        println!("{}", serde_json::to_string(&o).unwrap());
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
+    use std::path::PathBuf;
+
+    use crate::parse::{parse, parse_workspace};
     use approx::assert_relative_eq;
-    use parse::parse;
+    use indexmap::IndexMap;
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
-
-    use super::*;
 
     const ARGON_SCOPES: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes.ar"));
@@ -132,14 +77,18 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
     ));
+    const ARGON_WORKSPACE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/argon_workspace/lib.ar"
+    );
 
     #[test]
     fn argon_scopes() {
         let ast = parse(ARGON_SCOPES).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "scopes",
+                cell: &["scopes"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -151,9 +100,9 @@ mod tests {
     fn argon_immediate() {
         let ast = parse(ARGON_IMMEDIATE).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "immediate",
+                cell: &["immediate"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -165,9 +114,9 @@ mod tests {
     fn argon_if() {
         let ast = parse(ARGON_IF).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "if_test",
+                cell: &["if_test"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -180,9 +129,9 @@ mod tests {
     fn argon_if_inconsistent() {
         let ast = parse(ARGON_IF_INCONSISTENT).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "if_test",
+                cell: &["if_test"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -194,9 +143,9 @@ mod tests {
     fn argon_via() {
         let ast = parse(ARGON_VIA).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "via",
+                cell: &["via"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -208,9 +157,9 @@ mod tests {
     fn argon_via_array() {
         let ast = parse(ARGON_VIA_ARRAY).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "vias",
+                cell: &["vias"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -222,9 +171,9 @@ mod tests {
     fn argon_func_out_of_order() {
         let ast = parse(ARGON_FUNC_OUT_OF_ORDER).expect("failed to parse Argon");
         let cell = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "test",
+                cell: &["test"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -236,9 +185,9 @@ mod tests {
     fn argon_hierarchy() {
         let ast = parse(ARGON_HIERARCHY).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -250,9 +199,9 @@ mod tests {
     fn argon_nested_inst() {
         let ast = parse(ARGON_NESTED_INST).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -265,9 +214,9 @@ mod tests {
     fn argon_cell_out_of_order() {
         let ast = parse(ARGON_CELL_OUT_OF_ORDER).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -279,9 +228,9 @@ mod tests {
     fn argon_fallback_basic() {
         let ast = parse(ARGON_FALLBACK_BASIC).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -297,9 +246,9 @@ mod tests {
     fn argon_fallback_inst() {
         let ast = parse(ARGON_FALLBACK_INST).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -315,9 +264,9 @@ mod tests {
     fn argon_bool_literal() {
         let ast = parse(ARGON_BOOL_LITERAL).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -347,9 +296,9 @@ mod tests {
     fn argon_dimensions() {
         let ast = parse(ARGON_DIMENSIONS).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -370,9 +319,9 @@ mod tests {
     fn argon_param_float() {
         let ast = parse(ARGON_PARAM_FLOAT).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: vec![CellArg::Float(50.), CellArg::Float(20.)],
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -385,9 +334,9 @@ mod tests {
     fn argon_param_int() {
         let ast = parse(ARGON_PARAM_INT).expect("failed to parse Argon");
         let cells = compile(
-            &ast,
+            &IndexMap::from_iter([(vec![], ast)]),
             CompileInput {
-                cell: "top",
+                cell: &["top"],
                 args: vec![CellArg::Int(50), CellArg::Int(20)],
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
@@ -396,13 +345,35 @@ mod tests {
         cells.unwrap_valid();
     }
 
+    #[test]
+    fn argon_workspace() {
+        let ast = parse_workspace(ARGON_WORKSPACE).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["test"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().next().unwrap().1.as_ref().unwrap_rect();
+        assert_relative_eq!(r.x0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 10., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 15., epsilon = EPSILON);
+    }
+
     // #[test]
     // fn argon_sky130_inverter() {
     //     let ast = parse(ARGON_SKY130_INVERTER).expect("failed to parse Argon");
     //     let cell = compile(CompileInput {
     //         cell: "inverter",
     //         ast: &ast,
-    //         args: HashMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
+    //         args: IndexMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
     //     })
     //     .expect("failed to solve compile Argon cell");
     //     println!("cell: {cell:?}");

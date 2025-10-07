@@ -1,8 +1,9 @@
-use std::{collections::HashMap, marker::PhantomData};
+use std::marker::PhantomData;
 
 use arcstr::{ArcStr, Substr};
 use cfgrammar::Span;
 use derive_where::derive_where;
+use indexmap::IndexMap;
 
 use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, StringLiteral};
 
@@ -10,7 +11,7 @@ use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, StringLit
 pub struct AnnotatedAst<T: AstMetadata> {
     pub text: ArcStr,
     pub ast: Ast<Substr, T>,
-    pub span2scope: HashMap<Span, Scope<Substr, T>>,
+    pub span2scope: IndexMap<Span, Scope<Substr, T>>,
 }
 
 impl<T: AstMetadata> AnnotatedAst<T> {
@@ -30,6 +31,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Cell(c) => {
                     decls.push(Decl::Cell(pass.transform_cell_decl(c)));
                 }
+                Decl::Mod(m) => {
+                    decls.push(Decl::Mod(pass.transform_mod_decl(m)));
+                }
                 _ => todo!(),
             }
         }
@@ -47,7 +51,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
 
 struct AstAnnotationPass<S, T: AstMetadata> {
     text: ArcStr,
-    span2scope: HashMap<Span, Scope<Substr, T>>,
+    span2scope: IndexMap<Span, Scope<Substr, T>>,
     phantom: PhantomData<S>,
 }
 
@@ -187,7 +191,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
     fn dispatch_call_expr(
         &mut self,
         input: &super::CallExpr<Self::InputS, Self::InputMetadata>,
-        _func: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _func: &super::IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &super::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         input.metadata.clone()

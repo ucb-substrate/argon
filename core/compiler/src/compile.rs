@@ -1,22 +1,25 @@
 //! # Argon compiler
-//!
+//
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::VecDeque;
 use std::io::BufReader;
 use std::path::Path;
 
+use arcstr::Substr;
 use enumify::enumify;
 use geometry::transform::{Rotation, TransformationMatrix};
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ComparisonOp, ConstantDecl, FieldAccessExpr, FnDecl, KwArgValue, Scope, UnaryOp,
+    BinOp, ComparisonOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue, ModPath,
+    Scope, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
-use crate::parse::ParseAst;
+use crate::parse::WorkspaceParseAst;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -26,9 +29,9 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-pub fn compile(ast: &ParseAst<'_>, input: CompileInput<'_>) -> CompileOutput {
-    let pass = VarIdTyPass::new(ast);
-    let (ast, errors) = pass.execute();
+pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+    let dag = construct_dag(ast);
+    let (ast, errors) = execute_var_id_ty_pass(ast, &dag);
     if !errors.is_empty() {
         return CompileOutput::StaticErrors(StaticErrorCompileOutput { errors });
     };
@@ -58,6 +61,241 @@ pub fn compile(ast: &ParseAst<'_>, input: CompileInput<'_>) -> CompileOutput {
     }
 }
 
+type ModDag<'a> = IndexMap<&'a ModPath, IndexSet<&'a ModPath>>;
+
+pub(crate) struct ImportPass<'a> {
+    ast: &'a WorkspaceParseAst,
+    current_path: &'a ModPath,
+    deps: IndexSet<&'a ModPath>,
+}
+
+pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> ModDag<'_> {
+    ast.keys()
+        .map(|path| (path, ImportPass::new(ast, path).execute()))
+        .collect()
+}
+
+impl<'a> ImportPass<'a> {
+    fn new(ast: &'a WorkspaceParseAst, current_path: &'a ModPath) -> Self {
+        Self {
+            ast,
+            current_path,
+            deps: Default::default(),
+        }
+    }
+
+    pub(crate) fn execute(mut self) -> IndexSet<&'a ModPath> {
+        for decl in &self.ast[self.current_path].ast.decls {
+            match decl {
+                Decl::Fn(f) => {
+                    self.transform_fn_decl(f);
+                }
+                Decl::Cell(c) => {
+                    self.transform_cell_decl(c);
+                }
+                Decl::Mod(_) => {}
+                _ => todo!(),
+            }
+        }
+
+        self.deps
+    }
+}
+
+impl<'a> AstTransformer for ImportPass<'a> {
+    type InputMetadata = ParseMetadata;
+    type OutputMetadata = ParseMetadata;
+    type InputS = Substr;
+    type OutputS = Substr;
+
+    fn dispatch_ident(
+        &mut self,
+        _input: &Ident<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::Ident {
+    }
+
+    fn dispatch_var_expr(
+        &mut self,
+        _input: &crate::ast::VarExpr<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
+    }
+
+    fn dispatch_enum_decl(
+        &mut self,
+        _input: &crate::ast::EnumDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+    }
+
+    fn dispatch_cell_decl(
+        &mut self,
+        _input: &CellDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
+        _scope: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
+    }
+
+    fn dispatch_fn_decl(
+        &mut self,
+        _input: &FnDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
+        _return_ty: &Option<Ident<Self::OutputS, Self::OutputMetadata>>,
+        _scope: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
+    }
+
+    fn dispatch_constant_decl(
+        &mut self,
+        _input: &ConstantDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ConstantDecl {
+    }
+
+    fn dispatch_let_binding(
+        &mut self,
+        _input: &LetBinding<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
+    }
+
+    fn dispatch_if_expr(
+        &mut self,
+        _input: &IfExpr<Self::InputS, Self::InputMetadata>,
+        _cond: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _then: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
+    }
+
+    fn dispatch_bin_op_expr(
+        &mut self,
+        _input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
+        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
+    }
+
+    fn dispatch_unary_op_expr(
+        &mut self,
+        _input: &crate::ast::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
+        _operand: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
+    }
+
+    fn dispatch_comparison_expr(
+        &mut self,
+        _input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
+        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
+    }
+
+    fn dispatch_cast(
+        &mut self,
+        _input: &crate::ast::CastExpr<Self::InputS, Self::InputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
+    }
+
+    fn dispatch_field_access_expr(
+        &mut self,
+        _input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _field: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
+    }
+
+    fn dispatch_enum_value(
+        &mut self,
+        _input: &EnumValue<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _variant: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
+    }
+
+    fn dispatch_call_expr(
+        &mut self,
+        _input: &CallExpr<Self::InputS, Self::InputMetadata>,
+        func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
+        _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
+        if func.path[0].name != "std" {
+            let path = if func.path[0].name == "crate" {
+                func.path
+                    .iter()
+                    .skip(1)
+                    .dropping_back(1)
+                    .map(|ident| ident.name.to_string())
+                    .collect_vec()
+            } else {
+                self.current_path
+                    .iter()
+                    .cloned()
+                    .chain(
+                        func.path
+                            .iter()
+                            .dropping_back(1)
+                            .map(|ident| ident.name.to_string()),
+                    )
+                    .collect_vec()
+            };
+            let (path_ref, _) = self.ast.get_key_value(&path).expect("module doesn't exist");
+            self.deps.insert(path_ref);
+        }
+    }
+
+    fn dispatch_emit_expr(
+        &mut self,
+        _input: &crate::ast::EmitExpr<Self::InputS, Self::InputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
+    }
+
+    fn dispatch_args(
+        &mut self,
+        _input: &crate::ast::Args<Self::InputS, Self::InputMetadata>,
+        _posargs: &[Expr<Self::OutputS, Self::OutputMetadata>],
+        _kwargs: &[crate::ast::KwArgValue<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::Args {
+    }
+
+    fn dispatch_kw_arg_value(
+        &mut self,
+        _input: &crate::ast::KwArgValue<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _value: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::KwArgValue {
+    }
+
+    fn dispatch_arg_decl(
+        &mut self,
+        _input: &ArgDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
+    }
+
+    fn dispatch_scope(
+        &mut self,
+        _input: &Scope<Self::InputS, Self::InputMetadata>,
+        _stmts: &[Statement<Self::OutputS, Self::OutputMetadata>],
+        _tail: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::Scope {
+    }
+
+    fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
+        s.clone()
+    }
+}
+
 fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
     for layer in data.layers.layers.iter() {
@@ -80,16 +318,90 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
 }
 
 #[derive(Default)]
-pub(crate) struct VarIdTyFrame<'a> {
-    var_bindings: IndexMap<&'a str, (VarId, Ty)>,
-    scope_bindings: IndexSet<&'a str>,
+pub(crate) struct VarIdTyFrame {
+    var_bindings: IndexMap<Substr, (VarId, Ty)>,
+    scope_bindings: IndexSet<Substr>,
 }
 
 pub(crate) struct VarIdTyPass<'a> {
-    ast: &'a ParseAst<'a>,
+    ast: &'a AnnotatedAst<ParseMetadata>,
+    mod_bindings: &'a IndexMap<&'a ModPath, VarIdTyFrame>,
+    current_path: &'a ModPath,
     next_id: VarId,
-    bindings: Vec<VarIdTyFrame<'a>>,
+    bindings: Vec<VarIdTyFrame>,
     errors: Vec<StaticError>,
+}
+
+pub(crate) fn execute_var_id_ty_pass<'a>(
+    ast: &'a WorkspaceParseAst,
+    dag: &'a ModDag<'a>,
+) -> (WorkspaceAst<VarIdTyMetadata>, Vec<StaticError>) {
+    let mut mod_bindings = IndexMap::new();
+    let mut workspace_ast = IndexMap::new();
+    let mut errors = Vec::new();
+    let mut next_id = 1;
+    let std_mod_path = vec!["std".to_string()];
+    let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
+    let (root, _) = ast.get_key_value(&vec![]).expect("module doesn't exist");
+    for path in [std_mod_path, Some(root)].iter().flatten() {
+        execute_var_id_ty_pass_inner(
+            ast,
+            dag,
+            path,
+            &mut mod_bindings,
+            &mut workspace_ast,
+            &mut errors,
+            &mut next_id,
+        );
+    }
+    (workspace_ast, errors)
+}
+pub(crate) fn execute_var_id_ty_pass_inner<'a>(
+    ast: &'a WorkspaceParseAst,
+    dag: &'a ModDag<'a>,
+    current_path: &'a ModPath,
+    mod_bindings: &mut IndexMap<&'a ModPath, VarIdTyFrame>,
+    workspace_ast: &mut WorkspaceAst<VarIdTyMetadata>,
+    errors: &mut Vec<StaticError>,
+    next_id: &mut VarId,
+) {
+    // TODO: fix hacky way to track visited modules.
+    if mod_bindings.contains_key(&current_path) {
+        return;
+    }
+    mod_bindings.insert(current_path, VarIdTyFrame::default());
+
+    if current_path
+        .first()
+        .map(|path| path == "std")
+        .unwrap_or(true)
+    {
+        for children in &dag[&current_path] {
+            execute_var_id_ty_pass_inner(
+                ast,
+                dag,
+                children,
+                mod_bindings,
+                workspace_ast,
+                errors,
+                next_id,
+            );
+        }
+    }
+
+    let mut pass = VarIdTyPass {
+        ast: &ast[current_path],
+        mod_bindings,
+        current_path,
+        next_id: *next_id,
+        bindings: vec![VarIdTyFrame::default()],
+        errors: vec![],
+    };
+    let ast = pass.execute();
+    workspace_ast.insert(current_path.clone(), ast);
+    errors.extend(pass.errors);
+    *next_id = pass.next_id;
+    mod_bindings.insert(current_path, pass.bindings.into_iter().next().unwrap());
 }
 
 #[derive(Debug, Clone)]
@@ -172,16 +484,6 @@ impl AstMetadata for VarIdTyMetadata {
 }
 
 impl<'a> VarIdTyPass<'a> {
-    pub(crate) fn new(ast: &'a ParseAst<'a>) -> Self {
-        Self {
-            ast,
-            // allocate space for the global namespace
-            bindings: vec![VarIdTyFrame::default()],
-            next_id: 1,
-            errors: Vec::new(),
-        }
-    }
-
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
         for frame in self.bindings.iter().rev() {
             if let Some(info) = frame.var_bindings.get(name) {
@@ -191,25 +493,25 @@ impl<'a> VarIdTyPass<'a> {
         None
     }
 
-    fn alloc(&mut self, name: &'a str, ty: Ty) -> VarId {
+    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
         let id = self.next_id;
         self.bindings
             .last_mut()
             .unwrap()
             .var_bindings
-            .insert(name, (id, ty));
+            .insert(name.clone(), (id, ty));
         self.next_id += 1;
         id
     }
 
-    pub(crate) fn execute(mut self) -> (Ast<&'a str, VarIdTyMetadata>, Vec<StaticError>) {
+    fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
-        for decl in &self.ast.decls {
+        for decl in &self.ast.ast.decls {
             if let Decl::Fn(f) = decl {
                 self.declare_fn_decl(f);
             }
         }
-        for decl in &self.ast.decls {
+        for decl in &self.ast.ast.decls {
             match decl {
                 Decl::Fn(f) => {
                     decls.push(Decl::Fn(self.transform_fn_decl(f)));
@@ -217,21 +519,25 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Cell(c) => {
                     decls.push(Decl::Cell(self.transform_cell_decl(c)));
                 }
+                Decl::Mod(m) => {
+                    decls.push(Decl::Mod(self.transform_mod_decl(m)));
+                }
                 _ => todo!(),
             }
         }
 
-        (
-            Ast {
+        AnnotatedAst::new(
+            self.ast.text.clone(),
+            &Ast {
                 decls,
-                span: self.ast.span,
+                span: self.ast.ast.span,
             },
-            self.errors,
         )
     }
 
-    fn declare_fn_decl(&mut self, input: &FnDecl<&'a str, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name) {
+    fn declare_fn_decl(&mut self, input: &'a FnDecl<Substr, ParseMetadata>) {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
+        {
             self.errors.push(StaticError {
                 span: input.name.span,
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -251,11 +557,11 @@ impl<'a> VarIdTyPass<'a> {
                 Ty::Nil
             },
         }));
-        self.alloc(input.name.name, ty);
+        self.alloc(&input.name.name, ty);
     }
 
-    fn ty_from_ident<M: AstMetadata>(&mut self, ident: &Ident<&'a str, M>) -> Ty {
-        Ty::from_name(ident.name).unwrap_or_else(|| {
+    fn ty_from_ident<M: AstMetadata>(&mut self, ident: &Ident<Substr, M>) -> Ty {
+        Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
             self.errors.push(StaticError {
                 span: ident.span,
                 kind: StaticErrorKind::UnknownType,
@@ -264,7 +570,7 @@ impl<'a> VarIdTyPass<'a> {
         })
     }
 
-    fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<&'a str, M>, ty: Ty) -> Ty {
+    fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<Substr, M>, ty: Ty) -> Ty {
         self.errors.push(StaticError {
             span: field.span,
             kind: StaticErrorKind::NoFieldOnTy {
@@ -310,32 +616,32 @@ impl<'a> VarIdTyPass<'a> {
 
     fn typecheck_kwargs(
         &mut self,
-        kwargs: &[KwArgValue<&'a str, VarIdTyMetadata>],
-        kwarg_defs: IndexMap<&'a str, Ty>,
+        kwargs: &[KwArgValue<Substr, VarIdTyMetadata>],
+        kwarg_defs: IndexMap<&str, Ty>,
     ) {
         let mut defined = IndexSet::new();
         for kwarg in kwargs {
             let mut cont = false;
-            if !kwarg_defs.contains_key(kwarg.name.name) {
+            if !kwarg_defs.contains_key(&kwarg.name.name.as_str()) {
                 self.errors.push(StaticError {
                     span: kwarg.name.span,
                     kind: StaticErrorKind::InvalidKwArg,
                 });
                 cont = true;
             }
-            if defined.contains(kwarg.name.name) {
+            if defined.contains(&&kwarg.name.name) {
                 self.errors.push(StaticError {
                     span: kwarg.name.span,
                     kind: StaticErrorKind::DuplicateKwArg,
                 });
                 cont = true;
             }
-            defined.insert(kwarg.name.name);
+            defined.insert(&kwarg.name.name);
             if !cont {
                 self.assert_eq_ty(
                     kwarg.value.span(),
                     &kwarg.value.ty(),
-                    kwarg_defs.get(kwarg.name.name).unwrap(),
+                    kwarg_defs.get(&kwarg.name.name.as_str()).unwrap(),
                 );
             }
         }
@@ -344,7 +650,7 @@ impl<'a> VarIdTyPass<'a> {
     fn typecheck_posargs(
         &mut self,
         call_span: cfgrammar::Span,
-        args: &[Expr<&'a str, VarIdTyMetadata>],
+        args: &[Expr<Substr, VarIdTyMetadata>],
         arg_defs: &[Ty],
     ) {
         self.assert_eq_arity(call_span, args.len(), arg_defs.len());
@@ -356,12 +662,50 @@ impl<'a> VarIdTyPass<'a> {
     fn typecheck_args(
         &mut self,
         call_span: cfgrammar::Span,
-        args: &crate::ast::Args<&'a str, VarIdTyMetadata>,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
         arg_defs: &[Ty],
-        kwarg_defs: IndexMap<&'a str, Ty>,
+        kwarg_defs: IndexMap<&str, Ty>,
     ) {
         self.typecheck_posargs(call_span, &args.posargs, arg_defs);
         self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+    }
+
+    fn typecheck_call(
+        &mut self,
+        lookup: Option<(VarId, Ty)>,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> (Option<VarId>, Ty) {
+        if let Some((varid, ty)) = lookup {
+            match ty {
+                Ty::Fn(ty) => {
+                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    (Some(varid), ty.ret.clone())
+                }
+                Ty::CellFn(ty) => {
+                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    (
+                        Some(varid),
+                        Ty::Cell(Box::new(CellTy {
+                            data: ty.data.clone(),
+                        })),
+                    )
+                }
+                ty => {
+                    self.errors.push(StaticError {
+                        span: call_span,
+                        kind: StaticErrorKind::CannotCall(ty),
+                    });
+                    (None, Ty::Unknown)
+                }
+            }
+        } else {
+            self.errors.push(StaticError {
+                span: call_span,
+                kind: StaticErrorKind::UndeclaredVar,
+            });
+            (None, Ty::Unknown)
+        }
     }
 }
 
@@ -390,61 +734,61 @@ impl<S> Expr<S, VarIdTyMetadata> {
 impl<'a> AstTransformer for VarIdTyPass<'a> {
     type InputMetadata = ParseMetadata;
     type OutputMetadata = VarIdTyMetadata;
-    type InputS = &'a str;
-    type OutputS = &'a str;
+    type InputS = Substr;
+    type OutputS = Substr;
 
     fn dispatch_ident(
         &mut self,
-        _input: &Ident<&'a str, Self::InputMetadata>,
+        _input: &Ident<Substr, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
     fn dispatch_var_expr(
         &mut self,
-        input: &crate::ast::VarExpr<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
+        input: &crate::ast::VarExpr<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
-        self.lookup(input.name.name)
+        self.lookup(&input.name.name)
             .expect("used variable before declaration")
     }
 
     fn dispatch_enum_decl(
         &mut self,
-        _input: &crate::ast::EnumDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _variants: &[Ident<&'a str, Self::OutputMetadata>],
+        _input: &crate::ast::EnumDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _variants: &[Ident<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
     }
 
     fn dispatch_cell_decl(
         &mut self,
-        _input: &CellDecl<&'a str, Self::InputMetadata>,
-        name: &Ident<&'a str, Self::OutputMetadata>,
-        _args: &[ArgDecl<&'a str, Self::OutputMetadata>],
-        _scope: &Scope<&'a str, Self::OutputMetadata>,
+        _input: &CellDecl<Substr, Self::InputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
+        _args: &[ArgDecl<Substr, Self::OutputMetadata>],
+        _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
         // TODO: Argument checks
         // UNUSED
-        self.lookup(name.name).unwrap().0
+        self.lookup(&name.name).unwrap().0
     }
 
     fn dispatch_fn_decl(
         &mut self,
-        _input: &FnDecl<&'a str, Self::InputMetadata>,
-        name: &Ident<&'a str, Self::OutputMetadata>,
-        _args: &[ArgDecl<&'a str, Self::OutputMetadata>],
-        _return_ty: &Option<Ident<&'a str, Self::OutputMetadata>>,
-        _scope: &Scope<&'a str, Self::OutputMetadata>,
+        _input: &FnDecl<Substr, Self::InputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
+        _args: &[ArgDecl<Substr, Self::OutputMetadata>],
+        _return_ty: &Option<Ident<Substr, Self::OutputMetadata>>,
+        _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
         // UNUSED
-        self.lookup(name.name).unwrap().0
+        self.lookup(&name.name).unwrap().0
     }
 
     fn transform_fn_decl(
         &mut self,
-        input: &FnDecl<&'a str, Self::InputMetadata>,
-    ) -> FnDecl<&'a str, Self::OutputMetadata> {
-        let (varid, _) = self.lookup(input.name.name).unwrap();
+        input: &FnDecl<Substr, Self::InputMetadata>,
+    ) -> FnDecl<Substr, Self::OutputMetadata> {
+        let (varid, _) = self.lookup(&input.name.name).unwrap();
         let args: Vec<_> = input
             .args
             .iter()
@@ -468,9 +812,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn transform_cell_decl(
         &mut self,
-        input: &CellDecl<&'a str, Self::InputMetadata>,
-    ) -> CellDecl<&'a str, Self::OutputMetadata> {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name) {
+        input: &CellDecl<Substr, Self::InputMetadata>,
+    ) -> CellDecl<Substr, Self::OutputMetadata> {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
+        {
             self.errors.push(StaticError {
                 span: input.name.span,
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -495,7 +840,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 .iter()
                 .filter_map(|stmt| {
                     if let Statement::LetBinding(lt) = stmt {
-                        if ["x", "y"].contains(&lt.name.name) {
+                        if ["x", "y"].contains(&lt.name.name.as_str()) {
                             self.errors.push(StaticError {
                                 span: lt.name.span,
                                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -508,7 +853,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 })
                 .collect(),
         }));
-        let vid = self.alloc(input.name.name, ty);
+        let vid = self.alloc(&input.name.name, ty);
         let name = self.transform_ident(&input.name);
         CellDecl {
             name,
@@ -521,29 +866,31 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_constant_decl(
         &mut self,
-        _input: &ConstantDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _ty: &Ident<&'a str, Self::OutputMetadata>,
-        _value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &ConstantDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &Ident<Substr, Self::OutputMetadata>,
+        _value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ConstantDecl {
     }
 
     fn dispatch_if_expr(
         &mut self,
-        input: &IfExpr<&'a str, Self::InputMetadata>,
-        cond: &Expr<&'a str, Self::OutputMetadata>,
-        then: &Scope<&'a str, Self::OutputMetadata>,
-        else_: &Scope<&'a str, Self::OutputMetadata>,
+        input: &IfExpr<Substr, Self::InputMetadata>,
+        cond: &Expr<Substr, Self::OutputMetadata>,
+        then: &Scope<Substr, Self::OutputMetadata>,
+        else_: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         if let Some(scope_annotation) = &input.scope_annotation {
             let bindings = self.bindings.last_mut().unwrap();
-            if bindings.scope_bindings.contains(scope_annotation.name) {
+            if bindings.scope_bindings.contains(&scope_annotation.name) {
                 self.errors.push(StaticError {
                     span: scope_annotation.span,
                     kind: StaticErrorKind::DuplicateNameDeclaration,
                 });
             }
-            bindings.scope_bindings.insert(scope_annotation.name);
+            bindings
+                .scope_bindings
+                .insert(scope_annotation.name.clone());
         }
         let cond_ty = cond.ty();
         let then_ty = then.metadata.clone();
@@ -565,9 +912,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_bin_op_expr(
         &mut self,
-        input: &BinOpExpr<&'a str, Self::InputMetadata>,
-        left: &Expr<&'a str, Self::OutputMetadata>,
-        right: &Expr<&'a str, Self::OutputMetadata>,
+        input: &BinOpExpr<Substr, Self::InputMetadata>,
+        left: &Expr<Substr, Self::OutputMetadata>,
+        right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
@@ -594,8 +941,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_unary_op_expr(
         &mut self,
-        input: &crate::ast::UnaryOpExpr<&'a str, Self::InputMetadata>,
-        operand: &Expr<&'a str, Self::OutputMetadata>,
+        input: &crate::ast::UnaryOpExpr<Substr, Self::InputMetadata>,
+        operand: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
@@ -622,9 +969,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_comparison_expr(
         &mut self,
-        input: &ComparisonExpr<&'a str, Self::InputMetadata>,
-        left: &Expr<&'a str, Self::OutputMetadata>,
-        right: &Expr<&'a str, Self::OutputMetadata>,
+        input: &ComparisonExpr<Substr, Self::InputMetadata>,
+        left: &Expr<Substr, Self::OutputMetadata>,
+        right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
@@ -654,18 +1001,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_field_access_expr(
         &mut self,
-        _input: &crate::ast::FieldAccessExpr<&'a str, Self::InputMetadata>,
-        base: &Expr<&'a str, Self::OutputMetadata>,
-        field: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &crate::ast::FieldAccessExpr<Substr, Self::InputMetadata>,
+        base: &Expr<Substr, Self::OutputMetadata>,
+        field: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
         let base_ty = base.ty();
         match base_ty {
-            Ty::Rect => match field.name {
+            Ty::Rect => match field.name.as_str() {
                 "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
                 "layer" => Ty::String,
                 _ => self.no_field_on_ty(field, Ty::Rect),
             },
-            Ty::Inst(ref c) => match field.name {
+            Ty::Inst(ref c) => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
                 name => c
                     .data
@@ -681,147 +1028,145 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_enum_value(
         &mut self,
-        _input: &EnumValue<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _variant: &Ident<&'a str, Self::OutputMetadata>,
+        _input: &EnumValue<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _variant: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
     }
 
     fn dispatch_call_expr(
         &mut self,
-        input: &crate::ast::CallExpr<&'a str, Self::InputMetadata>,
-        func: &Ident<&'a str, Self::OutputMetadata>,
-        args: &crate::ast::Args<&'a str, Self::OutputMetadata>,
+        input: &crate::ast::CallExpr<Substr, Self::InputMetadata>,
+        func: &IdentPath<Substr, Self::OutputMetadata>,
+        args: &crate::ast::Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        match func.name {
-            "crect" | "rect" => {
-                if func.name == "crect" {
-                    self.typecheck_posargs(input.span, &args.posargs, &[]);
-                } else {
-                    self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
+        if func.path.len() == 1 {
+            match func.path[0].name.as_str() {
+                name @ "crect" | name @ "rect" => {
+                    if name == "crect" {
+                        self.typecheck_posargs(input.span, &args.posargs, &[]);
+                    } else {
+                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
+                    }
+                    self.typecheck_kwargs(
+                        &args.kwargs,
+                        IndexMap::from_iter([
+                            ("x0", Ty::Float),
+                            ("x1", Ty::Float),
+                            ("y0", Ty::Float),
+                            ("y1", Ty::Float),
+                            ("x0i", Ty::Float),
+                            ("x1i", Ty::Float),
+                            ("y0i", Ty::Float),
+                            ("y1i", Ty::Float),
+                            ("w", Ty::Float),
+                            ("h", Ty::Float),
+                        ]),
+                    );
+                    (None, Ty::Rect)
                 }
-                self.typecheck_kwargs(
-                    &args.kwargs,
-                    IndexMap::from_iter([
-                        ("x0", Ty::Float),
-                        ("x1", Ty::Float),
-                        ("y0", Ty::Float),
-                        ("y1", Ty::Float),
-                        ("x0i", Ty::Float),
-                        ("x1i", Ty::Float),
-                        ("y0i", Ty::Float),
-                        ("y1i", Ty::Float),
-                        ("w", Ty::Float),
-                        ("h", Ty::Float),
-                    ]),
-                );
-                (None, Ty::Rect)
-            }
-            "float" => {
-                self.typecheck_args(input.span, args, &[], IndexMap::new());
-                (None, Ty::Float)
-            }
-            "eq" => {
-                self.typecheck_args(input.span, args, &[Ty::Float, Ty::Float], IndexMap::new());
-                (None, Ty::Nil)
-            }
-            "dimension" => {
-                self.typecheck_args(
-                    input.span,
-                    args,
-                    &[
-                        Ty::Float,
-                        Ty::Float,
-                        Ty::Float,
-                        Ty::Float,
-                        Ty::Float,
-                        Ty::Float,
-                        Ty::Bool,
-                    ],
-                    IndexMap::new(),
-                );
-                (None, Ty::Nil)
-            }
-            "inst" => {
-                self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                self.typecheck_kwargs(
-                    &args.kwargs,
-                    IndexMap::from_iter([
-                        ("reflect", Ty::Bool),
-                        ("angle", Ty::Int),
-                        ("x", Ty::Float),
-                        ("y", Ty::Float),
-                        ("xi", Ty::Float),
-                        ("yi", Ty::Float),
-                    ]),
-                );
-                if let Some(ty) = args.posargs.first() {
-                    self.assert_ty_is_cell(ty.span(), &ty.ty());
-                    if let Ty::Cell(c) = ty.ty() {
-                        (None, Ty::Inst(c.clone()))
+                "float" => {
+                    self.typecheck_args(input.span, args, &[], IndexMap::new());
+                    (None, Ty::Float)
+                }
+                "eq" => {
+                    self.typecheck_args(input.span, args, &[Ty::Float, Ty::Float], IndexMap::new());
+                    (None, Ty::Nil)
+                }
+                "dimension" => {
+                    self.typecheck_args(
+                        input.span,
+                        args,
+                        &[
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Float,
+                            Ty::Bool,
+                        ],
+                        IndexMap::new(),
+                    );
+                    (None, Ty::Nil)
+                }
+                "inst" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    self.typecheck_kwargs(
+                        &args.kwargs,
+                        IndexMap::from_iter([
+                            ("reflect", Ty::Bool),
+                            ("angle", Ty::Int),
+                            ("x", Ty::Float),
+                            ("y", Ty::Float),
+                            ("xi", Ty::Float),
+                            ("yi", Ty::Float),
+                        ]),
+                    );
+                    if let Some(ty) = args.posargs.first() {
+                        self.assert_ty_is_cell(ty.span(), &ty.ty());
+                        if let Ty::Cell(c) = ty.ty() {
+                            (None, Ty::Inst(c.clone()))
+                        } else {
+                            (None, Ty::Unknown)
+                        }
                     } else {
                         (None, Ty::Unknown)
                     }
-                } else {
-                    (None, Ty::Unknown)
                 }
+                name => self.typecheck_call(self.lookup(name), input.span, args),
             }
-            name => {
-                if let Some((varid, ty)) = self.lookup(name) {
-                    match ty {
-                        Ty::Fn(ty) => {
-                            self.typecheck_args(input.span, args, &ty.args, IndexMap::new());
-                            (Some(varid), ty.ret.clone())
-                        }
-                        Ty::CellFn(ty) => {
-                            self.typecheck_args(input.span, args, &ty.args, IndexMap::new());
-                            (
-                                Some(varid),
-                                Ty::Cell(Box::new(CellTy {
-                                    data: ty.data.clone(),
-                                })),
-                            )
-                        }
-                        ty => {
-                            self.errors.push(StaticError {
-                                span: input.span,
-                                kind: StaticErrorKind::CannotCall(ty),
-                            });
-                            (None, Ty::Unknown)
-                        }
-                    }
-                } else {
-                    self.errors.push(StaticError {
-                        span: input.span,
-                        kind: StaticErrorKind::UndeclaredVar,
-                    });
-                    (None, Ty::Unknown)
+        } else {
+            let path = match func.path[0].name.as_str() {
+                "std" => {
+                    vec!["std".to_string()]
                 }
-            }
+                "crate" => func
+                    .path
+                    .iter()
+                    .skip(1)
+                    .dropping_back(1)
+                    .map(|ident| ident.name.to_string())
+                    .collect_vec(),
+                _ => self
+                    .current_path
+                    .iter()
+                    .cloned()
+                    .chain(
+                        func.path
+                            .iter()
+                            .dropping_back(1)
+                            .map(|ident| ident.name.to_string()),
+                    )
+                    .collect_vec(),
+            };
+            let name = &func.path.last().unwrap().name;
+            let lookup = self.mod_bindings[&path].var_bindings.get(name).cloned();
+            self.typecheck_call(lookup, input.span, args)
         }
     }
 
     fn dispatch_emit_expr(
         &mut self,
-        _input: &crate::ast::EmitExpr<&'a str, Self::InputMetadata>,
-        value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &crate::ast::EmitExpr<Substr, Self::InputMetadata>,
+        value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
         value.ty()
     }
 
     fn dispatch_args(
         &mut self,
-        _input: &crate::ast::Args<&'a str, Self::InputMetadata>,
-        _posargs: &[Expr<&'a str, Self::OutputMetadata>],
-        _kwargs: &[crate::ast::KwArgValue<&'a str, Self::OutputMetadata>],
+        _input: &crate::ast::Args<Substr, Self::InputMetadata>,
+        _posargs: &[Expr<Substr, Self::OutputMetadata>],
+        _kwargs: &[crate::ast::KwArgValue<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::Args {
     }
 
     fn dispatch_cast(
         &mut self,
-        input: &crate::ast::CastExpr<&'a str, Self::InputMetadata>,
-        value: &Expr<&'a str, Self::OutputMetadata>,
-        ty: &Ident<&'a str, Self::OutputMetadata>,
+        input: &crate::ast::CastExpr<Substr, Self::InputMetadata>,
+        value: &Expr<Substr, Self::OutputMetadata>,
+        ty: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
         let ty = self.ty_from_ident(ty);
         match (value.ty(), &ty) {
@@ -842,65 +1187,67 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_kw_arg_value(
         &mut self,
-        _input: &crate::ast::KwArgValue<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &crate::ast::KwArgValue<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::KwArgValue {
         value.ty()
     }
 
     fn dispatch_arg_decl(
         &mut self,
-        input: &ArgDecl<&'a str, Self::InputMetadata>,
-        _name: &Ident<&'a str, Self::OutputMetadata>,
-        _ty: &Ident<&'a str, Self::OutputMetadata>,
+        input: &ArgDecl<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         let ty = self.ty_from_ident(&input.ty);
-        (self.alloc(input.name.name, ty.clone()), ty)
+        (self.alloc(&input.name.name, ty.clone()), ty)
     }
 
     fn dispatch_scope(
         &mut self,
-        _input: &Scope<&'a str, Self::InputMetadata>,
-        _stmts: &[Statement<&'a str, Self::OutputMetadata>],
-        tail: &Option<Expr<&'a str, Self::OutputMetadata>>,
+        _input: &Scope<Substr, Self::InputMetadata>,
+        _stmts: &[Statement<Substr, Self::OutputMetadata>],
+        tail: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::Scope {
         tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
-    fn enter_scope(&mut self, input: &crate::ast::Scope<&'a str, Self::InputMetadata>) {
+    fn enter_scope(&mut self, input: &crate::ast::Scope<Substr, Self::InputMetadata>) {
         if let Some(scope_annotation) = &input.scope_annotation {
             let bindings = self.bindings.last_mut().unwrap();
-            if bindings.scope_bindings.contains(scope_annotation.name) {
+            if bindings.scope_bindings.contains(&scope_annotation.name) {
                 self.errors.push(StaticError {
                     span: scope_annotation.span,
                     kind: StaticErrorKind::DuplicateNameDeclaration,
                 });
             }
-            bindings.scope_bindings.insert(scope_annotation.name);
+            bindings
+                .scope_bindings
+                .insert(scope_annotation.name.clone());
         }
         self.bindings.push(Default::default());
     }
 
     fn exit_scope(
         &mut self,
-        _input: &crate::ast::Scope<&'a str, Self::InputMetadata>,
-        _output: &crate::ast::Scope<&'a str, Self::OutputMetadata>,
+        _input: &crate::ast::Scope<Substr, Self::InputMetadata>,
+        _output: &crate::ast::Scope<Substr, Self::OutputMetadata>,
     ) {
         self.bindings.pop();
     }
 
     fn dispatch_let_binding(
         &mut self,
-        _input: &LetBinding<&'a str, Self::InputMetadata>,
-        name: &Ident<&'a str, Self::OutputMetadata>,
-        value: &Expr<&'a str, Self::OutputMetadata>,
+        _input: &LetBinding<Substr, Self::InputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
+        value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
-        self.alloc(name.name, value.ty())
+        self.alloc(&name.name, value.ty())
     }
 
     fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
-        *s
+        s.clone()
     }
 }
 
@@ -912,7 +1259,8 @@ pub enum CellArg {
 
 #[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
-    pub cell: &'a str,
+    /// Full path to cell.
+    pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
     pub lyp_file: &'a Path,
 }
@@ -1017,9 +1365,9 @@ struct CellState {
 }
 
 struct ExecPass<'a> {
-    ast: &'a Ast<&'a str, VarIdTyMetadata>,
+    ast: &'a WorkspaceAst<VarIdTyMetadata>,
     cell_states: IndexMap<CellId, CellState>,
-    values: IndexMap<ValueId, DeferValue<'a, VarIdTyMetadata>>,
+    values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
     true_value: ValueId,
@@ -1043,7 +1391,7 @@ enum ExecScopeName {
 }
 
 impl<'a> ExecPass<'a> {
-    pub(crate) fn new(ast: &'a Ast<&'a str, VarIdTyMetadata>) -> Self {
+    pub(crate) fn new(ast: &'a WorkspaceAst<VarIdTyMetadata>) -> Self {
         Self {
             ast,
             cell_states: IndexMap::new(),
@@ -1084,7 +1432,39 @@ impl<'a> ExecPass<'a> {
 
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
-        let cell_id = self.execute_cell(input.cell, input.args);
+        let path = match input.cell[0] {
+            "std" => {
+                vec!["std".to_string()]
+            }
+            "crate" => input
+                .cell
+                .iter()
+                .skip(1)
+                .dropping_back(1)
+                .map(|ident| ident.to_string())
+                .collect_vec(),
+            _ => input
+                .cell
+                .iter()
+                .dropping_back(1)
+                .map(|ident| ident.to_string())
+                .collect_vec(),
+        };
+        let vid = self.ast[&path]
+            .ast
+            .decls
+            .iter()
+            .find_map(|d| match d {
+                Decl::Cell(
+                    v @ CellDecl {
+                        name: Ident { name, .. },
+                        ..
+                    },
+                ) if name == input.cell.last().unwrap() => Some(v.metadata),
+                _ => None,
+            })
+            .expect("cell not found");
+        let cell_id = self.execute_cell(vid, input.args);
         let layers =
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
@@ -1107,26 +1487,17 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    pub(crate) fn execute_cell(&mut self, cell: &'a str, args: Vec<CellArg>) -> CellId {
-        let cell_decl = self
-            .ast
-            .decls
-            .iter()
-            .find_map(|d| match d {
-                Decl::Cell(
-                    v @ CellDecl {
-                        name: Ident { name, .. },
-                        ..
-                    },
-                ) if *name == cell => Some(v),
-                _ => None,
-            })
-            .expect("cell not found");
-
+    pub(crate) fn execute_cell(&mut self, cell: VarId, args: Vec<CellArg>) -> CellId {
         let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
         };
+        let cell_decl = self.values[&self.lookup(self.global_frame, cell).unwrap()]
+            .as_ref()
+            .unwrap_ready()
+            .as_ref()
+            .unwrap_cell_fn()
+            .clone();
         assert_eq!(args.len(), cell_decl.args.len());
         for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
@@ -1144,7 +1515,7 @@ impl<'a> ExecPass<'a> {
             parent: None,
             static_parent: None,
             span: cell_decl.scope.span,
-            name: format!("cell {cell}"),
+            name: format!("cell {}", &cell_decl.name.name),
             bindings: Default::default(),
         };
         let root_scope_id = self.scope_id();
@@ -1423,46 +1794,48 @@ impl<'a> ExecPass<'a> {
     }
 
     fn declare_globals(&mut self) {
-        for decl in &self.ast.decls {
-            match decl {
-                Decl::Fn(f) => {
-                    let vid = self.value_id();
-                    assert!(
-                        self.values
-                            .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
-                            .is_none()
-                    );
-                    assert!(
-                        self.frames
-                            .get_mut(&self.global_frame)
-                            .unwrap()
-                            .bindings
-                            .insert(f.metadata, vid)
-                            .is_none()
-                    );
+        for ast in self.ast.values() {
+            for decl in &ast.ast.decls {
+                match decl {
+                    Decl::Fn(f) => {
+                        let vid = self.value_id();
+                        assert!(
+                            self.values
+                                .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
+                                .is_none()
+                        );
+                        assert!(
+                            self.frames
+                                .get_mut(&self.global_frame)
+                                .unwrap()
+                                .bindings
+                                .insert(f.metadata, vid)
+                                .is_none()
+                        );
+                    }
+                    Decl::Cell(c) => {
+                        let vid = self.value_id();
+                        assert!(
+                            self.values
+                                .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
+                                .is_none()
+                        );
+                        assert!(
+                            self.frames
+                                .get_mut(&self.global_frame)
+                                .unwrap()
+                                .bindings
+                                .insert(c.metadata, vid)
+                                .is_none()
+                        );
+                    }
+                    _ => (),
                 }
-                Decl::Cell(c) => {
-                    let vid = self.value_id();
-                    assert!(
-                        self.values
-                            .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
-                            .is_none()
-                    );
-                    assert!(
-                        self.frames
-                            .get_mut(&self.global_frame)
-                            .unwrap()
-                            .bindings
-                            .insert(c.metadata, vid)
-                            .is_none()
-                    );
-                }
-                _ => (),
             }
         }
     }
 
-    fn eval_stmt(&mut self, loc: DynLoc, stmt: &Statement<&'a str, VarIdTyMetadata>) {
+    fn eval_stmt(&mut self, loc: DynLoc, stmt: &Statement<Substr, VarIdTyMetadata>) {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(loc, &binding.value);
@@ -1537,7 +1910,7 @@ impl<'a> ExecPass<'a> {
         cell_id: CellId,
         frame: FrameId,
         scope: ScopeId,
-        s: &Scope<&'a str, VarIdTyMetadata>,
+        s: &Scope<Substr, VarIdTyMetadata>,
     ) -> ValueId {
         let mut seq_num = SeqNum::new();
         for stmt in &s.stmts {
@@ -1565,7 +1938,7 @@ impl<'a> ExecPass<'a> {
             .unwrap_or(self.nil_value)
     }
 
-    fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<&'a str, VarIdTyMetadata>) -> ValueId {
+    fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<Substr, VarIdTyMetadata>) -> ValueId {
         let partial_eval_state = match expr {
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
@@ -1605,7 +1978,9 @@ impl<'a> ExecPass<'a> {
                 return value;
             }
             Expr::Call(c) => {
-                if ["rect", "crect", "float", "inst", "eq", "dimension"].contains(&c.func.name) {
+                if ["rect", "crect", "float", "inst", "eq", "dimension"]
+                    .contains(&c.func.path.last().unwrap().name.as_str())
+                {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
                         state: CallExprState {
@@ -1763,7 +2138,7 @@ impl<'a> ExecPass<'a> {
         let vref = vref.unwrap_deferred();
         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
         let progress = match &mut vref.state {
-            PartialEvalState::Call(c) => match c.expr.func.name {
+            PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
                 "crect" | "rect" => {
                     let layer = c.state.posargs.first().map(|vid| {
                         self.values[vid]
@@ -1793,7 +2168,7 @@ impl<'a> ExecPass<'a> {
                         state.objects.insert(rect.id, rect.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            match kwarg.name.name {
+                            match kwarg.name.name.as_str() {
                                 "x0" | "x0i" => {
                                     self.values.insert(
                                         lhs,
@@ -1987,7 +2362,7 @@ impl<'a> ExecPass<'a> {
                         state.objects.insert(inst.id, inst.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            match kwarg.name.name {
+                            match kwarg.name.name.as_str() {
                                 "x" | "xi" => {
                                     self.values.insert(
                                         lhs,
@@ -2022,7 +2397,7 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
-                cell => {
+                _ => {
                     // Must be calling a cell generator.
                     // User functions are never deferred.
                     let arg_vals = c
@@ -2038,7 +2413,7 @@ impl<'a> ExecPass<'a> {
                         })
                         .collect::<Option<Vec<CellArg>>>();
                     if let Some(arg_vals) = arg_vals {
-                        let cell = self.execute_cell(cell, arg_vals);
+                        let cell = self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals);
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {
@@ -2240,7 +2615,7 @@ impl<'a> ExecPass<'a> {
                 if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
                     match base.as_ref() {
                         ValueRef::Rect(rect) => {
-                            let val = match field_access_expr.expr.field.name {
+                            let val = match field_access_expr.expr.field.name.as_str() {
                                 "x0" => Value::Linear(LinearExpr::from(rect.x0)),
                                 "x1" => Value::Linear(LinearExpr::from(rect.x1)),
                                 "y0" => Value::Linear(LinearExpr::from(rect.y0)),
@@ -2258,7 +2633,7 @@ impl<'a> ExecPass<'a> {
                             true
                         }
                         ValueRef::Inst(inst) => {
-                            let val = match field_access_expr.expr.field.name {
+                            let val = match field_access_expr.expr.field.name.as_str() {
                                 "x" => Some(Value::Linear(LinearExpr::from(inst.x))),
                                 "y" => Some(Value::Linear(LinearExpr::from(inst.y))),
                                 field => {
@@ -2420,14 +2795,14 @@ impl<'a> ExecPass<'a> {
 
 #[enumify]
 #[derive(Debug, Clone)]
-pub enum Value<'a> {
+pub enum Value {
     EnumValue(String),
     String(String),
     Linear(LinearExpr),
     Int(i64),
     Rect(Rect<Var>),
     Bool(bool),
-    Fn(FnDecl<&'a str, VarIdTyMetadata>),
+    Fn(FnDecl<Substr, VarIdTyMetadata>),
     /// A cell generator.
     ///
     /// Example:
@@ -2438,7 +2813,7 @@ pub enum Value<'a> {
     /// ```
     ///
     /// `mycell` is a value of type `CellFn`.
-    CellFn(CellDecl<&'a str, VarIdTyMetadata>),
+    CellFn(CellDecl<Substr, VarIdTyMetadata>),
     /// A particular parameterization of a cell.
     ///
     /// Example:
@@ -2468,7 +2843,7 @@ pub enum Value<'a> {
     None,
 }
 
-impl<'a> Value<'a> {
+impl Value {
     pub fn to_obj(&self) -> Option<Object> {
         match self {
             Self::Rect(r) => Some(Object::Rect(r.clone())),
@@ -2674,22 +3049,22 @@ enum Defer<R, D> {
     Deferred(D),
 }
 
-type DeferValue<'a, T> = Defer<Value<'a>, PartialEval<'a, T>>;
+type DeferValue<T> = Defer<Value, PartialEval<T>>;
 
 #[derive(Debug, Clone)]
-struct PartialEval<'a, T: AstMetadata> {
-    state: PartialEvalState<'a, T>,
+struct PartialEval<T: AstMetadata> {
+    state: PartialEvalState<T>,
     loc: DynLoc,
 }
 
 #[derive(Debug, Clone)]
-enum PartialEvalState<'a, T: AstMetadata> {
-    If(Box<PartialIfExpr<'a, T>>),
-    Comparison(Box<PartialComparisonExpr<'a, T>>),
+enum PartialEvalState<T: AstMetadata> {
+    If(Box<PartialIfExpr<T>>),
+    Comparison(Box<PartialComparisonExpr<T>>),
     BinOp(PartialBinOp),
     UnaryOp(PartialUnaryOp),
-    Call(Box<PartialCallExpr<'a, T>>),
-    FieldAccess(Box<PartialFieldAccessExpr<'a, T>>),
+    Call(Box<PartialCallExpr<T>>),
+    FieldAccess(Box<PartialFieldAccessExpr<T>>),
     Constraint(PartialConstraint),
     Cast(PartialCast),
 }
@@ -2721,8 +3096,8 @@ struct PartialUnaryOp {
 }
 
 #[derive(Debug, Clone)]
-struct PartialIfExpr<'a, T: AstMetadata> {
-    expr: IfExpr<&'a str, T>,
+struct PartialIfExpr<T: AstMetadata> {
+    expr: IfExpr<Substr, T>,
     state: IfExprState,
 }
 
@@ -2734,8 +3109,8 @@ pub enum IfExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialCallExpr<'a, T: AstMetadata> {
-    expr: CallExpr<&'a str, T>,
+struct PartialCallExpr<T: AstMetadata> {
+    expr: CallExpr<Substr, T>,
     state: CallExprState,
 }
 
@@ -2746,8 +3121,8 @@ pub struct CallExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialComparisonExpr<'a, T: AstMetadata> {
-    expr: ComparisonExpr<&'a str, T>,
+struct PartialComparisonExpr<T: AstMetadata> {
+    expr: ComparisonExpr<Substr, T>,
     state: ComparisonExprState,
 }
 
@@ -2758,8 +3133,8 @@ pub struct ComparisonExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialFieldAccessExpr<'a, T: AstMetadata> {
-    expr: FieldAccessExpr<&'a str, T>,
+struct PartialFieldAccessExpr<T: AstMetadata> {
+    expr: FieldAccessExpr<Substr, T>,
     state: FieldAccessExprState,
 }
 

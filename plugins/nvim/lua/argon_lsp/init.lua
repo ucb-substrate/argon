@@ -57,7 +57,15 @@ end
 M.start = function(bufnr)
     local lsp_start_config = { 
         name = 'argon_lsp',
-        cmd = { config.argon_repo_path ..'/target/debug/lsp-server' }
+        cmd = { config.argon_repo_path ..'/target/debug/lsp-server' },
+        handlers = {
+            ['custom/forceSave'] = function(err, result, ctx)
+                print("Handler called!", vim.inspect(command))
+                --- TODO: write to correct buffer.
+                vim.cmd('write')
+                return vim.NIL
+            end
+        }
     }
     
     bufnr = bufnr or vim.api.nvim_get_current_buf()

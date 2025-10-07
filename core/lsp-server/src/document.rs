@@ -1,6 +1,5 @@
 use std::ops::{Deref, DerefMut};
 
-use arcstr::ArcStr;
 use compiler::{
     ast::annotated::AnnotatedAst,
     parse::{self, ParseMetadata},
@@ -100,10 +99,7 @@ impl GuiDocument {
     pub(crate) fn apply_changes(&mut self, changes: Vec<DocumentChange>, version: i32) {
         if version > self.version() {
             self.doc.apply_changes(changes, version);
-            self.ast = AnnotatedAst::new(
-                ArcStr::from(self.contents()),
-                &parse::parse(self.contents()).unwrap(),
-            );
+            self.ast = parse::parse(self.contents()).unwrap();
         }
     }
 }

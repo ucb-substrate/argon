@@ -3776,6 +3776,7 @@ dependencies = [
  "env_logger",
  "futures",
  "futures-util 0.2.1",
+ "indexmap 2.11.4",
  "itertools 0.14.0",
  "log",
  "lsp-document",
