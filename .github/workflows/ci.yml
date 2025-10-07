@@ -18,3 +18,4 @@ jobs:
           clean: false
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked
