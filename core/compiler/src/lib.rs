@@ -9,9 +9,9 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::parse::{parse, parse_workspace};
+    use crate::parse::parse_workspace;
     use approx::assert_relative_eq;
-    use indexmap::IndexMap;
+    use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
@@ -327,55 +327,59 @@ mod tests {
         assert_relative_eq!(r.y1.0, 15., epsilon = EPSILON);
     }
 
-    // #[test]
-    // fn argon_sky130_inverter() {
-    //     let ast = parse_workspace(ARGON_SKY130_INVERTER).expect("failed to parse Argon");
-    //     let cell = compile(CompileInput {
-    //         cell: "inverter",
-    //         ast: &ast,
-    //         args: IndexMap::from_iter([("nw", 1_200.), ("pw", 2_000.)]),
-    //     })
-    //     .expect("failed to solve compile Argon cell");
-    //     println!("cell: {cell:?}");
+    #[test]
+    fn argon_sky130_inverter() {
+        let ast = parse_workspace(ARGON_SKY130_INVERTER).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["inverter"],
+                args: vec![CellArg::Float(1_200.), CellArg::Float(2_000.)],
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("cells: {cells:?}");
 
-    //     let mut gds = GdsLibrary::new("TOP");
-    //     let mut ocell = GdsStruct::new("cell");
-    //     for rect in &cell.rects {
-    //         if let Some(layer) = &rect.layer {
-    //             let (layer, datatype) = match layer.as_str() {
-    //                 "Nwell" => (64, 20),
-    //                 "Diff" => (65, 20),
-    //                 "Tap" => (65, 44),
-    //                 "Psdm" => (94, 20),
-    //                 "Nsdm" => (93, 44),
-    //                 "Poly" => (66, 20),
-    //                 "Licon1" => (66, 44),
-    //                 "Npc" => (95, 20),
-    //                 "Li1" => (67, 20),
-    //                 _ => unreachable!(),
-    //             };
-    //             let x0 = rect.x0 as i32;
-    //             let x1 = rect.x1 as i32;
-    //             let y0 = rect.y0 as i32;
-    //             let y1 = rect.y1 as i32;
-    //             ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
-    //                 layer,
-    //                 datatype,
-    //                 xy: vec![
-    //                     GdsPoint::new(x0, y0),
-    //                     GdsPoint::new(x0, y1),
-    //                     GdsPoint::new(x1, y1),
-    //                     GdsPoint::new(x1, y0),
-    //                 ],
-    //                 ..Default::default()
-    //             }));
-    //         }
-    //     }
-    //     gds.structs.push(ocell);
-    //     let work_dir =
-    //         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_inverter");
-    //     std::fs::create_dir_all(&work_dir).expect("failed to create dirs");
-    //     gds.save(work_dir.join("layout.gds"))
-    //         .expect("failed to write GDS");
-    // }
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let mut gds = GdsLibrary::new("TOP");
+        let mut ocell = GdsStruct::new("cell");
+        for rect in cell.objects.iter().filter_map(|obj| obj.1.get_rect()) {
+            if let Some(layer) = &rect.layer {
+                let (layer, datatype) = match layer.as_str() {
+                    "Nwell" => (64, 20),
+                    "Diff" => (65, 20),
+                    "Tap" => (65, 44),
+                    "Psdm" => (94, 20),
+                    "Nsdm" => (93, 44),
+                    "Poly" => (66, 20),
+                    "Licon1" => (66, 44),
+                    "Npc" => (95, 20),
+                    "Li1" => (67, 20),
+                    _ => unreachable!(),
+                };
+                let x0 = rect.x0.0 as i32;
+                let x1 = rect.x1.0 as i32;
+                let y0 = rect.y0.0 as i32;
+                let y1 = rect.y1.0 as i32;
+                ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+                    layer,
+                    datatype,
+                    xy: vec![
+                        GdsPoint::new(x0, y0),
+                        GdsPoint::new(x0, y1),
+                        GdsPoint::new(x1, y1),
+                        GdsPoint::new(x1, y0),
+                    ],
+                    ..Default::default()
+                }));
+            }
+        }
+        gds.structs.push(ocell);
+        let work_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_inverter");
+        std::fs::create_dir_all(&work_dir).expect("failed to create dirs");
+        gds.save(work_dir.join("layout.gds"))
+            .expect("failed to write GDS");
+    }
 }
