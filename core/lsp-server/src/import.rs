@@ -7,7 +7,7 @@ use compiler::{
         ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
         Scope, UnaryOpExpr, VarExpr, annotated::AnnotatedAst,
     },
-    parse::{ParseAst, ParseMetadata},
+    parse::ParseMetadata,
 };
 use tower_lsp::lsp_types::{Range, TextEdit};
 

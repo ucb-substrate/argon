@@ -18,7 +18,7 @@ use crate::ast::{
     BinOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, ModPath, Scope, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
-use crate::parse::{ParseAst, WorkspaceParseAst};
+use crate::parse::WorkspaceParseAst;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -54,8 +54,8 @@ pub(crate) struct ImportPass<'a> {
 }
 
 pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> ModDag<'_> {
-    ast.iter()
-        .map(|(path, _)| (path, ImportPass::new(ast, path).execute()))
+    ast.keys()
+        .map(|path| (path, ImportPass::new(ast, path).execute()))
         .collect()
 }
 
@@ -94,14 +94,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
 
     fn dispatch_ident(
         &mut self,
-        input: &Ident<Self::InputS, Self::InputMetadata>,
+        _input: &Ident<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
     fn dispatch_var_expr(
         &mut self,
-        input: &crate::ast::VarExpr<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _input: &crate::ast::VarExpr<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
     }
 

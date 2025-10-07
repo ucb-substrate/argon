@@ -157,7 +157,11 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state.editor_client.send_request::<ForceSave>(()).await;
+            self.state
+                .editor_client
+                .send_request::<ForceSave>(())
+                .await
+                .unwrap();
 
             let o = state_mut.compile_gui_cell(&file, &cell);
             if let Some(gui_client) = &mut state_mut.gui_client {
@@ -249,7 +253,11 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state.editor_client.send_request::<ForceSave>(()).await;
+            self.state
+                .editor_client
+                .send_request::<ForceSave>(())
+                .await
+                .unwrap();
 
             let o = state_mut.compile_gui_cell(&file, &cell);
             if let Some(gui_client) = &mut state_mut.gui_client {

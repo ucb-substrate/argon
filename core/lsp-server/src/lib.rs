@@ -12,9 +12,8 @@ use std::{
     sync::Arc,
 };
 
-use arcstr::ArcStr;
 use compiler::{
-    ast::{Expr, annotated::AnnotatedAst},
+    ast::Expr,
     compile::{self, CellArg, CompileInput, CompileOutput},
     parse,
 };
@@ -29,9 +28,9 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tokio::{process::Command, sync::Mutex};
+use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{request::Request, *};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
-use tower_lsp::{jsonrpc::Result, lsp_types::notification::Notification};
 
 use crate::{
     document::{Document, DocumentChange, GuiDocument},
@@ -50,8 +49,6 @@ pub struct StateMut {
 impl StateMut {
     fn compile_gui_cell(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) -> CompileOutput {
         let file = file.as_ref();
-        let url = Url::from_file_path(file).unwrap();
-        let doc = &self.gui_files[&url];
 
         // TODO: un-hardcode this.
         let lyp = concat!(

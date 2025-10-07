@@ -1,6 +1,5 @@
 use std::ops::{Deref, DerefMut};
 
-use arcstr::ArcStr;
 use compiler::{
     ast::annotated::AnnotatedAst,
     parse::{self, ParseMetadata},
