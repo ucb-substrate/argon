@@ -51,7 +51,7 @@ impl AstMetadata for ParseMetadata {
 pub fn get_mod(root_dir: impl AsRef<Path>, path: &ModPath) -> Result<String, anyhow::Error> {
     let mut base_path = PathBuf::from(root_dir.as_ref());
     if path.is_empty() {
-        base_path.push("lib.rs");
+        base_path.push("lib.ar");
         return Ok(std::fs::read_to_string(&base_path)?);
     }
     for m in &path[0..path.len() - 1] {
@@ -60,7 +60,7 @@ pub fn get_mod(root_dir: impl AsRef<Path>, path: &ModPath) -> Result<String, any
     let mut direct_path = base_path.clone();
     direct_path.push(format!("{}.ar", path.last().unwrap()));
     base_path.push(path.last().unwrap());
-    base_path.push("mod.rs");
+    base_path.push("mod.ar");
     if direct_path.exists() && base_path.exists() {
         bail!("both mod paths exists for mod {}", path.last().unwrap());
     }

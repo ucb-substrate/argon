@@ -23,6 +23,7 @@ Decl -> Result<Decl<&'input str, ParseMetadata>, ()>
   | CellDecl { Ok(Decl::Cell($1?)) }
   | FnDecl { Ok(Decl::Fn($1?)) }
   | ConstantDecl { Ok(Decl::Constant($1?)) }
+  | ModDecl { Ok(Decl::Mod($1?)) }
   ;
 
 Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
@@ -101,6 +102,16 @@ ConstantDecl -> Result<ConstantDecl<&'input str, ParseMetadata>, ()>
       ty: $4?,
       value: $6?,
       metadata: (),
+    })
+  }
+  ;
+
+ModDecl -> Result<ModDecl<&'input str, ParseMetadata>, ()>
+  : 'MOD' Ident ';'
+  {
+    Ok(ModDecl {
+      ident: $2?,
+      span: $span,
     })
   }
   ;

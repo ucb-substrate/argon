@@ -30,6 +30,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Cell(c) => {
                     decls.push(Decl::Cell(pass.transform_cell_decl(c)));
                 }
+                Decl::Mod(m) => {
+                    decls.push(Decl::Mod(pass.transform_mod_decl(m)));
+                }
                 _ => todo!(),
             }
         }

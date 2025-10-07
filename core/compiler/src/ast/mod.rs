@@ -585,6 +585,16 @@ pub trait AstTransformer {
             metadata,
         }
     }
+    fn transform_mod_decl(
+        &mut self,
+        input: &ModDecl<Self::InputS, Self::InputMetadata>,
+    ) -> ModDecl<Self::OutputS, Self::OutputMetadata> {
+        let ident = self.transform_ident(&input.ident);
+        ModDecl {
+            ident,
+            span: input.span,
+        }
+    }
     fn transform_constant_decl(
         &mut self,
         input: &ConstantDecl<Self::InputS, Self::InputMetadata>,

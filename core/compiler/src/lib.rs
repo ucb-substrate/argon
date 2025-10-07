@@ -9,7 +9,7 @@ mod tests {
 
     use std::{collections::HashMap, path::PathBuf};
 
-    use crate::parse::parse;
+    use crate::parse::{parse, parse_workspace};
     use approx::assert_relative_eq;
 
     use crate::compile::{CellArg, CompileInput, compile};
@@ -76,6 +76,7 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/sky130_inverter.ar"
     ));
+    const ARGON_WORKSPACE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/argon_workspace");
 
     #[test]
     fn argon_scopes() {
@@ -333,6 +334,28 @@ mod tests {
         );
         println!("{cells:#?}");
         cells.unwrap_valid();
+    }
+
+    #[test]
+    fn argon_workspace() {
+        let ast = parse_workspace(ARGON_WORKSPACE).expect("failed to parse Argon");
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["test"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().next().unwrap().1.as_ref().unwrap_rect();
+        assert_relative_eq!(r.x0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 10., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 15., epsilon = EPSILON);
     }
 
     // #[test]
