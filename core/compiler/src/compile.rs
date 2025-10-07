@@ -346,6 +346,12 @@ pub(crate) fn execute_var_id_ty_pass_inner<'a>(
     errors: &mut Vec<StaticError>,
     next_id: &mut VarId,
 ) {
+    // TODO: fix hacky way to track visited modules.
+    if mod_bindings.contains_key(&current_path) {
+        return;
+    }
+    mod_bindings.insert(current_path, VarIdTyFrame::default());
+
     if current_path
         .first()
         .map(|path| path == "std")
