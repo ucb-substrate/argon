@@ -244,10 +244,10 @@ impl TextInput {
                                     _ => ("x0", "x1"),
                                 };
                                 state.lsp_client.add_eq_constraint(
-                                    cell.file.clone(),
                                     cell.output.cells[&selected_scope_addr.cell].scopes
                                         [&selected_scope_addr.scope]
-                                        .span,
+                                        .span
+                                        .clone(),
                                     format!(
                                         "{}.{} - {}.{}",
                                         dim_tool.edges[0].0, right, dim_tool.edges[0].0, left
@@ -263,10 +263,10 @@ impl TextInput {
                                         (1, 0)
                                     };
                                 state.lsp_client.add_eq_constraint(
-                                    cell.file.clone(),
                                     cell.output.cells[&selected_scope_addr.cell].scopes
                                         [&selected_scope_addr.scope]
-                                        .span,
+                                        .span
+                                        .clone(),
                                     format!(
                                         "{}.{} - {}.{}",
                                         dim_tool.edges[right].0,

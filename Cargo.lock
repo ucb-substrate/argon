@@ -3779,6 +3779,8 @@ dependencies = [
  "indexmap 2.11.4",
  "itertools 0.14.0",
  "log",
+ "lrlex",
+ "lrpar",
  "lsp-document",
  "portpicker",
  "serde",

@@ -41,6 +41,9 @@ impl<'a> ScopeAnnotationPass<'a> {
                 Decl::Cell(c) => {
                     self.transform_cell_decl(c);
                 }
+                Decl::Mod(c) => {
+                    self.transform_mod_decl(c);
+                }
                 _ => todo!(),
             }
         }

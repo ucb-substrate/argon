@@ -15,11 +15,12 @@ use std::{
 use compiler::{
     ast::Expr,
     compile::{self, CellArg, CompileInput, CompileOutput},
-    parse,
+    parse::{self, ParseOutput},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
 use itertools::Itertools;
+use lrpar::{LexError, LexParseError, Lexeme};
 use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
@@ -34,7 +35,7 @@ use tower_lsp::lsp_types::{request::Request, *};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
 use crate::{
-    document::{Document, DocumentChange, GuiDocument},
+    document::{Document, DocumentChange},
     import::ScopeAnnotationPass,
 };
 
@@ -42,43 +43,111 @@ use crate::{
 // TODO: Verify synchronization between GUI and editor files when appropriate.
 #[derive(Debug, Clone, Default)]
 pub struct StateMut {
+    root_dir: Option<PathBuf>,
+    cell: Option<String>,
     gui_client: Option<LspToGuiClient>,
-    gui_files: IndexMap<Url, GuiDocument>,
     editor_files: IndexMap<Url, Document>,
 }
 
 impl StateMut {
-    fn compile_gui_cell(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) -> CompileOutput {
-        let file = file.as_ref();
+    fn parse_diagnostics(&self, parse_output: &ParseOutput) -> IndexMap<Url, Vec<Diagnostic>> {
+        parse_output
+            .errs
+            .iter()
+            .map(|(path, (lex_errs, mod_errs))| {
+                let url = Url::from_file_path(path).unwrap();
+                let diagnostics = self
+                    .editor_files
+                    .get(&url)
+                    .iter()
+                    .flat_map(|doc| {
+                        lex_errs
+                            .iter()
+                            .map(|err| match err {
+                                LexParseError::LexError(e) => Diagnostic {
+                                    range: Range {
+                                        start: doc.offset_to_pos(e.span().start()),
+                                        end: doc.offset_to_pos(e.span().end()),
+                                    },
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    message: format!("{}", e),
+                                    ..Default::default()
+                                },
+                                LexParseError::ParseError(e) => Diagnostic {
+                                    range: Range {
+                                        start: doc.offset_to_pos(e.lexeme().span().start()),
+                                        end: doc.offset_to_pos(e.lexeme().span().end()),
+                                    },
+                                    severity: Some(DiagnosticSeverity::ERROR),
+                                    message: format!("{}", e),
+                                    ..Default::default()
+                                },
+                            })
+                            .chain(mod_errs.iter().filter_map(|(span, mod_path)| {
+                                if let Err(e) = parse_output.asts.get(mod_path)? {
+                                    Some(Diagnostic {
+                                        range: Range {
+                                            start: doc.offset_to_pos(span.start()),
+                                            end: doc.offset_to_pos(span.end()),
+                                        },
+                                        severity: Some(DiagnosticSeverity::ERROR),
+                                        message: format!("{e}"),
+                                        ..Default::default()
+                                    })
+                                } else {
+                                    None
+                                }
+                            }))
+                    })
+                    .collect();
+                (url, diagnostics)
+            })
+            .collect()
+    }
+
+    fn compile_cell(
+        &mut self,
+        cell: impl AsRef<str>,
+    ) -> (CompileOutput, IndexMap<Url, Vec<Diagnostic>>) {
+        let cell = cell.as_ref();
+
+        self.cell = Some(cell.to_string());
 
         // TODO: un-hardcode this.
         let lyp = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../core/compiler/examples/lyp/basic.lyp"
         );
-        let cell_ast = parse::parse_cell(cell.as_ref()).unwrap();
-        let ast = parse::parse_workspace(file).unwrap();
-        compile::compile(
-            &ast,
-            CompileInput {
-                cell: &cell_ast
-                    .func
-                    .path
-                    .iter()
-                    .map(|ident| ident.name)
-                    .collect_vec(),
-                args: cell_ast
-                    .args
-                    .posargs
-                    .iter()
-                    .map(|arg| match arg {
-                        Expr::FloatLiteral(float_literal) => CellArg::Float(float_literal.value),
-                        Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
-                        _ => panic!("must be int or float literal for now"),
-                    })
-                    .collect(),
-                lyp_file: &PathBuf::from(lyp),
-            },
+        let cell_ast = parse::parse_cell(cell).unwrap();
+        let parse_output = parse::parse_workspace(self.root_dir.as_ref().unwrap().join("lib.ar"));
+        let diagnostics = self.parse_diagnostics(&parse_output);
+        let ast = parse_output.best_effort_ast();
+        (
+            compile::compile(
+                &ast,
+                CompileInput {
+                    cell: &cell_ast
+                        .func
+                        .path
+                        .iter()
+                        .map(|ident| ident.name)
+                        .collect_vec(),
+                    args: cell_ast
+                        .args
+                        .posargs
+                        .iter()
+                        .map(|arg| match arg {
+                            Expr::FloatLiteral(float_literal) => {
+                                CellArg::Float(float_literal.value)
+                            }
+                            Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
+                            _ => panic!("must be int or float literal for now"),
+                        })
+                        .collect(),
+                    lyp_file: &PathBuf::from(lyp),
+                },
+            ),
+            diagnostics,
         )
     }
 }
@@ -117,7 +186,9 @@ impl Request for ForceSave {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        self.state.state_mut.lock().await.root_dir =
+            params.root_uri.map(|root| root.to_file_path().unwrap());
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
@@ -167,15 +238,12 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+    async fn did_save(&self, _: DidSaveTextDocumentParams) {
         let state_mut = self.state.state_mut.lock().await;
-        if let Some(doc) = state_mut.gui_files.get(&params.text_document.uri) {
-            self.open_cell(OpenCellParams {
-                file: params.text_document.uri.to_file_path().unwrap(),
-                cell: doc.cell.clone(),
-            })
-            .await
-            .unwrap();
+        if let Some(cell) = &state_mut.cell {
+            self.open_cell(OpenCellParams { cell: cell.clone() })
+                .await
+                .unwrap();
         }
     }
 
@@ -193,24 +261,12 @@ impl LanguageServer for Backend {
 
 #[derive(Serialize, Deserialize)]
 struct OpenCellParams {
-    file: PathBuf,
     cell: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SetParams {
     kv: String,
-}
-
-#[allow(dead_code)]
-fn make_tmp_file_path(file: impl AsRef<Path>) -> PathBuf {
-    let file = file.as_ref();
-    let mut tmp_file_name = OsString::from(".");
-    tmp_file_name.push(file.file_name().unwrap());
-    tmp_file_name.push(".gui");
-    let mut tmp_file = PathBuf::from(file.parent().unwrap());
-    tmp_file.push(tmp_file_name);
-    tmp_file
 }
 
 impl Backend {
@@ -240,6 +296,7 @@ impl Backend {
         Ok(())
     }
 
+    // TODO: run scope annotation pass at some point.
     async fn open_file_in_gui(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) {
         let file = file.as_ref();
         let mut state_mut = self.state.state_mut.lock().await;
@@ -251,80 +308,73 @@ impl Backend {
             return;
         };
 
-        let ast = parse::parse(doc.contents()).unwrap();
-        let scope_annotation = ScopeAnnotationPass::new(&doc, &ast);
-        let mut text_edits = scope_annotation.execute();
-        text_edits.sort_by_key(|edit| Reverse(edit.range.start));
-        doc.apply_changes(
-            text_edits
-                .iter()
-                .map(|text_edit| DocumentChange {
-                    range: Some(text_edit.range),
-                    patch: text_edit.new_text.clone(),
-                })
-                .collect(),
-            doc.version() + 1,
-        );
-        let ast = parse::parse(doc.contents()).unwrap();
-        state_mut.gui_files.insert(
-            url,
-            GuiDocument {
-                doc,
-                ast,
-                cell: cell.as_ref().to_string(),
-            },
-        );
-
-        if !text_edits.is_empty() {
-            self.state
-                .editor_client
-                .apply_edit(WorkspaceEdit {
-                    changes: Some(HashMap::from_iter([(
-                        Url::from_file_path(file).unwrap(),
-                        text_edits,
-                    )])),
-                    document_changes: None,
-                    change_annotations: None,
-                })
-                .await
-                .unwrap();
+        if let Ok(ast) = parse::parse(doc.contents()).0 {
+            let scope_annotation = ScopeAnnotationPass::new(&doc, &ast);
+            let mut text_edits = scope_annotation.execute();
+            text_edits.sort_by_key(|edit| Reverse(edit.range.start));
+            doc.apply_changes(
+                text_edits
+                    .iter()
+                    .map(|text_edit| DocumentChange {
+                        range: Some(text_edit.range),
+                        patch: text_edit.new_text.clone(),
+                    })
+                    .collect(),
+                doc.version() + 1,
+            );
+            if !text_edits.is_empty() {
+                self.state
+                    .editor_client
+                    .apply_edit(WorkspaceEdit {
+                        changes: Some(HashMap::from_iter([(
+                            Url::from_file_path(file).unwrap(),
+                            text_edits,
+                        )])),
+                        document_changes: None,
+                        change_annotations: None,
+                    })
+                    .await
+                    .unwrap();
+            }
         }
+        let ast = parse::parse(doc.contents()).0.ok();
     }
 
-    /// Compiles an **open** GUI cell.
-    async fn compile_gui_cell(
+    /// Compiles a cell.
+    async fn compile_cell(
         &self,
-        file: impl AsRef<Path>,
         cell: impl AsRef<str>,
-    ) -> CompileOutput {
-        let state_mut = self.state.state_mut.lock().await;
-        state_mut.compile_gui_cell(file, cell)
+    ) -> (CompileOutput, IndexMap<Url, Vec<Diagnostic>>) {
+        let mut state_mut = self.state.state_mut.lock().await;
+        state_mut.compile_cell(cell)
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
         let state = self.state.clone();
         state
             .editor_client
-            .show_message(
-                MessageType::INFO,
-                &format!("file {:?}, cell {}", params.file, params.cell),
-            )
+            .show_message(MessageType::INFO, &format!("cell {}", params.cell))
             .await;
         let self_clone = self.clone();
         tokio::spawn(async move {
-            self_clone
-                .open_file_in_gui(&params.file, &params.cell)
-                .await;
-            let o = self_clone.compile_gui_cell(&params.file, params.cell).await;
+            let (o, diagnostics) = self_clone.compile_cell(params.cell).await;
+            for (uri, diags) in diagnostics {
+                state
+                    .editor_client
+                    .show_message(MessageType::INFO, format!("{:?} {:?}", uri, diags))
+                    .await;
+                // TODO: potentially add version number;
+                state
+                    .editor_client
+                    .publish_diagnostics(uri, diags, None)
+                    .await;
+            }
             if let Some(client) = state.state_mut.lock().await.gui_client.as_mut() {
-                client
-                    .open_cell(context::current(), params.file, o)
-                    .await
-                    .unwrap();
+                client.open_cell(context::current(), o).await.unwrap();
             } else {
                 state
                     .editor_client
-                    .show_message(MessageType::ERROR, "No GUI connected")
+                    .show_message(MessageType::WARNING, "No GUI connected")
                     .await;
             }
         });

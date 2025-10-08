@@ -13,27 +13,6 @@ pub(crate) struct Document {
     version: i32,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct GuiDocument {
-    pub(crate) doc: Document,
-    pub(crate) ast: AnnotatedAst<ParseMetadata>,
-    pub(crate) cell: String,
-}
-
-impl Deref for GuiDocument {
-    type Target = Document;
-
-    fn deref(&self) -> &Self::Target {
-        &self.doc
-    }
-}
-
-impl DerefMut for GuiDocument {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.doc
-    }
-}
-
 pub(crate) struct DocumentChange {
     pub(crate) range: Option<Range>,
     pub(crate) patch: String,
@@ -92,14 +71,5 @@ impl Document {
 
     pub(crate) fn version(&self) -> i32 {
         self.version
-    }
-}
-
-impl GuiDocument {
-    pub(crate) fn apply_changes(&mut self, changes: Vec<DocumentChange>, version: i32) {
-        if version > self.version() {
-            self.doc.apply_changes(changes, version);
-            self.ast = parse::parse(self.contents()).unwrap();
-        }
     }
 }

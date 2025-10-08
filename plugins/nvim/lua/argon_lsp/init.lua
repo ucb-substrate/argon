@@ -70,7 +70,8 @@ M.start = function(bufnr)
     
     bufnr = bufnr or vim.api.nvim_get_current_buf()
     local bufname = vim.api.nvim_buf_get_name(bufnr)
-    root_dir = vim.fs.dirname(bufname)
+    local crate_dir = vim.fs.root(bufname, { 'lib.ar' })
+    root_dir = crate_dir
     lsp_start_config.root_dir = root_dir
 
     local old_on_init = lsp_start_config.on_init
