@@ -14,6 +14,7 @@ use tower_lsp::lsp_types::{
 use crate::{
     ForceSave, State,
     document::{Document, DocumentChange},
+    import::ScopeAnnotationPass,
 };
 
 #[tarpc::service]
@@ -44,19 +45,16 @@ impl GuiToLsp for LspServer {
             LspToGuiClient::new(tarpc::client::Config::default(), transport.await.unwrap()).spawn()
         };
         let mut state_mut = self.state.state_mut.lock().await;
-        if let Some(o) = &state_mut.compile_output {
-            gui_client
-                .open_cell(context::current(), o.clone())
-                .await
-                .unwrap();
-        }
         state_mut.gui_client = Some(gui_client);
+        state_mut.compile(&self.state.editor_client).await;
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
         // TODO: check that vim file is in sync with GUI file.
-        let url = Url::from_file_path(&span.path).unwrap();
-        if let Some(doc) = self.state.state_mut.lock().await.editor_files.get(&url) {
+        let state_mut = self.state.state_mut.lock().await;
+        if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
+            let doc = Document::new(&ast.text, 0);
+            let url = Url::from_file_path(&span.path).unwrap();
             let diagnostics = vec![Diagnostic {
                 range: Range {
                     start: doc.offset_to_pos(span.span.start()),
@@ -81,14 +79,12 @@ impl GuiToLsp for LspServer {
         rect: BasicRect<f64>,
     ) {
         // TODO: check if editor file is up to date with ast.
-        let mut state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
-        let doc = state_mut
-            .editor_files
-            .get(&url)
-            .map::<Result<_, std::io::Error>, _>(|doc| Ok(doc.clone()))
-            .unwrap_or_else(|| Ok(Document::new(std::fs::read_to_string(&scope_span.path)?, 0)));
-        if let Ok(doc) = doc
+        if let Some(ast) = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)
             && let Some(scope) = state_mut
                 .ast
                 .values()
@@ -96,6 +92,7 @@ impl GuiToLsp for LspServer {
                 .as_ref()
                 .and_then(|ast| ast.span2scope.get(&scope_span))
         {
+            let doc = Document::new(&ast.text, 0);
             let edit = if let Some(tail) = &scope.tail {
                 let start = doc.offset_to_pos(tail.span().start());
                 TextEdit {
@@ -153,16 +150,6 @@ impl GuiToLsp for LspServer {
                     .await;
                 return;
             }
-            if let Some(doc) = state_mut.editor_files.get_mut(&url) {
-                let version = doc.version() + 1;
-                doc.apply_changes(
-                    vec![DocumentChange {
-                        range: Some(edit.range),
-                        patch: edit.new_text.clone(),
-                    }],
-                    version,
-                );
-            }
 
             self.state
                 .editor_client
@@ -201,14 +188,12 @@ impl GuiToLsp for LspServer {
         rhs: String,
     ) {
         // TODO: check if editor file is up to date with ast.
-        let mut state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
-        let doc = state_mut
-            .editor_files
-            .get(&url)
-            .map::<Result<_, std::io::Error>, _>(|doc| Ok(doc.clone()))
-            .unwrap_or_else(|| Ok(Document::new(std::fs::read_to_string(&scope_span.path)?, 0)));
-        if let Ok(doc) = doc
+        if let Some(ast) = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)
             && let Some(scope) = state_mut
                 .ast
                 .values()
@@ -216,6 +201,7 @@ impl GuiToLsp for LspServer {
                 .as_ref()
                 .and_then(|ast| ast.span2scope.get(&scope_span))
         {
+            let doc = Document::new(&ast.text, 0);
             let edit = if let Some(tail) = &scope.tail {
                 let start = doc.offset_to_pos(tail.span().start());
                 TextEdit {
@@ -262,17 +248,6 @@ impl GuiToLsp for LspServer {
                     )
                     .await;
                 return;
-            }
-
-            if let Some(doc) = state_mut.editor_files.get_mut(&url) {
-                let version = doc.version() + 1;
-                doc.apply_changes(
-                    vec![DocumentChange {
-                        range: Some(edit.range),
-                        patch: edit.new_text.clone(),
-                    }],
-                    version,
-                );
             }
 
             self.state

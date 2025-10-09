@@ -1,15 +1,10 @@
-use std::ops::{Deref, DerefMut};
-
-use compiler::{
-    ast::annotated::AnnotatedAst,
-    parse::{self, ParseMetadata},
-};
+use arcstr::ArcStr;
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
 use tower_lsp::lsp_types::{Position, Range};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Document {
-    contents: IndexedText<String>,
+    contents: IndexedText<ArcStr>,
     version: i32,
 }
 
@@ -30,7 +25,7 @@ fn position2pos(pos: Position) -> Pos {
 }
 
 impl Document {
-    pub(crate) fn new(contents: impl Into<String>, version: i32) -> Self {
+    pub(crate) fn new(contents: impl Into<ArcStr>, version: i32) -> Self {
         Self {
             contents: IndexedText::new(contents.into()),
             version,
@@ -51,7 +46,7 @@ impl Document {
     pub(crate) fn apply_changes(&mut self, changes: Vec<DocumentChange>, version: i32) {
         if version > self.version {
             for change in changes {
-                self.contents = IndexedText::new(apply_change(
+                self.contents = IndexedText::new(ArcStr::from(apply_change(
                     &self.contents,
                     TextChange {
                         range: change
@@ -59,7 +54,7 @@ impl Document {
                             .map(|range| position2pos(range.start)..position2pos(range.end)),
                         patch: change.patch,
                     },
-                ));
+                )));
             }
             self.version = version;
         }
@@ -69,6 +64,7 @@ impl Document {
         self.contents.text()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn version(&self) -> i32 {
         self.version
     }

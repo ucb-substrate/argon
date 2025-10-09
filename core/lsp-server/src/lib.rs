@@ -56,106 +56,162 @@ pub struct StateMut {
 }
 
 impl StateMut {
-    fn output_to_diagnostics(&self, o: &CompileOutput) -> IndexMap<Url, Vec<Diagnostic>> {
+    fn diagnostics(&self) -> IndexMap<Url, Vec<Diagnostic>> {
         let mut diagnostics = IndexMap::new();
-        let errs = match o {
-            CompileOutput::FatalParseErrors => {
-                vec![(
-                    Span {
-                        path: self.root_dir.as_ref().unwrap().join("lib.ar"),
-                        span: cfgrammar::Span::new(0, 0),
-                    },
-                    "fatal parse errors encountered, unable to compile".to_string(),
-                )]
-            }
-            CompileOutput::StaticErrors(StaticErrorCompileOutput { errors }) => errors
-                .iter()
-                .map(|e| (e.span.clone(), format!("{}", e.kind)))
-                .collect(),
-            CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, .. }) => errors
-                .iter()
-                .filter_map(|e| Some((e.span.as_ref()?.clone(), format!("{}", e.kind))))
-                .collect(),
-            CompileOutput::Valid(_) => vec![],
-        };
-        for (span, message) in errs {
-            let url = Url::from_file_path(&span.path).unwrap();
-            if let Some(doc) = self.editor_files.get(&url) {
-                diagnostics
-                    .entry(url)
-                    .or_insert_with(Vec::new)
-                    .push(Diagnostic {
-                        range: Range {
-                            start: doc.offset_to_pos(span.span.start()),
-                            end: doc.offset_to_pos(span.span.end()),
+        if let Some(o) = &self.compile_output {
+            let errs = match o {
+                CompileOutput::FatalParseErrors => {
+                    vec![(
+                        Span {
+                            path: self.root_dir.as_ref().unwrap().join("lib.ar"),
+                            span: cfgrammar::Span::new(0, 0),
                         },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        message,
-                        ..Default::default()
-                    });
+                        "fatal parse errors encountered, unable to compile".to_string(),
+                    )]
+                }
+                CompileOutput::StaticErrors(StaticErrorCompileOutput { errors }) => errors
+                    .iter()
+                    .map(|e| (e.span.clone(), format!("{}", e.kind)))
+                    .collect(),
+                CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, .. }) => errors
+                    .iter()
+                    .filter_map(|e| Some((e.span.as_ref()?.clone(), format!("{}", e.kind))))
+                    .collect(),
+                CompileOutput::Valid(_) => vec![],
+            };
+            for (span, message) in errs {
+                let url = Url::from_file_path(&span.path).unwrap();
+                if let Some(ast) = self.ast.values().find(|ast| ast.path == span.path) {
+                    let doc = Document::new(&ast.text, 0);
+                    diagnostics
+                        .entry(url)
+                        .or_insert_with(Vec::new)
+                        .push(Diagnostic {
+                            range: Range {
+                                start: doc.offset_to_pos(span.span.start()),
+                                end: doc.offset_to_pos(span.span.end()),
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            message,
+                            ..Default::default()
+                        });
+                }
             }
         }
         diagnostics
     }
 
-    fn compile_cell(
-        &mut self,
-        cell: impl AsRef<str>,
-    ) -> (CompileOutput, IndexMap<Url, Vec<Diagnostic>>) {
-        let cell = cell.as_ref();
-
-        self.cell = Some(cell.to_string());
-
+    async fn compile(&mut self, client: &Client) {
         // TODO: un-hardcode this.
         let lyp = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../core/compiler/examples/lyp/basic.lyp"
         );
-        let cell_ast = parse::parse_cell(cell).unwrap();
-        let parse_output = parse::parse_workspace(self.root_dir.as_ref().unwrap().join("lib.ar"));
+        let parse_output =
+            parse::parse_workspace_with_std(self.root_dir.as_ref().unwrap().join("lib.ar"));
         let parse_errs = parse_output.static_errors();
         let ast = parse_output.best_effort_ast();
-        let mut o = compile::compile(
-            &ast,
-            CompileInput {
-                cell: &cell_ast
-                    .func
-                    .path
-                    .iter()
-                    .map(|ident| ident.name)
-                    .collect_vec(),
-                args: cell_ast
-                    .args
-                    .posargs
-                    .iter()
-                    .map(|arg| match arg {
-                        Expr::FloatLiteral(float_literal) => CellArg::Float(float_literal.value),
-                        Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
-                        _ => panic!("must be int or float literal for now"),
-                    })
-                    .collect(),
-                lyp_file: &PathBuf::from(lyp),
-            },
-        );
         self.ast = ast;
-        match &mut o {
-            CompileOutput::StaticErrors(e) => e.errors.extend(parse_errs),
-            o => {
-                if !parse_errs.is_empty() {
-                    *o = CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                        errors: parse_errs,
-                    });
+        let static_output = compile::static_compile(&self.ast);
+        // If GUI is connected, must annotate scopes.
+        if self.gui_client.is_some() {
+            for (_, ast) in &self.ast {
+                let scope_annotation = ScopeAnnotationPass::new(ast);
+                let mut text_edits = scope_annotation.execute();
+                text_edits.sort_by_key(|edit| Reverse(edit.range.start));
+                if !text_edits.is_empty() {
+                    client
+                        .apply_edit(WorkspaceEdit {
+                            changes: Some(HashMap::from_iter([(
+                                Url::from_file_path(&ast.path).unwrap(),
+                                text_edits,
+                            )])),
+                            document_changes: None,
+                            change_annotations: None,
+                        })
+                        .await
+                        .unwrap();
+
+                    client
+                        .send_request::<ForceSave>(ast.path.clone())
+                        .await
+                        .unwrap();
+
+                    // `compile` will be reinvoked upon save.
+                    return;
                 }
             }
         }
-        let mut tmp = self.output_to_diagnostics(&o);
+
+        let mut o = if let Some((ast, static_output)) = static_output {
+            if !static_output.errors.is_empty() {
+                Some(CompileOutput::StaticErrors(static_output))
+            } else if let Some(cell) = &self.cell
+                && let Ok(cell_ast) = parse::parse_cell(cell)
+            {
+                Some(compile::dynamic_compile(
+                    &ast,
+                    CompileInput {
+                        cell: &cell_ast
+                            .func
+                            .path
+                            .iter()
+                            .map(|ident| ident.name)
+                            .collect_vec(),
+                        args: cell_ast
+                            .args
+                            .posargs
+                            .iter()
+                            .map(|arg| match arg {
+                                Expr::FloatLiteral(float_literal) => {
+                                    CellArg::Float(float_literal.value)
+                                }
+                                Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
+                                _ => panic!("must be int or float literal for now"),
+                            })
+                            .collect(),
+                        lyp_file: &PathBuf::from(lyp),
+                    },
+                ))
+            } else {
+                None
+            }
+        } else {
+            Some(CompileOutput::FatalParseErrors)
+        };
+        match &mut o {
+            Some(CompileOutput::StaticErrors(e)) => e.errors.extend(parse_errs),
+            o => {
+                if !parse_errs.is_empty() {
+                    *o = Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                        errors: parse_errs,
+                    }));
+                }
+            }
+        }
+        self.compile_output = o;
+        let mut tmp = self.diagnostics();
         let mut diagnostics = tmp.clone();
         std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
         for (path, _) in tmp {
-            diagnostics.entry(path).or_insert_with(Vec::new);
+            diagnostics.entry(path).or_default();
         }
-        self.compile_output = Some(o.clone());
-        (o, diagnostics)
+        for (uri, diags) in diagnostics {
+            // TODO: potentially add version number
+            client.publish_diagnostics(uri, diags, None).await;
+        }
+        if let Some(o) = &self.compile_output
+            && let Some(client) = self.gui_client.as_mut()
+        {
+            client
+                .open_cell(context::current(), o.clone())
+                .await
+                .unwrap();
+        } else {
+            client
+                .show_message(MessageType::WARNING, "No GUI connected")
+                .await;
+        }
     }
 }
 
@@ -217,6 +273,7 @@ impl LanguageServer for Backend {
             .editor_client
             .log_message(MessageType::INFO, "server initialized!")
             .await;
+        self.compile().await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -246,12 +303,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {
-        let state_mut = self.state.state_mut.lock().await;
-        if let Some(cell) = &state_mut.cell {
-            self.open_cell(OpenCellParams { cell: cell.clone() })
-                .await
-                .unwrap();
-        }
+        self.compile().await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -303,57 +355,17 @@ impl Backend {
         Ok(())
     }
 
-    // TODO: run scope annotation pass at some point.
-    async fn open_file_in_gui(&self, file: impl AsRef<Path>, cell: impl AsRef<str>) {
-        let file = file.as_ref();
+    /// Compiles a cell.
+    async fn compile_cell(&self, cell: impl Into<String>) {
         let mut state_mut = self.state.state_mut.lock().await;
-        let url = Url::from_file_path(file).unwrap();
-        let mut doc = if let Some(doc) = state_mut.editor_files.get(&url).cloned() {
-            doc
-        } else {
-            // TODO: handle error
-            return;
-        };
-
-        if let Ok(ast) = parse::parse(doc.contents()).0 {
-            let scope_annotation = ScopeAnnotationPass::new(&doc, &ast);
-            let mut text_edits = scope_annotation.execute();
-            text_edits.sort_by_key(|edit| Reverse(edit.range.start));
-            doc.apply_changes(
-                text_edits
-                    .iter()
-                    .map(|text_edit| DocumentChange {
-                        range: Some(text_edit.range),
-                        patch: text_edit.new_text.clone(),
-                    })
-                    .collect(),
-                doc.version() + 1,
-            );
-            if !text_edits.is_empty() {
-                self.state
-                    .editor_client
-                    .apply_edit(WorkspaceEdit {
-                        changes: Some(HashMap::from_iter([(
-                            Url::from_file_path(file).unwrap(),
-                            text_edits,
-                        )])),
-                        document_changes: None,
-                        change_annotations: None,
-                    })
-                    .await
-                    .unwrap();
-            }
-        }
-        let ast = parse::parse(doc.contents()).0.ok();
+        state_mut.cell = Some(cell.into());
+        state_mut.compile(&self.state.editor_client).await;
     }
 
-    /// Compiles a cell.
-    async fn compile_cell(
-        &self,
-        cell: impl AsRef<str>,
-    ) -> (CompileOutput, IndexMap<Url, Vec<Diagnostic>>) {
+    /// Compiles the current workspace and the open cell if it exists.
+    async fn compile(&self) {
         let mut state_mut = self.state.state_mut.lock().await;
-        state_mut.compile_cell(cell)
+        state_mut.compile(&self.state.editor_client).await;
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
@@ -364,22 +376,7 @@ impl Backend {
             .await;
         let self_clone = self.clone();
         tokio::spawn(async move {
-            let (o, diagnostics) = self_clone.compile_cell(params.cell).await;
-            for (uri, diags) in diagnostics {
-                // TODO: potentially add version number
-                state
-                    .editor_client
-                    .publish_diagnostics(uri, diags, None)
-                    .await;
-            }
-            if let Some(client) = state.state_mut.lock().await.gui_client.as_mut() {
-                client.open_cell(context::current(), o).await.unwrap();
-            } else {
-                state
-                    .editor_client
-                    .show_message(MessageType::WARNING, "No GUI connected")
-                    .await;
-            }
+            self_clone.compile_cell(params.cell).await;
         });
         Ok(())
     }

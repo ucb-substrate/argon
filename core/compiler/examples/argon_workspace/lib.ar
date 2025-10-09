@@ -2,9 +2,11 @@ mod utils;
 mod nested;
 
 cell test() {
+    if 1 > 2 {} else {};
     rect("met1", x0=0., y0=0., x1=nested::nested::test(), y1=crate::utils::test())!;
     let rect0 = rect("met1", x0i = 389.05859375, y0i = -246.8787841796875, x1i = 517.26171875, y1i = -92.36315155029295)!;
     let rect1 = rect("met1", x0i = 147.859375, y0i = -455.1014404296875, x1i = 281.57421875, y1i = -312.0819091796875)!;
+    let rect2 = rect("met1", x0i = 400.859375, y0i = -455.1014404296875, x1i = 500.57421875, y1i = -312.0819091796875)!;
     eq(rect0.x1 - rect0.x0, 50.);
     eq(rect0.y1 - rect0.y0, 100.0);
 }

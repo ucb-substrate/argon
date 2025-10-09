@@ -3137,14 +3137,6 @@ pub enum ExecErrorKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[enumify]
-pub enum StaticCompileOutput {
-    FatalParseErrors,
-    StaticErrors(StaticErrorCompileOutput),
-    Valid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[enumify]
 pub enum CompileOutput {
     FatalParseErrors,
     StaticErrors(StaticErrorCompileOutput),
