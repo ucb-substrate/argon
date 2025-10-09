@@ -107,12 +107,13 @@ impl StateMut {
         let lyp = self
             .config
             .as_ref()
-            .map(|config| {
-                if config.lyp.is_relative() {
-                    root_dir.join(&config.lyp)
+            .and_then(|config| {
+                let lyp = config.lyp.as_ref()?;
+                Some(if lyp.is_relative() {
+                    root_dir.join(lyp)
                 } else {
-                    config.lyp.clone()
-                }
+                    lyp.clone()
+                })
             })
             .unwrap_or_else(|| {
                 PathBuf::from(concat!(
