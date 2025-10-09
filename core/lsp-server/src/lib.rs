@@ -415,16 +415,16 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 pub async fn main() {
     // Start server for communication with GUI.
     let port = 12345; // for debugging
-    let port = if is_free(port) {
-        port
+    let mut listener = if let Ok(listener) =
+        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12345), Json::default).await
+    {
+        listener
     } else {
-        loop {
-            if let Some(port) = pick_unused_port() {
-                break port;
-            }
-        }
+        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
+            .await
+            .unwrap()
     };
-    let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port).into();
+    let server_addr = listener.local_addr();
 
     // Construct actual LSP server.
     let stdin = tokio::io::stdin();
@@ -441,12 +441,6 @@ pub async fn main() {
     .custom_method("custom/set", Backend::set)
     .finish();
     let state = ext_state.unwrap();
-
-    // JSON transport is provided by the json_transport tarpc module. It makes it easy
-    // to start up a serde-powered json serialization strategy over TCP.
-    let mut listener = tarpc::serde_transport::tcp::listen(&server_addr, Json::default)
-        .await
-        .unwrap();
     listener.config_mut().max_frame_length(usize::MAX);
     let state_clone = state.clone();
     tokio::spawn(async move {

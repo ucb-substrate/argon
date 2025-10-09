@@ -372,7 +372,6 @@ mod tests {
             .layers
             .iter()
             .map(|layer_prop| {
-                println!("{}", layer_prop.source);
                 let re = Regex::new(r"(\d*)/(\d*)@\d*").unwrap();
                 let caps = re.captures(&layer_prop.source).unwrap();
                 let layer = caps.get(1).unwrap().as_str().parse().unwrap();

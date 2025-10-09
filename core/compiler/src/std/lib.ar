@@ -89,3 +89,15 @@ fn max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect 
     let ny = (((h - r.h) / ypitch) as Int + 1);
     array2(r, nx, ny, xpitch, ypitch)
 }
+
+fn eq_rect(r1: Rect, r2: Rect) {
+    eq(r1.x0, r2.x0);
+    eq(r1.y0, r2.y0);
+    eq(r1.x1, r2.x1);
+    eq(r1.y1, r2.y1);
+}
+
+fn center_rects(r1: Rect, r2: Rect) {
+    eq((r1.x0 + r1.x1)/2., (r2.x0 + r2.x1)/2.);
+    eq((r1.y0 + r1.y1)/2., (r2.y0 + r2.y1)/2.);
+}

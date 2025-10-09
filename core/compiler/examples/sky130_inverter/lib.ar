@@ -57,15 +57,16 @@ cell inverter(nw: Float, pw: Float) {
 
     let licon = rect("licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let cons = crect(x0=vdd_s.x0, x1=vdd_s.x1, y0=pdiff.y0+40., y1=pdiff.y1-40.);
-    // MaxArray!(licon, cons, 170, 170);
+    std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
     let cons = crect(x0=vout.x0, x1=vout.x1, y0=pdiff.y0+40., y1=pdiff.y1-40.);
-    // MaxArray!(licon, cons, 170, 170);
+    std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
     let cons = crect(x0=vout.x0, x1=vout.x1, y0=ndiff.y0+40., y1=ndiff.y1-40.);
-    // MaxArray!(licon, cons, 170, 170);
+    std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
     let cons = crect(x0=vss_s.x0, x1=vss_s.x1, y0=ndiff.y0+40., y1=ndiff.y1-40.);
-    // MaxArray!(licon, cons, 170, 170);
+    std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
     let cons = crect(x0=vss_ptap.x0, x1=vss_ptap.x1, y0=vss_ptap.y0+80., y1=vss_ptap.y1-80.);
-    // MaxArray!(licon, cons, 170, 170);
+    std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
     let cons = crect(x0=vdd_ntap.x0, x1=vdd_ntap.x1, y0=vdd_ntap.y0+80., y1=vdd_ntap.y1-80.);
-    // MaxArray!(licon, cons, 170, 170);
+    let r = std::max_array(licon, cons.w, cons.h, 340., 340.);
+    std::center_rects(r, cons);
 }
