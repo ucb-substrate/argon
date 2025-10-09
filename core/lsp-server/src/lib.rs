@@ -183,7 +183,7 @@ impl StateMut {
                                 _ => panic!("must be int or float literal for now"),
                             })
                             .collect(),
-                        lyp_file: &PathBuf::from(lyp),
+                        lyp_file: &lyp,
                     },
                 ))
             } else {
