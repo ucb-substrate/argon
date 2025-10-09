@@ -1,6 +1,5 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, path::PathBuf};
 
-use cfgrammar::Span;
 use derive_where::derive_where;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -13,16 +12,22 @@ pub mod annotated;
 pub type ModPath = Vec<String>;
 pub type WorkspaceAst<T> = IndexMap<ModPath, AnnotatedAst<T>>;
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Span {
+    pub path: PathBuf,
+    pub span: cfgrammar::Span,
+}
+
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct Ast<S, T: AstMetadata> {
     pub decls: Vec<Decl<S, T>>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct ModDecl<S, T: AstMetadata> {
     pub ident: Ident<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -38,37 +43,37 @@ pub enum Decl<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct IdentPath<S, T: AstMetadata> {
     pub path: Vec<Ident<S, T>>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct Ident<S, T: AstMetadata> {
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub name: S,
     pub metadata: T::Ident,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FloatLiteral {
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub value: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct IntLiteral {
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub value: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StringLiteral<S> {
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub value: S,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BoolLiteral {
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub value: bool,
 }
 
@@ -83,7 +88,7 @@ pub struct EnumDecl<S, T: AstMetadata> {
 pub struct StructDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub fields: Vec<StructField<S, T>>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::StructDecl,
 }
 
@@ -91,7 +96,7 @@ pub struct StructDecl<S, T: AstMetadata> {
 pub struct StructField<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub ty: Ident<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::StructField,
 }
 
@@ -100,7 +105,7 @@ pub struct CellDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub args: Vec<ArgDecl<S, T>>,
     pub scope: Scope<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::CellDecl,
 }
 
@@ -110,7 +115,7 @@ pub struct FnDecl<S, T: AstMetadata> {
     pub args: Vec<ArgDecl<S, T>>,
     pub return_ty: Option<Ident<S, T>>,
     pub scope: Scope<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::FnDecl,
 }
 
@@ -125,7 +130,7 @@ pub struct ConstantDecl<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct Scope<S, T: AstMetadata> {
     pub scope_annotation: Option<Ident<S, T>>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub stmts: Vec<Statement<S, T>>,
     pub tail: Option<Expr<S, T>>,
     pub metadata: T::Scope,
@@ -142,7 +147,7 @@ pub struct LetBinding<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub value: Expr<S, T>,
     pub metadata: T::LetBinding,
-    pub span: Span,
+    pub span: cfgrammar::Span,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -200,7 +205,7 @@ pub struct IfExpr<S, T: AstMetadata> {
     pub cond: Expr<S, T>,
     pub then: Scope<S, T>,
     pub else_: Scope<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::IfExpr,
 }
 
@@ -209,7 +214,7 @@ pub struct BinOpExpr<S, T: AstMetadata> {
     pub op: BinOp,
     pub left: Expr<S, T>,
     pub right: Expr<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::BinOpExpr,
 }
 
@@ -217,7 +222,7 @@ pub struct BinOpExpr<S, T: AstMetadata> {
 pub struct UnaryOpExpr<S, T: AstMetadata> {
     pub op: UnaryOp,
     pub operand: Expr<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::UnaryOpExpr,
 }
 
@@ -226,7 +231,7 @@ pub struct ComparisonExpr<S, T: AstMetadata> {
     pub op: ComparisonOp,
     pub left: Expr<S, T>,
     pub right: Expr<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::ComparisonExpr,
 }
 
@@ -234,7 +239,7 @@ pub struct ComparisonExpr<S, T: AstMetadata> {
 pub struct FieldAccessExpr<S, T: AstMetadata> {
     pub base: Expr<S, T>,
     pub field: Ident<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::FieldAccessExpr,
 }
 
@@ -242,7 +247,7 @@ pub struct FieldAccessExpr<S, T: AstMetadata> {
 pub struct EnumValue<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub variant: Ident<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::EnumValue,
 }
 
@@ -250,14 +255,14 @@ pub struct EnumValue<S, T: AstMetadata> {
 pub struct CallExpr<S, T: AstMetadata> {
     pub func: IdentPath<S, T>,
     pub args: Args<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::CallExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct EmitExpr<S, T: AstMetadata> {
     pub value: Expr<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::EmitExpr,
 }
 
@@ -265,7 +270,7 @@ pub struct EmitExpr<S, T: AstMetadata> {
 pub struct Args<S, T: AstMetadata> {
     pub posargs: Vec<Expr<S, T>>,
     pub kwargs: Vec<KwArgValue<S, T>>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::Args,
 }
 
@@ -273,7 +278,7 @@ pub struct Args<S, T: AstMetadata> {
 pub struct KwArgValue<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub value: Expr<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::KwArgValue,
 }
 
@@ -288,7 +293,7 @@ pub struct ArgDecl<S, T: AstMetadata> {
 pub struct CastExpr<S, T: AstMetadata> {
     pub value: Expr<S, T>,
     pub ty: Ident<S, T>,
-    pub span: Span,
+    pub span: cfgrammar::Span,
     pub metadata: T::CastExpr,
 }
 
@@ -307,7 +312,7 @@ pub(crate) fn flatten<T>(lhs: Result<Vec<T>, ()>, rhs: Result<T, ()>) -> Result<
 }
 
 impl<S, T: AstMetadata> Expr<S, T> {
-    pub fn span(&self) -> Span {
+    pub fn span(&self) -> cfgrammar::Span {
         match self {
             Self::If(x) => x.span,
             Self::Comparison(x) => x.span,

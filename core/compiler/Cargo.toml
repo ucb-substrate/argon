@@ -31,6 +31,7 @@ rgb = { version = "0.8", features = ["serde"] }
 klayout-lyp = "0.1.1"
 ndarray = "0.16.1"
 ndarray-linalg = { version = "0.17.0", default-features = false, features = ["openblas-system"] }
+thiserror = "2"
 
 [build-dependencies]
 cfgrammar = "0.13"
