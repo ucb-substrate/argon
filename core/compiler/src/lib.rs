@@ -9,7 +9,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use crate::parse::{parse_workspace, parse_workspace_with_std};
+    use crate::parse::parse_workspace_with_std;
     use approx::assert_relative_eq;
     use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
