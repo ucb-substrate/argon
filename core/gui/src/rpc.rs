@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use async_compat::CompatExt;
 use compiler::{
@@ -47,7 +47,7 @@ impl SyncGuiToLspClient {
                 break port;
             }
         };
-        let server_addr = (IpAddr::V6(Ipv6Addr::LOCALHOST), port).into();
+        let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port).into();
         let background_executor = self.app.background_executor().clone();
         let (tx, mut rx) = mpsc::channel(1);
         self.app
