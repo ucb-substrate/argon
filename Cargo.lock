@@ -1213,12 +1213,14 @@ dependencies = [
  "nalgebra",
  "ndarray",
  "ndarray-linalg",
+ "regex",
  "rgb",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
  "serde_json",
  "thiserror 2.0.16",
+ "toml 0.9.7",
 ]
 
 [[package]]

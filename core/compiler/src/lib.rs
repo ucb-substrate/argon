@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod compile;
+pub mod config;
 pub mod layer;
 pub mod parse;
 pub mod solver;
@@ -7,17 +8,20 @@ pub mod solver;
 #[cfg(test)]
 mod tests {
 
-    use std::path::PathBuf;
+    use std::{io::BufReader, path::PathBuf};
 
     use crate::parse::parse_workspace_with_std;
     use approx::assert_relative_eq;
     use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
+    use indexmap::IndexMap;
+    use regex::Regex;
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const ARGON_SCOPES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes/lib.ar");
     const BASIC_LYP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lyp/basic.lyp");
+    const SKY130_LYP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lyp/sky130.lyp");
     const ARGON_IMMEDIATE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/immediate/lib.ar");
     const ARGON_IF: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concat!(
@@ -352,7 +356,7 @@ mod tests {
             CompileInput {
                 cell: &["inverter"],
                 args: vec![CellArg::Float(1_200.), CellArg::Float(2_000.)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
+                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("cells: {cells:?}");
@@ -361,20 +365,24 @@ mod tests {
         let cell = &cells.cells[&cells.top];
         let mut gds = GdsLibrary::new("TOP");
         let mut ocell = GdsStruct::new("cell");
+        let lyp =
+            klayout_lyp::from_reader(BufReader::new(std::fs::File::open(SKY130_LYP).unwrap()))
+                .unwrap();
+        let layers = lyp
+            .layers
+            .iter()
+            .map(|layer_prop| {
+                println!("{}", layer_prop.source);
+                let re = Regex::new(r"(\d*)/(\d*)@\d*").unwrap();
+                let caps = re.captures(&layer_prop.source).unwrap();
+                let layer = caps.get(1).unwrap().as_str().parse().unwrap();
+                let datatype = caps.get(2).unwrap().as_str().parse().unwrap();
+                (layer_prop.name.as_str(), (layer, datatype))
+            })
+            .collect::<IndexMap<_, _>>();
         for rect in cell.objects.iter().filter_map(|obj| obj.1.get_rect()) {
             if let Some(layer) = &rect.layer {
-                let (layer, datatype) = match layer.as_str() {
-                    "Nwell" => (64, 20),
-                    "Diff" => (65, 20),
-                    "Tap" => (65, 44),
-                    "Psdm" => (94, 20),
-                    "Nsdm" => (93, 44),
-                    "Poly" => (66, 20),
-                    "Licon1" => (66, 44),
-                    "Npc" => (95, 20),
-                    "Li1" => (67, 20),
-                    _ => unreachable!(),
-                };
+                let (layer, datatype) = layers[&layer.as_str()];
                 let x0 = rect.x0.0 as i32;
                 let x1 = rect.x1.0 as i32;
                 let y0 = rect.y0.0 as i32;

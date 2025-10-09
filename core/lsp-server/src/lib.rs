@@ -17,6 +17,7 @@ use compiler::{
         self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
         StaticErrorCompileOutput,
     },
+    config::{Config, parse_config},
     parse::{self, WorkspaceParseAst},
 };
 use futures::prelude::*;
@@ -45,6 +46,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct StateMut {
     root_dir: Option<PathBuf>,
+    config: Option<Config>,
     ast: WorkspaceParseAst,
     prev_diagnostics: IndexMap<Url, Vec<Diagnostic>>,
     compile_output: Option<CompileOutput>,
@@ -101,12 +103,25 @@ impl StateMut {
 
     async fn compile(&mut self, client: &Client) {
         // TODO: un-hardcode this.
-        let lyp = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../core/compiler/examples/lyp/basic.lyp"
-        );
-        let parse_output =
-            parse::parse_workspace_with_std(self.root_dir.as_ref().unwrap().join("lib.ar"));
+        let root_dir = self.root_dir.as_ref().unwrap();
+        self.config = parse_config(root_dir.join("Argon.toml")).ok();
+        let lyp = self
+            .config
+            .as_ref()
+            .map(|config| {
+                if config.lyp.is_relative() {
+                    root_dir.join(&config.lyp)
+                } else {
+                    config.lyp.clone()
+                }
+            })
+            .unwrap_or_else(|| {
+                PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../core/compiler/examples/lyp/basic.lyp"
+                ))
+            });
+        let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
         let parse_errs = parse_output.static_errors();
         let ast = parse_output.best_effort_ast();
         self.ast = ast;
