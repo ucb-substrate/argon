@@ -224,7 +224,6 @@ impl TextInput {
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let (_yield_, reset) = self.dim_tool.update(cx, |dim_tool, cx| {
             if let Some(dim_tool) = dim_tool {
-                // TODO: only update state after entering dimension.
                 if dim_tool.edges.is_empty() {
                     return (true, false);
                 }
@@ -244,10 +243,10 @@ impl TextInput {
                                     _ => ("x0", "x1"),
                                 };
                                 state.lsp_client.add_eq_constraint(
-                                    cell.file.clone(),
                                     cell.output.cells[&selected_scope_addr.cell].scopes
                                         [&selected_scope_addr.scope]
-                                        .span,
+                                        .span
+                                        .clone(),
                                     format!(
                                         "{}.{} - {}.{}",
                                         dim_tool.edges[0].0, right, dim_tool.edges[0].0, left
@@ -263,10 +262,10 @@ impl TextInput {
                                         (1, 0)
                                     };
                                 state.lsp_client.add_eq_constraint(
-                                    cell.file.clone(),
                                     cell.output.cells[&selected_scope_addr.cell].scopes
                                         [&selected_scope_addr.scope]
-                                        .span,
+                                        .span
+                                        .clone(),
                                     format!(
                                         "{}.{} - {}.{}",
                                         dim_tool.edges[right].0,

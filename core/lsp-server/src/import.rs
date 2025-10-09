@@ -15,17 +15,17 @@ use crate::document::Document;
 
 pub(crate) struct ScopeAnnotationPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
-    content: &'a Document,
+    content: Document,
     assigned_names: Vec<HashSet<String>>,
     ids: Vec<usize>,
     edits: Vec<TextEdit>,
 }
 
 impl<'a> ScopeAnnotationPass<'a> {
-    pub(crate) fn new(content: &'a Document, ast: &'a AnnotatedAst<ParseMetadata>) -> Self {
+    pub(crate) fn new(ast: &'a AnnotatedAst<ParseMetadata>) -> Self {
         Self {
             ast,
-            content,
+            content: Document::new(&ast.text, 0),
             assigned_names: vec![Default::default()],
             ids: vec![Default::default()],
             edits: vec![],
@@ -40,6 +40,9 @@ impl<'a> ScopeAnnotationPass<'a> {
                 }
                 Decl::Cell(c) => {
                     self.transform_cell_decl(c);
+                }
+                Decl::Mod(c) => {
+                    self.transform_mod_decl(c);
                 }
                 _ => todo!(),
             }

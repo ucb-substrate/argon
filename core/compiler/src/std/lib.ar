@@ -89,29 +89,3 @@ fn max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect 
     let ny = (((h - r.h) / ypitch) as Int + 1);
     array2(r, nx, ny, xpitch, ypitch)
 }
-
-cell vias() {
-    let met2 = rect("met2")!;
-    let met1 = rect("met1")!;
-
-    // Create via.
-    let via = rect("via1");
-    eq(via.w, 10.);
-    eq(via.h, 10.);
-    eq(via.x0, 0.);
-    eq(via.y0, 0.);
-    let intersection = intersection(met1, met2);
-    let via_array = max_array(via, intersection.w, intersection.h, 20., 20.);
-    eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
-    eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
-
-    // Constrain metals.
-    eq(met2.x0, 0.);
-    eq(met2.y0, 0.);
-    eq(met2.x1, 100.);
-    eq(met2.y1, 100.);
-    eq(met1.x0, 5.);
-    eq(met1.y0, 5.);
-    eq(met1.x1, 95.);
-    eq(met1.y1, 95.);
-}

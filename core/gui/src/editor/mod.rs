@@ -1,12 +1,12 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
-    path::PathBuf,
 };
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, CompiledData, Rect, ScopeId, SolvedValue, ifmatvec,
+    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
+    ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -53,7 +53,6 @@ pub struct ScopeAddress {
 
 #[derive(Clone, Debug)]
 pub struct CompileOutputState {
-    pub file: PathBuf,
     pub output: CompiledData,
     pub selected_scope: ScopePath,
     pub selected_rect: Option<RectId>,
@@ -180,7 +179,7 @@ impl EditorState {
                                     x1: p0p.0.max(p1p.0) + inst.x,
                                     y1: p0p.1.max(p1p.1) + inst.y,
                                     id: inst.id,
-                                    span: rect.span,
+                                    span: rect.span.clone(),
                                 }
                             }),
                     );
@@ -218,8 +217,16 @@ impl EditorState {
             },
         );
     }
-    pub fn update(&mut self, cx: &mut App, file: PathBuf, solved_cell: CompileOutput) {
-        let solved_cell = solved_cell.unwrap_valid();
+    pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
+        let solved_cell = match output {
+            CompileOutput::Valid(d) => d,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(d), ..
+            }) => d,
+            _ => {
+                return;
+            }
+        };
         let root_scope = ScopeAddress {
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
@@ -262,7 +269,6 @@ impl EditorState {
         });
         self.solved_cell.update(cx, |old_cell, cx| {
             *old_cell = Some(CompileOutputState {
-                file,
                 output: solved_cell,
                 selected_scope: old_cell
                     .as_ref()

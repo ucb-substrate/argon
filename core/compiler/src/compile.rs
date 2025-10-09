@@ -4,7 +4,7 @@
 //! Pass 3: solving
 use std::collections::VecDeque;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use arcstr::Substr;
 use enumify::enumify;
@@ -12,11 +12,12 @@ use geometry::transform::{Rotation, TransformationMatrix};
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue, ModPath, Scope, UnaryOp,
-    WorkspaceAst,
+    BinOp, ComparisonOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue, ModPath,
+    Scope, Span, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -29,19 +30,23 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-    let dag = construct_dag(ast);
-    let (ast, errors) = execute_var_id_ty_pass(ast, &dag);
-    if !errors.is_empty() {
-        return CompileOutput::StaticErrors(StaticErrorCompileOutput { errors });
-    };
-    let input = CompileInput {
-        cell: input.cell,
-        args: input.args,
-        lyp_file: input.lyp_file,
-    };
+pub fn static_compile(
+    ast: &WorkspaceParseAst,
+) -> Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)> {
+    if !ast.contains_key(&vec![]) {
+        return None;
+    }
+    let (dag, mut errors) = construct_dag(ast);
+    let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
+    errors.extend(new_errors);
+    Some((ast, StaticErrorCompileOutput { errors }))
+}
 
-    let res = ExecPass::new(&ast).execute(input);
+pub fn dynamic_compile(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+) -> CompileOutput {
+    let res = ExecPass::new(ast).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput {
             errors,
@@ -61,18 +66,41 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
     }
 }
 
+pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+    let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
+        static_output
+    } else {
+        return CompileOutput::FatalParseErrors;
+    };
+    if !static_output.errors.is_empty() {
+        return CompileOutput::StaticErrors(static_output);
+    };
+
+    dynamic_compile(&ast, input)
+}
+
 type ModDag<'a> = IndexMap<&'a ModPath, IndexSet<&'a ModPath>>;
 
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
     deps: IndexSet<&'a ModPath>,
+    errors: Vec<StaticError>,
 }
 
-pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> ModDag<'_> {
-    ast.keys()
-        .map(|path| (path, ImportPass::new(ast, path).execute()))
-        .collect()
+pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> (ModDag<'_>, Vec<StaticError>) {
+    let mut errors = Vec::new();
+    (
+        ast.keys()
+            .map(|path| {
+                let (children, new_errors) = ImportPass::new(ast, path).execute();
+                errors.extend(new_errors);
+
+                (path, children)
+            })
+            .collect(),
+        errors,
+    )
 }
 
 impl<'a> ImportPass<'a> {
@@ -81,10 +109,18 @@ impl<'a> ImportPass<'a> {
             ast,
             current_path,
             deps: Default::default(),
+            errors: Default::default(),
         }
     }
 
-    pub(crate) fn execute(mut self) -> IndexSet<&'a ModPath> {
+    fn span(&self, span: cfgrammar::Span) -> Span {
+        Span {
+            path: self.ast[self.current_path].path.clone(),
+            span,
+        }
+    }
+
+    pub(crate) fn execute(mut self) -> (IndexSet<&'a ModPath>, Vec<StaticError>) {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -98,7 +134,7 @@ impl<'a> ImportPass<'a> {
             }
         }
 
-        self.deps
+        (self.deps, self.errors)
     }
 }
 
@@ -247,8 +283,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
                     )
                     .collect_vec()
             };
-            let (path_ref, _) = self.ast.get_key_value(&path).expect("module doesn't exist");
-            self.deps.insert(path_ref);
+            if let Some((path_ref, _)) = self.ast.get_key_value(&path) {
+                self.deps.insert(path_ref);
+            } else {
+                self.errors.push(StaticError {
+                    span: self.span(func.span),
+                    kind: StaticErrorKind::InvalidMod,
+                });
+            }
         }
     }
 
@@ -301,14 +343,15 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
     for layer in data.layers.layers.iter() {
         layers.insert(layer.name.clone());
     }
-    for (_, cell) in data.cells.iter() {
+    for (cell_id, cell) in data.cells.iter() {
         for (_, obj) in cell.objects.iter() {
             if let SolvedValue::Rect(r) = obj
                 && let Some(layer) = &r.layer
                 && !layers.contains(layer)
             {
                 errs.push(ExecError {
-                    span: r.span,
+                    span: r.span.clone(),
+                    cell: *cell_id,
                     kind: ExecErrorKind::IllegalLayer(layer.clone()),
                 })
             }
@@ -341,17 +384,18 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
     let mut next_id = 1;
     let std_mod_path = vec!["std".to_string()];
     let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
-    let (root, _) = ast.get_key_value(&vec![]).expect("module doesn't exist");
-    for path in [std_mod_path, Some(root)].iter().flatten() {
-        execute_var_id_ty_pass_inner(
-            ast,
-            dag,
-            path,
-            &mut mod_bindings,
-            &mut workspace_ast,
-            &mut errors,
-            &mut next_id,
-        );
+    if let Some((root, _)) = ast.get_key_value(&vec![]) {
+        for path in [std_mod_path, Some(root)].iter().flatten() {
+            execute_var_id_ty_pass_inner(
+                ast,
+                dag,
+                path,
+                &mut mod_bindings,
+                &mut workspace_ast,
+                &mut errors,
+                &mut next_id,
+            );
+        }
     }
     (workspace_ast, errors)
 }
@@ -461,10 +505,10 @@ impl AstMetadata for VarIdTyMetadata {
     type EnumDecl = ();
     type StructDecl = ();
     type StructField = ();
-    type CellDecl = VarId;
+    type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
-    type FnDecl = VarId;
+    type FnDecl = (PathBuf, VarId);
     type IfExpr = Ty;
     type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
@@ -483,6 +527,13 @@ impl AstMetadata for VarIdTyMetadata {
 }
 
 impl<'a> VarIdTyPass<'a> {
+    fn span(&self, span: cfgrammar::Span) -> Span {
+        Span {
+            path: self.ast.path.clone(),
+            span,
+        }
+    }
+
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
         for frame in self.bindings.iter().rev() {
             if let Some(info) = frame.var_bindings.get(name) {
@@ -531,6 +582,7 @@ impl<'a> VarIdTyPass<'a> {
                 decls,
                 span: self.ast.ast.span,
             },
+            self.ast.path.clone(),
         )
     }
 
@@ -538,7 +590,7 @@ impl<'a> VarIdTyPass<'a> {
         if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
         {
             self.errors.push(StaticError {
-                span: input.name.span,
+                span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
             return;
@@ -562,7 +614,7 @@ impl<'a> VarIdTyPass<'a> {
     fn ty_from_ident<M: AstMetadata>(&mut self, ident: &Ident<Substr, M>) -> Ty {
         Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
             self.errors.push(StaticError {
-                span: ident.span,
+                span: self.span(ident.span),
                 kind: StaticErrorKind::UnknownType,
             });
             Ty::Unknown
@@ -571,7 +623,7 @@ impl<'a> VarIdTyPass<'a> {
 
     fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<Substr, M>, ty: Ty) -> Ty {
         self.errors.push(StaticError {
-            span: field.span,
+            span: self.span(field.span),
             kind: StaticErrorKind::NoFieldOnTy {
                 field: field.name.to_string(),
                 ty,
@@ -583,7 +635,7 @@ impl<'a> VarIdTyPass<'a> {
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
         if *found != *expected {
             self.errors.push(StaticError {
-                span,
+                span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
                     found: found.clone(),
                     expected: expected.clone(),
@@ -595,7 +647,7 @@ impl<'a> VarIdTyPass<'a> {
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
         if !matches!(ty, Ty::Cell(_)) {
             self.errors.push(StaticError {
-                span,
+                span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
                     found: ty.clone(),
                     expected: "Cell".into(),
@@ -607,7 +659,7 @@ impl<'a> VarIdTyPass<'a> {
     fn assert_eq_arity(&mut self, span: cfgrammar::Span, found: usize, expected: usize) {
         if found != expected {
             self.errors.push(StaticError {
-                span,
+                span: self.span(span),
                 kind: StaticErrorKind::CallIncorrectPositionalArity { expected, found },
             });
         }
@@ -623,14 +675,14 @@ impl<'a> VarIdTyPass<'a> {
             let mut cont = false;
             if !kwarg_defs.contains_key(&kwarg.name.name.as_str()) {
                 self.errors.push(StaticError {
-                    span: kwarg.name.span,
+                    span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::InvalidKwArg,
                 });
                 cont = true;
             }
             if defined.contains(&&kwarg.name.name) {
                 self.errors.push(StaticError {
-                    span: kwarg.name.span,
+                    span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::DuplicateKwArg,
                 });
                 cont = true;
@@ -667,6 +719,44 @@ impl<'a> VarIdTyPass<'a> {
     ) {
         self.typecheck_posargs(call_span, &args.posargs, arg_defs);
         self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+    }
+
+    fn typecheck_call(
+        &mut self,
+        lookup: Option<(VarId, Ty)>,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> (Option<VarId>, Ty) {
+        if let Some((varid, ty)) = lookup {
+            match ty {
+                Ty::Fn(ty) => {
+                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    (Some(varid), ty.ret.clone())
+                }
+                Ty::CellFn(ty) => {
+                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    (
+                        Some(varid),
+                        Ty::Cell(Box::new(CellTy {
+                            data: ty.data.clone(),
+                        })),
+                    )
+                }
+                ty => {
+                    self.errors.push(StaticError {
+                        span: self.span(call_span),
+                        kind: StaticErrorKind::CannotCall(ty),
+                    });
+                    (None, Ty::Unknown)
+                }
+            }
+        } else {
+            self.errors.push(StaticError {
+                span: self.span(call_span),
+                kind: StaticErrorKind::UndeclaredVar,
+            });
+            (None, Ty::Unknown)
+        }
     }
 }
 
@@ -729,8 +819,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
         // TODO: Argument checks
-        // UNUSED
-        self.lookup(&name.name).unwrap().0
+        (self.ast.path.clone(), self.lookup(&name.name).unwrap().0)
     }
 
     fn dispatch_fn_decl(
@@ -741,15 +830,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _return_ty: &Option<Ident<Substr, Self::OutputMetadata>>,
         _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
-        // UNUSED
-        self.lookup(&name.name).unwrap().0
+        (self.ast.path.clone(), self.lookup(&name.name).unwrap().0)
     }
 
     fn transform_fn_decl(
         &mut self,
         input: &FnDecl<Substr, Self::InputMetadata>,
     ) -> FnDecl<Substr, Self::OutputMetadata> {
-        let (varid, _) = self.lookup(&input.name.name).unwrap();
         let args: Vec<_> = input
             .args
             .iter()
@@ -761,13 +848,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .as_ref()
             .map(|ident| self.transform_ident(ident));
         let scope = self.transform_scope(&input.scope);
+        let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
             name,
             args,
             return_ty,
             scope,
             span: input.span,
-            metadata: varid,
+            metadata,
         }
     }
 
@@ -778,7 +866,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
         {
             self.errors.push(StaticError {
-                span: input.name.span,
+                span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
@@ -790,7 +878,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let scope = self.transform_scope(&input.scope);
         if let Some(tail) = scope.tail.as_ref() {
             self.errors.push(StaticError {
-                span: tail.span(),
+                span: self.span(tail.span()),
                 kind: StaticErrorKind::CellWithTailExpr,
             });
         }
@@ -803,7 +891,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     if let Statement::LetBinding(lt) = stmt {
                         if ["x", "y"].contains(&lt.name.name.as_str()) {
                             self.errors.push(StaticError {
-                                span: lt.name.span,
+                                span: self.span(lt.name.span),
                                 kind: StaticErrorKind::RedeclarationOfBuiltin,
                             });
                         }
@@ -814,14 +902,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 })
                 .collect(),
         }));
-        let vid = self.alloc(&input.name.name, ty);
+        self.alloc(&input.name.name, ty);
         let name = self.transform_ident(&input.name);
+        let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
             name,
             scope,
             args,
             span: input.span,
-            metadata: vid,
+            metadata,
         }
     }
 
@@ -842,10 +931,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         else_: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         if let Some(scope_annotation) = &input.scope_annotation {
+            let span = self.span(scope_annotation.span);
             let bindings = self.bindings.last_mut().unwrap();
             if bindings.scope_bindings.contains(&scope_annotation.name) {
                 self.errors.push(StaticError {
-                    span: scope_annotation.span,
+                    span,
                     kind: StaticErrorKind::DuplicateNameDeclaration,
                 });
             }
@@ -856,16 +946,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let cond_ty = cond.ty();
         let then_ty = then.metadata.clone();
         let else_ty = else_.metadata.clone();
-        assert_eq!(cond_ty, Ty::Bool);
         if cond_ty != Ty::Bool {
             self.errors.push(StaticError {
-                span: cond.span(),
+                span: self.span(cond.span()),
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
         if then_ty != else_ty {
             self.errors.push(StaticError {
-                span: input.span,
+                span: self.span(input.span),
                 kind: StaticErrorKind::BranchesDifferentTypes,
             });
         }
@@ -882,19 +971,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let right_ty = right.ty();
         if left_ty != right_ty {
             self.errors.push(StaticError {
-                span: input.span,
+                span: self.span(input.span),
                 kind: StaticErrorKind::BinOpMismatchedTypes,
             });
         }
         if ![Ty::Float, Ty::Int].contains(&left_ty) {
             self.errors.push(StaticError {
-                span: left.span(),
+                span: self.span(left.span()),
                 kind: StaticErrorKind::BinOpInvalidType,
             });
         }
         if ![Ty::Float, Ty::Int].contains(&right_ty) {
             self.errors.push(StaticError {
-                span: right.span(),
+                span: self.span(right.span()),
                 kind: StaticErrorKind::BinOpInvalidType,
             });
         }
@@ -910,7 +999,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             UnaryOp::Not => {
                 if operand.ty() != Ty::Bool {
                     self.errors.push(StaticError {
-                        span: operand.span(),
+                        span: self.span(operand.span()),
                         kind: StaticErrorKind::UnaryOpInvalidType,
                     });
                 }
@@ -920,7 +1009,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 let operand_ty = operand.ty();
                 if ![Ty::Float, Ty::Int].contains(&operand_ty) {
                     self.errors.push(StaticError {
-                        span: operand.span(),
+                        span: self.span(operand.span()),
                         kind: StaticErrorKind::UnaryOpInvalidType,
                     });
                 }
@@ -939,19 +1028,21 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let right_ty = right.ty();
         if left_ty != right_ty {
             self.errors.push(StaticError {
-                span: input.span,
+                span: self.span(input.span),
                 kind: StaticErrorKind::BinOpMismatchedTypes,
             });
         } else {
-            if left_ty == Ty::Float {
+            if left_ty == Ty::Float
+                && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
+            {
                 self.errors.push(StaticError {
-                    span: input.span,
+                    span: self.span(input.span),
                     kind: StaticErrorKind::FloatEquality,
                 });
             }
             if left_ty != Ty::Float && left_ty != Ty::Int {
                 self.errors.push(StaticError {
-                    span: input.span,
+                    span: self.span(input.span),
                     kind: StaticErrorKind::ComparisonInvalidType,
                 });
             }
@@ -1074,62 +1165,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         (None, Ty::Unknown)
                     }
                 }
-                name => {
-                    if let Some((varid, ty)) = self.lookup(name) {
-                        match ty {
-                            Ty::Fn(ty) => {
-                                if args.posargs.len() != ty.args.len() {
-                                    self.errors.push(StaticError {
-                                        span: args.span,
-                                        kind: StaticErrorKind::CallIncorrectPositionalArity {
-                                            expected: ty.args.len(),
-                                            found: args.posargs.len(),
-                                        },
-                                    });
-                                }
-                                for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                                    self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
-                                }
-                                assert!(args.kwargs.is_empty());
-                                (Some(varid), ty.ret.clone())
-                            }
-                            Ty::CellFn(ty) => {
-                                if args.posargs.len() != ty.args.len() {
-                                    self.errors.push(StaticError {
-                                        span: args.span,
-                                        kind: StaticErrorKind::CallIncorrectPositionalArity {
-                                            expected: ty.args.len(),
-                                            found: args.posargs.len(),
-                                        },
-                                    });
-                                }
-                                for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                                    self.assert_eq_ty(arg.span(), &arg.ty(), arg_ty);
-                                }
-                                assert!(args.kwargs.is_empty());
-                                (
-                                    Some(varid),
-                                    Ty::Cell(Box::new(CellTy {
-                                        data: ty.data.clone(),
-                                    })),
-                                )
-                            }
-                            ty => {
-                                self.errors.push(StaticError {
-                                    span: input.span,
-                                    kind: StaticErrorKind::CannotCall(ty),
-                                });
-                                (None, Ty::Unknown)
-                            }
-                        }
-                    } else {
-                        self.errors.push(StaticError {
-                            span: input.span,
-                            kind: StaticErrorKind::UndeclaredVar,
-                        });
-                        (None, Ty::Unknown)
-                    }
-                }
+                name => self.typecheck_call(self.lookup(name), input.span, args),
             }
         } else {
             let path = match func.path[0].name.as_str() {
@@ -1156,34 +1192,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .collect_vec(),
             };
             let name = &func.path.last().unwrap().name;
-            let (varid, ty) = self.mod_bindings[&path]
-                .var_bindings
-                .get(name)
-                .unwrap_or_else(|| panic!("no function or cell named `{name}`"));
-            match ty {
-                Ty::Fn(ty) => {
-                    assert_eq!(args.posargs.len(), ty.args.len());
-                    for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                        assert_eq!(&arg.ty(), arg_ty);
-                    }
-                    assert!(args.kwargs.is_empty());
-                    (Some(*varid), ty.ret.clone())
-                }
-                Ty::CellFn(ty) => {
-                    assert_eq!(args.posargs.len(), ty.args.len());
-                    for (arg, arg_ty) in args.posargs.iter().zip(&ty.args) {
-                        assert_eq!(&arg.ty(), arg_ty);
-                    }
-                    assert!(args.kwargs.is_empty());
-                    (
-                        Some(*varid),
-                        Ty::Cell(Box::new(CellTy {
-                            data: ty.data.clone(),
-                        })),
-                    )
-                }
-                ty => panic!("cannot invoke an object of type {ty:?}"),
-            }
+            let lookup = self
+                .mod_bindings
+                .get(&path)
+                .as_ref()
+                .and_then(|mod_binding| mod_binding.var_bindings.get(name).cloned());
+            self.typecheck_call(lookup, input.span, args)
         }
     }
 
@@ -1218,7 +1232,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             (_, Ty::Unknown) => (),
             _ => {
                 self.errors.push(StaticError {
-                    span: input.span,
+                    span: self.span(input.span),
                     kind: StaticErrorKind::InvalidCast,
                 });
             }
@@ -1256,10 +1270,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn enter_scope(&mut self, input: &crate::ast::Scope<Substr, Self::InputMetadata>) {
         if let Some(scope_annotation) = &input.scope_annotation {
+            let span = self.span(scope_annotation.span);
             let bindings = self.bindings.last_mut().unwrap();
             if bindings.scope_bindings.contains(&scope_annotation.name) {
                 self.errors.push(StaticError {
-                    span: scope_annotation.span,
+                    span,
                     kind: StaticErrorKind::DuplicateNameDeclaration,
                 });
             }
@@ -1311,7 +1326,7 @@ pub type ConstraintVarId = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledEmit {
-    pub span: cfgrammar::Span,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1331,7 +1346,7 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
-    pub span: Option<cfgrammar::Span>,
+    pub span: Option<Span>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1344,7 +1359,7 @@ pub struct Dimension<T> {
     pub pstop: T,
     pub nstop: T,
     pub horiz: bool,
-    pub span: Option<cfgrammar::Span>,
+    pub span: Option<Span>,
 }
 
 type FrameId = u64;
@@ -1379,7 +1394,7 @@ struct Frame {
 struct Emit {
     value: ValueId,
     scope: ScopeId,
-    span: cfgrammar::Span,
+    span: Span,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1387,7 +1402,7 @@ struct ExecScope {
     parent: Option<ScopeId>,
     static_parent: Option<(ScopeId, SeqNum)>,
     name: String,
-    span: cfgrammar::Span,
+    span: Span,
     bindings: IndexMap<SeqNum, (String, ValueId)>,
 }
 
@@ -1421,6 +1436,7 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
+    errors: Vec<ExecError>,
 }
 
 enum ExecScopeName {
@@ -1428,6 +1444,30 @@ enum ExecScopeName {
     Specified(String),
     // Exact name has not been specified, need to generate unique identifier based on prefix.
     Prefix(String),
+}
+
+fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
+    if cell.scopes.contains_key(&id) {
+        return;
+    }
+    if let Some(p) = scope.parent {
+        add_scope(cell, state, p, &state.scopes[&p]);
+        cell.scopes.get_mut(&p).unwrap().children.insert(id);
+    }
+    if let Some((p, _)) = scope.static_parent {
+        add_scope(cell, state, p, &state.scopes[&p]);
+    }
+    cell.scopes.insert(
+        id,
+        CompiledScope {
+            static_parent: scope.static_parent,
+            bindings: Default::default(),
+            children: Default::default(),
+            name: scope.name.clone(),
+            span: scope.span.clone(),
+            emit: Vec::new(),
+        },
+    );
 }
 
 impl<'a> ExecPass<'a> {
@@ -1454,6 +1494,17 @@ impl<'a> ExecPass<'a> {
             next_id: 4,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    fn span(&self, loc: &DynLoc, span: cfgrammar::Span) -> Span {
+        Span {
+            path: self.cell_state(loc.cell).scopes[&loc.scope]
+                .span
+                .path
+                .clone(),
+            span,
         }
     }
 
@@ -1489,7 +1540,7 @@ impl<'a> ExecPass<'a> {
                 .map(|ident| ident.to_string())
                 .collect_vec(),
         };
-        let vid = self.ast[&path]
+        let (_, vid) = self.ast[&path]
             .ast
             .decls
             .iter()
@@ -1499,7 +1550,7 @@ impl<'a> ExecPass<'a> {
                         name: Ident { name, .. },
                         ..
                     },
-                ) if name == input.cell.last().unwrap() => Some(v.metadata),
+                ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
                 _ => None,
             })
             .expect("cell not found");
@@ -1508,11 +1559,22 @@ impl<'a> ExecPass<'a> {
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
                 .into();
-        CompileOutput::Valid(CompiledData {
-            cells: self.compiled_cells,
-            top: cell_id,
-            layers,
-        })
+        if self.errors.is_empty() {
+            CompileOutput::Valid(CompiledData {
+                cells: self.compiled_cells,
+                top: cell_id,
+                layers,
+            })
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: Some(CompiledData {
+                    cells: self.compiled_cells,
+                    top: cell_id,
+                    layers,
+                }),
+            })
+        }
     }
 
     pub(crate) fn execute_cell(&mut self, cell: VarId, args: Vec<CellArg>) -> CellId {
@@ -1542,7 +1604,10 @@ impl<'a> ExecPass<'a> {
         let root_scope = ExecScope {
             parent: None,
             static_parent: None,
-            span: cell_decl.scope.span,
+            span: Span {
+                path: cell_decl.metadata.0.clone(),
+                span: cell_decl.scope.span,
+            },
             name: format!("cell {}", &cell_decl.name.name),
             bindings: Default::default(),
         };
@@ -1622,8 +1687,14 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 if state.nullspace_vecs.is_none() {
                     state.nullspace_vecs = Some(state.solver.nullspace_vecs());
+                    self.errors.push(ExecError {
+                        span: None,
+                        cell: cell_id,
+                        kind: ExecErrorKind::Underconstrained,
+                    });
                 }
                 let mut constraint_added = false;
+                let state = self.cell_state_mut(cell_id);
                 while let Some(expr) = state.fallback_constraints.pop() {
                     if expr
                         .coeffs
@@ -1650,10 +1721,17 @@ impl<'a> ExecPass<'a> {
                 require_progress = true;
             }
         }
+        let state = self.cell_state_mut(cell_id);
         if progress {
-            let state = self.cell_state_mut(cell_id);
             state.solve_iters += 1;
             state.solver.solve();
+        }
+        if state.solver.is_inconsistent() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::InconsistentConstraints,
+            });
         }
         self.partial_cells
             .pop_back()
@@ -1675,7 +1753,7 @@ impl<'a> ExecPass<'a> {
                     y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
                     x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
                     y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
-                    span: rect.span,
+                    span: rect.span.clone(),
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
@@ -1686,7 +1764,7 @@ impl<'a> ExecPass<'a> {
                     pstop: (state.solver.value_of(dim.pstop).unwrap(), dim.pstop),
                     nstop: (state.solver.value_of(dim.nstop).unwrap(), dim.nstop),
                     horiz: dim.horiz,
-                    span: dim.span,
+                    span: dim.span.clone(),
                 }),
                 Object::Inst(inst) => SolvedValue::Instance(SolvedInstance {
                     id: inst.id,
@@ -1720,29 +1798,6 @@ impl<'a> ExecPass<'a> {
             nullspace_vecs: state.nullspace_vecs.clone().unwrap_or_default(),
             objects: IndexMap::new(),
         };
-        fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
-            if cell.scopes.contains_key(&id) {
-                return;
-            }
-            if let Some(p) = scope.parent {
-                add_scope(cell, state, p, &state.scopes[&p]);
-                cell.scopes.get_mut(&p).unwrap().children.insert(id);
-            }
-            if let Some((p, _)) = scope.static_parent {
-                add_scope(cell, state, p, &state.scopes[&p]);
-            }
-            cell.scopes.insert(
-                id,
-                CompiledScope {
-                    static_parent: scope.static_parent,
-                    bindings: Default::default(),
-                    children: Default::default(),
-                    name: scope.name.clone(),
-                    span: scope.span,
-                    emit: Vec::new(),
-                },
-            );
-        }
         for (id, scope) in state.scopes.iter() {
             add_scope(&mut ccell, state, *id, scope);
         }
@@ -1753,12 +1808,12 @@ impl<'a> ExecPass<'a> {
 
         for emit in state.emit.iter() {
             let obj_id = emit_value(emit.value).unwrap();
-            ccell
-                .scopes
-                .get_mut(&emit.scope)
-                .unwrap()
-                .emit
-                .push((obj_id, CompiledEmit { span: emit.span }));
+            ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
+                obj_id,
+                CompiledEmit {
+                    span: emit.span.clone(),
+                },
+            ));
         }
 
         for (id, scope) in state.scopes.iter() {
@@ -1831,7 +1886,7 @@ impl<'a> ExecPass<'a> {
                                 .get_mut(&self.global_frame)
                                 .unwrap()
                                 .bindings
-                                .insert(f.metadata, vid)
+                                .insert(f.metadata.1, vid)
                                 .is_none()
                         );
                     }
@@ -1847,7 +1902,7 @@ impl<'a> ExecPass<'a> {
                                 .get_mut(&self.global_frame)
                                 .unwrap()
                                 .bindings
-                                .insert(c.metadata, vid)
+                                .insert(c.metadata.1, vid)
                                 .is_none()
                         );
                     }
@@ -1888,7 +1943,7 @@ impl<'a> ExecPass<'a> {
         parent: ScopeId,
         static_parent: Option<(ScopeId, SeqNum)>,
         name: ExecScopeName,
-        span: cfgrammar::Span,
+        span: Span,
     ) -> ScopeId {
         let id = self.scope_id();
         let name = match name {
@@ -1916,7 +1971,7 @@ impl<'a> ExecPass<'a> {
         &mut self,
         loc: DynLoc,
         name: ExecScopeName,
-        span: cfgrammar::Span,
+        span: Span,
     ) -> ScopeId {
         self.create_exec_scope(
             loc.cell,
@@ -1992,10 +2047,11 @@ impl<'a> ExecPass<'a> {
             }
             Expr::Emit(e) => {
                 let value = self.visit_expr(loc, &e.value);
+                let span = self.span(&loc, e.span);
                 self.cell_state_mut(loc.cell).emit.push(Emit {
                     scope: loc.scope,
                     value,
-                    span: e.span,
+                    span,
                 });
                 return value;
             }
@@ -2053,7 +2109,10 @@ impl<'a> ExecPass<'a> {
                                 loc.scope,
                                 None,
                                 ExecScopeName::Specified(format!("fn {}", val.name.name)),
-                                val.scope.span,
+                                Span {
+                                    path: val.metadata.0.clone(),
+                                    span: val.scope.span,
+                                },
                             );
                             let fid = self.frame_id();
                             self.frames.insert(fid, call_frame);
@@ -2098,7 +2157,7 @@ impl<'a> ExecPass<'a> {
                     } else {
                         ExecScopeName::Prefix("scope".to_string())
                     },
-                    s.span,
+                    self.span(&loc, s.span),
                 );
                 return self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s);
             }
@@ -2175,6 +2234,7 @@ impl<'a> ExecPass<'a> {
                     };
                     if let Some(layer) = layer {
                         let id = self.object_id();
+                        let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let rect = Rect {
                             id,
@@ -2183,7 +2243,7 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var(),
                             x1: state.solver.new_var(),
                             y1: state.solver.new_var(),
-                            span: Some(c.expr.span),
+                            span: Some(span),
                         };
                         self.values
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
@@ -2283,6 +2343,7 @@ impl<'a> ExecPass<'a> {
                     if let Some(args) = args {
                         assert_eq!(args.len(), 7);
                         let id = object_id(&mut self.next_id);
+                        let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let dim = Dimension {
                             id,
@@ -2293,7 +2354,7 @@ impl<'a> ExecPass<'a> {
                             pstop: state.solver.new_var(),
                             nstop: state.solver.new_var(),
                             horiz: *args[6].as_ref().unwrap_bool(),
-                            span: Some(c.expr.span),
+                            span: Some(span),
                         };
                         state.objects.insert(dim.id, dim.clone().into());
                         for (var, rhs) in [dim.p, dim.n, dim.value, dim.coord, dim.pstop, dim.nstop]
@@ -2345,13 +2406,21 @@ impl<'a> ExecPass<'a> {
                         .zip(c.state.kwargs.iter())
                         .find_map(|(kwarg, vid)| {
                             if kwarg.name.name == "angle" {
+                                let span = self.span(&vref.loc, kwarg.value.span());
                                 Some(self.values[vid].as_ref().get_ready().map(|refl| {
                                     match ((*refl.as_ref().unwrap_int() % 360) + 360) % 360 {
                                         0 => Rotation::R0,
                                         90 => Rotation::R90,
                                         180 => Rotation::R180,
                                         270 => Rotation::R270,
-                                        x => panic!("angle {x} must be a multiple of 90 degrees between 0 and 360 degrees"),
+                                        _ => {
+                                            self.errors.push(ExecError {
+                                                span: Some(span),
+                                                cell: vref.loc.cell,
+                                                kind: ExecErrorKind::InvalidRotation,
+                                            });
+                                            Rotation::R0
+                                        }
                                     }
                                 }))
                             } else {
@@ -2528,7 +2597,7 @@ impl<'a> ExecPass<'a> {
                                 } else {
                                     ExecScopeName::Prefix("if".to_string())
                                 },
-                                if_.expr.then.span,
+                                self.span(&vref.loc, if_.expr.then.span),
                             );
                             let then = self.visit_scope_expr_inner(
                                 vref.loc.cell,
@@ -2548,7 +2617,7 @@ impl<'a> ExecPass<'a> {
                                 } else {
                                     ExecScopeName::Prefix("else".to_string())
                                 },
-                                if_.expr.else_.span,
+                                self.span(&vref.loc, if_.expr.else_.span),
                             );
                             let else_ = self.visit_scope_expr_inner(
                                 vref.loc.cell,
@@ -2672,7 +2741,7 @@ impl<'a> ExecPass<'a> {
                                                     y0: state.solver.new_var(),
                                                     x1: state.solver.new_var(),
                                                     y1: state.solver.new_var(),
-                                                    span: rect.span,
+                                                    span: rect.span.clone(),
                                                 };
                                                 state
                                                     .objects
@@ -2933,7 +3002,7 @@ pub struct CompiledScope {
     /// Dynamic children.
     pub children: IndexSet<ScopeId>,
     pub name: String,
-    pub span: cfgrammar::Span,
+    pub span: Span,
     /// Objects emitted in this scope.
     pub emit: Vec<(ObjectId, CompiledEmit)>,
 }
@@ -2962,77 +3031,114 @@ impl CompiledCell {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticError {
-    pub span: cfgrammar::Span,
+    pub span: Span,
     pub kind: StaticErrorKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum StaticErrorKind {
     /// Multiple declarations with the same name.
     ///
     /// For example, two cells named `my_cell`.
+    #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
     /// Attempted to declare an object with the same name as a built-in object.
     ///
     /// For example, users cannot declare cells or functions named `rect`.
+    #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
     /// A cell had an expression in tail position, which is not permitted.
+    #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
     /// If conditions must have type bool.
+    #[error("if conditions must have type bool")]
     IfCondNotBool,
     /// Branches in expresssions must evaluate to the same type.
+    #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
     /// The operands in a binary expression must have the same type.
+    #[error("operands of binary expression must have the same type")]
     BinOpMismatchedTypes,
     /// Cannot compare equality or inequality of floating point numbers.
+    #[error("cannot compare equality or inequality of floating point numbers")]
     FloatEquality,
     /// A type cannot be used in a binary expression.
+    #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,
     /// A type cannot be used in a unary operation.
+    #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,
     /// A type cannot be used in a comparison expression.
+    #[error("type cannot be used in comparison expression")]
     ComparisonInvalidType,
     /// An unknown type, i.e. a type that has not been declared.
+    #[error("unknown type")]
     UnknownType,
     /// No field on object of the given type.
+    #[error("no field {field} on type {ty:?}")]
     NoFieldOnTy { field: String, ty: Ty },
     /// Incorrect type.
+    #[error("expected type {expected:?}, found {found:?}")]
     IncorrectTy { expected: Ty, found: Ty },
     /// Incorrect type category.
+    #[error("expected type category {expected}, found {found:?}")]
     IncorrectTyCategory { found: Ty, expected: String },
     /// Called a function or cell with the wrong number of positional arguments.
+    #[error("expected {expected} position arguments, found {found}")]
     CallIncorrectPositionalArity { expected: usize, found: usize },
     /// Invalid keyword argument.
+    #[error("invalid keyword argument")]
     InvalidKwArg,
     /// Duplicate keyword argument.
+    #[error("duplicate keyword argument")]
     DuplicateKwArg,
     /// Identifier used without being declared.
+    #[error("identifier used without being declared")]
     UndeclaredVar,
     /// Attempted to use an object of the given type as the function of a call expression.
+    #[error("cannot call type {0:?}")]
     CannotCall(Ty),
     /// Cannot perform the requested type cast.
+    #[error("invalid type cast")]
     InvalidCast,
+    /// Module doesn't exist.
+    #[error("module doesn't exist")]
+    InvalidMod,
+    /// Error during lexing.
+    #[error("error during lexing")]
+    LexError,
+    /// Error during parsing.
+    #[error("error during parsing")]
+    ParseError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecError {
-    pub span: Option<cfgrammar::Span>,
+    pub span: Option<Span>,
+    pub cell: CellId,
     pub kind: ExecErrorKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum ExecErrorKind {
     /// A non-Manhattan rotation.
+    #[error("non-Manhattan rotation")]
     InvalidRotation,
     /// A cell is underconstrained.
+    #[error("cell is underconstrained")]
     Underconstrained,
     /// Illegal layer (not defined in layer properties).
+    #[error("layer {0} is not defined in layer properties")]
     IllegalLayer(String),
+    /// Conflicting constraints.
+    #[error("inconsistent constraints")]
+    InconsistentConstraints,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[enumify]
 pub enum CompileOutput {
+    FatalParseErrors,
     StaticErrors(StaticErrorCompileOutput),
     ExecErrors(ExecErrorCompileOutput),
     Valid(CompiledData),
@@ -3194,7 +3300,7 @@ impl Rect<(f64, Var)> {
             y0: self.y0.0,
             x1: self.x1.0,
             y1: self.y1.0,
-            span: self.span,
+            span: self.span.clone(),
         }
     }
 }
@@ -3211,7 +3317,7 @@ impl Rect<f64> {
             y0: p0p.1.min(p1p.1),
             x1: p0p.0.max(p1p.0),
             y1: p0p.1.max(p1p.1),
-            span: self.span,
+            span: None,
         }
     }
 }
