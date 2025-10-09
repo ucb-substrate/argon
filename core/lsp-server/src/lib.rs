@@ -5,7 +5,7 @@ pub mod rpc;
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -409,7 +409,7 @@ pub async fn main() {
             }
         }
     };
-    let server_addr = (IpAddr::V6(Ipv6Addr::LOCALHOST), port).into();
+    let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port).into();
 
     // Construct actual LSP server.
     let stdin = tokio::io::stdin();
