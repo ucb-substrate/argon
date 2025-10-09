@@ -224,7 +224,6 @@ impl TextInput {
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let (_yield_, reset) = self.dim_tool.update(cx, |dim_tool, cx| {
             if let Some(dim_tool) = dim_tool {
-                // TODO: only update state after entering dimension.
                 if dim_tool.edges.is_empty() {
                     return (true, false);
                 }

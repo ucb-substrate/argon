@@ -13,9 +13,12 @@ use std::{
 };
 
 use compiler::{
-    ast::Expr,
-    compile::{self, CellArg, CompileInput, CompileOutput},
-    parse::{self, ParseOutput},
+    ast::{Expr, Span},
+    compile::{
+        self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput, StaticError,
+        StaticErrorCompileOutput,
+    },
+    parse::{self, ParseOutput, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
@@ -44,65 +47,55 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct StateMut {
     root_dir: Option<PathBuf>,
+    ast: WorkspaceParseAst,
+    prev_diagnostics: IndexMap<Url, Vec<Diagnostic>>,
+    compile_output: Option<CompileOutput>,
     cell: Option<String>,
     gui_client: Option<LspToGuiClient>,
     editor_files: IndexMap<Url, Document>,
 }
 
 impl StateMut {
-    fn parse_diagnostics(&self, parse_output: &ParseOutput) -> IndexMap<Url, Vec<Diagnostic>> {
-        parse_output
-            .errs
-            .iter()
-            .map(|(path, (lex_errs, mod_errs))| {
-                let url = Url::from_file_path(path).unwrap();
-                let diagnostics = self
-                    .editor_files
-                    .get(&url)
-                    .iter()
-                    .flat_map(|doc| {
-                        lex_errs
-                            .iter()
-                            .map(|err| match err {
-                                LexParseError::LexError(e) => Diagnostic {
-                                    range: Range {
-                                        start: doc.offset_to_pos(e.span().start()),
-                                        end: doc.offset_to_pos(e.span().end()),
-                                    },
-                                    severity: Some(DiagnosticSeverity::ERROR),
-                                    message: format!("{}", e),
-                                    ..Default::default()
-                                },
-                                LexParseError::ParseError(e) => Diagnostic {
-                                    range: Range {
-                                        start: doc.offset_to_pos(e.lexeme().span().start()),
-                                        end: doc.offset_to_pos(e.lexeme().span().end()),
-                                    },
-                                    severity: Some(DiagnosticSeverity::ERROR),
-                                    message: format!("{}", e),
-                                    ..Default::default()
-                                },
-                            })
-                            .chain(mod_errs.iter().filter_map(|(span, mod_path)| {
-                                if let Err(e) = parse_output.asts.get(mod_path)? {
-                                    Some(Diagnostic {
-                                        range: Range {
-                                            start: doc.offset_to_pos(span.start()),
-                                            end: doc.offset_to_pos(span.end()),
-                                        },
-                                        severity: Some(DiagnosticSeverity::ERROR),
-                                        message: format!("{e}"),
-                                        ..Default::default()
-                                    })
-                                } else {
-                                    None
-                                }
-                            }))
-                    })
-                    .collect();
-                (url, diagnostics)
-            })
-            .collect()
+    fn output_to_diagnostics(&self, o: &CompileOutput) -> IndexMap<Url, Vec<Diagnostic>> {
+        let mut diagnostics = IndexMap::new();
+        let errs = match o {
+            CompileOutput::FatalParseErrors => {
+                vec![(
+                    Span {
+                        path: self.root_dir.as_ref().unwrap().join("lib.ar"),
+                        span: cfgrammar::Span::new(0, 0),
+                    },
+                    "fatal parse errors encountered, unable to compile".to_string(),
+                )]
+            }
+            CompileOutput::StaticErrors(StaticErrorCompileOutput { errors }) => errors
+                .iter()
+                .map(|e| (e.span.clone(), format!("{}", e.kind)))
+                .collect(),
+            CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, .. }) => errors
+                .iter()
+                .filter_map(|e| Some((e.span.as_ref()?.clone(), format!("{}", e.kind))))
+                .collect(),
+            CompileOutput::Valid(_) => vec![],
+        };
+        for (span, message) in errs {
+            let url = Url::from_file_path(&span.path).unwrap();
+            if let Some(doc) = self.editor_files.get(&url) {
+                diagnostics
+                    .entry(url)
+                    .or_insert_with(Vec::new)
+                    .push(Diagnostic {
+                        range: Range {
+                            start: doc.offset_to_pos(span.span.start()),
+                            end: doc.offset_to_pos(span.span.end()),
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message,
+                        ..Default::default()
+                    });
+            }
+        }
+        diagnostics
     }
 
     fn compile_cell(
@@ -120,35 +113,49 @@ impl StateMut {
         );
         let cell_ast = parse::parse_cell(cell).unwrap();
         let parse_output = parse::parse_workspace(self.root_dir.as_ref().unwrap().join("lib.ar"));
-        let diagnostics = self.parse_diagnostics(&parse_output);
+        let parse_errs = parse_output.static_errors();
         let ast = parse_output.best_effort_ast();
-        (
-            compile::compile(
-                &ast,
-                CompileInput {
-                    cell: &cell_ast
-                        .func
-                        .path
-                        .iter()
-                        .map(|ident| ident.name)
-                        .collect_vec(),
-                    args: cell_ast
-                        .args
-                        .posargs
-                        .iter()
-                        .map(|arg| match arg {
-                            Expr::FloatLiteral(float_literal) => {
-                                CellArg::Float(float_literal.value)
-                            }
-                            Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
-                            _ => panic!("must be int or float literal for now"),
-                        })
-                        .collect(),
-                    lyp_file: &PathBuf::from(lyp),
-                },
-            ),
-            diagnostics,
-        )
+        let mut o = compile::compile(
+            &ast,
+            CompileInput {
+                cell: &cell_ast
+                    .func
+                    .path
+                    .iter()
+                    .map(|ident| ident.name)
+                    .collect_vec(),
+                args: cell_ast
+                    .args
+                    .posargs
+                    .iter()
+                    .map(|arg| match arg {
+                        Expr::FloatLiteral(float_literal) => CellArg::Float(float_literal.value),
+                        Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
+                        _ => panic!("must be int or float literal for now"),
+                    })
+                    .collect(),
+                lyp_file: &PathBuf::from(lyp),
+            },
+        );
+        self.ast = ast;
+        match &mut o {
+            CompileOutput::StaticErrors(e) => e.errors.extend(parse_errs),
+            o => {
+                if !parse_errs.is_empty() {
+                    *o = CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                        errors: parse_errs,
+                    });
+                }
+            }
+        }
+        let mut tmp = self.output_to_diagnostics(&o);
+        let mut diagnostics = tmp.clone();
+        std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
+        for (path, _) in tmp {
+            diagnostics.entry(path).or_insert_with(Vec::new);
+        }
+        self.compile_output = Some(o.clone());
+        (o, diagnostics)
     }
 }
 
@@ -178,7 +185,7 @@ struct Backend {
 struct ForceSave;
 
 impl Request for ForceSave {
-    type Params = ();
+    type Params = PathBuf;
     type Result = ();
 
     const METHOD: &'static str = "custom/forceSave";
@@ -359,11 +366,7 @@ impl Backend {
         tokio::spawn(async move {
             let (o, diagnostics) = self_clone.compile_cell(params.cell).await;
             for (uri, diags) in diagnostics {
-                state
-                    .editor_client
-                    .show_message(MessageType::INFO, format!("{:?} {:?}", uri, diags))
-                    .await;
-                // TODO: potentially add version number;
+                // TODO: potentially add version number
                 state
                     .editor_client
                     .publish_diagnostics(uri, diags, None)

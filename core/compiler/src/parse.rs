@@ -7,10 +7,11 @@ use anyhow::{Context, bail};
 use arcstr::ArcStr;
 use indexmap::IndexMap;
 use lrlex::{DefaultLexerTypes, lrlex_mod};
-use lrpar::{LexParseError, NonStreamingLexer, Span, lrpar_mod};
+use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, lrpar_mod};
 
-use crate::ast::{
-    Ast, AstMetadata, CallExpr, Decl, ModPath, WorkspaceAst, annotated::AnnotatedAst,
+use crate::{
+    ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
+    compile::{StaticError, StaticErrorKind},
 };
 
 lrlex_mod!("argon.l");
@@ -78,7 +79,7 @@ pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, an
 
 type ParseResult = Result<AnnotatedParseAst, anyhow::Error>;
 type LexParseErrors = Vec<LexParseError<u32, DefaultLexerTypes>>;
-type ModSpans = Vec<(Span, ModPath)>;
+type ModSpans = Vec<(cfgrammar::Span, ModPath)>;
 
 pub struct ParseOutput {
     pub asts: IndexMap<ModPath, ParseResult>,
@@ -96,6 +97,44 @@ impl ParseOutput {
         self.asts
             .into_iter()
             .filter_map(|(k, v)| Some((k, v.ok()?)))
+            .collect()
+    }
+    pub fn static_errors(&self) -> Vec<StaticError> {
+        self.errs
+            .iter()
+            .flat_map(|(path, (lex_errs, mod_errs))| {
+                lex_errs
+                    .iter()
+                    .map(|err| match err {
+                        LexParseError::LexError(e) => StaticError {
+                            span: Span {
+                                path: path.clone(),
+                                span: e.span(),
+                            },
+                            kind: StaticErrorKind::LexError,
+                        },
+                        LexParseError::ParseError(e) => StaticError {
+                            span: Span {
+                                path: path.clone(),
+                                span: e.lexeme().span(),
+                            },
+                            kind: StaticErrorKind::ParseError,
+                        },
+                    })
+                    .chain(mod_errs.iter().filter_map(|(span, mod_path)| {
+                        if self.asts.get(mod_path)?.is_err() {
+                            Some(StaticError {
+                                span: Span {
+                                    path: path.clone(),
+                                    span: *span,
+                                },
+                                kind: StaticErrorKind::InvalidMod,
+                            })
+                        } else {
+                            None
+                        }
+                    }))
+            })
             .collect()
     }
 }

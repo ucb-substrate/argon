@@ -12,6 +12,7 @@ use geometry::transform::{Rotation, TransformationMatrix};
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
@@ -29,22 +30,23 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+pub fn static_compile(
+    ast: &WorkspaceParseAst,
+) -> Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)> {
     if !ast.contains_key(&vec![]) {
-        return CompileOutput::FatalParseErrors;
+        return None;
     }
-    let dag = construct_dag(ast);
-    let (ast, errors) = execute_var_id_ty_pass(ast, &dag);
-    if !errors.is_empty() {
-        return CompileOutput::StaticErrors(StaticErrorCompileOutput { errors });
-    };
-    let input = CompileInput {
-        cell: input.cell,
-        args: input.args,
-        lyp_file: input.lyp_file,
-    };
+    let (dag, mut errors) = construct_dag(ast);
+    let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
+    errors.extend(new_errors);
+    Some((ast, StaticErrorCompileOutput { errors }))
+}
 
-    let res = ExecPass::new(&ast).execute(input);
+pub fn dynamic_compile(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+) -> CompileOutput {
+    let res = ExecPass::new(ast).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput {
             errors,
@@ -64,18 +66,41 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
     }
 }
 
+pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+    let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
+        static_output
+    } else {
+        return CompileOutput::FatalParseErrors;
+    };
+    if !static_output.errors.is_empty() {
+        return CompileOutput::StaticErrors(static_output);
+    };
+
+    dynamic_compile(&ast, input)
+}
+
 type ModDag<'a> = IndexMap<&'a ModPath, IndexSet<&'a ModPath>>;
 
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
     deps: IndexSet<&'a ModPath>,
+    errors: Vec<StaticError>,
 }
 
-pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> ModDag<'_> {
-    ast.keys()
-        .map(|path| (path, ImportPass::new(ast, path).execute()))
-        .collect()
+pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> (ModDag<'_>, Vec<StaticError>) {
+    let mut errors = Vec::new();
+    (
+        ast.keys()
+            .map(|path| {
+                let (children, new_errors) = ImportPass::new(ast, path).execute();
+                errors.extend(new_errors);
+
+                (path, children)
+            })
+            .collect(),
+        errors,
+    )
 }
 
 impl<'a> ImportPass<'a> {
@@ -84,10 +109,18 @@ impl<'a> ImportPass<'a> {
             ast,
             current_path,
             deps: Default::default(),
+            errors: Default::default(),
         }
     }
 
-    pub(crate) fn execute(mut self) -> IndexSet<&'a ModPath> {
+    fn span(&self, span: cfgrammar::Span) -> Span {
+        Span {
+            path: self.ast[self.current_path].path.clone(),
+            span,
+        }
+    }
+
+    pub(crate) fn execute(mut self) -> (IndexSet<&'a ModPath>, Vec<StaticError>) {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -101,7 +134,7 @@ impl<'a> ImportPass<'a> {
             }
         }
 
-        self.deps
+        (self.deps, self.errors)
     }
 }
 
@@ -250,8 +283,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
                     )
                     .collect_vec()
             };
-            let (path_ref, _) = self.ast.get_key_value(&path).expect("module doesn't exist");
-            self.deps.insert(path_ref);
+            if let Some((path_ref, _)) = self.ast.get_key_value(&path) {
+                self.deps.insert(path_ref);
+            } else {
+                self.errors.push(StaticError {
+                    span: self.span(func.span),
+                    kind: StaticErrorKind::InvalidMod,
+                });
+            }
         }
     }
 
@@ -1153,7 +1192,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .collect_vec(),
             };
             let name = &func.path.last().unwrap().name;
-            let lookup = self.mod_bindings[&path].var_bindings.get(name).cloned();
+            let lookup = self
+                .mod_bindings
+                .get(&path)
+                .as_ref()
+                .and_then(|mod_binding| mod_binding.var_bindings.get(name).cloned());
             self.typecheck_call(lookup, input.span, args)
         }
     }
@@ -2992,54 +3035,81 @@ pub struct StaticError {
     pub kind: StaticErrorKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum StaticErrorKind {
     /// Multiple declarations with the same name.
     ///
     /// For example, two cells named `my_cell`.
+    #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
     /// Attempted to declare an object with the same name as a built-in object.
     ///
     /// For example, users cannot declare cells or functions named `rect`.
+    #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
     /// A cell had an expression in tail position, which is not permitted.
+    #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
     /// If conditions must have type bool.
+    #[error("if conditions must have type bool")]
     IfCondNotBool,
     /// Branches in expresssions must evaluate to the same type.
+    #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
     /// The operands in a binary expression must have the same type.
+    #[error("operands of binary expression must have the same type")]
     BinOpMismatchedTypes,
     /// Cannot compare equality or inequality of floating point numbers.
+    #[error("cannot compare equality or inequality of floating point numbers")]
     FloatEquality,
     /// A type cannot be used in a binary expression.
+    #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,
     /// A type cannot be used in a unary operation.
+    #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,
     /// A type cannot be used in a comparison expression.
+    #[error("type cannot be used in comparison expression")]
     ComparisonInvalidType,
     /// An unknown type, i.e. a type that has not been declared.
+    #[error("unknown type")]
     UnknownType,
     /// No field on object of the given type.
+    #[error("no field {field} on type {ty:?}")]
     NoFieldOnTy { field: String, ty: Ty },
     /// Incorrect type.
+    #[error("expected type {expected:?}, found {found:?}")]
     IncorrectTy { expected: Ty, found: Ty },
     /// Incorrect type category.
+    #[error("expected type category {expected}, found {found:?}")]
     IncorrectTyCategory { found: Ty, expected: String },
     /// Called a function or cell with the wrong number of positional arguments.
+    #[error("expected {expected} position arguments, found {found}")]
     CallIncorrectPositionalArity { expected: usize, found: usize },
     /// Invalid keyword argument.
+    #[error("invalid keyword argument")]
     InvalidKwArg,
     /// Duplicate keyword argument.
+    #[error("duplicate keyword argument")]
     DuplicateKwArg,
     /// Identifier used without being declared.
+    #[error("identifier used without being declared")]
     UndeclaredVar,
     /// Attempted to use an object of the given type as the function of a call expression.
+    #[error("cannot call type {0:?}")]
     CannotCall(Ty),
     /// Cannot perform the requested type cast.
+    #[error("invalid type cast")]
     InvalidCast,
     /// Module doesn't exist.
+    #[error("module doesn't exist")]
     InvalidMod,
+    /// Error during lexing.
+    #[error("error during lexing")]
+    LexError,
+    /// Error during parsing.
+    #[error("error during parsing")]
+    ParseError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3049,16 +3119,28 @@ pub struct ExecError {
     pub kind: ExecErrorKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum ExecErrorKind {
     /// A non-Manhattan rotation.
+    #[error("non-Manhattan rotation")]
     InvalidRotation,
     /// A cell is underconstrained.
+    #[error("cell is underconstrained")]
     Underconstrained,
     /// Illegal layer (not defined in layer properties).
+    #[error("layer {0} is not defined in layer properties")]
     IllegalLayer(String),
     /// Conflicting constraints.
+    #[error("inconsistent constraints")]
     InconsistentConstraints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[enumify]
+pub enum StaticCompileOutput {
+    FatalParseErrors,
+    StaticErrors(StaticErrorCompileOutput),
+    Valid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

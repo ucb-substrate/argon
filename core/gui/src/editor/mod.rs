@@ -1,7 +1,6 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
-    path::PathBuf,
 };
 
 use canvas::{LayoutCanvas, ShapeFill};
