@@ -5,7 +5,7 @@ pub mod rpc;
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
     sync::Arc,
@@ -23,7 +23,6 @@ use compiler::{
 use futures::prelude::*;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
 use tarpc::{
