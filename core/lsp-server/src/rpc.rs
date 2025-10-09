@@ -1,21 +1,17 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr};
 
 use compiler::{
     ast::Span,
     compile::{BasicRect, CompileOutput},
 };
 
-use tarpc::{context, tokio_serde::formats::Json};
+use tarpc::tokio_serde::formats::Json;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
     Url, WorkspaceEdit,
 };
 
-use crate::{
-    ForceSave, State,
-    document::{Document, DocumentChange},
-    import::ScopeAnnotationPass,
-};
+use crate::{ForceSave, State, document::Document};
 
 #[tarpc::service]
 pub trait GuiToLsp {

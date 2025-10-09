@@ -5,9 +5,8 @@ pub mod rpc;
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    ffi::OsString,
     net::{IpAddr, Ipv6Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     sync::Arc,
 };
@@ -15,15 +14,14 @@ use std::{
 use compiler::{
     ast::{Expr, Span},
     compile::{
-        self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput, StaticError,
+        self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
         StaticErrorCompileOutput,
     },
-    parse::{self, ParseOutput, WorkspaceParseAst},
+    parse::{self, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use lrpar::{LexError, LexParseError, Lexeme};
 use portpicker::{is_free, pick_unused_port};
 use rpc::{GuiToLsp, LspServer, LspToGuiClient};
 use serde::{Deserialize, Serialize};
