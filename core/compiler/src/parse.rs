@@ -12,6 +12,7 @@ use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, lrpar_mod};
 use crate::{
     ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
     compile::{StaticError, StaticErrorKind},
+    config::parse_config,
 };
 
 lrlex_mod!("argon.l");
@@ -140,19 +141,45 @@ impl ParseOutput {
 }
 
 pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
-    let ParseOutput { mut asts, mut errs } = parse_workspace(root_lib);
+    let root_lib = root_lib.as_ref();
+    let mut ast = IndexMap::new();
+    let mut err = IndexMap::new();
+    let root_dir = root_lib.parent().unwrap();
+    if let Ok(config) = parse_config(root_dir.join("Argon.toml")) {
+        for (name, mod_path) in config.mods {
+            let ParseOutput { asts, errs } = parse_workspace(
+                if mod_path.is_relative() {
+                    root_dir.join(mod_path)
+                } else {
+                    mod_path
+                }
+                .join("lib.ar"),
+            );
+            ast.extend(asts.into_iter().map(|(mut k, v)| {
+                k.insert(0, name.clone());
+                (k, v)
+            }));
+            err.extend(errs);
+        }
+    }
+    let ParseOutput { asts, errs } = parse_workspace(root_lib);
+    ast.extend(asts);
+    err.extend(errs);
     let std_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/std/lib.ar");
     let ParseOutput {
         asts: std_asts,
         errs: std_errs,
     } = parse_workspace(std_path);
     // TODO: fix std library overwriting user-defined std mods.
-    asts.extend(std_asts.into_iter().map(|(mut k, v)| {
+    ast.extend(std_asts.into_iter().map(|(mut k, v)| {
         k.insert(0, "std".to_string());
         (k, v)
     }));
-    errs.extend(std_errs);
-    ParseOutput { asts, errs }
+    err.extend(std_errs);
+    ParseOutput {
+        asts: ast,
+        errs: err,
+    }
 }
 
 pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {

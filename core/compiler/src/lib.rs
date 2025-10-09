@@ -62,6 +62,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
     );
+    const ARGON_EXTERNAL_MODS: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/external_mods/main_crate/lib.ar"
+    );
 
     #[test]
     fn argon_scopes() {
@@ -346,6 +350,28 @@ mod tests {
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 10., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 15., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_external_mods() {
+        let ast = parse_workspace_with_std(ARGON_EXTERNAL_MODS).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["test"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().next().unwrap().1.as_ref().unwrap_rect();
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 10., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 20., epsilon = EPSILON);
     }
 
     #[test]
