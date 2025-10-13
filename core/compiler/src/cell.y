@@ -30,6 +30,7 @@ CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
   : IdentPath '(' Args ')'
     {
       Ok(CallExpr {
+        scope_annotation: None,
         func: $1?,
         args: $3?,
         span: $span,
