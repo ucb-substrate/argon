@@ -438,7 +438,7 @@ mod tests {
     #[test]
     fn argon_enumerations() {
         let ast = parse_workspace_with_std(ARGON_ENUMERATIONS).unwrap_asts();
-        let cell = compile(
+        let cells = compile(
             &ast,
             CompileInput {
                 cell: &["top"],
@@ -446,7 +446,15 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
-        println!("{cell:?}");
-        cell.unwrap_valid();
+        println!("{cells:?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().next().unwrap().1.as_ref().unwrap_rect();
+        assert_eq!(r.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 300., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 400., epsilon = EPSILON);
     }
 }

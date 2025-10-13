@@ -1169,7 +1169,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::FloatEquality,
                 });
             }
-            if left_ty != Ty::Float && left_ty != Ty::Int {
+            if matches!(left_ty, Ty::Enum(_))
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::EnumsNotOrd,
+                });
+            }
+            if !matches!(left_ty, Ty::Float | Ty::Int | Ty::Enum(_)) {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
                     kind: StaticErrorKind::ComparisonInvalidType,
@@ -2813,6 +2821,15 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                             true
                         }
+                        (Value::EnumValue(vl), Value::EnumValue(vr)) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => vl == vr,
+                                crate::ast::ComparisonOp::Ne => vl != vr,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -3193,6 +3210,9 @@ pub enum StaticErrorKind {
     /// Cannot compare equality or inequality of floating point numbers.
     #[error("cannot compare equality or inequality of floating point numbers")]
     FloatEquality,
+    /// Cannot perform greater/less than comparisons on enum values.
+    #[error("cannot perform greater/less than comparisons on enum values")]
+    EnumsNotOrd,
     /// A type cannot be used in a binary expression.
     #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,
