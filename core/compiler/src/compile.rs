@@ -632,7 +632,6 @@ impl<'a> VarIdTyPass<'a> {
             id: self.alloc_id(),
             variants: IndexSet::from_iter(input.variants.iter().map(|s| s.name.to_string())),
         });
-        println!("{} = {:?}", &input.name.name, ty);
         self.alloc(&input.name.name, ty);
     }
 
@@ -862,7 +861,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .collect_vec(),
             };
             let enum_ = &input.path[input.path.len() - 2];
-            println!("lookup {:?}, {}", path, enum_.name);
             let lookup = if path.is_empty() {
                 self.lookup(&enum_.name)
             } else {
@@ -870,7 +868,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .get(&path)
                     .as_ref()
                     .and_then(|mod_binding| {
-                        println!("here0 {:?}", mod_binding.var_bindings);
                         mod_binding.var_bindings.get(enum_.name.as_str()).cloned()
                     })
             };
@@ -885,7 +882,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     }
                     (None, ty)
                 } else {
-                    println!("here1");
                     self.errors.push(StaticError {
                         span: self.span(enum_.span),
                         kind: StaticErrorKind::NotAnEnum,
@@ -893,7 +889,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     (None, Ty::Unknown)
                 }
             } else {
-                println!("here2");
                 self.errors.push(StaticError {
                     span: self.span(enum_.span),
                     kind: StaticErrorKind::NotAnEnum,
@@ -1312,10 +1307,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 .mod_bindings
                 .get(&path)
                 .as_ref()
-                .and_then(|mod_binding| {
-                    println!("here0.1 {:?}", mod_binding.var_bindings);
-                    mod_binding.var_bindings.get(name).cloned()
-                });
+                .and_then(|mod_binding| mod_binding.var_bindings.get(name).cloned());
             self.typecheck_call(lookup, input.span, args)
         }
     }
