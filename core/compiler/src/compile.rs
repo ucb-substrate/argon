@@ -153,7 +153,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
 
     fn dispatch_ident_path(
         &mut self,
-        input: &IdentPath<Self::InputS, Self::InputMetadata>,
+        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
     }
 
