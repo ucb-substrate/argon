@@ -628,9 +628,19 @@ impl<'a> VarIdTyPass<'a> {
             });
             return;
         }
+        let mut variants = IndexSet::with_capacity(input.variants.len());
+        for variant in input.variants.iter() {
+            if variants.contains(variant.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(variant.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            variants.insert(variant.name.to_string());
+        }
         let ty = Ty::Enum(EnumTy {
             id: self.alloc_id(),
-            variants: IndexSet::from_iter(input.variants.iter().map(|s| s.name.to_string())),
+            variants,
         });
         self.alloc(&input.name.name, ty);
     }
