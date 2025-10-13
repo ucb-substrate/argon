@@ -3,12 +3,7 @@ enum MyEnum {
     Variant2,
 }
 
-fn make_num() -> Float {
-    1.
-}
-
 cell top() {
-  let my_float = make_num();
   let variant = MyEnum::Variant1;
   rect("met1", x0=0., y0=0., w=200., h=100.)!;
 }
