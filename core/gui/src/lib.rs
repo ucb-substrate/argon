@@ -35,6 +35,7 @@ pub fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("r", DrawRect, None),
             KeyBinding::new("d", DrawDim, None),
+            KeyBinding::new("f", Fit, None),
             KeyBinding::new("escape", Cancel, None),
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),

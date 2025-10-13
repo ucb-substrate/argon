@@ -9,7 +9,7 @@ use futures::{
     channel::mpsc::{self, Sender},
     prelude::*,
 };
-use gpui::{AsyncApp, Context, Entity};
+use gpui::AsyncApp;
 use lsp_server::rpc::{GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
@@ -18,7 +18,7 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 
-use crate::editor::EditorState;
+use crate::editor::Editor;
 
 #[derive(Clone)]
 pub struct SyncGuiToLspClient {
@@ -41,7 +41,7 @@ impl SyncGuiToLspClient {
         Self { app, client }
     }
 
-    pub fn register_server(&self, state: Entity<EditorState>) {
+    pub fn register_server(&self, editor: Editor) {
         let port = loop {
             if let Some(port) = pick_unused_port() {
                 break port;
@@ -97,11 +97,7 @@ impl SyncGuiToLspClient {
             .spawn(async move |app| {
                 loop {
                     if let Some(exec) = rx.next().await {
-                        state
-                            .update(app, |state, cx| {
-                                exec(state, cx);
-                            })
-                            .unwrap();
+                        exec(&editor, app);
                     }
                 }
             })
@@ -150,19 +146,18 @@ impl SyncGuiToLspClient {
     }
 }
 
-type StateMutFn = Box<dyn FnOnce(&mut EditorState, &mut Context<EditorState>) + Send>;
+type EditorFn = Box<dyn FnOnce(&Editor, &mut AsyncApp) + Send>;
 
 #[derive(Clone)]
 pub struct GuiServer {
-    to_exec: Sender<StateMutFn>,
+    to_exec: Sender<EditorFn>,
 }
 
 impl LspToGui for GuiServer {
-    async fn open_cell(mut self, _: context::Context, cell: CompileOutput) {
+    async fn open_cell(mut self, _: context::Context, cell: CompileOutput, update: bool) {
         self.to_exec
-            .send(Box::new(|state, cx| {
-                state.update(cx, cell);
-                cx.notify();
+            .send(Box::new(move |editor, cx| {
+                editor.open_cell(cx, cell, update);
             }))
             .await
             .unwrap();
@@ -171,10 +166,15 @@ impl LspToGui for GuiServer {
         match key.as_str() {
             "hierarchyDepth" => {
                 self.to_exec
-                    .send(Box::new(move |state, cx| {
-                        // TODO: Need better way to specify infinite hierarchy depth.
-                        state.hierarchy_depth = value.parse().unwrap_or(usize::MAX);
-                        cx.notify();
+                    .send(Box::new(move |editor, cx| {
+                        editor
+                            .state
+                            .update(cx, |state, cx| {
+                                // TODO: Need better way to specify infinite hierarchy depth.
+                                state.hierarchy_depth = value.parse().unwrap_or(usize::MAX);
+                                cx.notify();
+                            })
+                            .unwrap();
                     }))
                     .await
                     .unwrap();

@@ -73,6 +73,7 @@ pub struct EditorState {
     pub subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Editor {
     pub state: Entity<EditorState>,
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
@@ -308,7 +309,6 @@ impl Editor {
                 lsp_client: lsp_client.clone(),
             }
         });
-        lsp_client.register_server(state.clone());
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state));
         let canvas_focus_handle = cx.focus_handle();
@@ -333,12 +333,32 @@ impl Editor {
             )
         });
 
-        Self {
+        let editor = Self {
             state,
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
             text_input,
+        };
+        lsp_client.register_server(editor.clone());
+
+        editor
+    }
+
+    pub fn open_cell(&self, cx: &mut AsyncApp, output: CompileOutput, update: bool) {
+        self.state
+            .update(cx, |state, cx| {
+                state.update(cx, output);
+                cx.notify();
+            })
+            .unwrap();
+        if !update {
+            self.canvas
+                .update(cx, |canvas, cx| {
+                    canvas.fit_to_screen(cx);
+                    cx.notify();
+                })
+                .unwrap();
         }
     }
 }
