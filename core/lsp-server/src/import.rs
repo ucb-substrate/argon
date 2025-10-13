@@ -19,7 +19,6 @@ pub(crate) struct ScopeAnnotationPass<'a> {
     assigned_names: Vec<HashSet<String>>,
     to_add: Vec<Vec<Range>>,
     edits: Vec<TextEdit>,
-    errors: Vec<String>,
 }
 
 impl<'a> ScopeAnnotationPass<'a> {
@@ -30,11 +29,10 @@ impl<'a> ScopeAnnotationPass<'a> {
             assigned_names: vec![Default::default()],
             to_add: vec![Default::default()],
             edits: vec![],
-            errors: Default::default(),
         }
     }
 
-    pub(crate) fn execute(mut self) -> (Vec<TextEdit>, Vec<String>) {
+    pub(crate) fn execute(mut self) -> Vec<TextEdit> {
         for decl in &self.ast.ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -50,7 +48,7 @@ impl<'a> ScopeAnnotationPass<'a> {
             }
         }
 
-        (self.edits, self.errors)
+        self.edits
     }
 }
 
@@ -199,8 +197,6 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         if let Some(mut to_add) = self.to_add.pop()
             && let Some(mut assigned_names) = self.assigned_names.pop()
         {
-            self.errors.push(format!("{:?}", to_add));
-            self.errors.push(format!("{:?}", assigned_names));
             to_add.reverse();
             let mut id = 0;
             while let Some(range) = to_add.pop() {

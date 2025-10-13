@@ -130,10 +130,7 @@ impl StateMut {
         if self.gui_client.is_some() {
             for (_, ast) in &self.ast {
                 let scope_annotation = ScopeAnnotationPass::new(ast);
-                let (mut text_edits, errors) = scope_annotation.execute();
-                for err in errors {
-                    client.log_message(MessageType::ERROR, err).await;
-                }
+                let mut text_edits = scope_annotation.execute();
                 text_edits.sort_by_key(|edit| Reverse(edit.range.start));
                 if !text_edits.is_empty() {
                     client
