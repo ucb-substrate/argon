@@ -419,7 +419,7 @@ pub enum Ty {
     Float,
     Int,
     Rect,
-    Enum,
+    Enum(ModPath, String),
     String,
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
@@ -471,7 +471,7 @@ impl AstMetadata for VarIdTyMetadata {
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
-    type EnumValue = ();
+    type EnumValue = Ty;
     type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
     type Args = ();
@@ -717,7 +717,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
-            Expr::EnumValue(_enum_value) => Ty::Enum,
+            Expr::EnumValue(enum_value) => enum_value.metadata.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
             Expr::Var(var_expr) => var_expr.metadata.1.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
