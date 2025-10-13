@@ -1,26 +1,29 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr};
 
-use cfgrammar::Span;
-use compiler::compile::{BasicRect, CompileOutput};
-
-use tarpc::{context, tokio_serde::formats::Json};
-use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, MessageType, Position, Range, TextEdit, Url, WorkspaceEdit,
+use compiler::{
+    ast::Span,
+    compile::{BasicRect, CompileOutput},
 };
 
-use crate::{ForceSave, State, document::DocumentChange};
+use tarpc::tokio_serde::formats::Json;
+use tower_lsp::lsp_types::{
+    Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
+    Url, WorkspaceEdit,
+};
+
+use crate::{ForceSave, State, document::Document};
 
 #[tarpc::service]
 pub trait GuiToLsp {
     async fn register(addr: SocketAddr);
-    async fn select_rect(span: Option<(PathBuf, Span)>);
-    async fn draw_rect(file: PathBuf, scope_span: Span, var_name: String, rect: BasicRect<f64>);
-    async fn add_eq_constraint(file: PathBuf, scope_span: Span, lhs: String, rhs: String);
+    async fn select_rect(span: Span);
+    async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>);
+    async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
 }
 
 #[tarpc::service]
 pub trait LspToGui {
-    async fn open_cell(file: PathBuf, cell: CompileOutput);
+    async fn open_cell(cell: CompileOutput);
     async fn set(key: String, value: String);
 }
 
@@ -31,55 +34,61 @@ pub struct LspServer {
 
 impl GuiToLsp for LspServer {
     async fn register(self, _: tarpc::context::Context, addr: SocketAddr) -> () {
-        self.state.state_mut.lock().await.gui_client = Some({
+        let gui_client = {
             let mut transport = tarpc::serde_transport::tcp::connect(addr, Json::default);
             transport.config_mut().max_frame_length(usize::MAX);
 
             LspToGuiClient::new(tarpc::client::Config::default(), transport.await.unwrap()).spawn()
-        });
+        };
+        let mut state_mut = self.state.state_mut.lock().await;
+        state_mut.gui_client = Some(gui_client);
+        state_mut.compile(&self.state.editor_client).await;
     }
 
-    async fn select_rect(self, _: tarpc::context::Context, span: Option<(PathBuf, Span)>) {
-        if let Some((file, span)) = &span {
-            // TODO: check that vim file is in sync with GUI file.
-            if let Some(doc) = self
-                .state
-                .state_mut
-                .lock()
-                .await
-                .gui_files
-                .get(&Url::from_file_path(file).unwrap())
-            {
-                let diagnostics = vec![Diagnostic {
-                    range: Range {
-                        start: doc.offset_to_pos(span.start()),
-                        end: doc.offset_to_pos(span.end()),
-                    },
-                    severity: Some(DiagnosticSeverity::INFORMATION),
-                    message: "selected rect".to_string(),
-                    ..Default::default()
-                }];
-                self.state
-                    .editor_client
-                    .publish_diagnostics(Url::from_file_path(file).unwrap(), diagnostics, None)
-                    .await;
-            }
+    async fn select_rect(self, _: tarpc::context::Context, span: Span) {
+        // TODO: check that vim file is in sync with GUI file.
+        let state_mut = self.state.state_mut.lock().await;
+        if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
+            let doc = Document::new(&ast.text, 0);
+            let url = Url::from_file_path(&span.path).unwrap();
+            let diagnostics = vec![Diagnostic {
+                range: Range {
+                    start: doc.offset_to_pos(span.span.start()),
+                    end: doc.offset_to_pos(span.span.end()),
+                },
+                severity: Some(DiagnosticSeverity::INFORMATION),
+                message: "selected rect".to_string(),
+                ..Default::default()
+            }];
+            self.state
+                .editor_client
+                .publish_diagnostics(url, diagnostics, None)
+                .await;
         }
     }
 
     async fn draw_rect(
         self,
         _: tarpc::context::Context,
-        file: PathBuf,
         scope_span: Span,
         var_name: String,
         rect: BasicRect<f64>,
     ) {
-        let mut state_mut = self.state.state_mut.lock().await;
-        let url = Url::from_file_path(&file).unwrap();
-        if let Some(doc) = state_mut.gui_files.get(&url)
-            && let Some(scope) = doc.ast.span2scope.get(&scope_span)
+        // TODO: check if editor file is up to date with ast.
+        let state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(&scope_span.path).unwrap();
+        if let Some(ast) = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)
+            && let Some(scope) = state_mut
+                .ast
+                .values()
+                .find(|ast| ast.path == scope_span.path)
+                .as_ref()
+                .and_then(|ast| ast.span2scope.get(&scope_span))
         {
+            let doc = Document::new(&ast.text, 0);
             let edit = if let Some(tail) = &scope.tail {
                 let start = doc.offset_to_pos(tail.span().start());
                 TextEdit {
@@ -137,15 +146,17 @@ impl GuiToLsp for LspServer {
                     .await;
                 return;
             }
-            let version = doc.version() + 1;
-            let cell = doc.cell.clone();
-            state_mut.gui_files.get_mut(&url).unwrap().apply_changes(
-                vec![DocumentChange {
-                    range: Some(edit.range),
-                    patch: edit.new_text.clone(),
-                }],
-                version,
-            );
+
+            self.state
+                .editor_client
+                .show_document(ShowDocumentParams {
+                    uri: url.clone(),
+                    external: None,
+                    take_focus: None,
+                    selection: None,
+                })
+                .await
+                .unwrap();
 
             self.state
                 .editor_client
@@ -159,33 +170,34 @@ impl GuiToLsp for LspServer {
 
             self.state
                 .editor_client
-                .send_request::<ForceSave>(())
+                .send_request::<ForceSave>(scope_span.path.clone())
                 .await
                 .unwrap();
-
-            let o = state_mut.compile_gui_cell(&file, &cell);
-            if let Some(gui_client) = &mut state_mut.gui_client {
-                gui_client
-                    .open_cell(context::current(), file, o)
-                    .await
-                    .unwrap();
-            }
         }
     }
 
     async fn add_eq_constraint(
         self,
         _: tarpc::context::Context,
-        file: PathBuf,
         scope_span: Span,
         lhs: String,
         rhs: String,
-    ) -> () {
-        let mut state_mut = self.state.state_mut.lock().await;
-        let url = Url::from_file_path(&file).unwrap();
-        if let Some(doc) = state_mut.gui_files.get(&url)
-            && let Some(scope) = doc.ast.span2scope.get(&scope_span)
+    ) {
+        // TODO: check if editor file is up to date with ast.
+        let state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(&scope_span.path).unwrap();
+        if let Some(ast) = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)
+            && let Some(scope) = state_mut
+                .ast
+                .values()
+                .find(|ast| ast.path == scope_span.path)
+                .as_ref()
+                .and_then(|ast| ast.span2scope.get(&scope_span))
         {
+            let doc = Document::new(&ast.text, 0);
             let edit = if let Some(tail) = &scope.tail {
                 let start = doc.offset_to_pos(tail.span().start());
                 TextEdit {
@@ -233,15 +245,17 @@ impl GuiToLsp for LspServer {
                     .await;
                 return;
             }
-            let version = doc.version() + 1;
-            let cell = doc.cell.clone();
-            state_mut.gui_files.get_mut(&url).unwrap().apply_changes(
-                vec![DocumentChange {
-                    range: Some(edit.range),
-                    patch: edit.new_text.clone(),
-                }],
-                version,
-            );
+
+            self.state
+                .editor_client
+                .show_document(ShowDocumentParams {
+                    uri: url.clone(),
+                    external: None,
+                    take_focus: None,
+                    selection: None,
+                })
+                .await
+                .unwrap();
 
             self.state
                 .editor_client
@@ -255,17 +269,9 @@ impl GuiToLsp for LspServer {
 
             self.state
                 .editor_client
-                .send_request::<ForceSave>(())
+                .send_request::<ForceSave>(scope_span.path.clone())
                 .await
                 .unwrap();
-
-            let o = state_mut.compile_gui_cell(&file, &cell);
-            if let Some(gui_client) = &mut state_mut.gui_client {
-                gui_client
-                    .open_cell(context::current(), file, o)
-                    .await
-                    .unwrap();
-            }
         }
     }
 }

@@ -1,11 +1,10 @@
-use std::{
-    net::{IpAddr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use async_compat::CompatExt;
-use cfgrammar::Span;
-use compiler::compile::{BasicRect, CompileOutput};
+use compiler::{
+    ast::Span,
+    compile::{BasicRect, CompileOutput},
+};
 use futures::{
     channel::mpsc::{self, Sender},
     prelude::*,
@@ -48,7 +47,7 @@ impl SyncGuiToLspClient {
                 break port;
             }
         };
-        let server_addr = (IpAddr::V6(Ipv6Addr::LOCALHOST), port).into();
+        let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port).into();
         let background_executor = self.app.background_executor().clone();
         let (tx, mut rx) = mpsc::channel(1);
         self.app
@@ -110,7 +109,7 @@ impl SyncGuiToLspClient {
     }
 
     // TODO: Improve API.
-    pub fn select_rect(&self, span: Option<(PathBuf, Span)>) {
+    pub fn select_rect(&self, span: Span) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
             async move {
@@ -124,18 +123,12 @@ impl SyncGuiToLspClient {
     }
 
     // TODO: Improve API.
-    pub fn draw_rect(
-        &self,
-        file: PathBuf,
-        scope_span: Span,
-        var_name: String,
-        rect: BasicRect<f64>,
-    ) {
+    pub fn draw_rect(&self, scope_span: Span, var_name: String, rect: BasicRect<f64>) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
             async move {
                 client_clone
-                    .draw_rect(context::current(), file, scope_span, var_name, rect)
+                    .draw_rect(context::current(), scope_span, var_name, rect)
                     .await
                     .unwrap()
             }
@@ -143,12 +136,12 @@ impl SyncGuiToLspClient {
         );
     }
 
-    pub fn add_eq_constraint(&self, file: PathBuf, scope_span: Span, lhs: String, rhs: String) {
+    pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
             async move {
                 client_clone
-                    .add_eq_constraint(context::current(), file, scope_span, lhs, rhs)
+                    .add_eq_constraint(context::current(), scope_span, lhs, rhs)
                     .await
                     .unwrap()
             }
@@ -165,10 +158,10 @@ pub struct GuiServer {
 }
 
 impl LspToGui for GuiServer {
-    async fn open_cell(mut self, _: context::Context, file: PathBuf, cell: CompileOutput) {
+    async fn open_cell(mut self, _: context::Context, cell: CompileOutput) {
         self.to_exec
             .send(Box::new(|state, cx| {
-                state.update(cx, file, cell);
+                state.update(cx, cell);
                 cx.notify();
             }))
             .await

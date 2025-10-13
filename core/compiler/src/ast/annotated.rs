@@ -1,23 +1,24 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, path::PathBuf};
 
 use arcstr::{ArcStr, Substr};
-use cfgrammar::Span;
 use derive_where::derive_where;
 use indexmap::IndexMap;
 
-use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, StringLiteral};
+use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, Span, StringLiteral};
 
 #[derive_where(Debug, Clone)]
 pub struct AnnotatedAst<T: AstMetadata> {
     pub text: ArcStr,
     pub ast: Ast<Substr, T>,
+    pub path: PathBuf,
     pub span2scope: IndexMap<Span, Scope<Substr, T>>,
 }
 
 impl<T: AstMetadata> AnnotatedAst<T> {
-    pub fn new<S>(text: ArcStr, ast: &Ast<S, T>) -> Self {
+    pub fn new<S>(text: ArcStr, ast: &Ast<S, T>, path: PathBuf) -> Self {
         let mut pass = AstAnnotationPass {
             text,
+            path: path.clone(),
             span2scope: Default::default(),
             phantom: Default::default(),
         };
@@ -34,6 +35,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Mod(m) => {
                     decls.push(Decl::Mod(pass.transform_mod_decl(m)));
                 }
+                Decl::Enum(e) => {
+                    decls.push(Decl::Enum(pass.transform_enum_decl(e)));
+                }
                 _ => todo!(),
             }
         }
@@ -44,6 +48,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 decls,
                 span: ast.span,
             },
+            path,
             span2scope: pass.span2scope,
         }
     }
@@ -51,6 +56,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
 
 struct AstAnnotationPass<S, T: AstMetadata> {
     text: ArcStr,
+    path: PathBuf,
     span2scope: IndexMap<Span, Scope<Substr, T>>,
     phantom: PhantomData<S>,
 }
@@ -68,11 +74,10 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
-    fn dispatch_var_expr(
+    fn dispatch_ident_path(
         &mut self,
-        input: &super::VarExpr<Self::InputS, Self::InputMetadata>,
-        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
+        input: &super::IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
         input.metadata.clone()
     }
 
@@ -179,15 +184,6 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
-    fn dispatch_enum_value(
-        &mut self,
-        input: &super::EnumValue<Self::InputS, Self::InputMetadata>,
-        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-        _variant: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
-        input.metadata.clone()
-    }
-
     fn dispatch_call_expr(
         &mut self,
         input: &super::CallExpr<Self::InputS, Self::InputMetadata>,
@@ -246,7 +242,13 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         _input: &Scope<Self::InputS, Self::InputMetadata>,
         output: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) {
-        self.span2scope.insert(output.span, output.clone());
+        self.span2scope.insert(
+            Span {
+                path: self.path.clone(),
+                span: output.span,
+            },
+            output.clone(),
+        );
     }
 
     fn transform_s(&mut self, _s: &Self::InputS) -> Self::OutputS {

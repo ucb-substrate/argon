@@ -11,6 +11,7 @@ env:
 
 jobs:
   lint:
+    name: Lint and test
     runs-on: bwrc
     steps:
       - uses: actions/checkout@v5
@@ -18,3 +19,6 @@ jobs:
           clean: false
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
+        if: '!cancelled()'
+      - run: cargo test --locked
+        if: '!cancelled()'

@@ -875,8 +875,7 @@ impl LayoutCanvas {
                                     .unwrap();
 
                                 state.lsp_client.draw_rect(
-                                    cell.file.clone(),
-                                    scope.span,
+                                    scope.span.clone(),
                                     rect_name,
                                     compile::BasicRect {
                                         layer: state
@@ -1063,18 +1062,17 @@ impl LayoutCanvas {
                                     let (obj, emit) = &ccell.scopes[&id.scope.scope].emit[id.idx];
 
                                     match &ccell.objects[obj] {
-                                        SolvedValue::Rect(_) => {
-                                            Some((cell.file.clone(), emit.span))
-                                        }
+                                        SolvedValue::Rect(_) => Some(&emit.span),
                                         _ => None,
                                     }
                                 }
-                                RectId::Scope(id) => Some((
-                                    cell.file.clone(),
-                                    cell.output.cells[&id.cell].scopes[&id.scope].span,
-                                )),
+                                RectId::Scope(id) => {
+                                    Some(&cell.output.cells[&id.cell].scopes[&id.scope].span)
+                                }
                             });
-                            state.lsp_client.select_rect(args);
+                            if let Some(span) = args {
+                                state.lsp_client.select_rect(span.clone());
+                            }
                             cx.notify();
                         }
                     });

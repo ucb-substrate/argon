@@ -34,11 +34,11 @@ Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   ;
 
 IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
-  : Ident { Ok(IdentPath { path: vec![$1?], span: $span }) }
+  : Ident { Ok(IdentPath { path: vec![$1?], metadata: (), span: $span }) }
   | Ident '::' IdentPath { 
     let mut path = vec![$1?];
     path.extend($3?.path);
-    Ok(IdentPath { path, span: $span })
+    Ok(IdentPath { path, metadata: (), span: $span })
   }
   ;
 
