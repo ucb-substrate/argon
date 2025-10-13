@@ -3171,7 +3171,7 @@ pub enum StaticErrorKind {
     /// For example, users cannot declare cells or functions named `rect`.
     #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
-    /// Attempted to treat a non-enum object (e.g. a mod or a function) like an enum using the "::"
+    /// Attempted to treat a non-enum object (e.g. a function or local variable) like an enum using the "::"
     /// operator.
     #[error("expected an enum")]
     NotAnEnum,
