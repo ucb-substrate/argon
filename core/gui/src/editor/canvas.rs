@@ -21,7 +21,7 @@ use indexmap::IndexSet;
 use itertools::Itertools;
 
 use crate::{
-    Cancel, DrawDim, DrawRect,
+    Cancel, DrawDim, DrawRect, Fit,
     editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
 };
 
@@ -166,11 +166,15 @@ pub struct LayoutCanvas {
     mouse_position: Point<Pixels>,
     // zoom state
     scale: f32,
-    screen_origin: Point<Pixels>,
+    screen_bounds: Bounds<Pixels>,
     #[allow(unused)]
     subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
     scope_rects: Vec<Rect>,
+    // True if waiting on render step to finish some initialization.
+    //
+    // Final bounds of layout canvas only determined in paint step.
+    pending_init: bool,
 }
 
 impl IntoElement for CanvasElement {
@@ -302,8 +306,13 @@ impl Element for CanvasElement {
         window: &mut gpui::Window,
         cx: &mut gpui::App,
     ) {
-        self.inner
-            .update(cx, |inner, _cx| inner.screen_origin = bounds.origin);
+        self.inner.update(cx, |inner, cx| {
+            inner.screen_bounds = bounds;
+            if inner.pending_init {
+                inner.pending_init = false;
+                inner.fit_to_screen(cx);
+            }
+        });
         let inner = self.inner.read(cx);
         let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
         let selected_rect = solved_cell.as_ref().and_then(|cell| cell.selected_rect);
@@ -788,6 +797,7 @@ impl Render for LayoutCanvas {
             // .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_dim))
+            .on_action(cx.listener(Self::fit_to_screen_action))
             .on_action(cx.listener(Self::cancel))
             .on_drag_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -830,11 +840,42 @@ impl LayoutCanvas {
             rect_tool: None,
             dim_tool: cx.new(|_cx| None),
             scale: 1.0,
-            screen_origin: Point::default(),
+            screen_bounds: Bounds::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
             state: state.clone(),
             rects: Vec::new(),
             scope_rects: Vec::new(),
+            pending_init: true,
+        }
+    }
+
+    pub(crate) fn fit_to_screen(&mut self, cx: &mut Context<Self>) {
+        if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
+            && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
+                let scope_address = &cell.state[&cell.selected_scope].address;
+                cell.state[&cell.scope_paths[&ScopeAddress {
+                    cell: scope_address.cell,
+                    scope: cell.output.cells[&scope_address.cell].root,
+                }]]
+                    .bbox
+                    .as_ref()
+            })
+        {
+            let scalex = self.screen_bounds.size.width.0 / (bbox.x1 - bbox.x0) as f32;
+            let scaley = self.screen_bounds.size.height.0 / (bbox.y1 - bbox.y0) as f32;
+            self.scale = 0.9 * scalex.min(scaley);
+            self.offset = Point::new(
+                Pixels(
+                    (-(bbox.x0 + bbox.x1) as f32 * self.scale + self.screen_bounds.size.width.0)
+                        / 2.,
+                ),
+                Pixels(
+                    ((bbox.y1 + bbox.y0) as f32 * self.scale + self.screen_bounds.size.height.0)
+                        / 2.,
+                ),
+            );
+        } else {
+            self.offset = Point::new(Pixels(0.), self.screen_bounds.size.height);
         }
     }
 
@@ -919,7 +960,7 @@ impl LayoutCanvas {
                     Bounds::new(
                         Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
                             + offset
-                            + self.screen_origin,
+                            + self.screen_bounds.origin,
                         Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
                     ),
                 )
@@ -1043,7 +1084,7 @@ impl LayoutCanvas {
                 let rect_bounds = Bounds::new(
                     Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
                         + offset
-                        + self.screen_origin,
+                        + self.screen_bounds.origin,
                     Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
                 );
                 if rect_bounds.contains(&event.position) && r.id.is_some() {
@@ -1094,11 +1135,11 @@ impl LayoutCanvas {
     fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
         Point::new(self.scale * Pixels(pt.x), self.scale * Pixels(-pt.y))
             + self.offset
-            + self.screen_origin
+            + self.screen_bounds.origin
     }
 
     fn px_to_layout(&self, pt: Point<Pixels>) -> Point<f32> {
-        let pt = pt - self.offset - self.screen_origin;
+        let pt = pt - self.offset - self.screen_bounds.origin;
         Point::new(pt.x.0 / self.scale, -pt.y.0 / self.scale)
     }
 
@@ -1130,6 +1171,15 @@ impl LayoutCanvas {
                 *dim_tool = Some(DimToolState { edges: Vec::new() })
             });
         }
+    }
+
+    pub(crate) fn fit_to_screen_action(
+        &mut self,
+        _: &Fit,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fit_to_screen(cx);
     }
 
     pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1225,10 +1275,10 @@ impl LayoutCanvas {
         // (screen-b0)/scale0 = (screen-b1)/scale1
         // b1 = scale1/scale0*(b0-screen)+screen
         let a = new_scale / self.scale;
-        let b0 = self.screen_origin + self.offset;
+        let b0 = self.screen_bounds.origin + self.offset;
         let b1 = Point::new(a * (b0.x - event.position.x), a * (b0.y - event.position.y))
             + event.position;
-        self.offset = b1 - self.screen_origin;
+        self.offset = b1 - self.screen_bounds.origin;
         self.scale = new_scale;
 
         cx.notify();

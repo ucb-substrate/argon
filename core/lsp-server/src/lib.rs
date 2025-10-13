@@ -100,7 +100,7 @@ impl StateMut {
         diagnostics
     }
 
-    async fn compile(&mut self, client: &Client) {
+    async fn compile(&mut self, client: &Client, update: bool) {
         // TODO: un-hardcode this.
         let root_dir = self.root_dir.as_ref().unwrap();
         self.config = parse_config(root_dir.join("Argon.toml")).ok();
@@ -217,7 +217,7 @@ impl StateMut {
             && let Some(client) = self.gui_client.as_mut()
         {
             client
-                .open_cell(context::current(), o.clone())
+                .open_cell(context::current(), o.clone(), update)
                 .await
                 .unwrap();
         } else {
@@ -372,13 +372,13 @@ impl Backend {
     async fn compile_cell(&self, cell: impl Into<String>) {
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut.cell = Some(cell.into());
-        state_mut.compile(&self.state.editor_client).await;
+        state_mut.compile(&self.state.editor_client, false).await;
     }
 
     /// Compiles the current workspace and the open cell if it exists.
     async fn compile(&self) {
         let mut state_mut = self.state.state_mut.lock().await;
-        state_mut.compile(&self.state.editor_client).await;
+        state_mut.compile(&self.state.editor_client, true).await;
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {

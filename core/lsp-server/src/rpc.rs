@@ -23,7 +23,7 @@ pub trait GuiToLsp {
 
 #[tarpc::service]
 pub trait LspToGui {
-    async fn open_cell(cell: CompileOutput);
+    async fn open_cell(cell: CompileOutput, update: bool);
     async fn set(key: String, value: String);
 }
 
@@ -42,7 +42,7 @@ impl GuiToLsp for LspServer {
         };
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut.gui_client = Some(gui_client);
-        state_mut.compile(&self.state.editor_client).await;
+        state_mut.compile(&self.state.editor_client, false).await;
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {

@@ -7,6 +7,7 @@ actions!(
         Quit,
         DrawRect,
         DrawDim,
+        Fit,
         Cancel,
         Backspace,
         Delete,
