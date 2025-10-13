@@ -1023,6 +1023,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
+        let scope_annotation = input
+            .scope_annotation
+            .as_ref()
+            .map(|anno| self.transform_ident(anno));
         let func = IdentPath {
             path: input
                 .func
@@ -1036,6 +1040,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
+            scope_annotation,
             func,
             args,
             span: input.span,
