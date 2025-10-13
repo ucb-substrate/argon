@@ -1702,7 +1702,7 @@ impl<'a> ExecPass<'a> {
                 _ => None,
             })
             .expect("cell not found");
-        let cell_id = self.execute_cell(vid, input.args, None);
+        let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
         let layers =
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
