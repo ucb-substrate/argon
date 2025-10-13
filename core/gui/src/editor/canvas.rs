@@ -21,7 +21,7 @@ use indexmap::IndexSet;
 use itertools::Itertools;
 
 use crate::{
-    Cancel, DrawDim, DrawRect, Fit,
+    actions::{All, Cancel, DrawDim, DrawRect, Fit, One, Zero},
     editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
 };
 
@@ -798,6 +798,9 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_dim))
             .on_action(cx.listener(Self::fit_to_screen_action))
+            .on_action(cx.listener(Self::zero_hierarchy))
+            .on_action(cx.listener(Self::one_hierarchy))
+            .on_action(cx.listener(Self::all_hierarchy))
             .on_action(cx.listener(Self::cancel))
             .on_drag_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -1180,6 +1183,32 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         self.fit_to_screen(cx);
+    }
+
+    pub(crate) fn zero_hierarchy(
+        &mut self,
+        _: &Zero,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, cx| {
+            state.hierarchy_depth = 0;
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn one_hierarchy(&mut self, _: &One, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.hierarchy_depth = 1;
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn all_hierarchy(&mut self, _: &All, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.hierarchy_depth = usize::MAX;
+            cx.notify();
+        });
     }
 
     pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
