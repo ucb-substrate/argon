@@ -454,12 +454,12 @@ pub enum Ty {
     Float,
     Int,
     Rect,
-    EnumValue(ModPath, String),
     String,
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
     Nil,
     Fn(Box<FnTy>),
+    /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
     Enum(EnumTy),
     CellFn(Box<CellFnTy>),
 }
