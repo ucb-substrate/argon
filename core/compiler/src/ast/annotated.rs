@@ -35,6 +35,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Mod(m) => {
                     decls.push(Decl::Mod(pass.transform_mod_decl(m)));
                 }
+                Decl::Enum(e) => {
+                    decls.push(Decl::Enum(pass.transform_enum_decl(e)));
+                }
                 _ => todo!(),
             }
         }
@@ -71,11 +74,10 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
-    fn dispatch_var_expr(
+    fn dispatch_ident_path(
         &mut self,
-        input: &super::VarExpr<Self::InputS, Self::InputMetadata>,
-        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
+        input: &super::IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
         input.metadata.clone()
     }
 
@@ -179,15 +181,6 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         _base: &super::Expr<Self::OutputS, Self::OutputMetadata>,
         _field: &super::Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
-        input.metadata.clone()
-    }
-
-    fn dispatch_enum_value(
-        &mut self,
-        input: &super::EnumValue<Self::InputS, Self::InputMetadata>,
-        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-        _variant: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
         input.metadata.clone()
     }
 

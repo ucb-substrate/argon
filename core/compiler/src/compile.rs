@@ -16,15 +16,15 @@ use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ComparisonOp, ConstantDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue, ModPath,
-    Scope, Span, UnaryOp, WorkspaceAst,
+    BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue,
+    ModPath, Scope, Span, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
-        Decl, EnumValue, Expr, Ident, IfExpr, LetBinding, Statement,
+        Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
     solver::{LinearExpr, Solver, Var},
@@ -130,6 +130,7 @@ impl<'a> ImportPass<'a> {
                     self.transform_cell_decl(c);
                 }
                 Decl::Mod(_) => {}
+                Decl::Enum(_) => {}
                 _ => todo!(),
             }
         }
@@ -150,11 +151,10 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
-    fn dispatch_var_expr(
+    fn dispatch_ident_path(
         &mut self,
-        _input: &crate::ast::VarExpr<Self::InputS, Self::InputMetadata>,
-        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
+        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
     }
 
     fn dispatch_enum_decl(
@@ -247,14 +247,6 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _base: &Expr<Self::OutputS, Self::OutputMetadata>,
         _field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
-    }
-
-    fn dispatch_enum_value(
-        &mut self,
-        _input: &EnumValue<Self::InputS, Self::InputMetadata>,
-        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        _variant: &Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
     }
 
     fn dispatch_call_expr(
@@ -462,12 +454,13 @@ pub enum Ty {
     Float,
     Int,
     Rect,
-    Enum,
     String,
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
     Nil,
     Fn(Box<FnTy>),
+    /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
+    Enum(EnumTy),
     CellFn(Box<CellFnTy>),
 }
 
@@ -500,8 +493,15 @@ pub struct CellTy {
     data: IndexMap<String, Ty>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumTy {
+    id: EnumId,
+    variants: IndexSet<String>,
+}
+
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
+    type IdentPath = (Option<VarId>, Ty);
     type EnumDecl = ();
     type StructDecl = ();
     type StructField = ();
@@ -514,7 +514,6 @@ impl AstMetadata for VarIdTyMetadata {
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
-    type EnumValue = ();
     type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
     type Args = ();
@@ -522,7 +521,6 @@ impl AstMetadata for VarIdTyMetadata {
     type ArgDecl = (VarId, Ty);
     type Scope = Ty;
     type Typ = ();
-    type VarExpr = (VarId, Ty);
     type CastExpr = Ty;
 }
 
@@ -543,22 +541,29 @@ impl<'a> VarIdTyPass<'a> {
         None
     }
 
-    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
+    fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
+        let id = self.alloc_id();
         self.bindings
             .last_mut()
             .unwrap()
             .var_bindings
             .insert(name.clone(), (id, ty));
-        self.next_id += 1;
         id
     }
 
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
         for decl in &self.ast.ast.decls {
-            if let Decl::Fn(f) = decl {
-                self.declare_fn_decl(f);
+            match decl {
+                Decl::Fn(f) => self.declare_fn_decl(f),
+                Decl::Enum(e) => self.declare_enum_decl(e),
+                _ => (),
             }
         }
         for decl in &self.ast.ast.decls {
@@ -571,6 +576,9 @@ impl<'a> VarIdTyPass<'a> {
                 }
                 Decl::Mod(m) => {
                     decls.push(Decl::Mod(self.transform_mod_decl(m)));
+                }
+                Decl::Enum(e) => {
+                    decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
                 _ => todo!(),
             }
@@ -608,6 +616,32 @@ impl<'a> VarIdTyPass<'a> {
                 Ty::Nil
             },
         }));
+        self.alloc(&input.name.name, ty);
+    }
+
+    fn declare_enum_decl(&mut self, input: &'a EnumDecl<Substr, ParseMetadata>) {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+            return;
+        }
+        let mut variants = IndexSet::with_capacity(input.variants.len());
+        for variant in input.variants.iter() {
+            if variants.contains(variant.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(variant.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            variants.insert(variant.name.to_string());
+        }
+        let ty = Ty::Enum(EnumTy {
+            id: self.alloc_id(),
+            variants,
+        });
         self.alloc(&input.name.name, ty);
     }
 
@@ -768,9 +802,8 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
-            Expr::EnumValue(_enum_value) => Ty::Enum,
+            Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
-            Expr::Var(var_expr) => var_expr.metadata.1.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -794,13 +827,85 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
-    fn dispatch_var_expr(
+    fn dispatch_ident_path(
         &mut self,
-        input: &crate::ast::VarExpr<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
-        self.lookup(&input.name.name)
-            .expect("used variable before declaration")
+        input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
+        // Currently, ident path exprs are either single variables or enum values
+        // Parser grammar ensures paths cannot be empty.
+        assert!(!input.path.is_empty());
+        if input.path.len() == 1 {
+            if let Some((varid, ty)) = self.lookup(&input.path[0].name) {
+                (Some(varid), ty)
+            } else {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::UndeclaredVar,
+                });
+                (None, Ty::Unknown)
+            }
+        } else {
+            // look up enum
+            let path = match input.path[0].name.as_str() {
+                "std" => {
+                    vec!["std".to_string()]
+                }
+                "crate" => input
+                    .path
+                    .iter()
+                    .skip(1)
+                    .dropping_back(2)
+                    .map(|ident| ident.name.to_string())
+                    .collect_vec(),
+                _ => self
+                    .current_path
+                    .iter()
+                    .cloned()
+                    .chain(
+                        input
+                            .path
+                            .iter()
+                            .dropping_back(2)
+                            .map(|ident| ident.name.to_string()),
+                    )
+                    .collect_vec(),
+            };
+            let enum_ = &input.path[input.path.len() - 2];
+            let lookup = if path.is_empty() {
+                self.lookup(&enum_.name)
+            } else {
+                self.mod_bindings
+                    .get(&path)
+                    .as_ref()
+                    .and_then(|mod_binding| {
+                        mod_binding.var_bindings.get(enum_.name.as_str()).cloned()
+                    })
+            };
+            if let Some((_, ty)) = lookup {
+                if let Ty::Enum(ref e) = ty {
+                    let variant = &input.path.last().unwrap().name;
+                    if !e.variants.contains(variant.as_str()) {
+                        self.errors.push(StaticError {
+                            span: self.span(enum_.span),
+                            kind: StaticErrorKind::InvalidVariant(variant.to_string()),
+                        });
+                    }
+                    (None, ty)
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(enum_.span),
+                        kind: StaticErrorKind::NotAnEnum,
+                    });
+                    (None, Ty::Unknown)
+                }
+            } else {
+                self.errors.push(StaticError {
+                    span: self.span(enum_.span),
+                    kind: StaticErrorKind::NotAnEnum,
+                });
+                (None, Ty::Unknown)
+            }
+        }
     }
 
     fn dispatch_enum_decl(
@@ -908,6 +1013,30 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         CellDecl {
             name,
             scope,
+            args,
+            span: input.span,
+            metadata,
+        }
+    }
+
+    fn transform_call_expr(
+        &mut self,
+        input: &CallExpr<Self::InputS, Self::InputMetadata>,
+    ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
+        let func = IdentPath {
+            path: input
+                .func
+                .path
+                .iter()
+                .map(|ident| self.transform_ident(ident))
+                .collect(),
+            metadata: (None, Ty::Unknown),
+            span: input.func.span,
+        };
+        let args = self.transform_args(&input.args);
+        let metadata = self.dispatch_call_expr(input, &func, &args);
+        CallExpr {
+            func,
             args,
             span: input.span,
             metadata,
@@ -1040,7 +1169,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::FloatEquality,
                 });
             }
-            if left_ty != Ty::Float && left_ty != Ty::Int {
+            if matches!(left_ty, Ty::Enum(_))
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::EnumsNotOrd,
+                });
+            }
+            if !matches!(left_ty, Ty::Float | Ty::Int | Ty::Enum(_)) {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
                     kind: StaticErrorKind::ComparisonInvalidType,
@@ -1075,14 +1212,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Unknown => Ty::Unknown,
             _ => self.no_field_on_ty(field, base_ty.clone()),
         }
-    }
-
-    fn dispatch_enum_value(
-        &mut self,
-        _input: &EnumValue<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
-        _variant: &Ident<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
     }
 
     fn dispatch_call_expr(
@@ -1378,6 +1507,7 @@ pub struct Dimension<T> {
 type FrameId = u64;
 type ValueId = u64;
 pub type CellId = u64;
+pub type EnumId = u64;
 
 /// Sequence number.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize, Ord, PartialOrd)]
@@ -2063,9 +2193,19 @@ impl<'a> ExecPass<'a> {
                     .insert(vid, Defer::Ready(Value::String(s.value.to_string())));
                 return vid;
             }
-            Expr::Var(v) => {
-                let var_id = v.metadata.0;
-                return self.lookup(loc.frame, var_id).unwrap();
+            Expr::IdentPath(path) => {
+                if let Some(var_id) = path.metadata.0 {
+                    return self.lookup(loc.frame, var_id).unwrap();
+                } else {
+                    // must be an enum value
+                    assert!(path.path.len() >= 2);
+                    let vid = self.value_id();
+                    self.values.insert(
+                        vid,
+                        Defer::Ready(Value::EnumValue(path.path.last().unwrap().name.to_string())),
+                    );
+                    return vid;
+                }
             }
             Expr::Emit(e) => {
                 let value = self.visit_expr(loc, &e.value);
@@ -2189,14 +2329,6 @@ impl<'a> ExecPass<'a> {
                     self.span(&loc, s.span),
                 );
                 return self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s);
-            }
-            Expr::EnumValue(e) => {
-                let vid = self.value_id();
-                self.values.insert(
-                    vid,
-                    Defer::Ready(Value::EnumValue(e.variant.name.to_string())),
-                );
-                return vid;
             }
             Expr::FieldAccess(f) => {
                 let base = self.visit_expr(loc, &f.base);
@@ -2725,6 +2857,15 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                             true
                         }
+                        (Value::EnumValue(vl), Value::EnumValue(vr)) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => vl == vr,
+                                crate::ast::ComparisonOp::Ne => vl != vr,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -3083,6 +3224,13 @@ pub enum StaticErrorKind {
     /// For example, users cannot declare cells or functions named `rect`.
     #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
+    /// Attempted to treat a non-enum object (e.g. a function or local variable) like an enum using the "::"
+    /// operator.
+    #[error("expected an enum")]
+    NotAnEnum,
+    /// Attempted to create a value using an enum variant that is not declared by the enum.
+    #[error("not a variant of the enum: {0}")]
+    InvalidVariant(String),
     /// A cell had an expression in tail position, which is not permitted.
     #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
@@ -3098,6 +3246,9 @@ pub enum StaticErrorKind {
     /// Cannot compare equality or inequality of floating point numbers.
     #[error("cannot compare equality or inequality of floating point numbers")]
     FloatEquality,
+    /// Cannot perform greater/less than comparisons on enum values.
+    #[error("cannot perform greater/less than comparisons on enum values")]
+    EnumsNotOrd,
     /// A type cannot be used in a binary expression.
     #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,

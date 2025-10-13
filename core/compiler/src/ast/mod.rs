@@ -43,6 +43,7 @@ pub enum Decl<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct IdentPath<S, T: AstMetadata> {
     pub path: Vec<Ident<S, T>>,
+    pub metadata: T::IdentPath,
     pub span: cfgrammar::Span,
 }
 
@@ -182,21 +183,14 @@ pub enum Expr<S, T: AstMetadata> {
     UnaryOp(Box<UnaryOpExpr<S, T>>),
     Call(CallExpr<S, T>),
     Emit(Box<EmitExpr<S, T>>),
-    EnumValue(EnumValue<S, T>),
     FieldAccess(Box<FieldAccessExpr<S, T>>),
-    Var(VarExpr<S, T>),
+    IdentPath(IdentPath<S, T>),
     FloatLiteral(FloatLiteral),
     IntLiteral(IntLiteral),
     StringLiteral(StringLiteral<S>),
     BoolLiteral(BoolLiteral),
     Scope(Box<Scope<S, T>>),
     Cast(Box<CastExpr<S, T>>),
-}
-
-#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
-pub struct VarExpr<S, T: AstMetadata> {
-    pub name: Ident<S, T>,
-    pub metadata: T::VarExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -241,14 +235,6 @@ pub struct FieldAccessExpr<S, T: AstMetadata> {
     pub field: Ident<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::FieldAccessExpr,
-}
-
-#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
-pub struct EnumValue<S, T: AstMetadata> {
-    pub name: Ident<S, T>,
-    pub variant: Ident<S, T>,
-    pub span: cfgrammar::Span,
-    pub metadata: T::EnumValue,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -321,9 +307,8 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::UnaryOp(x) => x.span,
             Self::Call(x) => x.span,
             Self::Emit(x) => x.span,
-            Self::EnumValue(x) => x.span,
+            Self::IdentPath(x) => x.span,
             Self::FieldAccess(x) => x.span,
-            Self::Var(x) => x.name.span,
             Self::FloatLiteral(x) => x.span,
             Self::IntLiteral(x) => x.span,
             Self::StringLiteral(x) => x.span,
@@ -336,7 +321,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
 
 pub trait AstMetadata {
     type Ident: Debug + Clone + Serialize + DeserializeOwned;
-    type VarExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type IdentPath: Debug + Clone + Serialize + DeserializeOwned;
     type EnumDecl: Debug + Clone + Serialize + DeserializeOwned;
     type StructDecl: Debug + Clone + Serialize + DeserializeOwned;
     type StructField: Debug + Clone + Serialize + DeserializeOwned;
@@ -349,7 +334,6 @@ pub trait AstMetadata {
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
     type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
-    type EnumValue: Debug + Clone + Serialize + DeserializeOwned;
     type CallExpr: Debug + Clone + Serialize + DeserializeOwned;
     type EmitExpr: Debug + Clone + Serialize + DeserializeOwned;
     type Args: Debug + Clone + Serialize + DeserializeOwned;
@@ -370,11 +354,10 @@ pub trait AstTransformer {
         &mut self,
         input: &Ident<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::Ident;
-    fn dispatch_var_expr(
+    fn dispatch_ident_path(
         &mut self,
-        input: &VarExpr<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr;
+        input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath;
     fn dispatch_enum_decl(
         &mut self,
         input: &EnumDecl<Self::InputS, Self::InputMetadata>,
@@ -445,12 +428,6 @@ pub trait AstTransformer {
         base: &Expr<Self::OutputS, Self::OutputMetadata>,
         field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr;
-    fn dispatch_enum_value(
-        &mut self,
-        input: &EnumValue<Self::InputS, Self::InputMetadata>,
-        name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        variant: &Ident<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue;
     fn dispatch_call_expr(
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
@@ -513,24 +490,18 @@ pub trait AstTransformer {
         &mut self,
         input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> IdentPath<Self::OutputS, Self::OutputMetadata> {
+        let metadata = self.dispatch_ident_path(input);
         IdentPath {
             path: input
                 .path
                 .iter()
                 .map(|ident| self.transform_ident(ident))
                 .collect(),
+            metadata,
             span: input.span,
         }
     }
 
-    fn transform_var_expr(
-        &mut self,
-        input: &VarExpr<Self::InputS, Self::InputMetadata>,
-    ) -> VarExpr<Self::OutputS, Self::OutputMetadata> {
-        let name = self.transform_ident(&input.name);
-        let metadata = self.dispatch_var_expr(input, &name);
-        VarExpr { name, metadata }
-    }
     fn transform_enum_decl(
         &mut self,
         input: &EnumDecl<Self::InputS, Self::InputMetadata>,
@@ -723,21 +694,6 @@ pub trait AstTransformer {
         }
     }
 
-    fn transform_enum_value(
-        &mut self,
-        input: &EnumValue<Self::InputS, Self::InputMetadata>,
-    ) -> EnumValue<Self::OutputS, Self::OutputMetadata> {
-        let name = self.transform_ident(&input.name);
-        let variant = self.transform_ident(&input.variant);
-        let metadata = self.dispatch_enum_value(input, &name, &variant);
-        EnumValue {
-            name,
-            variant,
-            span: input.span,
-            metadata,
-        }
-    }
-
     fn transform_call_expr(
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
@@ -757,6 +713,7 @@ pub trait AstTransformer {
             metadata,
         }
     }
+
     fn transform_emit_expr(
         &mut self,
         input: &EmitExpr<Self::InputS, Self::InputMetadata>,
@@ -886,11 +843,10 @@ pub trait AstTransformer {
             }
             Expr::Call(call_expr) => Expr::Call(self.transform_call_expr(call_expr)),
             Expr::Emit(emit_expr) => Expr::Emit(Box::new(self.transform_emit_expr(emit_expr))),
-            Expr::EnumValue(enum_value) => Expr::EnumValue(self.transform_enum_value(enum_value)),
             Expr::FieldAccess(field_access_expr) => Expr::FieldAccess(Box::new(
                 self.transform_field_access_expr(field_access_expr),
             )),
-            Expr::Var(var_expr) => Expr::Var(self.transform_var_expr(var_expr)),
+            Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
             Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),

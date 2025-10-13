@@ -5,7 +5,7 @@ use compiler::{
     ast::{
         ArgDecl, Args, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
         ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
-        Scope, UnaryOpExpr, VarExpr, annotated::AnnotatedAst,
+        Scope, UnaryOpExpr, annotated::AnnotatedAst,
     },
     parse::ParseMetadata,
 };
@@ -64,11 +64,10 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::Ident {
     }
 
-    fn dispatch_var_expr(
+    fn dispatch_ident_path(
         &mut self,
-        _input: &VarExpr<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::VarExpr {
+        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
     }
 
     fn dispatch_enum_decl(
@@ -232,14 +231,6 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
-    fn dispatch_enum_value(
-        &mut self,
-        _input: &compiler::ast::EnumValue<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
-        _variant: &Ident<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::EnumValue {
-    }
-
     fn dispatch_emit_expr(
         &mut self,
         _input: &compiler::ast::EmitExpr<Substr, Self::InputMetadata>,
@@ -296,11 +287,10 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
             }
             Expr::Call(call_expr) => Expr::Call(self.transform_call_expr(call_expr)),
             Expr::Emit(emit_expr) => Expr::Emit(Box::new(self.transform_emit_expr(emit_expr))),
-            Expr::EnumValue(enum_value) => Expr::EnumValue(self.transform_enum_value(enum_value)),
             Expr::FieldAccess(field_access_expr) => Expr::FieldAccess(Box::new(
                 self.transform_field_access_expr(field_access_expr),
             )),
-            Expr::Var(var_expr) => Expr::Var(self.transform_var_expr(var_expr)),
+            Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
             Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),

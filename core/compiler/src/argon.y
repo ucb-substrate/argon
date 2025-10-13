@@ -34,11 +34,11 @@ Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   ;
 
 IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
-  : Ident { Ok(IdentPath { path: vec![$1?], span: $span }) }
+  : Ident { Ok(IdentPath { path: vec![$1?], metadata: (), span: $span }) }
   | Ident '::' IdentPath { 
     let mut path = vec![$1?];
     path.extend($3?.path);
-    Ok(IdentPath { path, span: $span })
+    Ok(IdentPath { path, metadata: (), span: $span })
   }
   ;
 
@@ -319,8 +319,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
   | CallExpr { Ok(Expr::Call($1?)) }
   | SubFactor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
   | SubFactor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
-  | Ident '::' Ident { Ok(Expr::EnumValue(EnumValue {name: $1?, variant: $3?, span: $span, metadata: (), } )) }
-  | Ident { Ok(Expr::Var(VarExpr { name: $1?, metadata: (), })) }
+  | IdentPath { Ok(Expr::IdentPath($1?)) }
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   | StringLiteral { Ok(Expr::StringLiteral($1?)) }

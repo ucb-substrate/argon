@@ -1,0 +1,13 @@
+enum MyEnum {
+    Variant1,
+    Variant2,
+}
+
+cell top() {
+  let variant = MyEnum::Variant2;
+  if variant == MyEnum::Variant1 {
+    rect("met1", x0=0., y0=0., w=200., h=100.)!;
+  } else {
+    rect("met2", x0=0., y0=0., w=300., h=400.)!;
+  };
+}

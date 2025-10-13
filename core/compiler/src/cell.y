@@ -6,11 +6,11 @@ Ident -> Result<Ident<&'input str, ParseMetadata>, ()>
   ;
 
 IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
-  : Ident { Ok(IdentPath { path: vec![$1?], span: $span }) }
+  : Ident { Ok(IdentPath { path: vec![$1?], metadata: (), span: $span }) }
   | Ident '::' IdentPath { 
     let mut path = vec![$1?];
     path.extend($3?.path);
-    Ok(IdentPath { path, span: $span })
+    Ok(IdentPath { path, metadata: (), span: $span })
   }
   ;
 
@@ -40,7 +40,7 @@ CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
   ;
 
 Expr -> Result<Expr<&'input str, ParseMetadata>, ()>
-  : Ident '::' Ident { Ok(Expr::EnumValue(EnumValue {name: $1?, variant: $3?, span: $span, metadata: (), } )) }
+  : IdentPath { Ok(Expr::IdentPath($1?)) }
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   ;

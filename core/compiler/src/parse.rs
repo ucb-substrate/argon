@@ -27,6 +27,7 @@ pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;
 
 impl AstMetadata for ParseMetadata {
     type Ident = ();
+    type IdentPath = ();
     type EnumDecl = ();
     type StructDecl = ();
     type StructField = ();
@@ -38,7 +39,6 @@ impl AstMetadata for ParseMetadata {
     type UnaryOpExpr = ();
     type ComparisonExpr = ();
     type FieldAccessExpr = ();
-    type EnumValue = ();
     type CallExpr = ();
     type EmitExpr = ();
     type Args = ();
@@ -46,7 +46,6 @@ impl AstMetadata for ParseMetadata {
     type ArgDecl = ();
     type Scope = ();
     type Typ = ();
-    type VarExpr = ();
     type FnDecl = ();
     type CastExpr = ();
 }
