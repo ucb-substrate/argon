@@ -5,7 +5,7 @@ use nalgebra::{DMatrix, DVector};
 use ndarray_linalg::SVD;
 use serde::{Deserialize, Serialize};
 
-const EPSILON: f64 = 1e-10;
+const EPSILON: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Var(u64);
@@ -139,6 +139,10 @@ impl Solver {
             if constraint.coeffs.is_empty()
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
+                println!(
+                    "detected inconsistent constraint, value = {}",
+                    constraint.constant
+                );
                 self.inconsistent = true;
             }
         }
