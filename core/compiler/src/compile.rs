@@ -1045,6 +1045,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
+        let scope_annotation = input
+            .scope_annotation
+            .as_ref()
+            .map(|anno| self.transform_ident(anno));
         let func = IdentPath {
             path: input
                 .func
@@ -1058,6 +1062,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
+            scope_annotation,
             func,
             args,
             span: input.span,
@@ -1287,6 +1292,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         func: &IdentPath<Substr, Self::OutputMetadata>,
         args: &crate::ast::Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
+        if let Some(scope_annotation) = &input.scope_annotation {
+            let span = self.span(scope_annotation.span);
+            let bindings = self.bindings.last_mut().unwrap();
+            if bindings.scope_bindings.contains(&scope_annotation.name) {
+                self.errors.push(StaticError {
+                    span,
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            bindings
+                .scope_bindings
+                .insert(scope_annotation.name.clone());
+        }
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
@@ -1751,7 +1769,7 @@ impl<'a> ExecPass<'a> {
                 _ => None,
             })
             .expect("cell not found");
-        let cell_id = self.execute_cell(vid, input.args);
+        let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
         let layers =
             klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
                 .unwrap()
@@ -1774,7 +1792,12 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    pub(crate) fn execute_cell(&mut self, cell: VarId, args: Vec<CellArg>) -> CellId {
+    pub(crate) fn execute_cell(
+        &mut self,
+        cell: VarId,
+        args: Vec<CellArg>,
+        scope_annotation: Option<&str>,
+    ) -> CellId {
         let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
@@ -1798,6 +1821,7 @@ impl<'a> ExecPass<'a> {
         let fid = self.frame_id();
         self.frames.insert(fid, frame);
 
+        let root_scope_id = self.scope_id();
         let root_scope = ExecScope {
             parent: None,
             static_parent: None,
@@ -1805,10 +1829,13 @@ impl<'a> ExecPass<'a> {
                 path: cell_decl.metadata.0.clone(),
                 span: cell_decl.scope.span,
             },
-            name: format!("cell {}", &cell_decl.name.name),
+            name: if let Some(anno) = scope_annotation {
+                format!("{} cell {}", anno, &cell_decl.name.name)
+            } else {
+                format!("cell {} {}", &cell_decl.name.name, root_scope_id.0)
+            },
             bindings: Default::default(),
         };
-        let root_scope_id = self.scope_id();
 
         let cell_id = self.alloc_id();
         self.partial_cells.push_back(cell_id);
@@ -2315,7 +2342,14 @@ impl<'a> ExecPass<'a> {
                                 loc.cell,
                                 loc.scope,
                                 None,
-                                ExecScopeName::Specified(format!("fn {}", val.name.name)),
+                                if let Some(anno) = &c.scope_annotation {
+                                    ExecScopeName::Specified(format!(
+                                        "{} fn {}",
+                                        anno.name, val.name.name
+                                    ))
+                                } else {
+                                    ExecScopeName::Prefix(format!("fn {}", val.name.name))
+                                },
                                 Span {
                                     path: val.metadata.0.clone(),
                                     span: val.scope.span,
@@ -2703,7 +2737,14 @@ impl<'a> ExecPass<'a> {
                         })
                         .collect::<Option<Vec<CellArg>>>();
                     if let Some(arg_vals) = arg_vals {
-                        let cell = self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals);
+                        let cell = self.execute_cell(
+                            c.expr.metadata.0.unwrap(),
+                            arg_vals,
+                            c.expr
+                                .scope_annotation
+                                .as_ref()
+                                .map(|anno| anno.name.as_str()),
+                        );
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {

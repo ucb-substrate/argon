@@ -214,7 +214,17 @@ Statement -> Result<Statement<&'input str, ParseMetadata>, ()>
   ;
 
 ScopeAnnotation -> Result<Ident<&'input str, ParseMetadata>, ()>
-    : 'ANNOTATION' { Ok(Ident { span: $span, name: &$lexer.span_str($span)[1..], metadata: () }) }
+    : 'ANNOTATION' 
+    { 
+        Ok(Ident {
+            span: cfgrammar::Span::new(
+                $span.start() + 1,
+                $span.end(),
+            ),
+            name: &$lexer.span_str($span)[1..],
+            metadata: ()
+        })
+    }
     ;
 
 UnannotatedScope -> Result<Scope<&'input str, ParseMetadata>, ()>
@@ -337,9 +347,20 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
 
 
 CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
-  : IdentPath '(' Args ')'
+  : ScopeAnnotation IdentPath '(' Args ')'
     {
       Ok(CallExpr {
+        scope_annotation: Some($1?),
+        func: $2?,
+        args: $4?,
+        span: $span,
+        metadata: (),
+      })
+    }
+  | IdentPath '(' Args ')'
+    {
+      Ok(CallExpr {
+        scope_annotation: None,
         func: $1?,
         args: $3?,
         span: $span,

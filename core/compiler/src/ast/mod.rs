@@ -255,6 +255,7 @@ pub struct FieldAccessExpr<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct CallExpr<S, T: AstMetadata> {
+    pub scope_annotation: Option<Ident<S, T>>,
     pub func: IdentPath<S, T>,
     pub args: Args<S, T>,
     pub span: cfgrammar::Span,
@@ -743,10 +744,15 @@ pub trait AstTransformer {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
+        let scope_annotation = input
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
         let func = self.transform_ident_path(&input.func);
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
+            scope_annotation,
             func,
             args,
             span: input.span,

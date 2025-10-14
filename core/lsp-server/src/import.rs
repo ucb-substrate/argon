@@ -17,7 +17,7 @@ pub(crate) struct ScopeAnnotationPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
     content: Document,
     assigned_names: Vec<HashSet<String>>,
-    ids: Vec<usize>,
+    to_add: Vec<Vec<Range>>,
     edits: Vec<TextEdit>,
 }
 
@@ -27,7 +27,7 @@ impl<'a> ScopeAnnotationPass<'a> {
             ast,
             content: Document::new(&ast.text, 0),
             assigned_names: vec![Default::default()],
-            ids: vec![Default::default()],
+            to_add: vec![Default::default()],
             edits: vec![],
         }
     }
@@ -119,20 +119,11 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
                 .unwrap()
                 .insert(scope_annotation.name.to_string());
         } else {
-            let name = loop {
-                let name = format!("scope{}", self.ids.last().unwrap());
-                *self.ids.last_mut().unwrap() += 1;
-                let names = self.assigned_names.last_mut().unwrap();
-                if !names.contains(&name) {
-                    names.insert(name.clone());
-                    break name;
-                }
-            };
             let start = self.content.offset_to_pos(input.span.start());
-            self.edits.push(TextEdit {
-                range: Range::new(start, start),
-                new_text: format!("#{name} "),
-            });
+            self.to_add
+                .last_mut()
+                .unwrap()
+                .push(Range::new(start, start));
         }
     }
 
@@ -177,15 +168,32 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
 
     fn dispatch_call_expr(
         &mut self,
-        _input: &CallExpr<Substr, Self::InputMetadata>,
+        input: &CallExpr<Substr, Self::InputMetadata>,
         _func: &IdentPath<Substr, Self::OutputMetadata>,
         _args: &Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
+        if ["crect", "rect", "float", "eq", "dimension", "inst"]
+            .contains(&input.func.path.last().unwrap().name.as_str())
+        {
+            return;
+        }
+        if let Some(scope_annotation) = &input.scope_annotation {
+            self.assigned_names
+                .last_mut()
+                .unwrap()
+                .insert(scope_annotation.name.to_string());
+        } else {
+            let start = self.content.offset_to_pos(input.span.start());
+            self.to_add
+                .last_mut()
+                .unwrap()
+                .push(Range::new(start, start));
+        }
     }
 
     fn enter_scope(&mut self, _input: &Scope<Substr, Self::InputMetadata>) {
         self.assigned_names.push(Default::default());
-        self.ids.push(Default::default());
+        self.to_add.push(Default::default());
     }
 
     fn exit_scope(
@@ -193,8 +201,26 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         _input: &Scope<Substr, Self::InputMetadata>,
         _output: &Scope<Substr, Self::OutputMetadata>,
     ) {
-        self.assigned_names.pop();
-        self.ids.pop();
+        if let Some(mut to_add) = self.to_add.pop()
+            && let Some(mut assigned_names) = self.assigned_names.pop()
+        {
+            to_add.reverse();
+            let mut id = 0;
+            while let Some(range) = to_add.pop() {
+                let name = loop {
+                    let name = format!("scope{}", id);
+                    id += 1;
+                    if !assigned_names.contains(&name) {
+                        assigned_names.insert(name.clone());
+                        break name;
+                    }
+                };
+                self.edits.push(TextEdit {
+                    range,
+                    new_text: format!("#{name} "),
+                });
+            }
+        }
     }
 
     fn dispatch_let_binding(
@@ -285,20 +311,11 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
                         .unwrap()
                         .insert(scope_annotation.name.to_string());
                 } else {
-                    let name = loop {
-                        let name = format!("scope{}", self.ids.last().unwrap());
-                        *self.ids.last_mut().unwrap() += 1;
-                        let names = self.assigned_names.last_mut().unwrap();
-                        if !names.contains(&name) {
-                            names.insert(name.clone());
-                            break name;
-                        }
-                    };
                     let start = self.content.offset_to_pos(scope.span.start());
-                    self.edits.push(TextEdit {
-                        range: Range::new(start, start),
-                        new_text: format!("#{name} "),
-                    });
+                    self.to_add
+                        .last_mut()
+                        .unwrap()
+                        .push(Range::new(start, start));
                 }
                 Expr::Scope(Box::new(self.transform_scope(scope)))
             }

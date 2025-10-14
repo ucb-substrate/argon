@@ -15,18 +15,18 @@ fn min(x0: Float, x1: Float) -> Float {
 }
 
 fn intersection(rect1: Rect, rect2: Rect) -> Rect {
-    let intersection_x0 = max(rect1.x0, rect2.x0);
-    let intersection_y0 = max(rect1.y0, rect2.y0);
-    let intersection_x1 = min(rect1.x1, rect2.x1);
-    let intersection_y1 = min(rect1.y1, rect2.y1);
+    let intersection_x0 = #scope0 max(rect1.x0, rect2.x0);
+    let intersection_y0 = #scope1 max(rect1.y0, rect2.y0);
+    let intersection_x1 = #scope2 min(rect1.x1, rect2.x1);
+    let intersection_y1 = #scope3 min(rect1.y1, rect2.y1);
     crect(x0=intersection_x0, y0=intersection_y0, x1=intersection_x1, y1=intersection_y1)
 }
 
 fn bbox(rect1: Rect, rect2: Rect) -> Rect {
-    let bbox_x0 = min(rect1.x0, rect2.x0);
-    let bbox_y0 = min(rect1.y0, rect2.y0);
-    let bbox_x1 = max(rect1.x1, rect2.x1);
-    let bbox_y1 = max(rect1.y1, rect2.y1);
+    let bbox_x0 = #scope0 min(rect1.x0, rect2.x0);
+    let bbox_y0 = #scope1 min(rect1.y0, rect2.y0);
+    let bbox_x1 = #scope2 max(rect1.x1, rect2.x1);
+    let bbox_y1 = #scope3 max(rect1.y1, rect2.y1);
     crect(x0=bbox_x0, y0=bbox_y0, x1=bbox_x1, y1=bbox_y1)
 }
 
@@ -37,7 +37,7 @@ fn array(r: Rect, n: Int, xpitch: Float, ypitch: Float) -> Rect {
         eq(first_rect.h, r.h);
         first_rect
     } else {
-        let subarray = array(r, n - 1, xpitch, ypitch);
+        let subarray = #scope2 array(r, n - 1, xpitch, ypitch);
         let first_rect = rect(r.layer)!;
         eq(first_rect.w, r.w);
         eq(first_rect.h, r.h);
@@ -64,10 +64,10 @@ fn array(r: Rect, n: Int, xpitch: Float, ypitch: Float) -> Rect {
 
 fn array2(r: Rect, nx: Int, ny: Int, xpitch: Float, ypitch: Float) -> Rect {
     #scope0 if ny == 1 {
-        array(r, nx, xpitch, 0.)
+        #scope0 array(r, nx, xpitch, 0.)
     } else {
-        let subarray = array2(r, nx, ny-1, xpitch, ypitch);
-        let first_rect = array(r, nx, xpitch, 0.);
+        let subarray = #scope1 array2(r, nx, ny-1, xpitch, ypitch);
+        let first_rect = #scope2 array(r, nx, xpitch, 0.);
         eq(first_rect.x0, subarray.x0);
         eq(first_rect.y0 + ypitch, subarray.y0);
         let out_rect = crect();
@@ -87,7 +87,7 @@ fn array2(r: Rect, nx: Int, ny: Int, xpitch: Float, ypitch: Float) -> Rect {
 fn max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect {
     let nx = (((w - r.w) / xpitch) as Int + 1);
     let ny = (((h - r.h) / ypitch) as Int + 1);
-    array2(r, nx, ny, xpitch, ypitch)
+    #scope0 array2(r, nx, ny, xpitch, ypitch)
 }
 
 fn eq_rect(r1: Rect, r2: Rect) {
