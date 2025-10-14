@@ -4,7 +4,10 @@ use gpui::*;
 use indexmap::IndexMap;
 
 use crate::{
-    editor::{CompileOutputState, Layers, ScopeAddress},
+    editor::{
+        CompileOutputState, Layers, ScopeAddress,
+        canvas::{LayoutCanvas, ToolState},
+    },
     theme::THEME,
 };
 
@@ -136,16 +139,23 @@ impl Render for LayerSideBar {
 
 pub struct HierarchySideBar {
     solved_cell: Entity<Option<CompileOutputState>>,
+    tool: Entity<ToolState>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
 
 impl HierarchySideBar {
-    pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        state: &Entity<EditorState>,
+        canvas: &Entity<LayoutCanvas>,
+    ) -> Self {
         let solved_cell = state.read(cx).solved_cell.clone();
+        let tool = canvas.read(cx).tool.clone();
         let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
         Self {
             solved_cell,
+            tool,
             subscriptions,
         }
     }

@@ -11,7 +11,10 @@ use unicode_segmentation::*;
 
 use crate::{
     actions::*,
-    editor::{EditorState, canvas::DimToolState},
+    editor::{
+        EditorState,
+        canvas::{EditDimToolState, LayoutCanvas, SelectToolState, ToolState},
+    },
 };
 
 pub(crate) struct TextInput {
@@ -25,7 +28,7 @@ pub(crate) struct TextInput {
     pub(crate) last_layout: Option<ShapedLine>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) is_selecting: bool,
-    pub(crate) dim_tool: Entity<Option<DimToolState>>,
+    pub(crate) tool: Entity<ToolState>,
     pub(crate) state: Entity<EditorState>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
@@ -36,16 +39,16 @@ impl TextInput {
         cx: &mut Context<Self>,
         window: &mut Window,
         focus_handle: FocusHandle,
-        canvas_focus_handle: FocusHandle,
-        dim_tool: Entity<Option<DimToolState>>,
         state: &Entity<EditorState>,
+        canvas: &Entity<LayoutCanvas>,
     ) -> Self {
         let subscriptions = vec![cx.on_focus(&focus_handle, window, |input, _window, _cx| {
             input.selected_range = 0..input.content.len();
         })];
+        let canvas = canvas.read(cx);
         TextInput {
             focus_handle,
-            canvas_focus_handle,
+            canvas_focus_handle: canvas.focus_handle(cx),
             content: "".into(),
             placeholder: "Type here...".into(),
             selected_range: 0..0,
@@ -54,7 +57,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            dim_tool,
+            tool: canvas.tool.clone(),
             state: state.clone(),
             subscriptions,
         }
@@ -212,83 +215,27 @@ impl TextInput {
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
-        self.dim_tool.update(cx, |dim_tool, _cx| {
-            if let Some(dim_tool) = dim_tool
-                && !dim_tool.edges.is_empty()
-            {
-                dim_tool.edges.clear();
+        self.tool.update(cx, |tool, _cx| {
+            if let ToolState::EditDim(_) = tool {
+                *tool = ToolState::default();
             }
         });
     }
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        let (_yield_, reset) = self.dim_tool.update(cx, |dim_tool, cx| {
-            if let Some(dim_tool) = dim_tool {
-                if dim_tool.edges.is_empty() {
-                    return (true, false);
+        let reset = self.tool.update(cx, |tool, cx| {
+            if let ToolState::EditDim(EditDimToolState { dim }) = tool {
+                if let Some(span) = self
+                    .state
+                    .read(cx)
+                    .lsp_client
+                    .edit_dimension(dim.clone(), self.content.to_string())
+                {
+                    *dim = span;
+                    return true;
                 }
-                let success = self.state.update(cx, |state, cx| {
-                    state.solved_cell.update(cx, |cell, cx| {
-                        if let Some(cell) = cell.as_mut() {
-                            let selected_scope_addr = cell.state[&cell.selected_scope].address;
-                            let value = if let Ok(value) = self.content.parse::<f32>() {
-                                value
-                            } else {
-                                return false;
-                            };
-
-                            if dim_tool.edges.len() == 1 {
-                                let (left, right) = match dim_tool.edges[0].1.as_str() {
-                                    "x0" | "x1" => ("y0", "y1"),
-                                    _ => ("x0", "x1"),
-                                };
-                                state.lsp_client.add_eq_constraint(
-                                    cell.output.cells[&selected_scope_addr.cell].scopes
-                                        [&selected_scope_addr.scope]
-                                        .span
-                                        .clone(),
-                                    format!(
-                                        "{}.{} - {}.{}",
-                                        dim_tool.edges[0].0, right, dim_tool.edges[0].0, left
-                                    ),
-                                    format!("{:?}", value),
-                                );
-                                cx.notify();
-                            } else if dim_tool.edges.len() == 2 {
-                                let (left, right) =
-                                    if dim_tool.edges[0].2.coord < dim_tool.edges[1].2.coord {
-                                        (0, 1)
-                                    } else {
-                                        (1, 0)
-                                    };
-                                state.lsp_client.add_eq_constraint(
-                                    cell.output.cells[&selected_scope_addr.cell].scopes
-                                        [&selected_scope_addr.scope]
-                                        .span
-                                        .clone(),
-                                    format!(
-                                        "{}.{} - {}.{}",
-                                        dim_tool.edges[right].0,
-                                        dim_tool.edges[right].1,
-                                        dim_tool.edges[left].0,
-                                        dim_tool.edges[left].1
-                                    ),
-                                    format!("{:?}", value),
-                                );
-                                cx.notify();
-                            }
-                            return true;
-                        }
-                        false
-                    })
-                });
-                if success {
-                    dim_tool.edges.clear();
-                    return (false, true);
-                }
-                return (false, false);
             }
-            (true, false)
+            false
         });
         if reset {
             self.reset();

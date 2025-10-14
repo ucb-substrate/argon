@@ -10,7 +10,7 @@ use futures::{
     prelude::*,
 };
 use gpui::AsyncApp;
-use lsp_server::rpc::{GuiToLspClient, LspToGui};
+use lsp_server::rpc::{DimensionParams, GuiToLspClient, LspToGui};
 use portpicker::pick_unused_port;
 use tarpc::{
     context,
@@ -104,7 +104,6 @@ impl SyncGuiToLspClient {
             .detach();
     }
 
-    // TODO: Improve API.
     pub fn select_rect(&self, span: Span) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
@@ -118,8 +117,12 @@ impl SyncGuiToLspClient {
         );
     }
 
-    // TODO: Improve API.
-    pub fn draw_rect(&self, scope_span: Span, var_name: String, rect: BasicRect<f64>) {
+    pub fn draw_rect(
+        &self,
+        scope_span: Span,
+        var_name: String,
+        rect: BasicRect<f64>,
+    ) -> Option<Span> {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
             async move {
@@ -129,7 +132,33 @@ impl SyncGuiToLspClient {
                     .unwrap()
             }
             .compat(),
-        );
+        )
+    }
+
+    pub fn draw_dimension(&self, scope_span: Span, params: DimensionParams) -> Option<Span> {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .draw_dimension(context::current(), scope_span, params)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        )
+    }
+
+    pub fn edit_dimension(&self, span: Span, value: String) -> Option<Span> {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .edit_dimension(context::current(), span, value)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        )
     }
 
     pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) {

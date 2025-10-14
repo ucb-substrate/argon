@@ -5,7 +5,8 @@ use std::{
 };
 
 use compiler::{
-    compile::{self, ObjectId, SolvedValue, ifmatvec},
+    ast::Span,
+    compile::{self, CellId, ObjectId, SolvedValue, ifmatvec},
     solver::Var,
 };
 use enumify::enumify;
@@ -19,6 +20,7 @@ use gpui::{
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
+use lsp_server::rpc::DimensionParams;
 
 use crate::{
     actions::{All, Cancel, DrawDim, DrawRect, Fit, One, Zero},
@@ -31,26 +33,13 @@ pub enum ShapeFill {
     Solid,
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
-pub struct ElementId {
-    scope: ScopeAddress,
-    idx: usize,
-}
-
-#[enumify]
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
-pub enum RectId {
-    Element(ElementId),
-    Scope(ScopeAddress),
-}
-
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
     pub x0: f32,
     pub x1: f32,
     pub y0: f32,
     pub y1: f32,
-    pub id: Option<RectId>,
+    pub id: Option<Span>,
     /// Empty if not accessible.
     pub object_path: Vec<ObjectId>,
 }
@@ -122,7 +111,7 @@ impl Rect {
             y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
             x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-            id: self.id,
+            id: self.id.clone(),
             object_path: self.object_path.clone(),
         }
     }
@@ -137,17 +126,45 @@ pub fn intersect(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> Option<Bounds<Pixels
     Some(Bounds::from_corners(origin, br))
 }
 
-// ~TextElement
 pub struct CanvasElement {
     inner: Entity<LayoutCanvas>,
 }
 
-struct RectToolState {
+pub(crate) struct DrawRectToolState {
     p0: Option<Point<f32>>,
 }
 
-pub(crate) struct DimToolState {
+pub(crate) struct DrawDimToolState {
     pub(crate) edges: Vec<(String, String, Edge<f32>)>,
+}
+
+pub(crate) struct EditDimToolState {
+    pub(crate) dim: Span,
+}
+
+// TODO: potentially re-use compiler provided object IDs
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub struct GlobalObjectId {
+    scope: ScopeAddress,
+    idx: usize,
+}
+
+pub(crate) struct SelectToolState {
+    pub(crate) selected_obj: Option<Span>,
+}
+
+#[enumify]
+pub(crate) enum ToolState {
+    DrawRect(DrawRectToolState),
+    DrawDim(DrawDimToolState),
+    EditDim(EditDimToolState),
+    Select(SelectToolState),
+}
+
+impl Default for ToolState {
+    fn default() -> Self {
+        ToolState::Select(SelectToolState { selected_obj: None })
+    }
 }
 
 pub struct LayoutCanvas {
@@ -160,9 +177,7 @@ pub struct LayoutCanvas {
     is_dragging: bool,
     drag_start: Point<Pixels>,
     offset_start: Point<Pixels>,
-    // rectangle drawing state
-    rect_tool: Option<RectToolState>,
-    pub(crate) dim_tool: Entity<Option<DimToolState>>,
+    pub(crate) tool: Entity<ToolState>,
     mouse_position: Point<Pixels>,
     // zoom state
     scale: f32,
@@ -315,8 +330,7 @@ impl Element for CanvasElement {
         });
         let inner = self.inner.read(cx);
         let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
-        let selected_rect = solved_cell.as_ref().and_then(|cell| cell.selected_rect);
-        let mut selected_rect_transformations = Vec::new();
+        let tool = inner.tool.read(cx);
         let state = inner.state.read(cx);
         let layers = state.layers.read(cx);
 
@@ -324,6 +338,7 @@ impl Element for CanvasElement {
         let mut rects = Vec::new();
         let mut scope_rects = Vec::new();
         let mut select_rects = Vec::new();
+        let mut dim_edges = Vec::new();
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let mut queue = VecDeque::from_iter([(
@@ -346,17 +361,6 @@ impl Element for CanvasElement {
                 path,
             )) = queue.pop_front()
             {
-                if let Some(selected_rect) = selected_rect
-                    && Some(curr_address)
-                        == match selected_rect {
-                            RectId::Scope(id) => {
-                                solved_cell.state[&solved_cell.scope_paths[&id]].parent
-                            }
-                            RectId::Element(id) => Some(id.scope),
-                        }
-                {
-                    selected_rect_transformations.push((mat, ofs));
-                }
                 let cell_info = &solved_cell.output.cells[&cell];
                 let scope_info = &cell_info.scopes[&scope];
                 let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
@@ -364,18 +368,25 @@ impl Element for CanvasElement {
                     if let Some(bbox) = &scope_state.bbox {
                         let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
                         let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
-                        scope_rects.push(Rect {
+                        let rect = Rect {
                             x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
                             y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
                             x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
                             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                            id: Some(RectId::Scope(curr_address)),
+                            id: Some(scope_info.span.clone()),
                             object_path: Vec::new(),
-                        });
+                        };
+                        if let ToolState::Select(SelectToolState { selected_obj }) =
+                            inner.tool.read(cx)
+                            && &rect.id == selected_obj
+                        {
+                            select_rects.push(rect.clone());
+                        }
+                        scope_rects.push(rect);
                     }
                     show = false;
                 }
-                for (i, (obj, _)) in scope_info.emit.iter().enumerate() {
+                for (obj, _) in &scope_info.emit {
                     let mut object_path = path.clone();
                     object_path.push(*obj);
                     let value = &cell_info.objects[obj];
@@ -391,20 +402,21 @@ impl Element for CanvasElement {
                                 if let Some(layer) = layer
                                     && layer.visible
                                 {
-                                    rects.push((
-                                        Rect {
-                                            x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                                            y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                                            x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                                            y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                                            id: Some(RectId::Element(ElementId {
-                                                scope: curr_address,
-                                                idx: i,
-                                            })),
-                                            object_path,
-                                        },
-                                        layer.clone(),
-                                    ));
+                                    let rect = Rect {
+                                        x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                                        y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                                        x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                                        y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                                        id: rect.span.clone(),
+                                        object_path,
+                                    };
+                                    if let ToolState::Select(SelectToolState { selected_obj }) =
+                                        inner.tool.read(cx)
+                                        && &rect.id == selected_obj
+                                    {
+                                        select_rects.push(rect.clone());
+                                    }
+                                    rects.push((rect, layer.clone()));
                                 }
                             }
                         }
@@ -430,17 +442,21 @@ impl Element for CanvasElement {
                                 if let Some(bbox) = &scope_state.bbox {
                                     let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
                                     let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
-                                    scope_rects.push(Rect {
+                                    let rect = Rect {
                                         x0: (p0p.0.min(p1p.0) + new_ofs.0) as f32,
                                         y0: (p0p.1.min(p1p.1) + new_ofs.1) as f32,
                                         x1: (p0p.0.max(p1p.0) + new_ofs.0) as f32,
                                         y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
-                                        id: Some(RectId::Element(ElementId {
-                                            scope: curr_address,
-                                            idx: i,
-                                        })),
+                                        id: Some(inst.span.clone()),
                                         object_path: object_path.clone(),
-                                    });
+                                    };
+                                    if let ToolState::Select(SelectToolState { selected_obj }) =
+                                        inner.tool.read(cx)
+                                        && &rect.id == selected_obj
+                                    {
+                                        select_rects.push(rect.clone());
+                                    }
+                                    scope_rects.push(rect);
                                 }
                                 show = false;
                             }
@@ -464,72 +480,30 @@ impl Element for CanvasElement {
                     queue.push_back((scope_address, mat, ofs, depth + 1, show, path.clone()));
                 }
             }
-            if let Some(selected_rect) = selected_rect {
-                let r = match selected_rect {
-                    RectId::Scope(id) => solved_cell.state[&solved_cell.scope_paths[&id]]
-                        .bbox
-                        .clone()
-                        .map(|r| r.into()),
-                    RectId::Element(id) => match &solved_cell.output.cells[&id.scope.cell].objects
-                        [&solved_cell.output.cells[&id.scope.cell].scopes[&id.scope.scope].emit
-                            [id.idx]
-                            .0]
-                    {
-                        SolvedValue::Rect(r) => Some(r.clone().into()),
-                        SolvedValue::Instance(inst) => {
-                            let inst_address = ScopeAddress {
-                                scope: solved_cell.output.cells[&inst.cell].root,
-                                cell: inst.cell,
-                            };
-                            let scope_state =
-                                &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
-                            scope_state.bbox.as_ref().map(|rect| {
-                                let mut inst_mat = TransformationMatrix::identity();
-                                if inst.reflect {
-                                    inst_mat = inst_mat.reflect_vert()
-                                }
-                                inst_mat = inst_mat.rotate(inst.angle);
-                                let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
-                                let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
-                                Rect {
-                                    x0: (p0p.0.min(p1p.0) + inst.x) as f32,
-                                    y0: (p0p.1.min(p1p.1) + inst.y) as f32,
-                                    x1: (p0p.0.max(p1p.0) + inst.x) as f32,
-                                    y1: (p0p.1.max(p1p.1) + inst.y) as f32,
-                                    id: None,
-                                    object_path: Vec::new(),
-                                }
-                            })
-                        }
-                        _ => None,
-                    },
-                };
-                if let Some(r) = r {
-                    for (mat, ofs) in selected_rect_transformations {
-                        select_rects.push(r.transform(mat, ofs));
-                    }
+
+            let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
+            match tool {
+                ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) => {
+                    rects.push((
+                        Rect {
+                            object_path: Vec::new(),
+                            x0: p0.x.min(layout_mouse_position.x),
+                            y0: p0.y.min(layout_mouse_position.y),
+                            x1: p0.x.max(layout_mouse_position.x),
+                            y1: p0.y.max(layout_mouse_position.y),
+                            id: None,
+                        },
+                        layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
+                    ));
                 }
+                ToolState::DrawDim(DrawDimToolState { edges }) => {
+                    dim_edges.extend_from_slice(edges);
+                }
+                _ => {}
             }
         }
 
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
-        if let Some(RectToolState { p0: Some(p0) }) = &inner.rect_tool {
-            rects.push((
-                Rect {
-                    object_path: Vec::new(),
-                    x0: p0.x.min(layout_mouse_position.x),
-                    y0: p0.y.min(layout_mouse_position.y),
-                    x1: p0.x.max(layout_mouse_position.x),
-                    y1: p0.y.max(layout_mouse_position.y),
-                    id: None,
-                },
-                layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
-            ));
-        }
-        let dim_edges = inner.dim_tool.read(cx).as_ref().map(|state| {
-            select_rects = Vec::new();
-            state.edges.clone()
-        });
         let rects = rects
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
@@ -582,192 +556,180 @@ impl Element for CanvasElement {
                     }
 
                     // draw dimension lines
-                    if let Some(dim_edges) = dim_edges {
-                        if dim_edges.len() == 1 {
-                            let edge = &dim_edges[0].2;
+                    if dim_edges.len() == 1 {
+                        let edge = &dim_edges[0].2;
+                        let (x0, y0, x1, y1) = match edge.dir {
+                            Dir::Horiz => (
+                                edge.start,
+                                edge.coord,
+                                edge.start,
+                                layout_mouse_position.y
+                                    + if layout_mouse_position.y > edge.coord {
+                                        5. / scale
+                                    } else {
+                                        -5. / scale
+                                    },
+                            ),
+                            Dir::Vert => (
+                                edge.coord,
+                                edge.start,
+                                layout_mouse_position.x
+                                    + if layout_mouse_position.x > edge.coord {
+                                        5. / scale
+                                    } else {
+                                        -5. / scale
+                                    },
+                                edge.start,
+                            ),
+                        };
+                        let start_line = Rect {
+                            object_path: Vec::new(),
+                            x0: x0.min(x1),
+                            y0: y0.min(y1),
+                            x1: x0.max(x1),
+                            y1: y0.max(y1),
+                            id: None,
+                        };
+                        let (x0, y0, x1, y1) = match edge.dir {
+                            Dir::Horiz => (
+                                edge.stop,
+                                edge.coord,
+                                edge.stop,
+                                layout_mouse_position.y
+                                    + if layout_mouse_position.y > edge.coord {
+                                        5. / scale
+                                    } else {
+                                        -5. / scale
+                                    },
+                            ),
+                            Dir::Vert => (
+                                edge.coord,
+                                edge.stop,
+                                layout_mouse_position.x
+                                    + if layout_mouse_position.x > edge.coord {
+                                        5. / scale
+                                    } else {
+                                        -5. / scale
+                                    },
+                                edge.stop,
+                            ),
+                        };
+                        let stop_line = Rect {
+                            object_path: Vec::new(),
+                            x0: x0.min(x1),
+                            y0: y0.min(y1),
+                            x1: x0.max(x1),
+                            y1: y0.max(y1),
+                            id: None,
+                        };
+                        let (x0, y0, x1, y1) = match edge.dir {
+                            Dir::Horiz => (
+                                edge.start,
+                                layout_mouse_position.y,
+                                edge.stop,
+                                layout_mouse_position.y,
+                            ),
+                            Dir::Vert => (
+                                layout_mouse_position.x,
+                                edge.start,
+                                layout_mouse_position.x,
+                                edge.stop,
+                            ),
+                        };
+                        let dim_line = Rect {
+                            object_path: Vec::new(),
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            id: None,
+                        };
+                        for r in &[start_line, stop_line, dim_line] {
+                            if let Some(quad) =
+                                get_paint_path(r, bounds, scale, offset, rgb(0xffffff), Pixels(2.))
+                            {
+                                window.paint_quad(quad);
+                            }
+                        }
+                    } else if dim_edges.len() == 2 {
+                        let edge0 = &dim_edges[0].2;
+                        let edge1 = &dim_edges[1].2;
+                        let [line0, line1] = [edge0, edge1].map(|edge| {
                             let (x0, y0, x1, y1) = match edge.dir {
                                 Dir::Horiz => (
-                                    edge.start,
+                                    edge.start.min(layout_mouse_position.x - 5.),
                                     edge.coord,
-                                    edge.start,
-                                    layout_mouse_position.y
-                                        + if layout_mouse_position.y > edge.coord {
-                                            5. / scale
-                                        } else {
-                                            -5. / scale
-                                        },
+                                    edge.stop.max(layout_mouse_position.x + 5.),
+                                    edge.coord,
                                 ),
                                 Dir::Vert => (
                                     edge.coord,
-                                    edge.start,
-                                    layout_mouse_position.x
-                                        + if layout_mouse_position.x > edge.coord {
-                                            5. / scale
-                                        } else {
-                                            -5. / scale
-                                        },
-                                    edge.start,
+                                    edge.start.min(layout_mouse_position.y - 5.),
+                                    edge.coord,
+                                    edge.stop.max(layout_mouse_position.y + 5.),
                                 ),
                             };
-                            let start_line = Rect {
+                            Rect {
                                 object_path: Vec::new(),
                                 x0: x0.min(x1),
                                 y0: y0.min(y1),
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
-                            };
-                            let (x0, y0, x1, y1) = match edge.dir {
-                                Dir::Horiz => (
-                                    edge.stop,
-                                    edge.coord,
-                                    edge.stop,
-                                    layout_mouse_position.y
-                                        + if layout_mouse_position.y > edge.coord {
-                                            5. / scale
-                                        } else {
-                                            -5. / scale
-                                        },
-                                ),
-                                Dir::Vert => (
-                                    edge.coord,
-                                    edge.stop,
-                                    layout_mouse_position.x
-                                        + if layout_mouse_position.x > edge.coord {
-                                            5. / scale
-                                        } else {
-                                            -5. / scale
-                                        },
-                                    edge.stop,
-                                ),
-                            };
-                            let stop_line = Rect {
-                                object_path: Vec::new(),
-                                x0: x0.min(x1),
-                                y0: y0.min(y1),
-                                x1: x0.max(x1),
-                                y1: y0.max(y1),
-                                id: None,
-                            };
-                            let (x0, y0, x1, y1) = match edge.dir {
-                                Dir::Horiz => (
-                                    edge.start,
-                                    layout_mouse_position.y,
-                                    edge.stop,
-                                    layout_mouse_position.y,
-                                ),
-                                Dir::Vert => (
-                                    layout_mouse_position.x,
-                                    edge.start,
-                                    layout_mouse_position.x,
-                                    edge.stop,
-                                ),
-                            };
-                            let dim_line = Rect {
+                            }
+                        });
+                        let (x0, y0, x1, y1) = match edge0.dir {
+                            Dir::Horiz => (
+                                layout_mouse_position.x,
+                                edge0.coord,
+                                layout_mouse_position.x,
+                                edge1.coord,
+                            ),
+                            Dir::Vert => (
+                                edge0.coord,
+                                layout_mouse_position.y,
+                                edge1.coord,
+                                layout_mouse_position.y,
+                            ),
+                        };
+                        let dim_line = Rect {
+                            object_path: Vec::new(),
+                            x0: x0.min(x1),
+                            y0: y0.min(y1),
+                            x1: x0.max(x1),
+                            y1: y0.max(y1),
+                            id: None,
+                        };
+                        for r in &[line0, line1, dim_line] {
+                            if let Some(quad) =
+                                get_paint_path(r, bounds, scale, offset, rgb(0xffffff), Pixels(2.))
+                            {
+                                window.paint_quad(quad);
+                            }
+                        }
+                    }
+                    // highlight selected edges
+                    for (_, _, edge) in &dim_edges {
+                        let (x0, y0, x1, y1) = match edge.dir {
+                            Dir::Horiz => (edge.start, edge.coord, edge.stop, edge.coord),
+                            Dir::Vert => (edge.coord, edge.start, edge.coord, edge.stop),
+                        };
+                        if let Some(quad) = get_paint_path(
+                            &Rect {
                                 object_path: Vec::new(),
                                 x0,
                                 y0,
                                 x1,
                                 y1,
                                 id: None,
-                            };
-                            for r in &[start_line, stop_line, dim_line] {
-                                if let Some(quad) = get_paint_path(
-                                    r,
-                                    bounds,
-                                    scale,
-                                    offset,
-                                    rgb(0xffffff),
-                                    Pixels(2.),
-                                ) {
-                                    window.paint_quad(quad);
-                                }
-                            }
-                        } else if dim_edges.len() == 2 {
-                            let edge0 = &dim_edges[0].2;
-                            let edge1 = &dim_edges[1].2;
-                            let [line0, line1] = [edge0, edge1].map(|edge| {
-                                let (x0, y0, x1, y1) = match edge.dir {
-                                    Dir::Horiz => (
-                                        edge.start.min(layout_mouse_position.x - 5.),
-                                        edge.coord,
-                                        edge.stop.max(layout_mouse_position.x + 5.),
-                                        edge.coord,
-                                    ),
-                                    Dir::Vert => (
-                                        edge.coord,
-                                        edge.start.min(layout_mouse_position.y - 5.),
-                                        edge.coord,
-                                        edge.stop.max(layout_mouse_position.y + 5.),
-                                    ),
-                                };
-                                Rect {
-                                    object_path: Vec::new(),
-                                    x0: x0.min(x1),
-                                    y0: y0.min(y1),
-                                    x1: x0.max(x1),
-                                    y1: y0.max(y1),
-                                    id: None,
-                                }
-                            });
-                            let (x0, y0, x1, y1) = match edge0.dir {
-                                Dir::Horiz => (
-                                    layout_mouse_position.x,
-                                    edge0.coord,
-                                    layout_mouse_position.x,
-                                    edge1.coord,
-                                ),
-                                Dir::Vert => (
-                                    edge0.coord,
-                                    layout_mouse_position.y,
-                                    edge1.coord,
-                                    layout_mouse_position.y,
-                                ),
-                            };
-                            let dim_line = Rect {
-                                object_path: Vec::new(),
-                                x0: x0.min(x1),
-                                y0: y0.min(y1),
-                                x1: x0.max(x1),
-                                y1: y0.max(y1),
-                                id: None,
-                            };
-                            for r in &[line0, line1, dim_line] {
-                                if let Some(quad) = get_paint_path(
-                                    r,
-                                    bounds,
-                                    scale,
-                                    offset,
-                                    rgb(0xffffff),
-                                    Pixels(2.),
-                                ) {
-                                    window.paint_quad(quad);
-                                }
-                            }
-                        }
-                        // highlight selected edges
-                        for (_, _, edge) in &dim_edges {
-                            let (x0, y0, x1, y1) = match edge.dir {
-                                Dir::Horiz => (edge.start, edge.coord, edge.stop, edge.coord),
-                                Dir::Vert => (edge.coord, edge.start, edge.coord, edge.stop),
-                            };
-                            if let Some(quad) = get_paint_path(
-                                &Rect {
-                                    object_path: Vec::new(),
-                                    x0,
-                                    y0,
-                                    x1,
-                                    y1,
-                                    id: None,
-                                },
-                                bounds,
-                                scale,
-                                offset,
-                                rgb(0xffff00),
-                                Pixels(2.),
-                            ) {
-                                window.paint_quad(quad);
-                            }
+                            },
+                            bounds,
+                            scale,
+                            offset,
+                            rgb(0xffff00),
+                            Pixels(2.),
+                        ) {
+                            window.paint_quad(quad);
                         }
                     }
                 })
@@ -840,8 +802,7 @@ impl LayoutCanvas {
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
-            rect_tool: None,
-            dim_tool: cx.new(|_cx| None),
+            tool: cx.new(|_cx| ToolState::default()),
             scale: 1.0,
             screen_bounds: Bounds::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
@@ -888,250 +849,319 @@ impl LayoutCanvas {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ref mut rect_tool) = self.rect_tool {
-            if let Some(p0) = rect_tool.p0 {
-                rect_tool.p0 = None;
-                let p1 = self.px_to_layout(event.position);
-                let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
-                let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
-                self.state.update(cx, |state, cx| {
-                    state.solved_cell.update(cx, {
-                        |cell, cx| {
-                            if let Some(cell) = cell.as_mut() {
-                                // TODO update in memory representation of code
-                                // TODO add solver to gui
-                                let scope_address = &cell.state[&cell.selected_scope].address;
-                                let reachable_objs = cell
-                                    .output
-                                    .reachable_objs(scope_address.cell, scope_address.scope);
-                                let names: IndexSet<_> = reachable_objs.values().collect();
-                                let scope = cell
-                                    .output
-                                    .cells
-                                    .get_mut(&scope_address.cell)
-                                    .unwrap()
-                                    .scopes
-                                    .get_mut(&scope_address.scope)
-                                    .unwrap();
-                                let rect_name = (0..)
-                                    .map(|i| format!("rect{i}"))
-                                    .find(|name| !names.contains(name))
-                                    .unwrap();
+        let layout_mouse_position = self.px_to_layout(event.position);
+        self.tool.update(cx, |tool, cx| {
+            match tool {
+                ToolState::DrawRect(rect_tool) => {
+                    if let Some(p0) = rect_tool.p0 {
+                        rect_tool.p0 = None;
+                        let p1 = layout_mouse_position;
+                        let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
+                        let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
+                        self.state.update(cx, |state, cx| {
+                            state.solved_cell.update(cx, {
+                                |cell, cx| {
+                                    if let Some(cell) = cell.as_mut() {
+                                        // TODO update in memory representation of code
+                                        // TODO add solver to gui
+                                        let scope_address =
+                                            &cell.state[&cell.selected_scope].address;
+                                        let reachable_objs = cell.output.reachable_objs(
+                                            scope_address.cell,
+                                            scope_address.scope,
+                                        );
+                                        let names: IndexSet<_> = reachable_objs.values().collect();
+                                        let scope = cell
+                                            .output
+                                            .cells
+                                            .get_mut(&scope_address.cell)
+                                            .unwrap()
+                                            .scopes
+                                            .get_mut(&scope_address.scope)
+                                            .unwrap();
+                                        let rect_name = (0..)
+                                            .map(|i| format!("rect{i}"))
+                                            .find(|name| !names.contains(name))
+                                            .unwrap();
 
-                                state.lsp_client.draw_rect(
-                                    scope.span.clone(),
-                                    rect_name,
-                                    compile::BasicRect {
-                                        layer: state
-                                            .layers
-                                            .read(cx)
-                                            .selected_layer
-                                            .clone()
-                                            .map(|s| s.to_string()),
-                                        x0: p0p.x as f64,
-                                        y0: p0p.y as f64,
-                                        x1: p1p.x as f64,
-                                        y1: p1p.y as f64,
-                                    },
-                                );
-                            }
-                        }
-                    });
-                });
-            } else {
-                // TODO: error handling.
-                if self.state.read(cx).layers.read(cx).selected_layer.is_none() {
-                    self.rect_tool = None;
-                } else {
-                    let p0 = self.px_to_layout(event.position);
-                    self.rect_tool.as_mut().unwrap().p0 = Some(p0);
-                }
-            }
-        } else if self.dim_tool.read(cx).is_some() {
-            let rects = self
-                .rects
-                .iter()
-                .rev()
-                .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                .map(|(r, _)| r);
-            let scale = self.scale;
-            let offset = self.offset;
-            let mut selected = None;
-            for (rect, r) in rects.map(|r| {
-                (
-                    r,
-                    Bounds::new(
-                        Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
-                            + offset
-                            + self.screen_bounds.origin,
-                        Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
-                    ),
-                )
-            }) {
-                for (name, edge_layout, edge_px) in [
-                    (
-                        "y0",
-                        Edge {
-                            dir: Dir::Horiz,
-                            coord: rect.y0,
-                            start: rect.x0,
-                            stop: rect.x1,
-                        },
-                        Edge {
-                            dir: Dir::Horiz,
-                            coord: r.bottom(),
-                            start: r.left(),
-                            stop: r.right(),
-                        },
-                    ),
-                    (
-                        "y1",
-                        Edge {
-                            dir: Dir::Horiz,
-                            coord: rect.y1,
-                            start: rect.x0,
-                            stop: rect.x1,
-                        },
-                        Edge {
-                            dir: Dir::Horiz,
-                            coord: r.top(),
-                            start: r.left(),
-                            stop: r.right(),
-                        },
-                    ),
-                    (
-                        "x0",
-                        Edge {
-                            dir: Dir::Vert,
-                            coord: rect.x0,
-                            start: rect.y0,
-                            stop: rect.y1,
-                        },
-                        Edge {
-                            dir: Dir::Vert,
-                            coord: r.left(),
-                            start: r.top(),
-                            stop: r.bottom(),
-                        },
-                    ),
-                    (
-                        "x1",
-                        Edge {
-                            dir: Dir::Vert,
-                            coord: rect.x1,
-                            start: rect.y0,
-                            stop: rect.y1,
-                        },
-                        Edge {
-                            dir: Dir::Vert,
-                            coord: r.right(),
-                            start: r.top(),
-                            stop: r.bottom(),
-                        },
-                    ),
-                ] {
-                    let bounds = edge_px.select_bounds(Pixels(4.));
-                    if bounds.contains(&event.position) && rect.id.is_some() {
-                        selected = Some((rect, name, edge_layout));
-                    }
-                }
-            }
-
-            if let Some((r, name, edge)) = selected {
-                self.dim_tool.update(cx, |dim_tool, cx| {
-                    if let Some(dim_tool) = dim_tool
-                        && dim_tool.edges.len() < 2
-                    {
-                        let path = self.state.update(cx, |state, cx| {
-                            state.solved_cell.update(cx, |cell, cx| {
-                                if let Some(cell) = cell.as_mut() {
-                                    let selected_scope_addr =
-                                        cell.state[&cell.selected_scope].address;
-                                    cx.notify();
-                                    if let (true, path) =
-                                        find_obj_path(&r.object_path, cell, selected_scope_addr)
-                                    {
-                                        let path = path.join(".");
-                                        return Some(path);
+                                        state.lsp_client.draw_rect(
+                                            scope.span.clone(),
+                                            rect_name,
+                                            compile::BasicRect {
+                                                layer: state
+                                                    .layers
+                                                    .read(cx)
+                                                    .selected_layer
+                                                    .clone()
+                                                    .map(|s| s.to_string()),
+                                                x0: p0p.x as f64,
+                                                y0: p0p.y as f64,
+                                                x1: p1p.x as f64,
+                                                y1: p1p.y as f64,
+                                            },
+                                        );
                                     }
                                 }
-                                None
-                            })
+                            });
                         });
-                        if let Some(path) = path {
-                            window.focus(&self.text_input_focus_handle);
-                            window.prevent_default();
-                            if dim_tool
-                                .edges
-                                .first()
-                                .map(|(_, _, edge0)| edge0.dir == edge.dir)
-                                .unwrap_or(true)
+                    } else {
+                        // TODO: error handling.
+                        if self.state.read(cx).layers.read(cx).selected_layer.is_some() {
+                            let p0 = self.px_to_layout(event.position);
+                            rect_tool.p0 = Some(p0);
+                        }
+                    }
+                }
+                ToolState::DrawDim(dim_tool) => {
+                    let enter_entry_mode = if dim_tool.edges.len() < 2 {
+                        let rects = self
+                            .rects
+                            .iter()
+                            .rev()
+                            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                            .map(|(r, _)| r);
+                        let scale = self.scale;
+                        let offset = self.offset;
+                        let mut selected = None;
+                        for (rect, r) in rects.map(|r| {
+                            (
+                                r,
+                                Bounds::new(
+                                    Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                        + offset
+                                        + self.screen_bounds.origin,
+                                    Size::new(
+                                        scale * Pixels(r.x1 - r.x0),
+                                        scale * Pixels(r.y1 - r.y0),
+                                    ),
+                                ),
+                            )
+                        }) {
+                            for (name, edge_layout, edge_px) in [
+                                (
+                                    "y0",
+                                    Edge {
+                                        dir: Dir::Horiz,
+                                        coord: rect.y0,
+                                        start: rect.x0,
+                                        stop: rect.x1,
+                                    },
+                                    Edge {
+                                        dir: Dir::Horiz,
+                                        coord: r.bottom(),
+                                        start: r.left(),
+                                        stop: r.right(),
+                                    },
+                                ),
+                                (
+                                    "y1",
+                                    Edge {
+                                        dir: Dir::Horiz,
+                                        coord: rect.y1,
+                                        start: rect.x0,
+                                        stop: rect.x1,
+                                    },
+                                    Edge {
+                                        dir: Dir::Horiz,
+                                        coord: r.top(),
+                                        start: r.left(),
+                                        stop: r.right(),
+                                    },
+                                ),
+                                (
+                                    "x0",
+                                    Edge {
+                                        dir: Dir::Vert,
+                                        coord: rect.x0,
+                                        start: rect.y0,
+                                        stop: rect.y1,
+                                    },
+                                    Edge {
+                                        dir: Dir::Vert,
+                                        coord: r.left(),
+                                        start: r.top(),
+                                        stop: r.bottom(),
+                                    },
+                                ),
+                                (
+                                    "x1",
+                                    Edge {
+                                        dir: Dir::Vert,
+                                        coord: rect.x1,
+                                        start: rect.y0,
+                                        stop: rect.y1,
+                                    },
+                                    Edge {
+                                        dir: Dir::Vert,
+                                        coord: r.right(),
+                                        start: r.top(),
+                                        stop: r.bottom(),
+                                    },
+                                ),
+                            ] {
+                                let bounds = edge_px.select_bounds(Pixels(4.));
+                                if bounds.contains(&event.position) && rect.id.is_some() {
+                                    selected = Some((rect, name, edge_layout));
+                                }
+                            }
+                        }
+                        let enter_entry_mode = !dim_tool.edges.is_empty();
+                        if let Some((r, name, edge)) = selected {
+                            let path = {
+                                let cell = self.state.read(cx).solved_cell.read(cx);
+                                if let Some(cell) = cell
+                                    && let selected_scope_addr =
+                                        cell.state[&cell.selected_scope].address
+                                    && let (true, path) =
+                                        find_obj_path(&r.object_path, cell, selected_scope_addr)
+                                {
+                                    let path = path.join(".");
+                                    Some(path)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(path) = path
+                                && dim_tool
+                                    .edges
+                                    .first()
+                                    .map(|(_, _, edge0)| edge0.dir == edge.dir)
+                                    .unwrap_or(true)
                             {
                                 dim_tool.edges.push((path, name.to_string(), edge));
                             }
+                            false
+                        } else {
+                            enter_entry_mode
+                        }
+                    } else {
+                        true
+                    };
+                    // TODO: add dimension constraint to code here instead of in input.rs
+                    let state = self.state.read(cx);
+
+                    if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
+                        let selected_scope_addr = cell.state[&cell.selected_scope].address;
+
+                        let span = if dim_tool.edges.len() == 1 {
+                            let (left, right, coord, horiz) = match dim_tool.edges[0].2.dir {
+                                Dir::Horiz => ("x0", "x1", layout_mouse_position.y, "true"),
+                                Dir::Vert => ("y0", "y1", layout_mouse_position.x, "false"),
+                            };
+
+                            state.lsp_client.draw_dimension(
+                                cell.output.cells[&selected_scope_addr.cell].scopes
+                                    [&selected_scope_addr.scope]
+                                    .span
+                                    .clone(),
+                                DimensionParams {
+                                    p: format!("{}.{}", dim_tool.edges[0].0, right),
+                                    n: format!("{}.{}", dim_tool.edges[0].0, left),
+                                    value: format!(
+                                        "{:?}",
+                                        dim_tool.edges[0].2.stop - dim_tool.edges[0].2.start
+                                    ),
+                                    coord: format!("{:?}", coord),
+                                    pstop: format!("{:?}", dim_tool.edges[0].2.coord,),
+                                    nstop: format!("{:?}", dim_tool.edges[0].2.coord,),
+                                    horiz: horiz.to_string(),
+                                },
+                            )
+                        } else if dim_tool.edges.len() == 2 {
+                            let (left, right) =
+                                if dim_tool.edges[0].2.coord < dim_tool.edges[1].2.coord {
+                                    (0, 1)
+                                } else {
+                                    (1, 0)
+                                };
+                            let (coord, horiz) = match dim_tool.edges[0].2.dir {
+                                Dir::Vert => (layout_mouse_position.y, "true"),
+                                Dir::Horiz => (layout_mouse_position.x, "false"),
+                            };
+
+                            state.lsp_client.draw_dimension(
+                                cell.output.cells[&selected_scope_addr.cell].scopes
+                                    [&selected_scope_addr.scope]
+                                    .span
+                                    .clone(),
+                                DimensionParams {
+                                    p: format!(
+                                        "{}.{}",
+                                        dim_tool.edges[right].0, dim_tool.edges[right].1,
+                                    ),
+                                    n: format!(
+                                        "{}.{}",
+                                        dim_tool.edges[left].0, dim_tool.edges[left].1
+                                    ),
+                                    value: format!(
+                                        "{:?}",
+                                        dim_tool.edges[right].2.coord
+                                            - dim_tool.edges[left].2.coord
+                                    ),
+                                    coord: format!("{:?}", coord),
+                                    pstop: format!(
+                                        "{:?}",
+                                        (dim_tool.edges[right].2.start
+                                            + dim_tool.edges[right].2.stop)
+                                            / 2.
+                                    ),
+                                    nstop: format!(
+                                        "{:?}",
+                                        (dim_tool.edges[left].2.start
+                                            + dim_tool.edges[left].2.stop)
+                                            / 2.
+                                    ),
+                                    horiz: horiz.to_string(),
+                                },
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(span) = span {
+                            *tool = ToolState::EditDim(EditDimToolState { dim: span });
+                            window.focus(&self.text_input_focus_handle);
+                            window.prevent_default();
+                            cx.notify();
                         }
                     }
-                });
-            }
-        } else {
-            let rects = self
-                .rects
-                .iter()
-                .rev()
-                .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                .map(|(r, _)| r);
-            let scale = self.scale;
-            let offset = self.offset;
-            let mut selected_rect = None;
-            for r in rects.chain(self.scope_rects.iter()) {
-                let rect_bounds = Bounds::new(
-                    Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
-                        + offset
-                        + self.screen_bounds.origin,
-                    Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
-                );
-                if rect_bounds.contains(&event.position) && r.id.is_some() {
-                    selected_rect = Some(r);
-                    break;
+                }
+                ToolState::Select(select_tool) => {
+                    let rects = self
+                        .rects
+                        .iter()
+                        .rev()
+                        .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                        .map(|(r, _)| r);
+                    let scale = self.scale;
+                    let offset = self.offset;
+                    let mut selected_rect = None;
+                    for r in rects.chain(self.scope_rects.iter()) {
+                        let rect_bounds = Bounds::new(
+                            Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                + offset
+                                + self.screen_bounds.origin,
+                            Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+                        );
+                        if rect_bounds.contains(&event.position) && r.id.is_some() {
+                            selected_rect = Some(r);
+                            break;
+                        }
+                    }
+                    if let Some(r) = selected_rect.cloned() {
+                        select_tool.selected_obj = r.id.clone();
+                        if let Some(span) = &r.id {
+                            self.state.read(cx).lsp_client.select_rect(span.clone());
+                        }
+                    } else {
+                        select_tool.selected_obj = None;
+                    }
+                    cx.notify();
+                }
+                _ => {
+                    // TODO: implement EditDim tool
                 }
             }
-            if let Some(r) = selected_rect.cloned() {
-                self.state.update(cx, |state, cx| {
-                    state.solved_cell.update(cx, |cell, cx| {
-                        if let Some(cell) = cell.as_mut() {
-                            cell.selected_rect = r.id;
-                            let args = r.id.and_then(|id| match id {
-                                RectId::Element(id) => {
-                                    let ccell = &cell.output.cells[&id.scope.cell];
-                                    let (obj, emit) = &ccell.scopes[&id.scope.scope].emit[id.idx];
-
-                                    match &ccell.objects[obj] {
-                                        SolvedValue::Rect(_) => Some(&emit.span),
-                                        _ => None,
-                                    }
-                                }
-                                RectId::Scope(id) => {
-                                    Some(&cell.output.cells[&id.cell].scopes[&id.scope].span)
-                                }
-                            });
-                            if let Some(span) = args {
-                                state.lsp_client.select_rect(span.clone());
-                            }
-                            cx.notify();
-                        }
-                    });
-                });
-            } else {
-                self.state.update(cx, |state, cx| {
-                    state.solved_cell.update(cx, |cell, cx| {
-                        if let Some(cell) = cell.as_mut() {
-                            cell.selected_rect = None;
-                            cx.notify();
-                        }
-                    });
-                });
-            }
-        }
+        });
     }
 
     #[allow(dead_code)]
@@ -1147,33 +1177,21 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn draw_rect(&mut self, _: &DrawRect, _window: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.solved_cell.update(cx, |cell, _cx| {
-                if let Some(cell) = cell {
-                    cell.selected_rect = None;
-                }
-            });
+        self.tool.update(cx, |tool, cx| {
+            if !tool.is_draw_rect() {
+                *tool = ToolState::DrawRect(DrawRectToolState { p0: None });
+                cx.notify();
+            }
         });
-        self.dim_tool.update(cx, |dim_tool, _cx| *dim_tool = None);
-        if self.rect_tool.is_none() {
-            self.rect_tool = Some(RectToolState { p0: None });
-        }
     }
 
     pub(crate) fn draw_dim(&mut self, _: &DrawDim, _window: &mut Window, cx: &mut Context<Self>) {
-        self.state.update(cx, |state, cx| {
-            state.solved_cell.update(cx, |cell, _cx| {
-                if let Some(cell) = cell {
-                    cell.selected_rect = None;
-                }
-            });
+        self.tool.update(cx, |tool, cx| {
+            if !tool.is_draw_dim() {
+                *tool = ToolState::DrawDim(DrawDimToolState { edges: Vec::new() });
+                cx.notify();
+            }
         });
-        self.rect_tool = None;
-        if self.dim_tool.read(cx).is_none() {
-            self.dim_tool.update(cx, |dim_tool, _cx| {
-                *dim_tool = Some(DimToolState { edges: Vec::new() })
-            });
-        }
     }
 
     pub(crate) fn fit_to_screen_action(
@@ -1212,30 +1230,23 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(rect_tool) = self.rect_tool.as_mut() {
-            if rect_tool.p0.is_none() {
-                self.rect_tool = None;
-            } else {
-                rect_tool.p0 = None;
-            }
-        }
-        self.dim_tool.update(cx, |dim_tool, _cx| {
-            if let Some(dim_tool_inner) = dim_tool {
-                if dim_tool_inner.edges.is_empty() {
-                    *dim_tool = None;
-                } else {
-                    dim_tool_inner.edges.clear();
+        self.tool.update(cx, |tool, cx| {
+            match tool {
+                ToolState::DrawRect(DrawRectToolState { p0: p0 @ Some(_) }) => {
+                    *p0 = None;
+                }
+                ToolState::DrawDim(DrawDimToolState { edges }) if !edges.is_empty() => {
+                    edges.clear();
+                }
+                ToolState::Select(SelectToolState { selected_obj }) => {
+                    *selected_obj = None;
+                }
+                _ => {
+                    *tool = ToolState::default();
                 }
             }
+            cx.notify();
         });
-        self.state.update(cx, |state, cx| {
-            state.solved_cell.update(cx, |cell, _cx| {
-                if let Some(cell) = cell.as_mut() {
-                    cell.selected_rect = None;
-                }
-            })
-        });
-        cx.notify();
     }
 
     #[allow(unused)]

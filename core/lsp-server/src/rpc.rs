@@ -5,6 +5,7 @@ use compiler::{
     compile::{BasicRect, CompileOutput},
 };
 
+use serde::{Deserialize, Serialize};
 use tarpc::tokio_serde::formats::Json;
 use tower_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
@@ -13,11 +14,24 @@ use tower_lsp::lsp_types::{
 
 use crate::{ForceSave, State, document::Document};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimensionParams {
+    pub p: String,
+    pub n: String,
+    pub value: String,
+    pub coord: String,
+    pub pstop: String,
+    pub nstop: String,
+    pub horiz: String,
+}
+
 #[tarpc::service]
 pub trait GuiToLsp {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Span);
-    async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>);
+    async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
+    async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
+    async fn edit_dimension(span: Span, value: String) -> Option<Span>;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
 }
 
@@ -73,7 +87,7 @@ impl GuiToLsp for LspServer {
         scope_span: Span,
         var_name: String,
         rect: BasicRect<f64>,
-    ) {
+    ) -> Option<Span> {
         // TODO: check if editor file is up to date with ast.
         let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
@@ -89,24 +103,41 @@ impl GuiToLsp for LspServer {
                 .and_then(|ast| ast.span2scope.get(&scope_span))
         {
             let doc = Document::new(&ast.text, 0);
-            let edit = if let Some(tail) = &scope.tail {
+            let format_rect = |rect: &BasicRect<f64>| {
+                format!(
+                    "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})!;",
+                    rect.layer
+                        .as_ref()
+                        .map(|layer| format!("{layer}, "))
+                        .unwrap_or_default(),
+                    rect.x0,
+                    rect.y0,
+                    rect.x1,
+                    rect.y1,
+                )
+            };
+            let (edit, span) = if let Some(tail) = &scope.tail {
                 let start = doc.offset_to_pos(tail.span().start());
-                TextEdit {
-                    range: Range::new(start, start),
-                    new_text: format!(
-                        "let {var_name} = rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})!;\n{}",
-                        rect.layer
-                            .map(|layer| format!("{layer}, "))
-                            .unwrap_or_default(),
-                        rect.x0,
-                        rect.y0,
-                        rect.x1,
-                        rect.y1,
-                        // TODO: handle different types of indentation, or enforce that gui
-                        // reformats file before editing.
-                        std::iter::repeat_n(' ', start.character as usize).collect::<String>()
-                    ),
-                }
+                let prefix = format!("let {var_name} = ");
+                let rect_str = format_rect(&rect);
+                (
+                    TextEdit {
+                        range: Range::new(start, start),
+                        new_text: format!(
+                            "{prefix}{rect_str}\n{}",
+                            // TODO: handle different types of indentation, or enforce that gui
+                            // reformats file before editing.
+                            std::iter::repeat_n(' ', start.character as usize).collect::<String>()
+                        ),
+                    },
+                    Span {
+                        path: scope_span.path.clone(),
+                        span: cfgrammar::Span::new(
+                            tail.span().start() + prefix.len(),
+                            tail.span().start() + prefix.len() + rect_str.len(),
+                        ),
+                    },
+                )
             } else {
                 let start = doc.offset_to_pos(scope.span.start());
                 let stop = doc.offset_to_pos(scope.span.end());
@@ -114,24 +145,28 @@ impl GuiToLsp for LspServer {
                 let trimmed = line.trim_start();
                 let whitespace = &line[..line.len() - trimmed.len()];
                 let insert_loc = doc.offset_to_pos(scope.span.end() - 1);
-                TextEdit {
-                    range: Range::new(insert_loc, insert_loc),
-                    new_text: format!(
-                        "{}let {var_name} = rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})!;\n{whitespace}",
-                        if start.line != stop.line {
-                            "    "
-                        } else {
-                            "\n"
-                        },
-                        rect.layer
-                            .map(|layer| format!("\"{layer}\", "))
-                            .unwrap_or_default(),
-                        rect.x0,
-                        rect.y0,
-                        rect.x1,
-                        rect.y1,
-                    ),
-                }
+                let prefix = format!(
+                    "{}let {var_name} = ",
+                    if start.line != stop.line {
+                        "    "
+                    } else {
+                        "\n"
+                    }
+                );
+                let rect_str = format_rect(&rect);
+                (
+                    TextEdit {
+                        range: Range::new(insert_loc, insert_loc),
+                        new_text: format!("{prefix}{rect_str}\n{whitespace}",),
+                    },
+                    Span {
+                        path: scope_span.path.clone(),
+                        span: cfgrammar::Span::new(
+                            scope.span.end() - 1 + prefix.len(),
+                            scope.span.end() - 1 + prefix.len() + rect_str.len(),
+                        ),
+                    },
+                )
             };
 
             if let Some(file) = state_mut.editor_files.get(&url)
@@ -144,7 +179,7 @@ impl GuiToLsp for LspServer {
                         "Editor buffer state is inconsistent with GUI state.",
                     )
                     .await;
-                return;
+                return None;
             }
 
             self.state
@@ -173,7 +208,148 @@ impl GuiToLsp for LspServer {
                 .send_request::<ForceSave>(scope_span.path.clone())
                 .await
                 .unwrap();
+            Some(span)
+        } else {
+            None
         }
+    }
+
+    async fn draw_dimension(
+        self,
+        _: tarpc::context::Context,
+        scope_span: Span,
+        params: DimensionParams,
+    ) -> Option<Span> {
+        // TODO: check if editor file is up to date with ast.
+        let state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(&scope_span.path).unwrap();
+        if let Some(ast) = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)
+            && let Some(scope) = state_mut
+                .ast
+                .values()
+                .find(|ast| ast.path == scope_span.path)
+                .as_ref()
+                .and_then(|ast| ast.span2scope.get(&scope_span))
+        {
+            let doc = Document::new(&ast.text, 0);
+            let format_dimension = |params: &DimensionParams| {
+                format!(
+                    "dimension({}, {}, {}, {}, {}, {}, {});",
+                    params.p,
+                    params.n,
+                    params.value,
+                    params.coord,
+                    params.pstop,
+                    params.nstop,
+                    params.horiz
+                )
+            };
+            let (edit, span) = if let Some(tail) = &scope.tail {
+                let start = doc.offset_to_pos(tail.span().start());
+                let dimension = format_dimension(&params);
+                (
+                    TextEdit {
+                        range: Range::new(start, start),
+                        new_text: format!(
+                            "{}\n{}",
+                            dimension,
+                            // TODO: handle different types of indentation, or enforce that gui
+                            // reformats file before editing.
+                            std::iter::repeat_n(' ', start.character as usize).collect::<String>()
+                        ),
+                    },
+                    Span {
+                        path: scope_span.path.clone(),
+                        span: cfgrammar::Span::new(
+                            tail.span().start(),
+                            tail.span().start() + dimension.len(),
+                        ),
+                    },
+                )
+            } else {
+                let start = doc.offset_to_pos(scope.span.start());
+                let stop = doc.offset_to_pos(scope.span.end());
+                let line = doc.substr(Position::new(stop.line, 0)..stop);
+                let trimmed = line.trim_start();
+                let whitespace = &line[..line.len() - trimmed.len()];
+                let insert_loc = doc.offset_to_pos(scope.span.end() - 1);
+                let prefix = if start.line != stop.line {
+                    "    "
+                } else {
+                    "\n"
+                };
+                let dimension = format_dimension(&params);
+                (
+                    TextEdit {
+                        range: Range::new(insert_loc, insert_loc),
+                        new_text: format!("{}{}\n{whitespace}", prefix, dimension,),
+                    },
+                    Span {
+                        path: scope_span.path.clone(),
+                        span: cfgrammar::Span::new(
+                            scope.span.end() - 1 + prefix.len(),
+                            scope.span.end() - 1 + prefix.len() + dimension.len(),
+                        ),
+                    },
+                )
+            };
+
+            if let Some(file) = state_mut.editor_files.get(&url)
+                && file.contents() != doc.contents()
+            {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        "Editor buffer state is inconsistent with GUI state.",
+                    )
+                    .await;
+                return None;
+            }
+
+            self.state
+                .editor_client
+                .show_document(ShowDocumentParams {
+                    uri: url.clone(),
+                    external: None,
+                    take_focus: None,
+                    selection: None,
+                })
+                .await
+                .unwrap();
+
+            self.state
+                .editor_client
+                .apply_edit(WorkspaceEdit {
+                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+                .await
+                .unwrap();
+
+            self.state
+                .editor_client
+                .send_request::<ForceSave>(scope_span.path.clone())
+                .await
+                .unwrap();
+            Some(span)
+        } else {
+            None
+        }
+    }
+
+    async fn edit_dimension(
+        self,
+        _: tarpc::context::Context,
+        span: Span,
+        value: String,
+    ) -> Option<Span> {
+        // TODO: implement
+        None
     }
 
     async fn add_eq_constraint(
