@@ -136,6 +136,14 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         }
     }
 
+    fn dispatch_match_expr(
+        &mut self,
+        _input: &compiler::ast::MatchExpr<Self::InputS, Self::InputMetadata>,
+        _scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _arms: &[compiler::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
+    }
+
     fn dispatch_bin_op_expr(
         &mut self,
         _input: &BinOpExpr<Substr, Self::InputMetadata>,
@@ -250,6 +258,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> Expr<Substr, Self::OutputMetadata> {
         match input {
             Expr::If(if_expr) => Expr::If(Box::new(self.transform_if_expr(if_expr))),
+            Expr::Match(match_expr) => Expr::Match(Box::new(self.transform_match_expr(match_expr))),
             Expr::BinOp(bin_op_expr) => {
                 Expr::BinOp(Box::new(self.transform_bin_op_expr(bin_op_expr)))
             }

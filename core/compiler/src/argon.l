@@ -2,6 +2,7 @@
 
 enum "ENUM"
 struct "STRUCT"
+match "MATCH"
 const "CONST"
 cell "CELL"
 mod "MOD"
@@ -34,6 +35,7 @@ false "FALSE"
 : ":"
 ; ";"
 , ","
+=> '=>'
 == "=="
 != "!="
 \>= ">="

@@ -273,7 +273,25 @@ Expr -> Result<Expr<&'input str, ParseMetadata>, ()>
 BlockExpr -> Result<Expr<&'input str, ParseMetadata>, ()>
   : 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: None, cond: $2?, then: $3?, else_: $5?, span: $span, metadata: (), }))) }
   | ScopeAnnotation 'IF' Expr Scope 'ELSE' Scope { Ok(Expr::If(Box::new(IfExpr { scope_annotation: Some($1?), cond: $3?, then: $4?, else_: $6?, span: $span, metadata: (), }))) }
+  | MatchExpr { Ok(Expr::Match(Box::new($1?))) }
   | Scope { Ok(Expr::Scope(Box::new($1?))) }
+  ;
+
+MatchExpr -> Result<MatchExpr<&'input str, ParseMetadata>, ()>
+  : 'MATCH' Expr '{' MatchArms '}' { Ok(MatchExpr { scrutinee: $2?, arms: $4?, span: $span, metadata: () }) }
+  ;
+
+MatchArms -> Result<Vec<MatchArm<&'input str, ParseMetadata>>, ()>
+  : MatchArm { Ok(vec![$1?]) }
+  | MatchArms MatchArm {
+      let mut __tmp = $1?;
+      __tmp.push($2?);
+      Ok(__tmp)
+  }
+  ;
+
+MatchArm -> Result<MatchArm<&'input str, ParseMetadata>, ()>
+  : IdentPath '=>' Expr ',' { Ok(MatchArm { pattern: $1?, expr: $3?, span: $span, }) }
   ;
 
 NonBlockExpr -> Result<Expr<&'input str, ParseMetadata>, ()>

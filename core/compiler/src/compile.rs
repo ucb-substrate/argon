@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue,
-    ModPath, Scope, Span, UnaryOp, WorkspaceAst,
+    MatchExpr, ModPath, Scope, Span, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -208,6 +208,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _then: &Scope<Self::OutputS, Self::OutputMetadata>,
         _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
+    }
+
+    fn dispatch_match_expr(
+        &mut self,
+        _input: &crate::ast::MatchExpr<Self::InputS, Self::InputMetadata>,
+        _scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
     }
 
     fn dispatch_bin_op_expr(
@@ -510,6 +518,7 @@ impl AstMetadata for VarIdTyMetadata {
     type LetBinding = VarId;
     type FnDecl = (PathBuf, VarId);
     type IfExpr = Ty;
+    type MatchExpr = Ty;
     type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
@@ -690,6 +699,18 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
+        if !matches!(ty, Ty::Enum(_)) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::IncorrectTyCategory {
+                    found: ty.clone(),
+                    expected: "Enum".into(),
+                },
+            });
+        }
+    }
+
     fn assert_eq_arity(&mut self, span: cfgrammar::Span, found: usize, expected: usize) {
         if found != expected {
             self.errors.push(StaticError {
@@ -798,6 +819,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
     fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
+            Expr::Match(match_expr) => match_expr.metadata.clone(),
             Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
@@ -1088,6 +1110,51 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             });
         }
         then_ty
+    }
+
+    fn dispatch_match_expr(
+        &mut self,
+        input: &crate::ast::MatchExpr<Self::InputS, Self::InputMetadata>,
+        scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
+        let scrutinee_ty = scrutinee.ty();
+        self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
+        let output_ty = arms.first().map(|arm| arm.expr.ty()).unwrap_or(Ty::Nil);
+
+        if let Ty::Enum(ref e) = scrutinee_ty {
+            let mut covered = IndexSet::new();
+            let mut remaining = e.variants.clone();
+            for arm in arms.iter() {
+                let arm_ty = &arm.pattern.metadata.1;
+                self.assert_eq_ty(arm.pattern.span, arm_ty, &scrutinee_ty);
+
+                let variant = arm.pattern.path.last().unwrap().name.clone();
+                remaining.swap_remove(variant.as_str());
+                if !covered.insert(variant) {
+                    self.errors.push(StaticError {
+                        span: self.span(arm.pattern.span),
+                        kind: StaticErrorKind::DuplicateMatchArm,
+                    });
+                }
+
+                if arm.expr.ty() != output_ty {
+                    self.errors.push(StaticError {
+                        span: self.span(arm.expr.span()),
+                        kind: StaticErrorKind::BranchesDifferentTypes,
+                    });
+                }
+            }
+
+            if !remaining.is_empty() {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::MatchArmsNotComprehensive,
+                });
+            }
+        }
+
+        output_ty
     }
 
     fn dispatch_bin_op_expr(
@@ -2281,6 +2348,13 @@ impl<'a> ExecPass<'a> {
                     state: IfExprState::Cond(cond),
                 }))
             }
+            Expr::Match(match_expr) => {
+                let scrutinee = self.visit_expr(loc, &match_expr.scrutinee);
+                PartialEvalState::Match(Box::new(PartialMatchExpr {
+                    expr: (**match_expr).clone(),
+                    state: MatchExprState::Scrutinee(scrutinee),
+                }))
+            }
             Expr::Comparison(comparison_expr) => {
                 let left = self.visit_expr(loc, &comparison_expr.left);
                 let right = self.visit_expr(loc, &comparison_expr.right);
@@ -2781,6 +2855,32 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
+            PartialEvalState::Match(match_) => match match_.state {
+                MatchExprState::Scrutinee(scrutinee) => {
+                    if let Defer::Ready(val) = &self.values[&scrutinee] {
+                        let variant = val.as_ref().unwrap_enum_value();
+                        let arm = match_
+                            .expr
+                            .arms
+                            .iter()
+                            .find(|arm| *variant == arm.pattern.path.last().unwrap().name)
+                            .unwrap();
+                        let value = self.visit_expr(vref.loc, &arm.expr);
+                        match_.state = MatchExprState::Value(value);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                MatchExprState::Value(value) => {
+                    if let Defer::Ready(val) = &self.values[&value] {
+                        self.values.insert(vid, Defer::Ready(val.clone()));
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
             PartialEvalState::Comparison(comparison_expr) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) = (
                     &self.values[&comparison_expr.state.left],
@@ -3204,6 +3304,12 @@ pub enum StaticErrorKind {
     /// Branches in expresssions must evaluate to the same type.
     #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
+    /// Multiple match arms with matching patterns.
+    #[error("match arms must be distinct")]
+    DuplicateMatchArm,
+    /// Match arms must be comprehensive.
+    #[error("match arms must be comprehensive")]
+    MatchArmsNotComprehensive,
     /// The operands in a binary expression must have the same type.
     #[error("operands of binary expression must have the same type")]
     BinOpMismatchedTypes,
@@ -3331,6 +3437,7 @@ struct PartialEval<T: AstMetadata> {
 #[derive(Debug, Clone)]
 enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
+    Match(Box<PartialMatchExpr<T>>),
     Comparison(Box<PartialComparisonExpr<T>>),
     BinOp(PartialBinOp),
     UnaryOp(PartialUnaryOp),
@@ -3373,10 +3480,22 @@ struct PartialIfExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialMatchExpr<T: AstMetadata> {
+    expr: MatchExpr<Substr, T>,
+    state: MatchExprState,
+}
+
+#[derive(Debug, Clone)]
 pub enum IfExprState {
     Cond(ValueId),
     Then(ValueId),
     Else(ValueId),
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchExprState {
+    Scrutinee(ValueId),
+    Value(ValueId),
 }
 
 #[derive(Debug, Clone)]

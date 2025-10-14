@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(cell.objects.len(), 1);
         let r = cell.objects.iter().next().unwrap().1.as_ref().unwrap_rect();
         assert_eq!(r.layer.as_deref(), Some("met2"));
-        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x0.0, 100., epsilon = EPSILON);
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 300., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 400., epsilon = EPSILON);

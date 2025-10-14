@@ -140,6 +140,15 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_match_expr(
+        &mut self,
+        input: &super::MatchExpr<Self::InputS, Self::InputMetadata>,
+        _scrutinee: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+        _arms: &[super::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
+        input.metadata.clone()
+    }
+
     fn dispatch_bin_op_expr(
         &mut self,
         input: &super::BinOpExpr<Self::InputS, Self::InputMetadata>,
