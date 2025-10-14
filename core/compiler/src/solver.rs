@@ -139,10 +139,6 @@ impl Solver {
             if constraint.coeffs.is_empty()
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
-                println!(
-                    "detected inconsistent constraint, value = {}",
-                    constraint.constant
-                );
                 self.inconsistent = true;
             }
         }
