@@ -231,10 +231,10 @@ impl TextInput {
                     .lsp_client
                     .edit_dimension(dim.clone(), self.content.to_string())
                     .is_some()
-                {
-                    *tool = ToolState::default();
-                    return true;
-                }
+            {
+                *tool = ToolState::default();
+                return true;
+            }
             false
         });
         if reset {
