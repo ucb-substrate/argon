@@ -7,6 +7,7 @@ use compiler::{
         ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
         Scope, UnaryOpExpr, annotated::AnnotatedAst,
     },
+    compile::BUILTINS,
     parse::ParseMetadata,
 };
 use tower_lsp::lsp_types::{Range, TextEdit};
@@ -172,9 +173,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         _func: &IdentPath<Substr, Self::OutputMetadata>,
         _args: &Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"]
-            .contains(&input.func.path.last().unwrap().name.as_str())
-        {
+        if BUILTINS.contains(&input.func.path.last().unwrap().name.as_str()) {
             return;
         }
         if let Some(scope_annotation) = &input.scope_annotation {

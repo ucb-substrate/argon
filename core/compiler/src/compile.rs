@@ -30,7 +30,7 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
-const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
+pub const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
