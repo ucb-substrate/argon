@@ -144,7 +144,7 @@ pub(crate) struct DrawDimToolState {
 pub(crate) struct EditDimToolState {
     pub(crate) dim: Span,
     /// `true` if entered from dimension tool
-    pub(crate) dim_mode: bool, // TODO: make more general purpose after state transitions finalized
+    pub(crate) dim_mode: bool,
 }
 
 // TODO: potentially re-use compiler provided object IDs
