@@ -32,4 +32,12 @@ cell top() {
     #scope1 if 1 > 2 { } else { }
     let met3 = rect("met3", x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.)!;
     let duplicate_rect = left.bot.met3!;
+    let rect0 = rect("met1", x0i = 39.64131546020508, y0i = 198.2907257080078, x1i = 103.88143157958984, y1i = 265.72265625)!;
+    dimension(rect0.x1, rect0.x0, 50., rect0.y1 + 39.787323, rect0.y1, rect0.y1, true);
+    dimension(rect0.y1, rect0.y0, 40., rect0.x1 + 66.39364, rect0.x1, rect0.x1, false);
+    dimension(right.bot.met2.x0, rect0.x1, 100., (right.bot.met2.y0 + right.bot.met2.y1 + rect0.y0 + rect0.y1)/4. + 49.23929, (right.bot.met2.y0 + right.bot.met2.y1) / 2., (rect0.y0 + rect0.y1) / 2., true);
+    dimension(rect0.y0, left.bot.met1.y1, 100., (rect0.x0 + rect0.x1 + left.bot.met1.x0 + left.bot.met1.x1)/4. + 68.92343, (rect0.x0 + rect0.x1) / 2., (left.bot.met1.x0 + left.bot.met1.x1) / 2., false);
+    dimension(rect0.y0, left.bot.met1.y1, 100., (rect0.x0 + rect0.x1 + left.bot.met1.x0 + left.bot.met1.x1)/4. - 34.98852, (rect0.x0 + rect0.x1) / 2., (left.bot.met1.x0 + left.bot.met1.x1) / 2., false);
+    dimension(right.bot.met2.x0, rect0.x1, 100., (right.bot.met2.y0 + right.bot.met2.y1 + rect0.y0 + rect0.y1)/4. + 71.08197, (right.bot.met2.y0 + right.bot.met2.y1) / 2., (rect0.y0 + rect0.y1) / 2., true);
+    dimension(rect0.y0, left.bot.met1.y1, 100., (rect0.x0 + rect0.x1 + left.bot.met1.x0 + left.bot.met1.x1)/4. - 83.21831, (rect0.x0 + rect0.x1) / 2., (left.bot.met1.x0 + left.bot.met1.x1) / 2., false);
 }
