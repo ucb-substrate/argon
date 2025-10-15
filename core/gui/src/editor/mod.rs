@@ -6,7 +6,7 @@ use std::{
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
-    ifmatvec,
+    bbox_union, ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -80,22 +80,6 @@ pub struct Editor {
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
     pub(crate) text_input: Entity<TextInput>,
-}
-
-fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>> {
-    match (b1, b2) {
-        (Some(r1), Some(r2)) => Some(Rect {
-            layer: None,
-            x0: r1.x0.min(r2.x0),
-            y0: r1.y0.min(r2.y0),
-            x1: r1.x1.max(r2.x1),
-            y1: r1.y1.max(r2.y1),
-            id: r1.id,
-            span: None,
-        }),
-        (Some(r), None) | (None, Some(r)) => Some(r),
-        (None, None) => None,
-    }
 }
 
 fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {

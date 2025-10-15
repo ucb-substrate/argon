@@ -30,6 +30,8 @@ use crate::{
     solver::{LinearExpr, Solver, Var},
 };
 
+const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
+
 pub fn static_compile(
     ast: &WorkspaceParseAst,
 ) -> Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)> {
@@ -575,6 +577,7 @@ impl<'a> VarIdTyPass<'a> {
                 _ => (),
             }
         }
+
         for decl in &self.ast.ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -604,13 +607,11 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_fn_decl(&mut self, input: &'a FnDecl<Substr, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
-        {
+        if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
-            return;
         }
         let args: Vec<_> = input
             .args
@@ -629,8 +630,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_enum_decl(&mut self, input: &'a EnumDecl<Substr, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
-        {
+        if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -990,8 +990,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CellDecl<Substr, Self::InputMetadata>,
     ) -> CellDecl<Substr, Self::OutputMetadata> {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
-        {
+        if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -1328,6 +1327,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             ("h", Ty::Float),
                         ]),
                     );
+                    (None, Ty::Rect)
+                }
+                "bbox" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    let argty = args.posargs[0].ty();
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                        self.errors.push(StaticError {
+                            span: self.span(input.span),
+                            kind: StaticErrorKind::IncorrectTyCategory {
+                                found: argty,
+                                expected: "Cell/Inst".to_string(),
+                            },
+                        });
+                    }
                     (None, Ty::Rect)
                 }
                 "float" => {
@@ -2290,9 +2303,7 @@ impl<'a> ExecPass<'a> {
                 return value;
             }
             Expr::Call(c) => {
-                if ["rect", "crect", "float", "inst", "eq", "dimension"]
-                    .contains(&c.func.path.last().unwrap().name.as_str())
-                {
+                if BUILTINS.contains(&c.func.path.last().unwrap().name.as_str()) {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
                         state: CallExprState {
@@ -2548,6 +2559,84 @@ impl<'a> ExecPass<'a> {
                             self.cell_state_mut(vref.loc.cell).deferred.insert(defer);
                         }
                         true
+                    } else {
+                        false
+                    }
+                }
+                "bbox" => {
+                    let arg = &self.values[&c.state.posargs[0]];
+                    if let Some(val) = arg.get_ready() {
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let r = match val {
+                            Value::Inst(i) => {
+                                if let Defer::Ready(cell) = &self.values[&i.cell] {
+                                    let cell_id = cell.as_ref().unwrap_cell();
+                                    Some(
+                                        self.bbox(*cell_id)
+                                            .map(|r| r.transform(i.reflect, i.angle)),
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
+                            Value::Cell(c) => Some(self.bbox(*c)),
+                            _ => unreachable!(),
+                        };
+                        if let Some(r) = r {
+                            if let Some(r) = r {
+                                let id = object_id(&mut self.next_id);
+                                let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                let orect = Rect {
+                                    id,
+                                    layer: None,
+                                    x0: state.solver.new_var(),
+                                    y0: state.solver.new_var(),
+                                    x1: state.solver.new_var(),
+                                    y1: state.solver.new_var(),
+                                    span: Some(span),
+                                };
+                                state.objects.insert(orect.id, orect.clone().into());
+                                let dx0 = LinearExpr::from(orect.x0) - r.x0;
+                                let dx1 = LinearExpr::from(orect.x1) - r.x1;
+                                let dy0 = LinearExpr::from(orect.y0) - r.y0;
+                                let dy1 = LinearExpr::from(orect.y1) - r.y1;
+                                let state = self.cell_state_mut(vref.loc.cell);
+                                state.solver.constrain_eq0(dx0);
+                                state.solver.constrain_eq0(dx1);
+                                state.solver.constrain_eq0(dy0);
+                                state.solver.constrain_eq0(dy1);
+                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
+                                true
+                            } else {
+                                // default to a zero rectangle
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: vref.loc.cell,
+                                    kind: ExecErrorKind::EmptyBbox,
+                                });
+                                let id = object_id(&mut self.next_id);
+                                let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                let orect = Rect {
+                                    id,
+                                    layer: None,
+                                    x0: state.solver.new_var(),
+                                    y0: state.solver.new_var(),
+                                    x1: state.solver.new_var(),
+                                    y1: state.solver.new_var(),
+                                    span: Some(span),
+                                };
+                                state.objects.insert(orect.id, orect.clone().into());
+                                let state = self.cell_state_mut(vref.loc.cell);
+                                state.solver.constrain_eq0(orect.x0.into());
+                                state.solver.constrain_eq0(orect.x1.into());
+                                state.solver.constrain_eq0(orect.y0.into());
+                                state.solver.constrain_eq0(orect.y1.into());
+                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
+                                true
+                            }
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }
@@ -3157,6 +3246,22 @@ impl<'a> ExecPass<'a> {
         }
         progress
     }
+
+    pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
+        let mut bbox = None;
+        let cell = &self.compiled_cells[&cell];
+        for (_, o) in cell.objects.iter() {
+            match o {
+                SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
+                SolvedValue::Instance(i) => {
+                    let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
+                    bbox = bbox_union(bbox, cell_bbox);
+                }
+                _ => (),
+            }
+        }
+        bbox
+    }
 }
 
 #[enumify]
@@ -3311,6 +3416,22 @@ impl CompiledCell {
     }
 }
 
+pub fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>> {
+    match (b1, b2) {
+        (Some(r1), Some(r2)) => Some(Rect {
+            layer: None,
+            x0: r1.x0.min(r2.x0),
+            y0: r1.y0.min(r2.y0),
+            x1: r1.x1.max(r2.x1),
+            y1: r1.y1.max(r2.y1),
+            id: r1.id,
+            span: None,
+        }),
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticError {
     pub span: Span,
@@ -3431,6 +3552,9 @@ pub enum ExecErrorKind {
     /// Conflicting constraints.
     #[error("inconsistent constraints")]
     InconsistentConstraints,
+    /// A cell or instance had an empty bounding box.
+    #[error("empty bbox")]
+    EmptyBbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

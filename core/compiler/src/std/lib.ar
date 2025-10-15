@@ -22,12 +22,12 @@ fn intersection(rect1: Rect, rect2: Rect) -> Rect {
     crect(x0=intersection_x0, y0=intersection_y0, x1=intersection_x1, y1=intersection_y1)
 }
 
-fn bbox(rect1: Rect, rect2: Rect) -> Rect {
-    let bbox_x0 = #scope0 min(rect1.x0, rect2.x0);
-    let bbox_y0 = #scope1 min(rect1.y0, rect2.y0);
-    let bbox_x1 = #scope2 max(rect1.x1, rect2.x1);
-    let bbox_y1 = #scope3 max(rect1.y1, rect2.y1);
-    crect(x0=bbox_x0, y0=bbox_y0, x1=bbox_x1, y1=bbox_y1)
+fn union(rect1: Rect, rect2: Rect) -> Rect {
+    let union_x0 = #scope0 min(rect1.x0, rect2.x0);
+    let union_y0 = #scope1 min(rect1.y0, rect2.y0);
+    let union_x1 = #scope2 max(rect1.x1, rect2.x1);
+    let union_y1 = #scope3 max(rect1.y1, rect2.y1);
+    crect(x0=union_x0, y0=union_y0, x1=union_x1, y1=union_y1)
 }
 
 fn array(r: Rect, n: Int, xpitch: Float, ypitch: Float) -> Rect {
