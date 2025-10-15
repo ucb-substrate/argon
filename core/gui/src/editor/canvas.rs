@@ -12,18 +12,18 @@ use compiler::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    App, AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
+    AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
     Element, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
     Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div,
-    pattern_slash, rgb, rgba, solid_background,
+    pattern_slash, rgb, rgba, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
 use lsp_server::rpc::DimensionParams;
 
 use crate::{
-    actions::{All, Cancel, DrawDim, DrawRect, Fit, One, Zero},
+    actions::{All, Cancel, DrawDim, DrawRect, Edit, Fit, One, Zero},
     editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
 };
 
@@ -191,6 +191,7 @@ pub struct LayoutCanvas {
     subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
     scope_rects: Vec<Rect>,
+    dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>)>,
     // True if waiting on render step to finish some initialization.
     //
     // Final bounds of layout canvas only determined in paint step.
@@ -515,6 +516,7 @@ impl Element for CanvasElement {
             .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
+        let mut dim_hitboxes = Vec::new();
         inner
             .bg_style
             .clone()
@@ -560,123 +562,130 @@ impl Element for CanvasElement {
                         }
                     }
 
-                    let draw_dim = |window: &mut Window,
-                                    cx: &mut App,
-                                    p: f32,
-                                    n: f32,
-                                    coord: f32,
-                                    pstop: f32,
-                                    nstop: f32,
-                                    horiz: bool,
-                                    value: String,
-                                    color: Rgba| {
-                        let (x0, y0, x1, y1) = if horiz {
-                            (
-                                p,
-                                pstop,
-                                p,
-                                coord
-                                    + if coord > pstop {
-                                        5. / scale
-                                    } else {
-                                        -5. / scale
-                                    },
-                            )
-                        } else {
-                            (
-                                pstop,
-                                p,
-                                coord
-                                    + if coord > pstop {
-                                        5. / scale
-                                    } else {
-                                        -5. / scale
-                                    },
-                                p,
-                            )
-                        };
-                        let start_line = Rect {
-                            object_path: Vec::new(),
-                            x0: x0.min(x1),
-                            y0: y0.min(y1),
-                            x1: x0.max(x1),
-                            y1: y0.max(y1),
-                            id: None,
-                        };
-                        let (x0, y0, x1, y1) = if horiz {
-                            (
-                                n,
-                                nstop,
-                                n,
-                                coord
-                                    + if coord > nstop {
-                                        5. / scale
-                                    } else {
-                                        -5. / scale
-                                    },
-                            )
-                        } else {
-                            (
-                                nstop,
-                                n,
-                                coord
-                                    + if coord > nstop {
-                                        5. / scale
-                                    } else {
-                                        -5. / scale
-                                    },
-                                n,
-                            )
-                        };
-                        let stop_line = Rect {
-                            object_path: Vec::new(),
-                            x0: x0.min(x1),
-                            y0: y0.min(y1),
-                            x1: x0.max(x1),
-                            y1: y0.max(y1),
-                            id: None,
-                        };
-                        let (x0, y0, x1, y1) = if horiz {
-                            (p, coord, n, coord)
-                        } else {
-                            (coord, p, coord, n)
-                        };
-                        let dim_line = Rect {
-                            object_path: Vec::new(),
-                            x0: x0.min(x1),
-                            y0: y0.min(y1),
-                            x1: x0.max(x1),
-                            y1: y0.max(y1),
-                            id: None,
-                        };
-                        for r in &[start_line, stop_line, dim_line] {
-                            if let Some(quad) =
-                                get_paint_path(r, bounds, scale, offset, color, Pixels(2.))
-                            {
-                                window.paint_quad(quad);
+                    let mut draw_dim =
+                        |p: f32,
+                         n: f32,
+                         coord: f32,
+                         pstop: f32,
+                         nstop: f32,
+                         horiz: bool,
+                         value: String,
+                         color: Rgba,
+                         span: Option<&Span>| {
+                            let (x0, y0, x1, y1) = if horiz {
+                                (
+                                    p,
+                                    pstop,
+                                    p,
+                                    coord
+                                        + if coord > pstop {
+                                            5. / scale
+                                        } else {
+                                            -5. / scale
+                                        },
+                                )
+                            } else {
+                                (
+                                    pstop,
+                                    p,
+                                    coord
+                                        + if coord > pstop {
+                                            5. / scale
+                                        } else {
+                                            -5. / scale
+                                        },
+                                    p,
+                                )
+                            };
+                            let start_line = Rect {
+                                object_path: Vec::new(),
+                                x0: x0.min(x1),
+                                y0: y0.min(y1),
+                                x1: x0.max(x1),
+                                y1: y0.max(y1),
+                                id: None,
+                            };
+                            let (x0, y0, x1, y1) = if horiz {
+                                (
+                                    n,
+                                    nstop,
+                                    n,
+                                    coord
+                                        + if coord > nstop {
+                                            5. / scale
+                                        } else {
+                                            -5. / scale
+                                        },
+                                )
+                            } else {
+                                (
+                                    nstop,
+                                    n,
+                                    coord
+                                        + if coord > nstop {
+                                            5. / scale
+                                        } else {
+                                            -5. / scale
+                                        },
+                                    n,
+                                )
+                            };
+                            let stop_line = Rect {
+                                object_path: Vec::new(),
+                                x0: x0.min(x1),
+                                y0: y0.min(y1),
+                                x1: x0.max(x1),
+                                y1: y0.max(y1),
+                                id: None,
+                            };
+                            let (x0, y0, x1, y1) = if horiz {
+                                (p, coord, n, coord)
+                            } else {
+                                (coord, p, coord, n)
+                            };
+                            let dim_line = Rect {
+                                object_path: Vec::new(),
+                                x0: x0.min(x1),
+                                y0: y0.min(y1),
+                                x1: x0.max(x1),
+                                y1: y0.max(y1),
+                                id: None,
+                            };
+                            for r in &[start_line, stop_line, dim_line] {
+                                if let Some(quad) =
+                                    get_paint_path(r, bounds, scale, offset, color, Pixels(2.))
+                                {
+                                    window.paint_quad(quad);
+                                }
                             }
-                        }
 
-                        let run_len = value.len();
-                        let text_origin = self
-                            .inner
-                            .read(cx)
-                            .layout_to_px(Point::new((x0 + x1) / 2., (y0 + y1) / 2.));
-                        window
-                            .text_system()
-                            .shape_line(
-                                SharedString::from(value),
-                                Pixels(14.),
-                                &[window.text_style().to_run(run_len)],
-                            )
-                            .paint(text_origin, Pixels(16.), window, cx)
-                            .unwrap();
-                    };
+                            let run_len = value.len();
+                            let font_size = Pixels(14.);
+                            let runs = &[window.text_style().to_run(run_len)];
+                            let origin = self
+                                .inner
+                                .read(cx)
+                                .layout_to_px(Point::new((x0 + x1) / 2., (y0 + y1) / 2.));
+                            let text = SharedString::from(value);
+                            let layout =
+                                window
+                                    .text_system()
+                                    .layout_line(text.clone(), font_size, runs);
+                            if let Some(span) = span {
+                                dim_hitboxes.push((
+                                    span.clone(),
+                                    vec![Bounds::new(origin, size(layout.width, font_size))],
+                                ));
+                            }
+                            window
+                                .text_system()
+                                .shape_line(text, font_size, runs)
+                                .paint(origin, Pixels(16.), window, cx)
+                                .unwrap();
+                        };
 
                     for dim in dims {
                         draw_dim(
-                            window,
-                            cx,
                             dim.p.0 as f32,
                             dim.n.0 as f32,
                             dim.coord.0 as f32,
@@ -695,6 +704,7 @@ impl Element for CanvasElement {
                                 }
                                 _ => rgb(0xffffff),
                             },
+                            dim.span.as_ref(),
                         );
                     }
 
@@ -707,8 +717,6 @@ impl Element for CanvasElement {
                                 Dir::Vert => layout_mouse_position.x,
                             };
                             draw_dim(
-                                window,
-                                cx,
                                 edge.start,
                                 edge.stop,
                                 coord,
@@ -717,6 +725,7 @@ impl Element for CanvasElement {
                                 edge.dir == Dir::Horiz,
                                 format!("{:.3}", (edge.stop - edge.start).abs()),
                                 rgb(0xff0000),
+                                None,
                             );
                         } else if edges.len() == 2 {
                             let edge0 = &edges[0].2;
@@ -726,8 +735,6 @@ impl Element for CanvasElement {
                                 Dir::Vert => layout_mouse_position.y,
                             };
                             draw_dim(
-                                window,
-                                cx,
                                 edge0.coord,
                                 edge1.coord,
                                 coord,
@@ -736,6 +743,7 @@ impl Element for CanvasElement {
                                 edge0.dir == Dir::Vert,
                                 format!("{:.3}", (edge1.coord - edge0.coord).abs()),
                                 rgb(0xff0000),
+                                None,
                             );
                         }
                         // highlight selected edges
@@ -768,6 +776,7 @@ impl Element for CanvasElement {
         self.inner.update(cx, |inner, cx| {
             inner.rects = rects;
             inner.scope_rects = scope_rects;
+            inner.dim_hitboxes = dim_hitboxes;
             cx.notify();
         });
     }
@@ -790,6 +799,7 @@ impl Render for LayoutCanvas {
             // .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_dim))
+            .on_action(cx.listener(Self::edit_action))
             .on_action(cx.listener(Self::fit_to_screen_action))
             .on_action(cx.listener(Self::zero_hierarchy))
             .on_action(cx.listener(Self::one_hierarchy))
@@ -840,6 +850,7 @@ impl LayoutCanvas {
             state: state.clone(),
             rects: Vec::new(),
             scope_rects: Vec::new(),
+            dim_hitboxes: Vec::new(),
             pending_init: true,
         }
     }
@@ -1206,24 +1217,30 @@ impl LayoutCanvas {
                         .map(|(r, _)| r);
                     let scale = self.scale;
                     let offset = self.offset;
-                    let mut selected_rect = None;
-                    for r in rects.chain(self.scope_rects.iter()) {
-                        let rect_bounds = Bounds::new(
-                            Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
-                                + offset
-                                + self.screen_bounds.origin,
-                            Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
-                        );
-                        if rect_bounds.contains(&event.position) && r.id.is_some() {
-                            selected_rect = Some(r);
+                    let mut selected_obj = None;
+                    for (span, bounds) in rects
+                        .chain(self.scope_rects.iter())
+                        .filter_map(|r| {
+                            let rect_bounds = Bounds::new(
+                                Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                    + offset
+                                    + self.screen_bounds.origin,
+                                Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+                            );
+                            Some((r.id.as_ref()?, rect_bounds))
+                        })
+                        .chain(self.dim_hitboxes.iter().flat_map(|(span, hitboxes)| {
+                            hitboxes.iter().map(|hitbox| (span, *hitbox)).collect_vec()
+                        }))
+                    {
+                        if bounds.contains(&event.position) {
+                            selected_obj = Some(span);
                             break;
                         }
                     }
-                    if let Some(r) = selected_rect.cloned() {
-                        select_tool.selected_obj = r.id.clone();
-                        if let Some(span) = &r.id {
-                            self.state.read(cx).lsp_client.select_rect(span.clone());
-                        }
+                    if let Some(span) = selected_obj {
+                        select_tool.selected_obj = Some(span.clone());
+                        self.state.read(cx).lsp_client.select_rect(span.clone());
                     } else {
                         select_tool.selected_obj = None;
                     }
@@ -1273,6 +1290,25 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         self.fit_to_screen(cx);
+    }
+
+    pub(crate) fn edit_action(&mut self, _: &Edit, window: &mut Window, cx: &mut Context<Self>) {
+        self.tool.update(cx, |tool, cx| {
+            if let ToolState::Select(SelectToolState {
+                selected_obj: Some(obj),
+            }) = tool
+                && self
+                    .dim_hitboxes
+                    .iter()
+                    .map(|(span, _)| span)
+                    .contains(&*obj)
+            {
+                *tool = ToolState::EditDim(EditDimToolState { dim: obj.clone() });
+                window.focus(&self.text_input_focus_handle);
+                window.prevent_default();
+                cx.notify();
+            }
+        });
     }
 
     pub(crate) fn zero_hierarchy(
