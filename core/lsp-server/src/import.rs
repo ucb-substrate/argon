@@ -7,6 +7,7 @@ use compiler::{
         ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
         Scope, UnaryOpExpr, annotated::AnnotatedAst,
     },
+    compile::BUILTINS,
     parse::ParseMetadata,
 };
 use tower_lsp::lsp_types::{Range, TextEdit};
@@ -127,6 +128,14 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         }
     }
 
+    fn dispatch_match_expr(
+        &mut self,
+        _input: &compiler::ast::MatchExpr<Self::InputS, Self::InputMetadata>,
+        _scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _arms: &[compiler::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
+    }
+
     fn dispatch_bin_op_expr(
         &mut self,
         _input: &BinOpExpr<Substr, Self::InputMetadata>,
@@ -164,9 +173,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         _func: &IdentPath<Substr, Self::OutputMetadata>,
         _args: &Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"]
-            .contains(&input.func.path.last().unwrap().name.as_str())
-        {
+        if BUILTINS.contains(&input.func.path.last().unwrap().name.as_str()) {
             return;
         }
         if let Some(scope_annotation) = &input.scope_annotation {
@@ -276,6 +283,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> Expr<Substr, Self::OutputMetadata> {
         match input {
             Expr::If(if_expr) => Expr::If(Box::new(self.transform_if_expr(if_expr))),
+            Expr::Match(match_expr) => Expr::Match(Box::new(self.transform_match_expr(match_expr))),
             Expr::BinOp(bin_op_expr) => {
                 Expr::BinOp(Box::new(self.transform_bin_op_expr(bin_op_expr)))
             }

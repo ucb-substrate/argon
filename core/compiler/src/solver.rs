@@ -5,7 +5,7 @@ use nalgebra::{DMatrix, DVector};
 use ndarray_linalg::SVD;
 use serde::{Deserialize, Serialize};
 
-const EPSILON: f64 = 1e-10;
+const EPSILON: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Var(u64);

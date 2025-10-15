@@ -178,6 +178,7 @@ pub enum ComparisonOp {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub enum Expr<S, T: AstMetadata> {
     If(Box<IfExpr<S, T>>),
+    Match(Box<MatchExpr<S, T>>),
     Comparison(Box<ComparisonExpr<S, T>>),
     BinOp(Box<BinOpExpr<S, T>>),
     UnaryOp(Box<UnaryOpExpr<S, T>>),
@@ -201,6 +202,21 @@ pub struct IfExpr<S, T: AstMetadata> {
     pub else_: Scope<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::IfExpr,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct MatchExpr<S, T: AstMetadata> {
+    pub scrutinee: Expr<S, T>,
+    pub arms: Vec<MatchArm<S, T>>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::MatchExpr,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct MatchArm<S, T: AstMetadata> {
+    pub pattern: IdentPath<S, T>,
+    pub expr: Expr<S, T>,
+    pub span: cfgrammar::Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -302,6 +318,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
     pub fn span(&self) -> cfgrammar::Span {
         match self {
             Self::If(x) => x.span,
+            Self::Match(x) => x.span,
             Self::Comparison(x) => x.span,
             Self::BinOp(x) => x.span,
             Self::UnaryOp(x) => x.span,
@@ -330,6 +347,7 @@ pub trait AstMetadata {
     type ConstantDecl: Debug + Clone + Serialize + DeserializeOwned;
     type LetBinding: Debug + Clone + Serialize + DeserializeOwned;
     type IfExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type MatchExpr: Debug + Clone + Serialize + DeserializeOwned;
     type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -399,6 +417,12 @@ pub trait AstTransformer {
         then: &Scope<Self::OutputS, Self::OutputMetadata>,
         else_: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr;
+    fn dispatch_match_expr(
+        &mut self,
+        input: &MatchExpr<Self::InputS, Self::InputMetadata>,
+        scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        arms: &[MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr;
     fn dispatch_bin_op_expr(
         &mut self,
         input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
@@ -636,6 +660,28 @@ pub trait AstTransformer {
             else_,
         }
     }
+    fn transform_match_expr(
+        &mut self,
+        input: &MatchExpr<Self::InputS, Self::InputMetadata>,
+    ) -> MatchExpr<Self::OutputS, Self::OutputMetadata> {
+        let scrutinee = self.transform_expr(&input.scrutinee);
+        let arms = input
+            .arms
+            .iter()
+            .map(|arm| MatchArm {
+                pattern: self.transform_ident_path(&arm.pattern),
+                expr: self.transform_expr(&arm.expr),
+                span: arm.span,
+            })
+            .collect::<Vec<_>>();
+        let metadata = self.dispatch_match_expr(input, &scrutinee, &arms);
+        MatchExpr {
+            scrutinee,
+            arms,
+            span: input.span,
+            metadata,
+        }
+    }
     fn transform_bin_op_expr(
         &mut self,
         input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
@@ -832,6 +878,7 @@ pub trait AstTransformer {
     ) -> Expr<Self::OutputS, Self::OutputMetadata> {
         match input {
             Expr::If(if_expr) => Expr::If(Box::new(self.transform_if_expr(if_expr))),
+            Expr::Match(match_expr) => Expr::Match(Box::new(self.transform_match_expr(match_expr))),
             Expr::BinOp(bin_op_expr) => {
                 Expr::BinOp(Box::new(self.transform_bin_op_expr(bin_op_expr)))
             }

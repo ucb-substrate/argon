@@ -60,6 +60,7 @@ mod tests {
     );
     const ARGON_ENUMERATIONS: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/enumerations/lib.ar");
+    const ARGON_BBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bbox/lib.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
@@ -452,9 +453,26 @@ mod tests {
         assert_eq!(cell.objects.len(), 1);
         let r = cell.objects.iter().next().unwrap().1.as_ref().unwrap_rect();
         assert_eq!(r.layer.as_deref(), Some("met2"));
-        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x0.0, 100., epsilon = EPSILON);
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 300., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 400., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_bbox() {
+        let ast = parse_workspace_with_std(ARGON_BBOX).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 5);
     }
 }

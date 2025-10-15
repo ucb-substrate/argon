@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue,
-    ModPath, Scope, Span, UnaryOp, WorkspaceAst,
+    MatchExpr, ModPath, Scope, Span, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -29,6 +29,8 @@ use crate::{
     parse::ParseMetadata,
     solver::{LinearExpr, Solver, Var},
 };
+
+pub const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
@@ -208,6 +210,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _then: &Scope<Self::OutputS, Self::OutputMetadata>,
         _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
+    }
+
+    fn dispatch_match_expr(
+        &mut self,
+        _input: &crate::ast::MatchExpr<Self::InputS, Self::InputMetadata>,
+        _scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
     }
 
     fn dispatch_bin_op_expr(
@@ -510,6 +520,7 @@ impl AstMetadata for VarIdTyMetadata {
     type LetBinding = VarId;
     type FnDecl = (PathBuf, VarId);
     type IfExpr = Ty;
+    type MatchExpr = Ty;
     type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
@@ -566,6 +577,7 @@ impl<'a> VarIdTyPass<'a> {
                 _ => (),
             }
         }
+
         for decl in &self.ast.ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -595,13 +607,11 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_fn_decl(&mut self, input: &'a FnDecl<Substr, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
-        {
+        if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
-            return;
         }
         let args: Vec<_> = input
             .args
@@ -620,8 +630,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_enum_decl(&mut self, input: &'a EnumDecl<Substr, ParseMetadata>) {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
-        {
+        if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -685,6 +694,18 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::IncorrectTyCategory {
                     found: ty.clone(),
                     expected: "Cell".into(),
+                },
+            });
+        }
+    }
+
+    fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
+        if !matches!(ty, Ty::Enum(_)) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::IncorrectTyCategory {
+                    found: ty.clone(),
+                    expected: "Enum".into(),
                 },
             });
         }
@@ -798,6 +819,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
     fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
+            Expr::Match(match_expr) => match_expr.metadata.clone(),
             Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
@@ -968,8 +990,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CellDecl<Substr, Self::InputMetadata>,
     ) -> CellDecl<Substr, Self::OutputMetadata> {
-        if ["crect", "rect", "float", "eq", "dimension", "inst"].contains(&input.name.name.as_str())
-        {
+        if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
@@ -1093,6 +1114,51 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             });
         }
         then_ty
+    }
+
+    fn dispatch_match_expr(
+        &mut self,
+        input: &crate::ast::MatchExpr<Self::InputS, Self::InputMetadata>,
+        scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
+        arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
+        let scrutinee_ty = scrutinee.ty();
+        self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
+        let output_ty = arms.first().map(|arm| arm.expr.ty()).unwrap_or(Ty::Nil);
+
+        if let Ty::Enum(ref e) = scrutinee_ty {
+            let mut covered = IndexSet::new();
+            let mut remaining = e.variants.clone();
+            for arm in arms.iter() {
+                let arm_ty = &arm.pattern.metadata.1;
+                self.assert_eq_ty(arm.pattern.span, arm_ty, &scrutinee_ty);
+
+                let variant = arm.pattern.path.last().unwrap().name.clone();
+                remaining.swap_remove(variant.as_str());
+                if !covered.insert(variant) {
+                    self.errors.push(StaticError {
+                        span: self.span(arm.pattern.span),
+                        kind: StaticErrorKind::DuplicateMatchArm,
+                    });
+                }
+
+                if arm.expr.ty() != output_ty {
+                    self.errors.push(StaticError {
+                        span: self.span(arm.expr.span()),
+                        kind: StaticErrorKind::BranchesDifferentTypes,
+                    });
+                }
+            }
+
+            if !remaining.is_empty() {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::MatchArmsNotComprehensive,
+                });
+            }
+        }
+
+        output_ty
     }
 
     fn dispatch_bin_op_expr(
@@ -1261,6 +1327,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             ("h", Ty::Float),
                         ]),
                     );
+                    (None, Ty::Rect)
+                }
+                "bbox" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    let argty = args.posargs[0].ty();
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                        self.errors.push(StaticError {
+                            span: self.span(input.span),
+                            kind: StaticErrorKind::IncorrectTyCategory {
+                                found: argty,
+                                expected: "Cell/Inst".to_string(),
+                            },
+                        });
+                    }
                     (None, Ty::Rect)
                 }
                 "float" => {
@@ -2224,9 +2304,7 @@ impl<'a> ExecPass<'a> {
                 return value;
             }
             Expr::Call(c) => {
-                if ["rect", "crect", "float", "inst", "eq", "dimension"]
-                    .contains(&c.func.path.last().unwrap().name.as_str())
-                {
+                if BUILTINS.contains(&c.func.path.last().unwrap().name.as_str()) {
                     PartialEvalState::Call(Box::new(PartialCallExpr {
                         expr: c.clone(),
                         state: CallExprState {
@@ -2314,6 +2392,13 @@ impl<'a> ExecPass<'a> {
                 PartialEvalState::If(Box::new(PartialIfExpr {
                     expr: (**if_expr).clone(),
                     state: IfExprState::Cond(cond),
+                }))
+            }
+            Expr::Match(match_expr) => {
+                let scrutinee = self.visit_expr(loc, &match_expr.scrutinee);
+                PartialEvalState::Match(Box::new(PartialMatchExpr {
+                    expr: (**match_expr).clone(),
+                    state: MatchExprState::Scrutinee(scrutinee),
                 }))
             }
             Expr::Comparison(comparison_expr) => {
@@ -2475,6 +2560,84 @@ impl<'a> ExecPass<'a> {
                             self.cell_state_mut(vref.loc.cell).deferred.insert(defer);
                         }
                         true
+                    } else {
+                        false
+                    }
+                }
+                "bbox" => {
+                    let arg = &self.values[&c.state.posargs[0]];
+                    if let Some(val) = arg.get_ready() {
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let r = match val {
+                            Value::Inst(i) => {
+                                if let Defer::Ready(cell) = &self.values[&i.cell] {
+                                    let cell_id = cell.as_ref().unwrap_cell();
+                                    Some(
+                                        self.bbox(*cell_id)
+                                            .map(|r| r.transform(i.reflect, i.angle)),
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
+                            Value::Cell(c) => Some(self.bbox(*c)),
+                            _ => unreachable!(),
+                        };
+                        if let Some(r) = r {
+                            if let Some(r) = r {
+                                let id = object_id(&mut self.next_id);
+                                let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                let orect = Rect {
+                                    id,
+                                    layer: None,
+                                    x0: state.solver.new_var(),
+                                    y0: state.solver.new_var(),
+                                    x1: state.solver.new_var(),
+                                    y1: state.solver.new_var(),
+                                    span: Some(span),
+                                };
+                                state.objects.insert(orect.id, orect.clone().into());
+                                let dx0 = LinearExpr::from(orect.x0) - r.x0;
+                                let dx1 = LinearExpr::from(orect.x1) - r.x1;
+                                let dy0 = LinearExpr::from(orect.y0) - r.y0;
+                                let dy1 = LinearExpr::from(orect.y1) - r.y1;
+                                let state = self.cell_state_mut(vref.loc.cell);
+                                state.solver.constrain_eq0(dx0);
+                                state.solver.constrain_eq0(dx1);
+                                state.solver.constrain_eq0(dy0);
+                                state.solver.constrain_eq0(dy1);
+                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
+                                true
+                            } else {
+                                // default to a zero rectangle
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: vref.loc.cell,
+                                    kind: ExecErrorKind::EmptyBbox,
+                                });
+                                let id = object_id(&mut self.next_id);
+                                let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                let orect = Rect {
+                                    id,
+                                    layer: None,
+                                    x0: state.solver.new_var(),
+                                    y0: state.solver.new_var(),
+                                    x1: state.solver.new_var(),
+                                    y1: state.solver.new_var(),
+                                    span: Some(span),
+                                };
+                                state.objects.insert(orect.id, orect.clone().into());
+                                let state = self.cell_state_mut(vref.loc.cell);
+                                state.solver.constrain_eq0(orect.x0.into());
+                                state.solver.constrain_eq0(orect.x1.into());
+                                state.solver.constrain_eq0(orect.y0.into());
+                                state.solver.constrain_eq0(orect.y1.into());
+                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
+                                true
+                            }
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }
@@ -2825,6 +2988,32 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
+            PartialEvalState::Match(match_) => match match_.state {
+                MatchExprState::Scrutinee(scrutinee) => {
+                    if let Defer::Ready(val) = &self.values[&scrutinee] {
+                        let variant = val.as_ref().unwrap_enum_value();
+                        let arm = match_
+                            .expr
+                            .arms
+                            .iter()
+                            .find(|arm| *variant == arm.pattern.path.last().unwrap().name)
+                            .unwrap();
+                        let value = self.visit_expr(vref.loc, &arm.expr);
+                        match_.state = MatchExprState::Value(value);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                MatchExprState::Value(value) => {
+                    if let Defer::Ready(val) = &self.values[&value] {
+                        self.values.insert(vid, Defer::Ready(val.clone()));
+                        true
+                    } else {
+                        false
+                    }
+                }
+            },
             PartialEvalState::Comparison(comparison_expr) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) = (
                     &self.values[&comparison_expr.state.left],
@@ -3061,6 +3250,22 @@ impl<'a> ExecPass<'a> {
         }
         progress
     }
+
+    pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
+        let mut bbox = None;
+        let cell = &self.compiled_cells[&cell];
+        for (_, o) in cell.objects.iter() {
+            match o {
+                SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
+                SolvedValue::Instance(i) => {
+                    let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
+                    bbox = bbox_union(bbox, cell_bbox);
+                }
+                _ => (),
+            }
+        }
+        bbox
+    }
 }
 
 #[enumify]
@@ -3217,6 +3422,22 @@ impl CompiledCell {
     }
 }
 
+pub fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f64>> {
+    match (b1, b2) {
+        (Some(r1), Some(r2)) => Some(Rect {
+            layer: None,
+            x0: r1.x0.min(r2.x0),
+            y0: r1.y0.min(r2.y0),
+            x1: r1.x1.max(r2.x1),
+            y1: r1.y1.max(r2.y1),
+            id: r1.id,
+            span: None,
+        }),
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticError {
     pub span: Span,
@@ -3251,6 +3472,12 @@ pub enum StaticErrorKind {
     /// Branches in expresssions must evaluate to the same type.
     #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
+    /// Multiple match arms with matching patterns.
+    #[error("match arms must be distinct")]
+    DuplicateMatchArm,
+    /// Match arms must be comprehensive.
+    #[error("match arms must be comprehensive")]
+    MatchArmsNotComprehensive,
     /// The operands in a binary expression must have the same type.
     #[error("operands of binary expression must have the same type")]
     BinOpMismatchedTypes,
@@ -3331,6 +3558,9 @@ pub enum ExecErrorKind {
     /// Conflicting constraints.
     #[error("inconsistent constraints")]
     InconsistentConstraints,
+    /// A cell or instance had an empty bounding box.
+    #[error("empty bbox")]
+    EmptyBbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3378,6 +3608,7 @@ struct PartialEval<T: AstMetadata> {
 #[derive(Debug, Clone)]
 enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
+    Match(Box<PartialMatchExpr<T>>),
     Comparison(Box<PartialComparisonExpr<T>>),
     BinOp(PartialBinOp),
     UnaryOp(PartialUnaryOp),
@@ -3420,10 +3651,22 @@ struct PartialIfExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialMatchExpr<T: AstMetadata> {
+    expr: MatchExpr<Substr, T>,
+    state: MatchExprState,
+}
+
+#[derive(Debug, Clone)]
 pub enum IfExprState {
     Cond(ValueId),
     Then(ValueId),
     Else(ValueId),
+}
+
+#[derive(Debug, Clone)]
+pub enum MatchExprState {
+    Scrutinee(ValueId),
+    Value(ValueId),
 }
 
 #[derive(Debug, Clone)]
