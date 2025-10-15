@@ -225,16 +225,20 @@ impl TextInput {
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.tool.update(cx, |tool, cx| {
             if let ToolState::EditDim(EditDimToolState { dim }) = tool {
-                if let Some(span) = self
+                if self
                     .state
                     .read(cx)
                     .lsp_client
                     .edit_dimension(dim.clone(), self.content.to_string())
+                    .is_some()
                 {
-                    *dim = span;
+                    println!("edited dimension");
+                    *tool = ToolState::default();
                     return true;
                 }
+                println!("correct tool but no edit");
             }
+            println!("couldn't edit dimension");
             false
         });
         if reset {

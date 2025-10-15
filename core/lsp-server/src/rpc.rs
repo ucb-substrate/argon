@@ -95,20 +95,15 @@ impl GuiToLsp for LspServer {
             .ast
             .values()
             .find(|ast| ast.path == scope_span.path)
-            && let Some(scope) = state_mut
-                .ast
-                .values()
-                .find(|ast| ast.path == scope_span.path)
-                .as_ref()
-                .and_then(|ast| ast.span2scope.get(&scope_span))
+            && let Some(scope) = ast.span2scope.get(&scope_span)
         {
             let doc = Document::new(&ast.text, 0);
             let format_rect = |rect: &BasicRect<f64>| {
                 format!(
-                    "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})!;",
+                    "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
                     rect.layer
                         .as_ref()
-                        .map(|layer| format!("{layer}, "))
+                        .map(|layer| format!("\"{layer}\", "))
                         .unwrap_or_default(),
                     rect.x0,
                     rect.y0,
@@ -124,7 +119,7 @@ impl GuiToLsp for LspServer {
                     TextEdit {
                         range: Range::new(start, start),
                         new_text: format!(
-                            "{prefix}{rect_str}\n{}",
+                            "{prefix}{rect_str}!;\n{}",
                             // TODO: handle different types of indentation, or enforce that gui
                             // reformats file before editing.
                             std::iter::repeat_n(' ', start.character as usize).collect::<String>()
@@ -157,7 +152,7 @@ impl GuiToLsp for LspServer {
                 (
                     TextEdit {
                         range: Range::new(insert_loc, insert_loc),
-                        new_text: format!("{prefix}{rect_str}\n{whitespace}",),
+                        new_text: format!("{prefix}{rect_str}!;\n{whitespace}",),
                     },
                     Span {
                         path: scope_span.path.clone(),
@@ -227,17 +222,12 @@ impl GuiToLsp for LspServer {
             .ast
             .values()
             .find(|ast| ast.path == scope_span.path)
-            && let Some(scope) = state_mut
-                .ast
-                .values()
-                .find(|ast| ast.path == scope_span.path)
-                .as_ref()
-                .and_then(|ast| ast.span2scope.get(&scope_span))
+            && let Some(scope) = ast.span2scope.get(&scope_span)
         {
             let doc = Document::new(&ast.text, 0);
             let format_dimension = |params: &DimensionParams| {
                 format!(
-                    "dimension({}, {}, {}, {}, {}, {}, {});",
+                    "dimension({}, {}, {}, {}, {}, {}, {})",
                     params.p,
                     params.n,
                     params.value,
@@ -254,7 +244,7 @@ impl GuiToLsp for LspServer {
                     TextEdit {
                         range: Range::new(start, start),
                         new_text: format!(
-                            "{}\n{}",
+                            "{};\n{}",
                             dimension,
                             // TODO: handle different types of indentation, or enforce that gui
                             // reformats file before editing.
@@ -285,7 +275,7 @@ impl GuiToLsp for LspServer {
                 (
                     TextEdit {
                         range: Range::new(insert_loc, insert_loc),
-                        new_text: format!("{}{}\n{whitespace}", prefix, dimension,),
+                        new_text: format!("{}{};\n{whitespace}", prefix, dimension,),
                     },
                     Span {
                         path: scope_span.path.clone(),
@@ -348,8 +338,70 @@ impl GuiToLsp for LspServer {
         span: Span,
         value: String,
     ) -> Option<Span> {
-        // TODO: implement
-        None
+        // TODO: check if editor file is up to date with ast.
+        let state_mut = self.state.state_mut.lock().await;
+        let url = Url::from_file_path(&span.path).unwrap();
+        if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
+            && let Some(c) = ast.span2call.get(&span)
+        {
+            let doc = Document::new(&ast.text, 0);
+            let start = doc.offset_to_pos(c.args.posargs[2].span().start());
+            let stop = doc.offset_to_pos(c.args.posargs[2].span().end());
+            let value_len = value.len();
+            let edit = TextEdit {
+                range: Range::new(start, stop),
+                new_text: value,
+            };
+            if let Some(file) = state_mut.editor_files.get(&url)
+                && file.contents() != doc.contents()
+            {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        "Editor buffer state is inconsistent with GUI state.",
+                    )
+                    .await;
+                return None;
+            }
+
+            self.state
+                .editor_client
+                .show_document(ShowDocumentParams {
+                    uri: url.clone(),
+                    external: None,
+                    take_focus: None,
+                    selection: None,
+                })
+                .await
+                .unwrap();
+
+            self.state
+                .editor_client
+                .apply_edit(WorkspaceEdit {
+                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+                .await
+                .unwrap();
+
+            self.state
+                .editor_client
+                .send_request::<ForceSave>(span.path.clone())
+                .await
+                .unwrap();
+
+            Some(Span {
+                path: span.path.clone(),
+                span: cfgrammar::Span::new(
+                    c.args.posargs[2].span().start(),
+                    c.args.posargs[2].span().start() + value_len,
+                ),
+            })
+        } else {
+            None
+        }
     }
 
     async fn add_eq_constraint(

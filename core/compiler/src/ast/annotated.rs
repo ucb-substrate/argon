@@ -4,7 +4,9 @@ use arcstr::{ArcStr, Substr};
 use derive_where::derive_where;
 use indexmap::IndexMap;
 
-use crate::ast::{Ast, AstMetadata, AstTransformer, Decl, Ident, Scope, Span, StringLiteral};
+use crate::ast::{
+    Ast, AstMetadata, AstTransformer, CallExpr, Decl, Ident, Scope, Span, StringLiteral,
+};
 
 #[derive_where(Debug, Clone)]
 pub struct AnnotatedAst<T: AstMetadata> {
@@ -12,6 +14,8 @@ pub struct AnnotatedAst<T: AstMetadata> {
     pub ast: Ast<Substr, T>,
     pub path: PathBuf,
     pub span2scope: IndexMap<Span, Scope<Substr, T>>,
+    // TODO: merge span2 IndexMaps
+    pub span2call: IndexMap<Span, CallExpr<Substr, T>>,
 }
 
 impl<T: AstMetadata> AnnotatedAst<T> {
@@ -20,6 +24,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             text,
             path: path.clone(),
             span2scope: Default::default(),
+            span2call: Default::default(),
             phantom: Default::default(),
         };
 
@@ -50,6 +55,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             },
             path,
             span2scope: pass.span2scope,
+            span2call: pass.span2call,
         }
     }
 }
@@ -58,6 +64,7 @@ struct AstAnnotationPass<S, T: AstMetadata> {
     text: ArcStr,
     path: PathBuf,
     span2scope: IndexMap<Span, Scope<Substr, T>>,
+    span2call: IndexMap<Span, CallExpr<Substr, T>>,
     phantom: PhantomData<S>,
 }
 
@@ -249,6 +256,34 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
             },
             output.clone(),
         );
+    }
+
+    fn transform_call_expr(
+        &mut self,
+        input: &CallExpr<Self::InputS, Self::InputMetadata>,
+    ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
+        let scope_annotation = input
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
+        let func = self.transform_ident_path(&input.func);
+        let args = self.transform_args(&input.args);
+        let metadata = self.dispatch_call_expr(input, &func, &args);
+        let o = CallExpr {
+            scope_annotation,
+            func,
+            args,
+            span: input.span,
+            metadata,
+        };
+        self.span2call.insert(
+            Span {
+                path: self.path.clone(),
+                span: o.span,
+            },
+            o.clone(),
+        );
+        o
     }
 
     fn transform_s(&mut self, _s: &Self::InputS) -> Self::OutputS {
