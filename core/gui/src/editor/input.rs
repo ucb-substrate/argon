@@ -13,7 +13,7 @@ use crate::{
     actions::*,
     editor::{
         EditorState,
-        canvas::{EditDimToolState, LayoutCanvas, ToolState},
+        canvas::{DrawDimToolState, EditDimToolState, LayoutCanvas, ToolState},
     },
 };
 
@@ -224,7 +224,7 @@ impl TextInput {
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.tool.update(cx, |tool, cx| {
-            if let ToolState::EditDim(EditDimToolState { dim }) = tool
+            if let ToolState::EditDim(EditDimToolState { dim, dim_mode }) = tool
                 && self
                     .state
                     .read(cx)
@@ -232,7 +232,11 @@ impl TextInput {
                     .edit_dimension(dim.clone(), self.content.to_string())
                     .is_some()
             {
-                *tool = ToolState::default();
+                *tool = if *dim_mode {
+                    ToolState::DrawDim(DrawDimToolState::default())
+                } else {
+                    ToolState::default()
+                };
                 return true;
             }
             false

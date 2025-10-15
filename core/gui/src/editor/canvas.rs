@@ -130,12 +130,12 @@ pub struct CanvasElement {
     inner: Entity<LayoutCanvas>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DrawRectToolState {
     p0: Option<Point<f32>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct DrawDimToolState {
     pub(crate) edges: Vec<(String, String, Edge<f32>)>,
 }
@@ -143,6 +143,8 @@ pub(crate) struct DrawDimToolState {
 #[derive(Debug, Clone)]
 pub(crate) struct EditDimToolState {
     pub(crate) dim: Span,
+    /// `true` if entered from dimension tool
+    pub(crate) dim_mode: bool, // TODO: make more general purpose after state transitions finalized
 }
 
 // TODO: potentially re-use compiler provided object IDs
@@ -152,7 +154,7 @@ pub struct GlobalObjectId {
     idx: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SelectToolState {
     pub(crate) selected_obj: Option<Span>,
 }
@@ -168,7 +170,7 @@ pub(crate) enum ToolState {
 
 impl Default for ToolState {
     fn default() -> Self {
-        ToolState::Select(SelectToolState { selected_obj: None })
+        ToolState::Select(SelectToolState::default())
     }
 }
 
@@ -345,6 +347,7 @@ impl Element for CanvasElement {
         let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
         let mut select_rects = Vec::new();
+        let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let mut queue = VecDeque::from_iter([(
@@ -493,7 +496,6 @@ impl Element for CanvasElement {
                 }
             }
 
-            let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
             if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = tool {
                 rects.push((
                     Rect {
@@ -509,7 +511,6 @@ impl Element for CanvasElement {
             }
         }
 
-        let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         let rects = rects
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
@@ -697,7 +698,7 @@ impl Element for CanvasElement {
                                 ToolState::Select(SelectToolState {
                                     selected_obj: Some(selected),
                                 })
-                                | ToolState::EditDim(EditDimToolState { dim: selected })
+                                | ToolState::EditDim(EditDimToolState { dim: selected, .. })
                                     if Some(selected) == dim.span.as_ref() =>
                                 {
                                     rgb(0xff0000)
@@ -1201,7 +1202,10 @@ impl LayoutCanvas {
                             None
                         };
                         if let Some(span) = span {
-                            *tool = ToolState::EditDim(EditDimToolState { dim: span });
+                            *tool = ToolState::EditDim(EditDimToolState {
+                                dim: span,
+                                dim_mode: true,
+                            });
                             window.focus(&self.text_input_focus_handle);
                             window.prevent_default();
                             cx.notify();
@@ -1268,7 +1272,7 @@ impl LayoutCanvas {
     pub(crate) fn draw_rect(&mut self, _: &DrawRect, _window: &mut Window, cx: &mut Context<Self>) {
         self.tool.update(cx, |tool, cx| {
             if !tool.is_draw_rect() {
-                *tool = ToolState::DrawRect(DrawRectToolState { p0: None });
+                *tool = ToolState::DrawRect(DrawRectToolState::default());
                 cx.notify();
             }
         });
@@ -1277,7 +1281,7 @@ impl LayoutCanvas {
     pub(crate) fn draw_dim(&mut self, _: &DrawDim, _window: &mut Window, cx: &mut Context<Self>) {
         self.tool.update(cx, |tool, cx| {
             if !tool.is_draw_dim() {
-                *tool = ToolState::DrawDim(DrawDimToolState { edges: Vec::new() });
+                *tool = ToolState::DrawDim(DrawDimToolState::default());
                 cx.notify();
             }
         });
@@ -1303,7 +1307,10 @@ impl LayoutCanvas {
                     .map(|(span, _)| span)
                     .contains(&*obj)
             {
-                *tool = ToolState::EditDim(EditDimToolState { dim: obj.clone() });
+                *tool = ToolState::EditDim(EditDimToolState {
+                    dim: obj.clone(),
+                    dim_mode: false,
+                });
                 window.focus(&self.text_input_focus_handle);
                 window.prevent_default();
                 cx.notify();
