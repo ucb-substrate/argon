@@ -36,6 +36,7 @@ pub fn main() {
             KeyBinding::new("r", DrawRect, None),
             KeyBinding::new("d", DrawDim, None),
             KeyBinding::new("f", Fit, None),
+            KeyBinding::new("q", Edit, None),
             KeyBinding::new("0", Zero, None),
             KeyBinding::new("1", One, None),
             KeyBinding::new("*", All, None),

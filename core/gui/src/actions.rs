@@ -7,6 +7,7 @@ actions!(
         Quit,
         DrawRect,
         DrawDim,
+        Edit,
         Fit,
         Zero,
         One,
