@@ -2,7 +2,7 @@
 //
 //! Pass 1: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::VecDeque;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -1634,6 +1634,32 @@ struct ExecScope {
     bindings: IndexMap<SeqNum, (String, ValueId)>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FallbackConstraint {
+    priority: i32,
+    constraint: LinearExpr,
+}
+
+impl PartialEq for FallbackConstraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority
+    }
+}
+
+impl Eq for FallbackConstraint {}
+
+impl PartialOrd for FallbackConstraint {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for FallbackConstraint {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.priority.cmp(&other.priority)
+    }
+}
+
 struct CellState {
     solve_iters: u64,
     solver: Solver,
@@ -1643,7 +1669,7 @@ struct CellState {
     deferred: IndexSet<ValueId>,
     root_scope: ScopeId,
     scopes: IndexMap<ScopeId, ExecScope>,
-    fallback_constraints: Vec<LinearExpr>,
+    fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<LinearExpr>,
     nullspace_vecs: Option<Vec<Vec<f64>>>,
 }
@@ -1863,7 +1889,7 @@ impl<'a> ExecPass<'a> {
                         emit: Vec::new(),
                         deferred: Default::default(),
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
-                        fallback_constraints: Vec::new(),
+                        fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
                         root_scope: root_scope_id,
                         nullspace_vecs: None,
@@ -1932,14 +1958,16 @@ impl<'a> ExecPass<'a> {
                 }
                 let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);
-                while let Some(expr) = state.fallback_constraints.pop() {
-                    if expr
+                while let Some(FallbackConstraint { constraint, .. }) =
+                    state.fallback_constraints.pop()
+                {
+                    if constraint
                         .coeffs
                         .iter()
                         .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
                     {
-                        state.fallback_constraints_used.push(expr.clone());
-                        state.solver.constrain_eq0(expr);
+                        state.fallback_constraints_used.push(constraint.clone());
+                        state.solver.constrain_eq0(constraint);
                         constraint_added = true;
                         break;
                     }
@@ -2502,30 +2530,34 @@ impl<'a> ExecPass<'a> {
                         state.objects.insert(rect.id, rect.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            match kwarg.name.name.as_str() {
+                            let priority = match kwarg.name.name.as_str() {
                                 "x0" | "x0i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.x0))),
                                     );
+                                    6
                                 }
                                 "x1" | "x1i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.x1))),
                                     );
+                                    5
                                 }
                                 "y0" | "y0i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.y0))),
                                     );
+                                    4
                                 }
                                 "y1" | "y1i" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(rect.y1))),
                                     );
+                                    3
                                 }
                                 "w" => {
                                     self.values.insert(
@@ -2534,6 +2566,7 @@ impl<'a> ExecPass<'a> {
                                             LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
                                         )),
                                     );
+                                    2
                                 }
                                 "h" => {
                                     self.values.insert(
@@ -2542,6 +2575,7 @@ impl<'a> ExecPass<'a> {
                                             LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
                                         )),
                                     );
+                                    1
                                 }
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
@@ -2553,6 +2587,7 @@ impl<'a> ExecPass<'a> {
                                         lhs,
                                         rhs: *rhs,
                                         fallback: kwarg.name.name.ends_with('i'),
+                                        priority,
                                     }),
                                     loc: vref.loc,
                                 }),
@@ -2778,18 +2813,20 @@ impl<'a> ExecPass<'a> {
                         state.objects.insert(inst.id, inst.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            match kwarg.name.name.as_str() {
+                            let priority = match kwarg.name.name.as_str() {
                                 "x" | "xi" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(inst.x))),
                                     );
+                                    2
                                 }
                                 "y" | "yi" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(LinearExpr::from(inst.y))),
                                     );
+                                    1
                                 }
                                 _ => continue,
                             };
@@ -2801,6 +2838,7 @@ impl<'a> ExecPass<'a> {
                                         lhs,
                                         rhs: *rhs,
                                         fallback: kwarg.name.name.ends_with('i'),
+                                        priority,
                                     }),
                                     loc: vref.loc,
                                 }),
@@ -3207,7 +3245,10 @@ impl<'a> ExecPass<'a> {
                     let rhs = vr.as_ref().unwrap_linear();
                     let expr = lhs.clone() - rhs.clone();
                     if c.fallback {
-                        state.fallback_constraints.push(expr);
+                        state.fallback_constraints.push(FallbackConstraint {
+                            priority: c.priority,
+                            constraint: expr,
+                        });
                     } else {
                         state.solver.constrain_eq0(expr);
                     }
@@ -3629,6 +3670,7 @@ struct PartialConstraint {
     lhs: ValueId,
     rhs: ValueId,
     fallback: bool,
+    priority: i32,
 }
 
 #[derive(Debug, Clone)]

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-6;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
 
 #[derive(Clone, Default)]
@@ -165,7 +165,7 @@ impl Solver {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
 pub struct LinearExpr {
     pub coeffs: Vec<(f64, Var)>,
     pub constant: f64,
