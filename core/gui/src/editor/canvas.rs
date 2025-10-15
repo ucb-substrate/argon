@@ -12,11 +12,11 @@ use compiler::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
+    App, AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
     Element, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, Size, Style, Styled, Subscription, Window, div, pattern_slash, rgb,
-    rgba, solid_background,
+    Rgba, ScrollWheelEvent, ShapedLine, SharedString, Size, Style, Styled, Subscription, Window,
+    div, pattern_slash, rgb, rgba, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -130,14 +130,17 @@ pub struct CanvasElement {
     inner: Entity<LayoutCanvas>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct DrawRectToolState {
     p0: Option<Point<f32>>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct DrawDimToolState {
     pub(crate) edges: Vec<(String, String, Edge<f32>)>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct EditDimToolState {
     pub(crate) dim: Span,
 }
@@ -149,11 +152,13 @@ pub struct GlobalObjectId {
     idx: usize,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct SelectToolState {
     pub(crate) selected_obj: Option<Span>,
 }
 
 #[enumify]
+#[derive(Debug, Clone)]
 pub(crate) enum ToolState {
     DrawRect(DrawRectToolState),
     DrawDim(DrawDimToolState),
@@ -330,15 +335,15 @@ impl Element for CanvasElement {
         });
         let inner = self.inner.read(cx);
         let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
-        let tool = inner.tool.read(cx);
+        let tool = inner.tool.read(cx).clone();
         let state = inner.state.read(cx);
         let layers = state.layers.read(cx);
 
         // TODO: Clean up code.
         let mut rects = Vec::new();
+        let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
         let mut select_rects = Vec::new();
-        let mut dim_edges = Vec::new();
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let mut queue = VecDeque::from_iter([(
@@ -469,9 +474,15 @@ impl Element for CanvasElement {
                                 object_path,
                             ));
                         }
-                        _ => (),
+                        SolvedValue::Dimension(_) => {}
                     }
                 }
+                dims.extend(
+                    cell_info
+                        .objects
+                        .values()
+                        .filter_map(|obj| obj.get_dimension().cloned()),
+                );
                 for child in &scope_info.children {
                     let scope_address = ScopeAddress {
                         scope: *child,
@@ -496,9 +507,6 @@ impl Element for CanvasElement {
                         layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
                     ));
                 }
-                ToolState::DrawDim(DrawDimToolState { edges }) => {
-                    dim_edges.extend_from_slice(edges);
-                }
                 _ => {}
             }
         }
@@ -513,7 +521,7 @@ impl Element for CanvasElement {
         inner
             .bg_style
             .clone()
-            .paint(bounds, window, cx, |window, _cx| {
+            .paint(bounds, window, cx, |window, cx| {
                 window.paint_layer(bounds, |window| {
                     for (r, l) in &rects {
                         if let Some(quad) = get_paint_quad(
@@ -555,32 +563,40 @@ impl Element for CanvasElement {
                         }
                     }
 
-                    // draw dimension lines
-                    if dim_edges.len() == 1 {
-                        let edge = &dim_edges[0].2;
-                        let (x0, y0, x1, y1) = match edge.dir {
-                            Dir::Horiz => (
-                                edge.start,
-                                edge.coord,
-                                edge.start,
-                                layout_mouse_position.y
-                                    + if layout_mouse_position.y > edge.coord {
+                    let draw_dim = |window: &mut Window,
+                                    cx: &mut App,
+                                    p: f32,
+                                    n: f32,
+                                    coord: f32,
+                                    pstop: f32,
+                                    nstop: f32,
+                                    horiz: bool,
+                                    value: String,
+                                    color: Rgba| {
+                        let (x0, y0, x1, y1) = if horiz {
+                            (
+                                p,
+                                pstop,
+                                p,
+                                coord
+                                    + if coord > pstop {
                                         5. / scale
                                     } else {
                                         -5. / scale
                                     },
-                            ),
-                            Dir::Vert => (
-                                edge.coord,
-                                edge.start,
-                                layout_mouse_position.x
-                                    + if layout_mouse_position.x > edge.coord {
+                            )
+                        } else {
+                            (
+                                pstop,
+                                p,
+                                coord
+                                    + if coord > pstop {
                                         5. / scale
                                     } else {
                                         -5. / scale
                                     },
-                                edge.start,
-                            ),
+                                p,
+                            )
                         };
                         let start_line = Rect {
                             object_path: Vec::new(),
@@ -590,29 +606,30 @@ impl Element for CanvasElement {
                             y1: y0.max(y1),
                             id: None,
                         };
-                        let (x0, y0, x1, y1) = match edge.dir {
-                            Dir::Horiz => (
-                                edge.stop,
-                                edge.coord,
-                                edge.stop,
-                                layout_mouse_position.y
-                                    + if layout_mouse_position.y > edge.coord {
+                        let (x0, y0, x1, y1) = if horiz {
+                            (
+                                n,
+                                nstop,
+                                n,
+                                coord
+                                    + if coord > nstop {
                                         5. / scale
                                     } else {
                                         -5. / scale
                                     },
-                            ),
-                            Dir::Vert => (
-                                edge.coord,
-                                edge.stop,
-                                layout_mouse_position.x
-                                    + if layout_mouse_position.x > edge.coord {
+                            )
+                        } else {
+                            (
+                                nstop,
+                                n,
+                                coord
+                                    + if coord > nstop {
                                         5. / scale
                                     } else {
                                         -5. / scale
                                     },
-                                edge.stop,
-                            ),
+                                n,
+                            )
                         };
                         let stop_line = Rect {
                             object_path: Vec::new(),
@@ -622,75 +639,10 @@ impl Element for CanvasElement {
                             y1: y0.max(y1),
                             id: None,
                         };
-                        let (x0, y0, x1, y1) = match edge.dir {
-                            Dir::Horiz => (
-                                edge.start,
-                                layout_mouse_position.y,
-                                edge.stop,
-                                layout_mouse_position.y,
-                            ),
-                            Dir::Vert => (
-                                layout_mouse_position.x,
-                                edge.start,
-                                layout_mouse_position.x,
-                                edge.stop,
-                            ),
-                        };
-                        let dim_line = Rect {
-                            object_path: Vec::new(),
-                            x0,
-                            y0,
-                            x1,
-                            y1,
-                            id: None,
-                        };
-                        for r in &[start_line, stop_line, dim_line] {
-                            if let Some(quad) =
-                                get_paint_path(r, bounds, scale, offset, rgb(0xffffff), Pixels(2.))
-                            {
-                                window.paint_quad(quad);
-                            }
-                        }
-                    } else if dim_edges.len() == 2 {
-                        let edge0 = &dim_edges[0].2;
-                        let edge1 = &dim_edges[1].2;
-                        let [line0, line1] = [edge0, edge1].map(|edge| {
-                            let (x0, y0, x1, y1) = match edge.dir {
-                                Dir::Horiz => (
-                                    edge.start.min(layout_mouse_position.x - 5.),
-                                    edge.coord,
-                                    edge.stop.max(layout_mouse_position.x + 5.),
-                                    edge.coord,
-                                ),
-                                Dir::Vert => (
-                                    edge.coord,
-                                    edge.start.min(layout_mouse_position.y - 5.),
-                                    edge.coord,
-                                    edge.stop.max(layout_mouse_position.y + 5.),
-                                ),
-                            };
-                            Rect {
-                                object_path: Vec::new(),
-                                x0: x0.min(x1),
-                                y0: y0.min(y1),
-                                x1: x0.max(x1),
-                                y1: y0.max(y1),
-                                id: None,
-                            }
-                        });
-                        let (x0, y0, x1, y1) = match edge0.dir {
-                            Dir::Horiz => (
-                                layout_mouse_position.x,
-                                edge0.coord,
-                                layout_mouse_position.x,
-                                edge1.coord,
-                            ),
-                            Dir::Vert => (
-                                edge0.coord,
-                                layout_mouse_position.y,
-                                edge1.coord,
-                                layout_mouse_position.y,
-                            ),
+                        let (x0, y0, x1, y1) = if horiz {
+                            (p, coord, n, coord)
+                        } else {
+                            (coord, p, coord, n)
                         };
                         let dim_line = Rect {
                             object_path: Vec::new(),
@@ -700,36 +652,118 @@ impl Element for CanvasElement {
                             y1: y0.max(y1),
                             id: None,
                         };
-                        for r in &[line0, line1, dim_line] {
+                        for r in &[start_line, stop_line, dim_line] {
                             if let Some(quad) =
-                                get_paint_path(r, bounds, scale, offset, rgb(0xffffff), Pixels(2.))
+                                get_paint_path(r, bounds, scale, offset, color, Pixels(2.))
                             {
                                 window.paint_quad(quad);
                             }
                         }
-                    }
-                    // highlight selected edges
-                    for (_, _, edge) in &dim_edges {
-                        let (x0, y0, x1, y1) = match edge.dir {
-                            Dir::Horiz => (edge.start, edge.coord, edge.stop, edge.coord),
-                            Dir::Vert => (edge.coord, edge.start, edge.coord, edge.stop),
-                        };
-                        if let Some(quad) = get_paint_path(
-                            &Rect {
-                                object_path: Vec::new(),
-                                x0,
-                                y0,
-                                x1,
-                                y1,
-                                id: None,
+
+                        let run_len = value.len();
+                        let text_origin = self
+                            .inner
+                            .read(cx)
+                            .layout_to_px(Point::new((x0 + x1) / 2., (y0 + y1) / 2.));
+                        window
+                            .text_system()
+                            .shape_line(
+                                SharedString::from(value),
+                                Pixels(14.),
+                                &[window.text_style().to_run(run_len)],
+                            )
+                            .paint(text_origin, Pixels(16.), window, cx)
+                            .unwrap();
+                    };
+
+                    for dim in dims {
+                        draw_dim(
+                            window,
+                            cx,
+                            dim.p.0 as f32,
+                            dim.n.0 as f32,
+                            dim.coord.0 as f32,
+                            dim.pstop.0 as f32,
+                            dim.nstop.0 as f32,
+                            dim.horiz,
+                            format!("{:.3}", dim.value.0), // TODO: show actual expression
+                            match &tool {
+                                ToolState::Select(SelectToolState {
+                                    selected_obj: Some(selected),
+                                })
+                                | ToolState::EditDim(EditDimToolState { dim: selected })
+                                    if Some(selected) == dim.span.as_ref() =>
+                                {
+                                    rgb(0xff0000)
+                                }
+                                _ => rgb(0xffffff),
                             },
-                            bounds,
-                            scale,
-                            offset,
-                            rgb(0xffff00),
-                            Pixels(2.),
-                        ) {
-                            window.paint_quad(quad);
+                        );
+                    }
+
+                    if let ToolState::DrawDim(DrawDimToolState { edges }) = &tool {
+                        // draw dimension lines
+                        if edges.len() == 1 {
+                            let edge = &edges[0].2;
+                            let coord = match edge.dir {
+                                Dir::Horiz => layout_mouse_position.y,
+                                Dir::Vert => layout_mouse_position.x,
+                            };
+                            draw_dim(
+                                window,
+                                cx,
+                                edge.start,
+                                edge.stop,
+                                coord,
+                                edge.coord,
+                                edge.coord,
+                                edge.dir == Dir::Horiz,
+                                format!("{:.3}", (edge.stop - edge.start).abs()),
+                                rgb(0xff0000),
+                            );
+                        } else if edges.len() == 2 {
+                            let edge0 = &edges[0].2;
+                            let edge1 = &edges[1].2;
+                            let coord = match edge0.dir {
+                                Dir::Horiz => layout_mouse_position.x,
+                                Dir::Vert => layout_mouse_position.y,
+                            };
+                            draw_dim(
+                                window,
+                                cx,
+                                edge0.coord,
+                                edge1.coord,
+                                coord,
+                                (edge0.start + edge0.stop) / 2.,
+                                (edge1.start + edge1.stop) / 2.,
+                                edge0.dir == Dir::Vert,
+                                format!("{:.3}", (edge1.coord - edge0.coord).abs()),
+                                rgb(0xff0000),
+                            );
+                        }
+                        // highlight selected edges
+                        for (_, _, edge) in edges {
+                            let (x0, y0, x1, y1) = match edge.dir {
+                                Dir::Horiz => (edge.start, edge.coord, edge.stop, edge.coord),
+                                Dir::Vert => (edge.coord, edge.start, edge.coord, edge.stop),
+                            };
+                            if let Some(quad) = get_paint_path(
+                                &Rect {
+                                    object_path: Vec::new(),
+                                    x0,
+                                    y0,
+                                    x1,
+                                    y1,
+                                    id: None,
+                                },
+                                bounds,
+                                scale,
+                                offset,
+                                rgb(0xffff00),
+                                Pixels(2.),
+                            ) {
+                                window.paint_quad(quad);
+                            }
                         }
                     }
                 })
@@ -1029,8 +1063,10 @@ impl LayoutCanvas {
                                     .unwrap_or(true)
                             {
                                 dim_tool.edges.push((path, name.to_string(), edge));
+                                false
+                            } else {
+                                enter_entry_mode
                             }
-                            false
                         } else {
                             enter_entry_mode
                         }
@@ -1061,9 +1097,29 @@ impl LayoutCanvas {
                                         "{:?}",
                                         dim_tool.edges[0].2.stop - dim_tool.edges[0].2.start
                                     ),
-                                    coord: format!("{:?}", coord),
-                                    pstop: format!("{:?}", dim_tool.edges[0].2.coord,),
-                                    nstop: format!("{:?}", dim_tool.edges[0].2.coord,),
+                                    coord: if coord > dim_tool.edges[0].2.coord {
+                                        format!(
+                                            "{}.{} + {}",
+                                            dim_tool.edges[0].0,
+                                            dim_tool.edges[0].1,
+                                            coord - dim_tool.edges[0].2.coord
+                                        )
+                                    } else {
+                                        format!(
+                                            "{}.{} - {}",
+                                            dim_tool.edges[0].0,
+                                            dim_tool.edges[0].1,
+                                            dim_tool.edges[0].2.coord - coord
+                                        )
+                                    },
+                                    pstop: format!(
+                                        "{}.{}",
+                                        dim_tool.edges[0].0, dim_tool.edges[0].1
+                                    ),
+                                    nstop: format!(
+                                        "{}.{}",
+                                        dim_tool.edges[0].0, dim_tool.edges[0].1
+                                    ),
                                     horiz: horiz.to_string(),
                                 },
                             )
@@ -1074,11 +1130,21 @@ impl LayoutCanvas {
                                 } else {
                                     (1, 0)
                                 };
-                            let (coord, horiz) = match dim_tool.edges[0].2.dir {
-                                Dir::Vert => (layout_mouse_position.y, "true"),
-                                Dir::Horiz => (layout_mouse_position.x, "false"),
+                            let (start, stop, coord, horiz) = match dim_tool.edges[0].2.dir {
+                                Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
+                                Dir::Horiz => ("x0", "x1", layout_mouse_position.x, "false"),
                             };
 
+                            let intended_coord = (dim_tool.edges[right].2.start
+                                + dim_tool.edges[right].2.stop
+                                + dim_tool.edges[left].2.start
+                                + dim_tool.edges[left].2.stop)
+                                / 4.;
+                            let coord_offset = if coord > intended_coord {
+                                format!("+ {}", coord - intended_coord)
+                            } else {
+                                format!("- {}", intended_coord - coord)
+                            };
                             state.lsp_client.draw_dimension(
                                 cell.output.cells[&selected_scope_addr.cell].scopes
                                     [&selected_scope_addr.scope]
@@ -1098,18 +1164,27 @@ impl LayoutCanvas {
                                         dim_tool.edges[right].2.coord
                                             - dim_tool.edges[left].2.coord
                                     ),
-                                    coord: format!("{:?}", coord),
+                                    coord: format!(
+                                        "({}.{} + {}.{} + {}.{} + {}.{})/4. {coord_offset}",
+                                        dim_tool.edges[right].0,
+                                        start,
+                                        dim_tool.edges[right].0,
+                                        stop,
+                                        dim_tool.edges[left].0,
+                                        start,
+                                        dim_tool.edges[left].0,
+                                        stop,
+                                    ),
                                     pstop: format!(
-                                        "{:?}",
-                                        (dim_tool.edges[right].2.start
-                                            + dim_tool.edges[right].2.stop)
-                                            / 2.
+                                        "({}.{} + {}.{}) / 2.",
+                                        dim_tool.edges[right].0,
+                                        start,
+                                        dim_tool.edges[right].0,
+                                        stop,
                                     ),
                                     nstop: format!(
-                                        "{:?}",
-                                        (dim_tool.edges[left].2.start
-                                            + dim_tool.edges[left].2.stop)
-                                            / 2.
+                                        "({}.{} + {}.{}) / 2.",
+                                        dim_tool.edges[left].0, start, dim_tool.edges[left].0, stop,
                                     ),
                                     horiz: horiz.to_string(),
                                 },

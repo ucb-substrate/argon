@@ -232,13 +232,10 @@ impl TextInput {
                     .edit_dimension(dim.clone(), self.content.to_string())
                     .is_some()
                 {
-                    println!("edited dimension");
                     *tool = ToolState::default();
                     return true;
                 }
-                println!("correct tool but no edit");
             }
-            println!("couldn't edit dimension");
             false
         });
         if reset {
