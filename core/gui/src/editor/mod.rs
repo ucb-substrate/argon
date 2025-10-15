@@ -1,17 +1,13 @@
 use std::{
-    collections::HashSet,
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
 };
 
 use canvas::{LayoutCanvas, ShapeFill};
-use compiler::{
-    ast::Span,
-    compile::{
+use compiler::compile::{
         CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
         ifmatvec,
-    },
-};
+    };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::IndexMap;

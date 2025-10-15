@@ -6,7 +6,7 @@ use std::{
 
 use compiler::{
     ast::Span,
-    compile::{self, CellId, ObjectId, SolvedValue, ifmatvec},
+    compile::{self, ObjectId, SolvedValue, ifmatvec},
     solver::Var,
 };
 use enumify::enumify;
@@ -15,7 +15,7 @@ use gpui::{
     App, AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
     Element, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, ShapedLine, SharedString, Size, Style, Styled, Subscription, Window,
+    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window,
     div, pattern_slash, rgb, rgba, solid_background,
 };
 use indexmap::IndexSet;
@@ -493,21 +493,18 @@ impl Element for CanvasElement {
             }
 
             let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
-            match tool {
-                ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) => {
-                    rects.push((
-                        Rect {
-                            object_path: Vec::new(),
-                            x0: p0.x.min(layout_mouse_position.x),
-                            y0: p0.y.min(layout_mouse_position.y),
-                            x1: p0.x.max(layout_mouse_position.x),
-                            y1: p0.y.max(layout_mouse_position.y),
-                            id: None,
-                        },
-                        layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
-                    ));
-                }
-                _ => {}
+            if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = tool {
+                rects.push((
+                    Rect {
+                        object_path: Vec::new(),
+                        x0: p0.x.min(layout_mouse_position.x),
+                        y0: p0.y.min(layout_mouse_position.y),
+                        x1: p0.x.max(layout_mouse_position.x),
+                        y1: p0.y.max(layout_mouse_position.y),
+                        id: None,
+                    },
+                    layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
+                ));
             }
         }
 

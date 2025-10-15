@@ -170,6 +170,7 @@ impl HierarchySideBar {
     ) {
         let solved_cell_clone_1 = self.solved_cell.clone();
         let solved_cell_clone_2 = self.solved_cell.clone();
+        let tool_clone = self.tool.clone();
         let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
         let scope_path = solved_cell.scope_paths[&scope].clone();
         scopes.push(
@@ -206,7 +207,11 @@ impl HierarchySideBar {
                                         state.selected_scope = scope_path.clone();
                                         cx.notify();
                                     }
-                                })
+                                });
+                                tool_clone.update(cx, |tool, cx| {
+                                    *tool = ToolState::default();
+                                    cx.notify();
+                                });
                             }
                         }),
                 )

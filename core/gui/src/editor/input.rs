@@ -13,7 +13,7 @@ use crate::{
     actions::*,
     editor::{
         EditorState,
-        canvas::{EditDimToolState, LayoutCanvas, SelectToolState, ToolState},
+        canvas::{EditDimToolState, LayoutCanvas, ToolState},
     },
 };
 
@@ -224,8 +224,8 @@ impl TextInput {
 
     fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.tool.update(cx, |tool, cx| {
-            if let ToolState::EditDim(EditDimToolState { dim }) = tool {
-                if self
+            if let ToolState::EditDim(EditDimToolState { dim }) = tool
+                && self
                     .state
                     .read(cx)
                     .lsp_client
@@ -235,7 +235,6 @@ impl TextInput {
                     *tool = ToolState::default();
                     return true;
                 }
-            }
             false
         });
         if reset {
