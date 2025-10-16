@@ -71,7 +71,7 @@ impl LayerSideBar {
     ) -> Self {
         let layers = state.read(cx).layers.clone();
         let name_filter =
-            cx.new(|cx| TextInput::new_layer_filter(cx, window, cx.focus_handle(), state, canvas));
+            cx.new(|cx| TextInput::new_filter(cx, window, cx.focus_handle(), state, canvas));
         let state = cx.new(|_cx| LayerSideBarState::default());
         let subscriptions = vec![
             cx.observe(&layers, |_, _, cx| cx.notify()),
@@ -111,7 +111,7 @@ impl Render for LayerSideBar {
                     .child(
                         div()
                             .flex_1()
-                            .id(SharedString::from("all_visible"))
+                            .id(SharedString::from("all_visible_layers"))
                             .child("All Visible")
                             .on_click({
                                 let layers = self.layers.clone();
@@ -128,7 +128,7 @@ impl Render for LayerSideBar {
                     .child(
                         div()
                             .flex_1()
-                            .id(SharedString::from("none_visible"))
+                            .id(SharedString::from("none_visible_layers"))
                             .child("None Visible")
                             .on_click({
                                 let layers = self.layers.clone();
@@ -243,6 +243,7 @@ impl Render for LayerSideBar {
 pub struct HierarchySideBar {
     solved_cell: Entity<Option<CompileOutputState>>,
     tool: Entity<ToolState>,
+    name_filter: Entity<TextInput>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
@@ -250,21 +251,26 @@ pub struct HierarchySideBar {
 impl HierarchySideBar {
     pub fn new(
         cx: &mut Context<Self>,
+        window: &mut Window,
         state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
         let solved_cell = state.read(cx).solved_cell.clone();
         let tool = canvas.read(cx).tool.clone();
+        let name_filter =
+            cx.new(|cx| TextInput::new_filter(cx, window, cx.focus_handle(), state, canvas));
         let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
         Self {
             solved_cell,
             tool,
+            name_filter,
             subscriptions,
         }
     }
 
     fn render_scopes_helper(
         &mut self,
+        cx: &mut Context<Self>,
         solved_cell: &CompileOutputState,
         scopes: &mut Vec<Div>,
         scope: ScopeAddress,
@@ -276,66 +282,71 @@ impl HierarchySideBar {
         let tool_clone = self.tool.clone();
         let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
         let scope_path = solved_cell.scope_paths[&scope].clone();
-        scopes.push(
-            div()
-                .flex()
-                .w_full()
-                .bg(
-                    if scope == solved_cell.state[&solved_cell.selected_scope].address {
-                        rgba(0x00000099)
-                    } else {
-                        rgba(0)
-                    },
-                )
-                .child(
-                    div()
-                        .id(SharedString::from(format!("scope_select_{scope:?}")))
-                        .flex_1()
-                        .overflow_hidden()
-                        .child(format!(
-                            "{}{}{}",
-                            std::iter::repeat_n("  ", depth).collect::<String>(),
-                            &scope_state.name,
-                            if count > 1 {
-                                format!(" ({count})")
-                            } else {
-                                "".to_string()
-                            }
-                        ))
-                        .on_click({
-                            let scope_path = scope_path.clone();
-                            move |_event, _window, cx| {
-                                solved_cell_clone_1.update(cx, |state, cx| {
-                                    if let Some(state) = state.as_mut() {
-                                        state.selected_scope = scope_path.clone();
+        if scope_state
+            .name
+            .contains(self.name_filter.read(cx).content.as_ref())
+        {
+            scopes.push(
+                div()
+                    .flex()
+                    .w_full()
+                    .bg(
+                        if scope == solved_cell.state[&solved_cell.selected_scope].address {
+                            rgba(0x00000099)
+                        } else {
+                            rgba(0)
+                        },
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("scope_select_{scope:?}")))
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(format!(
+                                "{}{}{}",
+                                std::iter::repeat_n("  ", depth).collect::<String>(),
+                                &scope_state.name,
+                                if count > 1 {
+                                    format!(" ({count})")
+                                } else {
+                                    "".to_string()
+                                }
+                            ))
+                            .on_click({
+                                let scope_path = scope_path.clone();
+                                move |_event, _window, cx| {
+                                    solved_cell_clone_1.update(cx, |state, cx| {
+                                        if let Some(state) = state.as_mut() {
+                                            state.selected_scope = scope_path.clone();
+                                            cx.notify();
+                                        }
+                                    });
+                                    tool_clone.update(cx, |tool, cx| {
+                                        *tool = ToolState::default();
                                         cx.notify();
-                                    }
-                                });
-                                tool_clone.update(cx, |tool, cx| {
-                                    *tool = ToolState::default();
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                )
-                .child(
-                    div()
-                        .child(if scope_state.visible { "--V" } else { "NV" })
-                        .id(SharedString::from(format!("scope_control_{scope:?}",)))
-                        .on_click({
-                            let scope_path = scope_path.clone();
-                            move |_event, _window, cx| {
-                                solved_cell_clone_2.update(cx, |state, cx| {
-                                    if let Some(state) = state.as_mut() {
-                                        state.state.get_mut(&scope_path).unwrap().visible =
-                                            !state.state[&scope_path].visible;
-                                        cx.notify();
-                                    }
-                                })
-                            }
-                        }),
-                ),
-        );
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .child(if scope_state.visible { "--V" } else { "NV" })
+                            .id(SharedString::from(format!("scope_control_{scope:?}",)))
+                            .on_click({
+                                let scope_path = scope_path.clone();
+                                move |_event, _window, cx| {
+                                    solved_cell_clone_2.update(cx, |state, cx| {
+                                        if let Some(state) = state.as_mut() {
+                                            state.state.get_mut(&scope_path).unwrap().visible =
+                                                !state.state[&scope_path].visible;
+                                            cx.notify();
+                                        }
+                                    })
+                                }
+                            }),
+                    ),
+            );
+        }
         let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
         let mut cells = IndexMap::new();
         for (obj, _) in scope_info.emit.iter() {
@@ -348,6 +359,7 @@ impl HierarchySideBar {
         for (cell, count) in cells {
             let scope = solved_cell.output.cells[&cell].root;
             self.render_scopes_helper(
+                cx,
                 solved_cell,
                 scopes,
                 ScopeAddress { scope, cell },
@@ -357,6 +369,7 @@ impl HierarchySideBar {
         }
         for child_scope in scope_info.children.clone() {
             self.render_scopes_helper(
+                cx,
                 solved_cell,
                 scopes,
                 ScopeAddress {
@@ -371,10 +384,11 @@ impl HierarchySideBar {
 
     fn render_scopes(&mut self, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
         let mut scopes = Vec::new();
-        if let Some(state) = self.solved_cell.read(cx) {
+        if let Some(state) = self.solved_cell.read(cx).clone() {
             let scope = state.output.cells[&state.output.top].root;
             self.render_scopes_helper(
-                state,
+                cx,
+                &state,
                 &mut scopes,
                 ScopeAddress {
                     scope,
@@ -410,6 +424,51 @@ impl Render for HierarchySideBar {
             .bg(THEME.sidebar)
             .min_h_0()
             .child("Scopes")
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .text_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(SharedString::from("all_visible_hierarchy"))
+                            .child("All Visible")
+                            .on_click({
+                                let solved_cell = self.solved_cell.clone();
+                                move |_event, _window, cx| {
+                                    solved_cell.update(cx, |cell, cx| {
+                                        if let Some(cell) = cell {
+                                            for state in cell.state.values_mut() {
+                                                state.visible = true;
+                                            }
+                                        }
+                                        cx.notify();
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(SharedString::from("none_visible_hierarchy"))
+                            .child("None Visible")
+                            .on_click({
+                                let solved_cell = self.solved_cell.clone();
+                                move |_event, _window, cx| {
+                                    solved_cell.update(cx, |cell, cx| {
+                                        if let Some(cell) = cell {
+                                            for state in cell.state.values_mut() {
+                                                state.visible = false;
+                                            }
+                                        }
+                                        cx.notify();
+                                    })
+                                }
+                            }),
+                    ),
+            )
+            .child(self.name_filter.clone())
             .child(self.render_scopes(cx))
     }
 }

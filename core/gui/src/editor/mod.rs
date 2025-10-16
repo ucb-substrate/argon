@@ -312,7 +312,7 @@ impl Editor {
         let text_input = cx.new(|cx| {
             TextInput::new_command_prompt(cx, window, text_input_focus_handle, &state, &canvas)
         });
-        let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
+        let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, window, &state, &canvas));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, window, &state, &canvas));
 
         let editor = Self {
