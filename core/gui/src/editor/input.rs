@@ -28,6 +28,8 @@ pub(crate) struct TextInput {
     pub(crate) last_layout: Option<ShapedLine>,
     pub(crate) last_bounds: Option<Bounds<Pixels>>,
     pub(crate) is_selecting: bool,
+    pub(crate) enter_handler: fn(&mut TextInput, &Enter, &mut Window, &mut Context<TextInput>),
+    pub(crate) cancel_handler: fn(&mut TextInput, &Cancel, &mut Window, &mut Context<TextInput>),
     pub(crate) tool: Entity<ToolState>,
     pub(crate) state: Entity<EditorState>,
     #[allow(dead_code)]
@@ -35,7 +37,7 @@ pub(crate) struct TextInput {
 }
 
 impl TextInput {
-    pub(crate) fn new(
+    pub(crate) fn new_command_prompt(
         cx: &mut Context<Self>,
         window: &mut Window,
         focus_handle: FocusHandle,
@@ -60,6 +62,37 @@ impl TextInput {
             tool: canvas.tool.clone(),
             state: state.clone(),
             subscriptions,
+            enter_handler: Self::command_prompt_enter,
+            cancel_handler: Self::command_prompt_cancel,
+        }
+    }
+    pub(crate) fn new_layer_filter(
+        cx: &mut Context<Self>,
+        window: &mut Window,
+        focus_handle: FocusHandle,
+        state: &Entity<EditorState>,
+        canvas: &Entity<LayoutCanvas>,
+    ) -> Self {
+        let subscriptions = vec![cx.on_focus(&focus_handle, window, |input, _window, _cx| {
+            input.selected_range = 0..input.content.len();
+        })];
+        let canvas = canvas.read(cx);
+        TextInput {
+            focus_handle,
+            canvas_focus_handle: canvas.focus_handle(cx),
+            content: "".into(),
+            placeholder: "Type here...".into(),
+            selected_range: 0..0,
+            selection_reversed: false,
+            marked_range: None,
+            last_layout: None,
+            last_bounds: None,
+            is_selecting: false,
+            tool: canvas.tool.clone(),
+            state: state.clone(),
+            subscriptions,
+            enter_handler: Self::layer_filter_enter,
+            cancel_handler: Self::layer_filter_cancel,
         }
     }
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -213,7 +246,15 @@ impl TextInput {
         cx.notify()
     }
 
-    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+    fn layer_filter_cancel(&mut self, _: &Cancel, window: &mut Window, _cx: &mut Context<Self>) {
+        window.focus(&self.canvas_focus_handle);
+    }
+
+    fn layer_filter_enter(&mut self, _: &Enter, window: &mut Window, _cx: &mut Context<Self>) {
+        window.focus(&self.canvas_focus_handle);
+    }
+
+    fn command_prompt_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
         self.tool.update(cx, |tool, _cx| {
             if let ToolState::EditDim(_) = tool {
@@ -222,7 +263,7 @@ impl TextInput {
         });
     }
 
-    fn enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    fn command_prompt_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.tool.update(cx, |tool, cx| {
             if let ToolState::EditDim(EditDimToolState { dim, dim_mode }) = tool
                 && self
@@ -642,8 +683,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(self.cancel_handler))
+            .on_action(cx.listener(self.enter_handler))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
