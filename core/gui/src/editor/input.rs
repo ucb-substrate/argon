@@ -66,7 +66,7 @@ impl TextInput {
             cancel_handler: Self::command_prompt_cancel,
         }
     }
-    pub(crate) fn new_layer_filter(
+    pub(crate) fn new_filter(
         cx: &mut Context<Self>,
         window: &mut Window,
         focus_handle: FocusHandle,
@@ -91,8 +91,8 @@ impl TextInput {
             tool: canvas.tool.clone(),
             state: state.clone(),
             subscriptions,
-            enter_handler: Self::layer_filter_enter,
-            cancel_handler: Self::layer_filter_cancel,
+            enter_handler: Self::filter_enter,
+            cancel_handler: Self::filter_cancel,
         }
     }
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -246,11 +246,11 @@ impl TextInput {
         cx.notify()
     }
 
-    fn layer_filter_cancel(&mut self, _: &Cancel, window: &mut Window, _cx: &mut Context<Self>) {
+    fn filter_cancel(&mut self, _: &Cancel, window: &mut Window, _cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
     }
 
-    fn layer_filter_enter(&mut self, _: &Enter, window: &mut Window, _cx: &mut Context<Self>) {
+    fn filter_enter(&mut self, _: &Enter, window: &mut Window, _cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
     }
 
