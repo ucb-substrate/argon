@@ -59,6 +59,7 @@ impl Solver {
                 .find(|&i| !self.solved_vars.contains_key(&Var(i)))
                 .unwrap();
             self.constrain_eq0(LinearExpr::from(Var(v)));
+            self.solve();
         }
     }
 
