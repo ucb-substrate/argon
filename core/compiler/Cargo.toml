@@ -24,6 +24,9 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 regex = { workspace = true }
 
+[dev-dependencies]
+gds21 = "0.2"
+
 [build-dependencies]
 lrpar = { version = "0.13", features = ["serde"] }
 
