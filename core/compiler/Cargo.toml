@@ -4,38 +4,28 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1"
-cfgrammar = { version = "0.13", features = ["serde"] }
-lrlex = "0.13"
-lrpar = "0.13"
-good_lp = { version = "1", features = [
-    "scip",
-    "scip_bundled",
-], default-features = false }
-itertools = "0.14"
-ena = "0.14"
-enumify = { version = "0.2", registry = "substrate" }
-gds21 = "0.2"
-arcstr = { version = "1", features = ["serde"] }
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
 derive-where = { version = "1", features = ["serde"] }
 nalgebra = "0.34"
-approx = "0.5"
-rust_decimal = "1"
-rust_decimal_macros = "1"
-indexmap = { version = "2", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-geometry = { version = "0.7", registry = "substrate" }
-rgb = { version = "0.8", features = ["serde"] }
 klayout-lyp = "0.1.1"
-ndarray = "0.16.1"
-ndarray-linalg = { version = "0.17.0", default-features = false, features = ["openblas-system"] }
-thiserror = "2"
-toml = "0.9"
-regex = "1"
+
+anyhow = { workspace = true }
+cfgrammar = { workspace = true }
+lrlex = { workspace = true }
+lrpar = { workspace = true }
+itertools = { workspace = true }
+enumify = { workspace = true }
+arcstr = { workspace = true }
+serde = { workspace = true }
+approx = { workspace = true }
+indexmap = { workspace = true }
+geometry = { workspace = true }
+rgb = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+regex = { workspace = true }
 
 [build-dependencies]
-cfgrammar = "0.13"
-lrlex = "0.13"
 lrpar = { version = "0.13", features = ["serde"] }
+
+cfgrammar = { workspace = true }
+lrlex = { workspace = true }

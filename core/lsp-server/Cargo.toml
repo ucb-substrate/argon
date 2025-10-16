@@ -8,20 +8,18 @@ compiler = { version = "0.1.0", path = "../compiler" }
 
 tokio = { version = "1", features = ["full"] }
 tower-lsp = "0.20"
-portpicker = "0.1"
 tokio-util = { version = "0.7", features = ["codec"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-futures = "0.3"
-futures-util = "0.2"
-bytes = "1"
-cfgrammar = { version = "0.13" }
-lrlex = "0.13"
-lrpar = "0.13"
-itertools = "0.14"
-tarpc = { version = "0.37", features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+cfgrammar = { workspace = true }
+lrlex = { workspace = true }
+lrpar = { workspace = true }
+itertools = { workspace = true }
+tarpc = { workspace = true }
 env_logger = "0.11"
-log = "0.4.27"
+log = "0.4"
 lsp-document = "0.6"
-arcstr = "1"
-indexmap = "2"
+arcstr = { workspace = true }
+indexmap = { workspace = true }

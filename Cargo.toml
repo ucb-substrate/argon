@@ -2,3 +2,28 @@
 
 resolver = "2"
 members = ["core/compiler", "core/gui", "core/lsp-server"]
+
+[workspace.dependencies]
+anyhow = "1"
+cfgrammar = { version = "0.13", features = ["serde"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+approx = "0.5"
+rust_decimal = "1"
+rust_decimal_macros = "1"
+indexmap = { version = "2", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+rgb = { version = "0.8", features = ["serde"] }
+thiserror = "2"
+toml = "0.9"
+regex = "1"
+arcstr = { version = "1", features = ["serde"] }
+itertools = "0.14"
+tarpc = { version = "0.37", features = ["full"] }
+lrlex = "0.13"
+lrpar = "0.13"
+bytes = "1"
+futures = "0.3"
+
+geometry = { version = "0.7", registry = "substrate" }
+enumify = { version = "0.2", registry = "substrate" }

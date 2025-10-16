@@ -10,18 +10,18 @@ gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
 smallvec = "1"
 rust-embed = "8"
 lazy_static = "1"
-itertools = "0.14"
-clap = { version = "4", features = ["derive"] }
-arcstr = "1"
-cfgrammar = { version = "0.13", features = ["serde"] }
-enumify = { version = "0.2.1", registry = "substrate" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-tarpc = { version = "0.37", features = ["full"] }
+itertools = { workspace = true }
+clap = { workspace = true }
+arcstr = { workspace = true }
+cfgrammar = { workspace = true }
+enumify = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+tarpc = { workspace = true }
 async-compat = "0.2"
 portpicker = "0.1"
-futures = "0.3"
+futures = { workspace = true }
 geometry = { version = "0.7.1", registry = "substrate" }
 indexmap = { version = "2", features = ["serde"] }
 rgb = { version = "0.8", features = ["serde"] }

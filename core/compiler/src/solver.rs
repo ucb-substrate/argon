@@ -2,7 +2,6 @@ use approx::relative_eq;
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
-use ndarray_linalg::SVD;
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-6;
@@ -64,34 +63,6 @@ impl Solver {
 
     pub fn unsolved_vars(&self) -> IndexSet<Var> {
         IndexSet::from_iter((0..self.next_var).map(Var).filter(|&v| !self.is_solved(v)))
-    }
-
-    pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {
-        let n_vars = self.next_var as usize;
-        let arr_shape = (self.constraints.len() + self.solved_vars.len(), n_vars);
-        let arr = self
-            .constraints
-            .iter()
-            .flat_map(|c| c.expr.coeff_vec(n_vars))
-            .chain(self.solved_vars.iter().flat_map(|(var, _)| {
-                let var = var.0 as usize;
-                std::iter::repeat_n(0., var)
-                    .chain(std::iter::once(1.))
-                    .chain(std::iter::repeat_n(0., n_vars - var - 1))
-            }))
-            .collect::<Vec<_>>();
-        let arr = ndarray::Array::from_shape_vec(arr_shape, arr).unwrap();
-        let (_, s, vt) = arr.svd(false, true).unwrap();
-        let vt = vt.unwrap();
-        let shape = vt.shape();
-        assert_eq!(shape.len(), 2);
-        assert_eq!(shape[0], n_vars);
-        assert_eq!(shape[1], n_vars);
-        let idx = s
-            .iter()
-            .position(|x| *x < 1e-10)
-            .unwrap_or_else(|| std::cmp::min(arr_shape.0, arr_shape.1));
-        (idx..n_vars).map(|i| vt.row(i).to_vec()).collect()
     }
 
     /// Constrains the value of `expr` to 0.
