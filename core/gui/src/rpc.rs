@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    fmt::Display,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use async_compat::CompatExt;
 use compiler::{
@@ -17,6 +20,7 @@ use tarpc::{
     server::{Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
+use tower_lsp::lsp_types::MessageType;
 
 use crate::editor::Editor;
 
@@ -180,6 +184,19 @@ impl SyncGuiToLspClient {
             async move {
                 client_clone
                     .open_cell(context::current(), cell)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        );
+    }
+
+    pub fn show_message<M: Display>(&self, typ: MessageType, message: M) {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .show_message(context::current(), typ, format!("{}", message))
                     .await
                     .unwrap()
             }

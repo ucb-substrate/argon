@@ -26,4 +26,4 @@ geometry = { version = "0.7.1", registry = "substrate" }
 indexmap = { version = "2", features = ["serde"] }
 rgb = { version = "0.8", features = ["serde"] }
 unicode-segmentation = "1"
-
+tower-lsp = "0.20"

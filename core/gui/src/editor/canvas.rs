@@ -21,6 +21,7 @@ use gpui::{
 use indexmap::IndexSet;
 use itertools::Itertools;
 use lsp_server::rpc::DimensionParams;
+use tower_lsp::lsp_types::MessageType;
 
 use crate::{
     actions::*,
@@ -380,7 +381,7 @@ impl Element for CanvasElement {
                 let cell_info = &solved_cell.output.cells[&cell];
                 let scope_info = &cell_info.scopes[&scope];
                 let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
-                if show && (depth >= state.hierarchy_depth || !scope_state.visible) {
+                if depth >= state.hierarchy_depth || !scope_state.visible {
                     if let Some(bbox) = &scope_state.bbox {
                         let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
                         let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
@@ -399,7 +400,9 @@ impl Element for CanvasElement {
                         {
                             select_rects.push(rect.clone());
                         }
-                        scope_rects.push(rect);
+                        if show {
+                            scope_rects.push(rect);
+                        }
                     }
                     show = false;
                 }
@@ -409,17 +412,15 @@ impl Element for CanvasElement {
                     let value = &cell_info.objects[obj];
                     match value {
                         SolvedValue::Rect(rect) => {
-                            if show {
-                                let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
-                                let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
-                                let layer = rect
-                                    .layer
-                                    .as_ref()
-                                    .and_then(|layer| layers.layers.get(layer.as_str()));
-                                if let Some(layer) = layer
-                                    && layer.visible
-                                {
-                                    let rect = Rect {
+                            let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                            let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
+                            let layer = rect
+                                .layer
+                                .as_ref()
+                                .and_then(|layer| layers.layers.get(layer.as_str()));
+                            if let Some(layer) = layer {
+                                let rect =
+                                    Rect {
                                         x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
                                         y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
                                         x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
@@ -458,13 +459,14 @@ impl Element for CanvasElement {
                                             },
                                         },
                                     };
-                                    if let ToolState::Select(SelectToolState { selected_obj }) =
-                                        inner.tool.read(cx)
-                                        && rect.id.is_some()
-                                        && &rect.id == selected_obj
-                                    {
-                                        select_rects.push(rect.clone());
-                                    }
+                                if let ToolState::Select(SelectToolState { selected_obj }) =
+                                    inner.tool.read(cx)
+                                    && rect.id.is_some()
+                                    && &rect.id == selected_obj
+                                {
+                                    select_rects.push(rect.clone());
+                                }
+                                if show && layer.visible {
                                     rects.push((rect, layer.clone()));
                                 }
                             }
@@ -486,8 +488,7 @@ impl Element for CanvasElement {
                             let scope_state =
                                 &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
                             let mut show = show;
-                            if show && (depth + 1 >= state.hierarchy_depth || !scope_state.visible)
-                            {
+                            if depth + 1 >= state.hierarchy_depth || !scope_state.visible {
                                 if let Some(bbox) = &scope_state.bbox {
                                     let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
                                     let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
@@ -507,7 +508,9 @@ impl Element for CanvasElement {
                                     {
                                         select_rects.push(rect.clone());
                                     }
-                                    scope_rects.push(rect);
+                                    if show {
+                                        scope_rects.push(rect);
+                                    }
                                 }
                                 show = false;
                             }
@@ -759,7 +762,7 @@ impl Element for CanvasElement {
                                 | ToolState::EditDim(EditDimToolState { dim: selected, .. })
                                     if Some(selected) == dim.span.as_ref() =>
                                 {
-                                    rgb(0xff0000)
+                                    rgb(0xffff00)
                                 }
                                 _ => rgb(0xffffff),
                             },
@@ -1232,63 +1235,78 @@ impl LayoutCanvas {
         self.tool.update(cx, |tool, cx| {
             match tool {
                 ToolState::DrawRect(rect_tool) => {
-                    if let Some(p0) = rect_tool.p0 {
-                        rect_tool.p0 = None;
-                        let p1 = layout_mouse_position;
-                        let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
-                        let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
-                        self.state.update(cx, |state, cx| {
-                            state.solved_cell.update(cx, {
-                                |cell, cx| {
-                                    if let Some(cell) = cell.as_mut() {
-                                        // TODO update in memory representation of code
-                                        // TODO add solver to gui
-                                        let scope_address =
-                                            &cell.state[&cell.selected_scope].address;
-                                        let reachable_objs = cell.output.reachable_objs(
-                                            scope_address.cell,
-                                            scope_address.scope,
-                                        );
-                                        let names: IndexSet<_> = reachable_objs.values().collect();
-                                        let scope = cell
-                                            .output
-                                            .cells
-                                            .get_mut(&scope_address.cell)
-                                            .unwrap()
-                                            .scopes
-                                            .get_mut(&scope_address.scope)
-                                            .unwrap();
-                                        let rect_name = (0..)
-                                            .map(|i| format!("rect{i}"))
-                                            .find(|name| !names.contains(name))
-                                            .unwrap();
+                    let state = self.state.read(cx);
+                    let layers = state.layers.read(cx);
+                    if let Some(layer) = &layers.selected_layer
+                        && let Some(layer_info) = layers.layers.get(layer)
+                    {
+                        if layer_info.visible {
+                            if let Some(p0) = rect_tool.p0 {
+                                rect_tool.p0 = None;
+                                let p1 = layout_mouse_position;
+                                let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
+                                let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
+                                self.state.update(cx, |state, cx| {
+                                    state.solved_cell.update(cx, {
+                                        |cell, cx| {
+                                            if let Some(cell) = cell.as_mut() {
+                                                // TODO update in memory representation of code
+                                                // TODO add solver to gui
+                                                let scope_address =
+                                                    &cell.state[&cell.selected_scope].address;
+                                                let reachable_objs = cell.output.reachable_objs(
+                                                    scope_address.cell,
+                                                    scope_address.scope,
+                                                );
+                                                let names: IndexSet<_> =
+                                                    reachable_objs.values().collect();
+                                                let scope = cell
+                                                    .output
+                                                    .cells
+                                                    .get_mut(&scope_address.cell)
+                                                    .unwrap()
+                                                    .scopes
+                                                    .get_mut(&scope_address.scope)
+                                                    .unwrap();
+                                                let rect_name = (0..)
+                                                    .map(|i| format!("rect{i}"))
+                                                    .find(|name| !names.contains(name))
+                                                    .unwrap();
 
-                                        state.lsp_client.draw_rect(
-                                            scope.span.clone(),
-                                            rect_name,
-                                            compile::BasicRect {
-                                                layer: state
-                                                    .layers
-                                                    .read(cx)
-                                                    .selected_layer
-                                                    .clone()
-                                                    .map(|s| s.to_string()),
-                                                x0: p0p.x as f64,
-                                                y0: p0p.y as f64,
-                                                x1: p1p.x as f64,
-                                                y1: p1p.y as f64,
-                                            },
-                                        );
-                                    }
-                                }
-                            });
-                        });
-                    } else {
-                        // TODO: error handling.
-                        if self.state.read(cx).layers.read(cx).selected_layer.is_some() {
-                            let p0 = self.px_to_layout(event.position);
-                            rect_tool.p0 = Some(p0);
+                                                state.lsp_client.draw_rect(
+                                                    scope.span.clone(),
+                                                    rect_name,
+                                                    compile::BasicRect {
+                                                        layer: state
+                                                            .layers
+                                                            .read(cx)
+                                                            .selected_layer
+                                                            .clone()
+                                                            .map(|s| s.to_string()),
+                                                        x0: p0p.x as f64,
+                                                        y0: p0p.y as f64,
+                                                        x1: p1p.x as f64,
+                                                        y1: p1p.y as f64,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    });
+                                });
+                            } else {
+                                let p0 = self.px_to_layout(event.position);
+                                rect_tool.p0 = Some(p0);
+                            }
+                        } else {
+                            state.lsp_client.show_message(
+                                MessageType::ERROR,
+                                "Cannot draw on an invisible layer.",
+                            );
                         }
+                    } else {
+                        state
+                            .lsp_client
+                            .show_message(MessageType::ERROR, "No layer has been selected.");
                     }
                 }
                 ToolState::DrawDim(dim_tool) => {

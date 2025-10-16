@@ -25,6 +25,7 @@ pub struct LayerState {
     pub name: SharedString,
     pub color: Rgba,
     pub fill: ShapeFill,
+    pub used: bool,
     pub border_color: Rgba,
     pub visible: bool,
     pub z: usize,
@@ -113,7 +114,9 @@ impl EditorState {
                     bbox = bbox_union(bbox, Some(rect.to_float()));
                     if let Some(layer) = &rect.layer {
                         let layer = SharedString::from(layer);
-                        if !state.layers.contains_key(&layer) {
+                        if let Some(layer_info) = state.layers.get_mut(&layer) {
+                            layer_info.used = true;
+                        } else {
                             let mut s = DefaultHasher::new();
                             layer.hash(&mut s);
                             let hash = s.finish() as usize;
@@ -127,6 +130,7 @@ impl EditorState {
                                     fill: ShapeFill::Stippling,
                                     border_color: color,
                                     visible: true,
+                                    used: true,
                                     z: state.layers.len(),
                                 },
                             );
@@ -215,8 +219,14 @@ impl EditorState {
             .name
             .clone();
         let mut state = ProcessScopeState::default();
+        let old_layers = self.layers.read(cx);
         for layer in &solved_cell.layers.layers {
             let name = SharedString::from(layer.name.clone());
+            let visible = old_layers
+                .layers
+                .get(&name)
+                .map(|layer| layer.visible)
+                .unwrap_or(true);
             state.layers.insert(
                 name.clone(),
                 LayerState {
@@ -224,7 +234,8 @@ impl EditorState {
                     color: rgb_to_rgba(layer.fill_color),
                     fill: ShapeFill::Stippling,
                     border_color: rgb_to_rgba(layer.border_color),
-                    visible: true,
+                    visible,
+                    used: false,
                     z: state.layers.len(),
                 },
             );
@@ -298,10 +309,11 @@ impl Editor {
                 text_input_focus_handle.clone(),
             )
         });
-        let text_input =
-            cx.new(|cx| TextInput::new(cx, window, text_input_focus_handle, &state, &canvas));
+        let text_input = cx.new(|cx| {
+            TextInput::new_command_prompt(cx, window, text_input_focus_handle, &state, &canvas)
+        });
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
-        let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state));
+        let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, window, &state, &canvas));
 
         let editor = Self {
             state,
@@ -349,6 +361,8 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("top")
+            .track_focus(&self.canvas.focus_handle(cx))
             .font_family("Zed Plex Sans")
             .size_full()
             .flex()
@@ -359,6 +373,7 @@ impl Render for Editor {
             .rounded(px(10.))
             .text_sm()
             .text_color(rgb(0xffffff))
+            .overflow_hidden()
             .whitespace_nowrap()
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(cx.new(|_cx| TitleBar))
@@ -370,7 +385,7 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child(div().overflow_hidden().flex_1().child(self.canvas.clone()))
+                    .child(div().flex_1().child(self.canvas.clone()))
                     .child(self.layer_sidebar.clone()),
             )
             .child(self.text_input.clone())

@@ -7,6 +7,7 @@ use crate::{
     editor::{
         CompileOutputState, Layers, ScopeAddress,
         canvas::{LayoutCanvas, ToolState},
+        input::TextInput,
     },
     theme::THEME,
 };
@@ -48,18 +49,38 @@ impl Render for ToolBar {
     }
 }
 
+#[derive(Default)]
+pub struct LayerSideBarState {
+    used_filter: bool,
+}
+
 pub struct LayerSideBar {
     layers: Entity<Layers>,
+    name_filter: Entity<TextInput>,
+    state: Entity<LayerSideBarState>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
 
 impl LayerSideBar {
-    pub fn new(cx: &mut Context<Self>, state: &Entity<EditorState>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        window: &mut Window,
+        state: &Entity<EditorState>,
+        canvas: &Entity<LayoutCanvas>,
+    ) -> Self {
         let layers = state.read(cx).layers.clone();
-        let subscriptions = vec![cx.observe(&layers, |_, _, cx| cx.notify())];
+        let name_filter =
+            cx.new(|cx| TextInput::new_layer_filter(cx, window, cx.focus_handle(), state, canvas));
+        let state = cx.new(|_cx| LayerSideBarState::default());
+        let subscriptions = vec![
+            cx.observe(&layers, |_, _, cx| cx.notify()),
+            cx.observe(&name_filter, |_, _, cx| cx.notify()),
+        ];
         Self {
             layers,
+            name_filter,
+            state,
             subscriptions,
         }
     }
@@ -85,54 +106,136 @@ impl Render for LayerSideBar {
             .child(
                 div()
                     .flex()
+                    .flex_row()
+                    .text_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(SharedString::from("all_visible"))
+                            .child("All Visible")
+                            .on_click({
+                                let layers = self.layers.clone();
+                                move |_event, _window, cx| {
+                                    layers.update(cx, |state, cx| {
+                                        for (_, layer) in state.layers.iter_mut() {
+                                            layer.visible = true;
+                                        }
+                                        cx.notify();
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(SharedString::from("none_visible"))
+                            .child("None Visible")
+                            .on_click({
+                                let layers = self.layers.clone();
+                                move |_event, _window, cx| {
+                                    layers.update(cx, |state, cx| {
+                                        for (_, layer) in state.layers.iter_mut() {
+                                            layer.visible = false;
+                                        }
+                                        cx.notify();
+                                    })
+                                }
+                            }),
+                    ),
+            )
+            .child(self.name_filter.clone())
+            .child(
+                div()
+                    .child(format!(
+                        "[{}] Filter Used",
+                        if self.state.read(cx).used_filter {
+                            "X"
+                        } else {
+                            "_"
+                        }
+                    ))
+                    .id(SharedString::from("filter_used"))
+                    .on_click({
+                        let state = self.state.clone();
+                        move |_event, _window, cx| {
+                            state.update(cx, |state, cx| {
+                                state.used_filter = !state.used_filter;
+                                cx.notify();
+                            })
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
                     .flex_col()
                     .w_full()
                     .items_start()
                     .id("layers_scroll_vert")
                     .overflow_y_scroll()
-                    .children(layers.layers.values().map(|layer| {
-                        div()
-                            .flex()
-                            .w_full()
-                            .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
-                                rgba(0x00000099)
-                            } else {
-                                rgba(0)
+                    .children(
+                        layers
+                            .layers
+                            .values()
+                            .filter(|layer| {
+                                layer
+                                    .name
+                                    .contains(self.name_filter.read(cx).content.as_ref())
+                                    && (!self.state.read(cx).used_filter || layer.used)
                             })
-                            .child(
+                            .map(|layer| {
                                 div()
-                                    .id(SharedString::from(format!("layer_select_{}", layer.z)))
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .child(layer.name.clone())
-                                    .on_click({
-                                        let layers = self.layers.clone();
-                                        let name = layer.name.clone();
-                                        move |_event, _window, cx| {
-                                            layers.update(cx, |state, cx| {
-                                                state.selected_layer = Some(name.clone());
-                                                cx.notify();
-                                            })
-                                        }
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .child(if layer.visible { "--V" } else { "NV" })
-                                    .id(SharedString::from(format!("layer_control_{}", layer.z)))
-                                    .on_click({
-                                        let layers = self.layers.clone();
-                                        let name = layer.name.clone();
-                                        move |_event, _window, cx| {
-                                            layers.update(cx, |state, cx| {
-                                                state.layers.get_mut(&name).unwrap().visible =
-                                                    !state.layers[&name].visible;
-                                                cx.notify();
-                                            })
-                                        }
-                                    }),
-                            )
-                    })),
+                                    .flex()
+                                    .w_full()
+                                    .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
+                                        rgba(0x00000099)
+                                    } else {
+                                        rgba(0)
+                                    })
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "layer_select_{}",
+                                                layer.z
+                                            )))
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .child(layer.name.clone())
+                                            .on_click({
+                                                let layers = self.layers.clone();
+                                                let name = layer.name.clone();
+                                                move |_event, _window, cx| {
+                                                    layers.update(cx, |state, cx| {
+                                                        state.selected_layer = Some(name.clone());
+                                                        cx.notify();
+                                                    })
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .child(if layer.visible { "--V" } else { "NV" })
+                                            .id(SharedString::from(format!(
+                                                "layer_control_{}",
+                                                layer.z
+                                            )))
+                                            .on_click({
+                                                let layers = self.layers.clone();
+                                                let name = layer.name.clone();
+                                                move |_event, _window, cx| {
+                                                    layers.update(cx, |state, cx| {
+                                                        state
+                                                            .layers
+                                                            .get_mut(&name)
+                                                            .unwrap()
+                                                            .visible = !state.layers[&name].visible;
+                                                        cx.notify();
+                                                    })
+                                                }
+                                            }),
+                                    )
+                            }),
+                    ),
             )
     }
 }
