@@ -12,6 +12,7 @@ actions!(
         Zero,
         One,
         All,
+        Command,
         Cancel,
         Backspace,
         Delete,

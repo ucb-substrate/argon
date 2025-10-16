@@ -369,7 +369,7 @@ impl Backend {
     }
 
     /// Compiles a cell.
-    async fn compile_cell(&self, cell: impl Into<String>) {
+    pub async fn compile_cell(&self, cell: impl Into<String>) {
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut.cell = Some(cell.into());
         state_mut.compile(&self.state.editor_client, false).await;

@@ -173,6 +173,19 @@ impl SyncGuiToLspClient {
             .compat(),
         );
     }
+
+    pub fn open_cell(&self, cell: String) {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .open_cell(context::current(), cell)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        );
+    }
 }
 
 type EditorFn = Box<dyn FnOnce(&Editor, &mut AsyncApp) + Send>;
