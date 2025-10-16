@@ -15,7 +15,7 @@ pub struct Solver {
     next_id: u64,
     constraints: Vec<LinearExpr>,
     solved_vars: IndexMap<Var, f64>,
-    inconsistent: bool,
+    overconstrained_vars: IndexSet<Var>,
 }
 
 pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
@@ -57,8 +57,8 @@ impl Solver {
     }
 
     #[inline]
-    pub fn is_inconsistent(&self) -> bool {
-        self.inconsistent
+    pub fn overconstrained_vars(&self) -> &IndexSet<Var> {
+        &self.overconstrained_vars
     }
 
     pub fn unsolved_vars(&self) -> IndexSet<Var> {
@@ -137,11 +137,16 @@ impl Solver {
             }
         }
         for constraint in self.constraints.iter_mut() {
+            let original = constraint.clone();
             substitute_expr(&self.solved_vars, constraint);
             if constraint.coeffs.is_empty()
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
-                self.inconsistent = true;
+                for (coeff, var) in original.coeffs {
+                    if approx::relative_ne!(coeff, 0., epsilon = EPSILON) {
+                        self.overconstrained_vars.insert(var);
+                    }
+                }
             }
         }
         self.constraints

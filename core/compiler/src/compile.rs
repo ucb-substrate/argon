@@ -1992,7 +1992,7 @@ impl<'a> ExecPass<'a> {
             state.solve_iters += 1;
             state.solver.solve();
         }
-        if state.solver.is_inconsistent() {
+        if !state.solver.overconstrained_vars().is_empty() {
             self.errors.push(ExecError {
                 span: None,
                 cell: cell_id,
@@ -2063,6 +2063,7 @@ impl<'a> ExecPass<'a> {
             root: state.root_scope,
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
+            overconstrained_vars: state.solver.overconstrained_vars().clone(),
             objects: IndexMap::new(),
         };
         for (id, scope) in state.scopes.iter() {
@@ -3386,6 +3387,7 @@ pub struct CompiledCell {
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
     pub unsolved_vars: IndexSet<Var>,
+    pub overconstrained_vars: IndexSet<Var>,
 }
 
 impl CompiledCell {
