@@ -27,7 +27,7 @@ use crate::{
         Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
-    solver::{LinearExpr, Solver, Var},
+    solver::{LinearExpr, Solver},
 };
 
 pub const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
@@ -2014,10 +2014,10 @@ impl<'a> ExecPass<'a> {
                 Object::Rect(rect) => SolvedValue::Rect(Rect {
                     id: rect.id,
                     layer: rect.layer.clone(),
-                    x0: (state.solver.value_of(rect.x0).unwrap(), rect.x0),
-                    y0: (state.solver.value_of(rect.y0).unwrap(), rect.y0),
-                    x1: (state.solver.value_of(rect.x1).unwrap(), rect.x1),
-                    y1: (state.solver.value_of(rect.y1).unwrap(), rect.y1),
+                    x0: (state.solver.eval_expr(&rect.x0).unwrap(), rect.x0.clone()),
+                    y0: (state.solver.eval_expr(&rect.y0).unwrap(), rect.y0.clone()),
+                    x1: (state.solver.eval_expr(&rect.x1).unwrap(), rect.x1.clone()),
+                    y1: (state.solver.eval_expr(&rect.y1).unwrap(), rect.y1.clone()),
                     span: rect.span.clone(),
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
@@ -2033,8 +2033,8 @@ impl<'a> ExecPass<'a> {
                 }),
                 Object::Inst(inst) => SolvedValue::Instance(SolvedInstance {
                     id: inst.id,
-                    x: state.solver.value_of(inst.x).unwrap(),
-                    y: state.solver.value_of(inst.y).unwrap(),
+                    x: state.solver.eval_expr(&inst.x).unwrap(),
+                    y: state.solver.eval_expr(&inst.y).unwrap(),
                     angle: inst.angle,
                     reflect: false,
                     cell: *self.values[&inst.cell]
@@ -2519,10 +2519,10 @@ impl<'a> ExecPass<'a> {
                         let rect = Rect {
                             id,
                             layer,
-                            x0: state.solver.new_var(),
-                            y0: state.solver.new_var(),
-                            x1: state.solver.new_var(),
-                            y1: state.solver.new_var(),
+                            x0: state.solver.new_var().into(),
+                            y0: state.solver.new_var().into(),
+                            x1: state.solver.new_var().into(),
+                            y1: state.solver.new_var().into(),
                             span: Some(span),
                         };
                         self.values
@@ -2532,38 +2532,30 @@ impl<'a> ExecPass<'a> {
                             let lhs = self.value_id();
                             let priority = match kwarg.name.name.as_str() {
                                 "x0" | "x0i" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.x0))),
-                                    );
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
                                     6
                                 }
                                 "x1" | "x1i" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.x1))),
-                                    );
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
                                     5
                                 }
                                 "y0" | "y0i" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.y0))),
-                                    );
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
                                     4
                                 }
                                 "y1" | "y1i" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::from(rect.y1))),
-                                    );
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
                                     3
                                 }
                                 "w" => {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(
-                                            LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
+                                            rect.x1.clone() - rect.x0.clone(),
                                         )),
                                     );
                                     2
@@ -2572,7 +2564,7 @@ impl<'a> ExecPass<'a> {
                                     self.values.insert(
                                         lhs,
                                         Defer::Ready(Value::Linear(
-                                            LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
+                                            rect.y1.clone() - rect.y0.clone(),
                                         )),
                                     );
                                     1
@@ -2625,22 +2617,13 @@ impl<'a> ExecPass<'a> {
                                 let orect = Rect {
                                     id,
                                     layer: None,
-                                    x0: state.solver.new_var(),
-                                    y0: state.solver.new_var(),
-                                    x1: state.solver.new_var(),
-                                    y1: state.solver.new_var(),
+                                    x0: r.x0.into(),
+                                    y0: r.y0.into(),
+                                    x1: r.x1.into(),
+                                    y1: r.y1.into(),
                                     span: Some(span),
                                 };
                                 state.objects.insert(orect.id, orect.clone().into());
-                                let dx0 = LinearExpr::from(orect.x0) - r.x0;
-                                let dx1 = LinearExpr::from(orect.x1) - r.x1;
-                                let dy0 = LinearExpr::from(orect.y0) - r.y0;
-                                let dy1 = LinearExpr::from(orect.y1) - r.y1;
-                                let state = self.cell_state_mut(vref.loc.cell);
-                                state.solver.constrain_eq0(dx0);
-                                state.solver.constrain_eq0(dx1);
-                                state.solver.constrain_eq0(dy0);
-                                state.solver.constrain_eq0(dy1);
                                 self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
                                 true
                             } else {
@@ -2655,18 +2638,13 @@ impl<'a> ExecPass<'a> {
                                 let orect = Rect {
                                     id,
                                     layer: None,
-                                    x0: state.solver.new_var(),
-                                    y0: state.solver.new_var(),
-                                    x1: state.solver.new_var(),
-                                    y1: state.solver.new_var(),
+                                    x0: 0.0.into(),
+                                    y0: 0.0.into(),
+                                    x1: 0.0.into(),
+                                    y1: 0.0.into(),
                                     span: Some(span),
                                 };
                                 state.objects.insert(orect.id, orect.clone().into());
-                                let state = self.cell_state_mut(vref.loc.cell);
-                                state.solver.constrain_eq0(orect.x0.into());
-                                state.solver.constrain_eq0(orect.x1.into());
-                                state.solver.constrain_eq0(orect.y0.into());
-                                state.solver.constrain_eq0(orect.y1.into());
                                 self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
                                 true
                             }
@@ -2796,8 +2774,8 @@ impl<'a> ExecPass<'a> {
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let inst = Instance {
                             id,
-                            x: state.solver.new_var(),
-                            y: state.solver.new_var(),
+                            x: state.solver.new_var().into(),
+                            y: state.solver.new_var().into(),
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
@@ -2808,17 +2786,13 @@ impl<'a> ExecPass<'a> {
                             let lhs = self.value_id();
                             let priority = match kwarg.name.name.as_str() {
                                 "x" | "xi" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::from(inst.x))),
-                                    );
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
                                     2
                                 }
                                 "y" | "yi" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::from(inst.y))),
-                                    );
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
                                     1
                                 }
                                 _ => continue,
@@ -3105,16 +3079,12 @@ impl<'a> ExecPass<'a> {
                     match base.as_ref() {
                         ValueRef::Rect(rect) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
-                                "x0" => Value::Linear(LinearExpr::from(rect.x0)),
-                                "x1" => Value::Linear(LinearExpr::from(rect.x1)),
-                                "y0" => Value::Linear(LinearExpr::from(rect.y0)),
-                                "y1" => Value::Linear(LinearExpr::from(rect.y1)),
-                                "w" => Value::Linear(
-                                    LinearExpr::from(rect.x1) - LinearExpr::from(rect.x0),
-                                ),
-                                "h" => Value::Linear(
-                                    LinearExpr::from(rect.y1) - LinearExpr::from(rect.y0),
-                                ),
+                                "x0" => Value::Linear(rect.x0.clone()),
+                                "x1" => Value::Linear(rect.x1.clone()),
+                                "y0" => Value::Linear(rect.y0.clone()),
+                                "y1" => Value::Linear(rect.y1.clone()),
+                                "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
+                                "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
                                 "layer" => Value::String(rect.layer.clone().unwrap()),
                                 f => unreachable!("invalid field `{f}`"),
                             };
@@ -3123,8 +3093,8 @@ impl<'a> ExecPass<'a> {
                         }
                         ValueRef::Inst(inst) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
-                                "x" => Some(Value::Linear(LinearExpr::from(inst.x))),
-                                "y" => Some(Value::Linear(LinearExpr::from(inst.y))),
+                                "x" => Some(Value::Linear(inst.x.clone())),
+                                "y" => Some(Value::Linear(inst.y.clone())),
                                 field => {
                                     if let Defer::Ready(cell) = &self.values[&inst.cell] {
                                         let cell_id = *cell.as_ref().unwrap_cell();
@@ -3135,42 +3105,22 @@ impl<'a> ExecPass<'a> {
                                         match cell.field(field).unwrap() {
                                             SolvedValue::Rect(rect) => {
                                                 let id = object_id(&mut self.next_id);
-                                                let state = self
-                                                    .cell_states
-                                                    .get_mut(&vref.loc.cell)
-                                                    .unwrap();
-                                                let xrect = Rect {
-                                                    id,
-                                                    layer: rect.layer.clone(),
-                                                    x0: state.solver.new_var(),
-                                                    y0: state.solver.new_var(),
-                                                    x1: state.solver.new_var(),
-                                                    y1: state.solver.new_var(),
-                                                    span: rect.span.clone(),
-                                                };
-                                                state
-                                                    .objects
-                                                    .insert(xrect.id, xrect.clone().into());
                                                 let rect = rect
                                                     .to_float()
                                                     .transform(inst.reflect, inst.angle);
-                                                let dx0 = LinearExpr::from(xrect.x0)
-                                                    - rect.x0
-                                                    - LinearExpr::from(inst.x);
-                                                let dx1 = LinearExpr::from(xrect.x1)
-                                                    - rect.x1
-                                                    - LinearExpr::from(inst.x);
-                                                let dy0 = LinearExpr::from(xrect.y0)
-                                                    - rect.y0
-                                                    - LinearExpr::from(inst.y);
-                                                let dy1 = LinearExpr::from(xrect.y1)
-                                                    - rect.y1
-                                                    - LinearExpr::from(inst.y);
+                                                let xrect = Rect {
+                                                    id,
+                                                    layer: rect.layer.clone(),
+                                                    x0: LinearExpr::add(rect.x0, inst.x.clone()),
+                                                    y0: LinearExpr::add(rect.y0, inst.y.clone()),
+                                                    x1: LinearExpr::add(rect.x1, inst.x.clone()),
+                                                    y1: LinearExpr::add(rect.y1, inst.y.clone()),
+                                                    span: rect.span.clone(),
+                                                };
                                                 let state = self.cell_state_mut(vref.loc.cell);
-                                                state.solver.constrain_eq0(dx0);
-                                                state.solver.constrain_eq0(dx1);
-                                                state.solver.constrain_eq0(dy0);
-                                                state.solver.constrain_eq0(dy1);
+                                                state
+                                                    .objects
+                                                    .insert(xrect.id, xrect.clone().into());
                                                 Some(Value::Rect(xrect))
                                             }
                                             SolvedValue::Instance(cinst) => {
@@ -3190,8 +3140,8 @@ impl<'a> ExecPass<'a> {
                                                 let oinst = Instance {
                                                     id,
                                                     cell: cinst.cell_vid,
-                                                    x: state.solver.new_var(),
-                                                    y: state.solver.new_var(),
+                                                    x: LinearExpr::add(inst.x.clone(), cx),
+                                                    y: LinearExpr::add(inst.y.clone(), cy),
                                                     angle,
                                                     reflect,
                                                     span: cinst.span.clone(),
@@ -3199,12 +3149,6 @@ impl<'a> ExecPass<'a> {
                                                 state
                                                     .objects
                                                     .insert(oinst.id, oinst.clone().into());
-                                                let dx = LinearExpr::from(inst.x) + cx
-                                                    - LinearExpr::from(oinst.x);
-                                                let dy = LinearExpr::from(inst.y) + cy
-                                                    - LinearExpr::from(oinst.y);
-                                                state.solver.constrain_eq0(dx);
-                                                state.solver.constrain_eq0(dy);
                                                 Some(Value::Inst(oinst))
                                             }
                                             _ => unreachable!(),
@@ -3309,7 +3253,7 @@ pub enum Value {
     String(String),
     Linear(LinearExpr),
     Int(i64),
-    Rect(Rect<Var>),
+    Rect(Rect<LinearExpr>),
     Bool(bool),
     Fn(FnDecl<Substr, VarIdTyMetadata>),
     /// A cell generator.
@@ -3365,8 +3309,8 @@ impl Value {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: ObjectId,
-    pub x: Var,
-    pub y: Var,
+    pub x: LinearExpr,
+    pub y: LinearExpr,
     pub cell: ValueId,
     pub reflect: bool,
     pub angle: Rotation,
@@ -3391,7 +3335,7 @@ pub struct SolvedInstance {
 #[enumify]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
-    Rect(Rect<(f64, Var)>),
+    Rect(Rect<(f64, LinearExpr)>),
     Dimension(Dimension<f64>),
     Instance(SolvedInstance),
 }
@@ -3399,13 +3343,13 @@ pub enum SolvedValue {
 #[enumify]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Object {
-    Rect(Rect<Var>),
+    Rect(Rect<LinearExpr>),
     Dimension(Dimension<LinearExpr>),
     Inst(Instance),
 }
 
-impl From<Rect<Var>> for Object {
-    fn from(value: Rect<Var>) -> Self {
+impl From<Rect<LinearExpr>> for Object {
+    fn from(value: Rect<LinearExpr>) -> Self {
         Self::Rect(value)
     }
 }
@@ -3767,7 +3711,7 @@ fn imat(mat: TransformationMatrix) -> (Rotation, bool) {
     (rot, refv)
 }
 
-impl Rect<(f64, Var)> {
+impl<T> Rect<(f64, T)> {
     pub fn to_float(&self) -> Rect<f64> {
         Rect {
             id: self.id,

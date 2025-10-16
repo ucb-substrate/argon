@@ -179,6 +179,10 @@ impl LinearExpr {
         }
         out
     }
+
+    pub fn add(lhs: impl Into<LinearExpr>, rhs: impl Into<LinearExpr>) -> Self {
+        lhs.into() + rhs.into()
+    }
 }
 
 impl std::ops::Add<f64> for LinearExpr {
