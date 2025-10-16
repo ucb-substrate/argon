@@ -40,6 +40,7 @@ pub fn main() {
             KeyBinding::new("0", Zero, None),
             KeyBinding::new("1", One, None),
             KeyBinding::new("*", All, None),
+            KeyBinding::new(":", Command, None),
             KeyBinding::new("escape", Cancel, None),
             KeyBinding::new("backspace", Backspace, None),
             KeyBinding::new("delete", Delete, None),
@@ -70,6 +71,7 @@ pub fn main() {
                     MenuItem::action("Rect", DrawRect),
                     MenuItem::action("Dim", DrawDim),
                     MenuItem::action("Edit", Edit),
+                    MenuItem::action("Command Prompt", Command),
                 ],
             },
             Menu {

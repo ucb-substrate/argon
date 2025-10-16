@@ -237,9 +237,16 @@ impl TextInput {
                 } else {
                     ToolState::default()
                 };
-                return true;
+                true
+            } else {
+                if let Some((command, rest)) = self.content.split_once(" ")
+                    && command == "openCell"
+                {
+                    self.state.read(cx).lsp_client.open_cell(rest.to_string());
+                    return true;
+                }
+                false
             }
-            false
         });
         if reset {
             self.reset();

@@ -33,6 +33,7 @@ pub trait GuiToLsp {
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
+    async fn open_cell(cell: String);
 }
 
 #[tarpc::service]
@@ -501,5 +502,18 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
         }
+    }
+
+    async fn open_cell(self, _: tarpc::context::Context, cell: String) {
+        let state = self.state.clone();
+        state
+            .editor_client
+            .show_message(MessageType::INFO, &format!("cell {}", cell))
+            .await;
+        tokio::spawn(async move {
+            let mut state_mut = state.state_mut.lock().await;
+            state_mut.cell = Some(cell);
+            state_mut.compile(&self.state.editor_client, false).await;
+        });
     }
 }

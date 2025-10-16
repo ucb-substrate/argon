@@ -23,7 +23,7 @@ use itertools::Itertools;
 use lsp_server::rpc::DimensionParams;
 
 use crate::{
-    actions::{All, Cancel, DrawDim, DrawRect, Edit, Fit, One, Zero},
+    actions::*,
     editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
 };
 
@@ -1127,6 +1127,7 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::zero_hierarchy))
             .on_action(cx.listener(Self::one_hierarchy))
             .on_action(cx.listener(Self::all_hierarchy))
+            .on_action(cx.listener(Self::command_action))
             .on_action(cx.listener(Self::cancel))
             .on_drag_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -1732,6 +1733,17 @@ impl LayoutCanvas {
                 cx.notify();
             }
         });
+    }
+
+    pub(crate) fn command_action(
+        &mut self,
+        _: &Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.text_input_focus_handle);
+        window.prevent_default();
+        cx.notify();
     }
 
     pub(crate) fn zero_hierarchy(
