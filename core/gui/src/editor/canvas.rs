@@ -33,6 +33,13 @@ pub enum ShapeFill {
     Solid,
 }
 
+const DEFAULT_BORDER_WIDTHS: Edges<Pixels> = Edges {
+    top: Pixels(2.),
+    right: Pixels(2.),
+    bottom: Pixels(2.),
+    left: Pixels(2.),
+};
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
     pub x0: f32,
@@ -42,6 +49,7 @@ pub struct Rect {
     pub id: Option<Span>,
     /// Empty if not accessible.
     pub object_path: Vec<ObjectId>,
+    pub border_widths: Edges<Pixels>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -85,6 +93,7 @@ impl From<compile::Rect<f64>> for Rect {
             y1: value.y1 as f32,
             id: None,
             object_path: Vec::new(),
+            border_widths: DEFAULT_BORDER_WIDTHS,
         }
     }
 }
@@ -98,6 +107,7 @@ impl From<editor::Rect<(f64, Var)>> for Rect {
             y1: value.y1.0 as f32,
             id: None,
             object_path: Vec::new(),
+            border_widths: DEFAULT_BORDER_WIDTHS,
         }
     }
 }
@@ -113,6 +123,7 @@ impl Rect {
             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
             id: self.id.clone(),
             object_path: self.object_path.clone(),
+            border_widths: self.border_widths,
         }
     }
 }
@@ -208,30 +219,25 @@ impl IntoElement for CanvasElement {
     }
 }
 
-fn get_paint_path(
-    rect_bounds: Bounds<Pixels>,
-    bounds: Bounds<Pixels>,
-    color: Rgba,
-    thickness: Pixels,
-) -> Option<PaintQuad> {
-    let rect_bounds = Bounds::new(
+fn get_paint_path(bounds: Bounds<Pixels>, color: Rgba, thickness: Pixels) -> PaintQuad {
+    let bounds = Bounds::new(
         Point::new(
-            rect_bounds.origin.x - thickness / 2.,
-            rect_bounds.origin.y - thickness / 2.,
+            bounds.origin.x - thickness / 2.,
+            bounds.origin.y - thickness / 2.,
         ),
         Size::new(
-            rect_bounds.size.width + thickness,
-            rect_bounds.size.height + thickness,
+            bounds.size.width + thickness,
+            bounds.size.height + thickness,
         ),
     );
-    intersect(&rect_bounds, &bounds).map(|clipped| PaintQuad {
-        bounds: clipped,
+    PaintQuad {
+        bounds,
         corner_radii: Corners::all(Pixels(0.)),
         background: solid_background(color),
         border_widths: Edges::all(Pixels(0.)),
         border_color: rgba(0).into(),
         border_style: BorderStyle::Solid,
-    })
+    }
 }
 
 fn get_rect_bounds(
@@ -247,46 +253,33 @@ fn get_rect_bounds(
 }
 
 fn get_paint_quad(
-    rect_bounds: Bounds<Pixels>,
     bounds: Bounds<Pixels>,
     fill: ShapeFill,
     color: Rgba,
     border_color: Rgba,
-) -> Option<PaintQuad> {
-    let rect_bounds = Bounds::new(
+    border_widths: Edges<Pixels>,
+) -> PaintQuad {
+    let bounds = Bounds::new(
         Point::new(
-            rect_bounds.origin.x - Pixels(1.),
-            rect_bounds.origin.y - Pixels(1.),
+            bounds.origin.x - border_widths.left / 2.,
+            bounds.origin.y - border_widths.top / 2.,
         ),
         Size::new(
-            rect_bounds.size.width + Pixels(2.),
-            rect_bounds.size.height + Pixels(2.),
+            bounds.size.width + (border_widths.left + border_widths.right) / 2.,
+            bounds.size.height + (border_widths.top + border_widths.bottom) / 2.,
         ),
     );
     let background = match fill {
         ShapeFill::Solid => solid_background(color),
         ShapeFill::Stippling => pattern_slash(color.into(), 1., 9.),
     };
-    if let Some(clipped) = intersect(&rect_bounds, &bounds) {
-        let left_border = f32::clamp((rect_bounds.left().0 + 2.) - bounds.left().0, 0., 2.);
-        let right_border = f32::clamp(bounds.right().0 - (rect_bounds.right().0 - 2.), 0., 2.);
-        let top_border = f32::clamp((rect_bounds.top().0 + 2.) - bounds.top().0, 0., 2.);
-        let bot_border = f32::clamp(bounds.bottom().0 - (rect_bounds.bottom().0 - 2.), 0., 2.);
-        let mut border_widths = Edges::all(Pixels(2.));
-        border_widths.left = Pixels(left_border);
-        border_widths.right = Pixels(right_border);
-        border_widths.top = Pixels(top_border);
-        border_widths.bottom = Pixels(bot_border);
-        Some(PaintQuad {
-            bounds: clipped,
-            corner_radii: Corners::all(Pixels(0.)),
-            background,
-            border_widths,
-            border_color: border_color.into(),
-            border_style: BorderStyle::Solid,
-        })
-    } else {
-        None
+    PaintQuad {
+        bounds,
+        corner_radii: Corners::all(Pixels(0.)),
+        background,
+        border_widths,
+        border_color: border_color.into(),
+        border_style: BorderStyle::Solid,
     }
 }
 
@@ -390,6 +383,7 @@ impl Element for CanvasElement {
                             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
                             id: Some(scope_info.span.clone()),
                             object_path: Vec::new(),
+                            border_widths: DEFAULT_BORDER_WIDTHS,
                         };
                         if let ToolState::Select(SelectToolState { selected_obj }) =
                             inner.tool.read(cx)
@@ -424,6 +418,14 @@ impl Element for CanvasElement {
                                         y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
                                         id: rect.span.clone(),
                                         object_path,
+                                        border_widths: Edges {
+                                            // TODO: make dashed or something more descriptive.
+                                            // TODO: check constrained status
+                                            top: Pixels(0.),
+                                            right: Pixels(2.),
+                                            bottom: Pixels(2.),
+                                            left: Pixels(2.),
+                                        },
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         inner.tool.read(cx)
@@ -464,6 +466,7 @@ impl Element for CanvasElement {
                                         y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
                                         id: Some(inst.span.clone()),
                                         object_path: object_path.clone(),
+                                        border_widths: DEFAULT_BORDER_WIDTHS,
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         inner.tool.read(cx)
@@ -511,6 +514,7 @@ impl Element for CanvasElement {
                         x1: p0.x.max(layout_mouse_position.x),
                         y1: p0.y.max(layout_mouse_position.y),
                         id: None,
+                        border_widths: DEFAULT_BORDER_WIDTHS,
                     },
                     layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
                 ));
@@ -530,37 +534,31 @@ impl Element for CanvasElement {
             .paint(bounds, window, cx, |window, cx| {
                 window.paint_layer(bounds, |window| {
                     for (r, l) in &rects {
-                        if let Some(quad) = get_paint_quad(
+                        window.paint_quad(get_paint_quad(
                             get_rect_bounds(r, bounds, scale, offset),
-                            bounds,
                             l.fill,
                             l.color,
                             l.border_color,
-                        ) {
-                            window.paint_quad(quad.clone());
-                        }
+                            r.border_widths,
+                        ));
                     }
                     for r in &scope_rects {
-                        if let Some(quad) = get_paint_quad(
+                        window.paint_quad(get_paint_quad(
                             get_rect_bounds(r, bounds, scale, offset),
-                            bounds,
                             ShapeFill::Solid,
                             rgba(0),
                             rgb(0xffffff),
-                        ) {
-                            window.paint_quad(quad);
-                        }
+                            r.border_widths,
+                        ));
                     }
                     for r in &select_rects {
-                        if let Some(quad) = get_paint_quad(
+                        window.paint_quad(get_paint_quad(
                             get_rect_bounds(r, bounds, scale, offset),
-                            bounds,
                             ShapeFill::Solid,
                             rgba(0),
                             rgb(0xffff00),
-                        ) {
-                            window.paint_quad(quad);
-                        }
+                            r.border_widths,
+                        ));
                     }
 
                     let mut draw_dim =
@@ -605,6 +603,7 @@ impl Element for CanvasElement {
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
+                                border_widths: DEFAULT_BORDER_WIDTHS,
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (
@@ -638,6 +637,7 @@ impl Element for CanvasElement {
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
+                                border_widths: DEFAULT_BORDER_WIDTHS,
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (p, coord, n, coord)
@@ -651,16 +651,14 @@ impl Element for CanvasElement {
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
+                                border_widths: DEFAULT_BORDER_WIDTHS,
                             };
                             for r in &[start_line, stop_line, dim_line] {
-                                if let Some(quad) = get_paint_path(
+                                window.paint_quad(get_paint_path(
                                     get_rect_bounds(r, bounds, scale, offset),
-                                    bounds,
                                     color,
                                     Pixels(2.),
-                                ) {
-                                    window.paint_quad(quad);
-                                }
+                                ));
                             }
 
                             let run_len = value.len();
@@ -756,7 +754,7 @@ impl Element for CanvasElement {
                                 Dir::Horiz => (edge.start, edge.coord, edge.stop, edge.coord),
                                 Dir::Vert => (edge.coord, edge.start, edge.coord, edge.stop),
                             };
-                            if let Some(quad) = get_paint_path(
+                            window.paint_quad(get_paint_path(
                                 get_rect_bounds(
                                     &Rect {
                                         object_path: Vec::new(),
@@ -765,17 +763,15 @@ impl Element for CanvasElement {
                                         x1,
                                         y1,
                                         id: None,
+                                        border_widths: DEFAULT_BORDER_WIDTHS,
                                     },
                                     bounds,
                                     scale,
                                     offset,
                                 ),
-                                bounds,
                                 rgb(0xffff00),
                                 Pixels(2.),
-                            ) {
-                                window.paint_quad(quad);
-                            }
+                            ));
                         }
                     }
                     let inner = self.inner.read(cx);
@@ -909,7 +905,7 @@ impl Element for CanvasElement {
                                                 (edge.coord, edge.start, edge.coord, edge.stop)
                                             }
                                         };
-                                        if let Some(quad) = get_paint_path(
+                                        window.paint_quad(get_paint_path(
                                             get_rect_bounds(
                                                 &Rect {
                                                     object_path: Vec::new(),
@@ -918,17 +914,15 @@ impl Element for CanvasElement {
                                                     x1,
                                                     y1,
                                                     id: None,
+                                                    border_widths: DEFAULT_BORDER_WIDTHS,
                                                 },
                                                 bounds,
                                                 scale,
                                                 offset,
                                             ),
-                                            bounds,
                                             rgb(0xffff00),
                                             Pixels(2.),
-                                        ) {
-                                            window.paint_quad(quad);
-                                        }
+                                        ));
                                     }
                                 }
                             }
@@ -965,15 +959,13 @@ impl Element for CanvasElement {
                                 )
                             {
                                 if hitbox.contains(&inner.mouse_position) {
-                                    if let Some(quad) = get_paint_quad(
+                                    window.paint_quad(get_paint_quad(
                                         hitbox,
-                                        bounds,
                                         ShapeFill::Solid,
                                         rgba(0),
                                         rgb(0xffff00),
-                                    ) {
-                                        window.paint_quad(quad);
-                                    }
+                                        Edges::all(Pixels(2.)),
+                                    ));
                                     break;
                                 }
                             }

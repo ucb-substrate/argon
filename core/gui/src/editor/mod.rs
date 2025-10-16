@@ -370,7 +370,7 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child(self.canvas.clone())
+                    .child(div().overflow_hidden().flex_1().child(self.canvas.clone()))
                     .child(self.layer_sidebar.clone()),
             )
             .child(self.text_input.clone())
