@@ -10,7 +10,7 @@ mod tests {
 
     use std::{io::BufReader, path::PathBuf};
 
-    use crate::parse::parse_workspace_with_std;
+    use crate::{compile::ExecErrorKind, parse::parse_workspace_with_std};
     use approx::assert_relative_eq;
     use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
     use indexmap::IndexMap;
@@ -61,6 +61,7 @@ mod tests {
     const ARGON_ENUMERATIONS: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/enumerations/lib.ar");
     const ARGON_BBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bbox/lib.ar");
+    const ARGON_ROUNDING: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/rounding/lib.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
@@ -474,5 +475,25 @@ mod tests {
         let cells = cells.unwrap_valid();
         let cell = &cells.cells[&cells.top];
         assert_eq!(cell.objects.len(), 5);
+    }
+
+    #[test]
+    fn argon_rounding() {
+        let ast = parse_workspace_with_std(ARGON_ROUNDING).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_exec_errors();
+        assert_eq!(cells.errors.len(), 1);
+        assert!(matches!(
+            cells.errors.first().unwrap().kind,
+            ExecErrorKind::InconsistentConstraint(_)
+        ));
     }
 }

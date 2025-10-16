@@ -5,6 +5,8 @@ use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-6;
+const ROUND_STEP: f64 = 1e-3;
+const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
@@ -28,6 +30,10 @@ pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
     });
     expr.coeffs = r;
     expr.constant += l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
+}
+
+fn round(x: f64) -> f64 {
+    (x * INV_ROUND_STEP).round() * ROUND_STEP
 }
 
 impl Solver {
@@ -109,7 +115,8 @@ impl Solver {
             if !self.solved_vars.contains_key(&Var(i))
                 && relative_eq!(recons, 1., epsilon = EPSILON)
             {
-                self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
+                let val = round(sol[(i as usize, 0)]);
+                self.solved_vars.insert(Var(i), val);
             }
         }
         for constraint in self.constraints.iter_mut() {
@@ -133,13 +140,13 @@ impl Solver {
     }
 
     pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
-        Some(
+        Some(round(
             expr.coeffs
                 .iter()
                 .map(|(coeff, var)| self.value_of(*var).map(|val| val * coeff))
                 .fold_options(0., |a, b| a + b)?
                 + expr.constant,
-        )
+        ))
     }
 }
 

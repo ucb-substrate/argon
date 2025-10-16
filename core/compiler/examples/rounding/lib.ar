@@ -1,0 +1,4 @@
+cell top() {
+    let val = float();
+    eq(val, 1.2345);
+}
