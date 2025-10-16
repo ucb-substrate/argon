@@ -4,7 +4,7 @@ use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
-const EPSILON: f64 = 1e-6;
+const EPSILON: f64 = 1e-10;
 const ROUND_STEP: f64 = 1e-3;
 const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
 
