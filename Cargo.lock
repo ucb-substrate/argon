@@ -2682,7 +2682,6 @@ dependencies = [
  "itertools 0.14.0",
  "lazy_static",
  "lsp-server",
- "portpicker",
  "rgb",
  "rust-embed",
  "serde",
@@ -4419,15 +4418,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
 dependencies = [
  "portable-atomic",
-]
-
-[[package]]
-name = "portpicker"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be97d76faf1bfab666e1375477b23fde79eccf0276e9b63b92a39d676a889ba9"
-dependencies = [
- "rand 0.8.5",
 ]
 
 [[package]]
