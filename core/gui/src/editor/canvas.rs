@@ -687,13 +687,13 @@ impl Element for CanvasElement {
 
                     for dim in dims {
                         draw_dim(
-                            dim.p.0 as f32,
-                            dim.n.0 as f32,
-                            dim.coord.0 as f32,
-                            dim.pstop.0 as f32,
-                            dim.nstop.0 as f32,
+                            dim.p as f32,
+                            dim.n as f32,
+                            dim.coord as f32,
+                            dim.pstop as f32,
+                            dim.nstop as f32,
                             dim.horiz,
-                            format!("{:.3}", dim.value.0), // TODO: show actual expression
+                            format!("{:.3}", dim.value), // TODO: show actual expression
                             match &tool {
                                 ToolState::Select(SelectToolState {
                                     selected_obj: Some(selected),

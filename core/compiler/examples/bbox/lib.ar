@@ -11,4 +11,7 @@ cell top() {
     eq(inst0.y, 100.);
     let r2 = bbox(inst0);
     rect("met3", x0=r2.x0, x1=r2.x1, y0=r2.y0, y1=r2.y1)!;
+    let rect0 = rect("met1", x0i = 31.683940887451172, y0i = -75.53675079345703, x1i = 190.65628051757813, y1i = -26.77390480041504)!;
+    dimension(rect0.x1, rect0.x0, 100., rect0.y1 + 124.51525, rect0.y1, rect0.y1, true);
+    dimension(inst0.met1.y0, rect0.y1, 200., (inst0.met1.x0 + inst0.met1.x1 + rect0.x0 + rect0.x1)/4. + 110.467606, (inst0.met1.x0 + inst0.met1.x1) / 2., (rect0.x0 + rect0.x1) / 2., false);
 }

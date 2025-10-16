@@ -2022,12 +2022,12 @@ impl<'a> ExecPass<'a> {
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
-                    p: (state.solver.value_of(dim.p).unwrap(), dim.p),
-                    n: (state.solver.value_of(dim.n).unwrap(), dim.n),
-                    value: (state.solver.value_of(dim.value).unwrap(), dim.value),
-                    coord: (state.solver.value_of(dim.coord).unwrap(), dim.coord),
-                    pstop: (state.solver.value_of(dim.pstop).unwrap(), dim.pstop),
-                    nstop: (state.solver.value_of(dim.nstop).unwrap(), dim.nstop),
+                    p: state.solver.eval_expr(&dim.p).unwrap(),
+                    n: state.solver.eval_expr(&dim.n).unwrap(),
+                    value: state.solver.eval_expr(&dim.value).unwrap(),
+                    coord: state.solver.eval_expr(&dim.coord).unwrap(),
+                    pstop: state.solver.eval_expr(&dim.pstop).unwrap(),
+                    nstop: state.solver.eval_expr(&dim.nstop).unwrap(),
                     horiz: dim.horiz,
                     span: dim.span.clone(),
                 }),
@@ -2705,33 +2705,26 @@ impl<'a> ExecPass<'a> {
                         .iter()
                         .map(|vid| self.values[vid].get_ready())
                         .collect::<Option<Vec<_>>>();
-                    if let Some(args) = args {
+                    if let Some(mut args) = args {
                         assert_eq!(args.len(), 7);
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let horiz = *args.pop().unwrap().as_ref().unwrap_bool();
+                        let mut arg = || args.pop().unwrap().as_ref().unwrap_linear().clone();
                         let dim = Dimension {
                             id,
-                            p: state.solver.new_var(),
-                            n: state.solver.new_var(),
-                            value: state.solver.new_var(),
-                            coord: state.solver.new_var(),
-                            pstop: state.solver.new_var(),
-                            nstop: state.solver.new_var(),
-                            horiz: *args[6].as_ref().unwrap_bool(),
+                            horiz,
+                            nstop: arg(),
+                            pstop: arg(),
+                            coord: arg(),
+                            value: arg(),
+                            n: arg(),
+                            p: arg(),
                             span: Some(span),
                         };
                         state.objects.insert(dim.id, dim.clone().into());
-                        for (var, rhs) in [dim.p, dim.n, dim.value, dim.coord, dim.pstop, dim.nstop]
-                            .iter()
-                            .zip(args.iter().take(6))
-                        {
-                            let expr = LinearExpr::from(*var) - rhs.as_ref().unwrap_linear();
-                            state.solver.constrain_eq0(expr);
-                        }
-                        let expr = LinearExpr::from(dim.p)
-                            - LinearExpr::from(dim.n)
-                            - LinearExpr::from(dim.value);
+                        let expr = dim.p - dim.n - dim.value;
                         state.solver.constrain_eq0(expr);
                         self.values.insert(vid, Defer::Ready(Value::None));
                         true
@@ -3399,7 +3392,7 @@ pub struct SolvedInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Rect(Rect<(f64, Var)>),
-    Dimension(Dimension<(f64, Var)>),
+    Dimension(Dimension<f64>),
     Instance(SolvedInstance),
 }
 
@@ -3407,7 +3400,7 @@ pub enum SolvedValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Object {
     Rect(Rect<Var>),
-    Dimension(Dimension<Var>),
+    Dimension(Dimension<LinearExpr>),
     Inst(Instance),
 }
 
@@ -3417,8 +3410,8 @@ impl From<Rect<Var>> for Object {
     }
 }
 
-impl From<Dimension<Var>> for Object {
-    fn from(value: Dimension<Var>) -> Self {
+impl From<Dimension<LinearExpr>> for Object {
+    fn from(value: Dimension<LinearExpr>) -> Self {
         Self::Dimension(value)
     }
 }
