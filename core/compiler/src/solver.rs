@@ -1,5 +1,5 @@
 use approx::relative_eq;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
 use ndarray_linalg::SVD;
@@ -59,6 +59,10 @@ impl Solver {
     #[inline]
     pub fn is_inconsistent(&self) -> bool {
         self.inconsistent
+    }
+
+    pub fn unsolved_vars(&self) -> IndexSet<Var> {
+        IndexSet::from_iter((0..self.next_id).map(Var).filter(|&v| !self.is_solved(v)))
     }
 
     pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {

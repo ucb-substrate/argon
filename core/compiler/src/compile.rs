@@ -21,6 +21,7 @@ use crate::ast::{
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
+use crate::solver::Var;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -1671,7 +1672,7 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<LinearExpr>,
-    nullspace_vecs: Option<Vec<Vec<f64>>>,
+    unsolved_vars: Option<IndexSet<Var>>,
 }
 
 struct ExecPass<'a> {
@@ -1892,7 +1893,7 @@ impl<'a> ExecPass<'a> {
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
                         root_scope: root_scope_id,
-                        nullspace_vecs: None,
+                        unsolved_vars: Default::default(),
                         objects: Default::default(),
                     }
                 )
@@ -1948,8 +1949,8 @@ impl<'a> ExecPass<'a> {
 
             if require_progress && !progress {
                 let state = self.cell_state_mut(cell_id);
-                if state.nullspace_vecs.is_none() {
-                    state.nullspace_vecs = Some(state.solver.nullspace_vecs());
+                if state.unsolved_vars.is_none() {
+                    state.unsolved_vars = Some(state.solver.unsolved_vars());
                     self.errors.push(ExecError {
                         span: None,
                         cell: cell_id,
@@ -2061,7 +2062,7 @@ impl<'a> ExecPass<'a> {
             scopes: IndexMap::new(),
             root: state.root_scope,
             fallback_constraints_used: state.fallback_constraints_used.clone(),
-            nullspace_vecs: state.nullspace_vecs.clone().unwrap_or_default(),
+            unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
             objects: IndexMap::new(),
         };
         for (id, scope) in state.scopes.iter() {
@@ -3384,7 +3385,7 @@ pub struct CompiledCell {
     pub root: ScopeId,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
-    pub nullspace_vecs: Vec<Vec<f64>>,
+    pub unsolved_vars: IndexSet<Var>,
 }
 
 impl CompiledCell {
