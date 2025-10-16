@@ -226,8 +226,8 @@ mod tests {
         .unwrap_exec_errors()
         .output
         .unwrap();
-        assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
         println!("{cells:#?}");
+        assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
     }
 
     #[test]
@@ -470,7 +470,7 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
-        println!("{cells:?}");
+        println!("{cells:#?}");
         let cells = cells.unwrap_valid();
         let cell = &cells.cells[&cells.top];
         assert_eq!(cell.objects.len(), 5);

@@ -121,19 +121,17 @@ impl Solver {
 
         let svd = a.clone().svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
-        let s = &svd.singular_values;
-        if s[0] < EPSILON {
+        let r = svd.rank(EPSILON);
+        if r == 0 {
             return;
         }
+        let vt_recons = vt.rows(0, r);
         let sol = svd.solve(&b, EPSILON).unwrap();
 
         for i in 0..self.next_id {
+            let recons = (vt_recons.transpose() * vt_recons.column(i as usize))[((i as usize), 0)];
             if !self.solved_vars.contains_key(&Var(i))
-                && relative_eq!(
-                    (vt.transpose() * vt.column(i as usize))[((i as usize), 0)],
-                    1.,
-                    epsilon = EPSILON
-                )
+                && relative_eq!(recons, 1., epsilon = EPSILON)
             {
                 self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
             }
