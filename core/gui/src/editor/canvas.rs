@@ -33,12 +33,10 @@ pub enum ShapeFill {
     Solid,
 }
 
-const DEFAULT_BORDER_WIDTHS: Edges<Pixels> = Edges {
-    top: Pixels(2.),
-    right: Pixels(2.),
-    bottom: Pixels(2.),
-    left: Pixels(2.),
-};
+const CONSTRAINED_BORDER_WIDTH: Pixels = Pixels(2.);
+const SELECT_WIDTH: Pixels = Pixels(4.);
+const DEFAULT_BORDER_WIDTH: Pixels = Pixels(2.);
+const UNCONSTRAINED_BORDER_WIDTH: Pixels = Pixels(0.);
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
@@ -93,7 +91,7 @@ impl From<compile::Rect<f64>> for Rect {
             y1: value.y1 as f32,
             id: None,
             object_path: Vec::new(),
-            border_widths: DEFAULT_BORDER_WIDTHS,
+            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
         }
     }
 }
@@ -107,7 +105,7 @@ impl From<editor::Rect<(f64, Var)>> for Rect {
             y1: value.y1.0 as f32,
             id: None,
             object_path: Vec::new(),
-            border_widths: DEFAULT_BORDER_WIDTHS,
+            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
         }
     }
 }
@@ -393,7 +391,7 @@ impl Element for CanvasElement {
                             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
                             id: Some(scope_info.span.clone()),
                             object_path: Vec::new(),
-                            border_widths: DEFAULT_BORDER_WIDTHS,
+                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                         };
                         if let ToolState::Select(SelectToolState { selected_obj }) =
                             inner.tool.read(cx)
@@ -430,14 +428,39 @@ impl Element for CanvasElement {
                                         object_path,
                                         border_widths: Edges {
                                             // TODO: check constrained status and modify widths
-                                            top: Pixels(2.),
-                                            right: Pixels(2.),
-                                            bottom: Pixels(2.),
-                                            left: Pixels(2.),
+                                            top: if rect.y1.1.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            }) {
+                                                UNCONSTRAINED_BORDER_WIDTH
+                                            } else {
+                                                CONSTRAINED_BORDER_WIDTH
+                                            },
+                                            right: if rect.x1.1.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            }) {
+                                                UNCONSTRAINED_BORDER_WIDTH
+                                            } else {
+                                                CONSTRAINED_BORDER_WIDTH
+                                            },
+                                            bottom: if rect.y0.1.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            }) {
+                                                UNCONSTRAINED_BORDER_WIDTH
+                                            } else {
+                                                CONSTRAINED_BORDER_WIDTH
+                                            },
+                                            left: if rect.x0.1.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            }) {
+                                                UNCONSTRAINED_BORDER_WIDTH
+                                            } else {
+                                                CONSTRAINED_BORDER_WIDTH
+                                            },
                                         },
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         inner.tool.read(cx)
+                                        && rect.id.is_some()
                                         && &rect.id == selected_obj
                                     {
                                         select_rects.push(rect.clone());
@@ -475,10 +498,11 @@ impl Element for CanvasElement {
                                         y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
                                         id: Some(inst.span.clone()),
                                         object_path: object_path.clone(),
-                                        border_widths: DEFAULT_BORDER_WIDTHS,
+                                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         inner.tool.read(cx)
+                                        && rect.id.is_some()
                                         && &rect.id == selected_obj
                                     {
                                         select_rects.push(rect.clone());
@@ -523,7 +547,7 @@ impl Element for CanvasElement {
                         x1: p0.x.max(layout_mouse_position.x),
                         y1: p0.y.max(layout_mouse_position.y),
                         id: None,
-                        border_widths: DEFAULT_BORDER_WIDTHS,
+                        border_widths: Edges::all(UNCONSTRAINED_BORDER_WIDTH),
                     },
                     layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
                 ));
@@ -559,12 +583,12 @@ impl Element for CanvasElement {
                     window.paint_quad(get_paint_path(
                         y_axis.select_bounds(Pixels(0.)),
                         rgb(0xffffff),
-                        Pixels(2.),
+                        DEFAULT_BORDER_WIDTH,
                     ));
                     window.paint_quad(get_paint_path(
                         x_axis.select_bounds(Pixels(0.)),
                         rgb(0xffffff),
-                        Pixels(2.),
+                        DEFAULT_BORDER_WIDTH,
                     ));
                     for (r, l) in &rects {
                         window.paint_quad(get_paint_quad(
@@ -636,7 +660,7 @@ impl Element for CanvasElement {
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
-                                border_widths: DEFAULT_BORDER_WIDTHS,
+                                border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (
@@ -670,7 +694,7 @@ impl Element for CanvasElement {
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
-                                border_widths: DEFAULT_BORDER_WIDTHS,
+                                border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (p, coord, n, coord)
@@ -684,13 +708,13 @@ impl Element for CanvasElement {
                                 x1: x0.max(x1),
                                 y1: y0.max(y1),
                                 id: None,
-                                border_widths: DEFAULT_BORDER_WIDTHS,
+                                border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                             };
                             for r in &[start_line, stop_line, dim_line] {
                                 window.paint_quad(get_paint_path(
                                     get_rect_bounds(r, bounds, scale, offset),
                                     color,
-                                    Pixels(2.),
+                                    DEFAULT_BORDER_WIDTH,
                                 ));
                             }
 
@@ -824,7 +848,7 @@ impl Element for CanvasElement {
                                             x1,
                                             y1,
                                             id: None,
-                                            border_widths: DEFAULT_BORDER_WIDTHS,
+                                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                         },
                                         bounds,
                                         scale,
@@ -834,7 +858,7 @@ impl Element for CanvasElement {
                                 DimEdge::X0 => y_axis.select_bounds(Pixels(0.)),
                                 DimEdge::Y0 => x_axis.select_bounds(Pixels(0.)),
                             };
-                            window.paint_quad(get_paint_path(bounds, rgb(0xffff00), Pixels(2.)));
+                            window.paint_quad(get_paint_path(bounds, rgb(0xffff00), DEFAULT_BORDER_WIDTH));
                         }
                     }
                     let inner = self.inner.read(cx);
@@ -852,13 +876,13 @@ impl Element for CanvasElement {
                                 let offset = inner.offset;
                                 let mut selected = None;
                                 if x_axis
-                                    .select_bounds(Pixels(4.))
+                                    .select_bounds(SELECT_WIDTH)
                                     .contains(&inner.mouse_position)
                                 {
                                     selected = Some(DimEdge::Y0);
                                 }
                                 if y_axis
-                                    .select_bounds(Pixels(4.))
+                                    .select_bounds(SELECT_WIDTH)
                                     .contains(&inner.mouse_position)
                                 {
                                     selected = Some(DimEdge::X0);
@@ -939,7 +963,7 @@ impl Element for CanvasElement {
                                             },
                                         ),
                                     ] {
-                                        let bounds = edge_px.select_bounds(Pixels(4.));
+                                        let bounds = edge_px.select_bounds(SELECT_WIDTH);
                                         if bounds.contains(&inner.mouse_position)
                                             && rect.id.is_some()
                                         {
@@ -996,14 +1020,14 @@ impl Element for CanvasElement {
                                                         x1,
                                                         y1,
                                                         id: None,
-                                                        border_widths: DEFAULT_BORDER_WIDTHS,
+                                                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                                     },
                                                     bounds,
                                                     scale,
                                                     offset,
                                                 ),
                                                 rgb(0xffff00),
-                                                Pixels(2.),
+                                                DEFAULT_BORDER_WIDTH,
                                             ));
                                         }
                                     }
@@ -1011,14 +1035,14 @@ impl Element for CanvasElement {
                                         window.paint_quad(get_paint_path(
                                             y_axis.select_bounds(Pixels(0.)),
                                             rgb(0xffff00),
-                                            Pixels(2.),
+                                            DEFAULT_BORDER_WIDTH,
                                         ));
                                     }
                                     Some(DimEdge::Y0) => {
                                         window.paint_quad(get_paint_path(
                                             x_axis.select_bounds(Pixels(0.)),
                                             rgb(0xffff00),
-                                            Pixels(2.),
+                                            DEFAULT_BORDER_WIDTH,
                                         ));
                                     }
                                     _ => {}
@@ -1062,7 +1086,7 @@ impl Element for CanvasElement {
                                         ShapeFill::Solid,
                                         rgba(0),
                                         rgb(0xffff00),
-                                        Edges::all(Pixels(2.)),
+                                        Edges::all(DEFAULT_BORDER_WIDTH),
                                     ));
                                     break;
                                 }
@@ -1277,10 +1301,10 @@ impl LayoutCanvas {
                         let scale = self.scale;
                         let offset = self.offset;
                         let mut selected = None;
-                        if x_axis.select_bounds(Pixels(4.)).contains(&event.position) {
+                        if x_axis.select_bounds(SELECT_WIDTH).contains(&event.position) {
                             selected = Some(DimEdge::Y0);
                         }
-                        if y_axis.select_bounds(Pixels(4.)).contains(&event.position) {
+                        if y_axis.select_bounds(SELECT_WIDTH).contains(&event.position) {
                             selected = Some(DimEdge::X0);
                         }
                         for (rect, r) in rects.map(|r| {
@@ -1359,7 +1383,7 @@ impl LayoutCanvas {
                                     },
                                 ),
                             ] {
-                                let bounds = edge_px.select_bounds(Pixels(4.));
+                                let bounds = edge_px.select_bounds(SELECT_WIDTH);
                                 if bounds.contains(&event.position) && rect.id.is_some() {
                                     selected = Some(DimEdge::Edge((rect, name, edge_layout)));
                                     break;
@@ -1408,11 +1432,39 @@ impl LayoutCanvas {
                                 }
                             }
                             Some(DimEdge::X0) => {
-                                dim_tool.edges.push(DimEdge::X0);
+                                if dim_tool
+                                    .edges
+                                    .first()
+                                    .map(|old_edge| {
+                                        let old_dir = match old_edge {
+                                            DimEdge::X0 => return false,
+                                            DimEdge::Y0 => return false,
+                                            DimEdge::Edge((_, _, edge)) => edge.dir,
+                                        };
+                                        old_dir == Dir::Vert
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    dim_tool.edges.push(DimEdge::X0);
+                                }
                                 false
                             }
                             Some(DimEdge::Y0) => {
-                                dim_tool.edges.push(DimEdge::Y0);
+                                if dim_tool
+                                    .edges
+                                    .first()
+                                    .map(|old_edge| {
+                                        let old_dir = match old_edge {
+                                            DimEdge::X0 => return false,
+                                            DimEdge::Y0 => return false,
+                                            DimEdge::Edge((_, _, edge)) => edge.dir,
+                                        };
+                                        old_dir == Dir::Horiz
+                                    })
+                                    .unwrap_or(true)
+                                {
+                                    dim_tool.edges.push(DimEdge::Y0);
+                                }
                                 false
                             }
                             _ => enter_entry_mode,
