@@ -122,9 +122,9 @@ mod tests {
                 args: Vec::new(),
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
-        )
-        .unwrap_exec_errors();
+        );
         println!("{cell:?}");
+        cell.unwrap_exec_errors();
     }
 
     #[test]

@@ -12,10 +12,11 @@ pub struct Var(u64);
 
 #[derive(Clone, Default)]
 pub struct Solver {
-    next_id: u64,
-    constraints: Vec<LinearExpr>,
+    next_var: u64,
+    next_constraint: ConstraintId,
+    constraints: Vec<SolverConstraint>,
     solved_vars: IndexMap<Var, f64>,
-    overconstrained_vars: IndexSet<Var>,
+    inconsistent_constraints: IndexSet<ConstraintId>,
 }
 
 pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
@@ -36,20 +37,20 @@ impl Solver {
     }
 
     pub fn new_var(&mut self) -> Var {
-        let var = Var(self.next_id);
-        self.next_id += 1;
+        let var = Var(self.next_var);
+        self.next_var += 1;
         var
     }
 
     /// Returns true if all variables have been solved.
     pub fn fully_solved(&self) -> bool {
-        self.solved_vars.len() == self.next_id as usize
+        self.solved_vars.len() == self.next_var as usize
     }
 
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
             // Find any unsolved variable and constrain it to equal 0.
-            let v = (0..self.next_id)
+            let v = (0..self.next_var)
                 .find(|&i| !self.solved_vars.contains_key(&Var(i)))
                 .unwrap();
             self.constrain_eq0(LinearExpr::from(Var(v)));
@@ -57,21 +58,21 @@ impl Solver {
     }
 
     #[inline]
-    pub fn overconstrained_vars(&self) -> &IndexSet<Var> {
-        &self.overconstrained_vars
+    pub fn inconsistent_constraints(&self) -> &IndexSet<ConstraintId> {
+        &self.inconsistent_constraints
     }
 
     pub fn unsolved_vars(&self) -> IndexSet<Var> {
-        IndexSet::from_iter((0..self.next_id).map(Var).filter(|&v| !self.is_solved(v)))
+        IndexSet::from_iter((0..self.next_var).map(Var).filter(|&v| !self.is_solved(v)))
     }
 
     pub fn nullspace_vecs(&self) -> Vec<Vec<f64>> {
-        let n_vars = self.next_id as usize;
+        let n_vars = self.next_var as usize;
         let arr_shape = (self.constraints.len() + self.solved_vars.len(), n_vars);
         let arr = self
             .constraints
             .iter()
-            .flat_map(|expr| expr.coeff_vec(n_vars))
+            .flat_map(|c| c.expr.coeff_vec(n_vars))
             .chain(self.solved_vars.iter().flat_map(|(var, _)| {
                 let var = var.0 as usize;
                 std::iter::repeat_n(0., var)
@@ -95,15 +96,19 @@ impl Solver {
 
     /// Constrains the value of `expr` to 0.
     /// TODO: Check if added constraints conflict with existing solution.
-    pub fn constrain_eq0(&mut self, mut expr: LinearExpr) {
-        substitute_expr(&self.solved_vars, &mut expr);
-        self.constraints.push(expr);
+    pub fn constrain_eq0(&mut self, expr: LinearExpr) -> ConstraintId {
+        let id = self.next_constraint;
+        self.next_constraint += 1;
+        let mut constraint = SolverConstraint { id, expr };
+        substitute_expr(&self.solved_vars, &mut constraint.expr);
+        self.constraints.push(constraint);
+        id
     }
 
     /// Solves for as many variables as possible and substitutes their values into existing constraints.
     /// Deletes constraints that no longer contain unsolved variables.
     pub fn solve(&mut self) {
-        let n_vars = self.next_id as usize;
+        let n_vars = self.next_var as usize;
         if n_vars == 0 || self.constraints.is_empty() {
             return;
         }
@@ -112,11 +117,11 @@ impl Solver {
             n_vars,
             self.constraints
                 .iter()
-                .flat_map(|expr| expr.coeff_vec(n_vars)),
+                .flat_map(|c| c.expr.coeff_vec(n_vars)),
         );
         let b = DVector::from_iterator(
             self.constraints.len(),
-            self.constraints.iter().map(|expr| -expr.constant),
+            self.constraints.iter().map(|c| -c.expr.constant),
         );
 
         let svd = a.clone().svd(true, true);
@@ -128,7 +133,7 @@ impl Solver {
         let vt_recons = vt.rows(0, r);
         let sol = svd.solve(&b, EPSILON).unwrap();
 
-        for i in 0..self.next_id {
+        for i in 0..self.next_var {
             let recons = (vt_recons.transpose() * vt_recons.column(i as usize))[((i as usize), 0)];
             if !self.solved_vars.contains_key(&Var(i))
                 && relative_eq!(recons, 1., epsilon = EPSILON)
@@ -137,20 +142,15 @@ impl Solver {
             }
         }
         for constraint in self.constraints.iter_mut() {
-            let original = constraint.clone();
-            substitute_expr(&self.solved_vars, constraint);
-            if constraint.coeffs.is_empty()
-                && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
+            substitute_expr(&self.solved_vars, &mut constraint.expr);
+            if constraint.expr.coeffs.is_empty()
+                && approx::relative_ne!(constraint.expr.constant, 0., epsilon = EPSILON)
             {
-                for (coeff, var) in original.coeffs {
-                    if approx::relative_ne!(coeff, 0., epsilon = EPSILON) {
-                        self.overconstrained_vars.insert(var);
-                    }
-                }
+                self.inconsistent_constraints.insert(constraint.id);
             }
         }
         self.constraints
-            .retain(|constraint| !constraint.coeffs.is_empty());
+            .retain(|constraint| !constraint.expr.coeffs.is_empty());
     }
 
     pub fn value_of(&self, var: Var) -> Option<f64> {
@@ -170,6 +170,14 @@ impl Solver {
                 + expr.constant,
         )
     }
+}
+
+pub type ConstraintId = u64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
+pub struct SolverConstraint {
+    pub id: ConstraintId,
+    pub expr: LinearExpr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]

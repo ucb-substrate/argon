@@ -21,7 +21,7 @@ use crate::ast::{
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
-use crate::solver::Var;
+use crate::solver::{ConstraintId, Var};
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -1587,6 +1587,7 @@ pub struct Dimension<T> {
     pub pstop: T,
     pub nstop: T,
     pub horiz: bool,
+    pub constraint: ConstraintId,
     pub span: Option<Span>,
 }
 
@@ -1992,11 +1993,11 @@ impl<'a> ExecPass<'a> {
             state.solve_iters += 1;
             state.solver.solve();
         }
-        if !state.solver.overconstrained_vars().is_empty() {
+        for constraint in state.solver.inconsistent_constraints().clone() {
             self.errors.push(ExecError {
                 span: None,
                 cell: cell_id,
-                kind: ExecErrorKind::InconsistentConstraints,
+                kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
         self.partial_cells
@@ -2030,6 +2031,7 @@ impl<'a> ExecPass<'a> {
                     pstop: state.solver.eval_expr(&dim.pstop).unwrap(),
                     nstop: state.solver.eval_expr(&dim.nstop).unwrap(),
                     horiz: dim.horiz,
+                    constraint: dim.constraint,
                     span: dim.span.clone(),
                 }),
                 Object::Inst(inst) => SolvedValue::Instance(SolvedInstance {
@@ -2063,7 +2065,7 @@ impl<'a> ExecPass<'a> {
             root: state.root_scope,
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
-            overconstrained_vars: state.solver.overconstrained_vars().clone(),
+            inconsistent_constraints: state.solver.inconsistent_constraints().clone(),
             objects: IndexMap::new(),
         };
         for (id, scope) in state.scopes.iter() {
@@ -2692,20 +2694,23 @@ impl<'a> ExecPass<'a> {
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         let horiz = *args.pop().unwrap().as_ref().unwrap_bool();
                         let mut arg = || args.pop().unwrap().as_ref().unwrap_linear().clone();
+                        let (nstop, pstop, coord, value, n, p) =
+                            (arg(), arg(), arg(), arg(), arg(), arg());
+                        let expr = p.clone() - n.clone() - value.clone();
+                        let constraint = state.solver.constrain_eq0(expr);
                         let dim = Dimension {
                             id,
                             horiz,
-                            nstop: arg(),
-                            pstop: arg(),
-                            coord: arg(),
-                            value: arg(),
-                            n: arg(),
-                            p: arg(),
+                            nstop,
+                            pstop,
+                            coord,
+                            value,
+                            n,
+                            p,
+                            constraint,
                             span: Some(span),
                         };
                         state.objects.insert(dim.id, dim.clone().into());
-                        let expr = dim.p - dim.n - dim.value;
-                        state.solver.constrain_eq0(expr);
                         self.values.insert(vid, Defer::Ready(Value::None));
                         true
                     } else {
@@ -3387,7 +3392,7 @@ pub struct CompiledCell {
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
     pub unsolved_vars: IndexSet<Var>,
-    pub overconstrained_vars: IndexSet<Var>,
+    pub inconsistent_constraints: IndexSet<ConstraintId>,
 }
 
 impl CompiledCell {
@@ -3536,9 +3541,9 @@ pub enum ExecErrorKind {
     /// Illegal layer (not defined in layer properties).
     #[error("layer {0} is not defined in layer properties")]
     IllegalLayer(String),
-    /// Conflicting constraints.
-    #[error("inconsistent constraints")]
-    InconsistentConstraints,
+    /// Inconsistent constraint.
+    #[error("inconsistent constraint")]
+    InconsistentConstraint(ConstraintId),
     /// A cell or instance had an empty bounding box.
     #[error("empty bbox")]
     EmptyBbox,
