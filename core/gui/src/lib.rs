@@ -59,10 +59,28 @@ pub fn main() {
         // Register the `quit` function so it can be referenced by the `MenuItem::action` in the menu bar
         cx.on_action(quit);
         // Add menu items
-        cx.set_menus(vec![Menu {
-            name: "Argon".into(),
-            items: vec![MenuItem::action("Quit", Quit)],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "Argon".into(),
+                items: vec![MenuItem::action("Quit", Quit)],
+            },
+            Menu {
+                name: "Tools".into(),
+                items: vec![
+                    MenuItem::action("Rect", DrawRect),
+                    MenuItem::action("Dim", DrawDim),
+                    MenuItem::action("Edit", Edit),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Full Hierarchy", All),
+                    MenuItem::action("Box Only", Zero),
+                    MenuItem::action("Top Level Only", One),
+                ],
+            },
+        ]);
 
         cx.open_window(
             WindowOptions {
