@@ -1,7 +1,4 @@
 cell top() {
-  let met1 = rect("met1", x0=0., y0=0., x1=160., y1=100.)!;
-    let rect0 = rect("met2", x0i = -16.476905822753906, y0i = -304.8184814453125, x1i = 210.72085571289065, y1i = -206.5757293701172)!;
-    dimension(met1.y0, rect0.y1, 100., (met1.x0 + met1.x1 + rect0.x0 + rect0.x1)/4. + 182.91286, (met1.x0 + met1.x1) / 2., (rect0.x0 + rect0.x1) / 2., false);
-    dimension(met1.y0, rect0.y1, 100., (met1.x0 + met1.x1 + rect0.x0 + rect0.x1)/4. - 167.29976, (met1.x0 + met1.x1) / 2., (rect0.x0 + rect0.x1) / 2., false);
+  let met1 = rect("met1", x0=0., y0=0., x1=160., y1i=100.)!;
 }
 
