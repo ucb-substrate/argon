@@ -32,4 +32,9 @@ cell top() {
     #scope1 if 1 > 2 { } else { }
     let met3 = rect("met3", x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.)!;
     let duplicate_rect = left.bot.met3!;
+    let rect0 = rect("met1", x0i = 62.51028060913086, y0i = 163.8791046142578, x1i = 160.22259521484375, y1i = 245.85006713867188)!;
+    dimension(rect0.x1, rect0.x0, 200., rect0.y1 + 37.12903, rect0.y1, rect0.y1, true);
+    dimension(right.bot.met2.x0, rect0.x1, 50., (right.bot.met2.y0 + right.bot.met2.y1 + rect0.y0 + rect0.y1)/4. + 31.51773, (right.bot.met2.y0 + right.bot.met2.y1) / 2., (rect0.y0 + rect0.y1) / 2., true);
+    dimension(rect0.y0, left.bot.met2.y1, 600., (rect0.x0 + rect0.x1 + left.bot.met2.x0 + left.bot.met2.x1)/4. - 177.21948, (rect0.x0 + rect0.x1) / 2., (left.bot.met2.x0 + left.bot.met2.x1) / 2., false);
+    dimension(rect0.y1, rect0.y0, 200., (rect0.x0 + rect0.x1 + rect0.x0 + rect0.x1)/4. + 318.27438, (rect0.x0 + rect0.x1) / 2., (rect0.x0 + rect0.x1) / 2., false);
 }

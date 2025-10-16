@@ -209,22 +209,19 @@ impl IntoElement for CanvasElement {
 }
 
 fn get_paint_path(
-    r: &Rect,
+    rect_bounds: Bounds<Pixels>,
     bounds: Bounds<Pixels>,
-    scale: f32,
-    offset: Point<Pixels>,
     color: Rgba,
     thickness: Pixels,
 ) -> Option<PaintQuad> {
     let rect_bounds = Bounds::new(
         Point::new(
-            scale * Pixels(r.x0) - thickness / 2.,
-            scale * Pixels(-r.y1) - thickness / 2.,
-        ) + offset
-            + bounds.origin,
+            rect_bounds.origin.x - thickness / 2.,
+            rect_bounds.origin.y - thickness / 2.,
+        ),
         Size::new(
-            scale * Pixels(r.x1 - r.x0) + thickness,
-            scale * Pixels(r.y1 - r.y0) + thickness,
+            rect_bounds.size.width + thickness,
+            rect_bounds.size.height + thickness,
         ),
     );
     intersect(&rect_bounds, &bounds).map(|clipped| PaintQuad {
@@ -237,24 +234,33 @@ fn get_paint_path(
     })
 }
 
-fn get_paint_quad(
+fn get_rect_bounds(
     r: &Rect,
     bounds: Bounds<Pixels>,
     scale: f32,
     offset: Point<Pixels>,
+) -> Bounds<Pixels> {
+    Bounds::new(
+        Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1)) + offset + bounds.origin,
+        Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+    )
+}
+
+fn get_paint_quad(
+    rect_bounds: Bounds<Pixels>,
+    bounds: Bounds<Pixels>,
     fill: ShapeFill,
     color: Rgba,
     border_color: Rgba,
 ) -> Option<PaintQuad> {
     let rect_bounds = Bounds::new(
         Point::new(
-            scale * Pixels(r.x0) - Pixels(1.),
-            scale * Pixels(-r.y1) - Pixels(1.),
-        ) + offset
-            + bounds.origin,
+            rect_bounds.origin.x - Pixels(1.),
+            rect_bounds.origin.y - Pixels(1.),
+        ),
         Size::new(
-            scale * Pixels(r.x1 - r.x0) + Pixels(2.),
-            scale * Pixels(r.y1 - r.y0) + Pixels(2.),
+            rect_bounds.size.width + Pixels(2.),
+            rect_bounds.size.height + Pixels(2.),
         ),
     );
     let background = match fill {
@@ -525,10 +531,8 @@ impl Element for CanvasElement {
                 window.paint_layer(bounds, |window| {
                     for (r, l) in &rects {
                         if let Some(quad) = get_paint_quad(
-                            r,
+                            get_rect_bounds(r, bounds, scale, offset),
                             bounds,
-                            scale,
-                            offset,
                             l.fill,
                             l.color,
                             l.border_color,
@@ -538,10 +542,8 @@ impl Element for CanvasElement {
                     }
                     for r in &scope_rects {
                         if let Some(quad) = get_paint_quad(
-                            r,
+                            get_rect_bounds(r, bounds, scale, offset),
                             bounds,
-                            scale,
-                            offset,
                             ShapeFill::Solid,
                             rgba(0),
                             rgb(0xffffff),
@@ -551,10 +553,8 @@ impl Element for CanvasElement {
                     }
                     for r in &select_rects {
                         if let Some(quad) = get_paint_quad(
-                            r,
+                            get_rect_bounds(r, bounds, scale, offset),
                             bounds,
-                            scale,
-                            offset,
                             ShapeFill::Solid,
                             rgba(0),
                             rgb(0xffff00),
@@ -653,9 +653,12 @@ impl Element for CanvasElement {
                                 id: None,
                             };
                             for r in &[start_line, stop_line, dim_line] {
-                                if let Some(quad) =
-                                    get_paint_path(r, bounds, scale, offset, color, Pixels(2.))
-                                {
+                                if let Some(quad) = get_paint_path(
+                                    get_rect_bounds(r, bounds, scale, offset),
+                                    bounds,
+                                    color,
+                                    Pixels(2.),
+                                ) {
                                     window.paint_quad(quad);
                                 }
                             }
@@ -754,23 +757,228 @@ impl Element for CanvasElement {
                                 Dir::Vert => (edge.coord, edge.start, edge.coord, edge.stop),
                             };
                             if let Some(quad) = get_paint_path(
-                                &Rect {
-                                    object_path: Vec::new(),
-                                    x0,
-                                    y0,
-                                    x1,
-                                    y1,
-                                    id: None,
-                                },
+                                get_rect_bounds(
+                                    &Rect {
+                                        object_path: Vec::new(),
+                                        x0,
+                                        y0,
+                                        x1,
+                                        y1,
+                                        id: None,
+                                    },
+                                    bounds,
+                                    scale,
+                                    offset,
+                                ),
                                 bounds,
-                                scale,
-                                offset,
                                 rgb(0xffff00),
                                 Pixels(2.),
                             ) {
                                 window.paint_quad(quad);
                             }
                         }
+                    }
+                    let inner = self.inner.read(cx);
+                    // highlight hover edges
+                    // TODO: reduce repeat code from on_left_mouse_down
+                    match tool {
+                        ToolState::DrawDim(dim_tool) => {
+                            if dim_tool.edges.len() < 2 {
+                                let rects = rects
+                                    .iter()
+                                    .rev()
+                                    .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                                    .map(|(r, _)| r);
+                                let scale = inner.scale;
+                                let offset = inner.offset;
+                                let mut selected = None;
+                                for (rect, r) in rects.map(|r| {
+                                    (
+                                        r,
+                                        Bounds::new(
+                                            Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                                + offset
+                                                + inner.screen_bounds.origin,
+                                            Size::new(
+                                                scale * Pixels(r.x1 - r.x0),
+                                                scale * Pixels(r.y1 - r.y0),
+                                            ),
+                                        ),
+                                    )
+                                }) {
+                                    for (name, edge_layout, edge_px) in [
+                                        (
+                                            "y0",
+                                            Edge {
+                                                dir: Dir::Horiz,
+                                                coord: rect.y0,
+                                                start: rect.x0,
+                                                stop: rect.x1,
+                                            },
+                                            Edge {
+                                                dir: Dir::Horiz,
+                                                coord: r.bottom(),
+                                                start: r.left(),
+                                                stop: r.right(),
+                                            },
+                                        ),
+                                        (
+                                            "y1",
+                                            Edge {
+                                                dir: Dir::Horiz,
+                                                coord: rect.y1,
+                                                start: rect.x0,
+                                                stop: rect.x1,
+                                            },
+                                            Edge {
+                                                dir: Dir::Horiz,
+                                                coord: r.top(),
+                                                start: r.left(),
+                                                stop: r.right(),
+                                            },
+                                        ),
+                                        (
+                                            "x0",
+                                            Edge {
+                                                dir: Dir::Vert,
+                                                coord: rect.x0,
+                                                start: rect.y0,
+                                                stop: rect.y1,
+                                            },
+                                            Edge {
+                                                dir: Dir::Vert,
+                                                coord: r.left(),
+                                                start: r.top(),
+                                                stop: r.bottom(),
+                                            },
+                                        ),
+                                        (
+                                            "x1",
+                                            Edge {
+                                                dir: Dir::Vert,
+                                                coord: rect.x1,
+                                                start: rect.y0,
+                                                stop: rect.y1,
+                                            },
+                                            Edge {
+                                                dir: Dir::Vert,
+                                                coord: r.right(),
+                                                start: r.top(),
+                                                stop: r.bottom(),
+                                            },
+                                        ),
+                                    ] {
+                                        let bounds = edge_px.select_bounds(Pixels(4.));
+                                        if bounds.contains(&inner.mouse_position)
+                                            && rect.id.is_some()
+                                        {
+                                            selected = Some((rect, name, edge_layout));
+                                        }
+                                    }
+                                }
+                                if let Some((r, _, edge)) = selected {
+                                    let path = {
+                                        let cell = inner.state.read(cx).solved_cell.read(cx);
+                                        if let Some(cell) = cell
+                                            && let selected_scope_addr =
+                                                cell.state[&cell.selected_scope].address
+                                            && let (true, path) = find_obj_path(
+                                                &r.object_path,
+                                                cell,
+                                                selected_scope_addr,
+                                            )
+                                        {
+                                            let path = path.join(".");
+                                            Some(path)
+                                        } else {
+                                            None
+                                        }
+                                    };
+                                    if path.is_some()
+                                        && dim_tool
+                                            .edges
+                                            .first()
+                                            .map(|(_, _, edge0)| edge0.dir == edge.dir)
+                                            .unwrap_or(true)
+                                    {
+                                        let (x0, y0, x1, y1) = match edge.dir {
+                                            Dir::Horiz => {
+                                                (edge.start, edge.coord, edge.stop, edge.coord)
+                                            }
+                                            Dir::Vert => {
+                                                (edge.coord, edge.start, edge.coord, edge.stop)
+                                            }
+                                        };
+                                        if let Some(quad) = get_paint_path(
+                                            get_rect_bounds(
+                                                &Rect {
+                                                    object_path: Vec::new(),
+                                                    x0,
+                                                    y0,
+                                                    x1,
+                                                    y1,
+                                                    id: None,
+                                                },
+                                                bounds,
+                                                scale,
+                                                offset,
+                                            ),
+                                            bounds,
+                                            rgb(0xffff00),
+                                            Pixels(2.),
+                                        ) {
+                                            window.paint_quad(quad);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ToolState::Select(_) => {
+                            let rects = inner
+                                .rects
+                                .iter()
+                                .rev()
+                                .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                                .map(|(r, _)| r);
+                            let scale = inner.scale;
+                            let offset = inner.offset;
+                            for hitbox in rects
+                                .chain(scope_rects.iter())
+                                .filter_map(|r| {
+                                    r.id.as_ref().map(|_| {
+                                        Bounds::new(
+                                            Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                                + offset
+                                                + inner.screen_bounds.origin,
+                                            Size::new(
+                                                scale * Pixels(r.x1 - r.x0),
+                                                scale * Pixels(r.y1 - r.y0),
+                                            ),
+                                        )
+                                    })
+                                })
+                                .chain(
+                                    inner
+                                        .dim_hitboxes
+                                        .iter()
+                                        .flat_map(|(_, hitboxes)| hitboxes.iter().copied()),
+                                )
+                            {
+                                if hitbox.contains(&inner.mouse_position) {
+                                    if let Some(quad) = get_paint_quad(
+                                        hitbox,
+                                        bounds,
+                                        ShapeFill::Solid,
+                                        rgba(0),
+                                        rgb(0xffff00),
+                                    ) {
+                                        window.paint_quad(quad);
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 })
             });
@@ -1250,9 +1458,7 @@ impl LayoutCanvas {
                     }
                     cx.notify();
                 }
-                _ => {
-                    // TODO: implement EditDim tool
-                }
+                _ => {}
             }
         });
     }
