@@ -84,3 +84,7 @@ Sessionx.vim
 tags
 # Persistent undo
 [._]*.un~
+
+out
+node_modules
+.vscode-test

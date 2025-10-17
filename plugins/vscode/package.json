@@ -1,0 +1,65 @@
+{
+    "name": "argon-lsp",
+    "description": "Argon LSP",
+    "version": "0.0.1",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/ucb-substrate/argon"
+    },
+    "engines": {
+        "vscode": "^1.100.0"
+    },
+    "main": "./client/out/extension",
+    "contributes": {
+        "languages": [{
+            "id": "argon",
+            "aliases": ["Argon", "argon"],
+            "extensions": [".ar"],
+            "configuration": "./language-configuration.json"
+        }],
+        "grammars": [{
+            "language": "argon",
+            "scopeName": "source.argon",
+            "path": "./syntaxes/argon.tmLanguage.json"
+        }],
+        "configuration": {
+            "type": "object",
+            "title": "Argon LSP configuration",
+            "properties": {
+                "argonLsp.argonRepoPath": {
+                    "scope": "resource",
+                    "type": "string",
+                    "description": "The path of the local Argon repository (for development purposes)."
+                }
+            }
+        },
+        "commands": [
+            {
+                "command": "argonLsp.openCell",
+                "title": "Argon LSP: Open Cell"
+            },
+            {
+                "command": "argonLsp.startGui",
+                "title": "Argon LSP: Start GUI"
+            }
+        ]
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -b",
+        "watch": "tsc -b -w",
+        "lint": "eslint",
+        "postinstall": "cd client && npm install && cd ..",
+        "test": "sh ./scripts/e2e.sh"
+    },
+    "devDependencies": {
+        "@eslint/js": "^9.13.0",
+        "@stylistic/eslint-plugin": "^2.9.0",
+        "@types/mocha": "^10.0.6",
+        "@types/node": "^22",
+        "eslint": "^9.13.0",
+        "mocha": "^10.3.0",
+        "typescript": "^5.9.2",
+        "typescript-eslint": "^8.39.0"
+    }
+}
