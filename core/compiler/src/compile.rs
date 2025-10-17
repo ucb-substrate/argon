@@ -3193,7 +3193,20 @@ impl<'a> ExecPass<'a> {
                                 "y1" => Value::Linear(rect.y1.clone()),
                                 "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
                                 "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
-                                "layer" => Value::String(rect.layer.clone().unwrap()),
+                                "layer" => {
+                                    if let Some(layer) = rect.layer.clone() {
+                                        Value::String(layer)
+                                    } else {
+                                        let span =
+                                            self.span(&vref.loc, field_access_expr.expr.span);
+                                        self.errors.push(ExecError {
+                                            span: Some(span),
+                                            cell: vref.loc.cell,
+                                            kind: ExecErrorKind::InvalidRotation,
+                                        });
+                                        Value::String("".to_string())
+                                    }
+                                }
                                 f => unreachable!("invalid field `{f}`"),
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -3687,6 +3700,9 @@ pub enum ExecErrorKind {
     /// A cell or instance had an empty bounding box.
     #[error("empty bbox")]
     EmptyBbox,
+    /// Field is empty (analogous to None).
+    #[error("empty field (field was not assigned a value)")]
+    EmptyField,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
