@@ -1601,7 +1601,7 @@ pub type EnumId = u64;
 pub struct SeqNum(u64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
-pub struct ObjectId(#[doc(hidden)] pub(crate) u64);
+pub struct ObjectId(u64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ScopeId(u64);
