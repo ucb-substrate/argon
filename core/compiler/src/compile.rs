@@ -1601,7 +1601,7 @@ pub type EnumId = u64;
 pub struct SeqNum(u64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
-pub struct ObjectId(u64);
+pub struct ObjectId(#[doc(hidden)] pub(crate) u64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ScopeId(u64);
@@ -1737,7 +1737,7 @@ impl<'a> ExecPass<'a> {
                 (3, DeferValue::Ready(Value::Bool(false))),
             ]),
             frames: IndexMap::from_iter([(
-                0,
+                5,
                 Frame {
                     bindings: Default::default(),
                     parent: None,
@@ -1746,8 +1746,8 @@ impl<'a> ExecPass<'a> {
             nil_value: 1,
             true_value: 2,
             false_value: 3,
-            global_frame: 0,
-            next_id: 4,
+            global_frame: 5,
+            next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
             errors: Vec::new(),
@@ -3421,6 +3421,38 @@ pub fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f
         }),
         (Some(r), None) | (None, Some(r)) => Some(r),
         (None, None) => None,
+    }
+}
+
+pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<Rect<f64>> {
+    let perp_max = dim.coord.max(dim.pstop).max(dim.nstop);
+    let perp_min = dim.coord.min(dim.pstop).min(dim.nstop);
+    let par_max = dim.n.max(dim.p);
+    let par_min = dim.n.min(dim.p);
+    let (xmin, xmax, ymin, ymax) = if dim.horiz {
+        (par_min, par_max, perp_min, perp_max)
+    } else {
+        (perp_min, perp_max, par_min, par_max)
+    };
+    match bbox {
+        Some(r) => Some(Rect {
+            layer: None,
+            x0: r.x0.min(xmin),
+            y0: r.y0.min(ymin),
+            x1: r.x1.max(xmax),
+            y1: r.y1.max(ymax),
+            id: r.id,
+            span: None,
+        }),
+        None => Some(Rect {
+            layer: None,
+            x0: xmin,
+            y0: ymin,
+            x1: xmax,
+            y1: ymax,
+            id: ObjectId(0), // FIXME: should not need to allocate an object ID
+            span: None,
+        }),
     }
 }
 

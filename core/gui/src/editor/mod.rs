@@ -6,7 +6,7 @@ use std::{
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
-    bbox_union, ifmatvec,
+    bbox_dim_union, bbox_union, ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -168,7 +168,9 @@ impl EditorState {
                             }),
                     );
                 }
-                _ => (),
+                SolvedValue::Dimension(dim) => {
+                    bbox = bbox_dim_union(bbox, dim);
+                }
             }
         }
 
