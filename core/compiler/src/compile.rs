@@ -1628,6 +1628,13 @@ struct Emit {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectEmit {
+    object: ObjectId,
+    scope: ScopeId,
+    span: Span,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExecScope {
     parent: Option<ScopeId>,
     static_parent: Option<(ScopeId, SeqNum)>,
@@ -1667,6 +1674,7 @@ struct CellState {
     solver: Solver,
     fields: IndexMap<String, ValueId>,
     emit: Vec<Emit>,
+    object_emit: Vec<ObjectEmit>,
     objects: IndexMap<ObjectId, Object>,
     deferred: IndexSet<ValueId>,
     root_scope: ScopeId,
@@ -1889,6 +1897,7 @@ impl<'a> ExecPass<'a> {
                         solver: Solver::new(),
                         fields: Default::default(),
                         emit: Vec::new(),
+                        object_emit: Vec::new(),
                         deferred: Default::default(),
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
@@ -2080,6 +2089,15 @@ impl<'a> ExecPass<'a> {
             let obj_id = emit_value(emit.value).unwrap();
             ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
                 obj_id,
+                CompiledEmit {
+                    span: emit.span.clone(),
+                },
+            ));
+        }
+
+        for emit in state.object_emit.iter() {
+            ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
+                emit.object,
                 CompiledEmit {
                     span: emit.span.clone(),
                 },
@@ -2519,7 +2537,7 @@ impl<'a> ExecPass<'a> {
                     if let Some(layer) = layer {
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let state = self.cell_state_mut(vref.loc.cell);
                         let rect = Rect {
                             id,
                             layer,
@@ -2527,11 +2545,16 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var().into(),
                             x1: state.solver.new_var().into(),
                             y1: state.solver.new_var().into(),
-                            span: Some(span),
+                            span: Some(span.clone()),
                         };
+                        state.objects.insert(rect.id, rect.clone().into());
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
                         self.values
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
-                        state.objects.insert(rect.id, rect.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
                             let priority = match kwarg.name.name.as_str() {
@@ -2708,8 +2731,13 @@ impl<'a> ExecPass<'a> {
                             n,
                             p,
                             constraint,
-                            span: Some(span),
+                            span: Some(span.clone()),
                         };
+                        state.object_emit.push(ObjectEmit {
+                            scope: vref.loc.scope,
+                            object: dim.id,
+                            span,
+                        });
                         state.objects.insert(dim.id, dim.clone().into());
                         self.values.insert(vid, Defer::Ready(Value::None));
                         true
@@ -2786,8 +2814,13 @@ impl<'a> ExecPass<'a> {
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
-                            span,
+                            span: span.clone(),
                         };
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
                         state.objects.insert(inst.id, inst.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
