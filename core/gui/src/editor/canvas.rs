@@ -1212,6 +1212,7 @@ impl LayoutCanvas {
         } else {
             self.offset = Point::new(Pixels(0.), self.screen_bounds.size.height);
         }
+        cx.notify();
     }
 
     pub(crate) fn on_left_mouse_down(
