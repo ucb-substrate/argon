@@ -1,6 +1,6 @@
 use std::{
     fmt::Display,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr},
 };
 
 use async_compat::CompatExt;
@@ -14,7 +14,6 @@ use futures::{
 };
 use gpui::AsyncApp;
 use lsp_server::rpc::{DimensionParams, GuiToLspClient, LspToGui};
-use portpicker::pick_unused_port;
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},
@@ -46,22 +45,21 @@ impl SyncGuiToLspClient {
     }
 
     pub fn register_server(&self, editor: Editor) {
-        let port = loop {
-            if let Some(port) = pick_unused_port() {
-                break port;
-            }
-        };
-        let server_addr = (IpAddr::V4(Ipv4Addr::LOCALHOST), port).into();
         let background_executor = self.app.background_executor().clone();
         let (tx, mut rx) = mpsc::channel(1);
+        let mut listener = self.app.background_executor().block(
+            async {
+                tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        );
+        let server_addr = listener.local_addr();
         self.app
             .background_executor()
             .spawn(
                 async move {
-                    let mut listener =
-                        tarpc::serde_transport::tcp::listen(&server_addr, Json::default)
-                            .await
-                            .unwrap();
                     listener.config_mut().max_frame_length(usize::MAX);
                     listener
                         // Ignore accept errors.
