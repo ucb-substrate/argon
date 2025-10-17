@@ -253,6 +253,16 @@
 		"comments": {
 			"patterns": [
 				{
+					"comment": "scope annotations",
+					"name": "comment.scope.rust",
+					"match": "(#)[A-Za-z0-9_]*",
+					"captures": {
+						"1": {
+							"name": "punctuation.definition.annotation.rust"
+						}
+					}
+				},
+				{
 					"comment": "documentation comments",
 					"name": "comment.line.documentation.rust",
 					"match": "(///).*$",
