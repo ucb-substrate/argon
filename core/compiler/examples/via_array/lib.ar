@@ -1,6 +1,6 @@
 cell vias() {
-    let met2 = rect("met2")!;
-    let met1 = rect("met1")!;
+    let met2 = rect("met2");
+    let met1 = rect("met1");
 
     // Create via.
     let via = rect("via1");

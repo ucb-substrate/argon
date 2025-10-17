@@ -10,7 +10,7 @@ fn rect(x0, y0, w, h) {
   Rect { x0, y0, w, h }
 }
 
-Rect(x0=0, y0=0, w=(int)(x/y.x), h=100)!
+Rect(x0=0, y0=0, w=(int)(x/y.x), h=100)
 let w
 eq(w, r.w)
 

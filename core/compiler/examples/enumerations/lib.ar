@@ -7,9 +7,9 @@ cell top() {
   let variant = MyEnum::Variant2;
   let x0 = float();
   if variant == MyEnum::Variant1 {
-    rect("met1", x0=x0, y0=0., x1=200., y1=100.)!;
+    rect("met1", x0=x0, y0=0., x1=200., y1=100.);
   } else {
-    rect("met2", x0=x0, y0=0., x1=300., y1=400.)!;
+    rect("met2", x0=x0, y0=0., x1=300., y1=400.);
   };
   let x0_value = match variant {
     MyEnum::Variant1 => 50.,

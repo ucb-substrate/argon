@@ -6,5 +6,5 @@ cell scopes() {
     let tmp = z + x0;
     tmp
   };
-  rect("met1", x0=x0, y0=y0, w=z, h=w)!;
+  rect("met1", x0=x0, y0=y0, w=z, h=w);
 }
