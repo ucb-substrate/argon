@@ -65,6 +65,8 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/enumerations/lib.ar");
     const ARGON_BBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bbox/lib.ar");
     const ARGON_ROUNDING: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/rounding/lib.ar");
+    const ARGON_FLIPPED_RECT: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/flipped_rect/lib.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
@@ -511,6 +513,30 @@ mod tests {
         assert!(matches!(
             cells.errors.first().unwrap().kind,
             ExecErrorKind::InconsistentConstraint(_)
+        ));
+    }
+
+    #[test]
+    fn argon_flipped_rect() {
+        let ast = parse_workspace_with_std(ARGON_FLIPPED_RECT).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_exec_errors();
+        assert_eq!(cells.errors.len(), 2);
+        assert!(matches!(
+            cells.errors[0].kind,
+            ExecErrorKind::FlippedRect(_)
+        ));
+        assert!(matches!(
+            cells.errors[1].kind,
+            ExecErrorKind::FlippedRect(_)
         ));
     }
 }

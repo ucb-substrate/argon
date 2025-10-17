@@ -2034,18 +2034,38 @@ impl<'a> ExecPass<'a> {
 
     fn emit(&mut self, cell: CellId) -> CompiledCell {
         let state = self.cell_states.get(&cell).expect("cell not found");
-        let emit_obj = |obj: &Object| -> SolvedValue {
+        let mut emit_obj = |obj: &Object| -> SolvedValue {
             match obj {
-                Object::Rect(rect) => SolvedValue::Rect(Rect {
-                    id: rect.id,
-                    layer: rect.layer.clone(),
-                    x0: (state.solver.eval_expr(&rect.x0).unwrap(), rect.x0.clone()),
-                    y0: (state.solver.eval_expr(&rect.y0).unwrap(), rect.y0.clone()),
-                    x1: (state.solver.eval_expr(&rect.x1).unwrap(), rect.x1.clone()),
-                    y1: (state.solver.eval_expr(&rect.y1).unwrap(), rect.y1.clone()),
-                    construction: rect.construction,
-                    span: rect.span.clone(),
-                }),
+                Object::Rect(rect) => {
+                    let x0 = state.solver.eval_expr(&rect.x0).unwrap();
+                    let y0 = state.solver.eval_expr(&rect.y0).unwrap();
+                    let x1 = state.solver.eval_expr(&rect.x1).unwrap();
+                    let y1 = state.solver.eval_expr(&rect.y1).unwrap();
+                    if x0 > x1 {
+                        self.errors.push(ExecError {
+                            span: rect.span.clone(),
+                            cell,
+                            kind: ExecErrorKind::FlippedRect("x0 > x1".to_string()),
+                        });
+                    }
+                    if y0 > y1 {
+                        self.errors.push(ExecError {
+                            span: rect.span.clone(),
+                            cell,
+                            kind: ExecErrorKind::FlippedRect("y0 > y1".to_string()),
+                        });
+                    }
+                    SolvedValue::Rect(Rect {
+                        id: rect.id,
+                        layer: rect.layer.clone(),
+                        x0: (x0, rect.x0.clone()),
+                        y0: (y0, rect.y0.clone()),
+                        x1: (x1, rect.x1.clone()),
+                        y1: (y1, rect.y1.clone()),
+                        construction: rect.construction,
+                        span: rect.span.clone(),
+                    })
+                }
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
                     p: state.solver.eval_expr(&dim.p).unwrap(),
@@ -3703,6 +3723,9 @@ pub enum ExecErrorKind {
     /// Field is empty (analogous to None).
     #[error("empty field (field was not assigned a value)")]
     EmptyField,
+    /// Edges of a rect are in the wrong order (e.g. x0 > x1 or y0 > y1).
+    #[error("rect edges are in the wrong order: {0}")]
+    FlippedRect(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
