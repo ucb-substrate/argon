@@ -32,13 +32,13 @@ fn union(rect1: Rect, rect2: Rect) -> Rect {
 
 fn array(r: Rect, n: Int, xpitch: Float, ypitch: Float) -> Rect {
     #scope0 if n == 1 {
-        let first_rect = rect(r.layer)!;
+        let first_rect = rect(r.layer);
         eq(first_rect.w, r.w);
         eq(first_rect.h, r.h);
         first_rect
     } else {
         let subarray = #scope2 array(r, n - 1, xpitch, ypitch);
-        let first_rect = rect(r.layer)!;
+        let first_rect = rect(r.layer);
         eq(first_rect.w, r.w);
         eq(first_rect.h, r.h);
         eq(first_rect.x0 + xpitch, subarray.x0);

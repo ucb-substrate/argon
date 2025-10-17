@@ -10,7 +10,10 @@ mod tests {
 
     use std::{io::BufReader, path::PathBuf};
 
-    use crate::{compile::ExecErrorKind, parse::parse_workspace_with_std};
+    use crate::{
+        compile::{ExecErrorKind, SolvedValueRef},
+        parse::parse_workspace_with_std,
+    };
     use approx::assert_relative_eq;
     use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
     use indexmap::IndexMap;
@@ -154,6 +157,20 @@ mod tests {
             },
         );
         println!("{cell:?}");
+        let cell = cell.unwrap_valid();
+        let cell = &cell.cells[&cell.top];
+        let n_rects = cell
+            .objects
+            .iter()
+            .filter(|(_, o)| {
+                if let SolvedValueRef::Rect(r) = o.as_ref() {
+                    !r.construction
+                } else {
+                    false
+                }
+            })
+            .count();
+        assert_eq!(n_rects, 27);
     }
 
     #[test]

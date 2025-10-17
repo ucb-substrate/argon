@@ -1308,13 +1308,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
-                    if name == "crect" {
+                    let kwarg_defs = if name == "crect" {
                         self.typecheck_posargs(input.span, &args.posargs, &[]);
-                    } else {
-                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
-                    }
-                    self.typecheck_kwargs(
-                        &args.kwargs,
                         IndexMap::from_iter([
                             ("x0", Ty::Float),
                             ("x1", Ty::Float),
@@ -1326,8 +1321,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             ("y1i", Ty::Float),
                             ("w", Ty::Float),
                             ("h", Ty::Float),
-                        ]),
-                    );
+                            ("layer", Ty::String),
+                        ])
+                    } else {
+                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
+                        IndexMap::from_iter([
+                            ("x0", Ty::Float),
+                            ("x1", Ty::Float),
+                            ("y0", Ty::Float),
+                            ("y1", Ty::Float),
+                            ("x0i", Ty::Float),
+                            ("x1i", Ty::Float),
+                            ("y0i", Ty::Float),
+                            ("y1i", Ty::Float),
+                            ("w", Ty::Float),
+                            ("h", Ty::Float),
+                        ])
+                    };
+                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Rect)
                 }
                 "bbox" => {
@@ -1380,6 +1391,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             ("y", Ty::Float),
                             ("xi", Ty::Float),
                             ("yi", Ty::Float),
+                            ("construction", Ty::Bool),
                         ]),
                     );
                     if let Some(ty) = args.posargs.first() {
@@ -1564,6 +1576,7 @@ pub struct BasicRect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+    pub construction: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1574,6 +1587,7 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+    pub construction: bool,
     pub span: Option<Span>,
 }
 
@@ -2029,6 +2043,7 @@ impl<'a> ExecPass<'a> {
                     y0: (state.solver.eval_expr(&rect.y0).unwrap(), rect.y0.clone()),
                     x1: (state.solver.eval_expr(&rect.x1).unwrap(), rect.x1.clone()),
                     y1: (state.solver.eval_expr(&rect.y1).unwrap(), rect.y1.clone()),
+                    construction: rect.construction,
                     span: rect.span.clone(),
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
@@ -2048,7 +2063,8 @@ impl<'a> ExecPass<'a> {
                     x: state.solver.eval_expr(&inst.x).unwrap(),
                     y: state.solver.eval_expr(&inst.y).unwrap(),
                     angle: inst.angle,
-                    reflect: false,
+                    reflect: inst.reflect,
+                    construction: inst.construction,
                     cell: *self.values[&inst.cell]
                         .as_ref()
                         .unwrap_ready()
@@ -2522,13 +2538,28 @@ impl<'a> ExecPass<'a> {
         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
-                "crect" | "rect" => {
-                    let layer = c.state.posargs.first().map(|vid| {
-                        self.values[vid]
-                            .as_ref()
-                            .get_ready()
-                            .map(|layer| layer.as_ref().unwrap_string().clone())
-                    });
+                f @ "crect" | f @ "rect" => {
+                    let layer = if f == "crect" {
+                        c.expr
+                            .args
+                            .kwargs
+                            .iter()
+                            .zip(c.state.kwargs.iter())
+                            .find(|(k, _)| k.name.name == "layer")
+                            .map(|(_, vid)| {
+                                self.values[vid]
+                                    .as_ref()
+                                    .get_ready()
+                                    .map(|layer| layer.as_ref().unwrap_string().clone())
+                            })
+                    } else {
+                        c.state.posargs.first().map(|vid| {
+                            self.values[vid]
+                                .as_ref()
+                                .get_ready()
+                                .map(|layer| layer.as_ref().unwrap_string().clone())
+                        })
+                    };
                     let layer = match layer {
                         None => Some(None),
                         Some(None) => None,
@@ -2545,6 +2576,7 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var().into(),
                             x1: state.solver.new_var().into(),
                             y1: state.solver.new_var().into(),
+                            construction: f == "crect",
                             span: Some(span.clone()),
                         };
                         state.objects.insert(rect.id, rect.clone().into());
@@ -2595,6 +2627,9 @@ impl<'a> ExecPass<'a> {
                                         )),
                                     );
                                     1
+                                }
+                                "layer" => {
+                                    continue;
                                 }
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
@@ -2648,9 +2683,15 @@ impl<'a> ExecPass<'a> {
                                     y0: r.y0.into(),
                                     x1: r.x1.into(),
                                     y1: r.y1.into(),
-                                    span: Some(span),
+                                    construction: true,
+                                    span: Some(span.clone()),
                                 };
                                 state.objects.insert(orect.id, orect.clone().into());
+                                state.emit.push(Emit {
+                                    scope: vref.loc.scope,
+                                    value: vid,
+                                    span,
+                                });
                                 self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
                                 true
                             } else {
@@ -2669,6 +2710,7 @@ impl<'a> ExecPass<'a> {
                                     y0: 0.0.into(),
                                     x1: 0.0.into(),
                                     y1: 0.0.into(),
+                                    construction: true,
                                     span: Some(span),
                                 };
                                 state.objects.insert(orect.id, orect.clone().into());
@@ -2803,7 +2845,32 @@ impl<'a> ExecPass<'a> {
                         Some(None) => None,
                         Some(Some(l)) => Some(Some(l)),
                     };
-                    if let (Some(refl), Some(angle)) = (refl, angle) {
+                    let construction = c
+                        .expr
+                        .args
+                        .kwargs
+                        .iter()
+                        .zip(c.state.kwargs.iter())
+                        .find_map(|(kwarg, vid)| {
+                            if kwarg.name.name == "construction" {
+                                Some(
+                                    self.values[vid]
+                                        .as_ref()
+                                        .get_ready()
+                                        .map(|v| *v.as_ref().unwrap_bool()),
+                                )
+                            } else {
+                                None
+                            }
+                        });
+                    let construction = match construction {
+                        None => Some(None),
+                        Some(None) => None,
+                        Some(Some(v)) => Some(Some(v)),
+                    };
+                    if let (Some(refl), Some(angle), Some(construction)) =
+                        (refl, angle, construction)
+                    {
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
@@ -2814,6 +2881,7 @@ impl<'a> ExecPass<'a> {
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
+                            construction: construction.unwrap_or_default(),
                             span: span.clone(),
                         };
                         state.emit.push(Emit {
@@ -3155,6 +3223,7 @@ impl<'a> ExecPass<'a> {
                                                     y0: LinearExpr::add(rect.y0, inst.y.clone()),
                                                     x1: LinearExpr::add(rect.x1, inst.x.clone()),
                                                     y1: LinearExpr::add(rect.y1, inst.y.clone()),
+                                                    construction: rect.construction,
                                                     span: rect.span.clone(),
                                                 };
                                                 let state = self.cell_state_mut(vref.loc.cell);
@@ -3184,6 +3253,7 @@ impl<'a> ExecPass<'a> {
                                                     y: LinearExpr::add(inst.y.clone(), cy),
                                                     angle,
                                                     reflect,
+                                                    construction: cinst.construction,
                                                     span: cinst.span.clone(),
                                                 };
                                                 state
@@ -3354,6 +3424,7 @@ pub struct Instance {
     pub cell: ValueId,
     pub reflect: bool,
     pub angle: Rotation,
+    pub construction: bool,
     pub span: Span,
 }
 
@@ -3364,6 +3435,7 @@ pub struct SolvedInstance {
     pub y: f64,
     pub angle: Rotation,
     pub reflect: bool,
+    pub construction: bool,
     pub cell: CellId,
     pub span: Span,
     /// The value ID of the cell being instantiated.
@@ -3450,6 +3522,7 @@ pub fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f
             x1: r1.x1.max(r2.x1),
             y1: r1.y1.max(r2.y1),
             id: r1.id,
+            construction: true,
             span: None,
         }),
         (Some(r), None) | (None, Some(r)) => Some(r),
@@ -3475,6 +3548,7 @@ pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<R
             x1: r.x1.max(xmax),
             y1: r.y1.max(ymax),
             id: r.id,
+            construction: true,
             span: None,
         }),
         None => Some(Rect {
@@ -3484,6 +3558,7 @@ pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<R
             x1: xmax,
             y1: ymax,
             id: ObjectId(0), // FIXME: should not need to allocate an object ID
+            construction: true,
             span: None,
         }),
     }
@@ -3793,6 +3868,7 @@ impl<T> Rect<(f64, T)> {
             y0: self.y0.0,
             x1: self.x1.0,
             y1: self.y1.0,
+            construction: self.construction,
             span: self.span.clone(),
         }
     }
@@ -3810,6 +3886,7 @@ impl Rect<f64> {
             y0: p0p.1.min(p1p.1),
             x1: p0p.0.max(p1p.0),
             y1: p0p.1.max(p1p.1),
+            construction: self.construction,
             span: None,
         }
     }
