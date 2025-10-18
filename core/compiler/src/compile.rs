@@ -1849,19 +1849,6 @@ impl<'a> ExecPass<'a> {
             .as_ref()
             .unwrap_cell_fn()
             .clone();
-        assert_eq!(args.len(), cell_decl.args.len());
-        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
-            let vid = self.value_id();
-            let val = match val {
-                CellArg::Int(i) => Value::Int(i),
-                CellArg::Float(f) => Value::Linear(LinearExpr::from(f)),
-            };
-            self.values.insert(vid, DeferValue::Ready(val));
-            frame.bindings.insert(decl.metadata.0, vid);
-        }
-        let fid = self.frame_id();
-        self.frames.insert(fid, frame);
-
         let root_scope_id = self.scope_id();
         let root_scope = ExecScope {
             parent: None,
@@ -1900,6 +1887,25 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
+        if args.len() != cell_decl.args.len() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidCell,
+            });
+            return cell_id;
+        }
+        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
+            let vid = self.value_id();
+            let val = match val {
+                CellArg::Int(i) => Value::Int(i),
+                CellArg::Float(f) => Value::Linear(LinearExpr::from(f)),
+            };
+            self.values.insert(vid, DeferValue::Ready(val));
+            frame.bindings.insert(decl.metadata.0, vid);
+        }
+        let fid = self.frame_id();
+        self.frames.insert(fid, frame);
 
         let mut seq_num = SeqNum::new();
         for stmt in cell_decl.scope.stmts.iter() {
@@ -3567,6 +3573,9 @@ pub enum ExecErrorKind {
     /// A non-Manhattan rotation.
     #[error("non-Manhattan rotation")]
     InvalidRotation,
+    /// An invalid cell was specified for execution.
+    #[error("invalid cell")]
+    InvalidCell,
     /// A cell is underconstrained.
     #[error("cell is underconstrained")]
     Underconstrained,

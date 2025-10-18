@@ -5,14 +5,15 @@ use std::{
 
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
-    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
-    bbox_dim_union, bbox_union, ifmatvec,
+    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, ExecErrorKind, Rect, ScopeId,
+    SolvedValue, bbox_dim_union, bbox_union, ifmatvec,
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::IndexMap;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
+use tower_lsp::lsp_types::MessageType;
 
 use crate::{editor::input::TextInput, rpc::SyncGuiToLspClient, theme::THEME};
 
@@ -207,8 +208,19 @@ impl EditorState {
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                output: Some(d), ..
-            }) => d,
+                output: Some(d),
+                errors,
+            }) => {
+                if errors
+                    .iter()
+                    .any(|e| matches!(e.kind, ExecErrorKind::InvalidCell))
+                {
+                    self.lsp_client
+                        .show_message(MessageType::ERROR, "Open cell is invalid");
+                    return;
+                }
+                d
+            }
             _ => {
                 return;
             }
@@ -387,7 +399,7 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child(div().flex_1().child(self.canvas.clone()))
+                    .child(div().flex_1().overflow_hidden().child(self.canvas.clone()))
                     .child(self.layer_sidebar.clone()),
             )
             .child(self.text_input.clone())

@@ -102,128 +102,131 @@ impl StateMut {
 
     async fn compile(&mut self, client: &Client, update: bool) {
         // TODO: un-hardcode this.
-        let root_dir = self.root_dir.as_ref().unwrap();
-        self.config = parse_config(root_dir.join("Argon.toml")).ok();
-        let lyp = self
-            .config
-            .as_ref()
-            .and_then(|config| {
-                let lyp = config.lyp.as_ref()?;
-                Some(if lyp.is_relative() {
-                    root_dir.join(lyp)
-                } else {
-                    lyp.clone()
+        if let Some(root_dir) = &self.root_dir {
+            self.config = parse_config(root_dir.join("Argon.toml")).ok();
+            let lyp = self
+                .config
+                .as_ref()
+                .and_then(|config| {
+                    let lyp = config.lyp.as_ref()?;
+                    Some(if lyp.is_relative() {
+                        root_dir.join(lyp)
+                    } else {
+                        lyp.clone()
+                    })
                 })
-            })
-            .unwrap_or_else(|| {
-                PathBuf::from(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/../../core/compiler/examples/lyp/basic.lyp"
-                ))
-            });
-        let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
-        let parse_errs = parse_output.static_errors();
-        let ast = parse_output.best_effort_ast();
-        self.ast = ast;
-        let static_output = compile::static_compile(&self.ast);
-        // If GUI is connected, must annotate scopes.
-        if self.gui_client.is_some() {
-            for (_, ast) in &self.ast {
-                let scope_annotation = ScopeAnnotationPass::new(ast);
-                let mut text_edits = scope_annotation.execute();
-                text_edits.sort_by_key(|edit| Reverse(edit.range.start));
-                if !text_edits.is_empty() {
-                    client
-                        .apply_edit(WorkspaceEdit {
-                            changes: Some(HashMap::from_iter([(
-                                Url::from_file_path(&ast.path).unwrap(),
-                                text_edits,
-                            )])),
-                            document_changes: None,
-                            change_annotations: None,
-                        })
-                        .await
-                        .unwrap();
-
-                    client
-                        .send_request::<ForceSave>(ast.path.clone())
-                        .await
-                        .unwrap();
-
-                    // `compile` will be reinvoked upon save.
-                    return;
-                }
-            }
-        }
-
-        let mut o = if let Some((ast, static_output)) = static_output {
-            if !static_output.errors.is_empty() {
-                Some(CompileOutput::StaticErrors(static_output))
-            } else if let Some(cell) = &self.cell
-                && let Ok(cell_ast) = parse::parse_cell(cell)
-            {
-                Some(compile::dynamic_compile(
-                    &ast,
-                    CompileInput {
-                        cell: &cell_ast
-                            .func
-                            .path
-                            .iter()
-                            .map(|ident| ident.name)
-                            .collect_vec(),
-                        args: cell_ast
-                            .args
-                            .posargs
-                            .iter()
-                            .map(|arg| match arg {
-                                Expr::FloatLiteral(float_literal) => {
-                                    CellArg::Float(float_literal.value)
-                                }
-                                Expr::IntLiteral(int_literal) => CellArg::Int(int_literal.value),
-                                _ => panic!("must be int or float literal for now"),
+                .unwrap_or_else(|| {
+                    PathBuf::from(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../core/compiler/examples/lyp/basic.lyp"
+                    ))
+                });
+            let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
+            let parse_errs = parse_output.static_errors();
+            let ast = parse_output.best_effort_ast();
+            self.ast = ast;
+            let static_output = compile::static_compile(&self.ast);
+            // If GUI is connected, must annotate scopes.
+            if self.gui_client.is_some() {
+                for (_, ast) in &self.ast {
+                    let scope_annotation = ScopeAnnotationPass::new(ast);
+                    let mut text_edits = scope_annotation.execute();
+                    text_edits.sort_by_key(|edit| Reverse(edit.range.start));
+                    if !text_edits.is_empty() {
+                        client
+                            .apply_edit(WorkspaceEdit {
+                                changes: Some(HashMap::from_iter([(
+                                    Url::from_file_path(&ast.path).unwrap(),
+                                    text_edits,
+                                )])),
+                                document_changes: None,
+                                change_annotations: None,
                             })
-                            .collect(),
-                        lyp_file: &lyp,
-                    },
-                ))
-            } else {
-                None
-            }
-        } else {
-            Some(CompileOutput::FatalParseErrors)
-        };
-        match &mut o {
-            Some(CompileOutput::StaticErrors(e)) => e.errors.extend(parse_errs),
-            o => {
-                if !parse_errs.is_empty() {
-                    *o = Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                        errors: parse_errs,
-                    }));
+                            .await
+                            .unwrap();
+
+                        client
+                            .send_request::<ForceSave>(ast.path.clone())
+                            .await
+                            .unwrap();
+
+                        // `compile` will be reinvoked upon save.
+                        return;
+                    }
                 }
             }
-        }
-        self.compile_output = o;
-        let mut tmp = self.diagnostics();
-        let mut diagnostics = tmp.clone();
-        std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
-        for (path, _) in tmp {
-            diagnostics.entry(path).or_default();
-        }
-        for (uri, diags) in diagnostics {
-            // TODO: potentially add version number
-            client.publish_diagnostics(uri, diags, None).await;
-        }
-        if let Some(o) = &self.compile_output
-            && let Some(client) = self.gui_client.as_mut()
-        {
-            client
-                .open_cell(context::current(), o.clone(), update)
-                .await
-                .unwrap();
-        } else {
-            client
-                .show_message(MessageType::WARNING, "No GUI connected")
-                .await;
+
+            let mut o = if let Some((ast, static_output)) = static_output {
+                if !static_output.errors.is_empty() {
+                    Some(CompileOutput::StaticErrors(static_output))
+                } else if let Some(cell) = &self.cell
+                    && let Ok(cell_ast) = parse::parse_cell(cell)
+                {
+                    Some(compile::dynamic_compile(
+                        &ast,
+                        CompileInput {
+                            cell: &cell_ast
+                                .func
+                                .path
+                                .iter()
+                                .map(|ident| ident.name)
+                                .collect_vec(),
+                            args: cell_ast
+                                .args
+                                .posargs
+                                .iter()
+                                .map(|arg| match arg {
+                                    Expr::FloatLiteral(float_literal) => {
+                                        CellArg::Float(float_literal.value)
+                                    }
+                                    Expr::IntLiteral(int_literal) => {
+                                        CellArg::Int(int_literal.value)
+                                    }
+                                    _ => panic!("must be int or float literal for now"),
+                                })
+                                .collect(),
+                            lyp_file: &lyp,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                Some(CompileOutput::FatalParseErrors)
+            };
+            match &mut o {
+                Some(CompileOutput::StaticErrors(e)) => e.errors.extend(parse_errs),
+                o => {
+                    if !parse_errs.is_empty() {
+                        *o = Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                            errors: parse_errs,
+                        }));
+                    }
+                }
+            }
+            self.compile_output = o;
+            let mut tmp = self.diagnostics();
+            let mut diagnostics = tmp.clone();
+            std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
+            for (path, _) in tmp {
+                diagnostics.entry(path).or_default();
+            }
+            for (uri, diags) in diagnostics {
+                // TODO: potentially add version number
+                client.publish_diagnostics(uri, diags, None).await;
+            }
+            if let Some(o) = &self.compile_output
+                && let Some(client) = self.gui_client.as_mut()
+            {
+                client
+                    .open_cell(context::current(), o.clone(), update)
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .show_message(MessageType::WARNING, "No GUI connected")
+                    .await;
+            }
         }
     }
 }
