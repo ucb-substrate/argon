@@ -31,7 +31,18 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
+pub const BUILTINS: [&str; 10] = [
+    "cons",
+    "head",
+    "tail",
+    "crect",
+    "rect",
+    "float",
+    "eq",
+    "dimension",
+    "inst",
+    "bbox",
+];
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
@@ -473,6 +484,7 @@ pub enum Ty {
     /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
     Enum(EnumTy),
     CellFn(Box<CellFnTy>),
+    Seq(Box<Ty>),
 }
 
 impl Ty {
@@ -827,6 +839,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::Nil(_) => Ty::Nil,
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -1341,6 +1354,65 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Rect)
                 }
+                "cons" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
+                    if args.posargs.len() == 2 {
+                        let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
+                        let tailty = args.posargs[1].ty();
+                        if !(tailty == Ty::Nil || tailty == seqty) {
+                            self.errors.push(StaticError {
+                                span: self.span(args.posargs[1].span()),
+                                kind: StaticErrorKind::IncorrectTy {
+                                    found: tailty,
+                                    expected: seqty.clone(),
+                                },
+                            });
+                        }
+                        (None, seqty)
+                    } else {
+                        (None, Ty::Nil)
+                    }
+                }
+                "head" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    if args.posargs.len() == 1 {
+                        let argty = args.posargs[0].ty();
+                        if let Ty::Seq(i) = argty {
+                            (None, *i)
+                        } else {
+                            self.errors.push(StaticError {
+                                span: self.span(input.span),
+                                kind: StaticErrorKind::IncorrectTyCategory {
+                                    found: argty,
+                                    expected: "Seq".to_string(),
+                                },
+                            });
+                            (None, Ty::Nil)
+                        }
+                    } else {
+                        (None, Ty::Nil)
+                    }
+                }
+                "tail" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    if args.posargs.len() == 1 {
+                        let argty = args.posargs[0].ty();
+                        if let Ty::Seq(_) = argty {
+                            (None, argty)
+                        } else {
+                            self.errors.push(StaticError {
+                                span: self.span(input.span),
+                                kind: StaticErrorKind::IncorrectTyCategory {
+                                    found: argty,
+                                    expected: "Seq".to_string(),
+                                },
+                            });
+                            (None, Ty::Nil)
+                        }
+                    } else {
+                        (None, Ty::Nil)
+                    }
+                }
                 "bbox" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
                     let argty = args.posargs[0].ty();
@@ -1754,7 +1826,7 @@ impl<'a> ExecPass<'a> {
             ast,
             cell_states: IndexMap::new(),
             values: IndexMap::from_iter([
-                (1, DeferValue::Ready(Value::None)),
+                (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
             ]),
@@ -2341,6 +2413,9 @@ impl<'a> ExecPass<'a> {
 
     fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<Substr, VarIdTyMetadata>) -> ValueId {
         let partial_eval_state = match expr {
+            Expr::Nil(_) => {
+                return self.nil_value;
+            }
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
                 self.values
@@ -2759,7 +2834,55 @@ impl<'a> ExecPass<'a> {
                         let expr = vl.as_ref().unwrap_linear().clone()
                             - vr.as_ref().unwrap_linear().clone();
                         state.solver.constrain_eq0(expr);
-                        self.values.insert(vid, Defer::Ready(Value::None));
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "cons" => {
+                    if let (Defer::Ready(head), Defer::Ready(tail)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let val = match tail {
+                            Value::Nil => {
+                                vec![head.clone()]
+                            }
+                            Value::Seq(s) => {
+                                let mut s = s.clone();
+                                s.insert(0, head.clone());
+                                s
+                            }
+                            _ => unreachable!(),
+                        };
+                        self.values.insert(vid, Defer::Ready(Value::Seq(val)));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "head" => {
+                    if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
+                        let val = match head {
+                            Value::Nil => Value::Nil,
+                            Value::Seq(s) => s.first().cloned().unwrap_or(Value::Nil),
+                            _ => unreachable!(),
+                        };
+                        self.values.insert(vid, Defer::Ready(val));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "tail" => {
+                    if let Defer::Ready(lst) = &self.values[&c.state.posargs[0]] {
+                        let val = match lst {
+                            Value::Nil => Value::Nil,
+                            Value::Seq(s) => Value::Seq(s[1..].to_vec()),
+                            _ => unreachable!(),
+                        };
+                        self.values.insert(vid, Defer::Ready(val));
                         true
                     } else {
                         false
@@ -2801,7 +2924,7 @@ impl<'a> ExecPass<'a> {
                             span,
                         });
                         state.objects.insert(dim.id, dim.clone().into());
-                        self.values.insert(vid, Defer::Ready(Value::None));
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
                         false
@@ -3332,7 +3455,7 @@ impl<'a> ExecPass<'a> {
                     } else {
                         state.solver.constrain_eq0(expr);
                     }
-                    self.values.insert(vid, DeferValue::Ready(Value::None));
+                    self.values.insert(vid, DeferValue::Ready(Value::Nil));
                     true
                 } else {
                     false
@@ -3436,7 +3559,8 @@ pub enum Value {
     ///
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
-    None,
+    Seq(Vec<Value>),
+    Nil,
 }
 
 impl Value {

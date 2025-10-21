@@ -67,6 +67,7 @@ mod tests {
     const ARGON_ROUNDING: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/flipped_rect/lib.ar");
+    const ARGON_SEQ_BASIC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_basic/lib.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
@@ -538,5 +539,28 @@ mod tests {
             cells.errors[1].kind,
             ExecErrorKind::FlippedRect(_)
         ));
+    }
+
+    #[test]
+    fn argon_seq_basic() {
+        let ast = parse_workspace_with_std(ARGON_SEQ_BASIC).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 200., epsilon = EPSILON);
     }
 }

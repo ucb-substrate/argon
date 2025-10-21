@@ -42,6 +42,12 @@ IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
   }
   ;
 
+NilLiteral -> Result<NilLiteral, ()>
+  : 'NIL' {
+  let v = $1.map_err(|_| ())?;
+  Ok(NilLiteral { span: v.span(), }) }
+  ;
+
 FloatLiteral -> Result<FloatLiteral, ()>
   : 'FLOATLIT' {
   let v = $1.map_err(|_| ())?;
@@ -342,6 +348,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   | StringLiteral { Ok(Expr::StringLiteral($1?)) }
   | BoolLiteral { Ok(Expr::BoolLiteral($1?)) }
+  | NilLiteral { Ok(Expr::Nil($1?)) }
   | SubFactor 'AS' Ident { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
   ;
 

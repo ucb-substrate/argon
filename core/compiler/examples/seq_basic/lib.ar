@@ -1,0 +1,6 @@
+cell top() {
+    let r = rect("met1", x0=0., y0=0., x1=400.)!;
+    let lst = cons(500., cons(300., cons(800., cons(200., cons(1400., nil)))));
+    let v = head(tail(tail(tail(lst))));
+    eq(r.y1, v);
+}
