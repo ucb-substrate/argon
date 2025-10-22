@@ -122,20 +122,20 @@ cell inset_rect() {
 ```
 
 Start the GUI and run `:openCell inset_rect()`. Click on the `met2` layer from the layer sidebar on the right to select it.
-Hit `R` to use the Rect tool and click on two points on the screen to draw your first rectangle.
+Hit `r` to use the Rect tool and click on two points on the screen to draw your first rectangle.
 You should see a rectangle appear in the GUI and code editor.
 
-Select the `met1` layer and draw another rectangle that surrounds the first.
+Select the `met1` layer and draw another rectangle that surrounds the first. You can use the `ESC` key to exit the Rect tool.
 
 Let us now dimension the rectangles such that the `met2`
 rectangle is inset by `50.` relative to the `met1` rectangle.
-Hit `D` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
+Hit `d` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
 of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
 
 Double check that there are no errors in your code editor, or the GUI will not be able to
 display the updated cell. If you make a mistake, 
-you can undo and redo changes from the GUI using `u` and `Ctrl + R`,
+you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
 respectively, or manually modify the code in the text editor if needed.
 
 Repeat for the other 3 sides of the rectangle.
@@ -155,7 +155,7 @@ and `h`. To resolve this, go back to the GUI and run `:openCell inset_rect(200.,
 You can now dimension the width of the `met1` rectangle by selecting the top edge then 
 clicking above the rectangle to place the dimension label.
 Enter the dimension as `w`. Dimension the right edge to `h`. You
-can use the `F` keybind to fit the layout to your screen.
+can use the `f` keybind to fit the layout to your screen.
 
 You may notice that none of the rectangles have a solid boundary, indicating that they are not fully constrained. In order to
 constrain the edges to absolute coordinates, you can dimension the left and bottom edges of the `met1` rectangle relative to the origin.
