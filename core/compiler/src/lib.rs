@@ -563,7 +563,9 @@ mod tests {
 
     #[test]
     fn argon_flipped_rect() {
-        let ast = parse_workspace_with_std(ARGON_FLIPPED_RECT).unwrap_asts();
+        let o = parse_workspace_with_std(ARGON_FLIPPED_RECT);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
         let cells = compile(
             &ast,
             CompileInput {
@@ -587,7 +589,9 @@ mod tests {
 
     #[test]
     fn argon_seq_basic() {
-        let ast = parse_workspace_with_std(ARGON_SEQ_BASIC).unwrap_asts();
+        let o = parse_workspace_with_std(ARGON_SEQ_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
         let cells = compile(
             &ast,
             CompileInput {
