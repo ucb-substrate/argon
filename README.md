@@ -3,7 +3,31 @@
 [![ci](https://github.com/ucb-substrate/argon/actions/workflows/ci.yml/badge.svg)](https://github.com/ucb-substrate/argon/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
-21st century design automation tools.
+Argon is a programming language for writing constraint-based integrated circuit layout generators.
+Argon's primary feature is bidirectional editing between a code editor (Neovim or VS Code) and a custom GUI.
+Simpler geometric constraints can be entered visually in the GUI, while more complex logic can be
+implemented in code.
+
+Argon's syntax and type system is inspired by Rust. Unlike Rust, Argon is not intended to be fully featured 
+general-purpose programming language. The main goal of Argon is to allow interoperability with the GUI,
+enable the creation of most practical parametric cells, and allow for performance optimizations such
+as caching and incremental compilation.
+
+Currently, Argon supports the following features:
+- Drawing rectangles and dimension constraints in GUI
+- Live reload of GUI upon changes in code editor
+- Parametric cells
+- Hierarchy
+- General linear constraint solving (slow)
+- Basic diagnostic reporting in the code editor
+- Basic detection of under/overconstrained systems
+
+Future versions of Argon will hopefully support:
+- Detection/reporting of under/overconstrained geometry and conflicting constraints
+- Faster linear constraint solving (not necessarily supporting general constraints) 
+- Additional editing capabilities in GUI (e.g. instantiating cells)
+- Incremental compilation/caching
+- Integration with Rust
 
 ## Installation
 
