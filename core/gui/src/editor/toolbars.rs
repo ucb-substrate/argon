@@ -1,11 +1,11 @@
 use compiler::compile::SolvedValue;
 use gpui::prelude::*;
 use gpui::*;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     editor::{
-        CompileOutputState, Layers, ScopeAddress,
+        CompileOutputState, Layers, ScopeAddress, ScopePath,
         canvas::{LayoutCanvas, ToolState},
         input::TextInput,
     },
@@ -110,7 +110,7 @@ impl Render for LayerSideBar {
                         div()
                             .flex_1()
                             .id(SharedString::from("all_visible_layers"))
-                            .child("All Visible")
+                            .child("Show All")
                             .on_click({
                                 let layers = self.layers.clone();
                                 move |_event, _window, cx| {
@@ -127,7 +127,7 @@ impl Render for LayerSideBar {
                         div()
                             .flex_1()
                             .id(SharedString::from("none_visible_layers"))
-                            .child("None Visible")
+                            .child("Hide All")
                             .on_click({
                                 let layers = self.layers.clone();
                                 move |_event, _window, cx| {
@@ -242,6 +242,7 @@ pub struct HierarchySideBar {
     solved_cell: Entity<Option<CompileOutputState>>,
     tool: Entity<ToolState>,
     name_filter: Entity<TextInput>,
+    pub expanded_scopes: IndexSet<ScopePath>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
@@ -260,6 +261,7 @@ impl HierarchySideBar {
             solved_cell,
             tool,
             name_filter,
+            expanded_scopes: IndexSet::new(),
             subscriptions,
         }
     }
@@ -278,6 +280,8 @@ impl HierarchySideBar {
         let tool_clone = self.tool.clone();
         let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
         let scope_path = solved_cell.scope_paths[&scope].clone();
+        let self_entity = cx.entity();
+        let expanded = self.expanded_scopes.contains(&scope_path);
         if scope_state
             .name
             .contains(self.name_filter.read(cx).content.as_ref())
@@ -295,12 +299,28 @@ impl HierarchySideBar {
                     )
                     .child(
                         div()
+                            .child(if expanded { "[-]" } else { "[+]" })
+                            .id(SharedString::from(format!("scope_collapse_{scope:?}",)))
+                            .on_click({
+                                let scope_path = scope_path.clone();
+                                move |_event, _window, cx| {
+                                    self_entity.update(cx, |sidebar, cx| {
+                                        if !sidebar.expanded_scopes.insert(scope_path.clone()) {
+                                            sidebar.expanded_scopes.swap_remove(&scope_path);
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
                             .id(SharedString::from(format!("scope_select_{scope:?}")))
                             .flex_1()
                             .overflow_hidden()
                             .child(format!(
                                 "{}{}{}",
-                                std::iter::repeat_n("  ", depth).collect::<String>(),
+                                std::iter::repeat_n(" ", depth).collect::<String>(),
                                 &scope_state.name,
                                 if count > 1 {
                                     format!(" ({count})")
@@ -326,7 +346,7 @@ impl HierarchySideBar {
                     )
                     .child(
                         div()
-                            .child(if scope_state.visible { "--V" } else { "NV" })
+                            .child(if scope_state.visible { "[-V]" } else { "[NV]" })
                             .id(SharedString::from(format!("scope_control_{scope:?}",)))
                             .on_click({
                                 let scope_path = scope_path.clone();
@@ -352,29 +372,31 @@ impl HierarchySideBar {
             }
         }
 
-        for (cell, count) in cells {
-            let scope = solved_cell.output.cells[&cell].root;
-            self.render_scopes_helper(
-                cx,
-                solved_cell,
-                scopes,
-                ScopeAddress { scope, cell },
-                count,
-                depth + 1,
-            );
-        }
-        for child_scope in scope_info.children.clone() {
-            self.render_scopes_helper(
-                cx,
-                solved_cell,
-                scopes,
-                ScopeAddress {
-                    scope: child_scope,
-                    cell: scope.cell,
-                },
-                1,
-                depth + 1,
-            );
+        if expanded {
+            for (cell, count) in cells {
+                let scope = solved_cell.output.cells[&cell].root;
+                self.render_scopes_helper(
+                    cx,
+                    solved_cell,
+                    scopes,
+                    ScopeAddress { scope, cell },
+                    count,
+                    depth + 1,
+                );
+            }
+            for child_scope in scope_info.children.clone() {
+                self.render_scopes_helper(
+                    cx,
+                    solved_cell,
+                    scopes,
+                    ScopeAddress {
+                        scope: child_scope,
+                        cell: scope.cell,
+                    },
+                    1,
+                    depth + 1,
+                );
+            }
         }
     }
 
@@ -429,7 +451,7 @@ impl Render for HierarchySideBar {
                         div()
                             .flex_1()
                             .id(SharedString::from("all_visible_hierarchy"))
-                            .child("All Visible")
+                            .child("Show All")
                             .on_click({
                                 let solved_cell = self.solved_cell.clone();
                                 move |_event, _window, cx| {
@@ -448,7 +470,7 @@ impl Render for HierarchySideBar {
                         div()
                             .flex_1()
                             .id(SharedString::from("none_visible_hierarchy"))
-                            .child("None Visible")
+                            .child("Hide All")
                             .on_click({
                                 let solved_cell = self.solved_cell.clone();
                                 move |_event, _window, cx| {
@@ -460,6 +482,49 @@ impl Render for HierarchySideBar {
                                         }
                                         cx.notify();
                                     })
+                                }
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .text_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(SharedString::from("all_collapse_hierarchy"))
+                            .child("Collapse All")
+                            .on_click({
+                                let self_entity = cx.entity();
+                                move |_event, _window, cx| {
+                                    self_entity.update(cx, |sidebar, cx| {
+                                        sidebar.expanded_scopes.clear();
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .id(SharedString::from("none_collapse_hierarchy"))
+                            .child("Expand All")
+                            .on_click({
+                                let self_entity = cx.entity();
+                                let solved_cell = self.solved_cell.clone();
+                                move |_event, _window, cx| {
+                                    let mut scope_paths = IndexSet::new();
+                                    if let Some(cell) = solved_cell.read(cx) {
+                                        for path in cell.state.keys() {
+                                            scope_paths.insert(path.clone());
+                                        }
+                                    }
+                                    self_entity.update(cx, |sidebar, cx| {
+                                        sidebar.expanded_scopes = scope_paths;
+                                        cx.notify();
+                                    });
                                 }
                             }),
                     ),

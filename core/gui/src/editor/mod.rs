@@ -10,7 +10,7 @@ use compiler::compile::{
 };
 use geometry::transform::TransformationMatrix;
 use gpui::*;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use lsp_server::rpc::GuiToLspAction;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
@@ -354,10 +354,33 @@ impl Editor {
                 cx.notify();
             })
             .unwrap();
-        if !update {
+        if update {
+            let state = self.state.clone();
+            self.hierarchy_sidebar
+                .update(cx, move |sidebar, cx| {
+                    let scope_paths: IndexSet<_> = state
+                        .read(cx)
+                        .solved_cell
+                        .read(cx)
+                        .as_ref()
+                        .map(|cell| cell.state.keys().collect())
+                        .unwrap_or_default();
+                    sidebar
+                        .expanded_scopes
+                        .retain(|path| scope_paths.contains(&path));
+                    cx.notify();
+                })
+                .unwrap();
+        } else {
             self.canvas
                 .update(cx, |canvas, cx| {
                     canvas.fit_to_screen(cx);
+                    cx.notify();
+                })
+                .unwrap();
+            self.hierarchy_sidebar
+                .update(cx, |sidebar, cx| {
+                    sidebar.expanded_scopes.clear();
                     cx.notify();
                 })
                 .unwrap();
@@ -397,7 +420,7 @@ impl Render for Editor {
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
-            .font_family("Zed Plex Sans")
+            .font_family("Zed Plex Mono")
             .size_full()
             .flex()
             .flex_col()

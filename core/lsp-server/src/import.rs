@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use arcstr::Substr;
 use compiler::{
     ast::{
@@ -10,6 +8,7 @@ use compiler::{
     compile::BUILTINS,
     parse::ParseMetadata,
 };
+use indexmap::IndexSet;
 use tower_lsp::lsp_types::{Range, TextEdit};
 
 use crate::document::Document;
@@ -17,7 +16,7 @@ use crate::document::Document;
 pub(crate) struct ScopeAnnotationPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
     content: Document,
-    assigned_names: Vec<HashSet<String>>,
+    assigned_names: Vec<IndexSet<String>>,
     to_add: Vec<Vec<Range>>,
     edits: Vec<TextEdit>,
 }

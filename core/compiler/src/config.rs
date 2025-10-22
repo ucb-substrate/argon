@@ -1,8 +1,6 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -11,7 +9,7 @@ pub struct Config {
     pub lyp: Option<PathBuf>,
     /// Additional modules to add to the current crate.
     #[serde(default)]
-    pub mods: HashMap<String, PathBuf>,
+    pub mods: IndexMap<String, PathBuf>,
 }
 
 pub fn parse_config(manifest_path: impl AsRef<Path>) -> anyhow::Result<Config> {
