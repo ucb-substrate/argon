@@ -13,7 +13,7 @@ use futures::{
     prelude::*,
 };
 use gpui::AsyncApp;
-use lsp_server::rpc::{DimensionParams, GuiToLspClient, LspToGui};
+use lsp_server::rpc::{DimensionParams, GuiToLspAction, GuiToLspClient, LspToGui};
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},
@@ -195,6 +195,19 @@ impl SyncGuiToLspClient {
             async move {
                 client_clone
                     .show_message(context::current(), typ, format!("{}", message))
+                    .await
+                    .unwrap()
+            }
+            .compat(),
+        );
+    }
+
+    pub fn dispatch_action(&self, action: GuiToLspAction) {
+        let client_clone = self.client.clone();
+        self.app.background_executor().block(
+            async move {
+                client_clone
+                    .dispatch_action(context::current(), action)
                     .await
                     .unwrap()
             }

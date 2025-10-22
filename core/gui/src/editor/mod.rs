@@ -11,11 +11,17 @@ use compiler::compile::{
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::IndexMap;
+use lsp_server::rpc::GuiToLspAction;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp::lsp_types::MessageType;
 
-use crate::{editor::input::TextInput, rpc::SyncGuiToLspClient, theme::THEME};
+use crate::{
+    actions::{Redo, Undo},
+    editor::input::TextInput,
+    rpc::SyncGuiToLspClient,
+    theme::THEME,
+};
 
 pub mod canvas;
 pub mod input;
@@ -278,7 +284,7 @@ impl EditorState {
                 selected_scope: old_cell
                     .as_ref()
                     .and_then(|cell| {
-                        cell.state
+                        state
                             .contains_key(&cell.selected_scope)
                             .then(|| cell.selected_scope.clone())
                     })
@@ -323,11 +329,10 @@ impl Editor {
                 text_input_focus_handle.clone(),
             )
         });
-        let text_input = cx.new(|cx| {
-            TextInput::new_command_prompt(cx, window, text_input_focus_handle, &state, &canvas)
-        });
-        let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, window, &state, &canvas));
-        let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, window, &state, &canvas));
+        let text_input = cx
+            .new(|cx| TextInput::new_command_prompt(cx, text_input_focus_handle, &state, &canvas));
+        let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
+        let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state, &canvas));
 
         let editor = Self {
             state,
@@ -357,9 +362,7 @@ impl Editor {
                 .unwrap();
         }
     }
-}
 
-impl Editor {
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -370,6 +373,20 @@ impl Editor {
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
         cx.notify();
     }
+
+    fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state
+            .read(cx)
+            .lsp_client
+            .dispatch_action(GuiToLspAction::Undo);
+    }
+
+    fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state
+            .read(cx)
+            .lsp_client
+            .dispatch_action(GuiToLspAction::Redo);
+    }
 }
 
 impl Render for Editor {
@@ -377,6 +394,8 @@ impl Render for Editor {
         div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
+            .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_redo))
             .font_family("Zed Plex Sans")
             .size_full()
             .flex()

@@ -4,7 +4,8 @@
  * ------------------------------------------------------------------------------------------ */
 
 import * as path from "path";
-import { commands, window, workspace, ExtensionContext, Uri } from "vscode";
+import * as fs from 'fs';
+import { commands, window, workspace, WorkspaceFolder, ExtensionContext, Uri } from "vscode";
 
 import {
 	LanguageClient,
@@ -14,6 +15,26 @@ import {
 } from "vscode-languageclient/node";
 
 let client: LanguageClient;
+
+/**
+ * Find the first enclosing folder (upwards) that contains `lib.ar`.
+ */
+function findWorkspaceRoot(startPath: string): string | undefined {
+  let dir = path.dirname(startPath);
+
+  while (true) {
+    const candidate = path.join(dir, 'lib.ar');
+    if (fs.existsSync(candidate)) {
+      return dir;
+    }
+
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+
+  return undefined;
+}
 
 export function activate(context: ExtensionContext) {
 	// The server is implemented in node
@@ -30,10 +51,25 @@ export function activate(context: ExtensionContext) {
 		}
 	};
 
+	const activeEditor = window.activeTextEditor;
+	if (!activeEditor) return;
+
+	const filePath = activeEditor.document.uri.fsPath;
+	let workspaceRoot = findWorkspaceRoot(filePath);
+
+	if (!workspaceRoot) {
+		window.showWarningMessage('No lib.ar found in parent folders.');
+		workspaceRoot = path.dirname(filePath);
+	}
 	// Options to control the language client
 	const clientOptions: LanguageClientOptions = {
 		// Register the server for Argon documents
 		documentSelector: [{ scheme: 'file', language: 'argon' }],
+		workspaceFolder: {
+			uri: Uri.file(workspaceRoot),
+			name: path.basename(workspaceRoot),
+			index: 0,
+		},
 	};
 
 	// Create the language client and start the client.
@@ -72,6 +108,30 @@ export function activate(context: ExtensionContext) {
 
 		// Save the document
 		const saved = await doc.save();
+	});
+
+	client.onRequest("custom/undo", async () => {
+		const activeEditor = window.activeTextEditor;
+		if (!activeEditor) return;
+
+		let doc = activeEditor.document;
+		if (doc) {
+			await window.showTextDocument(doc, { preview: false });
+			await commands.executeCommand('undo');
+			await doc.save();
+		}
+	});
+
+	client.onRequest("custom/redo", async () => {
+		const activeEditor = window.activeTextEditor;
+		if (!activeEditor) return;
+
+		let doc = activeEditor.document;
+		if (doc) {
+			await window.showTextDocument(doc, { preview: false });
+			await commands.executeCommand('redo');
+			await doc.save();
+		}
 	});
 
 	// Start the client. This will also launch the server

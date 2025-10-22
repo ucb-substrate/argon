@@ -30,7 +30,11 @@ use tarpc::{
     server::{Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
-use tokio::{process::Command, sync::Mutex};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::Mutex,
+};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{request::Request, *};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
@@ -123,7 +127,7 @@ impl StateMut {
                 });
             let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
             let parse_errs = parse_output.static_errors();
-            let ast = parse_output.best_effort_ast();
+            let ast = parse_output.ast();
             self.ast = ast;
             let static_output = compile::static_compile(&self.ast);
             // If GUI is connected, must annotate scopes.
@@ -159,35 +163,40 @@ impl StateMut {
             let mut o = if let Some((ast, static_output)) = static_output {
                 if !static_output.errors.is_empty() {
                     Some(CompileOutput::StaticErrors(static_output))
-                } else if let Some(cell) = &self.cell
-                    && let Ok(cell_ast) = parse::parse_cell(cell)
-                {
-                    Some(compile::dynamic_compile(
-                        &ast,
-                        CompileInput {
-                            cell: &cell_ast
-                                .func
-                                .path
-                                .iter()
-                                .map(|ident| ident.name)
-                                .collect_vec(),
-                            args: cell_ast
-                                .args
-                                .posargs
-                                .iter()
-                                .map(|arg| match arg {
-                                    Expr::FloatLiteral(float_literal) => {
-                                        CellArg::Float(float_literal.value)
-                                    }
-                                    Expr::IntLiteral(int_literal) => {
-                                        CellArg::Int(int_literal.value)
-                                    }
-                                    _ => panic!("must be int or float literal for now"),
-                                })
-                                .collect(),
-                            lyp_file: &lyp,
-                        },
-                    ))
+                } else if let Some(cell) = &self.cell {
+                    if let Ok(cell_ast) = parse::parse_cell(cell) {
+                        Some(compile::dynamic_compile(
+                            &ast,
+                            CompileInput {
+                                cell: &cell_ast
+                                    .func
+                                    .path
+                                    .iter()
+                                    .map(|ident| ident.name)
+                                    .collect_vec(),
+                                args: cell_ast
+                                    .args
+                                    .posargs
+                                    .iter()
+                                    .map(|arg| match arg {
+                                        Expr::FloatLiteral(float_literal) => {
+                                            CellArg::Float(float_literal.value)
+                                        }
+                                        Expr::IntLiteral(int_literal) => {
+                                            CellArg::Int(int_literal.value)
+                                        }
+                                        _ => panic!("must be int or float literal for now"),
+                                    })
+                                    .collect(),
+                                lyp_file: &lyp,
+                            },
+                        ))
+                    } else {
+                        client
+                            .show_message(MessageType::ERROR, "Open cell is invalid")
+                            .await;
+                        None
+                    }
                 } else {
                     None
                 }
@@ -216,15 +225,13 @@ impl StateMut {
                 client.publish_diagnostics(uri, diags, None).await;
             }
             if let Some(o) = &self.compile_output
-                && let Some(client) = self.gui_client.as_mut()
-            {
-                client
+                && let Some(gui_client) = self.gui_client.as_mut()
+                && let Err(e) = gui_client
                     .open_cell(context::current(), o.clone(), update)
                     .await
-                    .unwrap();
-            } else {
+            {
                 client
-                    .show_message(MessageType::WARNING, "No GUI connected")
+                    .show_message(MessageType::ERROR, format!("{e}"))
                     .await;
             }
         }
@@ -251,6 +258,26 @@ impl State {
 #[derive(Debug, Clone)]
 struct Backend {
     state: State,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Undo;
+
+impl Request for Undo {
+    type Params = ();
+    type Result = ();
+
+    const METHOD: &'static str = "custom/undo";
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Redo;
+
+impl Request for Redo {
+    type Params = ();
+    type Result = ();
+
+    const METHOD: &'static str = "custom/redo";
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -350,22 +377,45 @@ impl Backend {
             .editor_client
             .show_message(MessageType::INFO, "Starting the GUI...")
             .await;
-        let server_addr = self.state.server_addr;
+        let state = self.state.clone();
 
         tokio::spawn(async move {
-            Command::new(concat!(
+            match Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../target/debug/gui"
             ))
-            .arg(format!("{server_addr}"))
+            .arg(format!("{}", state.server_addr))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
-            .unwrap()
-            .wait()
-            .await
-            .unwrap();
+            {
+                Ok(child) => {
+                    if let Some(stdout) = child.stdout {
+                        let editor_client = state.editor_client.clone();
+                        tokio::spawn(async move {
+                            let reader = BufReader::new(stdout);
+                            let mut lines = reader.lines();
+
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                editor_client.log_message(MessageType::INFO, line).await;
+                            }
+                        });
+                    }
+                    if let Some(stderr) = child.stderr {
+                        let editor_client = state.editor_client.clone();
+                        tokio::spawn(async move {
+                            let reader = BufReader::new(stderr);
+                            let mut lines = reader.lines();
+
+                            while let Ok(Some(line)) = lines.next_line().await {
+                                editor_client.log_message(MessageType::ERROR, line).await;
+                            }
+                        });
+                    }
+                }
+                Err(_) => todo!(),
+            }
         });
 
         Ok(())
@@ -403,8 +453,13 @@ impl Backend {
         let (k, v) = params.kv.split_once(" ").unwrap();
         let (k, v) = (k.to_string(), v.to_string());
         tokio::spawn(async move {
-            if let Some(client) = state.state_mut.lock().await.gui_client.as_mut() {
-                client.set(context::current(), k, v).await.unwrap();
+            if let Some(client) = state.state_mut.lock().await.gui_client.as_mut()
+                && let Err(e) = client.set(context::current(), k, v).await
+            {
+                state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("{e}"))
+                    .await;
             }
         });
         Ok(())
@@ -417,7 +472,6 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 
 pub async fn main() {
     // Start server for communication with GUI.
-    let port = 12345; // for debugging
     let mut listener = if let Ok(listener) =
         tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12345), Json::default).await
     {
@@ -471,7 +525,7 @@ pub async fn main() {
         .editor_client
         .show_message(
             MessageType::INFO,
-            format!("Server listening on port {port}"),
+            format!("Server listening on port {}", server_addr.port()),
         )
         .await;
 

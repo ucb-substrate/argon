@@ -1796,39 +1796,45 @@ impl<'a> ExecPass<'a> {
                 .map(|ident| ident.to_string())
                 .collect_vec(),
         };
-        let (_, vid) = self.ast[&path]
-            .ast
-            .decls
-            .iter()
-            .find_map(|d| match d {
-                Decl::Cell(
-                    v @ CellDecl {
-                        name: Ident { name, .. },
-                        ..
-                    },
-                ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
-                _ => None,
-            })
-            .expect("cell not found");
-        let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
-        let layers =
-            klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
-                .unwrap()
-                .into();
-        if self.errors.is_empty() {
-            CompileOutput::Valid(CompiledData {
-                cells: self.compiled_cells,
-                top: cell_id,
-                layers,
-            })
-        } else {
-            CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                errors: self.errors,
-                output: Some(CompiledData {
+        if let Some((_, vid)) = self.ast[&path].ast.decls.iter().find_map(|d| match d {
+            Decl::Cell(
+                v @ CellDecl {
+                    name: Ident { name, .. },
+                    ..
+                },
+            ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
+            _ => None,
+        }) {
+            let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
+            let layers = klayout_lyp::from_reader(BufReader::new(
+                std::fs::File::open(input.lyp_file).unwrap(),
+            ))
+            .unwrap()
+            .into();
+            if self.errors.is_empty() {
+                CompileOutput::Valid(CompiledData {
                     cells: self.compiled_cells,
                     top: cell_id,
                     layers,
-                }),
+                })
+            } else {
+                CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                    errors: self.errors,
+                    output: Some(CompiledData {
+                        cells: self.compiled_cells,
+                        top: cell_id,
+                        layers,
+                    }),
+                })
+            }
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: vec![ExecError {
+                    span: None,
+                    cell: 0, // TODO: don't use dummy cell ID
+                    kind: ExecErrorKind::InvalidCell,
+                }],
+                output: None,
             })
         }
     }

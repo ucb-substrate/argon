@@ -12,7 +12,7 @@ use tower_lsp::lsp_types::{
     Url, WorkspaceEdit,
 };
 
-use crate::{ForceSave, State, document::Document};
+use crate::{ForceSave, Redo, State, Undo, document::Document};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DimensionParams {
@@ -25,6 +25,12 @@ pub struct DimensionParams {
     pub horiz: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GuiToLspAction {
+    Undo,
+    Redo,
+}
+
 #[tarpc::service]
 pub trait GuiToLsp {
     async fn register(addr: SocketAddr);
@@ -35,6 +41,7 @@ pub trait GuiToLsp {
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
+    async fn dispatch_action(action: GuiToLspAction);
 }
 
 #[tarpc::service]
@@ -520,5 +527,24 @@ impl GuiToLsp for LspServer {
 
     async fn show_message(self, _: tarpc::context::Context, typ: MessageType, message: String) {
         self.state.editor_client.show_message(typ, message).await;
+    }
+
+    async fn dispatch_action(self, _: tarpc::context::Context, action: GuiToLspAction) {
+        match action {
+            GuiToLspAction::Undo => {
+                self.state
+                    .editor_client
+                    .send_request::<Undo>(())
+                    .await
+                    .unwrap();
+            }
+            GuiToLspAction::Redo => {
+                self.state
+                    .editor_client
+                    .send_request::<Redo>(())
+                    .await
+                    .unwrap();
+            }
+        }
     }
 }

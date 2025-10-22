@@ -4,8 +4,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, Subscription, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill,
-    hsla, point, prelude::*, px, relative, rgb, rgba, size, white,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill, hsla, point,
+    prelude::*, px, relative, rgb, rgba, size, white,
 };
 use unicode_segmentation::*;
 
@@ -32,22 +32,15 @@ pub(crate) struct TextInput {
     pub(crate) cancel_handler: fn(&mut TextInput, &Cancel, &mut Window, &mut Context<TextInput>),
     pub(crate) tool: Entity<ToolState>,
     pub(crate) state: Entity<EditorState>,
-    #[allow(dead_code)]
-    subscriptions: Vec<Subscription>,
 }
 
 impl TextInput {
     pub(crate) fn new_command_prompt(
         cx: &mut Context<Self>,
-        window: &mut Window,
         focus_handle: FocusHandle,
         state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
-        let subscriptions = vec![cx.on_focus(&focus_handle, window, |input, _window, _cx| {
-            input.selected_range = 0..input.content.len();
-        })];
-        let canvas = canvas.read(cx);
         TextInput {
             focus_handle,
             canvas_focus_handle: canvas.focus_handle(cx),
@@ -59,23 +52,18 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            tool: canvas.tool.clone(),
+            tool: canvas.read(cx).tool.clone(),
             state: state.clone(),
-            subscriptions,
             enter_handler: Self::command_prompt_enter,
             cancel_handler: Self::command_prompt_cancel,
         }
     }
     pub(crate) fn new_filter(
         cx: &mut Context<Self>,
-        window: &mut Window,
         focus_handle: FocusHandle,
         state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
-        let subscriptions = vec![cx.on_focus(&focus_handle, window, |input, _window, _cx| {
-            input.selected_range = 0..input.content.len();
-        })];
         let canvas = canvas.read(cx);
         TextInput {
             focus_handle,
@@ -90,7 +78,6 @@ impl TextInput {
             is_selecting: false,
             tool: canvas.tool.clone(),
             state: state.clone(),
-            subscriptions,
             enter_handler: Self::filter_enter,
             cancel_handler: Self::filter_cancel,
         }
@@ -265,7 +252,7 @@ impl TextInput {
 
     fn command_prompt_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.tool.update(cx, |tool, cx| {
-            if let ToolState::EditDim(EditDimToolState { dim, dim_mode }) = tool
+            if let ToolState::EditDim(EditDimToolState { dim, dim_mode, .. }) = tool
                 && self
                     .state
                     .read(cx)
@@ -281,7 +268,7 @@ impl TextInput {
                 true
             } else {
                 if let Some((command, rest)) = self.content.split_once(" ")
-                    && command == "openCell"
+                    && command.trim_start_matches(":") == "openCell"
                 {
                     self.state.read(cx).lsp_client.open_cell(rest.to_string());
                     return true;
@@ -670,6 +657,15 @@ impl Render for TextInput {
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
+            .on_action(cx.listener(move |input, _: &EditDim, _window, cx| {
+                println!("test");
+                if let ToolState::EditDim(EditDimToolState { original_value, .. }) =
+                    input.tool.read(cx)
+                {
+                    input.content = original_value.clone();
+                    input.selected_range = 0..input.content.len();
+                }
+            }))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))

@@ -74,7 +74,18 @@ From within the GUI, type `:openCell test()` to open the `test` cell. You should
 
 ## Parametric Cell Tutorial
 
-Start a new project by creating a folder with a `lib.ar` file in it.
+Create a new Argon workspace with the following command:
+
+```bash
+mkdir tutorial && touch tutorial/lib.ar
+```
+
+Before opening your text editor, your directory should look something like this to allow your editor to find your Argon project:
+
+```
+tutorial
+└── lib.ar
+```
 
 Inside `lib.ar`, define a new cell:
 
@@ -83,18 +94,22 @@ cell inset_rect() {
 }
 ```
 
-Start the GUI and run `:openCell inset_rect()`. Click on the `met1` layer from the layer sidebar on the right to select it.
+Start the GUI and run `:openCell inset_rect()`. Click on the `met2` layer from the layer sidebar on the right to select it.
 Hit `R` to use the Rect tool and click on two points on the screen to draw your first rectangle.
 You should see a rectangle appear in the GUI and code.
-Select the `met2` layer and draw another rectangle that surrounds the first.
+Select the `met1` layer and draw another rectangle that surrounds the first.
 
-Let us now dimension the rectangles such that the `met1`
-rectangle is inset by `5.` relative to the `met2` rectangle.
+Let us now dimension the rectangles such that the `met2`
+rectangle is inset by `50.` relative to the `met1` rectangle.
 Hit `D` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
 of the dimension.
-Repeat for the other 3 sides of the rectangle. Double check that there are no errors in your code editor, or the GUI will not be able to
-display the cell.
+Repeat for the other 3 sides of the rectangle.
+
+Double check that there are no errors in your code editor, or the GUI will not be able to
+display the updated cell. If you make a mistake, 
+you can undo and redo changes from the GUI using `u` and `Ctrl + R`,
+respectively, or manually modify the code in the text editor if needed.
 
 Now, let's parametrize the width and height of the outer rectangle. In the code editor, add a width and height parameter to your cell:
 
@@ -106,16 +121,15 @@ cell inset_rect(w: Float, h: Float) {
 
 Once you save, you may notice that an error popped up saying that the open cell is invalid.
 This is because we opened the cell with no arguments, but the cell now requires us to specify `w`
-and `h`. To resolve this, go back to the GUI and run `:openCell inset_rect(40., 40.)`. 
+and `h`. To resolve this, go back to the GUI and run `:openCell inset_rect(200., 200.)`. 
 
-You can now dimension the width of the `met2` rectangle by selecting the top edge then 
+You can now dimension the width of the `met1` rectangle by selecting the top edge then 
 clicking above the rectangle to place the dimension label.
 Enter the dimension as `w`. Dimension the right edge to `h`. You
 can use the `F` keybind to fit the layout to your screen.
 
-
 You may notice that none of the rectangles have a solid boundary, indicating that the cell is not fully constrained. In order to
-constrain the edges to absolute coordinates, you can dimension the left and bottom edges of the `met2` recctangle relative to the origin.
+constrain the edges to absolute coordinates, you can dimension the left and bottom edges of the `met1` rectangle relative to the origin.
 If the origin is not in view, you can also add the following lines to your code (make sure to
 save in order to have your changes reflected in the GUI):
 
@@ -127,22 +141,20 @@ cell inset_rect(w: Float, h: Float) {
 }
 ```
 
-You can also define a hierarchical parametric cell in your code editor as follows:
+You can also define a hierarchical cell in your code editor as follows:
 
 ```rust
 cell triple_rect() {
-    let cell1 = inset_rect(40., 40.);
-    let inst1 = inst(cell1);
-    let inst2 = inst(cell1, xi=100.);
-    let inst3 = inst(inset_rect(20., 60.), xi = 200.);
+    let cell1 = inset_rect(200., 200.);
+    let inst1 = inst(cell1)!;
+    let inst2 = inst(cell1, xi=300.)!;
+    let inst3 = inst(inset_rect(300., 400.), xi=600.)!;
 }
 ```
 
 After saving, try opening this cell from the GUI by running `:openCell triple_rect()`. You
 should be able to constrain the instances relative to one another based on their
 constituent rectangles.
-
-
 
 ## Contributing
 

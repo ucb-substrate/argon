@@ -52,15 +52,29 @@ local function restart(bufnr, filter, callback)
   end)
 end
 
+M.get_root_dir = function(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
+    local bufname = vim.api.nvim_buf_get_name(bufnr)
+    local crate_dir = vim.fs.root(bufname, { 'lib.ar' })
+    return crate_dir
+end
+
 --- Start or attach the LSP client
 ---@param bufnr? number The buffer number (optional), defaults to the current buffer
 M.start = function(bufnr)
+    local root_dir = M.get_root_dir(bufnr)
+    if not root_dir then
+        vim.notify(
+          'argon_lsp: Could not detect workspace, treating current file as root.',
+          vim.log.levels.WARN
+        )
+        root_dir = vim.fs.dirname(bufname)
+    end
     local lsp_start_config = { 
         name = 'argon_lsp',
         cmd = { config.argon_repo_path ..'/target/debug/lsp-server' },
         handlers = {
             ['custom/forceSave'] = function(err, result, ctx)
-                --- TODO: write to correct buffer.
                 local bufnr = vim.fn.bufnr(result)
 
                 if bufnr ~= -1 then
@@ -71,14 +85,33 @@ M.start = function(bufnr)
 
                 return vim.NIL
             end,
-        }
+            ['custom/undo'] = function(err, result, ctx)
+                local bufnr = vim.api.nvim_get_current_buf()
+
+                if bufnr ~= -1 then
+                    vim.api.nvim_buf_call(bufnr, function()
+                        vim.cmd('undo')
+                        vim.cmd('write')
+                    end)
+                end
+
+                return vim.NIL
+            end,
+            ['custom/redo'] = function(err, result, ctx)
+                local bufnr = vim.api.nvim_get_current_buf()
+
+                if bufnr ~= -1 then
+                    vim.api.nvim_buf_call(bufnr, function()
+                        vim.cmd('redo')
+                        vim.cmd('write')
+                    end)
+                end
+
+                return vim.NIL
+            end,
+        },
+        root_dir = root_dir
     }
-    
-    bufnr = bufnr or vim.api.nvim_get_current_buf()
-    local bufname = vim.api.nvim_buf_get_name(bufnr)
-    local crate_dir = vim.fs.root(bufname, { 'lib.ar' })
-    root_dir = crate_dir
-    lsp_start_config.root_dir = root_dir
 
     local old_on_init = lsp_start_config.on_init
     lsp_start_config.on_init = function(...)
