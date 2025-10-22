@@ -374,7 +374,7 @@ impl Backend {
         tokio::spawn(async move {
             match Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
-                "/../../target/debug/gui"
+                "/../../target/release/gui"
             ))
             .arg(format!("{}", state.server_addr))
             .stdin(Stdio::null())
