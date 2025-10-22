@@ -8,7 +8,7 @@ Argon's primary feature is bidirectional editing between a code editor (Neovim o
 Simpler geometric constraints can be entered visually in the GUI, while more complex logic can be
 implemented in code.
 
-Argon's syntax and type system is inspired by Rust. Unlike Rust, Argon is not intended to be fully featured 
+Argon's syntax and type system is inspired by Rust. Unlike Rust, Argon is not intended to be a fully featured 
 general-purpose programming language. The main goal of Argon is to allow interoperability with the GUI,
 enable the creation of most practical parametric cells, and allow for performance optimizations such
 as caching and incremental compilation.
@@ -27,6 +27,7 @@ Future versions of Argon will hopefully support:
 - Faster linear constraint solving (not necessarily supporting general constraints) 
 - Additional editing capabilities in GUI (e.g. instantiating cells)
 - Incremental compilation/caching
+- More advanced data types (e.g. Rust-style enums)
 - Integration with Rust
 
 ## Installation
