@@ -616,7 +616,9 @@ mod tests {
 
     #[test]
     fn argon_seq_fn() {
-        let ast = parse_workspace_with_std(ARGON_SEQ_FN).unwrap_asts();
+        let o = parse_workspace_with_std(ARGON_SEQ_FN);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
         let cells = compile(
             &ast,
             CompileInput {
@@ -639,7 +641,9 @@ mod tests {
 
     #[test]
     fn argon_seq_cell() {
-        let ast = parse_workspace_with_std(ARGON_SEQ_CELL).unwrap_asts();
+        let o = parse_workspace_with_std(ARGON_SEQ_CELL);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
         let cells = compile(
             &ast,
             CompileInput {
@@ -651,7 +655,6 @@ mod tests {
         println!("{cells:#?}");
         let cells = cells.unwrap_valid();
         let cell = &cells.cells[&cells.top];
-        // println!("{:?}", cell.objects);
         assert!(cell.objects.len() >= 3);
         let inst = cell
             .objects
