@@ -160,8 +160,9 @@ impl StateMut {
                 }
             }
 
-            let mut o = if let Some((ast, static_output)) = static_output {
-                if !static_output.errors.is_empty() {
+            let o = if let Some((ast, mut static_output)) = static_output {
+                if !static_output.errors.is_empty() || !parse_errs.is_empty() {
+                    static_output.errors.extend(parse_errs);
                     Some(CompileOutput::StaticErrors(static_output))
                 } else if let Some(cell) = &self.cell {
                     if let Ok(cell_ast) = parse::parse_cell(cell) {
@@ -203,16 +204,6 @@ impl StateMut {
             } else {
                 Some(CompileOutput::FatalParseErrors)
             };
-            match &mut o {
-                Some(CompileOutput::StaticErrors(e)) => e.errors.extend(parse_errs),
-                o => {
-                    if !parse_errs.is_empty() {
-                        *o = Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                            errors: parse_errs,
-                        }));
-                    }
-                }
-            }
             self.compile_output = o;
             let mut tmp = self.diagnostics();
             let mut diagnostics = tmp.clone();
