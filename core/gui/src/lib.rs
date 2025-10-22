@@ -68,6 +68,13 @@ pub fn main() {
                 items: vec![MenuItem::action("Quit", Quit)],
             },
             Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Undo", Undo),
+                    MenuItem::action("Redo", Redo),
+                ],
+            },
+            Menu {
                 name: "Tools".into(),
                 items: vec![
                     MenuItem::action("Rect", DrawRect),

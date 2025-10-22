@@ -39,7 +39,8 @@ vim core/compiler/examples/argon_workspace/lib.ar
 
 Start the GUI by running `:ArgonLsp startGui`.
 
-From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to view and edit layouts in both Neovim and GUI.
+From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
+in both Neovim and the GUI.
 
 ### VS Code
 
@@ -70,7 +71,8 @@ codear core/compiler/examples/argon_workspace
 
 Open the `lib.ar` file within the workspace. You can then start the GUI by running Command Palette > Argon LSP: Start GUI.
 
-From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to view and edit layouts in both VS Code and GUI.
+From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
+in both VS Code and the GUI.
 
 ## Parametric Cell Tutorial
 
@@ -80,7 +82,7 @@ Create a new Argon workspace with the following command:
 mkdir tutorial && touch tutorial/lib.ar
 ```
 
-Before opening your text editor, your directory should look something like this to allow your editor to find your Argon project:
+Your workspace directory should look like this:
 
 ```
 tutorial
@@ -96,7 +98,8 @@ cell inset_rect() {
 
 Start the GUI and run `:openCell inset_rect()`. Click on the `met2` layer from the layer sidebar on the right to select it.
 Hit `R` to use the Rect tool and click on two points on the screen to draw your first rectangle.
-You should see a rectangle appear in the GUI and code.
+You should see a rectangle appear in the GUI and code editor.
+
 Select the `met1` layer and draw another rectangle that surrounds the first.
 
 Let us now dimension the rectangles such that the `met2`
@@ -104,12 +107,13 @@ rectangle is inset by `50.` relative to the `met1` rectangle.
 Hit `D` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
 of the dimension.
-Repeat for the other 3 sides of the rectangle.
 
 Double check that there are no errors in your code editor, or the GUI will not be able to
 display the updated cell. If you make a mistake, 
 you can undo and redo changes from the GUI using `u` and `Ctrl + R`,
 respectively, or manually modify the code in the text editor if needed.
+
+Repeat for the other 3 sides of the rectangle.
 
 Now, let's parametrize the width and height of the outer rectangle. In the code editor, add a width and height parameter to your cell:
 
@@ -128,7 +132,7 @@ clicking above the rectangle to place the dimension label.
 Enter the dimension as `w`. Dimension the right edge to `h`. You
 can use the `F` keybind to fit the layout to your screen.
 
-You may notice that none of the rectangles have a solid boundary, indicating that the cell is not fully constrained. In order to
+You may notice that none of the rectangles have a solid boundary, indicating that they are not fully constrained. In order to
 constrain the edges to absolute coordinates, you can dimension the left and bottom edges of the `met1` rectangle relative to the origin.
 If the origin is not in view, you can also add the following lines to your code (make sure to
 save in order to have your changes reflected in the GUI):
