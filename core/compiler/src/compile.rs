@@ -51,10 +51,13 @@ pub fn dynamic_compile(
 ) -> CompileOutput {
     let res = ExecPass::new(ast).execute(input);
     let (data, mut errors) = match res {
-        CompileOutput::ExecErrors(ExecErrorCompileOutput {
-            errors,
-            output: Some(output),
-        }) => (output, errors),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
+            if let Some(output) = output {
+                (output, errors)
+            } else {
+                return CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output });
+            }
+        }
         CompileOutput::Valid(v) => (v, Vec::new()),
         _ => unreachable!(),
     };

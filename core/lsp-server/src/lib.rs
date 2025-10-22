@@ -233,6 +233,7 @@ impl StateMut {
                 client
                     .show_message(MessageType::ERROR, format!("{e}"))
                     .await;
+                self.gui_client = None;
             }
         }
     }
@@ -453,13 +454,15 @@ impl Backend {
         let (k, v) = params.kv.split_once(" ").unwrap();
         let (k, v) = (k.to_string(), v.to_string());
         tokio::spawn(async move {
-            if let Some(client) = state.state_mut.lock().await.gui_client.as_mut()
+            let mut state_mut = state.state_mut.lock().await;
+            if let Some(client) = state_mut.gui_client.as_mut()
                 && let Err(e) = client.set(context::current(), k, v).await
             {
                 state
                     .editor_client
                     .show_message(MessageType::ERROR, format!("{e}"))
                     .await;
+                state_mut.gui_client = None;
             }
         });
         Ok(())
