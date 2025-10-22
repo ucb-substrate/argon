@@ -3,7 +3,7 @@ use compiler::{
     ast::{
         ArgDecl, Args, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
         ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
-        Scope, UnaryOpExpr, annotated::AnnotatedAst,
+        Scope, TySpec, UnaryOpExpr, annotated::AnnotatedAst,
     },
     compile::BUILTINS,
     parse::ParseMetadata,
@@ -92,7 +92,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         _input: &FnDecl<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
         _args: &[ArgDecl<Substr, Self::OutputMetadata>],
-        _return_ty: &Option<Ident<Substr, Self::OutputMetadata>>,
+        _return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
         _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
     }
@@ -233,7 +233,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         &mut self,
         _input: &compiler::ast::CastExpr<Substr, Self::InputMetadata>,
         _value: &Expr<Substr, Self::OutputMetadata>,
-        _ty: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &TySpec<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
@@ -264,7 +264,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         &mut self,
         _input: &ArgDecl<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
-        _ty: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &TySpec<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 

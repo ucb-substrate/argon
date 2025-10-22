@@ -116,10 +116,22 @@ pub struct CellDecl<S, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub enum TySpecKind<S, T: AstMetadata> {
+    Ident(Ident<S, T>),
+    Seq(Box<TySpec<S, T>>),
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct TySpec<S, T: AstMetadata> {
+    pub kind: TySpecKind<S, T>,
+    pub span: cfgrammar::Span,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct FnDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub args: Vec<ArgDecl<S, T>>,
-    pub return_ty: Option<Ident<S, T>>,
+    pub return_ty: Option<TySpec<S, T>>,
     pub scope: Scope<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::FnDecl,
@@ -294,14 +306,14 @@ pub struct KwArgValue<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct ArgDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
-    pub ty: Ident<S, T>,
+    pub ty: TySpec<S, T>,
     pub metadata: T::ArgDecl,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct CastExpr<S, T: AstMetadata> {
     pub value: Expr<S, T>,
-    pub ty: Ident<S, T>,
+    pub ty: TySpec<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::CastExpr,
 }
@@ -401,7 +413,7 @@ pub trait AstTransformer {
         input: &FnDecl<Self::InputS, Self::InputMetadata>,
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
         args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
-        return_ty: &Option<Ident<Self::OutputS, Self::OutputMetadata>>,
+        return_ty: &Option<TySpec<Self::OutputS, Self::OutputMetadata>>,
         scope: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl;
     fn dispatch_constant_decl(
@@ -451,7 +463,7 @@ pub trait AstTransformer {
         &mut self,
         input: &CastExpr<Self::InputS, Self::InputMetadata>,
         value: &Expr<Self::OutputS, Self::OutputMetadata>,
-        ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr;
     fn dispatch_field_access_expr(
         &mut self,
@@ -486,7 +498,7 @@ pub trait AstTransformer {
         &mut self,
         input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl;
     fn dispatch_scope(
         &mut self,
@@ -529,6 +541,20 @@ pub trait AstTransformer {
                 .map(|ident| self.transform_ident(ident))
                 .collect(),
             metadata,
+            span: input.span,
+        }
+    }
+
+    fn transform_ty_spec(
+        &mut self,
+        input: &TySpec<Self::InputS, Self::InputMetadata>,
+    ) -> TySpec<Self::OutputS, Self::OutputMetadata> {
+        let kind = match &input.kind {
+            TySpecKind::Ident(inner) => TySpecKind::Ident(self.transform_ident(inner)),
+            TySpecKind::Seq(inner) => TySpecKind::Seq(Box::new(self.transform_ty_spec(inner))),
+        };
+        TySpec {
+            kind,
             span: input.span,
         }
     }
@@ -583,7 +609,7 @@ pub trait AstTransformer {
         let return_ty = input
             .return_ty
             .as_ref()
-            .map(|ident| self.transform_ident(ident));
+            .map(|spec| self.transform_ty_spec(spec));
         let scope = self.transform_scope(&input.scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
@@ -821,7 +847,7 @@ pub trait AstTransformer {
         input: &ArgDecl<Self::InputS, Self::InputMetadata>,
     ) -> ArgDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
-        let ty = self.transform_ident(&input.ty);
+        let ty = self.transform_ty_spec(&input.ty);
         let metadata = self.dispatch_arg_decl(input, &name, &ty);
         ArgDecl { name, ty, metadata }
     }
@@ -858,7 +884,7 @@ pub trait AstTransformer {
         input: &CastExpr<Self::InputS, Self::InputMetadata>,
     ) -> CastExpr<Self::OutputS, Self::OutputMetadata> {
         let value = self.transform_expr(&input.value);
-        let ty = self.transform_ident(&input.ty);
+        let ty = self.transform_ty_spec(&input.ty);
         let metadata = self.dispatch_cast(input, &value, &ty);
         CastExpr {
             span: input.span,
