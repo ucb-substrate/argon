@@ -106,7 +106,7 @@ Let us now dimension the rectangles such that the `met2`
 rectangle is inset by `50.` relative to the `met1` rectangle.
 Hit `D` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
-of the dimension.
+of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
 
 Double check that there are no errors in your code editor, or the GUI will not be able to
 display the updated cell. If you make a mistake, 
