@@ -38,7 +38,7 @@ function findWorkspaceRoot(startPath: string): string | undefined {
 
 export function activate(context: ExtensionContext) {
 	// The server is implemented in node
-	const serverModule = path.join(workspace.getConfiguration(undefined, undefined).argonLsp.argonRepoDir, 'target', 'debug', 'lsp-server')
+	const serverModule = path.join(workspace.getConfiguration(undefined, undefined).argonLsp.argonRepoDir, 'target', 'release', 'lsp-server')
 	console.log(serverModule);
 
 	// If the extension is launched in debug mode then the debug server options are used

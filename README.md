@@ -41,7 +41,7 @@ Begin by cloning and compiling the Argon source code:
 ```bash
 git clone https://github.com/ucb-substrate/argon.git
 cd argon
-cargo b
+cargo b --release
 ```
 
 ### Neovim

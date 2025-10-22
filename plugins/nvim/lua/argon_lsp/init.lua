@@ -72,7 +72,7 @@ M.start = function(bufnr)
     end
     local lsp_start_config = { 
         name = 'argon_lsp',
-        cmd = { config.argon_repo_path ..'/target/debug/lsp-server' },
+        cmd = { config.argon_repo_path ..'/target/release/lsp-server' },
         handlers = {
             ['custom/forceSave'] = function(err, result, ctx)
                 local bufnr = vim.fn.bufnr(result)
