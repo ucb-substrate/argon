@@ -55,6 +55,11 @@ pub struct Ident<S, T: AstMetadata> {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct NilLiteral {
+    pub span: cfgrammar::Span,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct FloatLiteral {
     pub span: cfgrammar::Span,
     pub value: f64,
@@ -186,6 +191,7 @@ pub enum Expr<S, T: AstMetadata> {
     Emit(Box<EmitExpr<S, T>>),
     FieldAccess(Box<FieldAccessExpr<S, T>>),
     IdentPath(IdentPath<S, T>),
+    Nil(NilLiteral),
     FloatLiteral(FloatLiteral),
     IntLiteral(IntLiteral),
     StringLiteral(StringLiteral<S>),
@@ -326,6 +332,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::Emit(x) => x.span,
             Self::IdentPath(x) => x.span,
             Self::FieldAccess(x) => x.span,
+            Self::Nil(x) => x.span,
             Self::FloatLiteral(x) => x.span,
             Self::IntLiteral(x) => x.span,
             Self::StringLiteral(x) => x.span,
@@ -894,6 +901,7 @@ pub trait AstTransformer {
                 self.transform_field_access_expr(field_access_expr),
             )),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
+            Expr::Nil(nil) => Expr::Nil(*nil),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
             Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),

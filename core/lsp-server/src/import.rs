@@ -299,6 +299,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
                 self.transform_field_access_expr(field_access_expr),
             )),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
+            Expr::Nil(nil) => Expr::Nil(*nil),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
             Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),

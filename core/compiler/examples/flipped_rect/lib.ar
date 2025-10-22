@@ -1,0 +1,3 @@
+cell top() {
+    let r = rect("met1", x0=100., y0=200., x1=0., y1=0.);
+}

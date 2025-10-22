@@ -1,15 +1,15 @@
 cell vias() {
-    let met2 = rect("met2")!;
-    let met1 = rect("met1")!;
+    let met2 = rect("met2");
+    let met1 = rect("met1");
 
     // Create via.
-    let via = rect("via1");
+    let via = crect(layer="via1");
     eq(via.w, 10.);
     eq(via.h, 10.);
     eq(via.x0, 0.);
     eq(via.y0, 0.);
-    let intersection = std::intersection(met1, met2);
-    let via_array = std::max_array(via, intersection.w, intersection.h, 20., 20.);
+    let intersection = #scope0 std::intersection(met1, met2);
+    let via_array = #scope1 std::max_array(via, intersection.w, intersection.h, 20., 20.);
     eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
     eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
 

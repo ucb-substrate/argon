@@ -425,7 +425,9 @@ impl Element for CanvasElement {
                                 .layer
                                 .as_ref()
                                 .and_then(|layer| layers.layers.get(layer.as_str()));
-                            if let Some(layer) = layer {
+                            if let Some(layer) = layer
+                                && !rect.construction
+                            {
                                 let rect =
                                     Rect {
                                         x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
@@ -1212,6 +1214,7 @@ impl LayoutCanvas {
         } else {
             self.offset = Point::new(Pixels(0.), self.screen_bounds.size.height);
         }
+        cx.notify();
     }
 
     pub(crate) fn on_left_mouse_down(
@@ -1290,6 +1293,7 @@ impl LayoutCanvas {
                                                         y0: p0p.y as f64,
                                                         x1: p1p.x as f64,
                                                         y1: p1p.y as f64,
+                                                        construction: false,
                                                     },
                                                 );
                                             }

@@ -32,13 +32,13 @@ fn union(rect1: Rect, rect2: Rect) -> Rect {
 
 fn array(r: Rect, n: Int, xpitch: Float, ypitch: Float) -> Rect {
     #scope0 if n == 1 {
-        let first_rect = rect(r.layer)!;
+        let first_rect = rect(r.layer);
         eq(first_rect.w, r.w);
         eq(first_rect.h, r.h);
         first_rect
     } else {
         let subarray = #scope2 array(r, n - 1, xpitch, ypitch);
-        let first_rect = rect(r.layer)!;
+        let first_rect = rect(r.layer);
         eq(first_rect.w, r.w);
         eq(first_rect.h, r.h);
         eq(first_rect.x0 + xpitch, subarray.x0);
@@ -100,4 +100,8 @@ fn eq_rect(r1: Rect, r2: Rect) {
 fn center_rects(r1: Rect, r2: Rect) {
     eq((r1.x0 + r1.x1)/2., (r2.x0 + r2.x1)/2.);
     eq((r1.y0 + r1.y1)/2., (r2.y0 + r2.y1)/2.);
+}
+
+fn crect2rect(r: Rect) -> Rect {
+    rect(r.layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
 }

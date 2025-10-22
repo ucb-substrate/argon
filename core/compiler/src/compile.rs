@@ -31,7 +31,18 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 7] = ["crect", "rect", "float", "eq", "dimension", "inst", "bbox"];
+pub const BUILTINS: [&str; 10] = [
+    "cons",
+    "head",
+    "tail",
+    "crect",
+    "rect",
+    "float",
+    "eq",
+    "dimension",
+    "inst",
+    "bbox",
+];
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
@@ -476,6 +487,7 @@ pub enum Ty {
     /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
     Enum(EnumTy),
     CellFn(Box<CellFnTy>),
+    Seq(Box<Ty>),
 }
 
 impl Ty {
@@ -830,6 +842,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::Nil(_) => Ty::Nil,
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -1311,13 +1324,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
-                    if name == "crect" {
+                    let kwarg_defs = if name == "crect" {
                         self.typecheck_posargs(input.span, &args.posargs, &[]);
-                    } else {
-                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
-                    }
-                    self.typecheck_kwargs(
-                        &args.kwargs,
                         IndexMap::from_iter([
                             ("x0", Ty::Float),
                             ("x1", Ty::Float),
@@ -1329,9 +1337,84 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             ("y1i", Ty::Float),
                             ("w", Ty::Float),
                             ("h", Ty::Float),
-                        ]),
-                    );
+                            ("layer", Ty::String),
+                        ])
+                    } else {
+                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
+                        IndexMap::from_iter([
+                            ("x0", Ty::Float),
+                            ("x1", Ty::Float),
+                            ("y0", Ty::Float),
+                            ("y1", Ty::Float),
+                            ("x0i", Ty::Float),
+                            ("x1i", Ty::Float),
+                            ("y0i", Ty::Float),
+                            ("y1i", Ty::Float),
+                            ("w", Ty::Float),
+                            ("h", Ty::Float),
+                        ])
+                    };
+                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Rect)
+                }
+                "cons" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
+                    if args.posargs.len() == 2 {
+                        let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
+                        let tailty = args.posargs[1].ty();
+                        if !(tailty == Ty::Nil || tailty == seqty) {
+                            self.errors.push(StaticError {
+                                span: self.span(args.posargs[1].span()),
+                                kind: StaticErrorKind::IncorrectTy {
+                                    found: tailty,
+                                    expected: seqty.clone(),
+                                },
+                            });
+                        }
+                        (None, seqty)
+                    } else {
+                        (None, Ty::Nil)
+                    }
+                }
+                "head" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    if args.posargs.len() == 1 {
+                        let argty = args.posargs[0].ty();
+                        if let Ty::Seq(i) = argty {
+                            (None, *i)
+                        } else {
+                            self.errors.push(StaticError {
+                                span: self.span(input.span),
+                                kind: StaticErrorKind::IncorrectTyCategory {
+                                    found: argty,
+                                    expected: "Seq".to_string(),
+                                },
+                            });
+                            (None, Ty::Nil)
+                        }
+                    } else {
+                        (None, Ty::Nil)
+                    }
+                }
+                "tail" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
+                    if args.posargs.len() == 1 {
+                        let argty = args.posargs[0].ty();
+                        if let Ty::Seq(_) = argty {
+                            (None, argty)
+                        } else {
+                            self.errors.push(StaticError {
+                                span: self.span(input.span),
+                                kind: StaticErrorKind::IncorrectTyCategory {
+                                    found: argty,
+                                    expected: "Seq".to_string(),
+                                },
+                            });
+                            (None, Ty::Nil)
+                        }
+                    } else {
+                        (None, Ty::Nil)
+                    }
                 }
                 "bbox" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
@@ -1383,6 +1466,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             ("y", Ty::Float),
                             ("xi", Ty::Float),
                             ("yi", Ty::Float),
+                            ("construction", Ty::Bool),
                         ]),
                     );
                     if let Some(ty) = args.posargs.first() {
@@ -1567,6 +1651,7 @@ pub struct BasicRect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+    pub construction: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1577,6 +1662,7 @@ pub struct Rect<T> {
     pub y0: T,
     pub x1: T,
     pub y1: T,
+    pub construction: bool,
     pub span: Option<Span>,
 }
 
@@ -1631,6 +1717,13 @@ struct Emit {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct ObjectEmit {
+    object: ObjectId,
+    scope: ScopeId,
+    span: Span,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ExecScope {
     parent: Option<ScopeId>,
     static_parent: Option<(ScopeId, SeqNum)>,
@@ -1670,6 +1763,7 @@ struct CellState {
     solver: Solver,
     fields: IndexMap<String, ValueId>,
     emit: Vec<Emit>,
+    object_emit: Vec<ObjectEmit>,
     objects: IndexMap<ObjectId, Object>,
     deferred: IndexSet<ValueId>,
     root_scope: ScopeId,
@@ -1735,7 +1829,7 @@ impl<'a> ExecPass<'a> {
             ast,
             cell_states: IndexMap::new(),
             values: IndexMap::from_iter([
-                (1, DeferValue::Ready(Value::None)),
+                (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
             ]),
@@ -1885,6 +1979,7 @@ impl<'a> ExecPass<'a> {
                         solver: Solver::new(),
                         fields: Default::default(),
                         emit: Vec::new(),
+                        object_emit: Vec::new(),
                         deferred: Default::default(),
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
@@ -2026,17 +2121,38 @@ impl<'a> ExecPass<'a> {
 
     fn emit(&mut self, cell: CellId) -> CompiledCell {
         let state = self.cell_states.get(&cell).expect("cell not found");
-        let emit_obj = |obj: &Object| -> SolvedValue {
+        let mut emit_obj = |obj: &Object| -> SolvedValue {
             match obj {
-                Object::Rect(rect) => SolvedValue::Rect(Rect {
-                    id: rect.id,
-                    layer: rect.layer.clone(),
-                    x0: (state.solver.eval_expr(&rect.x0).unwrap(), rect.x0.clone()),
-                    y0: (state.solver.eval_expr(&rect.y0).unwrap(), rect.y0.clone()),
-                    x1: (state.solver.eval_expr(&rect.x1).unwrap(), rect.x1.clone()),
-                    y1: (state.solver.eval_expr(&rect.y1).unwrap(), rect.y1.clone()),
-                    span: rect.span.clone(),
-                }),
+                Object::Rect(rect) => {
+                    let x0 = state.solver.eval_expr(&rect.x0).unwrap();
+                    let y0 = state.solver.eval_expr(&rect.y0).unwrap();
+                    let x1 = state.solver.eval_expr(&rect.x1).unwrap();
+                    let y1 = state.solver.eval_expr(&rect.y1).unwrap();
+                    if x0 > x1 {
+                        self.errors.push(ExecError {
+                            span: rect.span.clone(),
+                            cell,
+                            kind: ExecErrorKind::FlippedRect("x0 > x1".to_string()),
+                        });
+                    }
+                    if y0 > y1 {
+                        self.errors.push(ExecError {
+                            span: rect.span.clone(),
+                            cell,
+                            kind: ExecErrorKind::FlippedRect("y0 > y1".to_string()),
+                        });
+                    }
+                    SolvedValue::Rect(Rect {
+                        id: rect.id,
+                        layer: rect.layer.clone(),
+                        x0: (x0, rect.x0.clone()),
+                        y0: (y0, rect.y0.clone()),
+                        x1: (x1, rect.x1.clone()),
+                        y1: (y1, rect.y1.clone()),
+                        construction: rect.construction,
+                        span: rect.span.clone(),
+                    })
+                }
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
                     p: state.solver.eval_expr(&dim.p).unwrap(),
@@ -2054,7 +2170,8 @@ impl<'a> ExecPass<'a> {
                     x: state.solver.eval_expr(&inst.x).unwrap(),
                     y: state.solver.eval_expr(&inst.y).unwrap(),
                     angle: inst.angle,
-                    reflect: false,
+                    reflect: inst.reflect,
+                    construction: inst.construction,
                     cell: *self.values[&inst.cell]
                         .as_ref()
                         .unwrap_ready()
@@ -2095,6 +2212,15 @@ impl<'a> ExecPass<'a> {
             let obj_id = emit_value(emit.value).unwrap();
             ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
                 obj_id,
+                CompiledEmit {
+                    span: emit.span.clone(),
+                },
+            ));
+        }
+
+        for emit in state.object_emit.iter() {
+            ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
+                emit.object,
                 CompiledEmit {
                     span: emit.span.clone(),
                 },
@@ -2302,6 +2428,9 @@ impl<'a> ExecPass<'a> {
 
     fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<Substr, VarIdTyMetadata>) -> ValueId {
         let partial_eval_state = match expr {
+            Expr::Nil(_) => {
+                return self.nil_value;
+            }
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
                 self.values
@@ -2519,13 +2648,28 @@ impl<'a> ExecPass<'a> {
         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
-                "crect" | "rect" => {
-                    let layer = c.state.posargs.first().map(|vid| {
-                        self.values[vid]
-                            .as_ref()
-                            .get_ready()
-                            .map(|layer| layer.as_ref().unwrap_string().clone())
-                    });
+                f @ "crect" | f @ "rect" => {
+                    let layer = if f == "crect" {
+                        c.expr
+                            .args
+                            .kwargs
+                            .iter()
+                            .zip(c.state.kwargs.iter())
+                            .find(|(k, _)| k.name.name == "layer")
+                            .map(|(_, vid)| {
+                                self.values[vid]
+                                    .as_ref()
+                                    .get_ready()
+                                    .map(|layer| layer.as_ref().unwrap_string().clone())
+                            })
+                    } else {
+                        c.state.posargs.first().map(|vid| {
+                            self.values[vid]
+                                .as_ref()
+                                .get_ready()
+                                .map(|layer| layer.as_ref().unwrap_string().clone())
+                        })
+                    };
                     let layer = match layer {
                         None => Some(None),
                         Some(None) => None,
@@ -2534,7 +2678,7 @@ impl<'a> ExecPass<'a> {
                     if let Some(layer) = layer {
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let state = self.cell_state_mut(vref.loc.cell);
                         let rect = Rect {
                             id,
                             layer,
@@ -2542,11 +2686,17 @@ impl<'a> ExecPass<'a> {
                             y0: state.solver.new_var().into(),
                             x1: state.solver.new_var().into(),
                             y1: state.solver.new_var().into(),
-                            span: Some(span),
+                            construction: f == "crect",
+                            span: Some(span.clone()),
                         };
+                        state.objects.insert(rect.id, rect.clone().into());
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
                         self.values
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
-                        state.objects.insert(rect.id, rect.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
                             let priority = match kwarg.name.name.as_str() {
@@ -2587,6 +2737,9 @@ impl<'a> ExecPass<'a> {
                                         )),
                                     );
                                     1
+                                }
+                                "layer" => {
+                                    continue;
                                 }
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
@@ -2640,9 +2793,15 @@ impl<'a> ExecPass<'a> {
                                     y0: r.y0.into(),
                                     x1: r.x1.into(),
                                     y1: r.y1.into(),
-                                    span: Some(span),
+                                    construction: true,
+                                    span: Some(span.clone()),
                                 };
                                 state.objects.insert(orect.id, orect.clone().into());
+                                state.emit.push(Emit {
+                                    scope: vref.loc.scope,
+                                    value: vid,
+                                    span,
+                                });
                                 self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
                                 true
                             } else {
@@ -2661,6 +2820,7 @@ impl<'a> ExecPass<'a> {
                                     y0: 0.0.into(),
                                     x1: 0.0.into(),
                                     y1: 0.0.into(),
+                                    construction: true,
                                     span: Some(span),
                                 };
                                 state.objects.insert(orect.id, orect.clone().into());
@@ -2689,7 +2849,55 @@ impl<'a> ExecPass<'a> {
                         let expr = vl.as_ref().unwrap_linear().clone()
                             - vr.as_ref().unwrap_linear().clone();
                         state.solver.constrain_eq0(expr);
-                        self.values.insert(vid, Defer::Ready(Value::None));
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "cons" => {
+                    if let (Defer::Ready(head), Defer::Ready(tail)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let val = match tail {
+                            Value::Nil => {
+                                vec![head.clone()]
+                            }
+                            Value::Seq(s) => {
+                                let mut s = s.clone();
+                                s.insert(0, head.clone());
+                                s
+                            }
+                            _ => unreachable!(),
+                        };
+                        self.values.insert(vid, Defer::Ready(Value::Seq(val)));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "head" => {
+                    if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
+                        let val = match head {
+                            Value::Nil => Value::Nil,
+                            Value::Seq(s) => s.first().cloned().unwrap_or(Value::Nil),
+                            _ => unreachable!(),
+                        };
+                        self.values.insert(vid, Defer::Ready(val));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "tail" => {
+                    if let Defer::Ready(lst) = &self.values[&c.state.posargs[0]] {
+                        let val = match lst {
+                            Value::Nil => Value::Nil,
+                            Value::Seq(s) => Value::Seq(s[1..].to_vec()),
+                            _ => unreachable!(),
+                        };
+                        self.values.insert(vid, Defer::Ready(val));
                         true
                     } else {
                         false
@@ -2723,10 +2931,15 @@ impl<'a> ExecPass<'a> {
                             n,
                             p,
                             constraint,
-                            span: Some(span),
+                            span: Some(span.clone()),
                         };
+                        state.object_emit.push(ObjectEmit {
+                            scope: vref.loc.scope,
+                            object: dim.id,
+                            span,
+                        });
                         state.objects.insert(dim.id, dim.clone().into());
-                        self.values.insert(vid, Defer::Ready(Value::None));
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
                         false
@@ -2790,7 +3003,32 @@ impl<'a> ExecPass<'a> {
                         Some(None) => None,
                         Some(Some(l)) => Some(Some(l)),
                     };
-                    if let (Some(refl), Some(angle)) = (refl, angle) {
+                    let construction = c
+                        .expr
+                        .args
+                        .kwargs
+                        .iter()
+                        .zip(c.state.kwargs.iter())
+                        .find_map(|(kwarg, vid)| {
+                            if kwarg.name.name == "construction" {
+                                Some(
+                                    self.values[vid]
+                                        .as_ref()
+                                        .get_ready()
+                                        .map(|v| *v.as_ref().unwrap_bool()),
+                                )
+                            } else {
+                                None
+                            }
+                        });
+                    let construction = match construction {
+                        None => Some(None),
+                        Some(None) => None,
+                        Some(Some(v)) => Some(Some(v)),
+                    };
+                    if let (Some(refl), Some(angle), Some(construction)) =
+                        (refl, angle, construction)
+                    {
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
@@ -2801,8 +3039,14 @@ impl<'a> ExecPass<'a> {
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
-                            span,
+                            construction: construction.unwrap_or_default(),
+                            span: span.clone(),
                         };
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
                         state.objects.insert(inst.id, inst.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
@@ -3107,7 +3351,20 @@ impl<'a> ExecPass<'a> {
                                 "y1" => Value::Linear(rect.y1.clone()),
                                 "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
                                 "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
-                                "layer" => Value::String(rect.layer.clone().unwrap()),
+                                "layer" => {
+                                    if let Some(layer) = rect.layer.clone() {
+                                        Value::String(layer)
+                                    } else {
+                                        let span =
+                                            self.span(&vref.loc, field_access_expr.expr.span);
+                                        self.errors.push(ExecError {
+                                            span: Some(span),
+                                            cell: vref.loc.cell,
+                                            kind: ExecErrorKind::InvalidRotation,
+                                        });
+                                        Value::String("".to_string())
+                                    }
+                                }
                                 f => unreachable!("invalid field `{f}`"),
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -3137,6 +3394,7 @@ impl<'a> ExecPass<'a> {
                                                     y0: LinearExpr::add(rect.y0, inst.y.clone()),
                                                     x1: LinearExpr::add(rect.x1, inst.x.clone()),
                                                     y1: LinearExpr::add(rect.y1, inst.y.clone()),
+                                                    construction: rect.construction,
                                                     span: rect.span.clone(),
                                                 };
                                                 let state = self.cell_state_mut(vref.loc.cell);
@@ -3166,6 +3424,7 @@ impl<'a> ExecPass<'a> {
                                                     y: LinearExpr::add(inst.y.clone(), cy),
                                                     angle,
                                                     reflect,
+                                                    construction: cinst.construction,
                                                     span: cinst.span.clone(),
                                                 };
                                                 state
@@ -3211,7 +3470,7 @@ impl<'a> ExecPass<'a> {
                     } else {
                         state.solver.constrain_eq0(expr);
                     }
-                    self.values.insert(vid, DeferValue::Ready(Value::None));
+                    self.values.insert(vid, DeferValue::Ready(Value::Nil));
                     true
                 } else {
                     false
@@ -3315,7 +3574,8 @@ pub enum Value {
     ///
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
-    None,
+    Seq(Vec<Value>),
+    Nil,
 }
 
 impl Value {
@@ -3336,6 +3596,7 @@ pub struct Instance {
     pub cell: ValueId,
     pub reflect: bool,
     pub angle: Rotation,
+    pub construction: bool,
     pub span: Span,
 }
 
@@ -3346,6 +3607,7 @@ pub struct SolvedInstance {
     pub y: f64,
     pub angle: Rotation,
     pub reflect: bool,
+    pub construction: bool,
     pub cell: CellId,
     pub span: Span,
     /// The value ID of the cell being instantiated.
@@ -3432,6 +3694,7 @@ pub fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f
             x1: r1.x1.max(r2.x1),
             y1: r1.y1.max(r2.y1),
             id: r1.id,
+            construction: true,
             span: None,
         }),
         (Some(r), None) | (None, Some(r)) => Some(r),
@@ -3457,6 +3720,7 @@ pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<R
             x1: r.x1.max(xmax),
             y1: r.y1.max(ymax),
             id: r.id,
+            construction: true,
             span: None,
         }),
         None => Some(Rect {
@@ -3466,6 +3730,7 @@ pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<R
             x1: xmax,
             y1: ymax,
             id: ObjectId(0), // FIXME: should not need to allocate an object ID
+            construction: true,
             span: None,
         }),
     }
@@ -3597,6 +3862,12 @@ pub enum ExecErrorKind {
     /// A cell or instance had an empty bounding box.
     #[error("empty bbox")]
     EmptyBbox,
+    /// Field is empty (analogous to None).
+    #[error("empty field (field was not assigned a value)")]
+    EmptyField,
+    /// Edges of a rect are in the wrong order (e.g. x0 > x1 or y0 > y1).
+    #[error("rect edges are in the wrong order: {0}")]
+    FlippedRect(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3778,6 +4049,7 @@ impl<T> Rect<(f64, T)> {
             y0: self.y0.0,
             x1: self.x1.0,
             y1: self.y1.0,
+            construction: self.construction,
             span: self.span.clone(),
         }
     }
@@ -3795,6 +4067,7 @@ impl Rect<f64> {
             y0: p0p.1.min(p1p.1),
             x1: p0p.0.max(p1p.0),
             y1: p0p.1.max(p1p.1),
+            construction: self.construction,
             span: None,
         }
     }

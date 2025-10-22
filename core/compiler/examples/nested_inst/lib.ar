@@ -1,7 +1,7 @@
 cell bot() {
-    let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.)!;
-    let met2 = rect("met1", x0=100., y0=0., x1=200., y1=100.)!;
-    let met3 = #scope0 make_rect()!; let met4 = #scope1 emit_rect();
+    let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
+    let met2 = rect("met1", x0=100., y0=0., x1=200., y1=100.);
+    let met3 = #scope0 make_rect(); let met4 = #scope1 emit_rect();
 }
 
 fn make_rect() -> Rect {
@@ -9,19 +9,19 @@ fn make_rect() -> Rect {
 }
 
 fn emit_rect() -> Rect {
-    rect("met2", x0=0., y0=0., x1=200., y1=100.)!
+    rect("met2", x0=0., y0=0., x1=200., y1=100.)
 }
 
 cell middle() {
-    let bot = inst(#scope0 bot())!;
+    let bot = inst(#scope0 bot());
     eq(bot.x, 0.);
     eq(bot.y, 0.);
 }
 
 cell top() {
     let mid_cell = #scope2 middle();
-    let left = inst(mid_cell)!;
-    let right = inst(mid_cell, angle=90)!;
+    let left = inst(mid_cell);
+    let right = inst(mid_cell, angle=90);
     #scope0
     {
       eq(left.x, 0.);
@@ -30,6 +30,6 @@ cell top() {
       eq(right.y, 100.);
     }
     #scope1 if 1 > 2 { } else { }
-    let met3 = rect("met3", x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.)!;
+    let met3 = rect("met3", x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.);
     let duplicate_rect = left.bot.met3!;
 }

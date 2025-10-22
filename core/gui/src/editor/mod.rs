@@ -170,6 +170,7 @@ impl EditorState {
                                     x1: p0p.0.max(p1p.0) + inst.x,
                                     y1: p0p.1.max(p1p.1) + inst.y,
                                     id: inst.id,
+                                    construction: true,
                                     span: rect.span.clone(),
                                 }
                             }),
