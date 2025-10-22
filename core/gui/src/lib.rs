@@ -89,6 +89,7 @@ pub fn main() {
                     MenuItem::action("Full Hierarchy", All),
                     MenuItem::action("Box Only", Zero),
                     MenuItem::action("Top Level Only", One),
+                    MenuItem::action("Fit to Screen", Fit),
                 ],
             },
         ]);
