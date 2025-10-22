@@ -62,10 +62,13 @@ pub fn dynamic_compile(
 ) -> CompileOutput {
     let res = ExecPass::new(ast).execute(input);
     let (data, mut errors) = match res {
-        CompileOutput::ExecErrors(ExecErrorCompileOutput {
-            errors,
-            output: Some(output),
-        }) => (output, errors),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
+            if let Some(output) = output {
+                (output, errors)
+            } else {
+                return CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output });
+            }
+        }
         CompileOutput::Valid(v) => (v, Vec::new()),
         _ => unreachable!(),
     };
@@ -1909,39 +1912,45 @@ impl<'a> ExecPass<'a> {
                 .map(|ident| ident.to_string())
                 .collect_vec(),
         };
-        let (_, vid) = self.ast[&path]
-            .ast
-            .decls
-            .iter()
-            .find_map(|d| match d {
-                Decl::Cell(
-                    v @ CellDecl {
-                        name: Ident { name, .. },
-                        ..
-                    },
-                ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
-                _ => None,
-            })
-            .expect("cell not found");
-        let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
-        let layers =
-            klayout_lyp::from_reader(BufReader::new(std::fs::File::open(input.lyp_file).unwrap()))
-                .unwrap()
-                .into();
-        if self.errors.is_empty() {
-            CompileOutput::Valid(CompiledData {
-                cells: self.compiled_cells,
-                top: cell_id,
-                layers,
-            })
-        } else {
-            CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                errors: self.errors,
-                output: Some(CompiledData {
+        if let Some((_, vid)) = self.ast[&path].ast.decls.iter().find_map(|d| match d {
+            Decl::Cell(
+                v @ CellDecl {
+                    name: Ident { name, .. },
+                    ..
+                },
+            ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
+            _ => None,
+        }) {
+            let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
+            let layers = klayout_lyp::from_reader(BufReader::new(
+                std::fs::File::open(input.lyp_file).unwrap(),
+            ))
+            .unwrap()
+            .into();
+            if self.errors.is_empty() {
+                CompileOutput::Valid(CompiledData {
                     cells: self.compiled_cells,
                     top: cell_id,
                     layers,
-                }),
+                })
+            } else {
+                CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                    errors: self.errors,
+                    output: Some(CompiledData {
+                        cells: self.compiled_cells,
+                        top: cell_id,
+                        layers,
+                    }),
+                })
+            }
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: vec![ExecError {
+                    span: None,
+                    cell: 0, // TODO: don't use dummy cell ID
+                    kind: ExecErrorKind::InvalidCell,
+                }],
+                output: None,
             })
         }
     }
@@ -1962,16 +1971,6 @@ impl<'a> ExecPass<'a> {
             .as_ref()
             .unwrap_cell_fn()
             .clone();
-        assert_eq!(args.len(), cell_decl.args.len());
-        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
-            let vid = self.value_id();
-            let val = Value::from_arg(&val);
-            self.values.insert(vid, DeferValue::Ready(val));
-            frame.bindings.insert(decl.metadata.0, vid);
-        }
-        let fid = self.frame_id();
-        self.frames.insert(fid, frame);
-
         let root_scope_id = self.scope_id();
         let root_scope = ExecScope {
             parent: None,
@@ -2011,6 +2010,22 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
+        if args.len() != cell_decl.args.len() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidCell,
+            });
+            return cell_id;
+        }
+        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
+            let vid = self.value_id();
+            let val = Value::from_arg(&val);
+            self.values.insert(vid, DeferValue::Ready(val));
+            frame.bindings.insert(decl.metadata.0, vid);
+        }
+        let fid = self.frame_id();
+        self.frames.insert(fid, frame);
 
         let mut seq_num = SeqNum::new();
         for stmt in cell_decl.scope.stmts.iter() {
@@ -3908,6 +3923,9 @@ pub enum ExecErrorKind {
     /// A non-Manhattan rotation.
     #[error("non-Manhattan rotation")]
     InvalidRotation,
+    /// An invalid cell was specified for execution.
+    #[error("invalid cell")]
+    InvalidCell,
     /// A cell is underconstrained.
     #[error("cell is underconstrained")]
     Underconstrained,

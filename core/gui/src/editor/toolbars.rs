@@ -65,13 +65,11 @@ pub struct LayerSideBar {
 impl LayerSideBar {
     pub fn new(
         cx: &mut Context<Self>,
-        window: &mut Window,
         state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
         let layers = state.read(cx).layers.clone();
-        let name_filter =
-            cx.new(|cx| TextInput::new_filter(cx, window, cx.focus_handle(), state, canvas));
+        let name_filter = cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), state, canvas));
         let state = cx.new(|_cx| LayerSideBarState::default());
         let subscriptions = vec![
             cx.observe(&layers, |_, _, cx| cx.notify()),
@@ -251,14 +249,12 @@ pub struct HierarchySideBar {
 impl HierarchySideBar {
     pub fn new(
         cx: &mut Context<Self>,
-        window: &mut Window,
         state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
         let solved_cell = state.read(cx).solved_cell.clone();
         let tool = canvas.read(cx).tool.clone();
-        let name_filter =
-            cx.new(|cx| TextInput::new_filter(cx, window, cx.focus_handle(), state, canvas));
+        let name_filter = cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), state, canvas));
         let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
         Self {
             solved_cell,

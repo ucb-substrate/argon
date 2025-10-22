@@ -3,8 +3,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, bail};
-use arcstr::ArcStr;
+use anyhow::{Context, anyhow, bail};
+use arcstr::{ArcStr, Substr};
 use indexmap::IndexMap;
 use lrlex::{DefaultLexerTypes, lrlex_mod};
 use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, lrpar_mod};
@@ -78,7 +78,7 @@ pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, an
     }
 }
 
-type ParseResult = Result<AnnotatedParseAst, anyhow::Error>;
+type ParseResult = (AnnotatedParseAst, Option<anyhow::Error>);
 type LexParseErrors = Vec<LexParseError<u32, DefaultLexerTypes>>;
 type ModSpans = Vec<(cfgrammar::Span, ModPath)>;
 
@@ -88,17 +88,8 @@ pub struct ParseOutput {
 }
 
 impl ParseOutput {
-    pub fn unwrap_asts(self) -> WorkspaceParseAst {
-        self.asts
-            .into_iter()
-            .map(|(k, v)| (k, v.unwrap()))
-            .collect()
-    }
-    pub fn best_effort_ast(self) -> WorkspaceParseAst {
-        self.asts
-            .into_iter()
-            .filter_map(|(k, v)| Some((k, v.ok()?)))
-            .collect()
+    pub fn ast(self) -> WorkspaceParseAst {
+        self.asts.into_iter().map(|(k, v)| (k, v.0)).collect()
     }
     pub fn static_errors(&self) -> Vec<StaticError> {
         self.errs
@@ -123,7 +114,7 @@ impl ParseOutput {
                         },
                     })
                     .chain(mod_errs.iter().filter_map(|(span, mod_path)| {
-                        if self.asts.get(mod_path)?.is_err() {
+                        if self.asts.get(mod_path)?.1.is_some() {
                             Some(StaticError {
                                 span: Span {
                                     path: path.clone(),
@@ -194,21 +185,33 @@ pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
             Ok(file_path) => {
                 let (ast, errs) = parse(&file_path);
                 let mut mod_spans = Vec::new();
-                if let Ok(ast) = &ast {
-                    for decl in &ast.ast.decls {
-                        if let Decl::Mod(decl) = decl {
-                            let mut path = path.clone();
-                            path.push(decl.ident.name.to_string());
-                            mod_spans.push((decl.span, path.clone()));
-                            stack.push(path);
-                        }
+                for decl in &ast.0.ast.decls {
+                    if let Decl::Mod(decl) = decl {
+                        let mut path = path.clone();
+                        path.push(decl.ident.name.to_string());
+                        mod_spans.push((decl.span, path.clone()));
+                        stack.push(path);
                     }
                 }
                 workspace_ast.insert(path, ast);
                 workspace_errs.insert(file_path, (errs, mod_spans));
             }
             Err(e) => {
-                workspace_ast.insert(path, Err(e));
+                workspace_ast.insert(
+                    path,
+                    (
+                        // TODO: make better data structures so this dummy isn't necessary.
+                        AnnotatedParseAst::new(
+                            "".into(),
+                            &Ast::<Substr, _> {
+                                decls: vec![],
+                                span: cfgrammar::Span::new(0, 0),
+                            },
+                            root_lib.into(),
+                        ),
+                        Some(e),
+                    ),
+                );
             }
         }
     }
@@ -225,18 +228,35 @@ fn parse_inner(
     res: Option<Result<ParseAst<'_>, ()>>,
     lexer: &dyn NonStreamingLexer<DefaultLexerTypes>,
     errs: &[LexParseError<u32, DefaultLexerTypes>],
-) -> Result<AnnotatedAst<ParseMetadata>, anyhow::Error> {
+) -> ParseResult {
+    let make_backup_ast = |input: ArcStr, path: PathBuf| {
+        let input_len = input.len();
+        AnnotatedParseAst::new(
+            input,
+            &Ast::<Substr, _> {
+                decls: vec![],
+                span: cfgrammar::Span::new(0, input_len),
+            },
+            path,
+        )
+    };
     if !errs.is_empty() {
         let mut err = String::new();
         for e in errs {
-            write!(&mut err, "{}", e.pp(lexer, &argon_y::token_epp))
-                .with_context(|| "failed to write to string buffer")?;
+            if let Err(e) = write!(&mut err, "{}", e.pp(lexer, &argon_y::token_epp))
+                .with_context(|| "failed to write to string buffer")
+            {
+                return (make_backup_ast(input, path), Some(anyhow!("{e}")));
+            }
         }
-        bail!("{err}")
+        return (make_backup_ast(input, path), Some(anyhow!("{err}")));
     }
     match res {
-        Some(Ok(ast)) => Ok(AnnotatedAst::new(input, &ast, path)),
-        _ => bail!("Unable to evaluate expression."),
+        Some(Ok(ast)) => (AnnotatedAst::new(input, &ast, path), None),
+        _ => (
+            make_backup_ast(input, path),
+            Some(anyhow!("Unable to evaluate expression.")),
+        ),
     }
 }
 
@@ -254,7 +274,20 @@ pub fn parse(path: impl Into<PathBuf>) -> (ParseResult, LexParseErrors) {
             let (res, errs) = argon_y::parse(&lexer);
             (parse_inner(input.clone(), path, res, &lexer, &errs), errs)
         }
-        Err(e) => (Err(e.into()), Vec::new()),
+        Err(e) => (
+            (
+                AnnotatedParseAst::new(
+                    "".into(),
+                    &Ast::<Substr, _> {
+                        decls: vec![],
+                        span: cfgrammar::Span::new(0, 0),
+                    },
+                    path,
+                ),
+                Some(e.into()),
+            ),
+            Vec::new(),
+        ),
     }
 }
 

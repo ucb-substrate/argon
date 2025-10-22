@@ -37,6 +37,8 @@ pub fn main() {
             KeyBinding::new("d", DrawDim, None),
             KeyBinding::new("f", Fit, None),
             KeyBinding::new("q", Edit, None),
+            KeyBinding::new("u", Undo, None),
+            KeyBinding::new("ctrl-r", Redo, None),
             KeyBinding::new("0", Zero, None),
             KeyBinding::new("1", One, None),
             KeyBinding::new("*", All, None),
@@ -66,6 +68,13 @@ pub fn main() {
                 items: vec![MenuItem::action("Quit", Quit)],
             },
             Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Undo", Undo),
+                    MenuItem::action("Redo", Redo),
+                ],
+            },
+            Menu {
                 name: "Tools".into(),
                 items: vec![
                     MenuItem::action("Rect", DrawRect),
@@ -80,6 +89,7 @@ pub fn main() {
                     MenuItem::action("Full Hierarchy", All),
                     MenuItem::action("Box Only", Zero),
                     MenuItem::action("Top Level Only", One),
+                    MenuItem::action("Fit to Screen", Fit),
                 ],
             },
         ]);

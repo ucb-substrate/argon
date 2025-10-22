@@ -163,6 +163,7 @@ pub(crate) struct DrawDimToolState {
 #[derive(Debug, Clone)]
 pub(crate) struct EditDimToolState {
     pub(crate) dim: Span,
+    pub(crate) original_value: SharedString,
     /// `true` if entered from dimension tool
     pub(crate) dim_mode: bool,
 }
@@ -213,7 +214,7 @@ pub struct LayoutCanvas {
     subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
     scope_rects: Vec<Rect>,
-    dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>)>,
+    dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
     // True if waiting on render step to finish some initialization.
     //
     // Final bounds of layout canvas only determined in paint step.
@@ -369,6 +370,12 @@ impl Element for CanvasElement {
                 true,
                 vec![],
             )]);
+            dims.extend(
+                solved_cell.output.cells[&scope_address.cell]
+                    .objects
+                    .values()
+                    .filter_map(|obj| obj.get_dimension().cloned()),
+            );
             while let Some((
                 curr_address @ ScopeAddress { scope, cell },
                 mat,
@@ -528,12 +535,6 @@ impl Element for CanvasElement {
                         SolvedValue::Dimension(_) => {}
                     }
                 }
-                dims.extend(
-                    cell_info
-                        .objects
-                        .values()
-                        .filter_map(|obj| obj.get_dimension().cloned()),
-                );
                 for child in &scope_info.children {
                     let scope_address = ScopeAddress {
                         scope: *child,
@@ -739,6 +740,7 @@ impl Element for CanvasElement {
                                 dim_hitboxes.push((
                                     span.clone(),
                                     vec![Bounds::new(origin, size(layout.width, font_size))],
+                                    text.clone(),
                                 ));
                             }
                             window
@@ -1082,7 +1084,7 @@ impl Element for CanvasElement {
                                     inner
                                         .dim_hitboxes
                                         .iter()
-                                        .flat_map(|(_, hitboxes)| hitboxes.iter().copied()),
+                                        .flat_map(|(_, hitboxes, _)| hitboxes.iter().copied()),
                                 )
                             {
                                 if hitbox.contains(&inner.mouse_position) {
@@ -1235,7 +1237,8 @@ impl LayoutCanvas {
             stop: self.screen_bounds.origin.x + self.screen_bounds.size.width,
         };
         let layout_mouse_position = self.px_to_layout(event.position);
-        self.tool.update(cx, |tool, cx| {
+        let edit_dim = self.tool.update(cx, |tool, cx| {
+            let mut edit_dim = false;
             match tool {
                 ToolState::DrawRect(rect_tool) => {
                     let state = self.state.read(cx);
@@ -1501,7 +1504,7 @@ impl LayoutCanvas {
                     if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
                         let selected_scope_addr = cell.state[&cell.selected_scope].address;
 
-                        let span = if dim_tool.edges.len() == 1
+                        let span_value = if dim_tool.edges.len() == 1
                             && let DimEdge::Edge(edge) = &dim_tool.edges[0]
                         {
                             let (left, right, coord, horiz) = match edge.2.dir {
@@ -1509,25 +1512,39 @@ impl LayoutCanvas {
                                 Dir::Vert => ("y0", "y1", layout_mouse_position.x, "false"),
                             };
 
-                            state.lsp_client.draw_dimension(
-                                cell.output.cells[&selected_scope_addr.cell].scopes
-                                    [&selected_scope_addr.scope]
-                                    .span
-                                    .clone(),
-                                DimensionParams {
-                                    p: format!("{}.{}", edge.0, right),
-                                    n: format!("{}.{}", edge.0, left),
-                                    value: format!("{:?}", edge.2.stop - edge.2.start),
-                                    coord: if coord > edge.2.coord {
-                                        format!("{}.{} + {}", edge.0, edge.1, coord - edge.2.coord)
-                                    } else {
-                                        format!("{}.{} - {}", edge.0, edge.1, edge.2.coord - coord)
+                            let value = format!("{:?}", edge.2.stop - edge.2.start);
+                            state
+                                .lsp_client
+                                .draw_dimension(
+                                    cell.output.cells[&selected_scope_addr.cell].scopes
+                                        [&selected_scope_addr.scope]
+                                        .span
+                                        .clone(),
+                                    DimensionParams {
+                                        p: format!("{}.{}", edge.0, right),
+                                        n: format!("{}.{}", edge.0, left),
+                                        value: value.clone(),
+                                        coord: if coord > edge.2.coord {
+                                            format!(
+                                                "{}.{} + {}",
+                                                edge.0,
+                                                edge.1,
+                                                coord - edge.2.coord
+                                            )
+                                        } else {
+                                            format!(
+                                                "{}.{} - {}",
+                                                edge.0,
+                                                edge.1,
+                                                edge.2.coord - coord
+                                            )
+                                        },
+                                        pstop: format!("{}.{}", edge.0, edge.1),
+                                        nstop: format!("{}.{}", edge.0, edge.1),
+                                        horiz: horiz.to_string(),
                                     },
-                                    pstop: format!("{}.{}", edge.0, edge.1),
-                                    nstop: format!("{}.{}", edge.0, edge.1),
-                                    horiz: horiz.to_string(),
-                                },
-                            )
+                                )
+                                .map(|span| (span, value))
                         } else if dim_tool.edges.len() == 2 {
                             match (&dim_tool.edges[0], &dim_tool.edges[1]) {
                                 (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
@@ -1551,6 +1568,7 @@ impl LayoutCanvas {
                                     } else {
                                         format!("- {}", intended_coord - coord)
                                     };
+                                    let value = format!("{:?}", right.2.coord - left.2.coord);
                                     state.lsp_client.draw_dimension(
                                         cell.output.cells[&selected_scope_addr.cell].scopes
                                             [&selected_scope_addr.scope]
@@ -1559,7 +1577,7 @@ impl LayoutCanvas {
                                         DimensionParams {
                                             p: format!("{}.{}", right.0, right.1,),
                                             n: format!("{}.{}", left.0, left.1),
-                                            value: format!("{:?}", right.2.coord - left.2.coord),
+                                            value: value.clone(),
                                             coord: format!(
                                                 "({}.{} + {}.{} + {}.{} + {}.{})/4. {coord_offset}",
                                                 right.0,
@@ -1581,7 +1599,7 @@ impl LayoutCanvas {
                                             ),
                                             horiz: horiz.to_string(),
                                         },
-                                    )
+                                    ).map(|span| (span, value))
                                 }
                                 (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                 | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
@@ -1608,7 +1626,7 @@ impl LayoutCanvas {
                                         (
                                             "0.".to_string(),
                                             format!("{}.{}", edge.0, edge.1),
-                                            format!("{}", -edge.2.coord),
+                                            format!("{:?}", -edge.2.coord),
                                             coord.clone(),
                                             pnstop,
                                         )
@@ -1616,39 +1634,42 @@ impl LayoutCanvas {
                                         (
                                             format!("{}.{}", edge.0, edge.1),
                                             "0.".to_string(),
-                                            format!("{}", edge.2.coord),
+                                            format!("{:?}", edge.2.coord),
                                             pnstop,
                                             coord.clone(),
                                         )
                                     };
-                                    state.lsp_client.draw_dimension(
-                                        cell.output.cells[&selected_scope_addr.cell].scopes
-                                            [&selected_scope_addr.scope]
-                                            .span
-                                            .clone(),
-                                        DimensionParams {
-                                            p,
-                                            n,
-                                            value,
-                                            coord,
-                                            pstop,
-                                            nstop,
-                                            horiz: horiz.to_string(),
-                                        },
-                                    )
+                                    state
+                                        .lsp_client
+                                        .draw_dimension(
+                                            cell.output.cells[&selected_scope_addr.cell].scopes
+                                                [&selected_scope_addr.scope]
+                                                .span
+                                                .clone(),
+                                            DimensionParams {
+                                                p,
+                                                n,
+                                                value: value.clone(),
+                                                coord,
+                                                pstop,
+                                                nstop,
+                                                horiz: horiz.to_string(),
+                                            },
+                                        )
+                                        .map(|span| (span, value))
                                 }
                                 _ => unreachable!(),
                             }
                         } else {
                             None
                         };
-                        if let Some(span) = span {
+                        if let Some((span, value)) = span_value {
                             *tool = ToolState::EditDim(EditDimToolState {
                                 dim: span,
+                                original_value: SharedString::from(value),
                                 dim_mode: true,
                             });
-                            window.focus(&self.text_input_focus_handle);
-                            window.prevent_default();
+                            edit_dim = true;
                             cx.notify();
                         }
                     }
@@ -1674,7 +1695,7 @@ impl LayoutCanvas {
                             );
                             Some((r.id.as_ref()?, rect_bounds))
                         })
-                        .chain(self.dim_hitboxes.iter().flat_map(|(span, hitboxes)| {
+                        .chain(self.dim_hitboxes.iter().flat_map(|(span, hitboxes, _)| {
                             hitboxes.iter().map(|hitbox| (span, *hitbox)).collect_vec()
                         }))
                     {
@@ -1693,7 +1714,14 @@ impl LayoutCanvas {
                 }
                 _ => {}
             }
+            edit_dim
         });
+        if edit_dim {
+            window.focus(&self.text_input_focus_handle);
+            self.text_input_focus_handle
+                .dispatch_action(&EditDim, window, cx);
+            window.prevent_default();
+        }
     }
 
     #[allow(dead_code)]
@@ -1736,25 +1764,25 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn edit_action(&mut self, _: &Edit, window: &mut Window, cx: &mut Context<Self>) {
-        self.tool.update(cx, |tool, cx| {
-            if let ToolState::Select(SelectToolState {
-                selected_obj: Some(obj),
-            }) = tool
-                && self
-                    .dim_hitboxes
-                    .iter()
-                    .map(|(span, _)| span)
-                    .contains(&*obj)
-            {
+        if let ToolState::Select(SelectToolState {
+            selected_obj: Some(obj),
+        }) = self.tool.read(cx)
+            && let Some((_, _, value)) = self.dim_hitboxes.iter().find(|(span, _, _)| span == obj)
+        {
+            let obj = obj.clone();
+            self.tool.update(cx, |tool, _cx| {
                 *tool = ToolState::EditDim(EditDimToolState {
                     dim: obj.clone(),
                     dim_mode: false,
-                });
-                window.focus(&self.text_input_focus_handle);
-                window.prevent_default();
-                cx.notify();
-            }
-        });
+                    original_value: value.clone(),
+                })
+            });
+            window.focus(&self.text_input_focus_handle);
+            self.text_input_focus_handle
+                .dispatch_action(&EditDim, window, cx);
+            window.prevent_default();
+            cx.notify();
+        }
     }
 
     pub(crate) fn command_action(
