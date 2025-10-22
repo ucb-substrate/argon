@@ -150,9 +150,9 @@ You can also define a hierarchical cell in your code editor as follows:
 ```rust
 cell triple_rect() {
     let cell1 = inset_rect(200., 200.);
-    let inst1 = inst(cell1)!;
-    let inst2 = inst(cell1, xi=300.)!;
-    let inst3 = inst(inset_rect(300., 400.), xi=600.)!;
+    let inst1 = inst(cell1);
+    let inst2 = inst(cell1, xi=300.);
+    let inst3 = inst(inset_rect(300., 400.), xi=600.);
 }
 ```
 
