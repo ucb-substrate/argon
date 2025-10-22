@@ -68,6 +68,8 @@ mod tests {
     const ARGON_FLIPPED_RECT: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_basic/lib.ar");
+    const ARGON_SEQ_FN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_fn/lib.ar");
+    const ARGON_SEQ_CELL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_cell/lib.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/examples/argon_workspace/lib.ar"
@@ -562,5 +564,53 @@ mod tests {
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 200., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_seq_fn() {
+        let ast = parse_workspace_with_std(ARGON_SEQ_FN).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 1250., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_seq_cell() {
+        let ast = parse_workspace_with_std(ARGON_SEQ_CELL).unwrap_asts();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        // println!("{:?}", cell.objects);
+        assert!(cell.objects.len() >= 3);
+        let inst = cell
+            .objects
+            .iter()
+            .find_map(|(_, v)| v.get_instance())
+            .unwrap();
+        assert_relative_eq!(inst.x, 2000., epsilon = EPSILON);
+        assert_relative_eq!(inst.y, 3000., epsilon = EPSILON);
     }
 }

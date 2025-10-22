@@ -1,0 +1,19 @@
+fn make_list(base: Float) -> [Float] {
+    cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., nil)))))
+}
+
+fn make_array() -> [[Float]] {
+    cons(make_list(0.), cons(make_list(500.), cons(make_list(1000.), nil)))
+}
+
+fn elem23(arr: [[Float]]) -> Float {
+    head(tail(tail(tail(head(tail(tail(arr)))))))
+}
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., x1=400.);
+    let arr = make_array();
+    let v = elem23(arr);
+    eq(r.y1, v);
+}
+

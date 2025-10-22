@@ -17,7 +17,7 @@ use thiserror::Error;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue,
-    MatchExpr, ModPath, Scope, Span, UnaryOp, WorkspaceAst,
+    MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -193,7 +193,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &FnDecl<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _args: &[ArgDecl<Self::OutputS, Self::OutputMetadata>],
-        _return_ty: &Option<Ident<Self::OutputS, Self::OutputMetadata>>,
+        _return_ty: &Option<TySpec<Self::OutputS, Self::OutputMetadata>>,
         _scope: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
     }
@@ -259,7 +259,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         &mut self,
         _input: &crate::ast::CastExpr<Self::InputS, Self::InputMetadata>,
         _value: &Expr<Self::OutputS, Self::OutputMetadata>,
-        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
@@ -335,7 +335,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         &mut self,
         _input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        _ty: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
@@ -634,7 +634,7 @@ impl<'a> VarIdTyPass<'a> {
         let ty = Ty::Fn(Box::new(FnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             ret: if let Some(return_ty) = &input.return_ty {
-                self.ty_from_ident(return_ty)
+                self.ty_from_spec(return_ty)
             } else {
                 Ty::Nil
             },
@@ -667,14 +667,17 @@ impl<'a> VarIdTyPass<'a> {
         self.alloc(&input.name.name, ty);
     }
 
-    fn ty_from_ident<M: AstMetadata>(&mut self, ident: &Ident<Substr, M>) -> Ty {
-        Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
-            self.errors.push(StaticError {
-                span: self.span(ident.span),
-                kind: StaticErrorKind::UnknownType,
-            });
-            Ty::Unknown
-        })
+    fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
+        match &spec.kind {
+            TySpecKind::Ident(ident) => Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
+                self.errors.push(StaticError {
+                    span: self.span(ident.span),
+                    kind: StaticErrorKind::UnknownType,
+                });
+                Ty::Unknown
+            }),
+            TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
+        }
     }
 
     fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<Substr, M>, ty: Ty) -> Ty {
@@ -968,7 +971,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _input: &FnDecl<Substr, Self::InputMetadata>,
         name: &Ident<Substr, Self::OutputMetadata>,
         _args: &[ArgDecl<Substr, Self::OutputMetadata>],
-        _return_ty: &Option<Ident<Substr, Self::OutputMetadata>>,
+        _return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
         _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
         (self.ast.path.clone(), self.lookup(&name.name).unwrap().0)
@@ -987,7 +990,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let return_ty = input
             .return_ty
             .as_ref()
-            .map(|ident| self.transform_ident(ident));
+            .map(|spec| self.transform_ty_spec(spec));
         let scope = self.transform_scope(&input.scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
@@ -1533,9 +1536,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &crate::ast::CastExpr<Substr, Self::InputMetadata>,
         value: &Expr<Substr, Self::OutputMetadata>,
-        ty: &Ident<Substr, Self::OutputMetadata>,
+        ty: &TySpec<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
-        let ty = self.ty_from_ident(ty);
+        let ty = self.ty_from_spec(ty);
         match (value.ty(), &ty) {
             (Ty::Int, Ty::Float)
             | (Ty::Int, Ty::Int)
@@ -1565,9 +1568,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &ArgDecl<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
-        _ty: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &TySpec<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
-        let ty = self.ty_from_ident(&input.ty);
+        let ty = self.ty_from_spec(&input.ty);
         (self.alloc(&input.name.name, ty.clone()), ty)
     }
 
@@ -1623,6 +1626,22 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 pub enum CellArg {
     Float(f64),
     Int(i64),
+    Seq(Vec<CellArg>),
+}
+
+impl CellArg {
+    pub fn from_value(val: &Value, solver: &Solver) -> Option<Self> {
+        match val {
+            Value::Linear(v) => solver.eval_expr(v).map(CellArg::Float),
+            Value::Int(i) => Some(CellArg::Int(*i)),
+            Value::Seq(s) => s
+                .iter()
+                .map(|v| Self::from_value(v, solver))
+                .collect::<Option<Vec<_>>>()
+                .map(CellArg::Seq),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1946,10 +1965,7 @@ impl<'a> ExecPass<'a> {
         assert_eq!(args.len(), cell_decl.args.len());
         for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
-            let val = match val {
-                CellArg::Int(i) => Value::Int(i),
-                CellArg::Float(f) => Value::Linear(LinearExpr::from(f)),
-            };
+            let val = Value::from_arg(&val);
             self.values.insert(vid, DeferValue::Ready(val));
             frame.bindings.insert(decl.metadata.0, vid);
         }
@@ -2167,14 +2183,9 @@ impl<'a> ExecPass<'a> {
                 }),
             }
         };
-        let emit_value = |vid: ValueId| -> Option<ObjectId> {
+        let emit_value = |vid: ValueId| -> Option<Arrayed<ObjectId>> {
             let value = &self.values[&vid];
-            let value = value.as_ref().unwrap_ready();
-            match value {
-                Value::Rect(r) => Some(r.id),
-                Value::Inst(i) => Some(i.id),
-                _ => None,
-            }
+            value.as_ref().unwrap_ready().obj_ids()
         };
 
         let mut ccell = CompiledCell {
@@ -2194,7 +2205,7 @@ impl<'a> ExecPass<'a> {
         }
 
         for emit in state.emit.iter() {
-            let obj_id = emit_value(emit.value).unwrap();
+            let obj_id = emit_value(emit.value).unwrap().unwrap_elem();
             ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
                 obj_id,
                 CompiledEmit {
@@ -3077,11 +3088,9 @@ impl<'a> ExecPass<'a> {
                         .posargs
                         .iter()
                         .map(|v| {
-                            self.values[v].get_ready().and_then(|v| match v {
-                                Value::Linear(v) => state.solver.eval_expr(v).map(CellArg::Float),
-                                Value::Int(i) => Some(CellArg::Int(*i)),
-                                _ => unreachable!(),
-                            })
+                            self.values[v]
+                                .get_ready()
+                                .and_then(|v| CellArg::from_value(v, &state.solver))
                         })
                         .collect::<Option<Vec<CellArg>>>();
                     if let Some(arg_vals) = arg_vals {
@@ -3366,59 +3375,71 @@ impl<'a> ExecPass<'a> {
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
                                         let cell = &self.compiled_cells[&cell_id];
-                                        match cell.field(field).unwrap() {
-                                            SolvedValue::Rect(rect) => {
-                                                let id = object_id(&mut self.next_id);
-                                                let rect = rect
-                                                    .to_float()
-                                                    .transform(inst.reflect, inst.angle);
-                                                let xrect = Rect {
-                                                    id,
-                                                    layer: rect.layer.clone(),
-                                                    x0: LinearExpr::add(rect.x0, inst.x.clone()),
-                                                    y0: LinearExpr::add(rect.y0, inst.y.clone()),
-                                                    x1: LinearExpr::add(rect.x1, inst.x.clone()),
-                                                    y1: LinearExpr::add(rect.y1, inst.y.clone()),
-                                                    construction: rect.construction,
-                                                    span: rect.span.clone(),
-                                                };
-                                                let state = self.cell_state_mut(vref.loc.cell);
-                                                state
-                                                    .objects
-                                                    .insert(xrect.id, xrect.clone().into());
-                                                Some(Value::Rect(xrect))
-                                            }
-                                            SolvedValue::Instance(cinst) => {
-                                                let (angle, reflect, cx, cy) = cascade(
-                                                    inst.angle,
-                                                    inst.reflect,
-                                                    cinst.angle,
-                                                    cinst.reflect,
-                                                    cinst.x,
-                                                    cinst.y,
-                                                );
-                                                let id = object_id(&mut self.next_id);
-                                                let state = self
-                                                    .cell_states
-                                                    .get_mut(&vref.loc.cell)
-                                                    .unwrap();
-                                                let oinst = Instance {
-                                                    id,
-                                                    cell: cinst.cell_vid,
-                                                    x: LinearExpr::add(inst.x.clone(), cx),
-                                                    y: LinearExpr::add(inst.y.clone(), cy),
-                                                    angle,
-                                                    reflect,
-                                                    construction: cinst.construction,
-                                                    span: cinst.span.clone(),
-                                                };
-                                                state
-                                                    .objects
-                                                    .insert(oinst.id, oinst.clone().into());
-                                                Some(Value::Inst(oinst))
-                                            }
-                                            _ => unreachable!(),
-                                        }
+                                        let state =
+                                            self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                        let obj_id = &mut self.next_id;
+                                        Some(Value::from_array(cell.field(field).unwrap().map(
+                                            &mut move |v| match v {
+                                                SolvedValue::Rect(rect) => {
+                                                    let id = object_id(obj_id);
+                                                    let rect = rect
+                                                        .to_float()
+                                                        .transform(inst.reflect, inst.angle);
+                                                    let xrect = Rect {
+                                                        id,
+                                                        layer: rect.layer.clone(),
+                                                        x0: LinearExpr::add(
+                                                            rect.x0,
+                                                            inst.x.clone(),
+                                                        ),
+                                                        y0: LinearExpr::add(
+                                                            rect.y0,
+                                                            inst.y.clone(),
+                                                        ),
+                                                        x1: LinearExpr::add(
+                                                            rect.x1,
+                                                            inst.x.clone(),
+                                                        ),
+                                                        y1: LinearExpr::add(
+                                                            rect.y1,
+                                                            inst.y.clone(),
+                                                        ),
+                                                        construction: rect.construction,
+                                                        span: rect.span.clone(),
+                                                    };
+                                                    state
+                                                        .objects
+                                                        .insert(xrect.id, xrect.clone().into());
+                                                    Value::Rect(xrect)
+                                                }
+                                                SolvedValue::Instance(cinst) => {
+                                                    let (angle, reflect, cx, cy) = cascade(
+                                                        inst.angle,
+                                                        inst.reflect,
+                                                        cinst.angle,
+                                                        cinst.reflect,
+                                                        cinst.x,
+                                                        cinst.y,
+                                                    );
+                                                    let id = object_id(obj_id);
+                                                    let oinst = Instance {
+                                                        id,
+                                                        cell: cinst.cell_vid,
+                                                        x: LinearExpr::add(inst.x.clone(), cx),
+                                                        y: LinearExpr::add(inst.y.clone(), cy),
+                                                        angle,
+                                                        reflect,
+                                                        construction: cinst.construction,
+                                                        span: cinst.span.clone(),
+                                                    };
+                                                    state
+                                                        .objects
+                                                        .insert(oinst.id, oinst.clone().into());
+                                                    Value::Inst(oinst)
+                                                }
+                                                _ => unreachable!(),
+                                            },
+                                        )))
                                     } else {
                                         None
                                     }
@@ -3571,6 +3592,32 @@ impl Value {
             _ => None,
         }
     }
+
+    pub fn from_arg(arg: &CellArg) -> Self {
+        match arg {
+            CellArg::Int(i) => Value::Int(*i),
+            CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
+        }
+    }
+
+    fn obj_ids(&self) -> Option<Arrayed<ObjectId>> {
+        match self {
+            Value::Rect(r) => Some(Arrayed::Elem(r.id)),
+            Value::Inst(i) => Some(Arrayed::Elem(i.id)),
+            Value::Seq(s) => Some(Arrayed::Array(
+                s.iter().map(|v| v.obj_ids()).collect::<Option<Vec<_>>>()?,
+            )),
+            _ => None,
+        }
+    }
+
+    fn from_array(arr: Arrayed<Value>) -> Self {
+        match arr {
+            Arrayed::Elem(v) => v,
+            Arrayed::Array(s) => Self::Seq(s.into_iter().map(Value::from_array).collect()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3638,7 +3685,7 @@ impl From<Instance> for Object {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledScope {
     pub static_parent: Option<(ScopeId, SeqNum)>,
-    pub bindings: IndexMap<SeqNum, (String, ObjectId)>,
+    pub bindings: IndexMap<SeqNum, (String, Arrayed<ObjectId>)>,
     /// Dynamic children.
     pub children: IndexSet<ScopeId>,
     pub name: String,
@@ -3657,12 +3704,41 @@ pub struct CompiledCell {
     pub inconsistent_constraints: IndexSet<ConstraintId>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[enumify]
+pub enum Arrayed<T> {
+    Elem(T),
+    Array(Vec<Arrayed<T>>),
+}
+
+impl<T> Arrayed<T> {
+    pub fn map<U, F>(&self, f: &mut F) -> Arrayed<U>
+    where
+        F: FnMut(&T) -> U,
+    {
+        match self {
+            Self::Elem(x) => Arrayed::Elem(f(x)),
+            Self::Array(x) => Arrayed::Array(x.iter().map(|x| x.map(f)).collect()),
+        }
+    }
+
+    pub fn for_each<F>(&self, f: &mut F)
+    where
+        F: FnMut(&T),
+    {
+        match self {
+            Self::Elem(x) => f(x),
+            Self::Array(x) => x.iter().for_each(|x| x.for_each(f)),
+        }
+    }
+}
+
 impl CompiledCell {
-    pub fn field(&self, name: &str) -> Option<&SolvedValue> {
+    pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
         let scope = &self.scopes[&self.root];
         scope.bindings.values().find_map(|(n, o)| {
             if n == name {
-                Some(&self.objects[o])
+                Some(o.map(&mut |id| &self.objects[id]))
             } else {
                 None
             }
@@ -4118,7 +4194,7 @@ impl CompiledData {
         }
         for (item_num, (name, obj)) in scope.bindings.iter() {
             if *item_num < seq_num {
-                match &cell.objects[obj] {
+                obj.for_each(&mut |obj| match &cell.objects[obj] {
                     SolvedValue::Rect(r) => {
                         set.insert(r.id, format!("{}{}", name_prefix, name));
                     }
@@ -4126,7 +4202,7 @@ impl CompiledData {
                         set.insert(inst.id, format!("{}{}", name_prefix, name));
                     }
                     _ => (),
-                }
+                });
             }
         }
     }

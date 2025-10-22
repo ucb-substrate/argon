@@ -112,7 +112,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::FnDecl<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
         _args: &[super::ArgDecl<Self::OutputS, Self::OutputMetadata>],
-        _return_ty: &Option<super::Ident<Self::OutputS, Self::OutputMetadata>>,
+        _return_ty: &Option<super::TySpec<Self::OutputS, Self::OutputMetadata>>,
         _scope: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
         input.metadata.clone()
@@ -186,7 +186,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         &mut self,
         input: &super::CastExpr<Self::InputS, Self::InputMetadata>,
         _value: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-        _ty: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &super::TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
         input.metadata.clone()
     }
@@ -239,7 +239,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         &mut self,
         input: &super::ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-        _ty: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &super::TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         input.metadata.clone()
     }

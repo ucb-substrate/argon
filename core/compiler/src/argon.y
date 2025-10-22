@@ -166,7 +166,7 @@ CellDecl -> Result<CellDecl<&'input str, ParseMetadata>, ()>
   ;
 
 FnDecl -> Result<FnDecl<&'input str, ParseMetadata>, ()>
-  : 'FN' Ident '(' ArgDecls ')' '->' Ident Scope
+  : 'FN' Ident '(' ArgDecls ')' '->' TySpec Scope
   {
     Ok(FnDecl {
       name: $2?,
@@ -349,7 +349,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
   | StringLiteral { Ok(Expr::StringLiteral($1?)) }
   | BoolLiteral { Ok(Expr::BoolLiteral($1?)) }
   | NilLiteral { Ok(Expr::Nil($1?)) }
-  | SubFactor 'AS' Ident { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
+  | SubFactor 'AS' TySpec { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
   ;
 
 
@@ -388,7 +388,12 @@ ArgDecls1 -> Result<Vec<ArgDecl<&'input str, ParseMetadata>>, ()>
   ;
 
 ArgDecl -> Result<ArgDecl<&'input str, ParseMetadata>, ()>
-  : Ident ':' Ident { Ok(ArgDecl { name: $1?, ty: $3?, metadata: () }) }
+  : Ident ':' TySpec { Ok(ArgDecl { name: $1?, ty: $3?, metadata: () }) }
+  ;
+
+TySpec -> Result<TySpec<&'input str, ParseMetadata>, ()>
+  : Ident { Ok(TySpec { kind: TySpecKind::Ident($1?), span: $span, }) }
+  | '[' TySpec ']' { Ok(TySpec { kind: TySpecKind::Seq(Box::new($2?)), span: $span, }) }
   ;
 
 Args -> Result<Args<&'input str, ParseMetadata>, ()>
