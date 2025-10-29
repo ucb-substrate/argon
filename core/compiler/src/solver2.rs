@@ -91,7 +91,7 @@ impl Solver {
 
     ///use QR to find inconcistent constraints (like what is a linear combination of others)
     /// kinda troll cuz u doing qr of AT
-    pub fn relationship_resigduals(&self, A: Mat<f64>, B: Mat<f64>) {
+    pub fn relationship_residuals(&self, A: Mat<f64>, B: Mat<f64>) {
         let AT = A.transpose();
         let qr = AT.col_piv_qr();
 
@@ -169,17 +169,19 @@ impl Solver {
         );
 
         let x = P * y1;
-        let residuals = (B - A * x).col(1);
+        let residuals = (B - A*x).col(1);
         let residuals_norm = residuals.norm_l2();
-
+        
         let mut badConstraints = false;
-
+        
         for r in 0..residuals.nrows() {
             if residuals[(r, 0)].abs() > 1e-3 {
                 badConstraints = true;
-            }
+            } 
         }
-
+        
+        
+        
         return Vec![b - A * x, x];
     }
 
