@@ -49,9 +49,16 @@ impl SyncGuiToLspClient {
         let (tx, mut rx) = mpsc::channel(1);
         let mut listener = self.app.background_executor().block(
             async {
-                tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
-                    .await
-                    .unwrap()
+                if let Ok(listener) =
+                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12346), Json::default)
+                        .await
+                {
+                    listener
+                } else {
+                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
+                        .await
+                        .unwrap()
+                }
             }
             .compat(),
         );

@@ -178,7 +178,8 @@ impl Render for LayerSideBar {
                             .filter(|layer| {
                                 layer
                                     .name
-                                    .contains(self.name_filter.read(cx).content.as_ref())
+                                    .to_lowercase()
+                                    .contains(&self.name_filter.read(cx).content.to_lowercase())
                                     && (!self.state.read(cx).used_filter || layer.used)
                             })
                             .map(|layer| {
@@ -284,7 +285,8 @@ impl HierarchySideBar {
         let expanded = self.expanded_scopes.contains(&scope_path);
         if scope_state
             .name
-            .contains(self.name_filter.read(cx).content.as_ref())
+            .to_lowercase()
+            .contains(&self.name_filter.read(cx).content.to_lowercase())
         {
             scopes.push(
                 div()
