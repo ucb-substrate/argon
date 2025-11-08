@@ -105,7 +105,6 @@ impl StateMut {
     }
 
     async fn compile(&mut self, client: &Client, update: bool) {
-        // TODO: un-hardcode this.
         if let Some(root_dir) = &self.root_dir {
             self.config = parse_config(root_dir.join("Argon.toml")).ok();
             let lyp = self

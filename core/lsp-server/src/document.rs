@@ -36,7 +36,6 @@ impl Document {
         pos2position(self.contents.offset_to_pos(offset).unwrap())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn substr(&self, range: std::ops::Range<Position>) -> &str {
         self.contents
             .substr(position2pos(range.start)..position2pos(range.end))

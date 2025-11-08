@@ -6,7 +6,7 @@ local commands = require('argon_lsp.commands')
 
 ---LSP restart internal implementations
 ---@param bufnr? number The buffer number, defaults to the current buffer
----@param filter? rustaceanvim.lsp.get_clients.Filter
+---@param filter? vim.lsp.get_clients.Filter
 ---@param callback? fun(client: vim.lsp.Client) Optional callback to run for each client before restarting.
 ---@return number|nil client_id
 local function restart(bufnr, filter, callback)

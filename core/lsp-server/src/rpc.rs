@@ -97,7 +97,6 @@ impl GuiToLsp for LspServer {
         var_name: String,
         rect: BasicRect<f64>,
     ) -> Option<Span> {
-        // TODO: check if editor file is up to date with ast.
         let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
         if let Some(ast) = state_mut
@@ -224,7 +223,6 @@ impl GuiToLsp for LspServer {
         scope_span: Span,
         params: DimensionParams,
     ) -> Option<Span> {
-        // TODO: check if editor file is up to date with ast.
         let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
         if let Some(ast) = state_mut
@@ -347,7 +345,6 @@ impl GuiToLsp for LspServer {
         span: Span,
         value: String,
     ) -> Option<Span> {
-        // TODO: check if editor file is up to date with ast.
         let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&span.path).unwrap();
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
@@ -420,7 +417,6 @@ impl GuiToLsp for LspServer {
         lhs: String,
         rhs: String,
     ) {
-        // TODO: check if editor file is up to date with ast.
         let state_mut = self.state.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
         if let Some(ast) = state_mut

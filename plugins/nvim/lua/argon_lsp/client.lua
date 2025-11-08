@@ -3,11 +3,8 @@
 ---@class argon_lsp.client.ClientAdapter
 local M = {}
 
----@class argon_lsp.lsp.get_clients.Filter: vim.lsp.get_clients.Filter
----@field exclude_rustc_target? string Cargo target triple (e.g., 'x86_64-unknown-linux-gnu') to filter rust-analyzer clients
-
 ---@param bufnr number | nil 0 for the current buffer, `nil` for no buffer filter
----@param filter? argon_lsp.lsp.get_clients.Filter
+---@param filter? vim.lsp.get_clients.Filter
 ---@return vim.lsp.Client[]
 M.get_active_argon_lsp_clients = function(bufnr, filter)
   ---@type vim.lsp.get_clients.Filter
