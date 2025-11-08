@@ -1498,7 +1498,6 @@ impl LayoutCanvas {
                     } else {
                         true
                     };
-                    // TODO: add dimension constraint to code here instead of in input.rs
                     let state = self.state.read(cx);
 
                     if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
@@ -1724,7 +1723,6 @@ impl LayoutCanvas {
         }
     }
 
-    #[allow(dead_code)]
     fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
         Point::new(self.scale * Pixels(pt.x), self.scale * Pixels(-pt.y))
             + self.offset
@@ -1842,7 +1840,6 @@ impl LayoutCanvas {
         });
     }
 
-    #[allow(unused)]
     pub(crate) fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1867,7 +1864,6 @@ impl LayoutCanvas {
         cx.notify();
     }
 
-    #[allow(unused)]
     pub(crate) fn on_drag_move(
         &mut self,
         _event: &DragMoveEvent<()>,
@@ -1877,7 +1873,6 @@ impl LayoutCanvas {
         self.is_dragging = false;
     }
 
-    #[allow(unused)]
     pub(crate) fn on_mouse_up(
         &mut self,
         _event: &MouseUpEvent,

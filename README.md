@@ -34,7 +34,7 @@ Future versions of Argon will hopefully support:
 
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
-- One of [Neovim](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code](https://code.visualstudio.com/download)
+- One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
 
 Begin by cloning and compiling the Argon source code:
 
@@ -81,6 +81,15 @@ Add the following key:
 }
 ```
 
+Compile the VS Code extension by running the following from the root directory of your Argon clone:
+
+```bash
+cd plugins/vscode
+npm install
+npm run compile
+cd ../..
+```
+
 To open an example Argon workspace, run the following from the root directory of your Argon clone:
 
 ```bash
@@ -91,10 +100,18 @@ We recommend defining an alias in your shell configuration to simplify future co
 
 ```bash
 alias codear="code --extensionDevelopmentPath=<absolute_path_to_argon_repo>/plugins/vscode"
+```
+
+With this alias defined, you can now run:
+
+```bash
 codear core/compiler/examples/argon_workspace
 ```
 
 Open the `lib.ar` file within the workspace. You can then start the GUI by running Command Palette > Argon LSP: Start GUI.
+
+> [!WARNING]
+> If you cannot find the command for starting the GUI but did not notice any obvious errors, you may be on an old version of VS Code.
 
 From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
 in both VS Code and the GUI.
@@ -133,10 +150,11 @@ Hit `d` to use the Dimension tool and click on the top edge of each rectangle. C
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
 of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
 
-Double check that there are no errors in your code editor, or the GUI will not be able to
-display the updated cell. If you make a mistake, 
-you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
-respectively, or manually modify the code in the text editor if needed.
+> [!WARNING]
+> Double check that there are no errors in your code editor, or the GUI will not be able to
+> display the updated cell. If you make a mistake, 
+> you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
+> respectively, or manually modify the code in the text editor if needed.
 
 Repeat for the other 3 sides of the rectangle.
 
