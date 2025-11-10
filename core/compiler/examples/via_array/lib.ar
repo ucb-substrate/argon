@@ -9,7 +9,7 @@ cell vias() {
     eq(via.x0, 0.);
     eq(via.y0, 0.);
     let intersection = #scope0 std::intersection(met1, met2);
-    let via_array = #scope1 std::max_array(via, intersection.w, intersection.h, 7., 7.);
+    let via_array = #scope1 std::max_array(via, intersection.w, intersection.h, 4., 4.);
     eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
     eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
 
@@ -22,4 +22,12 @@ cell vias() {
     eq(met1.y0, 5.);
     eq(met1.x1, 95.);
     eq(met1.y1, 95.);
+    let rect0 = rect("met1", x0i = 104.8876495361328, y0i = 44.94535827636719, x1i = 138.3390655517578, y1i = 89.4662857055664)!;
+    let rect1 = rect("met1", x0i = 23.816783905029297, y0i = 109.46134948730467, x1i = 88.86714172363281, y1i = 133.4925079345703)!;
+    let rect2 = rect("met1", x0i = -44.62438201904297, y0i = 62.87663269042969, x1i = -16.965187072753906, y1i = 125.67778778076172)!;
+    let rect3 = rect("met1", x0i = -53.744258880615234, y0i = 18.89412498474121, x1i = -6.56930685043335, y1i = 42.87104034423828)!;
+    let rect4 = rect("met1", x0i = -48.53336334228515, y0i = -6.339365482330322, x1i = -12.944475173950195, y1i = 14.906608581542969)!;
+    let rect5 = rect("met1", x0i = 1.9109463691711424, y0i = -30.261226654052734, x1i = 98.14733123779295, y1i = -2.6854238510131836)!;
+    let rect6 = rect("met1", x0i = -95.67323303222656, y0i = 55.12253952026367, x1i = -61.15962219238281, y1i = 102.88053131103516)!;
+    let rect7 = rect("met1", x0i = -117.24901580810548, y0i = 0.8445477485656738, x1i = -68.25762176513672, y1i = 47.33610153198242)!;
 }

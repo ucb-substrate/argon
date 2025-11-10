@@ -69,4 +69,33 @@ cell inverter(nw: Float, pw: Float) {
     let cons = crect(x0=vdd_ntap.x0, x1=vdd_ntap.x1, y0=vdd_ntap.y0+80., y1=vdd_ntap.y1-80.);
     let r = #scope10 std::max_array(licon, cons.w, cons.h, 340., 340.);
     #scope11 std::center_rects(r, cons);
+
+    // Create via.
+    let met2 = rect("met2");
+    let met1 = rect("met1");
+    let via = crect(layer="via1");
+    eq(via.w, 10.);
+    eq(via.h, 10.);
+    eq(via.x0, 0.);
+    eq(via.y0, 0.);
+    let intersection = #scope12 std::intersection(met1, met2);
+    let via_array = #scope13 std::max_array(via, intersection.w, intersection.h, 4., 4.);
+    eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
+    eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
+
+    // Constrain metals.
+    eq(met2.x0, -50.);
+    eq(met2.y0, -50.);
+    eq(met2.x1, 50.);
+    eq(met2.y1, 50.);
+    eq(met1.x0, -45.);
+    eq(met1.y0, -45.);
+    eq(met1.x1, 45.);
+    eq(met1.y1, 45.);
+
+    let rect0 = rect("diff.pin", x0i = 1312.0797119140625, y0i = 261.0885009765625, x1i = 2195.316162109375, y1i = 1018.610595703125)!;
+    let rect1 = rect("diff.pin", x0i = 1284.021728515625, y0i = 1152.3382568359375, x1i = 2899.489990234375, y1i = 2258.67724609375)!;
+    let rect2 = rect("nwell.net", x0i = 1436.1422119140625, y0i = 2051.601318359375, x1i = 1534.3118896484375, y1i = 2117.73974609375)!;
+    let rect3 = rect("pwell.res", x0i = 1545.271728515625, y0i = 1402.0479736328125, x1i = 2534.71337890625, y1i = 2050.351318359375)!;
+    let rect4 = rect("pwell.res", x0i = 1411.432373046875, y0i = -584.3131103515625, x1i = 1697.8162841796875, y1i = 374.1241760253906)!;
 }

@@ -110,6 +110,7 @@ impl Solver {
         use nalgebra::{DMatrix, DVector};
         use nalgebra::{Dyn, Matrix, VecStorage};
         use rayon::prelude::*;
+        use std::time::Instant;
 
         let tolerance = 0.03;
         let n_vars = self.next_var as usize;
@@ -138,6 +139,8 @@ impl Solver {
         let temp_a_constraind_ids: Vec<u64> = self.constraints.par_iter().map(|c| c.id).collect();
         let a_constraint_ids = Vec::from_iter(temp_a_constraind_ids);
 
+        let start_time = Instant::now();
+
         let qr = SpqrFactorization::new(&a).unwrap();
 
         let rank = qr.rank();
@@ -146,16 +149,36 @@ impl Solver {
         let E = qr.permutation();
 
         let x = if m >= n {
-            qr.solve(&b).unwrap()
+            qr.solve_regular(&b).unwrap()
         } else {
-            let at = a.transpose();
-            let aat = &a * &at;
-            let qr_normal = SpqrFactorization::new(&aat).unwrap();
-            let y = qr_normal.solve(&b).unwrap();
-            &at * &y
+            // let at = a.transpose();
+            // let aat = &a * &at;
+            // let qr_normal = SpqrFactorization::new(&aat).unwrap();
+            // let y = qr_normal.solve_regular(&b).unwrap();
+            // &at * &y
+            qr.solve_underconstrained(&a, &b).unwrap()
         };
 
         let residual = &b - &a * &x;
+
+        let elapsed_time = start_time.elapsed();
+
+        use std::fs;
+        use std::fs::OpenOptions;
+        use std::io::{self, Write};
+
+        let time_str = format!(
+            "sparse qr time on {rows}x{cols} taken: {:?}\n",
+            elapsed_time,
+            rows = m,
+            cols = n
+        );
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open("sparse_qr_time_count.txt")
+            .unwrap();
+        file.write_all(time_str.as_bytes()).unwrap();
 
         let tolerance = 1e-10;
 
@@ -174,6 +197,17 @@ impl Solver {
             let actual_val = x[(r, 0)];
             self.solved_vars.insert(Var(r as u64), actual_val);
         }
+
+        for constraint in self.constraints.iter_mut() {
+            substitute_expr(&self.solved_vars, &mut constraint.expr);
+            if constraint.expr.coeffs.is_empty()
+                && approx::relative_ne!(constraint.expr.constant, 0., epsilon = EPSILON)
+            {
+                self.inconsistent_constraints.insert(constraint.id);
+            }
+        }
+        self.constraints
+            .retain(|constraint| !constraint.expr.coeffs.is_empty());
     }
 
     pub fn solve_qr(&mut self) {

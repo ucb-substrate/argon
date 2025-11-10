@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
-nalgebra = "0.34"
+nalgebra = { version = "0.34", features = ["rayon"] }
 nalgebra-sparse = "0.11"
 klayout-lyp = "0.1.1"
 faer = {version = "0.23.2", features = ["rayon"]}

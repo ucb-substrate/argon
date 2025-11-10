@@ -13,7 +13,10 @@ mod ffi {
 
 use nalgebra::DMatrix;
 use nalgebra::DVector;
+use nalgebra::SimdPartialOrd;
+use rayon::prelude::*;
 use std::ptr;
+use std::ptr::NonNull;
 
 pub struct SpqrFactorization {
     q: *mut ffi::cholmod_sparse,
@@ -25,11 +28,23 @@ pub struct SpqrFactorization {
     n: usize,
 }
 
+pub struct unsafe_pointer_for_threads<T> {
+    pointer: NonNull<T>,
+}
+impl<T> unsafe_pointer_for_threads<T> {
+    fn as_ptr(&self) -> *mut T {
+        return self.pointer.as_ptr();
+    }
+}
+unsafe impl<T> Send for unsafe_pointer_for_threads<T> {}
+unsafe impl<T> Sync for unsafe_pointer_for_threads<T> {}
+
 impl SpqrFactorization {
     pub fn new(matrix: &DMatrix<f64>) -> Result<Self, String> {
         unsafe {
             let mut cc = Box::new(std::mem::zeroed::<ffi::cholmod_common>());
             ffi::cholmod_l_start(cc.as_mut());
+            cc.nthreads_max = 0;
 
             let m = matrix.nrows();
             let n = matrix.ncols();
@@ -110,14 +125,10 @@ impl SpqrFactorization {
         let m = matrix.nrows();
         let n = matrix.ncols();
 
-        let mut nnz = 0;
-        for i in 0..m {
-            for j in 0..n {
-                if matrix[(i, j)] != 0 as f64 {
-                    nnz = nnz + 1;
-                }
-            }
-        }
+        let mut nnz = matrix
+            .par_column_iter()
+            .map(|col| col.into_iter().filter(|x| **x != 0.0).count())
+            .sum();
 
         if nnz < 1 {
             nnz = 1;
@@ -172,13 +183,18 @@ impl SpqrFactorization {
 
         let dense_ref = &mut *dense;
         let data_pointer = dense_ref.x as *mut f64;
+        let acc_data_pointer = unsafe_pointer_for_threads::<f64> {
+            pointer: NonNull::new(data_pointer).unwrap(),
+        };
 
         //column major for cholmod
-        for j in 0..n {
+
+        (0..n).into_par_iter().for_each(|j| unsafe {
+            let col_pointer = acc_data_pointer.as_ptr().add(j * m);
             for i in 0..m {
-                *data_pointer.add(i + j * m) = matrix[(i, j)];
+                *col_pointer.add(i) = matrix[(i, j)];
             }
-        }
+        });
 
         Ok(dense)
     }
@@ -204,20 +220,27 @@ impl SpqrFactorization {
         let dense_ref = &*dense;
         let m = dense_ref.nrow;
         let n = dense_ref.ncol;
-        let data_pointer = dense_ref.x as *const f64;
+        let data_pointer = dense_ref.x as *mut f64;
+        let acc_data_pointer = unsafe_pointer_for_threads {
+            pointer: NonNull::new(data_pointer).unwrap(),
+        };
 
         let mut matrix = DMatrix::zeros(m, n);
 
-        for j in 0..n {
-            for i in 0..m {
-                matrix[(i, j)] = *data_pointer.add(i + j * m);
-            }
-        }
+        matrix
+            .par_column_iter_mut()
+            .enumerate()
+            .for_each(|(j, mut col_slice)| unsafe {
+                let col_pointer = acc_data_pointer.as_ptr().add(j * m);
+                for i in 0..m {
+                    col_slice[i] = *col_pointer.add(i);
+                }
+            });
 
         Ok(matrix)
     }
 
-    pub fn solve(&self, b: &DVector<f64>) -> Result<DVector<f64>, String> {
+    pub fn solve_regular(&self, b: &DVector<f64>) -> Result<DVector<f64>, String> {
         let q = self.q_matrix().unwrap();
         let r = self.r_matrix().unwrap();
         let perm_vec = self.permutation().unwrap();
@@ -239,6 +262,33 @@ impl SpqrFactorization {
         for i in 0..self.n {
             x[perm_vec[i]] = y[i];
         }
+
+        Ok(x)
+    }
+
+    pub fn solve_underconstrained(
+        &self,
+        a: &DMatrix<f64>,
+        b: &DVector<f64>,
+    ) -> Result<DVector<f64>, String> {
+        let qr = SpqrFactorization::new(&a.transpose()).unwrap();
+
+        let q = qr.q_matrix().unwrap();
+        let r = qr.r_matrix().unwrap();
+        let perm_vec = qr.permutation().unwrap();
+        let rank = qr.rank();
+
+        let mut c = DVector::zeros(a.nrows());
+        for i in 0..a.nrows() {
+            c[i] = b[perm_vec[i]];
+        }
+
+        let r_main = r.columns(0, rank);
+        let c_main = c.rows(0, rank);
+
+        let y = r_main.transpose().solve_lower_triangular(&c_main).unwrap();
+
+        let x = q * y;
 
         Ok(x)
     }

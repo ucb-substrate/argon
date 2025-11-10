@@ -1,0 +1,2 @@
+sparse qr time on 40x40 taken: 3.043208ms
+sparse qr time on 2x2 taken: 243.333µs
