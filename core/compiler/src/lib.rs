@@ -470,6 +470,9 @@ mod tests {
             })
             .collect::<IndexMap<_, _>>();
         for rect in cell.objects.iter().filter_map(|obj| obj.1.get_rect()) {
+            if rect.construction {
+                continue;
+            }
             if let Some(layer) = &rect.layer {
                 let (layer, datatype) = layers[&layer.as_str()];
                 let x0 = rect.x0.0 as i32;

@@ -1,5 +1,5 @@
 cell inverter(nw: Float, pw: Float) {
-    let ndiff = rect("diff.drawing", x0=0., y0=0., y1=nw + nw);
+    let ndiff = rect("diff.drawing", x0=0., y0=0., y1=nw);
     let poly = rect("poly.drawing", y0=ndiff.y0-130.);
     eq(poly.x0 + poly.x1, ndiff.x0 + ndiff.x1);
     eq(poly.x1 - poly.x0, 150.);
@@ -55,7 +55,7 @@ cell inverter(nw: Float, pw: Float) {
 
     let nwell = rect("nwell.drawing", x0=ntap.x0-180., x1=ntap.x1+180., y0=pdiff.y0-180., y1=ntap.y1+180.);
 
-    let licon = rect("licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
+    let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let cons = crect(x0=vdd_s.x0, x1=vdd_s.x1, y0=pdiff.y0+40., y1=pdiff.y1-40.);
     #scope1 std::center_rects(cons, #scope0 std::max_array(licon, cons.w, cons.h, 340., 340.));
     let cons = crect(x0=vout.x0, x1=vout.x1, y0=pdiff.y0+40., y1=pdiff.y1-40.);
