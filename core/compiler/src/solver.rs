@@ -190,7 +190,6 @@ impl Solver {
         let forward = E.unwrap();
 
         let determ_var_idx: Vec<usize> = forward[0..rank].to_vec();
-        // let _free_var_idx: Vec<usize> = forward[rank..n].to_vec();
         
         for &r in determ_var_idx.iter() {
             let actual_val = x[(r, 0)];
@@ -310,7 +309,6 @@ impl Solver {
         let (forward, __) = P.arrays();
 
         let determ_var_idx: Vec<usize> = forward[0..rank_A].to_vec();
-        let _free_var_idx: Vec<usize> = forward[rank_A..n].to_vec();
 
         for (_i, &r) in determ_var_idx.iter().enumerate() {
             let actual_val = x[(r, 0)];
