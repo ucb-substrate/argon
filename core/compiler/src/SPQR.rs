@@ -389,7 +389,7 @@ impl SpqrFactorization {
     ///Returns the nullspace vectors of A. Uses the last n - r rows of Q from AT
     pub fn get_nullspace(&self) -> Result<DMatrix<f64>, String> {
         let q = &self.qat_matrix().unwrap();
-        let null_space_vectors = q.columns(self.rank, self.n).clone_owned(); //might have to change depending on memmove time
+        let null_space_vectors = q.columns(self.rank, self.n - self.rank).clone_owned(); //might have to change depending on memmove time
         return Ok(null_space_vectors);
     }
 }
@@ -418,7 +418,6 @@ impl Drop for SpqrFactorization {
                     &mut *self.cc_a,
                 );
             }
-            println!("WERE HERE");
             if !self.e_at.is_null() {
                 ffi::cholmod_l_free(
                     self.m,
@@ -427,7 +426,6 @@ impl Drop for SpqrFactorization {
                     &mut *self.cc_at,
                 );
             }
-            println!("WERE NOT HERE");
 
             if !self.cc_a.is_null() {
                 ffi::cholmod_l_finish(&mut *self.cc_a);

@@ -13,7 +13,6 @@ const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
-//use crate::spqr_wrapper::SpqrFactorization;
 use crate::SPQR::SpqrFactorization;
 
 #[derive(Clone, Default)]
@@ -182,16 +181,15 @@ impl Solver {
                 self.inconsistent_constraints.insert(a_constraint_ids[i]);
             }
         }
-        let forward = E.unwrap();
 
-        let determ_var_idx: Vec<usize> = forward[0..rank].to_vec();
-        let _free_var_idx: Vec<usize> = forward[rank..n].to_vec();
-
-        let par_solved_vars: HashMap<Var, f64> = determ_var_idx
-            .par_iter()
-            .map(|&r| {
-                let actual_val = x[(r, 0)];
-                (Var(r as u64), actual_val)
+        let ones_vector: DVector<f64> = DVector::from_element(n - rank, 1.0);
+        let null_space_components = qr.get_nullspace().unwrap().abs() * ones_vector;
+        let par_solved_vars: HashMap<Var, f64> = (0..n)
+            .into_par_iter()
+            .filter(|&i| null_space_components[i] < tolerance)
+            .map(|i| {
+                let actual_val = x[(i, 0)];
+                (Var(i as u64), actual_val)
             })
             .collect();
 
