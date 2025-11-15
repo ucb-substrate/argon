@@ -139,6 +139,10 @@ impl SpqrFactorization {
         }
     }
 
+    ///triplet construction of A, AT
+    /// Need AT to get nullspace vectors a
+    /// last m - r columns of Q for A^T are nullspace basis vectors
+
     ///triplet to cholmod sparse
     pub unsafe fn triplet_to_cholmod_sparse(
         triplet: &Vec<(usize, usize, f64)>,

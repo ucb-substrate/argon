@@ -29,4 +29,5 @@ geometry = { version = "0.7", registry = "substrate" }
 enumify = { version = "0.2", registry = "substrate" }
 
 [profile.release]
+debug=true
 opt-level = 3

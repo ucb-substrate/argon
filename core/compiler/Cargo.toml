@@ -13,7 +13,6 @@ rayon = "1.10"
 faer-ext = { version = "0.7.1", features = ["nalgebra"] }
 libc = "0.2"
 
-
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }
 lrlex = { workspace = true }

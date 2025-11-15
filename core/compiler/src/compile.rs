@@ -2644,6 +2644,17 @@ impl<'a> ExecPass<'a> {
         vid
     }
 
+    fn stall(&mut self) {
+        let mut j = 0;
+        for i in 0..10000000 {
+            if i % 2 == 0 {
+                j += i;
+            } else {
+                j -= i;
+            }
+        }
+    }
+
     fn eval_partial(&mut self, vid: ValueId) -> bool {
         let v = self.values.swap_remove(&vid);
         if v.is_none() {
