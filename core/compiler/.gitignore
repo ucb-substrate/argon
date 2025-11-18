@@ -1,1 +1,4 @@
 build/
+
+# Ignore timing files
+*.txt

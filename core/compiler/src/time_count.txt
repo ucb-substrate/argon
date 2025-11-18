@@ -1,0 +1,3 @@
+time taken: 5.672459ms
+time taken: 481.625µs
+time taken: 175.55875ms

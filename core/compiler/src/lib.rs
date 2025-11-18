@@ -4,6 +4,9 @@ pub mod config;
 pub mod layer;
 pub mod parse;
 pub mod solver;
+pub mod spqr_wrapper;
+pub use spqr_wrapper::SpqrFactorization;
+pub mod SPQR;
 
 #[cfg(test)]
 mod tests {
