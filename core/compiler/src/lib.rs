@@ -19,7 +19,7 @@ mod tests {
     use indexmap::IndexMap;
     use regex::Regex;
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::compile::{compile, CellArg, CompileInput};
     const EPSILON: f64 = 1e-10;
 
     const ARGON_SCOPES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes/lib.ar");
@@ -69,6 +69,8 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/examples/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_basic/lib.ar");
     const ARGON_SEQ_FN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_fn/lib.ar");
+    const ARGON_SEQ_RECUR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_recur/lib.ar");
+    const ARGON_LUB_MATCH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lub_match/lib.ar");
     const ARGON_SEQ_CELL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_cell/lib.ar");
     const ARGON_WORKSPACE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -640,6 +642,56 @@ mod tests {
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 1250., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_seq_recur() {
+        let o = parse_workspace_with_std(ARGON_SEQ_RECUR);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 1200., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_lub_match() {
+        let o = parse_workspace_with_std(ARGON_LUB_MATCH);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 200., epsilon = EPSILON);
     }
 
     #[test]

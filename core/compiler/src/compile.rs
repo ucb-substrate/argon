@@ -1,6 +1,7 @@
 //! # Argon compiler
 //
-//! Pass 1: assign variable IDs/type checking
+//! Pass 1: import resolution
+//! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, VecDeque};
 use std::io::BufReader;
@@ -376,7 +377,7 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct VarIdTyFrame {
     var_bindings: IndexMap<Substr, (VarId, Ty)>,
     scope_bindings: IndexSet<Substr>,
@@ -498,6 +499,25 @@ impl Ty {
             "Int" => Some(Ty::Int),
             "()" => Some(Ty::Nil),
             _ => None,
+        }
+    }
+
+    /// Computes the least upper bound (LUB) of self and other.
+    /// For use in type promotion.
+    pub fn lub(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            // Unknown promotes to any type.
+            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
+            // Nil promotes to any sequence type.
+            (Ty::Nil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::Nil) => Some(Ty::Seq(inner.clone())),
+            // No other types promote.
+            (a, b) => {
+                if a == b {
+                    Some(a.clone())
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -632,10 +652,13 @@ impl<'a> VarIdTyPass<'a> {
         let args: Vec<_> = input
             .args
             .iter()
-            .map(|arg| self.transform_arg_decl(arg))
+            .map(|arg| {
+                let ty_spec = self.transform_ty_spec(&arg.ty);
+                self.ty_from_spec(&ty_spec)
+            })
             .collect();
         let ty = Ty::Fn(Box::new(FnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            args,
             ret: if let Some(return_ty) = &input.return_ty {
                 self.ty_from_spec(return_ty)
             } else {
@@ -873,7 +896,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
-        // Currently, ident path exprs are either single variables or enum values
+        // Currently, ident path exprs are either single variables or enum values.
         // Parser grammar ensures paths cannot be empty.
         assert!(!input.path.is_empty());
         if input.path.len() == 1 {
@@ -984,17 +1007,43 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &FnDecl<Substr, Self::InputMetadata>,
     ) -> FnDecl<Substr, Self::OutputMetadata> {
-        let args: Vec<_> = input
-            .args
-            .iter()
-            .map(|arg| self.transform_arg_decl(arg))
-            .collect();
         let name = self.transform_ident(&input.name);
         let return_ty = input
             .return_ty
             .as_ref()
             .map(|spec| self.transform_ty_spec(spec));
-        let scope = self.transform_scope(&input.scope);
+        // TODO: this code is mostly duplicated from `transform_scope`.
+        self.enter_scope(&input.scope);
+        let scope_annotation = input
+            .scope
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
+        let args: Vec<_> = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
+        let stmts = input
+            .scope
+            .stmts
+            .iter()
+            .map(|stmt| self.transform_statement(stmt))
+            .collect_vec();
+        let tail = input
+            .scope
+            .tail
+            .as_ref()
+            .map(|stmt| self.transform_expr(stmt));
+        let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
+        let scope = Scope {
+            scope_annotation,
+            span: input.span,
+            stmts,
+            tail,
+            metadata,
+        };
+        self.exit_scope(&input.scope, &scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
             name,
@@ -1127,13 +1176,16 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
-        if then_ty != else_ty {
+        let lub_ty = then_ty.lub(&else_ty);
+        if let Some(lub_ty) = lub_ty {
+            lub_ty
+        } else {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::BranchesDifferentTypes,
             });
+            then_ty
         }
-        then_ty
     }
 
     fn dispatch_match_expr(
@@ -1246,12 +1298,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        if left_ty != right_ty {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
-            });
-        } else {
+        let lub_ty = left_ty.lub(&right_ty);
+        if let Some(lub_ty) = lub_ty {
             if left_ty == Ty::Float
                 && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
             {
@@ -1268,12 +1316,38 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::EnumsNotOrd,
                 });
             }
-            if !matches!(left_ty, Ty::Float | Ty::Int | Ty::Enum(_)) {
+            if matches!(left_ty, Ty::Nil)
+                && matches!(right_ty, Ty::Nil)
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::NilNotOrd,
+                });
+            }
+            if matches!(lub_ty, Ty::Seq(_))
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+                && !(left_ty == Ty::Nil || right_ty == Ty::Nil)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::SeqMustCompareEqNil,
+                });
+            }
+            if !matches!(
+                left_ty,
+                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil
+            ) {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
                     kind: StaticErrorKind::ComparisonInvalidType,
                 });
             }
+        } else {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::BinOpMismatchedTypes,
+            });
         }
         Ty::Bool
     }
@@ -3343,6 +3417,24 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                             true
                         }
+                        (Value::Nil, Value::Nil) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => true,
+                                crate::ast::ComparisonOp::Ne => false,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
+                        (Value::Seq(x), Value::Nil) | (Value::Nil, Value::Seq(x)) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => x.is_empty(),
+                                crate::ast::ComparisonOp::Ne => !x.is_empty(),
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -3861,6 +3953,12 @@ pub enum StaticErrorKind {
     /// Cannot perform greater/less than comparisons on enum values.
     #[error("cannot perform greater/less than comparisons on enum values")]
     EnumsNotOrd,
+    /// Cannot perform greater/less than comparisons on nil values.
+    #[error("cannot perform greater/less than comparisons on nil")]
+    NilNotOrd,
+    /// Must compare sequences for equality/inequality to nil.
+    #[error("sequences can only be compared for equality/inequality to nil")]
+    SeqMustCompareEqNil,
     /// A type cannot be used in a binary expression.
     #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,

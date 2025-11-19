@@ -1,0 +1,19 @@
+fn make_list(base: Float) -> [Float] {
+    cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., nil)))))
+}
+
+fn double(arr: [Float]) -> [Float] {
+    if arr == nil {
+        nil
+    } else {
+        cons(2. * head(arr), double(tail(arr)))
+    }
+}
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., x1=400.);
+    let arr = make_list(500.);
+    let v = head(tail(double(arr)));
+    eq(r.y1, v);
+}
+

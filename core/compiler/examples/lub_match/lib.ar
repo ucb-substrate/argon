@@ -1,0 +1,20 @@
+enum ListKind {
+    Empty,
+    Pair,
+}
+
+fn make_list(kind: ListKind) -> [Float] {
+    match kind {
+        ListKind::Empty => nil,
+        ListKind::Pair => cons(100., cons(200., nil)),
+    }
+}
+
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., x1=400.);
+    let arr = make_list(ListKind::Pair);
+    let v = head(tail(arr));
+    eq(r.y1, v);
+}
+
