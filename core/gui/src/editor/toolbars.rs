@@ -168,7 +168,7 @@ impl Render for ToolBar {
                                 .id(*id)
                                 .on_click({
                                     let state = self.state.clone();
-                                    move |_, window, cx| {
+                                    move |_, _, cx| {
                                         on_click(state.clone(), cx);
                                     }
                                 })
