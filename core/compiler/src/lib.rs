@@ -19,7 +19,7 @@ mod tests {
     use indexmap::IndexMap;
     use regex::Regex;
 
-    use crate::compile::{compile, CellArg, CompileInput};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const ARGON_SCOPES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes/lib.ar");

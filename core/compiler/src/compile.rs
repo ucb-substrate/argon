@@ -696,11 +696,15 @@ impl<'a> VarIdTyPass<'a> {
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
         match &spec.kind {
             TySpecKind::Ident(ident) => Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
-                self.errors.push(StaticError {
-                    span: self.span(ident.span),
-                    kind: StaticErrorKind::UnknownType,
-                });
-                Ty::Unknown
+                if let Some((_, ty)) = self.lookup(ident.name.as_str()) {
+                    ty
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(ident.span),
+                        kind: StaticErrorKind::UnknownType,
+                    });
+                    Ty::Unknown
+                }
             }),
             TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
         }
@@ -1196,7 +1200,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
         let scrutinee_ty = scrutinee.ty();
         self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
-        let output_ty = arms.first().map(|arm| arm.expr.ty()).unwrap_or(Ty::Nil);
+        let mut lub_ty: Option<Ty> = None;
 
         if let Ty::Enum(ref e) = scrutinee_ty {
             let mut covered = IndexSet::new();
@@ -1214,11 +1218,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     });
                 }
 
-                if arm.expr.ty() != output_ty {
-                    self.errors.push(StaticError {
-                        span: self.span(arm.expr.span()),
-                        kind: StaticErrorKind::BranchesDifferentTypes,
-                    });
+                if let Some(ref inner) = lub_ty {
+                    if let Some(lub) = inner.lub(&arm.expr.ty()) {
+                        lub_ty = Some(lub);
+                    } else {
+                        self.errors.push(StaticError {
+                            span: self.span(arm.expr.span()),
+                            kind: StaticErrorKind::BranchesDifferentTypes,
+                        });
+                    }
+                } else {
+                    lub_ty = Some(arm.expr.ty());
                 }
             }
 
@@ -1230,7 +1240,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         }
 
-        output_ty
+        lub_ty.unwrap_or_default()
     }
 
     fn dispatch_bin_op_expr(
