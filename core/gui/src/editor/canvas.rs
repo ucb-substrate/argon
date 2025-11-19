@@ -12,11 +12,11 @@ use compiler::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
-    Element, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div,
-    pattern_slash, rgb, size, solid_background,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
+    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div, pattern_slash,
+    rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
