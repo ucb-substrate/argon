@@ -43,9 +43,13 @@ IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
   ;
 
 NilLiteral -> Result<NilLiteral, ()>
-  : 'NIL' {
-  let v = $1.map_err(|_| ())?;
-  Ok(NilLiteral { span: v.span(), }) }
+  : '(' ')' {
+  Ok(NilLiteral { span: $span, }) }
+  ;
+
+SeqNilLiteral -> Result<SeqNilLiteral, ()>
+  : '[' ']' {
+  Ok(SeqNilLiteral { span: $span, }) }
   ;
 
 FloatLiteral -> Result<FloatLiteral, ()>
@@ -349,6 +353,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
   | StringLiteral { Ok(Expr::StringLiteral($1?)) }
   | BoolLiteral { Ok(Expr::BoolLiteral($1?)) }
   | NilLiteral { Ok(Expr::Nil($1?)) }
+  | SeqNilLiteral { Ok(Expr::SeqNil($1?)) }
   | SubFactor 'AS' TySpec { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
   ;
 

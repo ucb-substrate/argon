@@ -1,9 +1,9 @@
 fn make_list(base: Float) -> [Float] {
-    cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., nil)))))
+    cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., [])))))
 }
 
 fn make_array() -> [[Float]] {
-    cons(make_list(0.), cons(make_list(500.), cons(make_list(1000.), nil)))
+    cons(make_list(0.), cons(make_list(500.), cons(make_list(1000.), [])))
 }
 
 fn elem23(arr: [[Float]]) -> Float {

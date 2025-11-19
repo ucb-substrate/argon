@@ -3,10 +3,14 @@ enum ListKind {
     Pair,
 }
 
+fn empty() {
+    ()
+}
+
 fn make_list(kind: ListKind) -> [Float] {
     match kind {
-        ListKind::Empty => nil,
-        ListKind::Pair => cons(100., cons(200., nil)),
+        ListKind::Empty => [],
+        ListKind::Pair => cons(100., cons(200., [])),
     }
 }
 

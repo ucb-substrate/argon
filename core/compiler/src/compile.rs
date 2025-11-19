@@ -484,6 +484,7 @@ pub enum Ty {
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
     Nil,
+    SeqNil,
     Fn(Box<FnTy>),
     /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
     Enum(EnumTy),
@@ -498,6 +499,7 @@ impl Ty {
             "Rect" => Some(Ty::Rect),
             "Int" => Some(Ty::Int),
             "()" => Some(Ty::Nil),
+            "[]" => Some(Ty::SeqNil),
             _ => None,
         }
     }
@@ -508,8 +510,10 @@ impl Ty {
         match (self, other) {
             // Unknown promotes to any type.
             (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
-            // Nil promotes to any sequence type.
-            (Ty::Nil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::Nil) => Some(Ty::Seq(inner.clone())),
+            // SeqNil promotes to any sequence type.
+            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => {
+                Some(Ty::Seq(inner.clone()))
+            }
             // No other types promote.
             (a, b) => {
                 if a == b {
@@ -873,6 +877,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
+            Expr::SeqNil(_) => Ty::SeqNil,
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -1335,18 +1340,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::NilNotOrd,
                 });
             }
-            if matches!(lub_ty, Ty::Seq(_))
+            if matches!(left_ty, Ty::SeqNil)
+                && matches!(right_ty, Ty::SeqNil)
                 && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-                && !(left_ty == Ty::Nil || right_ty == Ty::Nil)
             {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
-                    kind: StaticErrorKind::SeqMustCompareEqNil,
+                    kind: StaticErrorKind::SeqNilNotOrd,
+                });
+            }
+            if matches!(lub_ty, Ty::Seq(_))
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+                && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::SeqMustCompareEqSeqNil,
                 });
             }
             if !matches!(
                 left_ty,
-                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil
+                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
             ) {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
@@ -1449,7 +1463,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     if args.posargs.len() == 2 {
                         let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
                         let tailty = args.posargs[1].ty();
-                        if !(tailty == Ty::Nil || tailty == seqty) {
+                        if !(tailty == Ty::SeqNil || tailty == seqty) {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
@@ -1460,7 +1474,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         }
                         (None, seqty)
                     } else {
-                        (None, Ty::Nil)
+                        (None, Ty::SeqNil)
                     }
                 }
                 "head" => {
@@ -1882,6 +1896,7 @@ struct ExecPass<'a> {
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
+    seq_nil_value: ValueId,
     true_value: ValueId,
     false_value: ValueId,
     global_frame: FrameId,
@@ -1935,6 +1950,7 @@ impl<'a> ExecPass<'a> {
                 (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
+                (4, DeferValue::Ready(Value::SeqNil)),
             ]),
             frames: IndexMap::from_iter([(
                 5,
@@ -1946,6 +1962,7 @@ impl<'a> ExecPass<'a> {
             nil_value: 1,
             true_value: 2,
             false_value: 3,
+            seq_nil_value: 4,
             global_frame: 5,
             next_id: 6,
             partial_cells: VecDeque::new(),
@@ -2526,6 +2543,9 @@ impl<'a> ExecPass<'a> {
             Expr::Nil(_) => {
                 return self.nil_value;
             }
+            Expr::SeqNil(_) => {
+                return self.seq_nil_value;
+            }
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
                 self.values
@@ -2956,7 +2976,7 @@ impl<'a> ExecPass<'a> {
                         &self.values[&c.state.posargs[1]],
                     ) {
                         let val = match tail {
-                            Value::Nil => {
+                            Value::SeqNil => {
                                 vec![head.clone()]
                             }
                             Value::Seq(s) => {
@@ -2975,7 +2995,7 @@ impl<'a> ExecPass<'a> {
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
-                            Value::Nil => Value::Nil,
+                            Value::SeqNil => Value::Nil,
                             Value::Seq(s) => s.first().cloned().unwrap_or(Value::Nil),
                             _ => unreachable!(),
                         };
@@ -2988,7 +3008,7 @@ impl<'a> ExecPass<'a> {
                 "tail" => {
                     if let Defer::Ready(lst) = &self.values[&c.state.posargs[0]] {
                         let val = match lst {
-                            Value::Nil => Value::Nil,
+                            Value::SeqNil => Value::SeqNil,
                             Value::Seq(s) => Value::Seq(s[1..].to_vec()),
                             _ => unreachable!(),
                         };
@@ -3436,7 +3456,16 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                             true
                         }
-                        (Value::Seq(x), Value::Nil) | (Value::Nil, Value::Seq(x)) => {
+                        (Value::SeqNil, Value::SeqNil) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => true,
+                                crate::ast::ComparisonOp::Ne => false,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
+                        (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => {
                             let res = match comparison_expr.expr.op {
                                 crate::ast::ComparisonOp::Eq => x.is_empty(),
                                 crate::ast::ComparisonOp::Ne => !x.is_empty(),
@@ -3698,6 +3727,7 @@ pub enum Value {
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
     Seq(Vec<Value>),
+    SeqNil,
     Nil,
 }
 
@@ -3966,9 +3996,12 @@ pub enum StaticErrorKind {
     /// Cannot perform greater/less than comparisons on nil values.
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
+    /// Cannot perform greater/less than comparisons on seq nil values.
+    #[error("cannot perform greater/less than comparisons on seq nil")]
+    SeqNilNotOrd,
     /// Must compare sequences for equality/inequality to nil.
-    #[error("sequences can only be compared for equality/inequality to nil")]
-    SeqMustCompareEqNil,
+    #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
+    SeqMustCompareEqSeqNil,
     /// A type cannot be used in a binary expression.
     #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,

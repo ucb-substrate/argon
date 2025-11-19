@@ -1,10 +1,10 @@
 fn make_list(base: Float) -> [Float] {
-    cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., nil)))))
+    cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., [])))))
 }
 
 fn double(arr: [Float]) -> [Float] {
-    if arr == nil {
-        nil
+    if arr == [] {
+        []
     } else {
         cons(2. * head(arr), double(tail(arr)))
     }
