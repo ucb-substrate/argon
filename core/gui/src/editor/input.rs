@@ -4,8 +4,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill, hsla, point,
-    prelude::*, px, relative, rgb, rgba, size, white,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill, point,
+    prelude::*, px, relative, size,
 };
 use unicode_segmentation::*;
 
@@ -30,8 +30,8 @@ pub(crate) struct TextInput {
     pub(crate) is_selecting: bool,
     pub(crate) enter_handler: fn(&mut TextInput, &Enter, &mut Window, &mut Context<TextInput>),
     pub(crate) cancel_handler: fn(&mut TextInput, &Cancel, &mut Window, &mut Context<TextInput>),
-    pub(crate) tool: Entity<ToolState>,
     pub(crate) state: Entity<EditorState>,
+    pub(crate) px: f32,
 }
 
 impl TextInput {
@@ -45,17 +45,17 @@ impl TextInput {
             focus_handle,
             canvas_focus_handle: canvas.focus_handle(cx),
             content: "".into(),
-            placeholder: "Type here...".into(),
+            placeholder: "Enter command...".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            tool: canvas.read(cx).tool.clone(),
             state: state.clone(),
             enter_handler: Self::command_prompt_enter,
             cancel_handler: Self::command_prompt_cancel,
+            px: 8.,
         }
     }
     pub(crate) fn new_filter(
@@ -69,17 +69,17 @@ impl TextInput {
             focus_handle,
             canvas_focus_handle: canvas.focus_handle(cx),
             content: "".into(),
-            placeholder: "Type here...".into(),
+            placeholder: "Filter by name...".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            tool: canvas.tool.clone(),
             state: state.clone(),
             enter_handler: Self::filter_enter,
             cancel_handler: Self::filter_cancel,
+            px: 4.,
         }
     }
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -243,7 +243,7 @@ impl TextInput {
 
     fn command_prompt_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
-        self.tool.update(cx, |tool, _cx| {
+        self.state.read(cx).tool.clone().update(cx, |tool, _cx| {
             if let ToolState::EditDim(_) = tool {
                 *tool = ToolState::default();
             }
@@ -251,7 +251,7 @@ impl TextInput {
     }
 
     fn command_prompt_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        let reset = self.tool.update(cx, |tool, cx| {
+        let reset = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             if let ToolState::EditDim(EditDimToolState { dim, dim_mode, .. }) = tool
                 && self
                     .state
@@ -267,11 +267,15 @@ impl TextInput {
                 };
                 true
             } else {
-                if let Some((command, rest)) = self.content.split_once(" ")
-                    && command.trim_start_matches(":") == "openCell"
-                {
-                    self.state.read(cx).lsp_client.open_cell(rest.to_string());
-                    return true;
+                if let Some((command, rest)) = self.content.split_once(" ") {
+                    #[allow(clippy::single_match)]
+                    match command.trim_start_matches(":") {
+                        "openCell" => {
+                            self.state.read(cx).lsp_client.open_cell(rest.to_string());
+                            return true;
+                        }
+                        _ => {} // TODO: support other commands, reduce redundancy with rpc.rs
+                    }
                 }
                 false
             }
@@ -532,10 +536,12 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), hsla(0., 0., 0., 0.2))
+            (input.placeholder.clone(), style.color.opacity(0.2))
         } else {
             (content.clone(), style.color)
         };
+
+        let theme = input.state.read(cx).theme();
 
         let run = TextRun {
             len: display_text.len(),
@@ -586,7 +592,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    gpui::blue(),
+                    style.color,
                 )),
             )
         } else {
@@ -602,7 +608,7 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    rgba(0x3311ff30),
+                    theme.selection,
                 )),
                 None,
             )
@@ -652,6 +658,7 @@ impl Element for TextElement {
 
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.state.read(cx).theme();
         div()
             .flex()
             .key_context("TextInput")
@@ -660,7 +667,7 @@ impl Render for TextInput {
             .on_action(cx.listener(move |input, _: &EditDim, _window, cx| {
                 println!("test");
                 if let ToolState::EditDim(EditDimToolState { original_value, .. }) =
-                    input.tool.read(cx)
+                    input.state.read(cx).tool.read(cx)
                 {
                     input.content = original_value.clone();
                     input.selected_range = 0..input.content.len();
@@ -685,15 +692,14 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .bg(rgb(0xeeeeee))
-            .line_height(px(30.))
-            .text_color(rgb(0))
+            .bg(theme.input_bg)
+            .text_color(theme.text)
             .child(
                 div()
-                    .h(px(30. + 4. * 2.))
                     .w_full()
                     .p(px(4.))
-                    .bg(white())
+                    .px(px(self.px))
+                    .bg(theme.input_bg)
                     .child(TextElement {
                         input: cx.entity().clone(),
                     }),

@@ -12,11 +12,11 @@ use compiler::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges,
-    Element, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div,
-    pattern_slash, rgb, rgba, size, solid_background,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
+    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div, pattern_slash,
+    rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -35,7 +35,7 @@ pub enum ShapeFill {
 }
 
 const CONSTRAINED_BORDER_WIDTH: Pixels = Pixels(2.);
-const SELECT_WIDTH: Pixels = Pixels(4.);
+const SELECT_WIDTH: Pixels = Pixels(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = Pixels(2.);
 const UNCONSTRAINED_BORDER_WIDTH: Pixels = Pixels(0.);
 
@@ -205,7 +205,6 @@ pub struct LayoutCanvas {
     is_dragging: bool,
     drag_start: Point<Pixels>,
     offset_start: Point<Pixels>,
-    pub(crate) tool: Entity<ToolState>,
     mouse_position: Point<Pixels>,
     // zoom state
     scale: f32,
@@ -245,7 +244,7 @@ fn get_paint_path(bounds: Bounds<Pixels>, color: Rgba, thickness: Pixels) -> Pai
         corner_radii: Corners::all(Pixels(0.)),
         background: solid_background(color),
         border_widths: Edges::all(Pixels(0.)),
-        border_color: rgba(0).into(),
+        border_color: Rgba { a: 0., ..color }.into(),
         border_style: BorderStyle::Solid,
     }
 }
@@ -347,8 +346,9 @@ impl Element for CanvasElement {
         });
         let inner = self.inner.read(cx);
         let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
-        let tool = inner.tool.read(cx).clone();
+        let hide_external_geometry = &inner.state.read(cx).hide_external_geometry;
         let state = inner.state.read(cx);
+        let tool = state.tool.read(cx).clone();
         let layers = state.layers.read(cx);
 
         // TODO: Clean up code.
@@ -362,7 +362,11 @@ impl Element for CanvasElement {
             let mut queue = VecDeque::from_iter([(
                 ScopeAddress {
                     cell: scope_address.cell,
-                    scope: solved_cell.output.cells[&scope_address.cell].root,
+                    scope: if *hide_external_geometry {
+                        scope_address.scope
+                    } else {
+                        solved_cell.output.cells[&scope_address.cell].root
+                    },
                 },
                 TransformationMatrix::identity(),
                 (0., 0.),
@@ -401,11 +405,13 @@ impl Element for CanvasElement {
                             object_path: Vec::new(),
                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                         };
-                        if let ToolState::Select(SelectToolState { selected_obj }) =
-                            inner.tool.read(cx)
+                        if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                             && &rect.id == selected_obj
                         {
-                            select_rects.push(rect.clone());
+                            select_rects.push(Rect {
+                                border_widths: Edges::all(SELECT_WIDTH),
+                                ..rect.clone()
+                            });
                         }
                         if show {
                             scope_rects.push(rect);
@@ -468,12 +474,14 @@ impl Element for CanvasElement {
                                             },
                                         },
                                     };
-                                if let ToolState::Select(SelectToolState { selected_obj }) =
-                                    inner.tool.read(cx)
+                                if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                                     && rect.id.is_some()
                                     && &rect.id == selected_obj
                                 {
-                                    select_rects.push(rect.clone());
+                                    select_rects.push(Rect {
+                                        border_widths: Edges::all(SELECT_WIDTH),
+                                        ..rect.clone()
+                                    });
                                 }
                                 if show && layer.visible {
                                     rects.push((rect, layer.clone()));
@@ -511,11 +519,14 @@ impl Element for CanvasElement {
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
-                                        inner.tool.read(cx)
+                                        &tool
                                         && rect.id.is_some()
                                         && &rect.id == selected_obj
                                     {
-                                        select_rects.push(rect.clone());
+                                        select_rects.push(Rect {
+                                            border_widths: Edges::all(SELECT_WIDTH),
+                                            ..rect.clone()
+                                        });
                                     }
                                     if show {
                                         scope_rects.push(rect);
@@ -567,6 +578,7 @@ impl Element for CanvasElement {
         let scale = inner.scale;
         let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
+        let theme = inner.state.read(cx).theme();
         inner
             .bg_style
             .clone()
@@ -588,12 +600,12 @@ impl Element for CanvasElement {
                     };
                     window.paint_quad(get_paint_path(
                         y_axis.select_bounds(Pixels(0.)),
-                        rgb(0xffffff),
+                        theme.axes,
                         DEFAULT_BORDER_WIDTH,
                     ));
                     window.paint_quad(get_paint_path(
                         x_axis.select_bounds(Pixels(0.)),
-                        rgb(0xffffff),
+                        theme.axes,
                         DEFAULT_BORDER_WIDTH,
                     ));
                     for (r, l) in &rects {
@@ -609,8 +621,8 @@ impl Element for CanvasElement {
                         window.paint_quad(get_paint_quad(
                             get_rect_bounds(r, bounds, scale, offset),
                             ShapeFill::Solid,
-                            rgba(0),
-                            rgb(0xffffff),
+                            Rgba { a: 0., ..theme.text },
+                            theme.text,
                             r.border_widths,
                         ));
                     }
@@ -618,7 +630,7 @@ impl Element for CanvasElement {
                         window.paint_quad(get_paint_quad(
                             get_rect_bounds(r, bounds, scale, offset),
                             ShapeFill::Solid,
-                            rgba(0),
+                            Rgba { a: 0., ..rgb(0xffff00) },
                             rgb(0xffff00),
                             r.border_widths,
                         ));
@@ -768,7 +780,7 @@ impl Element for CanvasElement {
                                 {
                                     rgb(0xffff00)
                                 }
-                                _ => rgb(0xffffff),
+                                _ => theme.text,
                             },
                             dim.span.as_ref(),
                         );
@@ -1091,9 +1103,9 @@ impl Element for CanvasElement {
                                     window.paint_quad(get_paint_quad(
                                         hitbox,
                                         ShapeFill::Solid,
-                                        rgba(0),
+                                        Rgba { a: 0., ..rgb(0xffff00) },
                                         rgb(0xffff00),
-                                        Edges::all(DEFAULT_BORDER_WIDTH),
+                                        Edges::all(SELECT_WIDTH),
                                     ));
                                     break;
                                 }
@@ -1128,6 +1140,7 @@ impl Render for LayoutCanvas {
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
             // .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
+            .on_action(cx.listener(Self::select_mode))
             .on_action(cx.listener(Self::draw_dim))
             .on_action(cx.listener(Self::edit_action))
             .on_action(cx.listener(Self::fit_to_screen_action))
@@ -1136,6 +1149,8 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::all_hierarchy))
             .on_action(cx.listener(Self::command_action))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::dark_mode))
+            .on_action(cx.listener(Self::light_mode))
             .on_drag_move(cx.listener(Self::on_drag_move))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
@@ -1174,7 +1189,6 @@ impl LayoutCanvas {
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
-            tool: cx.new(|_cx| ToolState::default()),
             scale: 1.0,
             screen_bounds: Bounds::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
@@ -1237,7 +1251,7 @@ impl LayoutCanvas {
             stop: self.screen_bounds.origin.x + self.screen_bounds.size.width,
         };
         let layout_mouse_position = self.px_to_layout(event.position);
-        let edit_dim = self.tool.update(cx, |tool, cx| {
+        let edit_dim = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             let mut edit_dim = false;
             match tool {
                 ToolState::DrawRect(rect_tool) => {
@@ -1735,7 +1749,7 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn draw_rect(&mut self, _: &DrawRect, _window: &mut Window, cx: &mut Context<Self>) {
-        self.tool.update(cx, |tool, cx| {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             if !tool.is_draw_rect() {
                 *tool = ToolState::DrawRect(DrawRectToolState::default());
                 cx.notify();
@@ -1743,8 +1757,22 @@ impl LayoutCanvas {
         });
     }
 
+    pub(crate) fn select_mode(
+        &mut self,
+        _: &SelectMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            if !tool.is_select() {
+                *tool = ToolState::Select(SelectToolState { selected_obj: None });
+                cx.notify();
+            }
+        });
+    }
+
     pub(crate) fn draw_dim(&mut self, _: &DrawDim, _window: &mut Window, cx: &mut Context<Self>) {
-        self.tool.update(cx, |tool, cx| {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             if !tool.is_draw_dim() {
                 *tool = ToolState::DrawDim(DrawDimToolState::default());
                 cx.notify();
@@ -1764,11 +1792,11 @@ impl LayoutCanvas {
     pub(crate) fn edit_action(&mut self, _: &Edit, window: &mut Window, cx: &mut Context<Self>) {
         if let ToolState::Select(SelectToolState {
             selected_obj: Some(obj),
-        }) = self.tool.read(cx)
+        }) = self.state.read(cx).tool.clone().read(cx)
             && let Some((_, _, value)) = self.dim_hitboxes.iter().find(|(span, _, _)| span == obj)
         {
             let obj = obj.clone();
-            self.tool.update(cx, |tool, _cx| {
+            self.state.read(cx).tool.clone().update(cx, |tool, _cx| {
                 *tool = ToolState::EditDim(EditDimToolState {
                     dim: obj.clone(),
                     dim_mode: false,
@@ -1821,7 +1849,7 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
-        self.tool.update(cx, |tool, cx| {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             match tool {
                 ToolState::DrawRect(DrawRectToolState { p0: p0 @ Some(_) }) => {
                     *p0 = None;
@@ -1836,6 +1864,25 @@ impl LayoutCanvas {
                     *tool = ToolState::default();
                 }
             }
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn dark_mode(&mut self, _: &DarkMode, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.dark_mode = true;
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn light_mode(
+        &mut self,
+        _: &LightMode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, cx| {
+            state.dark_mode = false;
             cx.notify();
         });
     }
