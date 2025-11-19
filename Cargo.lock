@@ -1020,7 +1020,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "indexmap 2.11.4",
  "rustc-hash 2.1.1",
@@ -1534,7 +1534,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2556,7 +2556,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "anyhow",
  "as-raw-xcb-connection",
@@ -2649,7 +2649,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2803,7 +2803,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3606,7 +3606,7 @@ dependencies = [
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4781,7 +4781,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "derive_refineable",
  "workspace-hack",
@@ -5095,7 +5095,7 @@ checksum = "0f7d95a54511e0c7be3f51e8867aa8cf35148d7b9445d44de2f943e2b206e749"
 [[package]]
 name = "semantic_version"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "anyhow",
  "serde",
@@ -5501,7 +5501,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "arrayvec",
  "log",
@@ -6415,7 +6415,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "util"
 version = "0.1.0"
-source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#049405b34170e2320e10aa039fc7f618f7392d1c"
+source = "git+https://github.com/ucb-substrate/zed?branch=argon-dev#6e95afece86e67c2e4ec60c6dfd8774d86e2794c"
 dependencies = [
  "anyhow",
  "async-fs",

@@ -18,9 +18,9 @@ use tower_lsp::lsp_types::MessageType;
 
 use crate::{
     actions::{Redo, Undo},
-    editor::input::TextInput,
+    editor::{canvas::ToolState, input::TextInput},
     rpc::SyncGuiToLspClient,
-    theme::THEME,
+    theme::{DARK_THEME, LIGHT_THEME, Theme},
 };
 
 pub mod canvas;
@@ -70,15 +70,20 @@ pub struct Layers {
 
 pub struct EditorState {
     pub hierarchy_depth: usize,
+    pub dark_mode: bool,
     pub solved_cell: Entity<Option<CompileOutputState>>,
+    pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
     pub lsp_client: SyncGuiToLspClient,
     pub subscriptions: Vec<Subscription>,
+    pub(crate) tool: Entity<ToolState>,
 }
 
 #[derive(Clone, Debug)]
 pub struct Editor {
     pub state: Entity<EditorState>,
+    pub title_bar: Entity<TitleBar>,
+    pub tool_bar: Entity<ToolBar>,
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
@@ -97,6 +102,13 @@ struct ProcessScopeState {
 }
 
 impl EditorState {
+    fn theme(&self) -> &'static Theme {
+        if self.dark_mode {
+            &DARK_THEME
+        } else {
+            &LIGHT_THEME
+        }
+    }
     fn process_scope(
         &self,
         cx: &App,
@@ -302,6 +314,7 @@ impl Editor {
     pub fn new(cx: &mut Context<Self>, window: &mut Window, lsp_addr: SocketAddr) -> Self {
         let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
         let solved_cell = cx.new(|_cx| None);
+        let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
             layers: IndexMap::new(),
             selected_layer: None,
@@ -313,14 +326,20 @@ impl Editor {
             ];
             EditorState {
                 hierarchy_depth: usize::MAX,
+                dark_mode: true,
                 solved_cell,
+                hide_external_geometry: false,
+                tool,
                 layers,
                 subscriptions,
                 lsp_client: lsp_client.clone(),
             }
         });
+        let title_bar = cx.new(|_cx| TitleBar::new(&state));
+        let tool_bar = cx.new(|_cx| ToolBar::new(&state));
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
+        println!("{canvas_focus_handle:?}");
         window.focus(&canvas_focus_handle);
         let canvas = cx.new(|cx| {
             LayoutCanvas::new(
@@ -337,6 +356,8 @@ impl Editor {
 
         let editor = Self {
             state,
+            title_bar,
+            tool_bar,
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
@@ -363,11 +384,13 @@ impl Editor {
                         .solved_cell
                         .read(cx)
                         .as_ref()
-                        .map(|cell| cell.state.keys().collect())
+                        .map(|cell| cell.state.keys().cloned().collect())
                         .unwrap_or_default();
-                    sidebar
-                        .expanded_scopes
-                        .retain(|path| scope_paths.contains(&path));
+                    sidebar.state.update(cx, |state, _cx| {
+                        state
+                            .expanded_scopes
+                            .retain(|path| scope_paths.contains(path));
+                    });
                     cx.notify();
                 })
                 .unwrap();
@@ -380,8 +403,10 @@ impl Editor {
                 .unwrap();
             self.hierarchy_sidebar
                 .update(cx, |sidebar, cx| {
-                    sidebar.expanded_scopes.clear();
-                    cx.notify();
+                    sidebar.state.update(cx, |state, cx| {
+                        state.expanded_scopes.clear();
+                        cx.notify();
+                    });
                 })
                 .unwrap();
         }
@@ -411,30 +436,36 @@ impl Editor {
             .lsp_client
             .dispatch_action(GuiToLspAction::Redo);
     }
+
+    fn theme(&self, cx: &mut Context<Self>) -> &'static Theme {
+        self.state.read(cx).theme()
+    }
 }
 
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme(cx);
         div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
-            .font_family("Zed Plex Mono")
+            .font_family("Zed Plex Sans")
             .size_full()
             .flex()
             .flex_col()
             .justify_start()
             .border_1()
-            .border_color(THEME.divider)
+            .border_color(theme.divider)
+            .bg(theme.bg)
             .rounded(px(10.))
             .text_sm()
-            .text_color(rgb(0xffffff))
+            .text_color(theme.text)
             .overflow_hidden()
             .whitespace_nowrap()
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .child(cx.new(|_cx| TitleBar))
-            .child(cx.new(|_cx| ToolBar))
+            .child(self.title_bar.clone())
+            .child(self.tool_bar.clone())
             .child(
                 div()
                     .flex()
