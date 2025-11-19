@@ -1,0 +1,31 @@
+cell fet1v8(nfet: Int, w: Float, nf: Int) {
+    let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
+    let poly_bbox = #scope0 std::array(poly, nf, 430., 0.);
+    eq(poly_bbox.x0, 0.);
+    eq(poly_bbox.y0, 0.);
+    let diff = rect(
+        "diff.drawing",
+        x0 = poly_bbox.x0 - 55. - 170. - 130.,
+        x1 = poly_bbox.x1 + 55. + 170. + 130.,
+        y0 = poly_bbox.y0 + 130.,
+        y1 = poly_bbox.y1 - 130.
+    )!;
+    let li1 = crect(layer="li1.drawing", x1=poly_bbox.x0 - 55., y0=diff.y0 - 100., w=170., y1=diff.y1 + 100.);
+    let li1_bbox = #scope1 std::array(li1, nf + 1, 430., 0.);
+    eq(li1_bbox.x0, li1.x0);
+    eq(li1_bbox.y0, li1.y0);
+    let sdm = rect(#scope2 if nfet == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
+
+    let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
+    let ny = (((diff.h - licon.h - 80.) / 340.) as Int + 1);
+    #scope4 std::center_rects(li1_bbox, #scope3 std::array2(licon, nf + 1, ny, 430., 340.));
+}
+
+cell tap(ntap: Int, w: Float, h: Float) {
+    let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
+    let li1 = rect("li1.drawing", x0=tap.x0 + 40., y0=tap.y0 + 40., x1 = tap.x1 - 40., y1 = tap.y1 - 40.);
+    let sdm = rect(#scope0 if ntap == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0=tap.x0 - 130., x1=tap.x1 + 130., y0=tap.y0 - 130., y1=tap.y1 + 130.);
+    let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
+    let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
+    #scope9 std::center_rects(cons, #scope8 std::max_array(licon, cons.w, cons.h, 340., 340.));
+}

@@ -6,6 +6,7 @@ actions!(
     [
         Quit,
         DrawRect,
+        SelectMode,
         DrawDim,
         Edit,
         Fit,
@@ -31,5 +32,7 @@ actions!(
         Paste,
         Cut,
         Copy,
+        DarkMode,
+        LightMode,
     ]
 );

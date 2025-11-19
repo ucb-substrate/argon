@@ -44,6 +44,7 @@ impl<'a> ScopeAnnotationPass<'a> {
                 Decl::Mod(c) => {
                     self.transform_mod_decl(c);
                 }
+                Decl::Enum(_) => {}
                 _ => todo!(),
             }
         }

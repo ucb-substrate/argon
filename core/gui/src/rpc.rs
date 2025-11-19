@@ -256,6 +256,23 @@ impl LspToGui for GuiServer {
                     .await
                     .unwrap();
             }
+            "darkMode" => {
+                self.to_exec
+                    .send(Box::new(move |editor, cx| {
+                        if let Ok(new_mode) = value.parse() {
+                            editor
+                                .state
+                                .update(cx, |state, cx| {
+                                    // TODO: Need better way to specify infinite hierarchy depth.
+                                    state.dark_mode = new_mode;
+                                    cx.notify();
+                                })
+                                .unwrap();
+                        }
+                    }))
+                    .await
+                    .unwrap();
+            }
             _ => {
                 // TODO: handle errors.
             }

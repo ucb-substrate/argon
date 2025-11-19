@@ -1,51 +1,195 @@
+use std::sync::Arc;
+
 use compiler::compile::SolvedValue;
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
+use itertools::Itertools;
+use lsp_server::rpc::GuiToLspAction;
 
 use crate::{
+    actions::{DrawDim, DrawRect, SelectMode},
     editor::{
         CompileOutputState, Layers, ScopeAddress, ScopePath,
-        canvas::{LayoutCanvas, ToolState},
+        canvas::{EditDimToolState, LayoutCanvas, ToolState},
         input::TextInput,
     },
-    theme::THEME,
 };
 
 use super::EditorState;
 
-pub struct TitleBar;
+pub struct TitleBar {
+    state: Entity<EditorState>,
+}
+
+impl TitleBar {
+    pub fn new(state: &Entity<EditorState>) -> Self {
+        Self {
+            state: state.clone(),
+        }
+    }
+}
 
 impl Render for TitleBar {
     fn render(
         &mut self,
         _window: &mut gpui::Window,
-        _cx: &mut gpui::Context<Self>,
+        cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
+        let theme = self.state.read(cx).theme();
         div()
-            .border_b_1()
-            .border_color(THEME.divider)
+            .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
-            .pl(px(71.))
-            .bg(THEME.titlebar)
-            .child("Project")
+            .p_1()
+            .bg(theme.titlebar)
+            .text_center()
+            .child("Argon")
     }
 }
 
-pub struct ToolBar;
+pub struct ToolBar {
+    state: Entity<EditorState>,
+}
+
+impl ToolBar {
+    pub fn new(state: &Entity<EditorState>) -> Self {
+        Self {
+            state: state.clone(),
+        }
+    }
+}
 
 impl Render for ToolBar {
     fn render(
         &mut self,
         _window: &mut gpui::Window,
-        _cx: &mut gpui::Context<Self>,
+        cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
+        let theme = self.state.read(cx).theme();
         div()
-            .border_b_1()
-            .border_color(THEME.divider)
-            .h(px(34.))
-            .bg(THEME.sidebar)
-            .child("Tools")
+            .border_color(theme.divider)
+            .p_2()
+            .bg(theme.bg)
+            .flex()
+            .flex_row()
+            .children({
+                type HighlightFn = Box<dyn Fn(&ToolState) -> bool>;
+                type OnClickFn = Arc<dyn Fn(Entity<EditorState>, &mut App)>;
+                let tools: [Option<(&'static str, &'static str, HighlightFn, OnClickFn)>; _] = [
+                    Some((
+                        "btn_undo",
+                        "icons/arrow-rotate-left-solid-full.svg",
+                        Box::new(|_| false),
+                        Arc::new(|state, cx| {
+                            state
+                                .read(cx)
+                                .lsp_client
+                                .dispatch_action(GuiToLspAction::Undo);
+                        }),
+                    )),
+                    Some((
+                        "btn_redo",
+                        "icons/arrow-rotate-right-solid-full.svg",
+                        Box::new(|_| false),
+                        Arc::new(|state, cx| {
+                            state
+                                .read(cx)
+                                .lsp_client
+                                .dispatch_action(GuiToLspAction::Redo);
+                        }),
+                    )),
+                    None,
+                    Some((
+                        "btn_select",
+                        "icons/arrow-pointer-solid-full.svg",
+                        Box::new(|tool| {
+                            matches!(
+                                tool,
+                                ToolState::Select(_)
+                                    | ToolState::EditDim(EditDimToolState {
+                                        dim_mode: false,
+                                        ..
+                                    })
+                            )
+                        }),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&SelectMode);
+                            });
+                        }),
+                    )),
+                    Some((
+                        "btn_rect",
+                        "icons/rect.svg",
+                        Box::new(|tool| matches!(tool, ToolState::DrawRect(_))),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&DrawRect);
+                            })
+                        }),
+                    )),
+                    Some((
+                        "btn_dim",
+                        "icons/arrows-left-right-to-line-solid-full.svg",
+                        Box::new(|tool| {
+                            matches!(
+                                tool,
+                                ToolState::DrawDim(_)
+                                    | ToolState::EditDim(EditDimToolState { dim_mode: true, .. })
+                            )
+                        }),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&DrawDim);
+                            });
+                        }),
+                    )),
+                ];
+                let wh = 20.;
+                tools
+                    .iter()
+                    .map(|path| {
+                        if let Some((id, path, highlighted, on_click)) = path {
+                            let on_click = on_click.clone();
+                            div()
+                                .w(px(wh + 8.))
+                                .h(px(wh + 8.))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .child(div().flex_1())
+                                .child(svg().path(*path).w(px(wh)).h_auto().text_color(theme.text))
+                                .child(div().flex_1())
+                                .bg(if highlighted(self.state.read(cx).tool.read(cx)) {
+                                    theme.selection
+                                } else {
+                                    rgba(0)
+                                })
+                                .id(*id)
+                                .on_click({
+                                    let state = self.state.clone();
+                                    move |_, window, cx| {
+                                        on_click(state.clone(), cx);
+                                    }
+                                })
+                        } else {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .child(
+                                    div()
+                                        .w_2()
+                                        .h(px(wh + 8.))
+                                        .border_r_1()
+                                        .border_color(theme.divider),
+                                )
+                                .child(div().w_2())
+                                .id("dummy") // TODO: fix?
+                        }
+                    })
+                    .collect_vec()
+            })
+            .child(div().flex_1())
     }
 }
 
@@ -58,6 +202,7 @@ pub struct LayerSideBar {
     layers: Entity<Layers>,
     name_filter: Entity<TextInput>,
     state: Entity<LayerSideBarState>,
+    editor_state: Entity<EditorState>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
@@ -65,11 +210,12 @@ pub struct LayerSideBar {
 impl LayerSideBar {
     pub fn new(
         cx: &mut Context<Self>,
-        state: &Entity<EditorState>,
+        editor_state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
-        let layers = state.read(cx).layers.clone();
-        let name_filter = cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), state, canvas));
+        let layers = editor_state.read(cx).layers.clone();
+        let name_filter =
+            cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
         let state = cx.new(|_cx| LayerSideBarState::default());
         let subscriptions = vec![
             cx.observe(&layers, |_, _, cx| cx.notify()),
@@ -79,6 +225,7 @@ impl LayerSideBar {
             layers,
             name_filter,
             state,
+            editor_state: editor_state.clone(),
             subscriptions,
         }
     }
@@ -91,26 +238,46 @@ impl Render for LayerSideBar {
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         let layers = self.layers.read(cx);
+        let theme = self.editor_state.read(cx).theme();
+        let icon_wh = 16.;
+        let icon_div = || {
+            div()
+                .w(px(icon_wh + 8.))
+                .h(px(icon_wh + 8.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(div().flex_1())
+        };
         div()
             .flex()
             .flex_col()
             .h_full()
             .w(px(200.))
+            .p_1()
             .border_l_1()
-            .border_color(THEME.divider)
-            .bg(THEME.sidebar)
+            .border_t_1()
+            .border_color(theme.divider)
+            .bg(theme.sidebar)
             .min_h_0()
-            .child("Layers")
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .text_center()
+                    .justify_center()
+                    .child("Layers")
+                    .child(div().flex_1())
                     .child(
-                        div()
-                            .flex_1()
-                            .id(SharedString::from("all_visible_layers"))
-                            .child("Show All")
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path("icons/eye-solid-full.svg")
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("all_visible_hierarchy_btn")
                             .on_click({
                                 let layers = self.layers.clone();
                                 move |_event, _window, cx| {
@@ -124,10 +291,16 @@ impl Render for LayerSideBar {
                             }),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .id(SharedString::from("none_visible_layers"))
-                            .child("Hide All")
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path("icons/eye-slash-solid-full.svg")
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("none_visible_hierarchy_btn")
                             .on_click({
                                 let layers = self.layers.clone();
                                 move |_event, _window, cx| {
@@ -139,30 +312,34 @@ impl Render for LayerSideBar {
                                     })
                                 }
                             }),
+                    )
+                    .child(
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path(if self.state.read(cx).used_filter {
+                                        "icons/filter-solid-full.svg"
+                                    } else {
+                                        "icons/filter-circle-xmark-solid-full.svg"
+                                    })
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("filter_used_btn")
+                            .on_click({
+                                let state = self.state.clone();
+                                move |_event, _window, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.used_filter = !state.used_filter;
+                                        cx.notify();
+                                    })
+                                }
+                            }),
                     ),
             )
             .child(self.name_filter.clone())
-            .child(
-                div()
-                    .child(format!(
-                        "[{}] Filter Used",
-                        if self.state.read(cx).used_filter {
-                            "X"
-                        } else {
-                            "_"
-                        }
-                    ))
-                    .id(SharedString::from("filter_used"))
-                    .on_click({
-                        let state = self.state.clone();
-                        move |_event, _window, cx| {
-                            state.update(cx, |state, cx| {
-                                state.used_filter = !state.used_filter;
-                                cx.notify();
-                            })
-                        }
-                    }),
-            )
             .child(
                 div()
                     .flex()
@@ -187,9 +364,9 @@ impl Render for LayerSideBar {
                                     .flex()
                                     .w_full()
                                     .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
-                                        rgba(0x00000099)
+                                        theme.selection
                                     } else {
-                                        rgba(0)
+                                        theme.sidebar
                                     })
                                     .child(
                                         div()
@@ -212,8 +389,19 @@ impl Render for LayerSideBar {
                                             }),
                                     )
                                     .child(
-                                        div()
-                                            .child(if layer.visible { "--V" } else { "NV" })
+                                        icon_div()
+                                            .child(
+                                                svg()
+                                                    .path(if layer.visible {
+                                                        "icons/eye-solid-full.svg"
+                                                    } else {
+                                                        "icons/eye-slash-solid-full.svg"
+                                                    })
+                                                    .w(px(icon_wh))
+                                                    .h_auto()
+                                                    .text_color(theme.text),
+                                            )
+                                            .child(div().flex_1())
                                             .id(SharedString::from(format!(
                                                 "layer_control_{}",
                                                 layer.z
@@ -239,11 +427,16 @@ impl Render for LayerSideBar {
     }
 }
 
+#[derive(Default)]
+pub struct HierarchySideBarState {
+    pub expanded_scopes: IndexSet<ScopePath>,
+}
+
 pub struct HierarchySideBar {
-    solved_cell: Entity<Option<CompileOutputState>>,
+    editor_state: Entity<EditorState>,
     tool: Entity<ToolState>,
     name_filter: Entity<TextInput>,
-    pub expanded_scopes: IndexSet<ScopePath>,
+    pub state: Entity<HierarchySideBarState>,
     #[allow(dead_code)]
     subscriptions: Vec<Subscription>,
 }
@@ -251,18 +444,20 @@ pub struct HierarchySideBar {
 impl HierarchySideBar {
     pub fn new(
         cx: &mut Context<Self>,
-        state: &Entity<EditorState>,
+        editor_state: &Entity<EditorState>,
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
-        let solved_cell = state.read(cx).solved_cell.clone();
-        let tool = canvas.read(cx).tool.clone();
-        let name_filter = cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), state, canvas));
+        let solved_cell = editor_state.read(cx).solved_cell.clone();
+        let tool = editor_state.read(cx).tool.clone();
+        let name_filter =
+            cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
         let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
+        let state = cx.new(|_cx| HierarchySideBarState::default());
         Self {
-            solved_cell,
+            editor_state: editor_state.clone(),
             tool,
             name_filter,
-            expanded_scopes: IndexSet::new(),
+            state,
             subscriptions,
         }
     }
@@ -276,13 +471,24 @@ impl HierarchySideBar {
         count: usize,
         depth: usize,
     ) {
-        let solved_cell_clone_1 = self.solved_cell.clone();
-        let solved_cell_clone_2 = self.solved_cell.clone();
+        let icon_wh = 16.;
+        let icon_div = || {
+            div()
+                .w(px(icon_wh + 8.))
+                .h(px(icon_wh + 8.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(div().flex_1())
+        };
+        let solved_cell_clone_1 = self.editor_state.read(cx).solved_cell.clone();
+        let solved_cell_clone_2 = self.editor_state.read(cx).solved_cell.clone();
         let tool_clone = self.tool.clone();
         let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
         let scope_path = solved_cell.scope_paths[&scope].clone();
         let self_entity = cx.entity();
-        let expanded = self.expanded_scopes.contains(&scope_path);
+        let expanded = self.state.read(cx).expanded_scopes.contains(&scope_path);
+        let theme = self.editor_state.read(cx).theme();
         if scope_state
             .name
             .to_lowercase()
@@ -294,21 +500,33 @@ impl HierarchySideBar {
                     .w_full()
                     .bg(
                         if scope == solved_cell.state[&solved_cell.selected_scope].address {
-                            rgba(0x00000099)
+                            theme.selection
                         } else {
-                            rgba(0)
+                            theme.sidebar
                         },
                     )
+                    .child(div().w(px(12. * depth as f32)))
                     .child(
-                        div()
-                            .child(if expanded { "[-]" } else { "[+]" })
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path(if expanded {
+                                        "icons/angle-down-solid-full.svg"
+                                    } else {
+                                        "icons/angle-right-solid-full.svg"
+                                    })
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
                             .id(SharedString::from(format!("scope_collapse_{scope:?}",)))
                             .on_click({
                                 let scope_path = scope_path.clone();
                                 move |_event, _window, cx| {
-                                    self_entity.update(cx, |sidebar, cx| {
-                                        if !sidebar.expanded_scopes.insert(scope_path.clone()) {
-                                            sidebar.expanded_scopes.swap_remove(&scope_path);
+                                    self_entity.read(cx).state.clone().update(cx, |state, cx| {
+                                        if !state.expanded_scopes.insert(scope_path.clone()) {
+                                            state.expanded_scopes.swap_remove(&scope_path);
                                         }
                                         cx.notify();
                                     });
@@ -321,8 +539,7 @@ impl HierarchySideBar {
                             .flex_1()
                             .overflow_hidden()
                             .child(format!(
-                                "{}{}{}",
-                                std::iter::repeat_n(" ", depth).collect::<String>(),
+                                "{}{}",
                                 &scope_state.name,
                                 if count > 1 {
                                     format!(" ({count})")
@@ -347,8 +564,19 @@ impl HierarchySideBar {
                             }),
                     )
                     .child(
-                        div()
-                            .child(if scope_state.visible { "[-V]" } else { "[NV]" })
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path(if scope_state.visible {
+                                        "icons/eye-solid-full.svg"
+                                    } else {
+                                        "icons/eye-slash-solid-full.svg"
+                                    })
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
                             .id(SharedString::from(format!("scope_control_{scope:?}",)))
                             .on_click({
                                 let scope_path = scope_path.clone();
@@ -404,7 +632,7 @@ impl HierarchySideBar {
 
     fn render_scopes(&mut self, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
         let mut scopes = Vec::new();
-        if let Some(state) = self.solved_cell.read(cx).clone() {
+        if let Some(state) = self.editor_state.read(cx).solved_cell.read(cx).clone() {
             let scope = state.output.cells[&state.output.top].root;
             self.render_scopes_helper(
                 cx,
@@ -434,28 +662,48 @@ impl Render for HierarchySideBar {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
+        let theme = self.editor_state.read(cx).theme();
+        let icon_wh = 16.;
+        let icon_div = || {
+            div()
+                .w(px(icon_wh + 8.))
+                .h(px(icon_wh + 8.))
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(div().flex_1())
+        };
         div()
             .flex()
             .flex_col()
             .h_full()
             .w(px(200.))
+            .p_1()
             .border_r_1()
-            .border_color(THEME.divider)
-            .bg(THEME.sidebar)
+            .border_t_1()
+            .border_color(theme.divider)
+            .bg(theme.sidebar)
             .min_h_0()
-            .child("Scopes")
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .text_center()
+                    .justify_center()
+                    .child("Scopes")
+                    .child(div().flex_1())
                     .child(
-                        div()
-                            .flex_1()
-                            .id(SharedString::from("all_visible_hierarchy"))
-                            .child("Show All")
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path("icons/eye-solid-full.svg")
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("all_visible_hierarchy_btn")
                             .on_click({
-                                let solved_cell = self.solved_cell.clone();
+                                let solved_cell = self.editor_state.read(cx).solved_cell.clone();
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
@@ -469,12 +717,18 @@ impl Render for HierarchySideBar {
                             }),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .id(SharedString::from("none_visible_hierarchy"))
-                            .child("Hide All")
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path("icons/eye-slash-solid-full.svg")
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("none_visible_hierarchy_btn")
                             .on_click({
-                                let solved_cell = self.solved_cell.clone();
+                                let solved_cell = self.editor_state.read(cx).solved_cell.clone();
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
@@ -486,36 +740,21 @@ impl Render for HierarchySideBar {
                                     })
                                 }
                             }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .text_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .id(SharedString::from("all_collapse_hierarchy"))
-                            .child("Collapse All")
-                            .on_click({
-                                let self_entity = cx.entity();
-                                move |_event, _window, cx| {
-                                    self_entity.update(cx, |sidebar, cx| {
-                                        sidebar.expanded_scopes.clear();
-                                        cx.notify();
-                                    });
-                                }
-                            }),
                     )
                     .child(
-                        div()
-                            .flex_1()
-                            .id(SharedString::from("none_collapse_hierarchy"))
-                            .child("Expand All")
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path("icons/angles-down-solid-full.svg")
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("none_collapse_hierarchy_btn")
                             .on_click({
                                 let self_entity = cx.entity();
-                                let solved_cell = self.solved_cell.clone();
+                                let solved_cell = self.editor_state.read(cx).solved_cell.clone();
                                 move |_event, _window, cx| {
                                     let mut scope_paths = IndexSet::new();
                                     if let Some(cell) = solved_cell.read(cx) {
@@ -523,10 +762,57 @@ impl Render for HierarchySideBar {
                                             scope_paths.insert(path.clone());
                                         }
                                     }
-                                    self_entity.update(cx, |sidebar, cx| {
-                                        sidebar.expanded_scopes = scope_paths;
+                                    self_entity.read(cx).state.clone().update(cx, |state, cx| {
+                                        state.expanded_scopes = scope_paths;
                                         cx.notify();
                                     });
+                                }
+                            }),
+                    )
+                    .child(
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path("icons/angles-up-solid-full.svg")
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("all_collapse_hierarchy_btn")
+                            .on_click({
+                                let self_entity = cx.entity();
+                                move |_event, _window, cx| {
+                                    self_entity.read(cx).state.clone().update(cx, |state, cx| {
+                                        state.expanded_scopes.clear();
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        icon_div()
+                            .child(
+                                svg()
+                                    .path(if self.editor_state.read(cx).hide_external_geometry {
+                                        "icons/bug-solid-full.svg"
+                                    } else {
+                                        "icons/bug-slash-solid-full.svg"
+                                    })
+                                    .w(px(icon_wh))
+                                    .h_auto()
+                                    .text_color(theme.text),
+                            )
+                            .child(div().flex_1())
+                            .id("hide_external_geometry")
+                            .on_click({
+                                let editor_state = self.editor_state.clone();
+                                move |_event, _window, cx| {
+                                    editor_state.update(cx, |state, cx| {
+                                        state.hide_external_geometry =
+                                            !state.hide_external_geometry;
+                                        cx.notify();
+                                    })
                                 }
                             }),
                     ),
