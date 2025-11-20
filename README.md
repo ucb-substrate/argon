@@ -227,7 +227,7 @@ vim.g.argon_lsp = {
 }
 ```
 
-The Neovim plugin will supply `ARGON_LOG=debug` when starting the LSP server and GUI.
+The Neovim plugin will then supply `ARGON_LOG=debug` when starting the LSP server and GUI.
 
 ### VS Code
 
@@ -241,7 +241,7 @@ To configure the log level, you can use the `argonLsp.log.level` key:
 }
 ```
 
-The VS Code plugin will supply `ARGON_LOG=debug` when starting the LSP server and GUI.
+The VS Code plugin will then supply `ARGON_LOG=debug` when starting the LSP server and GUI.
 
 ## Contributing
 

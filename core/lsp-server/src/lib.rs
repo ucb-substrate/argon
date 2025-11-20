@@ -419,7 +419,6 @@ impl Backend {
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut.cell = Some(cell.into());
         state_mut.compile(&self.state.editor_client, false).await;
-        info!("compiling cell");
     }
 
     /// Compiles the current workspace and the open cell if it exists.
@@ -467,7 +466,6 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 }
 
 pub async fn main() {
-    info!("test");
     // Start server for communication with GUI.
     let mut listener = if let Ok(listener) =
         tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12345), Json::default).await
