@@ -1,6 +1,7 @@
 //! # Argon compiler
 //
-//! Pass 1: assign variable IDs/type checking
+//! Pass 1: import resolution
+//! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, VecDeque};
 use std::io::BufReader;
@@ -376,7 +377,7 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct VarIdTyFrame {
     var_bindings: IndexMap<Substr, (VarId, Ty)>,
     scope_bindings: IndexSet<Substr>,
@@ -483,6 +484,7 @@ pub enum Ty {
     Cell(Box<CellTy>),
     Inst(Box<CellTy>),
     Nil,
+    SeqNil,
     Fn(Box<FnTy>),
     /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
     Enum(EnumTy),
@@ -497,7 +499,29 @@ impl Ty {
             "Rect" => Some(Ty::Rect),
             "Int" => Some(Ty::Int),
             "()" => Some(Ty::Nil),
+            "[]" => Some(Ty::SeqNil),
             _ => None,
+        }
+    }
+
+    /// Computes the least upper bound (LUB) of self and other.
+    /// For use in type promotion.
+    pub fn lub(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            // Unknown promotes to any type.
+            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
+            // SeqNil promotes to any sequence type.
+            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => {
+                Some(Ty::Seq(inner.clone()))
+            }
+            // No other types promote.
+            (a, b) => {
+                if a == b {
+                    Some(a.clone())
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -632,10 +656,13 @@ impl<'a> VarIdTyPass<'a> {
         let args: Vec<_> = input
             .args
             .iter()
-            .map(|arg| self.transform_arg_decl(arg))
+            .map(|arg| {
+                let ty_spec = self.transform_ty_spec(&arg.ty);
+                self.ty_from_spec(&ty_spec)
+            })
             .collect();
         let ty = Ty::Fn(Box::new(FnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            args,
             ret: if let Some(return_ty) = &input.return_ty {
                 self.ty_from_spec(return_ty)
             } else {
@@ -673,11 +700,15 @@ impl<'a> VarIdTyPass<'a> {
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
         match &spec.kind {
             TySpecKind::Ident(ident) => Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
-                self.errors.push(StaticError {
-                    span: self.span(ident.span),
-                    kind: StaticErrorKind::UnknownType,
-                });
-                Ty::Unknown
+                if let Some((_, ty)) = self.lookup(ident.name.as_str()) {
+                    ty
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(ident.span),
+                        kind: StaticErrorKind::UnknownType,
+                    });
+                    Ty::Unknown
+                }
             }),
             TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
         }
@@ -846,6 +877,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
+            Expr::SeqNil(_) => Ty::SeqNil,
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -873,7 +905,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
-        // Currently, ident path exprs are either single variables or enum values
+        // Currently, ident path exprs are either single variables or enum values.
         // Parser grammar ensures paths cannot be empty.
         assert!(!input.path.is_empty());
         if input.path.len() == 1 {
@@ -984,17 +1016,43 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &FnDecl<Substr, Self::InputMetadata>,
     ) -> FnDecl<Substr, Self::OutputMetadata> {
-        let args: Vec<_> = input
-            .args
-            .iter()
-            .map(|arg| self.transform_arg_decl(arg))
-            .collect();
         let name = self.transform_ident(&input.name);
         let return_ty = input
             .return_ty
             .as_ref()
             .map(|spec| self.transform_ty_spec(spec));
-        let scope = self.transform_scope(&input.scope);
+        // TODO: this code is mostly duplicated from `transform_scope`.
+        self.enter_scope(&input.scope);
+        let scope_annotation = input
+            .scope
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
+        let args: Vec<_> = input
+            .args
+            .iter()
+            .map(|arg| self.transform_arg_decl(arg))
+            .collect();
+        let stmts = input
+            .scope
+            .stmts
+            .iter()
+            .map(|stmt| self.transform_statement(stmt))
+            .collect_vec();
+        let tail = input
+            .scope
+            .tail
+            .as_ref()
+            .map(|stmt| self.transform_expr(stmt));
+        let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
+        let scope = Scope {
+            scope_annotation,
+            span: input.span,
+            stmts,
+            tail,
+            metadata,
+        };
+        self.exit_scope(&input.scope, &scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
             name,
@@ -1127,13 +1185,16 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
-        if then_ty != else_ty {
+        let lub_ty = then_ty.lub(&else_ty);
+        if let Some(lub_ty) = lub_ty {
+            lub_ty
+        } else {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::BranchesDifferentTypes,
             });
+            then_ty
         }
-        then_ty
     }
 
     fn dispatch_match_expr(
@@ -1144,7 +1205,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
         let scrutinee_ty = scrutinee.ty();
         self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
-        let output_ty = arms.first().map(|arm| arm.expr.ty()).unwrap_or(Ty::Nil);
+        let mut lub_ty: Option<Ty> = None;
 
         if let Ty::Enum(ref e) = scrutinee_ty {
             let mut covered = IndexSet::new();
@@ -1162,11 +1223,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     });
                 }
 
-                if arm.expr.ty() != output_ty {
-                    self.errors.push(StaticError {
-                        span: self.span(arm.expr.span()),
-                        kind: StaticErrorKind::BranchesDifferentTypes,
-                    });
+                if let Some(ref inner) = lub_ty {
+                    if let Some(lub) = inner.lub(&arm.expr.ty()) {
+                        lub_ty = Some(lub);
+                    } else {
+                        self.errors.push(StaticError {
+                            span: self.span(arm.expr.span()),
+                            kind: StaticErrorKind::BranchesDifferentTypes,
+                        });
+                    }
+                } else {
+                    lub_ty = Some(arm.expr.ty());
                 }
             }
 
@@ -1178,7 +1245,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         }
 
-        output_ty
+        lub_ty.unwrap_or_default()
     }
 
     fn dispatch_bin_op_expr(
@@ -1246,12 +1313,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        if left_ty != right_ty {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
-            });
-        } else {
+        let lub_ty = left_ty.lub(&right_ty);
+        if let Some(lub_ty) = lub_ty {
             if left_ty == Ty::Float
                 && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
             {
@@ -1268,12 +1331,47 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::EnumsNotOrd,
                 });
             }
-            if !matches!(left_ty, Ty::Float | Ty::Int | Ty::Enum(_)) {
+            if matches!(left_ty, Ty::Nil)
+                && matches!(right_ty, Ty::Nil)
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::NilNotOrd,
+                });
+            }
+            if matches!(left_ty, Ty::SeqNil)
+                && matches!(right_ty, Ty::SeqNil)
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::SeqNilNotOrd,
+                });
+            }
+            if matches!(lub_ty, Ty::Seq(_))
+                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+                && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
+            {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+                });
+            }
+            if !matches!(
+                left_ty,
+                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+            ) {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
                     kind: StaticErrorKind::ComparisonInvalidType,
                 });
             }
+        } else {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::BinOpMismatchedTypes,
+            });
         }
         Ty::Bool
     }
@@ -1365,7 +1463,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     if args.posargs.len() == 2 {
                         let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
                         let tailty = args.posargs[1].ty();
-                        if !(tailty == Ty::Nil || tailty == seqty) {
+                        if !(tailty == Ty::SeqNil || tailty == seqty) {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
@@ -1376,7 +1474,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         }
                         (None, seqty)
                     } else {
-                        (None, Ty::Nil)
+                        (None, Ty::SeqNil)
                     }
                 }
                 "head" => {
@@ -1798,6 +1896,7 @@ struct ExecPass<'a> {
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
+    seq_nil_value: ValueId,
     true_value: ValueId,
     false_value: ValueId,
     global_frame: FrameId,
@@ -1851,6 +1950,7 @@ impl<'a> ExecPass<'a> {
                 (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
+                (4, DeferValue::Ready(Value::SeqNil)),
             ]),
             frames: IndexMap::from_iter([(
                 5,
@@ -1862,6 +1962,7 @@ impl<'a> ExecPass<'a> {
             nil_value: 1,
             true_value: 2,
             false_value: 3,
+            seq_nil_value: 4,
             global_frame: 5,
             next_id: 6,
             partial_cells: VecDeque::new(),
@@ -2442,6 +2543,9 @@ impl<'a> ExecPass<'a> {
             Expr::Nil(_) => {
                 return self.nil_value;
             }
+            Expr::SeqNil(_) => {
+                return self.seq_nil_value;
+            }
             Expr::FloatLiteral(f) => {
                 let vid = self.value_id();
                 self.values
@@ -2872,7 +2976,7 @@ impl<'a> ExecPass<'a> {
                         &self.values[&c.state.posargs[1]],
                     ) {
                         let val = match tail {
-                            Value::Nil => {
+                            Value::SeqNil => {
                                 vec![head.clone()]
                             }
                             Value::Seq(s) => {
@@ -2891,7 +2995,7 @@ impl<'a> ExecPass<'a> {
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
-                            Value::Nil => Value::Nil,
+                            Value::SeqNil => Value::Nil,
                             Value::Seq(s) => s.first().cloned().unwrap_or(Value::Nil),
                             _ => unreachable!(),
                         };
@@ -2904,7 +3008,7 @@ impl<'a> ExecPass<'a> {
                 "tail" => {
                     if let Defer::Ready(lst) = &self.values[&c.state.posargs[0]] {
                         let val = match lst {
-                            Value::Nil => Value::Nil,
+                            Value::SeqNil => Value::SeqNil,
                             Value::Seq(s) => Value::Seq(s[1..].to_vec()),
                             _ => unreachable!(),
                         };
@@ -3343,6 +3447,33 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                             true
                         }
+                        (Value::Nil, Value::Nil) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => true,
+                                crate::ast::ComparisonOp::Ne => false,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
+                        (Value::SeqNil, Value::SeqNil) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => true,
+                                crate::ast::ComparisonOp::Ne => false,
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
+                        (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => {
+                            let res = match comparison_expr.expr.op {
+                                crate::ast::ComparisonOp::Eq => x.is_empty(),
+                                crate::ast::ComparisonOp::Ne => !x.is_empty(),
+                                _ => unreachable!(),
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
                         _ => unreachable!(),
                     }
                 } else {
@@ -3596,6 +3727,7 @@ pub enum Value {
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
     Seq(Vec<Value>),
+    SeqNil,
     Nil,
 }
 
@@ -3861,6 +3993,15 @@ pub enum StaticErrorKind {
     /// Cannot perform greater/less than comparisons on enum values.
     #[error("cannot perform greater/less than comparisons on enum values")]
     EnumsNotOrd,
+    /// Cannot perform greater/less than comparisons on nil values.
+    #[error("cannot perform greater/less than comparisons on nil")]
+    NilNotOrd,
+    /// Cannot perform greater/less than comparisons on seq nil values.
+    #[error("cannot perform greater/less than comparisons on seq nil")]
+    SeqNilNotOrd,
+    /// Must compare sequences for equality/inequality to nil.
+    #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
+    SeqMustCompareEqSeqNil,
     /// A type cannot be used in a binary expression.
     #[error("type cannot be used in a binary expression")]
     BinOpInvalidType,

@@ -5,11 +5,11 @@ fn make_list(base: Float) -> [Rect] {
       rect("met1", x0=200.+base, y0=0., w=100., h=100.),
       cons(
       rect("met1", x0=400.+base, y0=0., w=100., h=100.),
-      nil)))
+      [])))
 }
 
 fn make_array() -> [[Rect]] {
-    cons(#scope0 make_list(0.), cons(#scope1 make_list(1000.), cons(#scope2 make_list(2000.), nil)))
+    cons(#scope0 make_list(0.), cons(#scope1 make_list(1000.), cons(#scope2 make_list(2000.), [])))
 }
 
 fn elem12(arr: [[Rect]]) -> Rect {
@@ -26,7 +26,7 @@ cell bot(input: [Float]) {
 }
 
 cell top() {
-    let lst = cons(250., cons(350., cons(450., nil)));
+    let lst = cons(250., cons(350., cons(450., [])));
     let bot_inst = inst(#scope0 bot(lst), x=2000., y=3000.);
     let r1 = bot_inst.v!;
     let r2 = #scope1 elem11(bot_inst.arr)!;
