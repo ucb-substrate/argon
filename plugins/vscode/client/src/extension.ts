@@ -5,6 +5,7 @@
 
 import * as path from "path";
 import * as fs from 'fs';
+import * as os from 'os';
 import { commands, window, workspace, WorkspaceFolder, ExtensionContext, Uri } from "vscode";
 
 import {
@@ -37,18 +38,26 @@ function findWorkspaceRoot(startPath: string): string | undefined {
 }
 
 export function activate(context: ExtensionContext) {
+    let config = workspace.getConfiguration(undefined, undefined)
 	// The server is implemented in node
-	const serverModule = path.join(workspace.getConfiguration(undefined, undefined).argonLsp.argonRepoDir, 'target', 'release', 'lsp-server')
-	console.log(serverModule);
+	const serverModule = path.join(config.argonLsp.argonRepoDir, 'target', 'release', 'lsp-server')
 
+    let env = {}
+    if (config.argonLsp.log.level) {
+        env.ARGON_LOG = config.argonLsp.log.level
+    }
+    const executable = {
+        command: serverModule,
+        transport: TransportKind.stdio,
+        options: {
+            env: env
+        }
+    };
 	// If the extension is launched in debug mode then the debug server options are used
 	// Otherwise the run options are used
 	const serverOptions: ServerOptions = {
-		run: { command: serverModule, transport: TransportKind.stdio },
-		debug: {
-			command: serverModule,
-			transport: TransportKind.stdio,
-		}
+		run: executable,
+		debug: executable
 	};
 
 	const activeEditor = window.activeTextEditor;
@@ -91,8 +100,17 @@ export function activate(context: ExtensionContext) {
 		}
 	};
 
+	const log = async () => {
+        // TODO: allow configuration via ARGON_HOME environment variable.
+        const doc = await workspace.openTextDocument(path.join(os.homedir(), ".local/state/argon/log"));
+        await window.showTextDocument(doc, {
+            preview: false  // ensures it's a new tab, not replacing the preview tab
+        });
+	};
+
 	context.subscriptions.push(commands.registerCommand("argonLsp.startGui", startGui));
 	context.subscriptions.push(commands.registerCommand("argonLsp.openCell", openCell));
+	context.subscriptions.push(commands.registerCommand("argonLsp.log", log));
 
 	client.onRequest("custom/forceSave", async (file: string) => {
 		let doc = workspace.textDocuments.find(d => d.uri.fsPath === file);

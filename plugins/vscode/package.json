@@ -30,6 +30,12 @@
                     "scope": "resource",
                     "type": "string",
                     "description": "The path of the local Argon repository (for development purposes)."
+                },
+                "argonLsp.log.level": {
+                    "scope": "resource",
+                    "type": "string",
+                    "default": "",
+                    "description": "The Argon log level. Follows [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax"
                 }
             }
         },
@@ -41,6 +47,10 @@
             {
                 "command": "argonLsp.startGui",
                 "title": "Argon LSP: Start GUI"
+            },
+            {
+                "command": "argonLsp.log",
+                "title": "Argon LSP: Open Log"
             }
         ]
     },

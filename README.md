@@ -71,7 +71,7 @@ in both Neovim and the GUI.
 To use VS Code as your code editor, you will additionally need:
 - [Node JS (tested on 25.0.0)](https://nodejs.org/en/download)
 
-First, open your VS Code user settings using Command Palette > Preferences: Open User Settings (JSON).
+First, open your VS Code user settings using `Command Palette > Preferences: Open User Settings (JSON)`.
 Add the following key:
 
 ```json
@@ -107,7 +107,7 @@ With this alias defined, you can now run:
 codear core/compiler/examples/argon_workspace
 ```
 
-Open the `lib.ar` file within the workspace. You can then start the GUI by running Command Palette > Argon LSP: Start GUI.
+Open the `lib.ar` file within the workspace. You can then start the GUI by running `Command Palette > Argon LSP: Start GUI`.
 
 > [!WARNING]
 > If you cannot find the command for starting the GUI but did not notice any obvious errors, you may be on an old version of VS Code.
@@ -202,6 +202,47 @@ After saving, try opening this cell from the GUI by running `:openCell triple_re
 should be able to constrain the instances relative to one another based on their
 constituent rectangles.
 
+## Logs
+
+<!-- TODO: Implement commands to open GUI log -->
+Argon writes log messages to `~/.local/state/argon/lsp.log` (LSP server) and `~/local/state/argon/gui.log` (GUI).
+Log level can be set using the `ARGON_LOG` environment variable
+or in editor-specific configuration. If no configuration is specified, only errors will be logged.
+Log level configuration follows [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
+
+For performance, it is recommended to use `ARGON_LOG=warn` or `ARGON_LOG=error` unless you are troubleshooting an issue.
+
+### Neovim
+
+While the LSP is running, you can open the LSP logs using the `:ArgonLsp log` command 
+
+To configure the log level, you can use the `vim.g.argon_lsp.log.level` key:
+
+```lua
+vim.g.argon_lsp = {
+    -- ...
+    log = {
+        level = "debug"
+    }
+}
+```
+
+The Neovim plugin will supply `ARGON_LOG=debug` when starting the LSP server and GUI.
+
+### VS Code
+
+While the LSP is running, you can open the LSP logs using the `Command Palette > Argon LSP: Open Log` command.
+
+To configure the log level, you can use the `argonLsp.log.level` key:
+
+```json
+{
+    "argonLsp.log.level": "debug"
+}
+```
+
+The VS Code plugin will supply `ARGON_LOG=debug` when starting the LSP server and GUI.
+
 ## Contributing
 
 If you'd like to contribute to Argon, please let us know. You can:
@@ -213,7 +254,7 @@ Documentation updates, tests, and bugfixes are always welcome.
 For larger feature additions, please discuss your ideas with us before implementing them.
 
 Contributions can be submitted by opening a pull request against the `main` branch
-of this repository.
+of this repository. Developer documentation can be found in the [`docs/`](docs/developers.md) folder.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion
 in the work by you shall be licensed under the BSD 3-Clause license, without any additional terms or conditions.

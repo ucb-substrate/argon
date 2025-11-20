@@ -1,3 +1,4 @@
+pub mod config;
 pub mod document;
 pub mod import;
 pub mod rpc;
@@ -38,8 +39,11 @@ use tokio::{
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{request::Request, *};
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 use crate::{
+    config::default_argon_home,
     document::{Document, DocumentChange},
     import::ScopeAnnotationPass,
 };
@@ -366,16 +370,16 @@ impl Backend {
     async fn start_gui(&self) -> Result<()> {
         self.state
             .editor_client
-            .show_message(MessageType::INFO, "Starting the GUI...")
+            .show_message(MessageType::LOG, "Starting the GUI...")
             .await;
-        let state = self.state.clone();
+        let server_addr = self.state.server_addr;
 
         tokio::spawn(async move {
             match Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../target/release/gui"
             ))
-            .arg(format!("{}", state.server_addr))
+            .arg(format!("{}", server_addr))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -383,24 +387,22 @@ impl Backend {
             {
                 Ok(child) => {
                     if let Some(stdout) = child.stdout {
-                        let editor_client = state.editor_client.clone();
                         tokio::spawn(async move {
                             let reader = BufReader::new(stdout);
                             let mut lines = reader.lines();
 
                             while let Ok(Some(line)) = lines.next_line().await {
-                                editor_client.log_message(MessageType::INFO, line).await;
+                                info!("{}", line);
                             }
                         });
                     }
                     if let Some(stderr) = child.stderr {
-                        let editor_client = state.editor_client.clone();
                         tokio::spawn(async move {
                             let reader = BufReader::new(stderr);
                             let mut lines = reader.lines();
 
                             while let Ok(Some(line)) = lines.next_line().await {
-                                editor_client.log_message(MessageType::ERROR, line).await;
+                                error!("{}", line);
                             }
                         });
                     }
@@ -417,6 +419,7 @@ impl Backend {
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut.cell = Some(cell.into());
         state_mut.compile(&self.state.editor_client, false).await;
+        info!("compiling cell");
     }
 
     /// Compiles the current workspace and the open cell if it exists.
@@ -429,7 +432,7 @@ impl Backend {
         let state = self.state.clone();
         state
             .editor_client
-            .show_message(MessageType::INFO, &format!("cell {}", params.cell))
+            .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
         let self_clone = self.clone();
         tokio::spawn(async move {
@@ -464,6 +467,7 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 }
 
 pub async fn main() {
+    info!("test");
     // Start server for communication with GUI.
     let mut listener = if let Ok(listener) =
         tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12345), Json::default).await
@@ -517,10 +521,19 @@ pub async fn main() {
     state
         .editor_client
         .show_message(
-            MessageType::INFO,
+            MessageType::LOG,
             format!("Server listening on port {}", server_addr.port()),
         )
         .await;
+
+    // TODO: Allow configuration via ARGON_HOME environment variable.
+    if let Some(log_dir) = default_argon_home() {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
+            .with_writer(tracing_appender::rolling::never(log_dir, "lsp.log"))
+            .with_ansi(false)
+            .init();
+    }
 
     // Start actual LSP server.
     Server::new(stdin, stdout, socket).serve(service).await;

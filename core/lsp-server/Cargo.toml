@@ -18,8 +18,9 @@ lrlex = { workspace = true }
 lrpar = { workspace = true }
 itertools = { workspace = true }
 tarpc = { workspace = true }
-env_logger = "0.11"
-log = "0.4"
 lsp-document = "0.6"
 arcstr = { workspace = true }
 indexmap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }

@@ -4,6 +4,9 @@ use std::{borrow::Cow, net::SocketAddr};
 use clap::Parser;
 use editor::Editor;
 use gpui::*;
+use lsp_server::config::default_argon_home;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use crate::actions::*;
 use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
@@ -49,6 +52,15 @@ impl AssetSource for Assets {
 
 pub fn main() {
     let args = Args::parse();
+
+    // TODO: Allow configuration via ARGON_HOME environment variable.
+    if let Some(log_dir) = default_argon_home() {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
+            .with_writer(tracing_appender::rolling::never(log_dir, "gui.log"))
+            .with_ansi(false)
+            .init();
+    }
 
     Application::new()
         .with_assets(Assets {
@@ -151,6 +163,6 @@ pub fn main() {
 
 // Define the quit function that is registered with the App
 fn quit(_: &Quit, cx: &mut App) {
-    println!("Gracefully quitting the application . . .");
+    info!("Gracefully quitting the application . . .");
     cx.quit();
 }

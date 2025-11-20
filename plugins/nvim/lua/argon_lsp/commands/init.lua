@@ -28,6 +28,12 @@ local argon_lsp_command_tbl = {
       gui.set(table.concat(args, " "))
     end,
   },
+  log = {
+      impl = function(args, opts)
+          -- TODO: allow configuration of log file name.
+          vim.cmd('tabnew ~/.local/state/argon/log')
+      end
+  }
 }
 
 ---@param command_tbl argon_lsp.command_tbl

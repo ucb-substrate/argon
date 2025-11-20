@@ -339,7 +339,6 @@ impl Editor {
         let tool_bar = cx.new(|_cx| ToolBar::new(&state));
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
-        println!("{canvas_focus_handle:?}");
         window.focus(&canvas_focus_handle);
         let canvas = cx.new(|cx| {
             LayoutCanvas::new(

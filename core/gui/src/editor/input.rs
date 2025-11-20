@@ -665,7 +665,6 @@ impl Render for TextInput {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(move |input, _: &EditDim, _window, cx| {
-                println!("test");
                 if let ToolState::EditDim(EditDimToolState { original_value, .. }) =
                     input.state.read(cx).tool.read(cx)
                 {

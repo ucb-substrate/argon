@@ -19,7 +19,7 @@
 ---The path of the local Argon repository (for development purposes).
 ---@field argon_repo_path? string
 
-local ArgonLspConfig
+local config = {}
 
 ---@type argon_lsp.Opts | fun():argon_lsp.Opts | nil
 vim.g.argon_lsp = vim.g.argon_lsp
@@ -36,15 +36,21 @@ local function exepath_or_binary(binary)
   return #exe_path > 0 and exe_path or binary
 end
 
----@class argon_lsp.Config
-local ArgonLspDefaultConfig = {
+---@class argon_lsp.config.Config
+local Config = {
     --- Defaults to `nil`, which means argon_lsp will not use a local development repo as source.
     ---@type nil | string
     argon_repo_path = nil,
+    log = {
+        --- Log level following [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
+        --- Defaults to `nil`.
+        ---@type nil | string
+        level = nil
+    },
 }
 
----@type argon_lsp.Config
-ArgonLspConfig = vim.tbl_deep_extend('force', {}, ArgonLspDefaultConfig, argon_lsp_opts)
+---@type argon_lsp.config.Config
+config.config = vim.tbl_deep_extend('force', {}, Config, argon_lsp_opts)
 
-return ArgonLspConfig
+return config
 
