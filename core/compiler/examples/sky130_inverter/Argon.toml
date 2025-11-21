@@ -1,4 +1,4 @@
-lyp = "../lyp/sky130.lyp"
+lyp = "../../../../pdks/sky130/sky130.lyp"
 
 [mods]
 sky130 = "../../../../pdks/sky130"
