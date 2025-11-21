@@ -5,7 +5,7 @@ use gpui::prelude::*;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
-use lsp_server::rpc::GuiToLspAction;
+use lang_server::rpc::LangServerAction;
 
 use crate::{
     actions::{DrawDim, DrawRect, SelectMode},
@@ -83,8 +83,8 @@ impl Render for ToolBar {
                         Arc::new(|state, cx| {
                             state
                                 .read(cx)
-                                .lsp_client
-                                .dispatch_action(GuiToLspAction::Undo);
+                                .lang_server_client
+                                .dispatch_action(LangServerAction::Undo);
                         }),
                     )),
                     Some((
@@ -94,8 +94,8 @@ impl Render for ToolBar {
                         Arc::new(|state, cx| {
                             state
                                 .read(cx)
-                                .lsp_client
-                                .dispatch_action(GuiToLspAction::Redo);
+                                .lang_server_client
+                                .dispatch_action(LangServerAction::Redo);
                         }),
                     )),
                     None,

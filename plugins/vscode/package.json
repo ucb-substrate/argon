@@ -1,6 +1,6 @@
 {
-    "name": "argon-lsp",
-    "description": "Argon LSP",
+    "name": "argon",
+    "description": "Argon Extension for VS Code",
     "version": "0.0.1",
     "repository": {
         "type": "git",
@@ -9,7 +9,7 @@
     "engines": {
         "vscode": "^1.100.0"
     },
-    "main": "./client/out/extension",
+    "main": "./out/extension",
     "contributes": {
         "languages": [{
             "id": "argon",
@@ -24,14 +24,14 @@
         }],
         "configuration": {
             "type": "object",
-            "title": "Argon LSP configuration",
+            "title": "Argon configuration",
             "properties": {
-                "argonLsp.argonRepoPath": {
+                "argon.argonRepoPath": {
                     "scope": "resource",
                     "type": "string",
                     "description": "The path of the local Argon repository (for development purposes)."
                 },
-                "argonLsp.log.level": {
+                "argon.log.level": {
                     "scope": "resource",
                     "type": "string",
                     "default": "",
@@ -41,16 +41,16 @@
         },
         "commands": [
             {
-                "command": "argonLsp.openCell",
-                "title": "Argon LSP: Open Cell"
+                "command": "argon.openCell",
+                "title": "Argon: Open Cell"
             },
             {
-                "command": "argonLsp.startGui",
-                "title": "Argon LSP: Start GUI"
+                "command": "argon.startGui",
+                "title": "Argon: Start GUI"
             },
             {
-                "command": "argonLsp.log",
-                "title": "Argon LSP: Open Log"
+                "command": "argon.log",
+                "title": "Argon: Open Log"
             }
         ]
     },
@@ -58,10 +58,15 @@
         "vscode:prepublish": "npm run compile",
         "compile": "tsc -b",
         "watch": "tsc -b -w",
-        "lint": "eslint",
-        "postinstall": "cd client && npm install && cd .."
+        "lint": "eslint"
+    },
+    "dependencies": {
+        "glob": "^11.0.0",
+        "vscode-languageclient": "^9.0.1"
     },
     "devDependencies": {
+        "@types/vscode": "^1.100.0",
+        "@vscode/test-electron": "^2.3.9",
         "@eslint/js": "^9.13.0",
         "@stylistic/eslint-plugin": "^2.9.0",
         "@types/mocha": "^10.0.6",

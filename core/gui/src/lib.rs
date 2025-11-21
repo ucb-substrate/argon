@@ -4,7 +4,7 @@ use std::{borrow::Cow, net::SocketAddr};
 use clap::Parser;
 use editor::Editor;
 use gpui::*;
-use lsp_server::config::default_argon_home;
+use lang_server::config::default_argon_home;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 

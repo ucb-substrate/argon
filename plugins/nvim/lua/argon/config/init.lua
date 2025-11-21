@@ -1,31 +1,31 @@
----@mod argon_lsp.config plugin configuration
+---@mod argon.config plugin configuration
 ---
 ---@brief [[
 ---
----argon_lsp is a filetype plugin, and does not need
+---argon is a filetype plugin, and does not need
 ---a `setup` function to work.
 ---
----To configure argon_lsp, set the variable `vim.g.argon_lsp`,
----which is a |argon_lsp.Opts| table, in your neovim configuration.
+---To configure argon, set the variable `vim.g.argon`,
+---which is a |argon.Opts| table, in your neovim configuration.
 ---
 ---Notes:
 ---
---- - `vim.g.argon_lsp` can also be a function that returns a |argon_lsp.Opts| table.
+--- - `vim.g.argon` can also be a function that returns a |argon.Opts| table.
 ---
 ---@brief ]]
 
----@class argon_lsp.Opts
+---@class argon.Opts
 ---
 ---The path of the local Argon repository (for development purposes).
 ---@field argon_repo_path? string
 
 local config = {}
 
----@type argon_lsp.Opts | fun():argon_lsp.Opts | nil
-vim.g.argon_lsp = vim.g.argon_lsp
+---@type argon.Opts | fun():argon.Opts | nil
+vim.g.argon = vim.g.argon
 
-local argon_lsp = vim.g.argon_lsp or {}
-local argon_lsp_opts = type(argon_lsp) == 'function' and argon_lsp() or argon_lsp
+local argon = vim.g.argon or {}
+local argon_opts = type(argon) == 'function' and argon() or argon
 
 ---Wrapper around |vim.fn.exepath()| that returns the binary if no path is found.
 ---@param binary string
@@ -36,9 +36,9 @@ local function exepath_or_binary(binary)
   return #exe_path > 0 and exe_path or binary
 end
 
----@class argon_lsp.config.Config
+---@class argon.config.Config
 local Config = {
-    --- Defaults to `nil`, which means argon_lsp will not use a local development repo as source.
+    --- Defaults to `nil`, which means argon will not use a local development repo as source.
     ---@type nil | string
     argon_repo_path = nil,
     log = {
@@ -49,8 +49,8 @@ local Config = {
     },
 }
 
----@type argon_lsp.config.Config
-config.config = vim.tbl_deep_extend('force', {}, Config, argon_lsp_opts)
+---@type argon.config.Config
+config.config = vim.tbl_deep_extend('force', {}, Config, argon_opts)
 
 return config
 

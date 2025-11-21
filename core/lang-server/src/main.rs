@@ -1,4 +1,4 @@
 #[tokio::main]
 async fn main() {
-    lsp_server::main().await;
+    lang_server::main().await;
 }

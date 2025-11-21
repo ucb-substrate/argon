@@ -1,8 +1,8 @@
 local M = {}
 
-local client = require('argon_lsp.client')
-local config = require('argon_lsp.config').config
-local commands = require('argon_lsp.commands')
+local client = require('argon.client')
+local config = require('argon.config').config
+local commands = require('argon.commands')
 
 ---LSP restart internal implementations
 ---@param bufnr? number The buffer number, defaults to the current buffer
@@ -15,7 +15,7 @@ local function restart(bufnr, filter, callback)
   local timer, _, _ = vim.uv.new_timer()
   if not timer then
     vim.schedule(function()
-      vim.notify('argon_lsp: Failed to initialise timer for LSP client restart.', vim.log.levels.ERROR)
+      vim.notify('argon: Failed to initialise timer for LSP client restart.', vim.log.levels.ERROR)
     end)
     return
   end
@@ -41,7 +41,7 @@ local function restart(bufnr, filter, callback)
     elseif attempts_to_live <= 0 then
       vim.schedule(function()
         vim.notify(
-          ('argon_lsp: Could not restart all LSP clients after %d attempts.'):format(max_attempts),
+          ('argon: Could not restart all LSP clients after %d attempts.'):format(max_attempts),
           vim.log.levels.ERROR
         )
       end)
@@ -65,7 +65,7 @@ M.start = function(bufnr)
     local root_dir = M.get_root_dir(bufnr)
     if not root_dir then
         vim.notify(
-          'argon_lsp: Could not detect workspace, treating current file as root.',
+          'argon: Could not detect workspace, treating current file as root.',
           vim.log.levels.WARN
         )
         root_dir = vim.fs.dirname(bufname)
@@ -75,8 +75,8 @@ M.start = function(bufnr)
         cmd_env.ARGON_LOG = config.log.level
     end
     local lsp_start_config = { 
-        name = 'argon_lsp',
-        cmd = { config.argon_repo_path ..'/target/release/lsp-server' },
+        name = 'argon',
+        cmd = { config.argon_repo_path ..'/target/release/lang-server' },
         cmd_env = cmd_env,
         handlers = {
             ['custom/forceSave'] = function(err, result, ctx)
@@ -120,7 +120,7 @@ M.start = function(bufnr)
 
     local old_on_init = lsp_start_config.on_init
     lsp_start_config.on_init = function(...)
-        commands.create_argon_lsp_command()
+        commands.create_argon_command()
         if type(old_on_init) == 'function' then
             old_on_init(...)
         end
@@ -130,7 +130,7 @@ M.start = function(bufnr)
     lsp_start_config.on_exit = function(...)
         -- on_exit runs in_fast_event
         vim.schedule(function()
-        commands.delete_argon_lsp_command()
+        commands.delete_argon_command()
         end)
         if type(old_on_exit) == 'function' then
         old_on_exit(...)
@@ -145,7 +145,7 @@ end
 ---@return vim.lsp.Client[] clients A list of clients that will be stopped
 M.stop = function(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
-  local clients = client.get_active_argon_lsp_clients(bufnr, filter)
+  local clients = client.get_active_argon_clients(bufnr, filter)
   vim.lsp.stop_client(clients)
   if type(clients) == 'table' then
     ---@cast clients vim.lsp.Client[]

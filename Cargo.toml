@@ -1,7 +1,7 @@
 [workspace]
 
 resolver = "2"
-members = ["core/compiler", "core/gui", "core/lsp-server"]
+members = ["core/compiler", "core/gui", "core/lang-server"]
 
 [workspace.dependencies]
 anyhow = "1"

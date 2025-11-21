@@ -256,7 +256,7 @@ impl TextInput {
                 && self
                     .state
                     .read(cx)
-                    .lsp_client
+                    .lang_server_client
                     .edit_dimension(dim.clone(), self.content.to_string())
                     .is_some()
             {
@@ -271,7 +271,10 @@ impl TextInput {
                     #[allow(clippy::single_match)]
                     match command.trim_start_matches(":") {
                         "openCell" => {
-                            self.state.read(cx).lsp_client.open_cell(rest.to_string());
+                            self.state
+                                .read(cx)
+                                .lang_server_client
+                                .open_cell(rest.to_string());
                             return true;
                         }
                         _ => {} // TODO: support other commands, reduce redundancy with rpc.rs
