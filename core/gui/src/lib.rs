@@ -4,7 +4,7 @@ use std::{borrow::Cow, net::SocketAddr};
 use clap::Parser;
 use editor::Editor;
 use gpui::*;
-use lsp_server::config::default_argon_home;
+use lang_server::config::default_argon_home;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -20,7 +20,7 @@ pub mod theme;
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    lsp_addr: SocketAddr,
+    lang_server_addr: SocketAddr,
 }
 
 struct Assets {
@@ -152,7 +152,9 @@ pub fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    window.replace_root(cx, |window, cx| Editor::new(cx, window, args.lsp_addr))
+                    window.replace_root(cx, |window, cx| {
+                        Editor::new(cx, window, args.lang_server_addr)
+                    })
                 },
             )
             .unwrap();

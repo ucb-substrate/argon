@@ -2666,8 +2666,8 @@ dependencies = [
  "gpui",
  "indexmap 2.11.4",
  "itertools 0.14.0",
+ "lang-server",
  "lazy_static",
- "lsp-server",
  "rgb",
  "rust-embed",
  "serde",
@@ -3207,6 +3207,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "lang-server"
+version = "0.1.0"
+dependencies = [
+ "arcstr",
+ "bytes",
+ "cfgrammar",
+ "compiler",
+ "futures",
+ "indexmap 2.11.4",
+ "itertools 0.14.0",
+ "lrlex",
+ "lrpar",
+ "lsp-document",
+ "serde",
+ "serde_json",
+ "tarpc",
+ "tokio",
+ "tokio-util",
+ "tower-lsp",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "layout21utils"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3407,31 +3432,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43590d4fd929e822de2ab109b9422467f1c547fe543be27e522b043c457dcb37"
 dependencies = [
  "lsp-types 0.93.2",
-]
-
-[[package]]
-name = "lsp-server"
-version = "0.1.0"
-dependencies = [
- "arcstr",
- "bytes",
- "cfgrammar",
- "compiler",
- "futures",
- "indexmap 2.11.4",
- "itertools 0.14.0",
- "lrlex",
- "lrpar",
- "lsp-document",
- "serde",
- "serde_json",
- "tarpc",
- "tokio",
- "tokio-util",
- "tower-lsp",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]

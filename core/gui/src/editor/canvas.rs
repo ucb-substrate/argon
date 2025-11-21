@@ -20,7 +20,7 @@ use gpui::{
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
-use lsp_server::rpc::DimensionParams;
+use lang_server::rpc::DimensionParams;
 use tower_lsp::lsp_types::MessageType;
 
 use crate::{
@@ -1293,7 +1293,7 @@ impl LayoutCanvas {
                                                     .find(|name| !names.contains(name))
                                                     .unwrap();
 
-                                                state.lsp_client.draw_rect(
+                                                state.lang_server_client.draw_rect(
                                                     scope.span.clone(),
                                                     rect_name,
                                                     compile::BasicRect {
@@ -1319,14 +1319,14 @@ impl LayoutCanvas {
                                 rect_tool.p0 = Some(p0);
                             }
                         } else {
-                            state.lsp_client.show_message(
+                            state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
                         }
                     } else {
                         state
-                            .lsp_client
+                            .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
                     }
                 }
@@ -1527,7 +1527,7 @@ impl LayoutCanvas {
 
                             let value = format!("{:?}", edge.2.stop - edge.2.start);
                             state
-                                .lsp_client
+                                .lang_server_client
                                 .draw_dimension(
                                     cell.output.cells[&selected_scope_addr.cell].scopes
                                         [&selected_scope_addr.scope]
@@ -1582,7 +1582,7 @@ impl LayoutCanvas {
                                         format!("- {}", intended_coord - coord)
                                     };
                                     let value = format!("{:?}", right.2.coord - left.2.coord);
-                                    state.lsp_client.draw_dimension(
+                                    state.lang_server_client.draw_dimension(
                                         cell.output.cells[&selected_scope_addr.cell].scopes
                                             [&selected_scope_addr.scope]
                                             .span
@@ -1653,7 +1653,7 @@ impl LayoutCanvas {
                                         )
                                     };
                                     state
-                                        .lsp_client
+                                        .lang_server_client
                                         .draw_dimension(
                                             cell.output.cells[&selected_scope_addr.cell].scopes
                                                 [&selected_scope_addr.scope]
@@ -1719,7 +1719,10 @@ impl LayoutCanvas {
                     }
                     if let Some(span) = selected_obj {
                         select_tool.selected_obj = Some(span.clone());
-                        self.state.read(cx).lsp_client.select_rect(span.clone());
+                        self.state
+                            .read(cx)
+                            .lang_server_client
+                            .select_rect(span.clone());
                     } else {
                         select_tool.selected_obj = None;
                     }

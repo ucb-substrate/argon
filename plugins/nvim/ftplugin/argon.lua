@@ -1,2 +1,2 @@
-require('argon_lsp').start()
+require('argon').start()
 

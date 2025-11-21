@@ -26,13 +26,13 @@ pub struct DimensionParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum GuiToLspAction {
+pub enum LangServerAction {
     Undo,
     Redo,
 }
 
 #[tarpc::service]
-pub trait GuiToLsp {
+pub trait LangServer {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Span);
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
@@ -41,36 +41,31 @@ pub trait GuiToLsp {
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
-    async fn dispatch_action(action: GuiToLspAction);
+    async fn dispatch_action(action: LangServerAction);
 }
 
 #[tarpc::service]
-pub trait LspToGui {
+pub trait Gui {
     async fn open_cell(cell: CompileOutput, update: bool);
     async fn set(key: String, value: String);
 }
 
-#[derive(Clone)]
-pub struct LspServer {
-    pub state: State,
-}
-
-impl GuiToLsp for LspServer {
+impl LangServer for State {
     async fn register(self, _: tarpc::context::Context, addr: SocketAddr) -> () {
         let gui_client = {
             let mut transport = tarpc::serde_transport::tcp::connect(addr, Json::default);
             transport.config_mut().max_frame_length(usize::MAX);
 
-            LspToGuiClient::new(tarpc::client::Config::default(), transport.await.unwrap()).spawn()
+            GuiClient::new(tarpc::client::Config::default(), transport.await.unwrap()).spawn()
         };
-        let mut state_mut = self.state.state_mut.lock().await;
+        let mut state_mut = self.state_mut.lock().await;
         state_mut.gui_client = Some(gui_client);
-        state_mut.compile(&self.state.editor_client, false).await;
+        state_mut.compile(&self.editor_client, false).await;
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
         // TODO: check that vim file is in sync with GUI file.
-        let state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state_mut.lock().await;
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
             let doc = Document::new(&ast.text, 0);
             let url = Url::from_file_path(&span.path).unwrap();
@@ -83,8 +78,7 @@ impl GuiToLsp for LspServer {
                 message: "selected rect".to_string(),
                 ..Default::default()
             }];
-            self.state
-                .editor_client
+            self.editor_client
                 .publish_diagnostics(url, diagnostics, None)
                 .await;
         }
@@ -97,7 +91,7 @@ impl GuiToLsp for LspServer {
         var_name: String,
         rect: BasicRect<f64>,
     ) -> Option<Span> {
-        let state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
         if let Some(ast) = state_mut
             .ast
@@ -175,8 +169,7 @@ impl GuiToLsp for LspServer {
             if let Some(file) = state_mut.editor_files.get(&url)
                 && file.contents() != doc.contents()
             {
-                self.state
-                    .editor_client
+                self.editor_client
                     .show_message(
                         MessageType::ERROR,
                         "Editor buffer state is inconsistent with GUI state.",
@@ -185,8 +178,7 @@ impl GuiToLsp for LspServer {
                 return None;
             }
 
-            self.state
-                .editor_client
+            self.editor_client
                 .show_document(ShowDocumentParams {
                     uri: url.clone(),
                     external: None,
@@ -196,8 +188,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .apply_edit(WorkspaceEdit {
                     changes: Some(HashMap::from_iter([(url, vec![edit])])),
                     document_changes: None,
@@ -206,8 +197,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .send_request::<ForceSave>(scope_span.path.clone())
                 .await
                 .unwrap();
@@ -223,7 +213,7 @@ impl GuiToLsp for LspServer {
         scope_span: Span,
         params: DimensionParams,
     ) -> Option<Span> {
-        let state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
         if let Some(ast) = state_mut
             .ast
@@ -297,8 +287,7 @@ impl GuiToLsp for LspServer {
             if let Some(file) = state_mut.editor_files.get(&url)
                 && file.contents() != doc.contents()
             {
-                self.state
-                    .editor_client
+                self.editor_client
                     .show_message(
                         MessageType::ERROR,
                         "Editor buffer state is inconsistent with GUI state.",
@@ -307,8 +296,7 @@ impl GuiToLsp for LspServer {
                 return None;
             }
 
-            self.state
-                .editor_client
+            self.editor_client
                 .show_document(ShowDocumentParams {
                     uri: url.clone(),
                     external: None,
@@ -318,8 +306,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .apply_edit(WorkspaceEdit {
                     changes: Some(HashMap::from_iter([(url, vec![edit])])),
                     document_changes: None,
@@ -328,8 +315,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .send_request::<ForceSave>(scope_span.path.clone())
                 .await
                 .unwrap();
@@ -345,7 +331,7 @@ impl GuiToLsp for LspServer {
         span: Span,
         value: String,
     ) -> Option<Span> {
-        let state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state_mut.lock().await;
         let url = Url::from_file_path(&span.path).unwrap();
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
             && let Some(c) = ast.span2call.get(&span)
@@ -361,8 +347,7 @@ impl GuiToLsp for LspServer {
             if let Some(file) = state_mut.editor_files.get(&url)
                 && file.contents() != doc.contents()
             {
-                self.state
-                    .editor_client
+                self.editor_client
                     .show_message(
                         MessageType::ERROR,
                         "Editor buffer state is inconsistent with GUI state.",
@@ -371,8 +356,7 @@ impl GuiToLsp for LspServer {
                 return None;
             }
 
-            self.state
-                .editor_client
+            self.editor_client
                 .show_document(ShowDocumentParams {
                     uri: url.clone(),
                     external: None,
@@ -382,8 +366,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .apply_edit(WorkspaceEdit {
                     changes: Some(HashMap::from_iter([(url, vec![edit])])),
                     document_changes: None,
@@ -392,8 +375,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .send_request::<ForceSave>(span.path.clone())
                 .await
                 .unwrap();
@@ -417,7 +399,7 @@ impl GuiToLsp for LspServer {
         lhs: String,
         rhs: String,
     ) {
-        let state_mut = self.state.state_mut.lock().await;
+        let state_mut = self.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
         if let Some(ast) = state_mut
             .ast
@@ -469,8 +451,7 @@ impl GuiToLsp for LspServer {
             if let Some(file) = state_mut.editor_files.get(&url)
                 && file.contents() != doc.contents()
             {
-                self.state
-                    .editor_client
+                self.editor_client
                     .show_message(
                         MessageType::ERROR,
                         "Editor buffer state is inconsistent with GUI state.",
@@ -479,8 +460,7 @@ impl GuiToLsp for LspServer {
                 return;
             }
 
-            self.state
-                .editor_client
+            self.editor_client
                 .show_document(ShowDocumentParams {
                     uri: url.clone(),
                     external: None,
@@ -490,8 +470,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .apply_edit(WorkspaceEdit {
                     changes: Some(HashMap::from_iter([(url, vec![edit])])),
                     document_changes: None,
@@ -500,8 +479,7 @@ impl GuiToLsp for LspServer {
                 .await
                 .unwrap();
 
-            self.state
-                .editor_client
+            self.editor_client
                 .send_request::<ForceSave>(scope_span.path.clone())
                 .await
                 .unwrap();
@@ -509,37 +487,27 @@ impl GuiToLsp for LspServer {
     }
 
     async fn open_cell(self, _: tarpc::context::Context, cell: String) {
-        let state = self.state.clone();
-        state
-            .editor_client
+        self.editor_client
             .show_message(MessageType::INFO, &format!("cell {}", cell))
             .await;
         tokio::spawn(async move {
-            let mut state_mut = state.state_mut.lock().await;
+            let mut state_mut = self.state_mut.lock().await;
             state_mut.cell = Some(cell);
-            state_mut.compile(&self.state.editor_client, false).await;
+            state_mut.compile(&self.editor_client, false).await;
         });
     }
 
     async fn show_message(self, _: tarpc::context::Context, typ: MessageType, message: String) {
-        self.state.editor_client.show_message(typ, message).await;
+        self.editor_client.show_message(typ, message).await;
     }
 
-    async fn dispatch_action(self, _: tarpc::context::Context, action: GuiToLspAction) {
+    async fn dispatch_action(self, _: tarpc::context::Context, action: LangServerAction) {
         match action {
-            GuiToLspAction::Undo => {
-                self.state
-                    .editor_client
-                    .send_request::<Undo>(())
-                    .await
-                    .unwrap();
+            LangServerAction::Undo => {
+                self.editor_client.send_request::<Undo>(()).await.unwrap();
             }
-            GuiToLspAction::Redo => {
-                self.state
-                    .editor_client
-                    .send_request::<Redo>(())
-                    .await
-                    .unwrap();
+            LangServerAction::Redo => {
+                self.editor_client.send_request::<Redo>(()).await.unwrap();
             }
         }
     }

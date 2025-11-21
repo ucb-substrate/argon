@@ -13,7 +13,7 @@ use futures::{
     prelude::*,
 };
 use gpui::AsyncApp;
-use lsp_server::rpc::{DimensionParams, GuiToLspAction, GuiToLspClient, LspToGui};
+use lang_server::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient};
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},
@@ -24,19 +24,20 @@ use tower_lsp::lsp_types::MessageType;
 use crate::editor::Editor;
 
 #[derive(Clone)]
-pub struct SyncGuiToLspClient {
+pub struct SyncLangServerClient {
     app: AsyncApp,
-    client: GuiToLspClient,
+    client: LangServerClient,
 }
 
-impl SyncGuiToLspClient {
-    pub fn new(app: AsyncApp, lsp_addr: SocketAddr) -> Self {
+impl SyncLangServerClient {
+    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> Self {
         let client = app.background_executor().block(
             async move {
-                let mut transport = tarpc::serde_transport::tcp::connect(lsp_addr, Json::default);
+                let mut transport =
+                    tarpc::serde_transport::tcp::connect(lang_server_addr, Json::default);
                 transport.config_mut().max_frame_length(usize::MAX);
 
-                GuiToLspClient::new(tarpc::client::Config::default(), transport.await.unwrap())
+                LangServerClient::new(tarpc::client::Config::default(), transport.await.unwrap())
                     .spawn()
             }
             .compat(),
@@ -209,7 +210,7 @@ impl SyncGuiToLspClient {
         );
     }
 
-    pub fn dispatch_action(&self, action: GuiToLspAction) {
+    pub fn dispatch_action(&self, action: LangServerAction) {
         let client_clone = self.client.clone();
         self.app.background_executor().block(
             async move {
@@ -230,7 +231,7 @@ pub struct GuiServer {
     to_exec: Sender<EditorFn>,
 }
 
-impl LspToGui for GuiServer {
+impl Gui for GuiServer {
     async fn open_cell(mut self, _: context::Context, cell: CompileOutput, update: bool) {
         self.to_exec
             .send(Box::new(move |editor, cx| {

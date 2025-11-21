@@ -11,7 +11,7 @@ use compiler::compile::{
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
-use lsp_server::rpc::GuiToLspAction;
+use lang_server::rpc::LangServerAction;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp::lsp_types::MessageType;
@@ -19,7 +19,7 @@ use tower_lsp::lsp_types::MessageType;
 use crate::{
     actions::{Redo, Undo},
     editor::{canvas::ToolState, input::TextInput},
-    rpc::SyncGuiToLspClient,
+    rpc::SyncLangServerClient,
     theme::{DARK_THEME, LIGHT_THEME, Theme},
 };
 
@@ -75,7 +75,7 @@ pub struct EditorState {
     pub solved_cell: Entity<Option<CompileOutputState>>,
     pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
-    pub lsp_client: SyncGuiToLspClient,
+    pub lang_server_client: SyncLangServerClient,
     pub subscriptions: Vec<Subscription>,
     pub(crate) tool: Entity<ToolState>,
 }
@@ -235,7 +235,7 @@ impl EditorState {
                     .iter()
                     .any(|e| matches!(e.kind, ExecErrorKind::InvalidCell))
                 {
-                    self.lsp_client
+                    self.lang_server_client
                         .show_message(MessageType::ERROR, "Open cell is invalid");
                     self.fatal_error = Some(SharedString::from("Open cell is invalid"));
                     return;
@@ -314,8 +314,8 @@ impl EditorState {
 }
 
 impl Editor {
-    pub fn new(cx: &mut Context<Self>, window: &mut Window, lsp_addr: SocketAddr) -> Self {
-        let lsp_client = SyncGuiToLspClient::new(cx.to_async(), lsp_addr);
+    pub fn new(cx: &mut Context<Self>, window: &mut Window, lang_server_addr: SocketAddr) -> Self {
+        let lang_server_client = SyncLangServerClient::new(cx.to_async(), lang_server_addr);
         let solved_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
@@ -336,7 +336,7 @@ impl Editor {
                 tool,
                 layers,
                 subscriptions,
-                lsp_client: lsp_client.clone(),
+                lang_server_client: lang_server_client.clone(),
             }
         });
         let title_bar = cx.new(|_cx| TitleBar::new(&state));
@@ -366,7 +366,7 @@ impl Editor {
             canvas,
             text_input,
         };
-        lsp_client.register_server(editor.clone());
+        lang_server_client.register_server(editor.clone());
 
         editor
     }
@@ -429,15 +429,15 @@ impl Editor {
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
         self.state
             .read(cx)
-            .lsp_client
-            .dispatch_action(GuiToLspAction::Undo);
+            .lang_server_client
+            .dispatch_action(LangServerAction::Undo);
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
         self.state
             .read(cx)
-            .lsp_client
-            .dispatch_action(GuiToLspAction::Redo);
+            .lang_server_client
+            .dispatch_action(LangServerAction::Redo);
     }
 
     fn theme(&self, cx: &mut Context<Self>) -> &'static Theme {

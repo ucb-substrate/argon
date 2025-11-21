@@ -1,6 +1,6 @@
----@mod argon_lsp.client Functions for interacting with argon_lsp clients.
+---@mod argon.client Functions for interacting with argon LSP clients.
 
----@class argon_lsp.client.ClientAdapter
+---@class argon.client.ClientAdapter
 local M = {}
 
 ---@param bufnr number | nil 0 for the current buffer, `nil` for no buffer filter
@@ -9,7 +9,7 @@ local M = {}
 M.get_active_argon_lsp_clients = function(bufnr, filter)
   ---@type vim.lsp.get_clients.Filter
   local client_filter = vim.tbl_deep_extend('force', filter or {}, {
-    name = 'argon_lsp',
+    name = 'argon',
   })
   if bufnr then
     client_filter.bufnr = bufnr
@@ -80,7 +80,7 @@ M.notify = function(method, params)
     client_found = true
   end
   if not client_found then
-    vim.notify('No argon_lsp client found for method: ' .. method, vim.log.levels.ERROR)
+    vim.notify('No argon LSP client found for method: ' .. method, vim.log.levels.ERROR)
   end
 end
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lsp-server = { path = "../lsp-server" }
+lang-server = { path = "../lang-server" }
 compiler = { path = "../compiler" }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
 smallvec = "1"

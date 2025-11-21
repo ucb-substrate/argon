@@ -1,6 +1,6 @@
 local M = {}
 
-local client = require('argon_lsp.client')
+local client = require('argon.client')
 
 function M.start_gui()
     client.buf_request(0, "custom/startGui", nil, client.print_error)
