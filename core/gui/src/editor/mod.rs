@@ -243,7 +243,7 @@ impl EditorState {
                 d
             }
             _ => {
-                self.fatal_error = Some(SharedString::from("Static compile errors encountered"));
+                self.fatal_error = Some(SharedString::from("static compile errors encountered"));
                 return;
             }
         };
@@ -310,6 +310,7 @@ impl EditorState {
             });
             cx.notify();
         });
+        self.fatal_error = None;
     }
 }
 
@@ -474,20 +475,48 @@ impl Render for Editor {
                     .flex()
                     .flex_row()
                     .flex_1()
-                    .relative()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child(div().flex_1().overflow_hidden().child(self.canvas.clone()))
-                    .child(self.layer_sidebar.clone())
-                    .child(
-                        div()
-                            .bg(rgb(0xff0000))
-                            .absolute()
-                            .w_full()
-                            .h_full()
-                            .top_0()
-                            .left_0(),
-                    ),
+                    .child({
+                        let mut d = div()
+                            .flex_1()
+                            .relative()
+                            .overflow_hidden()
+                            .child(self.canvas.clone());
+
+                        if let Some(fatal_error) = &self.state.read(cx).fatal_error {
+                            d = d.child(
+                                div()
+                                    .id("error_modal")
+                                    .bg(theme.bg)
+                                    .border_1()
+                                    .border_color(theme.divider)
+                                    .rounded_sm()
+                                    .absolute()
+                                    .p_2()
+                                    .child(
+                                        div().flex().flex_row().text_color(theme.error).child(
+                                            div().flex().flex_col().child(div().flex_1()).child(
+                                            svg()
+                                                .path("icons/circle-exclamation-solid-full.svg")
+                                                .w(px(20.))
+                                                .h_auto()
+                                                .mr_1()
+                                                .text_color(theme.error)).child(div().flex_1())
+                                        )
+                                        .child(div().child("Error"))
+                                    )
+                                    .child(format!("Editing disabled due to error: {fatal_error}."))
+                                    .whitespace_normal()
+                                    .top_2()
+                                    .left_2()
+                                    .right_2()
+                            );
+                        }
+
+                        d
+                    })
+                    .child(self.layer_sidebar.clone()),
             )
             .child(self.text_input.clone())
     }

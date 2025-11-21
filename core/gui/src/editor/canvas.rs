@@ -1267,7 +1267,7 @@ impl LayoutCanvas {
                                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                                 self.state.update(cx, |state, cx| {
-                                    state.solved_cell.update(cx, {
+                                    let error = state.solved_cell.update(cx, {
                                         |cell, cx| {
                                             if let Some(cell) = cell.as_mut() {
                                                 // TODO update in memory representation of code
@@ -1293,26 +1293,39 @@ impl LayoutCanvas {
                                                     .find(|name| !names.contains(name))
                                                     .unwrap();
 
-                                                state.lang_server_client.draw_rect(
-                                                    scope.span.clone(),
-                                                    rect_name,
-                                                    compile::BasicRect {
-                                                        layer: state
-                                                            .layers
-                                                            .read(cx)
-                                                            .selected_layer
-                                                            .clone()
-                                                            .map(|s| s.to_string()),
-                                                        x0: p0p.x as f64,
-                                                        y0: p0p.y as f64,
-                                                        x1: p1p.x as f64,
-                                                        y1: p1p.y as f64,
-                                                        construction: false,
-                                                    },
-                                                );
+                                                if state
+                                                    .lang_server_client
+                                                    .draw_rect(
+                                                        scope.span.clone(),
+                                                        rect_name,
+                                                        compile::BasicRect {
+                                                            layer: state
+                                                                .layers
+                                                                .read(cx)
+                                                                .selected_layer
+                                                                .clone()
+                                                                .map(|s| s.to_string()),
+                                                            x0: p0p.x as f64,
+                                                            y0: p0p.y as f64,
+                                                            x1: p1p.x as f64,
+                                                            y1: p1p.y as f64,
+                                                            construction: false,
+                                                        },
+                                                    )
+                                                    .is_none()
+                                                {
+                                                    Some("inconsistent editor and GUI state".into())
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                Some("no cell to edit".into())
                                             }
                                         }
                                     });
+                                    if state.fatal_error.is_none() {
+                                        state.fatal_error = error;
+                                    }
                                 });
                             } else {
                                 let p0 = self.px_to_layout(event.position);

@@ -102,7 +102,7 @@ export function activate(context: ExtensionContext) {
 
     const log = async () => {
         // TODO: allow configuration via ARGON_HOME environment variable.
-        const doc = await workspace.openTextDocument(path.join(os.homedir(), ".local/state/argon/log"));
+        const doc = await workspace.openTextDocument(path.join(os.homedir(), ".local/state/argon/lang-server.log"));
         await window.showTextDocument(doc, {
             preview: false  // ensures it's a new tab, not replacing the preview tab
         });

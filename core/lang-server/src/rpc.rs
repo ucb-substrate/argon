@@ -93,6 +93,24 @@ impl LangServer for State {
     ) -> Option<Span> {
         let state_mut = self.state_mut.lock().await;
         let url = Url::from_file_path(&scope_span.path).unwrap();
+
+        if state_mut.ast.values().any(|ast| {
+            ast.text
+                != state_mut
+                    .editor_files
+                    .get(&url)
+                    .map(|file| file.contents())
+                    .unwrap_or_default()
+        }) {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Editor buffer state is inconsistent with GUI state.",
+                )
+                .await;
+            return None;
+        }
+
         if let Some(ast) = state_mut
             .ast
             .values()
@@ -165,18 +183,6 @@ impl LangServer for State {
                     },
                 )
             };
-
-            if let Some(file) = state_mut.editor_files.get(&url)
-                && file.contents() != doc.contents()
-            {
-                self.editor_client
-                    .show_message(
-                        MessageType::ERROR,
-                        "Editor buffer state is inconsistent with GUI state.",
-                    )
-                    .await;
-                return None;
-            }
 
             self.editor_client
                 .show_document(ShowDocumentParams {

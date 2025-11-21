@@ -13,7 +13,7 @@ local gui = require('argon.commands.gui')
 
 ---@type argon.command_tbl[]
 local argon_command_tbl = {
-  startGui = {
+  gui = {
     impl = function(_, opts)
       gui.start_gui()
     end,
@@ -31,7 +31,7 @@ local argon_command_tbl = {
   log = {
       impl = function(args, opts)
           -- TODO: allow configuration of log file name.
-          vim.cmd('tabnew ~/.local/state/argon/log')
+          vim.cmd('tabnew ~/.local/state/argon/lang-server.log')
       end
   }
 }

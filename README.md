@@ -61,7 +61,7 @@ To open an example Argon workspace, run the following from the root directory of
 vim core/compiler/examples/argon_workspace/lib.ar
 ```
 
-Start the GUI by running `:Argon startGui`.
+Start the GUI by running `:Argon gui`.
 
 From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
 in both Neovim and the GUI.
