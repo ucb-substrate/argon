@@ -71,6 +71,7 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub fatal_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
     pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
@@ -236,11 +237,13 @@ impl EditorState {
                 {
                     self.lsp_client
                         .show_message(MessageType::ERROR, "Open cell is invalid");
+                    self.fatal_error = Some(SharedString::from("Open cell is invalid"));
                     return;
                 }
                 d
             }
             _ => {
+                self.fatal_error = Some(SharedString::from("Static compile errors encountered"));
                 return;
             }
         };
@@ -327,6 +330,7 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                fatal_error: None,
                 solved_cell,
                 hide_external_geometry: false,
                 tool,
@@ -470,10 +474,20 @@ impl Render for Editor {
                     .flex()
                     .flex_row()
                     .flex_1()
+                    .relative()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
                     .child(div().flex_1().overflow_hidden().child(self.canvas.clone()))
-                    .child(self.layer_sidebar.clone()),
+                    .child(self.layer_sidebar.clone())
+                    .child(
+                        div()
+                            .bg(rgb(0xff0000))
+                            .absolute()
+                            .w_full()
+                            .h_full()
+                            .top_0()
+                            .left_0(),
+                    ),
             )
             .child(self.text_input.clone())
     }
