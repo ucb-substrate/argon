@@ -237,7 +237,7 @@ impl EditorState {
                 {
                     self.lang_server_client
                         .show_message(MessageType::ERROR, "Open cell is invalid");
-                    self.fatal_error = Some(SharedString::from("Open cell is invalid"));
+                    self.fatal_error = Some(SharedString::from("open cell is invalid"));
                     return;
                 }
                 d
