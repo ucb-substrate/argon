@@ -252,30 +252,46 @@ impl TextInput {
 
     fn command_prompt_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
-            if let ToolState::EditDim(EditDimToolState { dim, dim_mode, .. }) = tool
-                && self
+            if let ToolState::EditDim(EditDimToolState { dim, dim_mode, .. }) = tool {
+                let error = match self
                     .state
                     .read(cx)
                     .lang_server_client
                     .edit_dimension(dim.clone(), self.content.to_string())
-                    .is_some()
-            {
-                *tool = if *dim_mode {
-                    ToolState::DrawDim(DrawDimToolState::default())
-                } else {
-                    ToolState::default()
+                {
+                    Ok(None) => Some("inconsistent editor and GUI state".into()),
+                    Ok(Some(_)) => None,
+                    Err(e) => Some(format!("{e}").into()),
                 };
-                true
+                if let Some(error) = error {
+                    self.state.update(cx, |state, _cx| {
+                        state.fatal_error = Some(error);
+                    });
+                    false
+                } else {
+                    *tool = if *dim_mode {
+                        ToolState::DrawDim(DrawDimToolState::default())
+                    } else {
+                        ToolState::default()
+                    };
+                    true
+                }
             } else {
                 if let Some((command, rest)) = self.content.split_once(" ") {
                     #[allow(clippy::single_match)]
                     match command.trim_start_matches(":") {
                         "openCell" => {
-                            self.state
+                            let res = self
+                                .state
                                 .read(cx)
                                 .lang_server_client
                                 .open_cell(rest.to_string());
-                            return true;
+                            if let Err(e) = &res {
+                                self.state.update(cx, |state, _cx| {
+                                    state.fatal_error = Some(format!("{e}").into());
+                                });
+                            }
+                            return res.is_ok();
                         }
                         _ => {} // TODO: support other commands, reduce redundancy with rpc.rs
                     }

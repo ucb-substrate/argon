@@ -27,6 +27,7 @@ futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+tower-lsp = "0.20"
 
 geometry = { version = "0.7", registry = "substrate" }
 enumify = { version = "0.2", registry = "substrate" }

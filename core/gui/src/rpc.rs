@@ -1,15 +1,17 @@
 use std::{
     fmt::Display,
     net::{Ipv4Addr, SocketAddr},
+    time::Duration,
 };
 
+use anyhow::{Result, anyhow};
 use async_compat::CompatExt;
 use compiler::{
     ast::Span,
     compile::{BasicRect, CompileOutput},
 };
 use futures::{
-    channel::mpsc::{self, Sender},
+    channel::mpsc::{self, Receiver, Sender},
     prelude::*,
 };
 use gpui::AsyncApp;
@@ -20,17 +22,21 @@ use tarpc::{
     tokio_serde::formats::Json,
 };
 use tower_lsp::lsp_types::MessageType;
+use tracing::error;
 
 use crate::editor::Editor;
+
+pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Clone)]
 pub struct SyncLangServerClient {
     app: AsyncApp,
     client: LangServerClient,
+    to_exec: Sender<EditorFn>,
 }
 
 impl SyncLangServerClient {
-    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> Self {
+    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, Receiver<EditorFn>) {
         let client = app.background_executor().block(
             async move {
                 let mut transport =
@@ -42,12 +48,19 @@ impl SyncLangServerClient {
             }
             .compat(),
         );
-        Self { app, client }
+        let (to_exec, rx) = mpsc::channel(1);
+        (
+            Self {
+                app,
+                client,
+                to_exec,
+            },
+            rx,
+        )
     }
 
-    pub fn register_server(&self, editor: Editor) {
+    pub fn register_server(&self) {
         let background_executor = self.app.background_executor().clone();
-        let (tx, mut rx) = mpsc::channel(1);
         let mut listener = self.app.background_executor().block(
             async {
                 if let Ok(listener) =
@@ -64,6 +77,7 @@ impl SyncLangServerClient {
             .compat(),
         );
         let server_addr = listener.local_addr();
+        let to_exec = self.to_exec.clone();
         self.app
             .background_executor()
             .spawn(
@@ -79,7 +93,7 @@ impl SyncLangServerClient {
                         // the generated World trait.
                         .map(|channel| {
                             let server = GuiServer {
-                                to_exec: tx.clone(),
+                                to_exec: to_exec.clone(),
                             };
                             channel
                                 .execute(server.serve())
@@ -94,37 +108,38 @@ impl SyncLangServerClient {
             )
             .detach();
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .register(context::current(), server_addr)
-                    .await
-                    .unwrap()
+        match self
+            .app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move { client_clone.register(context::current(), server_addr).await }
+                    .compat()
+                    .map_err(|e| format!("{}", e)),
+            )
+            .map_err(|_| format!("timeout after {LANG_SERVER_CLIENT_TIMEOUT:?}"))
+        {
+            Err(e) | Ok(Err(e)) => {
+                error!("Failed to register: {e}");
+                std::process::exit(1);
             }
-            .compat(),
-        );
-        self.app
-            .spawn(async move |app| {
-                loop {
-                    if let Some(exec) = rx.next().await {
-                        exec(&editor, app);
-                    }
-                }
-            })
-            .detach();
+            _ => {}
+        }
     }
 
-    pub fn select_rect(&self, span: Span) {
+    pub fn select_rect(&self, span: Span) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .select_rect(context::current(), span)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        );
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move { client_clone.select_rect(context::current(), span).await }.compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
     }
 
     pub fn draw_rect(
@@ -132,95 +147,140 @@ impl SyncLangServerClient {
         scope_span: Span,
         var_name: String,
         rect: BasicRect<f64>,
-    ) -> Option<Span> {
+    ) -> Result<Option<Span>> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .draw_rect(context::current(), scope_span, var_name, rect)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        )
+        Ok(self
+            .app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .draw_rect(context::current(), scope_span, var_name, rect)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??)
     }
 
-    pub fn draw_dimension(&self, scope_span: Span, params: DimensionParams) -> Option<Span> {
+    pub fn draw_dimension(
+        &self,
+        scope_span: Span,
+        params: DimensionParams,
+    ) -> Result<Option<Span>> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .draw_dimension(context::current(), scope_span, params)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        )
+        Ok(self
+            .app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .draw_dimension(context::current(), scope_span, params)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??)
     }
 
-    pub fn edit_dimension(&self, span: Span, value: String) -> Option<Span> {
+    pub fn edit_dimension(&self, span: Span, value: String) -> Result<Option<Span>> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .edit_dimension(context::current(), span, value)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        )
+        Ok(self
+            .app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .edit_dimension(context::current(), span, value)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??)
     }
 
-    pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) {
+    pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .add_eq_constraint(context::current(), scope_span, lhs, rhs)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        );
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .add_eq_constraint(context::current(), scope_span, lhs, rhs)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
     }
 
-    pub fn open_cell(&self, cell: String) {
+    pub fn open_cell(&self, cell: String) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .open_cell(context::current(), cell)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        );
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move { client_clone.open_cell(context::current(), cell).await }.compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
     }
 
-    pub fn show_message<M: Display>(&self, typ: MessageType, message: M) {
+    pub fn show_message<M: Display>(&self, typ: MessageType, message: M) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .show_message(context::current(), typ, format!("{}", message))
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        );
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .show_message(context::current(), typ, format!("{}", message))
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
     }
 
-    pub fn dispatch_action(&self, action: LangServerAction) {
+    pub fn dispatch_action(&self, action: LangServerAction) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app.background_executor().block(
-            async move {
-                client_clone
-                    .dispatch_action(context::current(), action)
-                    .await
-                    .unwrap()
-            }
-            .compat(),
-        );
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .dispatch_action(context::current(), action)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
     }
 }
 
@@ -235,7 +295,9 @@ impl Gui for GuiServer {
     async fn open_cell(mut self, _: context::Context, cell: CompileOutput, update: bool) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                editor.open_cell(cx, cell, update);
+                let _ = cx.update(|cx| {
+                    editor.open_cell(cx, cell, update);
+                });
             }))
             .await
             .unwrap();
@@ -278,5 +340,16 @@ impl Gui for GuiServer {
                 // TODO: handle errors.
             }
         }
+    }
+
+    async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
+        self.to_exec
+            .send(Box::new(|_, cx| {
+                let _ = cx.update(|cx| {
+                    cx.activate(true);
+                });
+            }))
+            .await
+            .unwrap();
     }
 }

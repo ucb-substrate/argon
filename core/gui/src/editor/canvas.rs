@@ -1293,30 +1293,28 @@ impl LayoutCanvas {
                                                     .find(|name| !names.contains(name))
                                                     .unwrap();
 
-                                                if state
-                                                    .lang_server_client
-                                                    .draw_rect(
-                                                        scope.span.clone(),
-                                                        rect_name,
-                                                        compile::BasicRect {
-                                                            layer: state
-                                                                .layers
-                                                                .read(cx)
-                                                                .selected_layer
-                                                                .clone()
-                                                                .map(|s| s.to_string()),
-                                                            x0: p0p.x as f64,
-                                                            y0: p0p.y as f64,
-                                                            x1: p1p.x as f64,
-                                                            y1: p1p.y as f64,
-                                                            construction: false,
-                                                        },
-                                                    )
-                                                    .is_none()
-                                                {
-                                                    Some("inconsistent editor and GUI state".into())
-                                                } else {
-                                                    None
+                                                match state.lang_server_client.draw_rect(
+                                                    scope.span.clone(),
+                                                    rect_name,
+                                                    compile::BasicRect {
+                                                        layer: state
+                                                            .layers
+                                                            .read(cx)
+                                                            .selected_layer
+                                                            .clone()
+                                                            .map(|s| s.to_string()),
+                                                        x0: p0p.x as f64,
+                                                        y0: p0p.y as f64,
+                                                        x1: p1p.x as f64,
+                                                        y1: p1p.y as f64,
+                                                        construction: false,
+                                                    },
+                                                ) {
+                                                    Ok(None) => Some(
+                                                        "inconsistent editor and GUI state".into(),
+                                                    ),
+                                                    Ok(Some(_)) => None,
+                                                    Err(e) => Some(format!("{e}").into()),
                                                 }
                                             } else {
                                                 Some("no cell to edit".into())
@@ -1332,15 +1330,25 @@ impl LayoutCanvas {
                                 rect_tool.p0 = Some(p0);
                             }
                         } else {
-                            state.lang_server_client.show_message(
+                            let res = state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
+                            if let Err(e) = res {
+                                self.state.update(cx, |state, _cx| {
+                                    state.fatal_error = Some(format!("{e}").into());
+                                });
+                            }
                         }
                     } else {
-                        state
+                        let res = state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
+                        if let Err(e) = res {
+                            self.state.update(cx, |state, _cx| {
+                                state.fatal_error = Some(format!("{e}").into());
+                            });
+                        }
                     }
                 }
                 ToolState::DrawDim(dim_tool) => {
@@ -1539,38 +1547,36 @@ impl LayoutCanvas {
                             };
 
                             let value = format!("{:?}", edge.2.stop - edge.2.start);
-                            state
-                                .lang_server_client
-                                .draw_dimension(
-                                    cell.output.cells[&selected_scope_addr.cell].scopes
-                                        [&selected_scope_addr.scope]
-                                        .span
-                                        .clone(),
-                                    DimensionParams {
-                                        p: format!("{}.{}", edge.0, right),
-                                        n: format!("{}.{}", edge.0, left),
-                                        value: value.clone(),
-                                        coord: if coord > edge.2.coord {
-                                            format!(
-                                                "{}.{} + {}",
-                                                edge.0,
-                                                edge.1,
-                                                coord - edge.2.coord
-                                            )
-                                        } else {
-                                            format!(
-                                                "{}.{} - {}",
-                                                edge.0,
-                                                edge.1,
-                                                edge.2.coord - coord
-                                            )
-                                        },
-                                        pstop: format!("{}.{}", edge.0, edge.1),
-                                        nstop: format!("{}.{}", edge.0, edge.1),
-                                        horiz: horiz.to_string(),
+                            let res = state.lang_server_client.draw_dimension(
+                                cell.output.cells[&selected_scope_addr.cell].scopes
+                                    [&selected_scope_addr.scope]
+                                    .span
+                                    .clone(),
+                                DimensionParams {
+                                    p: format!("{}.{}", edge.0, right),
+                                    n: format!("{}.{}", edge.0, left),
+                                    value: value.clone(),
+                                    coord: if coord > edge.2.coord {
+                                        format!("{}.{} + {}", edge.0, edge.1, coord - edge.2.coord)
+                                    } else {
+                                        format!("{}.{} - {}", edge.0, edge.1, edge.2.coord - coord)
                                     },
-                                )
-                                .map(|span| (span, value))
+                                    pstop: format!("{}.{}", edge.0, edge.1),
+                                    nstop: format!("{}.{}", edge.0, edge.1),
+                                    horiz: horiz.to_string(),
+                                },
+                            );
+                            if let Some(error) = match &res {
+                                Ok(None) => Some("inconsistent editor and GUI state".into()),
+                                Ok(Some(_)) => None,
+                                Err(e) => Some(format!("{e}").into()),
+                            } {
+                                self.state.update(cx, |state, _cx| {
+                                    state.fatal_error = Some(error);
+                                });
+                            }
+
+                            res.unwrap_or_default().map(|span| (span, value))
                         } else if dim_tool.edges.len() == 2 {
                             match (&dim_tool.edges[0], &dim_tool.edges[1]) {
                                 (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
@@ -1595,7 +1601,7 @@ impl LayoutCanvas {
                                         format!("- {}", intended_coord - coord)
                                     };
                                     let value = format!("{:?}", right.2.coord - left.2.coord);
-                                    state.lang_server_client.draw_dimension(
+                                    let res = state.lang_server_client.draw_dimension(
                                         cell.output.cells[&selected_scope_addr.cell].scopes
                                             [&selected_scope_addr.scope]
                                             .span
@@ -1625,7 +1631,20 @@ impl LayoutCanvas {
                                             ),
                                             horiz: horiz.to_string(),
                                         },
-                                    ).map(|span| (span, value))
+                                    );
+                                    if let Some(error) = match &res {
+                                        Ok(None) => {
+                                            Some("inconsistent editor and GUI state".into())
+                                        }
+                                        Ok(Some(_)) => None,
+                                        Err(e) => Some(format!("{e}").into()),
+                                    } {
+                                        self.state.update(cx, |state, _cx| {
+                                            state.fatal_error = Some(error);
+                                        });
+                                    }
+
+                                    res.unwrap_or_default().map(|span| (span, value))
                                 }
                                 (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                 | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
@@ -1665,24 +1684,34 @@ impl LayoutCanvas {
                                             coord.clone(),
                                         )
                                     };
-                                    state
-                                        .lang_server_client
-                                        .draw_dimension(
-                                            cell.output.cells[&selected_scope_addr.cell].scopes
-                                                [&selected_scope_addr.scope]
-                                                .span
-                                                .clone(),
-                                            DimensionParams {
-                                                p,
-                                                n,
-                                                value: value.clone(),
-                                                coord,
-                                                pstop,
-                                                nstop,
-                                                horiz: horiz.to_string(),
-                                            },
-                                        )
-                                        .map(|span| (span, value))
+                                    let res = state.lang_server_client.draw_dimension(
+                                        cell.output.cells[&selected_scope_addr.cell].scopes
+                                            [&selected_scope_addr.scope]
+                                            .span
+                                            .clone(),
+                                        DimensionParams {
+                                            p,
+                                            n,
+                                            value: value.clone(),
+                                            coord,
+                                            pstop,
+                                            nstop,
+                                            horiz: horiz.to_string(),
+                                        },
+                                    );
+                                    if let Some(error) = match &res {
+                                        Ok(None) => {
+                                            Some("inconsistent editor and GUI state".into())
+                                        }
+                                        Ok(Some(_)) => None,
+                                        Err(e) => Some(format!("{e}").into()),
+                                    } {
+                                        self.state.update(cx, |state, _cx| {
+                                            state.fatal_error = Some(error);
+                                        });
+                                    }
+
+                                    res.unwrap_or_default().map(|span| (span, value))
                                 }
                                 _ => unreachable!(),
                             }
@@ -1732,10 +1761,18 @@ impl LayoutCanvas {
                     }
                     if let Some(span) = selected_obj {
                         select_tool.selected_obj = Some(span.clone());
-                        self.state
+                        if let Err(e) = self
+                            .state
                             .read(cx)
                             .lang_server_client
-                            .select_rect(span.clone());
+                            .select_rect(span.clone())
+                        {
+                            self.state.update(cx, |state, cx| {
+                                state.fatal_error =
+                                    Some(format!("Editing disabled due to error {e}").into());
+                                cx.notify();
+                            });
+                        }
                     } else {
                         select_tool.selected_obj = None;
                     }

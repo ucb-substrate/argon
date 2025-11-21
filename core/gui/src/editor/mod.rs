@@ -8,6 +8,7 @@ use compiler::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, ExecErrorKind, Rect, ScopeId,
     SolvedValue, bbox_dim_union, bbox_union, ifmatvec,
 };
+use futures::StreamExt;
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
@@ -235,7 +236,8 @@ impl EditorState {
                     .iter()
                     .any(|e| matches!(e.kind, ExecErrorKind::InvalidCell))
                 {
-                    self.lang_server_client
+                    let _ = self
+                        .lang_server_client
                         .show_message(MessageType::ERROR, "Open cell is invalid");
                     self.fatal_error = Some(SharedString::from("open cell is invalid"));
                     return;
@@ -316,7 +318,8 @@ impl EditorState {
 
 impl Editor {
     pub fn new(cx: &mut Context<Self>, window: &mut Window, lang_server_addr: SocketAddr) -> Self {
-        let lang_server_client = SyncLangServerClient::new(cx.to_async(), lang_server_addr);
+        let (lang_server_client, mut rx) =
+            SyncLangServerClient::new(cx.to_async(), lang_server_addr);
         let solved_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
@@ -367,52 +370,56 @@ impl Editor {
             canvas,
             text_input,
         };
-        lang_server_client.register_server(editor.clone());
+        cx.to_async()
+            .spawn({
+                let editor = editor.clone();
+                async move |app| {
+                    loop {
+                        if let Some(exec) = rx.next().await {
+                            exec(&editor, app);
+                        }
+                    }
+                }
+            })
+            .detach();
+        lang_server_client.register_server();
 
         editor
     }
 
-    pub fn open_cell(&self, cx: &mut AsyncApp, output: CompileOutput, update: bool) {
-        self.state
-            .update(cx, |state, cx| {
-                state.update(cx, output);
-                cx.notify();
-            })
-            .unwrap();
+    pub fn open_cell(&self, cx: &mut App, output: CompileOutput, update: bool) {
+        self.state.update(cx, |state, cx| {
+            state.update(cx, output);
+            cx.notify();
+        });
         if update {
             let state = self.state.clone();
-            self.hierarchy_sidebar
-                .update(cx, move |sidebar, cx| {
-                    let scope_paths: IndexSet<_> = state
-                        .read(cx)
-                        .solved_cell
-                        .read(cx)
-                        .as_ref()
-                        .map(|cell| cell.state.keys().cloned().collect())
-                        .unwrap_or_default();
-                    sidebar.state.update(cx, |state, _cx| {
-                        state
-                            .expanded_scopes
-                            .retain(|path| scope_paths.contains(path));
-                    });
-                    cx.notify();
-                })
-                .unwrap();
+            self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
+                let scope_paths: IndexSet<_> = state
+                    .read(cx)
+                    .solved_cell
+                    .read(cx)
+                    .as_ref()
+                    .map(|cell| cell.state.keys().cloned().collect())
+                    .unwrap_or_default();
+                sidebar.state.update(cx, |state, _cx| {
+                    state
+                        .expanded_scopes
+                        .retain(|path| scope_paths.contains(path));
+                });
+                cx.notify();
+            });
         } else {
-            self.canvas
-                .update(cx, |canvas, cx| {
-                    canvas.fit_to_screen(cx);
+            self.canvas.update(cx, |canvas, cx| {
+                canvas.fit_to_screen(cx);
+                cx.notify();
+            });
+            self.hierarchy_sidebar.update(cx, |sidebar, cx| {
+                sidebar.state.update(cx, |state, cx| {
+                    state.expanded_scopes.clear();
                     cx.notify();
-                })
-                .unwrap();
-            self.hierarchy_sidebar
-                .update(cx, |sidebar, cx| {
-                    sidebar.state.update(cx, |state, cx| {
-                        state.expanded_scopes.clear();
-                        cx.notify();
-                    });
-                })
-                .unwrap();
+                });
+            });
         }
     }
 
@@ -428,17 +435,29 @@ impl Editor {
     }
 
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
-        self.state
+        if let Err(e) = self
+            .state
             .read(cx)
             .lang_server_client
-            .dispatch_action(LangServerAction::Undo);
+            .dispatch_action(LangServerAction::Undo)
+        {
+            self.state.update(cx, |state, _cx| {
+                state.fatal_error = Some(format!("{e}").into());
+            });
+        }
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
-        self.state
+        if let Err(e) = self
+            .state
             .read(cx)
             .lang_server_client
-            .dispatch_action(LangServerAction::Redo);
+            .dispatch_action(LangServerAction::Redo)
+        {
+            self.state.update(cx, |state, _cx| {
+                state.fatal_error = Some(format!("{e}").into());
+            });
+        }
     }
 
     fn theme(&self, cx: &mut Context<Self>) -> &'static Theme {

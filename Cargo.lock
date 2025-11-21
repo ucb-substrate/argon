@@ -2654,6 +2654,7 @@ checksum = "d196ffc1627db18a531359249b2bf8416178d84b729f3cebeb278f285fb9b58c"
 name = "gui"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arcstr",
  "async-compat",
  "bytes",

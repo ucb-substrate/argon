@@ -33,7 +33,7 @@ use tarpc::{
 };
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::Command,
+    process::{Child, Command},
     sync::Mutex,
 };
 use tower_lsp::jsonrpc::Result;
@@ -50,8 +50,9 @@ use crate::{
 
 // TODO: finer-grained synchronization?
 // TODO: Verify synchronization between GUI and editor files when appropriate.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct StateMut {
+    gui: Option<Child>,
     root_dir: Option<PathBuf>,
     config: Option<Config>,
     ast: WorkspaceParseAst,
@@ -352,6 +353,9 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        if let Some(gui) = self.state.state_mut.lock().await.gui.as_mut() {
+            let _ = gui.kill().await;
+        }
         Ok(())
     }
 }
@@ -368,25 +372,47 @@ struct SetParams {
 
 impl Backend {
     async fn start_gui(&self) -> Result<()> {
+        let mut state_mut = self.state.state_mut.lock().await;
+        if let Some(gui_client) = &state_mut.gui_client {
+            self.state
+                .editor_client
+                .show_message(MessageType::LOG, "Attempting to contact existing GUI...")
+                .await;
+            if gui_client.activate(context::current()).await.is_ok() {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::LOG, "Connected to existing GUI!")
+                    .await;
+                return Ok(());
+            }
+            self.state
+                .editor_client
+                .show_message(MessageType::LOG, "Failed to contact existing GUI.")
+                .await;
+        }
+        if let Some(mut gui) = state_mut.gui.take() {
+            let _ = gui.kill().await;
+        }
+
         self.state
             .editor_client
             .show_message(MessageType::LOG, "Starting the GUI...")
             .await;
-        let server_addr = self.state.server_addr;
+        let state = self.state.clone();
 
         tokio::spawn(async move {
             match Command::new(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../target/release/gui"
             ))
-            .arg(format!("{}", server_addr))
+            .arg(format!("{}", state.server_addr))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             {
-                Ok(child) => {
-                    if let Some(stdout) = child.stdout {
+                Ok(mut child) => {
+                    if let Some(stdout) = child.stdout.take() {
                         tokio::spawn(async move {
                             let reader = BufReader::new(stdout);
                             let mut lines = reader.lines();
@@ -396,16 +422,21 @@ impl Backend {
                             }
                         });
                     }
-                    if let Some(stderr) = child.stderr {
+                    if let Some(stderr) = child.stderr.take() {
                         tokio::spawn(async move {
                             let reader = BufReader::new(stderr);
                             let mut lines = reader.lines();
 
                             while let Ok(Some(line)) = lines.next_line().await {
                                 error!("{}", line);
+                                state
+                                    .editor_client
+                                    .show_message(MessageType::ERROR, line)
+                                    .await;
                             }
                         });
                     }
+                    state.state_mut.lock().await.gui = Some(child);
                 }
                 Err(_) => todo!(),
             }
