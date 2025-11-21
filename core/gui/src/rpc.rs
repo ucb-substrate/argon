@@ -30,10 +30,11 @@ pub struct SyncLangServerClient {
 }
 
 impl SyncLangServerClient {
-    pub fn new(app: AsyncApp, lsp_addr: SocketAddr) -> Self {
+    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> Self {
         let client = app.background_executor().block(
             async move {
-                let mut transport = tarpc::serde_transport::tcp::connect(lsp_addr, Json::default);
+                let mut transport =
+                    tarpc::serde_transport::tcp::connect(lang_server_addr, Json::default);
                 transport.config_mut().max_frame_length(usize::MAX);
 
                 LangServerClient::new(tarpc::client::Config::default(), transport.await.unwrap())

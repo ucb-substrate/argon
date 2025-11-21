@@ -145,7 +145,7 @@ end
 ---@return vim.lsp.Client[] clients A list of clients that will be stopped
 M.stop = function(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
-  local clients = client.get_active_argon_clients(bufnr, filter)
+  local clients = client.get_active_argon_lsp_clients(bufnr, filter)
   vim.lsp.stop_client(clients)
   if type(clients) == 'table' then
     ---@cast clients vim.lsp.Client[]
