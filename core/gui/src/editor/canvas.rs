@@ -21,7 +21,7 @@ use gpui::{
 use indexmap::IndexSet;
 use itertools::Itertools;
 use lang_server::rpc::DimensionParams;
-use tower_lsp::lsp_types::MessageType;
+use tower_lsp_server::lsp_types::MessageType;
 
 use crate::{
     actions::*,

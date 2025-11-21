@@ -15,7 +15,7 @@ use indexmap::{IndexMap, IndexSet};
 use lang_server::rpc::LangServerAction;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
-use tower_lsp::lsp_types::MessageType;
+use tower_lsp_server::lsp_types::MessageType;
 
 use crate::{
     actions::{Redo, Undo},
@@ -525,7 +525,8 @@ impl Render for Editor {
                                         )
                                         .child(div().child("Error"))
                                     )
-                                    .child(format!("Editing disabled due to error: {fatal_error}."))
+                                    .child(format!("Editing may be disabled due to error: {fatal_error}."))
+                                    .child(div().text_xs().text_color(theme.subtext).child("Fix the error and save in the editor to dismiss."))
                                     .whitespace_normal()
                                     .top_2()
                                     .left_2()

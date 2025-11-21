@@ -1,6 +1,6 @@
 use arcstr::ArcStr;
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
-use tower_lsp::lsp_types::{Position, Range};
+use tower_lsp_server::lsp_types::{Position, Range};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Document {

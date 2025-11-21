@@ -7,9 +7,12 @@ use compiler::{
 
 use serde::{Deserialize, Serialize};
 use tarpc::tokio_serde::formats::Json;
-use tower_lsp::lsp_types::{
-    Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
-    Url, WorkspaceEdit,
+use tower_lsp_server::{
+    UriExt,
+    lsp_types::{
+        Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
+        Uri, WorkspaceEdit,
+    },
 };
 
 use crate::{ForceSave, Redo, State, Undo, document::Document};
@@ -69,7 +72,7 @@ impl LangServer for State {
         let state_mut = self.state_mut.lock().await;
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
             let doc = Document::new(&ast.text, 0);
-            let url = Url::from_file_path(&span.path).unwrap();
+            let url = Uri::from_file_path(&span.path).unwrap();
             let diagnostics = vec![Diagnostic {
                 range: Range {
                     start: doc.offset_to_pos(span.span.start()),
@@ -97,7 +100,7 @@ impl LangServer for State {
         if state_mut.ast.values().any(|ast| {
             state_mut
                 .editor_files
-                .get(&Url::from_file_path(&ast.path).unwrap())
+                .get(&Uri::from_file_path(&ast.path).unwrap())
                 .map(|file| file.contents() != ast.text)
                 .unwrap_or_default()
         }) {
@@ -110,7 +113,7 @@ impl LangServer for State {
             return None;
         }
 
-        let url = Url::from_file_path(&scope_span.path).unwrap();
+        let url = Uri::from_file_path(&scope_span.path).unwrap();
 
         if let Some(ast) = state_mut
             .ast
@@ -225,7 +228,7 @@ impl LangServer for State {
         if state_mut.ast.values().any(|ast| {
             state_mut
                 .editor_files
-                .get(&Url::from_file_path(&ast.path).unwrap())
+                .get(&Uri::from_file_path(&ast.path).unwrap())
                 .map(|file| file.contents() != ast.text)
                 .unwrap_or_default()
         }) {
@@ -238,7 +241,7 @@ impl LangServer for State {
             return None;
         }
 
-        let url = Url::from_file_path(&scope_span.path).unwrap();
+        let url = Uri::from_file_path(&scope_span.path).unwrap();
 
         if let Some(ast) = state_mut
             .ast
@@ -349,7 +352,7 @@ impl LangServer for State {
         if state_mut.ast.values().any(|ast| {
             state_mut
                 .editor_files
-                .get(&Url::from_file_path(&ast.path).unwrap())
+                .get(&Uri::from_file_path(&ast.path).unwrap())
                 .map(|file| file.contents() != ast.text)
                 .unwrap_or_default()
         }) {
@@ -362,7 +365,7 @@ impl LangServer for State {
             return None;
         }
 
-        let url = Url::from_file_path(&span.path).unwrap();
+        let url = Uri::from_file_path(&span.path).unwrap();
 
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
             && let Some(c) = ast.span2call.get(&span)
@@ -424,7 +427,7 @@ impl LangServer for State {
         if state_mut.ast.values().any(|ast| {
             state_mut
                 .editor_files
-                .get(&Url::from_file_path(&ast.path).unwrap())
+                .get(&Uri::from_file_path(&ast.path).unwrap())
                 .map(|file| file.contents() != ast.text)
                 .unwrap_or_default()
         }) {
@@ -437,7 +440,7 @@ impl LangServer for State {
             return;
         }
 
-        let url = Url::from_file_path(&scope_span.path).unwrap();
+        let url = Uri::from_file_path(&scope_span.path).unwrap();
 
         if let Some(ast) = state_mut
             .ast

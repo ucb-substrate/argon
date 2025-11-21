@@ -7,7 +7,7 @@ edition = "2024"
 compiler = { version = "0.1.0", path = "../compiler" }
 
 tokio = { version = "1", features = ["full"] }
-tower-lsp = "0.20"
+tower-lsp-server = { workspace = true }
 tokio-util = { version = "0.7", features = ["codec"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -21,7 +21,7 @@ use tarpc::{
     server::{Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
-use tower_lsp::lsp_types::MessageType;
+use tower_lsp_server::lsp_types::MessageType;
 use tracing::error;
 
 use crate::editor::Editor;

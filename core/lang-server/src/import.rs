@@ -9,7 +9,7 @@ use compiler::{
     parse::ParseMetadata,
 };
 use indexmap::IndexSet;
-use tower_lsp::lsp_types::{Range, TextEdit};
+use tower_lsp_server::lsp_types::{Range, TextEdit};
 
 use crate::document::Document;
 

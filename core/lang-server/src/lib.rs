@@ -36,9 +36,9 @@ use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
-use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::{request::Request, *};
-use tower_lsp::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::lsp_types::{request::Request, *};
+use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{UriExt, jsonrpc::Result};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -56,15 +56,15 @@ pub struct StateMut {
     root_dir: Option<PathBuf>,
     config: Option<Config>,
     ast: WorkspaceParseAst,
-    prev_diagnostics: IndexMap<Url, Vec<Diagnostic>>,
+    prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     compile_output: Option<CompileOutput>,
     cell: Option<String>,
     gui_client: Option<GuiClient>,
-    editor_files: IndexMap<Url, Document>,
+    editor_files: IndexMap<Uri, Document>,
 }
 
 impl StateMut {
-    fn diagnostics(&self) -> IndexMap<Url, Vec<Diagnostic>> {
+    fn diagnostics(&self) -> IndexMap<Uri, Vec<Diagnostic>> {
         let mut diagnostics = IndexMap::new();
         if let Some(o) = &self.compile_output {
             let errs = match o {
@@ -88,7 +88,7 @@ impl StateMut {
                 CompileOutput::Valid(_) => vec![],
             };
             for (span, message) in errs {
-                let url = Url::from_file_path(&span.path).unwrap();
+                let url = Uri::from_file_path(&span.path).unwrap();
                 if let Some(ast) = self.ast.values().find(|ast| ast.path == span.path) {
                     let doc = Document::new(&ast.text, 0);
                     diagnostics
@@ -144,7 +144,7 @@ impl StateMut {
                         client
                             .apply_edit(WorkspaceEdit {
                                 changes: Some(HashMap::from_iter([(
-                                    Url::from_file_path(&ast.path).unwrap(),
+                                    Uri::from_file_path(&ast.path).unwrap(),
                                     text_edits,
                                 )])),
                                 document_changes: None,
@@ -286,11 +286,14 @@ impl Request for ForceSave {
     const METHOD: &'static str = "custom/forceSave";
 }
 
-#[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        self.state.state_mut.lock().await.root_dir =
-            params.root_uri.map(|root| root.to_file_path().unwrap());
+        #[allow(deprecated)]
+        {
+            self.state.state_mut.lock().await.root_dir = params
+                .root_uri
+                .map(|root| PathBuf::from(root.to_file_path().unwrap()));
+        }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
