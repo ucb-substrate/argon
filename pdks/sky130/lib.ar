@@ -29,3 +29,10 @@ cell tap(ntap: Int, w: Float, h: Float) {
     let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
     #scope9 std::center_rects(cons, #scope8 std::max_array(licon, cons.w, cons.h, 340., 340.));
 }
+
+cell inv(nw: Float, pw: Float, nf: Int) {
+    let nmos = inst(#scope0 fet1v8(1, nw, nf));
+    let ptap = inst(#scope1 tap(0, nmos.sdm.w, 800.));
+    let pmos = inst(#scope2 fet1v8(0, pw, nf));
+    let ntap = inst(#scope3 tap(1, pmos.sdm.w, 800.));
+}
