@@ -185,7 +185,7 @@ impl Solver {
             .map(|i| {
                 let actual_val = x[(i, 0)];
                 let actual_var = rev_var_map[i];
-                (Var(actual_var as u64), actual_val)
+                (Var(actual_var as u64), round(actual_val))
             })
             .collect();
 

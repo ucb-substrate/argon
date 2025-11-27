@@ -35,7 +35,7 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Link libraries
+    // // Link libraries
     println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
     println!("cargo:rustc-link-lib=spqr");
     println!("cargo:rustc-link-lib=cholmod");
