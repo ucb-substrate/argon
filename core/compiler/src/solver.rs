@@ -1,7 +1,10 @@
-use approx::relative_eq;
+use std::collections::HashMap;
+
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
-use nalgebra::{DMatrix, DVector};
+use nalgebra::DVector;
+use nalgebra_sparse::{CooMatrix, CsrMatrix};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-10;
@@ -10,6 +13,7 @@ const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
+use crate::spqr::SpqrFactorization;
 
 #[derive(Clone, Default)]
 pub struct Solver {
@@ -90,36 +94,103 @@ impl Solver {
         if n_vars == 0 || self.constraints.is_empty() {
             return;
         }
-        let a = DMatrix::from_row_iterator(
-            self.constraints.len(),
-            n_vars,
-            self.constraints
-                .iter()
-                .flat_map(|c| c.expr.coeff_vec(n_vars)),
-        );
-        let b = DVector::from_iterator(
-            self.constraints.len(),
-            self.constraints.iter().map(|c| -c.expr.constant),
-        );
 
-        let svd = a.clone().svd(true, true);
-        let vt = svd.v_t.as_ref().expect("No V^T matrix");
-        let r = svd.rank(EPSILON);
-        if r == 0 {
-            return;
+        let old_triplets: Vec<(usize, usize, f64)> = self
+            .constraints
+            .par_iter()
+            .enumerate()
+            .flat_map(|(c_index, c)| {
+                c.expr
+                    .coeff_vec(n_vars)
+                    .into_par_iter()
+                    .enumerate()
+                    .filter_map(move |(v_index, v)| {
+                        if v != 0.0 {
+                            Some((c_index, v_index, v))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect();
+
+        let mut used = vec![false; n_vars];
+        for (_, v_index, _) in &old_triplets {
+            used[*v_index] = true;
         }
-        let vt_recons = vt.rows(0, r);
-        let sol = svd.solve(&b, EPSILON).unwrap();
 
-        for i in 0..self.next_var {
-            let recons = (vt_recons.transpose() * vt_recons.column(i as usize))[((i as usize), 0)];
-            if !self.solved_vars.contains_key(&Var(i))
-                && relative_eq!(recons, 1., epsilon = EPSILON)
-            {
-                let val = round(sol[(i as usize, 0)]);
-                self.solved_vars.insert(Var(i), val);
+        let mut var_map = vec![usize::MAX; n_vars];
+        let mut rev_var_map = Vec::with_capacity(n_vars);
+        let mut new_index = 0;
+
+        for (old_index, &is_used) in used.iter().enumerate() {
+            if is_used {
+                var_map[old_index] = new_index;
+                rev_var_map.push(old_index);
+                new_index += 1;
             }
         }
+
+        let n = new_index;
+        let m = self.constraints.len();
+
+        let triplets: Vec<(usize, usize, f64)> = old_triplets
+            .into_par_iter()
+            .map(|(c_index, v_index, val)| {
+                let new_index = var_map[v_index];
+                (c_index, new_index, val)
+            })
+            .collect();
+
+        let temp_b: Vec<f64> = self
+            .constraints
+            .par_iter()
+            .map(|c| -c.expr.constant)
+            .collect();
+
+        let b = DVector::from_iterator(self.constraints.len(), temp_b);
+
+        let temp_a_constraind_ids: Vec<u64> = self.constraints.par_iter().map(|c| c.id).collect();
+        let a_constraint_ids = Vec::from_iter(temp_a_constraind_ids);
+
+        let mut a_coo = CooMatrix::new(m, n);
+        for (i, j, v) in triplets.iter() {
+            a_coo.push(*i, *j, *v);
+        }
+        let a_sparse: CsrMatrix<f64> = CsrMatrix::from(&a_coo);
+
+        let qr = SpqrFactorization::from_triplets(&triplets, m, n).unwrap();
+
+        let rank = qr.rank();
+
+        let x = qr.solve(&b).unwrap();
+
+        let residual = &b - &a_sparse * &x;
+
+        let tolerance = 1e-10;
+
+        for i in 0..residual.nrows() {
+            let r = residual[(i, 0)];
+            if r.abs() > tolerance {
+                self.inconsistent_constraints.insert(a_constraint_ids[i]);
+            }
+        }
+
+        let ones_vector: DVector<f64> = DVector::from_element(n - rank, 1.0);
+        let null_space_components = qr.get_nspace_sparse().unwrap() * ones_vector;
+
+        let par_solved_vars: HashMap<Var, f64> = (0..n)
+            .into_par_iter()
+            .filter(|&i| null_space_components[i] < tolerance)
+            .map(|i| {
+                let actual_val = x[(i, 0)];
+                let actual_var = rev_var_map[i];
+                (Var(actual_var as u64), round(actual_val))
+            })
+            .collect();
+
+        self.solved_vars.extend(par_solved_vars);
+
         for constraint in self.constraints.iter_mut() {
             substitute_expr(&self.solved_vars, &mut constraint.expr);
             if constraint.expr.coeffs.is_empty()
