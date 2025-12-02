@@ -83,7 +83,15 @@ impl StateMut {
                     .collect(),
                 CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, .. }) => errors
                     .iter()
-                    .filter_map(|e| Some((e.span.as_ref()?.clone(), format!("{}", e.kind))))
+                    .map(|e| {
+                        (
+                            e.span.clone().unwrap_or_else(|| Span {
+                                path: self.root_dir.as_ref().unwrap().join("lib.ar"),
+                                span: cfgrammar::Span::new(0, 0),
+                            }),
+                            format!("{}", e.kind),
+                        )
+                    })
                     .collect(),
                 CompileOutput::Valid(_) => vec![],
             };
