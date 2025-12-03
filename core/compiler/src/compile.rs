@@ -32,12 +32,13 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 10] = [
+pub const BUILTINS: [&str; 11] = [
     "cons",
     "head",
     "tail",
     "crect",
     "rect",
+    "text",
     "float",
     "eq",
     "dimension",
@@ -498,6 +499,7 @@ impl Ty {
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
             "Int" => Some(Ty::Int),
+            "String" => Some(Ty::String),
             "()" => Some(Ty::Nil),
             "[]" => Some(Ty::SeqNil),
             _ => None,
@@ -1457,6 +1459,16 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     };
                     self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Rect)
+                }
+                "text" => {
+                    // text, layer, x, y
+                    self.typecheck_posargs(
+                        input.span,
+                        &args.posargs,
+                        &[Ty::String, Ty::String, Ty::Float, Ty::Float],
+                    );
+                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    (None, Ty::Nil)
                 }
                 "cons" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 2);
@@ -2884,6 +2896,46 @@ impl<'a> ExecPass<'a> {
                             );
                             self.cell_state_mut(vref.loc.cell).deferred.insert(defer);
                         }
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "text" => {
+                    let args = c
+                        .state
+                        .posargs
+                        .iter()
+                        .map(|vid| self.values[vid].get_ready())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(mut args) = args {
+                        assert_eq!(args.len(), 4);
+                        let id = object_id(&mut self.next_id);
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let y = *args.pop().unwrap().as_ref().unwrap_bool();
+                        let x = *args.pop().unwrap().as_ref().unwrap_bool();
+                        let layer = *args.pop().unwrap().as_ref().unwrap_string();
+                        let text = *args.pop().unwrap().as_ref().unwrap_string();
+                        let dim = Dimension {
+                            id,
+                            horiz,
+                            nstop,
+                            pstop,
+                            coord,
+                            value,
+                            n,
+                            p,
+                            constraint,
+                            span: Some(span.clone()),
+                        };
+                        state.object_emit.push(ObjectEmit {
+                            scope: vref.loc.scope,
+                            object: dim.id,
+                            span,
+                        });
+                        state.objects.insert(dim.id, dim.clone().into());
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
                         false
