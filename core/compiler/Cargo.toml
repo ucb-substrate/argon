@@ -23,6 +23,7 @@ rgb = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 regex = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 gds21 = "0.2"
