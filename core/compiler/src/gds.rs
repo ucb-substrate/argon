@@ -105,8 +105,11 @@ impl CompiledData {
     fn cell_to_gds(&self, exporter: &mut GdsExporter, id: CellId) -> Result<()> {
         let cell = &self.cells[&id];
         let name = &cell.scopes[&cell.root].name;
-        exporter.names.assign_name(id, name);
-        let mut ocell = GdsStruct::new(name);
+        let re = Regex::new(r".*cell ([a-zA-Z0-9_]*)")?;
+        let caps = re.captures(name).ok_or_else(|| anyhow!("parse error"))?;
+        let name = caps.get(1).ok_or_else(|| anyhow!("parse error"))?.as_str();
+        let name = exporter.names.assign_name(id, name);
+        let mut ocell = GdsStruct::new(name.to_string());
         for (_, obj) in &cell.objects {
             match obj {
                 SolvedValue::Rect(rect) => {
