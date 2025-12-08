@@ -1142,6 +1142,7 @@ dependencies = [
  "approx",
  "arcstr",
  "cfgrammar",
+ "const_format",
  "derive-where",
  "enumify",
  "gds21",
@@ -1157,6 +1158,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.16",
  "toml 0.9.7",
+ "uniquify",
 ]
 
 [[package]]
@@ -1204,6 +1206,26 @@ dependencies = [
  "getrandom 0.2.16",
  "once_cell",
  "tiny-keccak",
+]
+
+[[package]]
+name = "const_format"
+version = "0.2.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7faa7469a93a566e9ccc1c73fe783b4a65c274c5ace346038dca9c39fe0030ad"
+dependencies = [
+ "const_format_proc_macros",
+]
+
+[[package]]
+name = "const_format_proc_macros"
+version = "0.2.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d57c2eccfb16dbac1f4e61e206105db5820c9d26c3c472bc17c774259ef7744"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-xid",
 ]
 
 [[package]]
@@ -6918,6 +6940,22 @@ name = "unicode-width"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a1a07cc7db3810833284e8d372ccdc6da29741639ecc70c9ec107df0fa6154c"
+
+[[package]]
+name = "unicode-xid"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "uniquify"
+version = "0.4.0"
+source = "registry+https://github.com/substrate-labs/crates-index"
+checksum = "b67a7ac4bcaa9f5d8c8f7e07990bef8df01195fc987974830d1d8bc0b99d1465"
+dependencies = [
+ "arcstr",
+ "serde",
+]
 
 [[package]]
 name = "untrusted"

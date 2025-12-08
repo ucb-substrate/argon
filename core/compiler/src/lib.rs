@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod compile;
 pub mod config;
+pub mod gds;
 pub mod layer;
 pub mod parse;
 pub mod solver;
@@ -8,78 +9,51 @@ pub mod solver;
 #[cfg(test)]
 mod tests {
 
-    use std::{io::BufReader, path::PathBuf};
+    use std::path::PathBuf;
 
     use crate::{
-        compile::{ExecErrorKind, SolvedValueRef},
+        compile::{ExecErrorKind, SolvedValue},
+        gds::GdsMap,
         parse::parse_workspace_with_std,
     };
     use approx::assert_relative_eq;
-    use gds21::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
-    use indexmap::IndexMap;
-    use regex::Regex;
+    use const_format::concatcp;
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
-    const ARGON_SCOPES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/scopes/lib.ar");
-    const BASIC_LYP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lyp/basic.lyp");
-    const SKY130_LYP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lyp/sky130.lyp");
-    const ARGON_IMMEDIATE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/immediate/lib.ar");
-    const ARGON_IF: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/if/lib.ar");
-    const ARGON_IF_INCONSISTENT: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/if_inconsistent/lib.ar"
-    );
-    const ARGON_VIA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via/lib.ar");
-    const ARGON_VIA_ARRAY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/via_array/lib.ar");
-    const ARGON_FUNC_OUT_OF_ORDER: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/func_out_of_order/lib.ar"
-    );
-    const ARGON_HIERARCHY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/hierarchy/lib.ar");
-    const ARGON_NESTED_INST: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/nested_inst/lib.ar");
-    const ARGON_CELL_OUT_OF_ORDER: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/cell_out_of_order/lib.ar"
-    );
-    const ARGON_FALLBACK_BASIC: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/fallback_basic/lib.ar"
-    );
-    const ARGON_FALLBACK_INST: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/fallback_inst/lib.ar");
-    const ARGON_BOOL_LITERAL: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bool_literal/lib.ar");
-    const ARGON_DIMENSIONS: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/dimensions/lib.ar");
-    const ARGON_PARAM_FLOAT: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/param_float/lib.ar");
-    const ARGON_PARAM_INT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/param_int/lib.ar");
-    const ARGON_SKY130_INVERTER: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/sky130_inverter/lib.ar"
-    );
-    const ARGON_ENUMERATIONS: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/enumerations/lib.ar");
-    const ARGON_BBOX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bbox/lib.ar");
-    const ARGON_ROUNDING: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/rounding/lib.ar");
-    const ARGON_FLIPPED_RECT: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/examples/flipped_rect/lib.ar");
-    const ARGON_SEQ_BASIC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_basic/lib.ar");
-    const ARGON_SEQ_FN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_fn/lib.ar");
-    const ARGON_SEQ_RECUR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_recur/lib.ar");
-    const ARGON_LUB_MATCH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/lub_match/lib.ar");
-    const ARGON_SEQ_CELL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/seq_cell/lib.ar");
-    const ARGON_WORKSPACE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/argon_workspace/lib.ar"
-    );
-    const ARGON_EXTERNAL_MODS: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/examples/external_mods/main_crate/lib.ar"
-    );
+    const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
+    const ARGON_SCOPES: &str = concatcp!(EXAMPLES_DIR, "/scopes/lib.ar");
+    const BASIC_LYP: &str = concatcp!(EXAMPLES_DIR, "/lyp/basic.lyp");
+    const ARGON_SKY130_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pdks/sky130");
+    const ARGON_SKY130_LIB: &str = concatcp!(ARGON_SKY130_DIR, "/lib.ar");
+    const SKY130_LYP: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.lyp");
+    const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
+    const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
+    const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
+    const ARGON_VIA: &str = concatcp!(EXAMPLES_DIR, "/via/lib.ar");
+    const ARGON_VIA_ARRAY: &str = concatcp!(EXAMPLES_DIR, "/via_array/lib.ar");
+    const ARGON_FUNC_OUT_OF_ORDER: &str = concatcp!(EXAMPLES_DIR, "/func_out_of_order/lib.ar");
+    const ARGON_HIERARCHY: &str = concatcp!(EXAMPLES_DIR, "/hierarchy/lib.ar");
+    const ARGON_NESTED_INST: &str = concatcp!(EXAMPLES_DIR, "/nested_inst/lib.ar");
+    const ARGON_CELL_OUT_OF_ORDER: &str = concatcp!(EXAMPLES_DIR, "/cell_out_of_order/lib.ar");
+    const ARGON_FALLBACK_BASIC: &str = concatcp!(EXAMPLES_DIR, "/fallback_basic/lib.ar");
+    const ARGON_FALLBACK_INST: &str = concatcp!(EXAMPLES_DIR, "/fallback_inst/lib.ar");
+    const ARGON_BOOL_LITERAL: &str = concatcp!(EXAMPLES_DIR, "/bool_literal/lib.ar");
+    const ARGON_DIMENSIONS: &str = concatcp!(EXAMPLES_DIR, "/dimensions/lib.ar");
+    const ARGON_PARAM_FLOAT: &str = concatcp!(EXAMPLES_DIR, "/param_float/lib.ar");
+    const ARGON_PARAM_INT: &str = concatcp!(EXAMPLES_DIR, "/param_int/lib.ar");
+    const ARGON_ENUMERATIONS: &str = concatcp!(EXAMPLES_DIR, "/enumerations/lib.ar");
+    const ARGON_BBOX: &str = concatcp!(EXAMPLES_DIR, "/bbox/lib.ar");
+    const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
+    const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
+    const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
+    const ARGON_SEQ_FN: &str = concatcp!(EXAMPLES_DIR, "/seq_fn/lib.ar");
+    const ARGON_SEQ_RECUR: &str = concatcp!(EXAMPLES_DIR, "/seq_recur/lib.ar");
+    const ARGON_LUB_MATCH: &str = concatcp!(EXAMPLES_DIR, "/lub_match/lib.ar");
+    const ARGON_SEQ_CELL: &str = concatcp!(EXAMPLES_DIR, "/seq_cell/lib.ar");
+    const ARGON_WORKSPACE: &str = concatcp!(EXAMPLES_DIR, "/argon_workspace/lib.ar");
+    const ARGON_EXTERNAL_MODS: &str = concatcp!(EXAMPLES_DIR, "/external_mods/main_crate/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -182,7 +156,7 @@ mod tests {
             .objects
             .iter()
             .filter(|(_, o)| {
-                if let SolvedValueRef::Rect(r) = o.as_ref() {
+                if let SolvedValue::Rect(r) = &o {
                     !r.construction
                 } else {
                     false
@@ -440,66 +414,33 @@ mod tests {
 
     #[test]
     fn argon_sky130_inverter() {
-        let o = parse_workspace_with_std(ARGON_SKY130_INVERTER);
+        let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
         let cells = compile(
             &ast,
             CompileInput {
-                cell: &["inverter"],
-                args: vec![CellArg::Float(1_200.), CellArg::Float(2_000.)],
+                cell: &["inv"],
+                args: vec![
+                    CellArg::Float(1_200.),
+                    CellArg::Float(2_000.),
+                    CellArg::Int(4),
+                ],
                 lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("cells: {cells:?}");
 
-        let cells = cells.unwrap_valid();
-        let cell = &cells.cells[&cells.top];
-        let mut gds = GdsLibrary::new("TOP");
-        let mut ocell = GdsStruct::new("cell");
-        let lyp =
-            klayout_lyp::from_reader(BufReader::new(std::fs::File::open(SKY130_LYP).unwrap()))
-                .unwrap();
-        let layers = lyp
-            .layers
-            .iter()
-            .map(|layer_prop| {
-                let re = Regex::new(r"(\d*)/(\d*)@\d*").unwrap();
-                let caps = re.captures(&layer_prop.source).unwrap();
-                let layer = caps.get(1).unwrap().as_str().parse().unwrap();
-                let datatype = caps.get(2).unwrap().as_str().parse().unwrap();
-                (layer_prop.name.as_str(), (layer, datatype))
-            })
-            .collect::<IndexMap<_, _>>();
-        for rect in cell.objects.iter().filter_map(|obj| obj.1.get_rect()) {
-            if rect.construction {
-                continue;
-            }
-            if let Some(layer) = &rect.layer {
-                let (layer, datatype) = layers[&layer.as_str()];
-                let x0 = rect.x0.0 as i32;
-                let x1 = rect.x1.0 as i32;
-                let y0 = rect.y0.0 as i32;
-                let y1 = rect.y1.0 as i32;
-                ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
-                    layer,
-                    datatype,
-                    xy: vec![
-                        GdsPoint::new(x0, y0),
-                        GdsPoint::new(x0, y1),
-                        GdsPoint::new(x1, y1),
-                        GdsPoint::new(x1, y0),
-                    ],
-                    ..Default::default()
-                }));
-            }
-        }
-        gds.structs.push(ocell);
+        assert!(cells.is_valid());
+
         let work_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_inverter");
-        std::fs::create_dir_all(&work_dir).expect("failed to create dirs");
-        gds.save(work_dir.join("layout.gds"))
-            .expect("failed to write GDS");
+        cells
+            .to_gds(
+                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                work_dir.join("layout.gds"),
+            )
+            .expect("Failed to write to GDS");
     }
 
     #[test]
