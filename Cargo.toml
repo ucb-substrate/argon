@@ -31,3 +31,4 @@ tower-lsp-server = "0.22"
 
 geometry = { version = "0.7", registry = "substrate" }
 enumify = { version = "0.2", registry = "substrate" }
+uniquify = { version = "0.4", registry = "substrate" }

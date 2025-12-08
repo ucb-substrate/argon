@@ -31,8 +31,56 @@ cell tap(ntap: Int, w: Float, h: Float) {
 }
 
 cell inv(nw: Float, pw: Float, nf: Int) {
-    let nmos = inst(#scope0 fet1v8(1, nw, nf));
-    let ptap = inst(#scope1 tap(0, nmos.sdm.w, 800.));
-    let pmos = inst(#scope2 fet1v8(0, pw, nf));
-    let ntap = inst(#scope3 tap(1, pmos.sdm.w, 800.));
+    let nmos = inst(#scope0 fet1v8(1, nw, nf), x=0., y=0.);
+    let ptap = inst(#scope1 tap(0, nmos.sdm.w - 260., 800.));
+    eq(ptap.sdm.y1 + 100., nmos.sdm.y0);
+    eq(ptap.sdm.x0, nmos.sdm.x0);
+    let pmos = inst(#scope2 fet1v8(0, pw, nf), x=0.);
+    let ntap = inst(#scope3 tap(1, pmos.sdm.w - 260., 800.));
+    eq(pmos.li1_bbox.y1 + 100., ntap.sdm.y0);
+    eq(ntap.sdm.x0, pmos.sdm.x0);
+
+    // Draw horizontal LI1 rails.
+    let o_li_bot = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., y0=nmos.li1_bbox.y1 + 170., h=170.);
+    let a_li_mid = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., y0=o_li_bot.y1 + 170., h=170.)!;
+    let o_li_top = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., x1=o_li_bot.x1, y0=a_li_mid.y1 + 170., h=170.)!;
+    eq(o_li_top.y1 + 170., pmos.li1_bbox.y0);
+
+    // Connect output LI1 rectangles.
+    let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + 170., w=170., y0=o_li_bot.y0, y1=o_li_top.y1);
+    eq(o_li_bot.x1, o_li_right.x1);
+    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=nmos.li1_bbox.y0, y1=o_li_bot.y1);
+    let li1_bbox_bot = #scope4 std::array(li1, (nf + 1) / 2, 860., 0.);
+    eq(li1_bbox_bot.x0, o_li_bot.x0);
+    eq(li1_bbox_bot.y1, o_li_bot.y1);
+    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y1=pmos.li1_bbox.y1, y0=o_li_top.y0);
+    let li1_bbox_top = #scope5 std::array(li1, (nf + 1) / 2, 860., 0.);
+    eq(li1_bbox_top.x0, o_li_top.x0);
+    eq(li1_bbox_top.y0, o_li_top.y0);
+
+    // Connect sources to taps.
+    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=ptap.li1.y0, y1=nmos.li1_bbox.y1);
+    let li1_bbox_bot = #scope8 std::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
+    eq(li1_bbox_bot.x0, nmos.li1_bbox.x0);
+    eq(li1_bbox_bot.y0, ptap.li1.y0);
+    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y1=ntap.li1.y1, y0=pmos.li1_bbox.y0);
+    let li1_bbox_top = #scope9 std::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
+    eq(li1_bbox_top.x0, pmos.li1_bbox.x0);
+    eq(li1_bbox_top.y1, ntap.li1.y1);
+
+    // Connect gates to input LI1 rectangle.
+    let a_poly_mid = rect("poly.drawing", x0=nmos.poly_bbox.x0 - 80., x1=nmos.poly_bbox.x1 + 80., h=270.)!;
+    eq(a_poly_mid.y0 + a_poly_mid.y1, a_li_mid.y0 + a_li_mid.y1);
+    let a_npc_mid = rect("npc.drawing", x0=nmos.poly_bbox.x0 - 100., x1=nmos.poly_bbox.x1 + 100., h=370.)!;
+    eq(a_poly_mid.y0 + a_poly_mid.y1, a_npc_mid.y0 + a_npc_mid.y1);
+
+    let poly = crect(layer="poly.drawing", x0=0., y0=nmos.poly_bbox.y0, y1=pmos.poly_bbox.y1, w=150.);
+    let poly_bbox = #scope6 std::array(poly, nf, 430., 0.);
+    eq(poly_bbox.x0, nmos.poly_bbox.x0);
+    eq(poly_bbox.y0, nmos.poly_bbox.y0);
+
+    let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
+    let licon_bbox = #scope7 std::array(licon, nf, 430., 0.);
+    eq(licon_bbox.x0, a_li_mid.x0 + 80.);
+    eq(licon_bbox.y0, a_li_mid.y0);
 }
