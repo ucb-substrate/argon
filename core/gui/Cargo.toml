@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 lang-server = { path = "../lang-server" }
 compiler = { path = "../compiler" }
-gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
+gpui = { path = "/scratch/rohankumar/zed/crates/gpui" }
 anyhow = { workspace = true }
 smallvec = "1"
 rust-embed = "8"
