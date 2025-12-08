@@ -6,6 +6,7 @@ use gds21::{
 };
 use indexmap::IndexMap;
 use regex::Regex;
+use tracing::trace;
 use uniquify::Names;
 
 use crate::compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, SolvedValue};
@@ -83,6 +84,7 @@ impl GdsMap {
 impl CompileOutput {
     pub fn to_gds(&self, map: GdsMap, out_path: impl AsRef<Path>) -> Result<()> {
         let out_path = out_path.as_ref();
+        trace!("Exporting to gds at {out_path:?}");
         let mut exporter = GdsExporter::new("TOP", map);
         if let CompileOutput::Valid(output)
         | CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -103,6 +105,7 @@ impl CompileOutput {
 
 impl CompiledData {
     fn cell_to_gds(&self, exporter: &mut GdsExporter, id: CellId) -> Result<()> {
+        trace!("Exporting cell {id}");
         let cell = &self.cells[&id];
         let name = &cell.scopes[&cell.root].name;
         let re = Regex::new(r".*cell ([a-zA-Z0-9_]*)")?;
