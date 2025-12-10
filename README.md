@@ -149,7 +149,7 @@ Hit `d` to use the Dimension tool and click on the top edge of each rectangle. C
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
 of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
 
-> [!INFO]
+> [!TIP]
 > If you make a mistake, you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
 > respectively, or manually modify the code in the text editor if needed.
 
