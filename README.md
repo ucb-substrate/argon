@@ -58,12 +58,12 @@ vim.cmd([[autocmd BufRead,BufNewFile *.ar setfiletype argon]])
 To open an example Argon workspace, run the following from the root directory of your Argon clone:
 
 ```
-vim core/compiler/examples/argon_workspace/lib.ar
+vim pdks/sky130/lib.ar
 ```
 
 Start the GUI by running `:Argon gui`.
 
-From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
+From within the GUI, type `:openCell inv(1200., 2000., 4)` to open the `inv` cell. You should now be able to edit layouts 
 in both Neovim and the GUI.
 
 ### VS Code
@@ -92,7 +92,7 @@ cd ../..
 To open an example Argon workspace, run the following from the root directory of your Argon clone:
 
 ```bash
-code --extensionDevelopmentPath=$(pwd)/plugins/vscode core/compiler/examples/argon_workspace
+code --extensionDevelopmentPath=$(pwd)/plugins/vscode pdks/sky130/lib.ar
 ```
 
 We recommend defining an alias in your shell configuration to simplify future commands:
@@ -104,7 +104,7 @@ alias codear="code --extensionDevelopmentPath=<absolute_path_to_argon_repo>/plug
 With this alias defined, you can now run:
 
 ```bash
-codear core/compiler/examples/argon_workspace
+codear pdks/sky130
 ```
 
 Open the `lib.ar` file within the workspace. You can then start the GUI by running `Command Palette > Argon: Start GUI`.
@@ -149,10 +149,8 @@ Hit `d` to use the Dimension tool and click on the top edge of each rectangle. C
 The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
 of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
 
-> [!WARNING]
-> Double check that there are no errors in your code editor, or the GUI will not be able to
-> display the updated cell. If you make a mistake, 
-> you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
+> [!INFO]
+> If you make a mistake, you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
 > respectively, or manually modify the code in the text editor if needed.
 
 Repeat for the other 3 sides of the rectangle.
