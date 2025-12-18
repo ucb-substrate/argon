@@ -2,7 +2,8 @@ use std::{io::BufReader, ops::Deref, path::Path};
 
 use anyhow::{Result, anyhow};
 use gds21::{
-    GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPoint, GdsStrans, GdsStruct, GdsStructRef,
+    GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPoint, GdsStrans, GdsStruct,
+    GdsStructRef, GdsUnits,
 };
 use indexmap::IndexMap;
 use regex::Regex;
@@ -22,9 +23,11 @@ struct GdsExporter {
 }
 
 impl GdsExporter {
-    fn new(name: impl Into<String>, map: GdsMap) -> Self {
+    fn new(name: impl Into<String>, map: GdsMap, units: GdsUnits) -> Self {
+        let mut lib = GdsLibrary::new(name);
+        lib.units = units;
         Self {
-            lib: GdsLibrary::new(name),
+            lib,
             map,
             names: Names::new(),
         }
@@ -54,7 +57,7 @@ impl GdsMap {
             lyp.layers
                 .into_iter()
                 .map(|layer_prop| {
-                    let re = Regex::new(r"(\d*)/(\d*)@\d*")?;
+                    let re = Regex::new(r"(\d*)/(\d*)(@\d*)?")?;
                     let caps = re
                         .captures(&layer_prop.source)
                         .ok_or_else(|| anyhow!("parse error"))?;
@@ -82,10 +85,10 @@ impl GdsMap {
 }
 
 impl CompileOutput {
-    pub fn to_gds(&self, map: GdsMap, out_path: impl AsRef<Path>) -> Result<()> {
+    pub fn to_gds(&self, map: GdsMap, units: GdsUnits, out_path: impl AsRef<Path>) -> Result<()> {
         let out_path = out_path.as_ref();
         trace!("Exporting to gds at {out_path:?}");
-        let mut exporter = GdsExporter::new("TOP", map);
+        let mut exporter = GdsExporter::new("TOP", map, units);
         if let CompileOutput::Valid(output)
         | CompileOutput::ExecErrors(ExecErrorCompileOutput {
             errors: _,
@@ -124,10 +127,10 @@ impl CompiledData {
                             layer,
                             xtype: datatype,
                         } = exporter.map[layer];
-                        let x0 = rect.x0.0 as i32;
-                        let x1 = rect.x1.0 as i32;
-                        let y0 = rect.y0.0 as i32;
-                        let y1 = rect.y1.0 as i32;
+                        let x0 = (rect.x0.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
+                        let x1 = (rect.x1.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
+                        let y0 = (rect.y0.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
+                        let y1 = (rect.y1.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
                         ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                             layer,
                             datatype,
