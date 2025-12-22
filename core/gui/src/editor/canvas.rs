@@ -16,7 +16,7 @@ use gpui::{
     FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
     ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div, pattern_slash,
-    rgb, size, solid_background,
+    px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -34,10 +34,8 @@ pub enum ShapeFill {
     Solid,
 }
 
-const CONSTRAINED_BORDER_WIDTH: Pixels = Pixels(2.);
-const SELECT_WIDTH: Pixels = Pixels(3.);
-const DEFAULT_BORDER_WIDTH: Pixels = Pixels(2.);
-const UNCONSTRAINED_BORDER_WIDTH: Pixels = Pixels(0.);
+const SELECT_WIDTH: Pixels = px(3.);
+const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
@@ -49,6 +47,7 @@ pub struct Rect {
     /// Empty if not accessible.
     pub object_path: Vec<ObjectId>,
     pub border_widths: Edges<Pixels>,
+    pub border_styles: Edges<BorderStyle>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -93,6 +92,7 @@ impl From<compile::Rect<f64>> for Rect {
             id: None,
             object_path: Vec::new(),
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            border_styles: Edges::all(BorderStyle::Solid),
         }
     }
 }
@@ -107,6 +107,7 @@ impl From<editor::Rect<(f64, Var)>> for Rect {
             id: None,
             object_path: Vec::new(),
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            border_styles: Edges::all(BorderStyle::Solid),
         }
     }
 }
@@ -123,6 +124,7 @@ impl Rect {
             id: self.id.clone(),
             object_path: self.object_path.clone(),
             border_widths: self.border_widths,
+            border_styles: self.border_styles,
         }
     }
 }
@@ -241,11 +243,11 @@ fn get_paint_path(bounds: Bounds<Pixels>, color: Rgba, thickness: Pixels) -> Pai
     );
     PaintQuad {
         bounds,
-        corner_radii: Corners::all(Pixels(0.)),
+        corner_radii: Corners::all(px(0.)),
         background: solid_background(color),
-        border_widths: Edges::all(Pixels(0.)),
+        border_widths: Edges::all(px(0.)),
         border_color: Rgba { a: 0., ..color }.into(),
-        border_style: BorderStyle::Solid,
+        border_styles: Edges::all(BorderStyle::Solid),
     }
 }
 
@@ -256,8 +258,8 @@ fn get_rect_bounds(
     offset: Point<Pixels>,
 ) -> Bounds<Pixels> {
     Bounds::new(
-        Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1)) + offset + bounds.origin,
-        Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+        Point::new(scale * px(r.x0), scale * px(-r.y1)) + offset + bounds.origin,
+        Size::new(scale * px(r.x1 - r.x0), scale * px(r.y1 - r.y0)),
     )
 }
 
@@ -267,6 +269,7 @@ fn get_paint_quad(
     color: Rgba,
     border_color: Rgba,
     border_widths: Edges<Pixels>,
+    border_styles: Edges<BorderStyle>,
 ) -> PaintQuad {
     let bounds = Bounds::new(
         Point::new(
@@ -284,11 +287,11 @@ fn get_paint_quad(
     };
     PaintQuad {
         bounds,
-        corner_radii: Corners::all(Pixels(0.)),
+        corner_radii: Corners::all(px(0.)),
         background,
         border_widths,
         border_color: border_color.into(),
-        border_style: BorderStyle::Solid,
+        border_styles,
     }
 }
 
@@ -404,6 +407,7 @@ impl Element for CanvasElement {
                             id: Some(scope_info.span.clone()),
                             object_path: Vec::new(),
                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                            border_styles: Edges::all(BorderStyle::Solid),
                         };
                         if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                             && &rect.id == selected_obj
@@ -442,35 +446,36 @@ impl Element for CanvasElement {
                                         y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
                                         id: rect.span.clone(),
                                         object_path,
-                                        border_widths: Edges {
+                                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                        border_styles: Edges {
                                             // TODO: check constrained status and modify widths
                                             top: if rect.y1.1.coeffs.iter().any(|(_, var)| {
                                                 cell_info.unsolved_vars.contains(var)
                                             }) {
-                                                UNCONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Dashed
                                             } else {
-                                                CONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Solid
                                             },
                                             right: if rect.x1.1.coeffs.iter().any(|(_, var)| {
                                                 cell_info.unsolved_vars.contains(var)
                                             }) {
-                                                UNCONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Dashed
                                             } else {
-                                                CONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Solid
                                             },
                                             bottom: if rect.y0.1.coeffs.iter().any(|(_, var)| {
                                                 cell_info.unsolved_vars.contains(var)
                                             }) {
-                                                UNCONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Dashed
                                             } else {
-                                                CONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Solid
                                             },
                                             left: if rect.x0.1.coeffs.iter().any(|(_, var)| {
                                                 cell_info.unsolved_vars.contains(var)
                                             }) {
-                                                UNCONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Dashed
                                             } else {
-                                                CONSTRAINED_BORDER_WIDTH
+                                                BorderStyle::Solid
                                             },
                                         },
                                     };
@@ -517,6 +522,7 @@ impl Element for CanvasElement {
                                         id: Some(inst.span.clone()),
                                         object_path: object_path.clone(),
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                        border_styles: Edges::all(BorderStyle::Solid),
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         &tool
@@ -564,7 +570,8 @@ impl Element for CanvasElement {
                         x1: p0.x.max(layout_mouse_position.x),
                         y1: p0.y.max(layout_mouse_position.y),
                         id: None,
-                        border_widths: Edges::all(UNCONSTRAINED_BORDER_WIDTH),
+                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                        border_styles: Edges::all(BorderStyle::Dashed),
                     },
                     layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
                 ));
@@ -599,12 +606,12 @@ impl Element for CanvasElement {
                         stop: bounds.origin.x + bounds.size.width,
                     };
                     window.paint_quad(get_paint_path(
-                        y_axis.select_bounds(Pixels(0.)),
+                        y_axis.select_bounds(px(0.)),
                         theme.axes,
                         DEFAULT_BORDER_WIDTH,
                     ));
                     window.paint_quad(get_paint_path(
-                        x_axis.select_bounds(Pixels(0.)),
+                        x_axis.select_bounds(px(0.)),
                         theme.axes,
                         DEFAULT_BORDER_WIDTH,
                     ));
@@ -615,6 +622,7 @@ impl Element for CanvasElement {
                             l.color,
                             l.border_color,
                             r.border_widths,
+                            r.border_styles,
                         ));
                     }
                     for r in &scope_rects {
@@ -624,6 +632,7 @@ impl Element for CanvasElement {
                             Rgba { a: 0., ..theme.text },
                             theme.text,
                             r.border_widths,
+                            r.border_styles,
                         ));
                     }
                     for r in &select_rects {
@@ -633,6 +642,7 @@ impl Element for CanvasElement {
                             Rgba { a: 0., ..rgb(0xffff00) },
                             rgb(0xffff00),
                             r.border_widths,
+                            r.border_styles,
                         ));
                     }
 
@@ -679,6 +689,7 @@ impl Element for CanvasElement {
                                 y1: y0.max(y1),
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                border_styles: Edges::all(BorderStyle::Solid),
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (
@@ -713,6 +724,7 @@ impl Element for CanvasElement {
                                 y1: y0.max(y1),
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                border_styles: Edges::all(BorderStyle::Solid),
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (p, coord, n, coord)
@@ -727,6 +739,7 @@ impl Element for CanvasElement {
                                 y1: y0.max(y1),
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                border_styles: Edges::all(BorderStyle::Solid),
                             };
                             for r in &[start_line, stop_line, dim_line] {
                                 window.paint_quad(get_paint_path(
@@ -737,7 +750,7 @@ impl Element for CanvasElement {
                             }
 
                             let run_len = value.len();
-                            let font_size = Pixels(14.);
+                            let font_size = px(14.);
                             let runs = &[window.text_style().to_run(run_len)];
                             let origin = self
                                 .inner
@@ -747,7 +760,7 @@ impl Element for CanvasElement {
                             let layout =
                                 window
                                     .text_system()
-                                    .layout_line(text.clone(), font_size, runs);
+                                    .layout_line(&text, font_size, runs, None);
                             if let Some(span) = span {
                                 dim_hitboxes.push((
                                     span.clone(),
@@ -757,8 +770,8 @@ impl Element for CanvasElement {
                             }
                             window
                                 .text_system()
-                                .shape_line(text, font_size, runs)
-                                .paint(origin, Pixels(16.), window, cx)
+                                .shape_line(text, font_size, runs, None)
+                                .paint(origin, px(16.), window, cx)
                                 .unwrap();
                         };
 
@@ -868,14 +881,15 @@ impl Element for CanvasElement {
                                             y1,
                                             id: None,
                                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                border_styles: Edges::all(BorderStyle::Solid),
                                         },
                                         bounds,
                                         scale,
                                         offset,
                                     )
                                 }
-                                DimEdge::X0 => y_axis.select_bounds(Pixels(0.)),
-                                DimEdge::Y0 => x_axis.select_bounds(Pixels(0.)),
+                                DimEdge::X0 => y_axis.select_bounds(px(0.)),
+                                DimEdge::Y0 => x_axis.select_bounds(px(0.)),
                             };
                             window.paint_quad(get_paint_path(bounds, rgb(0xffff00), DEFAULT_BORDER_WIDTH));
                         }
@@ -910,12 +924,12 @@ impl Element for CanvasElement {
                                     (
                                         r,
                                         Bounds::new(
-                                            Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                            Point::new(scale * px(r.x0), scale * px(-r.y1))
                                                 + offset
                                                 + inner.screen_bounds.origin,
                                             Size::new(
-                                                scale * Pixels(r.x1 - r.x0),
-                                                scale * Pixels(r.y1 - r.y0),
+                                                scale * px(r.x1 - r.x0),
+                                                scale * px(r.y1 - r.y0),
                                             ),
                                         ),
                                     )
@@ -1040,6 +1054,8 @@ impl Element for CanvasElement {
                                                         y1,
                                                         id: None,
                                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                border_styles: Edges::all(BorderStyle::Solid),
+
                                                     },
                                                     bounds,
                                                     scale,
@@ -1052,14 +1068,14 @@ impl Element for CanvasElement {
                                     }
                                     Some(DimEdge::X0) => {
                                         window.paint_quad(get_paint_path(
-                                            y_axis.select_bounds(Pixels(0.)),
+                                            y_axis.select_bounds(px(0.)),
                                             rgb(0xffff00),
                                             DEFAULT_BORDER_WIDTH,
                                         ));
                                     }
                                     Some(DimEdge::Y0) => {
                                         window.paint_quad(get_paint_path(
-                                            x_axis.select_bounds(Pixels(0.)),
+                                            x_axis.select_bounds(px(0.)),
                                             rgb(0xffff00),
                                             DEFAULT_BORDER_WIDTH,
                                         ));
@@ -1082,12 +1098,12 @@ impl Element for CanvasElement {
                                 .filter_map(|r| {
                                     r.id.as_ref().map(|_| {
                                         Bounds::new(
-                                            Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                            Point::new(scale * px(r.x0), scale * px(-r.y1))
                                                 + offset
                                                 + inner.screen_bounds.origin,
                                             Size::new(
-                                                scale * Pixels(r.x1 - r.x0),
-                                                scale * Pixels(r.y1 - r.y0),
+                                                scale * px(r.x1 - r.x0),
+                                                scale * px(r.y1 - r.y0),
                                             ),
                                         )
                                     })
@@ -1106,6 +1122,7 @@ impl Element for CanvasElement {
                                         Rgba { a: 0., ..rgb(0xffff00) },
                                         rgb(0xffff00),
                                         Edges::all(SELECT_WIDTH),
+                                Edges::all(BorderStyle::Solid),
                                     ));
                                     break;
                                 }
@@ -1177,7 +1194,7 @@ impl LayoutCanvas {
         LayoutCanvas {
             focus_handle,
             text_input_focus_handle,
-            offset: Point::new(Pixels(0.), Pixels(0.)),
+            offset: Point::new(px(0.), px(0.)),
             bg_style: Style {
                 size: Size {
                     width: Length::Definite(DefiniteLength::Fraction(1.)),
@@ -1212,21 +1229,19 @@ impl LayoutCanvas {
                     .as_ref()
             })
         {
-            let scalex = self.screen_bounds.size.width.0 / (bbox.x1 - bbox.x0) as f32;
-            let scaley = self.screen_bounds.size.height.0 / (bbox.y1 - bbox.y0) as f32;
-            self.scale = 0.9 * scalex.min(scaley);
+            let scalex = self.screen_bounds.size.width / (bbox.x1 - bbox.x0) as f32;
+            let scaley = self.screen_bounds.size.height / (bbox.y1 - bbox.y0) as f32;
+            self.scale = 0.9 * f32::from(scalex.min(scaley));
             self.offset = Point::new(
-                Pixels(
-                    (-(bbox.x0 + bbox.x1) as f32 * self.scale + self.screen_bounds.size.width.0)
-                        / 2.,
-                ),
-                Pixels(
-                    ((bbox.y1 + bbox.y0) as f32 * self.scale + self.screen_bounds.size.height.0)
-                        / 2.,
-                ),
+                px((-(bbox.x0 + bbox.x1) as f32 * self.scale
+                    + f32::from(self.screen_bounds.size.width))
+                    / 2.),
+                px(((bbox.y1 + bbox.y0) as f32 * self.scale
+                    + f32::from(self.screen_bounds.size.height))
+                    / 2.),
             );
         } else {
-            self.offset = Point::new(Pixels(0.), self.screen_bounds.size.height);
+            self.offset = Point::new(px(0.), self.screen_bounds.size.height);
         }
         cx.notify();
     }
@@ -1372,13 +1387,10 @@ impl LayoutCanvas {
                             (
                                 r,
                                 Bounds::new(
-                                    Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                    Point::new(scale * px(r.x0), scale * px(-r.y1))
                                         + offset
                                         + self.screen_bounds.origin,
-                                    Size::new(
-                                        scale * Pixels(r.x1 - r.x0),
-                                        scale * Pixels(r.y1 - r.y0),
-                                    ),
+                                    Size::new(scale * px(r.x1 - r.x0), scale * px(r.y1 - r.y0)),
                                 ),
                             )
                         }) {
@@ -1743,10 +1755,10 @@ impl LayoutCanvas {
                         .chain(self.scope_rects.iter())
                         .filter_map(|r| {
                             let rect_bounds = Bounds::new(
-                                Point::new(scale * Pixels(r.x0), scale * Pixels(-r.y1))
+                                Point::new(scale * px(r.x0), scale * px(-r.y1))
                                     + offset
                                     + self.screen_bounds.origin,
-                                Size::new(scale * Pixels(r.x1 - r.x0), scale * Pixels(r.y1 - r.y0)),
+                                Size::new(scale * px(r.x1 - r.x0), scale * px(r.y1 - r.y0)),
                             );
                             Some((r.id.as_ref()?, rect_bounds))
                         })
@@ -1791,14 +1803,14 @@ impl LayoutCanvas {
     }
 
     fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
-        Point::new(self.scale * Pixels(pt.x), self.scale * Pixels(-pt.y))
+        Point::new(self.scale * px(pt.x), self.scale * px(-pt.y))
             + self.offset
             + self.screen_bounds.origin
     }
 
     fn px_to_layout(&self, pt: Point<Pixels>) -> Point<f32> {
         let pt = pt - self.offset - self.screen_bounds.origin;
-        Point::new(pt.x.0 / self.scale, -pt.y.0 / self.scale)
+        Point::new(f32::from(pt.x / self.scale), f32::from(-pt.y / self.scale))
     }
 
     pub(crate) fn draw_rect(&mut self, _: &DrawRect, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1993,8 +2005,8 @@ impl LayoutCanvas {
             return;
         }
         let new_scale = {
-            let delta = event.delta.pixel_delta(Pixels(20.));
-            let ns = self.scale + delta.y.0 / 400.;
+            let delta = event.delta.pixel_delta(px(20.));
+            let ns = self.scale + f32::from(delta.y) / 400.;
             f32::clamp(ns, 0.01, 100.)
         };
 
