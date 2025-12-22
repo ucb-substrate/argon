@@ -1809,6 +1809,16 @@ pub struct Dimension<T> {
     pub span: Option<Span>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Text<T> {
+    pub id: ObjectId,
+    pub text: String,
+    pub layer: String,
+    pub x: T,
+    pub y: T,
+    pub span: Option<Span>,
+}
+
 type FrameId = u64;
 type ValueId = u64;
 pub type CellId = u64;
@@ -2293,6 +2303,14 @@ impl<'a> ExecPass<'a> {
                         span: rect.span.clone(),
                     })
                 }
+                Object::Text(text) => SolvedValue::Text(Text {
+                    id: text.id,
+                    text: text.text.clone(),
+                    layer: text.layer.clone(),
+                    x: state.solver.eval_expr(&text.x).unwrap(),
+                    y: state.solver.eval_expr(&text.y).unwrap(),
+                    span: text.span.clone(),
+                }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
                     p: state.solver.eval_expr(&dim.p).unwrap(),
@@ -2913,28 +2931,24 @@ impl<'a> ExecPass<'a> {
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
-                        let y = *args.pop().unwrap().as_ref().unwrap_bool();
-                        let x = *args.pop().unwrap().as_ref().unwrap_bool();
-                        let layer = *args.pop().unwrap().as_ref().unwrap_string();
-                        let text = *args.pop().unwrap().as_ref().unwrap_string();
-                        let dim = Dimension {
+                        let y = args.pop().unwrap().as_ref().unwrap_linear().clone();
+                        let x = args.pop().unwrap().as_ref().unwrap_linear().clone();
+                        let layer = args.pop().unwrap().as_ref().unwrap_string().clone();
+                        let text_val = args.pop().unwrap().as_ref().unwrap_string().clone();
+                        let text = Text {
                             id,
-                            horiz,
-                            nstop,
-                            pstop,
-                            coord,
-                            value,
-                            n,
-                            p,
-                            constraint,
+                            text: text_val,
+                            layer,
+                            x,
+                            y,
                             span: Some(span.clone()),
                         };
                         state.object_emit.push(ObjectEmit {
                             scope: vref.loc.scope,
-                            object: dim.id,
+                            object: text.id,
                             span,
                         });
-                        state.objects.insert(dim.id, dim.clone().into());
+                        state.objects.insert(text.id, text.clone().into());
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
@@ -3862,6 +3876,7 @@ pub struct SolvedInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Rect(Rect<(f64, LinearExpr)>),
+    Text(Text<f64>),
     Dimension(Dimension<f64>),
     Instance(SolvedInstance),
 }
@@ -3870,6 +3885,7 @@ pub enum SolvedValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Object {
     Rect(Rect<LinearExpr>),
+    Text(Text<LinearExpr>),
     Dimension(Dimension<LinearExpr>),
     Inst(Instance),
 }
@@ -3877,6 +3893,12 @@ pub enum Object {
 impl From<Rect<LinearExpr>> for Object {
     fn from(value: Rect<LinearExpr>) -> Self {
         Self::Rect(value)
+    }
+}
+
+impl From<Text<LinearExpr>> for Object {
+    fn from(value: Text<LinearExpr>) -> Self {
+        Self::Text(value)
     }
 }
 
@@ -3970,6 +3992,31 @@ pub fn bbox_union(b1: Option<Rect<f64>>, b2: Option<Rect<f64>>) -> Option<Rect<f
         }),
         (Some(r), None) | (None, Some(r)) => Some(r),
         (None, None) => None,
+    }
+}
+
+pub fn bbox_text_union(b: Option<Rect<f64>>, t: &Text<f64>) -> Option<Rect<f64>> {
+    match b {
+        Some(r) => Some(Rect {
+            layer: None,
+            x0: r.x0.min(t.x),
+            y0: r.y0.min(t.y),
+            x1: r.x1.max(t.x),
+            y1: r.y1.max(t.y),
+            id: r.id,
+            construction: true,
+            span: None,
+        }),
+        None => Some(Rect {
+            layer: None,
+            x0: t.x,
+            y0: t.y,
+            x1: t.x,
+            y1: t.y,
+            id: t.id,
+            construction: true,
+            span: None,
+        }),
     }
 }
 
