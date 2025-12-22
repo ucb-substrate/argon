@@ -19,7 +19,7 @@ mod tests {
     use approx::assert_relative_eq;
     use const_format::concatcp;
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::compile::{compile, CellArg, CompileInput};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -672,15 +672,24 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
+                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("{cells:#?}");
+
+        let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_text");
+        cells
+            .to_gds(
+                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                work_dir.join("layout.gds"),
+            )
+            .expect("Failed to write to GDS");
+
         let cells = cells.unwrap_valid();
         let cell = &cells.cells[&cells.top];
-        assert_eq!(cell.objects.len(), 1);
+        assert_eq!(cell.objects.len(), 2);
         let t = cell.objects.iter().find_map(|(_, v)| v.get_text()).unwrap();
-        assert_eq!(t.layer, "met1");
+        assert_eq!(t.layer, "met1.label");
         assert_eq!(t.text, "mytext");
         assert_relative_eq!(t.x, 0., epsilon = EPSILON);
         assert_relative_eq!(t.y, 10., epsilon = EPSILON);
