@@ -3,7 +3,6 @@
 //! Pass 1: import resolution
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::HashMap;
 use std::collections::{BinaryHeap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -1876,7 +1875,6 @@ struct ExecScope {
 struct FallbackConstraint {
     priority: i32,
     constraint: LinearExpr,
-    span: Span,
 }
 
 impl PartialEq for FallbackConstraint {
@@ -1912,7 +1910,6 @@ struct CellState {
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<LinearExpr>,
     unsolved_vars: Option<IndexSet<Var>>,
-    constraint_span_map: HashMap<ConstraintId, Span>,
 }
 
 struct ExecPass<'a> {
@@ -2143,7 +2140,6 @@ impl<'a> ExecPass<'a> {
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
-                        constraint_span_map: HashMap::new(),
                     }
                 )
                 .is_none()
@@ -2224,9 +2220,8 @@ impl<'a> ExecPass<'a> {
                 }
                 let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);
-                while let Some(FallbackConstraint {
-                    constraint, span, ..
-                }) = state.fallback_constraints.pop()
+                while let Some(FallbackConstraint { constraint, .. }) =
+                    state.fallback_constraints.pop()
                 {
                     if constraint
                         .coeffs
@@ -2235,7 +2230,6 @@ impl<'a> ExecPass<'a> {
                     {
                         state.fallback_constraints_used.push(constraint.clone());
                         let constraint_id = state.solver.constrain_eq0(constraint);
-                        state.constraint_span_map.insert(constraint_id, span);
                         constraint_added = true;
                         break;
                     }
@@ -2268,7 +2262,7 @@ impl<'a> ExecPass<'a> {
                 .clone()
                 .into_iter()
                 .map(|constraint| ExecError {
-                    span: state.constraint_span_map.get(&constraint).cloned(),
+                    span: state.solver.constraint_lookup.get(&constraint).cloned(),
                     cell: cell_id,
                     kind: ExecErrorKind::InconsistentConstraint(constraint),
                 })
@@ -2925,7 +2919,6 @@ impl<'a> ExecPass<'a> {
                                         rhs: *rhs,
                                         fallback: kwarg.name.name.ends_with('i'),
                                         priority,
-                                        span,
                                     }),
                                     loc: vref.loc,
                                 }),
@@ -3060,13 +3053,9 @@ impl<'a> ExecPass<'a> {
                             - vr.as_ref().unwrap_linear().clone();
                         let constraint = state.solver.constrain_eq0(expr);
 
-                        state.constraint_span_map.insert(
-                            constraint,
-                            Span {
-                                path: state.scopes[&vref.loc.scope].span.path.clone(),
-                                span: c.expr.span,
-                            },
-                        );
+                        state
+                            .constraint_span_map
+                            .insert(constraint, self.span.clone());
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
@@ -3292,7 +3281,6 @@ impl<'a> ExecPass<'a> {
                                         rhs: *rhs,
                                         fallback: kwarg.name.name.ends_with('i'),
                                         priority,
-                                        span,
                                     }),
                                     loc: vref.loc,
                                 }),
@@ -3724,11 +3712,9 @@ impl<'a> ExecPass<'a> {
                         state.fallback_constraints.push(FallbackConstraint {
                             priority: c.priority,
                             constraint: expr,
-                            span: c.span.clone(),
                         });
                     } else {
                         let constraint = state.solver.constrain_eq0(expr);
-                        state.constraint_span_map.insert(constraint, c.span.clone());
                     }
                     self.values.insert(vid, DeferValue::Ready(Value::Nil));
                     true
@@ -4298,7 +4284,6 @@ struct PartialConstraint {
     rhs: ValueId,
     fallback: bool,
     priority: i32,
-    span: Span,
 }
 
 #[derive(Debug, Clone)]
