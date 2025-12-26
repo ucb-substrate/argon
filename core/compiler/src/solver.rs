@@ -1,8 +1,10 @@
+use crate::ast::Span;
 use approx::relative_eq;
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 const EPSILON: f64 = 1e-8;
 const ROUND_STEP: f64 = 0.1;
@@ -18,6 +20,7 @@ pub struct Solver {
     constraints: Vec<SolverConstraint>,
     solved_vars: IndexMap<Var, f64>,
     inconsistent_constraints: IndexSet<ConstraintId>,
+    constraint_lookup: HashMap<ConstraintId, Span>,
 }
 
 pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
@@ -58,7 +61,7 @@ impl Solver {
             let v = (0..self.next_var)
                 .find(|&i| !self.solved_vars.contains_key(&Var(i)))
                 .unwrap();
-            self.constrain_eq0(LinearExpr::from(Var(v)));
+            self.constrain_eq0(LinearExpr::from(Var(v)), None);
             self.solve();
         }
     }
@@ -72,12 +75,19 @@ impl Solver {
         IndexSet::from_iter((0..self.next_var).map(Var).filter(|&v| !self.is_solved(v)))
     }
 
+    pub fn constraint_span(&self, id: ConstraintId) -> Option<Span> {
+        self.constraint_lookup.get(&id).cloned()
+    }
+
     /// Constrains the value of `expr` to 0.
     /// TODO: Check if added constraints conflict with existing solution.
-    pub fn constrain_eq0(&mut self, expr: LinearExpr) -> ConstraintId {
+    pub fn constrain_eq0(&mut self, expr: LinearExpr, span: Option<Span>) -> ConstraintId {
         let id = self.next_constraint;
         self.next_constraint += 1;
         let mut constraint = SolverConstraint { id, expr };
+        if let Some(s) = span {
+            self.constraint_lookup.insert(id, s);
+        }
         substitute_expr(&self.solved_vars, &mut constraint.expr);
         self.constraints.push(constraint);
         self.solve();
@@ -287,14 +297,20 @@ mod tests {
         let x = solver.new_var();
         let y = solver.new_var();
         let z = solver.new_var();
-        solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x)],
-            constant: -5.,
-        });
-        solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., y), (-1., x)],
-            constant: 0.,
-        });
+        solver.constrain_eq0(
+            LinearExpr {
+                coeffs: vec![(1., x)],
+                constant: -5.,
+            },
+            None,
+        );
+        solver.constrain_eq0(
+            LinearExpr {
+                coeffs: vec![(1., y), (-1., x)],
+                constant: 0.,
+            },
+            None,
+        );
         solver.solve();
         assert_relative_eq!(*solver.solved_vars.get(&x).unwrap(), 5., epsilon = EPSILON);
         assert_relative_eq!(*solver.solved_vars.get(&y).unwrap(), 5., epsilon = EPSILON);
