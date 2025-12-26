@@ -2229,7 +2229,7 @@ impl<'a> ExecPass<'a> {
                         .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
                     {
                         state.fallback_constraints_used.push(constraint.clone());
-                        let constraint_id = state.solver.constrain_eq0(constraint);
+                        state.solver.constrain_eq0(constraint, None);
                         constraint_added = true;
                         break;
                     }
@@ -2262,7 +2262,7 @@ impl<'a> ExecPass<'a> {
                 .clone()
                 .into_iter()
                 .map(|constraint| ExecError {
-                    span: state.solver.constraint_lookup.get(&constraint).cloned(),
+                    span: state.solver.constraint_span(constraint),
                     cell: cell_id,
                     kind: ExecErrorKind::InconsistentConstraint(constraint),
                 })
@@ -2844,6 +2844,7 @@ impl<'a> ExecPass<'a> {
                     if let Some(layer) = layer {
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
+
                         let state = self.cell_state_mut(vref.loc.cell);
                         let rect = Rect {
                             id,
@@ -2909,7 +2910,6 @@ impl<'a> ExecPass<'a> {
                                 }
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
-                            let span = self.span(&vref.loc, kwarg.span);
                             let defer = self.value_id();
                             self.values.insert(
                                 defer,
@@ -3051,11 +3051,9 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let expr = vl.as_ref().unwrap_linear().clone()
                             - vr.as_ref().unwrap_linear().clone();
-                        let constraint = state.solver.constrain_eq0(expr);
+                        let span = self.span(&vref.loc, c.expr.span);
+                        state.solver.constrain_eq0(expr, Some(span.clone()));
 
-                        state
-                            .constraint_span_map
-                            .insert(constraint, self.span.clone());
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
@@ -3127,7 +3125,7 @@ impl<'a> ExecPass<'a> {
                         let (nstop, pstop, coord, value, n, p) =
                             (arg(), arg(), arg(), arg(), arg(), arg());
                         let expr = p.clone() - n.clone() - value.clone();
-                        let constraint = state.solver.constrain_eq0(expr);
+                        let constraint = state.solver.constrain_eq0(expr, Some(span.clone()));
                         let dim = Dimension {
                             id,
                             horiz,
@@ -3140,7 +3138,6 @@ impl<'a> ExecPass<'a> {
                             constraint,
                             span: Some(span.clone()),
                         };
-                        state.constraint_span_map.insert(constraint, span.clone());
                         state.object_emit.push(ObjectEmit {
                             scope: vref.loc.scope,
                             object: dim.id,
@@ -3271,7 +3268,6 @@ impl<'a> ExecPass<'a> {
                                 }
                                 _ => continue,
                             };
-                            let span = self.span(&vref.loc, kwarg.span);
                             let defer = self.value_id();
                             self.values.insert(
                                 defer,
@@ -3714,7 +3710,7 @@ impl<'a> ExecPass<'a> {
                             constraint: expr,
                         });
                     } else {
-                        let constraint = state.solver.constrain_eq0(expr);
+                        state.solver.constrain_eq0(expr, None);
                     }
                     self.values.insert(vid, DeferValue::Ready(Value::Nil));
                     true

@@ -75,6 +75,10 @@ impl Solver {
         IndexSet::from_iter((0..self.next_var).map(Var).filter(|&v| !self.is_solved(v)))
     }
 
+    pub fn constraint_span(&self, id: ConstraintId) -> Option<Span> {
+        self.constraint_lookup.get(&id).cloned()
+    }
+
     /// Constrains the value of `expr` to 0.
     /// TODO: Check if added constraints conflict with existing solution.
     pub fn constrain_eq0(&mut self, expr: LinearExpr, span: Option<Span>) -> ConstraintId {
