@@ -3052,6 +3052,7 @@ impl<'a> ExecPass<'a> {
                         let expr = vl.as_ref().unwrap_linear().clone()
                             - vr.as_ref().unwrap_linear().clone();
                         let span = self.span(&vref.loc, c.expr.span);
+                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
                         state.solver.constrain_eq0(expr, Some(span.clone()));
 
                         self.values.insert(vid, Defer::Ready(Value::Nil));
