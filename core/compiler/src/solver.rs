@@ -61,7 +61,7 @@ impl Solver {
             let v = (0..self.next_var)
                 .find(|&i| !self.solved_vars.contains_key(&Var(i)))
                 .unwrap();
-            self.constrain_eq0(LinearExpr::from(Var(v)));
+            self.constrain_eq0(LinearExpr::from(Var(v)), None);
             self.solve();
         }
     }
@@ -77,11 +77,13 @@ impl Solver {
 
     /// Constrains the value of `expr` to 0.
     /// TODO: Check if added constraints conflict with existing solution.
-    pub fn constrain_eq0(&mut self, expr: LinearExpr, span: Span) -> ConstraintId {
+    pub fn constrain_eq0(&mut self, expr: LinearExpr, span: Option<Span>) -> ConstraintId {
         let id = self.next_constraint;
         self.next_constraint += 1;
         let mut constraint = SolverConstraint { id, expr };
-        self.constraint_lookup.insert(id, span);
+        if let Some(s) = span {
+            self.constraint_lookup.insert(id, s);
+        }
         substitute_expr(&self.solved_vars, &mut constraint.expr);
         self.constraints.push(constraint);
         self.solve();
