@@ -1,0 +1,8 @@
+fn pair<T>(x: T) -> [T] {
+    cons(x, cons(x, []))
+}
+
+cell top() {
+    let float_pair = pair(800.);
+    let r = rect("met1", x0=0., y0=200., x1=head(float_pair), y1=head(tail(float_pair)));
+}

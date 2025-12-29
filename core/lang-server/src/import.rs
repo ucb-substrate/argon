@@ -269,6 +269,13 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
+    fn dispatch_generic_decl(
+        &mut self,
+        _input: &compiler::ast::GenericDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::GenericDecl {
+    }
+
     fn dispatch_scope(
         &mut self,
         _input: &Scope<Substr, Self::InputMetadata>,

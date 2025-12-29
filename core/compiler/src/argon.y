@@ -170,23 +170,25 @@ CellDecl -> Result<CellDecl<&'input str, ParseMetadata>, ()>
   ;
 
 FnDecl -> Result<FnDecl<&'input str, ParseMetadata>, ()>
-  : 'FN' Ident '(' ArgDecls ')' '->' TySpec Scope
+  : 'FN' Ident BracketedGenericDecls '(' ArgDecls ')' '->' TySpec Scope
   {
     Ok(FnDecl {
       name: $2?,
-      args: $4?,
-      scope: $8?,
-      return_ty: Some($7?),
+      generics: $3?,
+      args: $5?,
+      scope: $9?,
+      return_ty: Some($8?),
       span: $span,
       metadata: (),
     })
   }
-  | 'FN' Ident '(' ArgDecls ')' Scope
+  | 'FN' Ident BracketedGenericDecls '(' ArgDecls ')' Scope
   {
     Ok(FnDecl {
       name: $2?,
-      args: $4?,
-      scope: $6?,
+      generics: $3?,
+      args: $5?,
+      scope: $7?,
       return_ty: None,
       span: $span,
       metadata: (),
@@ -394,6 +396,26 @@ ArgDecls1 -> Result<Vec<ArgDecl<&'input str, ParseMetadata>>, ()>
 
 ArgDecl -> Result<ArgDecl<&'input str, ParseMetadata>, ()>
   : Ident ':' TySpec { Ok(ArgDecl { name: $1?, ty: $3?, metadata: () }) }
+  ;
+
+BracketedGenericDecls -> Result<Vec<GenericDecl<&'input str, ParseMetadata>>, ()>
+  : { Ok(Vec::new()) }
+  | '<' GenericDecls '>' { $2 }
+  ;
+
+GenericDecls -> Result<Vec<GenericDecl<&'input str, ParseMetadata>>, ()>
+  : { Ok(Vec::new()) }
+  | GenericDecls1 { $1 }
+  | GenericDecls1 ',' { $1 }
+  ;
+
+GenericDecls1 -> Result<Vec<GenericDecl<&'input str, ParseMetadata>>, ()>
+  : GenericDecls1 ',' GenericDecl { flatten($1, $3) }
+  | GenericDecl { Ok(vec![$1?]) }
+  ;
+
+GenericDecl -> Result<GenericDecl<&'input str, ParseMetadata>, ()>
+  : Ident { Ok(GenericDecl { name: $1?, metadata: () }) }
   ;
 
 TySpec -> Result<TySpec<&'input str, ParseMetadata>, ()>

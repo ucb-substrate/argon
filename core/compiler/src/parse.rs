@@ -45,6 +45,7 @@ impl AstMetadata for ParseMetadata {
     type Args = ();
     type KwArgValue = ();
     type ArgDecl = ();
+    type GenericDecl = ();
     type Scope = ();
     type Typ = ();
     type FnDecl = ();

@@ -244,6 +244,14 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_generic_decl(
+        &mut self,
+        input: &super::GenericDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::GenericDecl {
+        input.metadata.clone()
+    }
+
     fn dispatch_scope(
         &mut self,
         input: &Scope<Self::InputS, Self::InputMetadata>,

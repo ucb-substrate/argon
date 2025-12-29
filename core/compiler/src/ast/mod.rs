@@ -135,6 +135,7 @@ pub struct TySpec<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct FnDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
+    pub generics: Vec<GenericDecl<S, T>>,
     pub args: Vec<ArgDecl<S, T>>,
     pub return_ty: Option<TySpec<S, T>>,
     pub scope: Scope<S, T>,
@@ -317,6 +318,12 @@ pub struct ArgDecl<S, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct GenericDecl<S, T: AstMetadata> {
+    pub name: Ident<S, T>,
+    pub metadata: T::GenericDecl,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct CastExpr<S, T: AstMetadata> {
     pub value: Expr<S, T>,
     pub ty: TySpec<S, T>,
@@ -383,6 +390,7 @@ pub trait AstMetadata {
     type Args: Debug + Clone + Serialize + DeserializeOwned;
     type KwArgValue: Debug + Clone + Serialize + DeserializeOwned;
     type ArgDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type GenericDecl: Debug + Clone + Serialize + DeserializeOwned;
     type Scope: Debug + Clone + Serialize + DeserializeOwned;
     type Typ: Debug + Clone + Serialize + DeserializeOwned;
     type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -507,6 +515,11 @@ pub trait AstTransformer {
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
         ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl;
+    fn dispatch_generic_decl(
+        &mut self,
+        input: &GenericDecl<Self::InputS, Self::InputMetadata>,
+        name: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::GenericDecl;
     fn dispatch_scope(
         &mut self,
         input: &Scope<Self::InputS, Self::InputMetadata>,
@@ -608,6 +621,11 @@ pub trait AstTransformer {
         input: &FnDecl<Self::InputS, Self::InputMetadata>,
     ) -> FnDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
+        let generics = input
+            .generics
+            .iter()
+            .map(|decl| self.transform_generic_decl(decl))
+            .collect_vec();
         let args = input
             .args
             .iter()
@@ -621,6 +639,7 @@ pub trait AstTransformer {
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
             name,
+            generics,
             args,
             return_ty,
             scope,
@@ -857,6 +876,15 @@ pub trait AstTransformer {
         let ty = self.transform_ty_spec(&input.ty);
         let metadata = self.dispatch_arg_decl(input, &name, &ty);
         ArgDecl { name, ty, metadata }
+    }
+
+    fn transform_generic_decl(
+        &mut self,
+        input: &GenericDecl<Self::InputS, Self::InputMetadata>,
+    ) -> GenericDecl<Self::OutputS, Self::OutputMetadata> {
+        let name = self.transform_ident(&input.name);
+        let metadata = self.dispatch_generic_decl(input, &name);
+        GenericDecl { name, metadata }
     }
 
     fn transform_scope(
