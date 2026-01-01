@@ -6,7 +6,7 @@ use std::{
 use canvas::{LayoutCanvas, ShapeFill};
 use compiler::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, ExecErrorKind, Rect, ScopeId,
-    SolvedValue, bbox_dim_union, bbox_union, ifmatvec,
+    SolvedValue, bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
 };
 use futures::StreamExt;
 use geometry::transform::TransformationMatrix;
@@ -193,6 +193,9 @@ impl EditorState {
                 SolvedValue::Dimension(dim) => {
                     bbox = bbox_dim_union(bbox, dim);
                 }
+                SolvedValue::Text(t) => {
+                    bbox = bbox_text_union(bbox, t);
+                }
             }
         }
 
@@ -373,11 +376,9 @@ impl Editor {
         cx.to_async()
             .spawn({
                 let editor = editor.clone();
-                async move |app| {
-                    loop {
-                        if let Some(exec) = rx.next().await {
-                            exec(&editor, app);
-                        }
+                async move |app| loop {
+                    if let Some(exec) = rx.next().await {
+                        exec(&editor, app);
                     }
                 }
             })

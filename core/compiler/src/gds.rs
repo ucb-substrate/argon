@@ -3,7 +3,7 @@ use std::{io::BufReader, ops::Deref, path::Path};
 use anyhow::{Result, anyhow};
 use gds21::{
     GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPoint, GdsStrans, GdsStruct,
-    GdsStructRef, GdsUnits,
+    GdsStructRef, GdsTextElem, GdsUnits,
 };
 use indexmap::IndexMap;
 use regex::Regex;
@@ -147,6 +147,21 @@ impl CompiledData {
                             ..Default::default()
                         }));
                     }
+                }
+                SolvedValue::Text(text) => {
+                    let GdsLayerSpec {
+                        layer,
+                        xtype: texttype,
+                    } = exporter.map[&text.layer];
+                    let x = text.x as i32;
+                    let y = text.y as i32;
+                    ocell.elems.push(GdsElement::GdsTextElem(GdsTextElem {
+                        string: text.text.clone(),
+                        layer,
+                        texttype,
+                        xy: GdsPoint::new(x, y),
+                        ..Default::default()
+                    }));
                 }
                 SolvedValue::Instance(i) => {
                     self.cell_to_gds(exporter, i.cell)?;
