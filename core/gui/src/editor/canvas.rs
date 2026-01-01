@@ -550,6 +550,7 @@ impl Element for CanvasElement {
                             ));
                         }
                         SolvedValue::Dimension(_) => {}
+                        SolvedValue::Text(_) => {}
                     }
                 }
                 for child in &scope_info.children {

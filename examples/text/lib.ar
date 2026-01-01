@@ -1,0 +1,4 @@
+cell top() {
+    rect("met1.drawing", x0=-100., y0=-100., x1=100., y1=100.);
+    text("mytext", "met1.label", 0., 10.);
+}

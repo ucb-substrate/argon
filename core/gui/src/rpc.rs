@@ -293,6 +293,7 @@ pub struct GuiServer {
 
 impl Gui for GuiServer {
     async fn open_cell(mut self, _: context::Context, cell: CompileOutput, update: bool) {
+        error!("received open cell");
         self.to_exec
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
