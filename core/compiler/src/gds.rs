@@ -32,6 +32,10 @@ impl GdsExporter {
             names: Names::new(),
         }
     }
+
+    fn coord_to_gds(&self, coord: f64) -> i32 {
+        (coord * 1e-9 / self.lib.units.db_unit()) as i32
+    }
 }
 
 impl FromIterator<(String, GdsLayerSpec)> for GdsMap {
@@ -127,10 +131,10 @@ impl CompiledData {
                             layer,
                             xtype: datatype,
                         } = exporter.map[layer];
-                        let x0 = (rect.x0.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
-                        let x1 = (rect.x1.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
-                        let y0 = (rect.y0.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
-                        let y1 = (rect.y1.0 * 1e-9 / exporter.lib.units.db_unit()) as i32;
+                        let x0 = exporter.coord_to_gds(rect.x0.0);
+                        let x1 = exporter.coord_to_gds(rect.x1.0);
+                        let y0 = exporter.coord_to_gds(rect.y0.0);
+                        let y1 = exporter.coord_to_gds(rect.y1.0);
                         ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                             layer,
                             datatype,
@@ -148,7 +152,7 @@ impl CompiledData {
                     self.cell_to_gds(exporter, i.cell)?;
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
                         name: exporter.names.name(&i.cell).unwrap().to_string(),
-                        xy: GdsPoint::new(i.x as i32, i.y as i32),
+                        xy: GdsPoint::new(exporter.coord_to_gds(i.x), exporter.coord_to_gds(i.y)),
                         strans: Some(GdsStrans {
                             reflected: i.reflect,
                             abs_mag: false,
