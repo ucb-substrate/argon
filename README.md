@@ -58,7 +58,7 @@ vim.cmd([[autocmd BufRead,BufNewFile *.ar setfiletype argon]])
 To open an example Argon workspace, run the following from the root directory of your Argon clone:
 
 ```
-vim pdks/sky130/lib.ar
+nvim pdks/sky130/lib.ar
 ```
 
 Start the GUI by running `:Argon gui`.

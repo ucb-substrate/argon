@@ -134,7 +134,7 @@ impl StateMut {
                 .unwrap_or_else(|| {
                     PathBuf::from(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../../core/compiler/examples/lyp/basic.lyp"
+                        "/../../pdks/sky130/sky130.lyp"
                     ))
                 });
             let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
