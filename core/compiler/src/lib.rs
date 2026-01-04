@@ -19,7 +19,7 @@ mod tests {
     use approx::assert_relative_eq;
     use const_format::concatcp;
 
-    use crate::compile::{compile, CellArg, CompileInput};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -55,6 +55,7 @@ mod tests {
     const ARGON_WORKSPACE: &str = concatcp!(EXAMPLES_DIR, "/argon_workspace/lib.ar");
     const ARGON_EXTERNAL_MODS: &str = concatcp!(EXAMPLES_DIR, "/external_mods/main_crate/lib.ar");
     const ARGON_TEXT: &str = concatcp!(EXAMPLES_DIR, "/text/lib.ar");
+    const ARGON_ANY_TYPE_INST: &str = concatcp!(EXAMPLES_DIR, "/any_type_inst/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -693,5 +694,25 @@ mod tests {
         assert_eq!(t.text, "mytext");
         assert_relative_eq!(t.x, 0., epsilon = EPSILON);
         assert_relative_eq!(t.y, 10., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_any_type_inst() {
+        let o = parse_workspace_with_std(ARGON_ANY_TYPE_INST);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(SKY130_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 2);
     }
 }

@@ -477,6 +477,10 @@ pub enum Ty {
     /// Suppresses type checking of dependent properties.
     #[default]
     Unknown,
+    /// Catch-all any type.
+    ///
+    /// Should eventually be removed.
+    Any,
     Bool,
     Float,
     Int,
@@ -498,6 +502,7 @@ impl Ty {
         match name {
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
+            "Any" => Some(Ty::Any),
             "Int" => Some(Ty::Int),
             "String" => Some(Ty::String),
             "()" => Some(Ty::Nil),
@@ -728,7 +733,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if *found != *expected {
+        if *found != *expected && !(*found == Ty::Any || *expected == Ty::Any) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
@@ -740,7 +745,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Cell(_)) {
+        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
@@ -752,7 +757,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Enum(_)) {
+        if !matches!(ty, Ty::Enum(_) | Ty::Any) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
