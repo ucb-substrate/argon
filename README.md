@@ -34,7 +34,18 @@ Future versions of Argon will hopefully support:
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
 - One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
+- [SuiteSparse](https://github.com/DrTimothyAldenDavis/SuiteSparse)
 
+### SuiteSparse Installation
+#### macOS
+If you use Homebrew, all you need is 
+```bash 
+brew install suitesparse
+```
+#### Windows/Linux
+In this case, you will need to download SuiteSparse manually; you can use something like ``` conda ``` or ```vcpkg```. Then, locate the folder that contains the ```.h``` files, such as ```cholmod.h```, and the folder containing the ```.lib``` files (```.so``` or ```.a``` on Linux). Set the environment variables ```SUITESPARSE_INCLUDE_DIR``` and ```SUITESPARSE_LIB_DIR``` to the two paths you obtained from before, respectively.
+
+### Argon Installation
 Begin by cloning and compiling the Argon source code:
 
 ```bash
@@ -42,7 +53,6 @@ git clone https://github.com/ucb-substrate/argon.git
 cd argon
 cargo b --release
 ```
-
 ### Neovim
 
 Add the following to your Neovim Lua configuration:
