@@ -5,10 +5,12 @@ pub mod gds;
 pub mod layer;
 pub mod parse;
 pub mod solver;
+pub mod spqr;
 
 #[cfg(test)]
 mod tests {
 
+    use gds21::GdsUnits;
     use std::path::PathBuf;
 
     use crate::{
@@ -19,7 +21,7 @@ mod tests {
     use approx::assert_relative_eq;
     use const_format::concatcp;
 
-    use crate::compile::{compile, CellArg, CompileInput};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -439,6 +441,7 @@ mod tests {
         cells
             .to_gds(
                 GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
                 work_dir.join("layout.gds"),
             )
             .expect("Failed to write to GDS");
@@ -681,6 +684,7 @@ mod tests {
         cells
             .to_gds(
                 GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
                 work_dir.join("layout.gds"),
             )
             .expect("Failed to write to GDS");
