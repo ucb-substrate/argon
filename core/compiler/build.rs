@@ -35,7 +35,15 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
 
-    println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+    println!("cargo:rerun-if-env-changed=SUITESPARSE_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=SUITESPARSE_LIB_DIR");
+
+    let include_dir =
+        env::var("SUITESPARSE_INCLUDE_DIR").unwrap_or_else(|_| "/opt/homebrew/include".to_string());
+    let lib_dir =
+        env::var("SUITESPARSE_LIB_DIR").unwrap_or_else(|_| "/opt/homebrew/lib".to_string());
+
+    println!("cargo:rustc-link-search=native={}", lib_dir);
     println!("cargo:rustc-link-lib=spqr");
     println!("cargo:rustc-link-lib=cholmod");
     println!("cargo:rustc-link-lib=suitesparseconfig");
@@ -44,10 +52,10 @@ fn main() {
     println!("cargo:rustc-link-lib=ccolamd");
     println!("cargo:rustc-link-lib=camd");
 
-    // Generate bindings
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_arg("-I/opt/homebrew/include")
+        .clang_arg(format!("-I{}", include_dir))
+        .clang_arg(format!("-I{}/suitesparse", include_dir))
         .wrap_unsafe_ops(true)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("SuiteSparseQR_C_QR")
