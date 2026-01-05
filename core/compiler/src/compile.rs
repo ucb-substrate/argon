@@ -17,8 +17,9 @@ use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue,
-    MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
+    BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, IndexExpr,
+    KwArgValue, MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr,
+    WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -274,6 +275,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _base: &Expr<Self::OutputS, Self::OutputMetadata>,
         _field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
+    }
+
+    fn dispatch_index_expr(
+        &mut self,
+        _input: &crate::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _index: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
     }
 
     fn dispatch_call_expr(
@@ -572,6 +581,7 @@ impl AstMetadata for VarIdTyMetadata {
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
+    type IndexExpr = Ty;
     type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
     type Args = ();
@@ -732,6 +742,14 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
+    fn cannot_index<M: AstMetadata>(&mut self, base: &Expr<Substr, M>, ty: Ty) -> Ty {
+        self.errors.push(StaticError {
+            span: self.span(base.span()),
+            kind: StaticErrorKind::CannotIndex { ty },
+        });
+        Ty::Unknown
+    }
+
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
         if *found != *expected && !(*found == Ty::Any || *expected == Ty::Any) {
             self.errors.push(StaticError {
@@ -883,6 +901,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
             Expr::SeqNil(_) => Ty::SeqNil,
             Expr::FloatLiteral(_) => Ty::Float,
@@ -1406,6 +1425,23 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             _ => self.no_field_on_ty(field, base_ty.clone()),
+        }
+    }
+
+    fn dispatch_index_expr(
+        &mut self,
+        _input: &crate::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
+        base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        index: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
+        let base_ty = base.ty();
+        self.assert_eq_ty(index.span(), &index.ty(), &Ty::Int);
+        match base_ty {
+            Ty::Seq(s) => (*s).clone(),
+            // Propagate any and unknown types without throwing an error.
+            Ty::Any => Ty::Any,
+            Ty::Unknown => Ty::Unknown,
+            _ => self.cannot_index(base, base_ty.clone()),
         }
     }
 
@@ -2784,6 +2820,14 @@ impl<'a> ExecPass<'a> {
                     state: FieldAccessExprState { base },
                 }))
             }
+            Expr::Index(i) => {
+                let base = self.visit_expr(loc, &i.base);
+                let index = self.visit_expr(loc, &i.index);
+                PartialEvalState::Index(Box::new(PartialIndexExpr {
+                    expr: (**i).clone(),
+                    state: IndexExprState { base, index },
+                }))
+            }
             Expr::BinOp(b) => {
                 let lhs = self.visit_expr(loc, &b.left);
                 let rhs = self.visit_expr(loc, &b.right);
@@ -3785,6 +3829,46 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::Index(index_expr) => {
+                if let Defer::Ready(base) = &self.values[&index_expr.state.base]
+                    && let Defer::Ready(index) = &self.values[&index_expr.state.index]
+                {
+                    if let ValueRef::Seq(s) = base.as_ref() {
+                        if let ValueRef::Int(i) = index.as_ref() {
+                            if let Some(v) = usize::try_from(*i).ok().and_then(|i| s.get(i)) {
+                                self.values.insert(vid, DeferValue::Ready(v.clone()));
+                                true
+                            } else {
+                                let span = self.span(&vref.loc, index_expr.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: vref.loc.cell,
+                                    kind: ExecErrorKind::IndexOutOfBounds,
+                                });
+                                return Err(());
+                            }
+                        } else {
+                            let span = self.span(&vref.loc, index_expr.expr.index.span());
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: vref.loc.cell,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
+                    } else {
+                        let span = self.span(&vref.loc, index_expr.expr.base.span());
+                        self.errors.push(ExecError {
+                            span: Some(span),
+                            cell: vref.loc.cell,
+                            kind: ExecErrorKind::InvalidType,
+                        });
+                        return Err(());
+                    }
+                } else {
+                    false
+                }
+            }
             PartialEvalState::Constraint(c) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
                     (&self.values[&c.lhs], &self.values[&c.rhs])
@@ -4230,6 +4314,9 @@ pub enum StaticErrorKind {
     /// No field on object of the given type.
     #[error("no field {field} on type {ty:?}")]
     NoFieldOnTy { field: String, ty: Ty },
+    /// Cannot index the given type.
+    #[error("type {ty:?} cannot be indexed")]
+    CannotIndex { ty: Ty },
     /// Incorrect type.
     #[error("expected type {expected:?}, found {found:?}")]
     IncorrectTy { expected: Ty, found: Ty },
@@ -4307,6 +4394,9 @@ pub enum ExecErrorKind {
     /// Operation on an incompatible type, usually due to erroneous use of `Any`.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,
+    /// Index out of bounds.
+    #[error("index out of bounds")]
+    IndexOutOfBounds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4360,6 +4450,7 @@ enum PartialEvalState<T: AstMetadata> {
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
+    Index(Box<PartialIndexExpr<T>>),
     Constraint(PartialConstraint),
     Cast(PartialCast),
 }
@@ -4449,8 +4540,20 @@ struct PartialFieldAccessExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialIndexExpr<T: AstMetadata> {
+    expr: IndexExpr<Substr, T>,
+    state: IndexExprState,
+}
+
+#[derive(Debug, Clone)]
 pub struct FieldAccessExprState {
     base: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexExprState {
+    base: ValueId,
+    index: ValueId,
 }
 
 pub fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
