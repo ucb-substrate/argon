@@ -15,21 +15,10 @@ pub struct Var(u64);
 pub struct Solver {
     next_var: u64,
     next_constraint: ConstraintId,
-    constraints: Vec<SolverConstraint>,
+    constraints: IndexMap<ConstraintId, LinearExpr>,
+    var_to_constraints: IndexMap<Var, IndexSet<ConstraintId>>,
     solved_vars: IndexMap<Var, f64>,
     inconsistent_constraints: IndexSet<ConstraintId>,
-}
-
-pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
-    let (l, r): (Vec<f64>, Vec<_>) = expr.coeffs.iter().partition_map(|a @ (coeff, var)| {
-        if let Some(s) = table.get(var) {
-            Either::Left(coeff * s)
-        } else {
-            Either::Right(*a)
-        }
-    });
-    expr.coeffs = r;
-    expr.constant += l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
 }
 
 fn round(x: f64) -> f64 {
@@ -77,11 +66,53 @@ impl Solver {
     pub fn constrain_eq0(&mut self, expr: LinearExpr) -> ConstraintId {
         let id = self.next_constraint;
         self.next_constraint += 1;
-        let mut constraint = SolverConstraint { id, expr };
-        substitute_expr(&self.solved_vars, &mut constraint.expr);
-        self.constraints.push(constraint);
-        self.solve();
+        for (_, var) in &expr.coeffs {
+            self.var_to_constraints
+                .entry(*var)
+                .or_insert(IndexSet::new())
+                .insert(id);
+        }
+        self.constraints.insert(id, expr);
+        self.try_back_substitute(id);
         id
+    }
+
+    // Tries to back substitute using the given [`ConstraintId`].
+    pub fn try_back_substitute(&mut self, constraint_id: ConstraintId) {
+        // If coefficient length is not 1, do nothing.
+        if let Some(constraint) = self.constraints.get_mut(&constraint_id) {
+            constraint.simplify(&self.solved_vars);
+            if constraint.coeffs.is_empty() && !relative_eq!(constraint.constant, 0.) {
+                self.inconsistent_constraints.insert(constraint_id);
+                self.constraints.swap_remove(&constraint_id);
+                return;
+            }
+            if constraint.coeffs.len() != 1 {
+                return;
+            }
+            // If constraint solves a variable, insert it into the solved vars and traverse all
+            // constraints involving the variable.
+            let (coeff, var) = constraint.coeffs[0];
+            let val = -constraint.constant / coeff;
+            if let Some(old_val) = self.solved_vars.get(&var) {
+                if !relative_eq!(*old_val, val, epsilon = EPSILON) {
+                    self.inconsistent_constraints.insert(constraint_id);
+                }
+            } else {
+                self.solved_vars.insert(var, val);
+            }
+            self.constraints.swap_remove(&constraint_id);
+            for constraint in self
+                .var_to_constraints
+                .get(&var)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect_vec()
+            {
+                self.try_back_substitute(constraint);
+            }
+        }
     }
 
     /// Solves for as many variables as possible and substitutes their values into existing constraints.
@@ -94,13 +125,11 @@ impl Solver {
         let a = DMatrix::from_row_iterator(
             self.constraints.len(),
             n_vars,
-            self.constraints
-                .iter()
-                .flat_map(|c| c.expr.coeff_vec(n_vars)),
+            self.constraints.values().flat_map(|c| c.coeff_vec(n_vars)),
         );
         let b = DVector::from_iterator(
             self.constraints.len(),
-            self.constraints.iter().map(|c| -c.expr.constant),
+            self.constraints.values().map(|c| -c.constant),
         );
 
         let svd = a.clone().svd(true, true);
@@ -121,16 +150,16 @@ impl Solver {
                 self.solved_vars.insert(Var(i), val);
             }
         }
-        for constraint in self.constraints.iter_mut() {
-            substitute_expr(&self.solved_vars, &mut constraint.expr);
-            if constraint.expr.coeffs.is_empty()
-                && approx::relative_ne!(constraint.expr.constant, 0., epsilon = EPSILON)
+        for (id, constraint) in self.constraints.iter_mut() {
+            constraint.simplify(&self.solved_vars);
+            if constraint.coeffs.is_empty()
+                && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
-                self.inconsistent_constraints.insert(constraint.id);
+                self.inconsistent_constraints.insert(*id);
             }
         }
         self.constraints
-            .retain(|constraint| !constraint.expr.coeffs.is_empty());
+            .retain(|_, constraint| !constraint.coeffs.is_empty());
     }
 
     pub fn value_of(&self, var: Var) -> Option<f64> {
@@ -155,12 +184,6 @@ impl Solver {
 pub type ConstraintId = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
-pub struct SolverConstraint {
-    pub id: ConstraintId,
-    pub expr: LinearExpr,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
 pub struct LinearExpr {
     pub coeffs: Vec<(f64, Var)>,
     pub constant: f64,
@@ -177,6 +200,22 @@ impl LinearExpr {
 
     pub fn add(lhs: impl Into<LinearExpr>, rhs: impl Into<LinearExpr>) -> Self {
         lhs.into() + rhs.into()
+    }
+
+    /// Substitutes variables in `table` and removes entries with coefficient 0.
+    pub fn simplify(&mut self, table: &IndexMap<Var, f64>) {
+        let (l, r): (Vec<f64>, Vec<_>) = self.coeffs.iter().partition_map(|a @ (coeff, var)| {
+            if relative_eq!(*coeff, 0., epsilon = EPSILON) {
+                return Either::Left(0.);
+            }
+            if let Some(s) = table.get(var) {
+                Either::Left(coeff * s)
+            } else {
+                Either::Right(*a)
+            }
+        });
+        self.coeffs = r;
+        self.constant += l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
     }
 }
 
