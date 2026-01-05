@@ -18,6 +18,7 @@ mod tests {
     };
     use approx::assert_relative_eq;
     use const_format::concatcp;
+    use gds21::GdsUnits;
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
@@ -440,6 +441,7 @@ mod tests {
         cells
             .to_gds(
                 GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
                 work_dir.join("layout.gds"),
             )
             .expect("Failed to write to GDS");
@@ -507,7 +509,7 @@ mod tests {
         assert_eq!(cells.errors.len(), 1);
         assert!(matches!(
             cells.errors.first().unwrap().kind,
-            ExecErrorKind::InconsistentConstraint(_)
+            ExecErrorKind::InvalidRounding(_)
         ));
     }
 
@@ -682,6 +684,7 @@ mod tests {
         cells
             .to_gds(
                 GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
                 work_dir.join("layout.gds"),
             )
             .expect("Failed to write to GDS");
