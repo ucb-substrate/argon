@@ -1,6 +1,6 @@
 use std::{io::BufReader, ops::Deref, path::Path};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gds21::{
     GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPoint, GdsStrans, GdsStruct,
     GdsStructRef, GdsTextElem,

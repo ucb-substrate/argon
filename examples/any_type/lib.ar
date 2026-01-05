@@ -1,0 +1,20 @@
+
+cell bot() {
+    let met1 = rect("met1", x0=0., y0=0., x1=100., y1=500.);
+}
+
+fn getx(inst_: Any) -> Float {
+    inst_.x
+}
+
+fn double(cell_: Any) -> [Any] {
+    let i1 = inst(cell_, x=0., y=0.);
+    let i2 = inst(cell_, x=getx(i1) + 200., y=0.);
+    cons(i1, cons(i2, []))
+}
+
+cell top() {
+    let bot_cell = bot();
+    let arr = double(bot_cell);
+    head(tail(arr)).met1!;
+}
