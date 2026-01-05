@@ -2269,6 +2269,18 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
+        for var in self
+            .cell_state_mut(cell_id)
+            .solver
+            .invalid_rounding()
+            .clone()
+        {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidRounding(var),
+            });
+        }
 
         self.partial_cells
             .pop_back()
@@ -4217,6 +4229,9 @@ pub enum ExecErrorKind {
     /// Inconsistent constraint.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
+    /// Invalid rounding (e.g. solved value is not sufficiently close to a rounding step).
+    #[error("invalid rounding")]
+    InvalidRounding(Var),
     /// A cell or instance had an empty bounding box.
     #[error("empty bbox")]
     EmptyBbox,

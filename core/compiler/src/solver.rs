@@ -1,4 +1,4 @@
-use approx::relative_eq;
+use approx::{relative_eq, relative_ne};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use nalgebra::{DMatrix, DVector};
@@ -19,6 +19,7 @@ pub struct Solver {
     var_to_constraints: IndexMap<Var, IndexSet<ConstraintId>>,
     solved_vars: IndexMap<Var, f64>,
     inconsistent_constraints: IndexSet<ConstraintId>,
+    invalid_rounding: IndexSet<Var>,
 }
 
 fn round(x: f64) -> f64 {
@@ -55,6 +56,11 @@ impl Solver {
     #[inline]
     pub fn inconsistent_constraints(&self) -> &IndexSet<ConstraintId> {
         &self.inconsistent_constraints
+    }
+
+    #[inline]
+    pub fn invalid_rounding(&self) -> &IndexSet<Var> {
+        &self.invalid_rounding
     }
 
     pub fn unsolved_vars(&self) -> IndexSet<Var> {
@@ -95,11 +101,15 @@ impl Solver {
             let (coeff, var) = constraint.coeffs[0];
             let val = -constraint.constant / coeff;
             if let Some(old_val) = self.solved_vars.get(&var) {
-                if !relative_eq!(*old_val, val, epsilon = EPSILON) {
+                if relative_ne!(*old_val, val, epsilon = EPSILON) {
                     self.inconsistent_constraints.insert(constraint_id);
                 }
             } else {
-                self.solved_vars.insert(var, val);
+                let rounded_val = round(val);
+                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
+                    self.invalid_rounding.insert(var);
+                }
+                self.solved_vars.insert(var, rounded_val);
             }
             self.constraints.swap_remove(&constraint_id);
             for constraint in self
@@ -146,8 +156,7 @@ impl Solver {
             if !self.solved_vars.contains_key(&Var(i))
                 && relative_eq!(recons, 1., epsilon = EPSILON)
             {
-                let val = round(sol[(i as usize, 0)]);
-                self.solved_vars.insert(Var(i), val);
+                self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
             }
         }
         for (id, constraint) in self.constraints.iter_mut() {
@@ -156,6 +165,16 @@ impl Solver {
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
                 self.inconsistent_constraints.insert(*id);
+            }
+        }
+        for i in 0..self.next_var {
+            if let Some(val) = self.solved_vars.get_mut(&Var(i)) {
+                let rounded_val = round(*val);
+                if relative_ne!(*val, rounded_val, epsilon = EPSILON) {
+                    self.invalid_rounding.insert(Var(i));
+                } else {
+                    *val = rounded_val;
+                }
             }
         }
         self.constraints
