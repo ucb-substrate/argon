@@ -40,6 +40,7 @@ impl AstMetadata for ParseMetadata {
     type UnaryOpExpr = ();
     type ComparisonExpr = ();
     type FieldAccessExpr = ();
+    type IndexExpr = ();
     type CallExpr = ();
     type EmitExpr = ();
     type Args = ();

@@ -346,6 +346,7 @@ SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
   : '(' Expr ')' { $2 }
   | CallExpr { Ok(Expr::Call($1?)) }
   | SubFactor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
+  | SubFactor '[' Expr ']' { Ok(Expr::Index(Box::new(IndexExpr { base: $1?, index: $3?, span: $span, metadata: () }))) }
   | SubFactor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
   | IdentPath { Ok(Expr::IdentPath($1?)) }
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }

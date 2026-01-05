@@ -20,7 +20,7 @@ mod tests {
     use const_format::concatcp;
     use gds21::GdsUnits;
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::compile::{compile, CellArg, CompileInput};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -57,6 +57,7 @@ mod tests {
     const ARGON_EXTERNAL_MODS: &str = concatcp!(EXAMPLES_DIR, "/external_mods/main_crate/lib.ar");
     const ARGON_TEXT: &str = concatcp!(EXAMPLES_DIR, "/text/lib.ar");
     const ARGON_ANY_TYPE: &str = concatcp!(EXAMPLES_DIR, "/any_type/lib.ar");
+    const ARGON_SEQ_INDEX: &str = concatcp!(EXAMPLES_DIR, "/seq_index/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -702,6 +703,33 @@ mod tests {
     #[test]
     fn argon_any_type_inst() {
         let o = parse_workspace_with_std(ARGON_ANY_TYPE);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 3);
+
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 200., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 300., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 500., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_seq_index() {
+        let o = parse_workspace_with_std(ARGON_SEQ_INDEX);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
         let cells = compile(
