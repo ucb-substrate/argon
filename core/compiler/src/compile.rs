@@ -2258,7 +2258,7 @@ impl<'a> ExecPass<'a> {
             if require_progress && !progress {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
-                    state.unsolved_vars = Some(state.solver.unsolved_vars());
+                    state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
                     self.errors.push(ExecError {
                         span: None,
                         cell: cell_id,

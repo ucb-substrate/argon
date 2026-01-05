@@ -1,7 +1,7 @@
 use approx::{relative_eq, relative_ne};
 use indexmap::{IndexMap, IndexSet};
-use itertools::{Either, Itertools};
-use nalgebra::{DMatrix, DVector};
+use itertools::{Either, Itertools, multiunzip};
+use nalgebra::{CsMatrix, DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 
 const EPSILON: f64 = 1e-8;
@@ -17,7 +17,9 @@ pub struct Solver {
     next_constraint: ConstraintId,
     constraints: IndexMap<ConstraintId, LinearExpr>,
     var_to_constraints: IndexMap<Var, IndexSet<ConstraintId>>,
+    // Solved and unsolved vars are separate to reduce overhead of many solved variables.
     solved_vars: IndexMap<Var, f64>,
+    unsolved_vars: IndexSet<Var>,
     inconsistent_constraints: IndexSet<ConstraintId>,
     invalid_rounding: IndexSet<Var>,
 }
@@ -33,22 +35,21 @@ impl Solver {
 
     pub fn new_var(&mut self) -> Var {
         let var = Var(self.next_var);
+        self.unsolved_vars.insert(var);
         self.next_var += 1;
         var
     }
 
     /// Returns true if all variables have been solved.
     pub fn fully_solved(&self) -> bool {
-        self.solved_vars.len() == self.next_var as usize
+        self.unsolved_vars.is_empty()
     }
 
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
             // Find any unsolved variable and constrain it to equal 0.
-            let v = (0..self.next_var)
-                .find(|&i| !self.solved_vars.contains_key(&Var(i)))
-                .unwrap();
-            self.constrain_eq0(LinearExpr::from(Var(v)));
+            let v = self.unsolved_vars.first().unwrap();
+            self.constrain_eq0(LinearExpr::from(*v));
             self.solve();
         }
     }
@@ -63,8 +64,13 @@ impl Solver {
         &self.invalid_rounding
     }
 
-    pub fn unsolved_vars(&self) -> IndexSet<Var> {
-        IndexSet::from_iter((0..self.next_var).map(Var).filter(|&v| !self.is_solved(v)))
+    pub fn unsolved_vars(&self) -> &IndexSet<Var> {
+        &self.unsolved_vars
+    }
+
+    pub fn solve_var(&mut self, var: Var, val: f64) {
+        self.solved_vars.insert(var, val);
+        self.unsolved_vars.swap_remove(&var);
     }
 
     /// Constrains the value of `expr` to 0.
@@ -109,7 +115,7 @@ impl Solver {
                 if relative_ne!(val, rounded_val, epsilon = EPSILON) {
                     self.invalid_rounding.insert(var);
                 }
-                self.solved_vars.insert(var, rounded_val);
+                self.solve_var(var, rounded_val);
             }
             self.constraints.swap_remove(&constraint_id);
             for constraint in self
@@ -127,16 +133,29 @@ impl Solver {
 
     /// Solves for as many variables as possible and substitutes their values into existing constraints.
     /// Deletes constraints that no longer contain unsolved variables.
+    ///
+    /// Constraints should be simplified before this function is invoked.
     pub fn solve(&mut self) {
-        let n_vars = self.next_var as usize;
+        // Snapshot unsolved variables before solving.
+        let unsolved_vars = self.unsolved_vars.clone();
+        let n_vars = unsolved_vars.len();
         if n_vars == 0 || self.constraints.is_empty() {
             return;
         }
-        let a = DMatrix::from_row_iterator(
+        let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
+            multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
+                expr.coeffs.iter().map({
+                    let unsolved_vars = &unsolved_vars;
+                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
+                })
+            }));
+        let a = DMatrix::from(CsMatrix::from_triplet(
             self.constraints.len(),
             n_vars,
-            self.constraints.values().flat_map(|c| c.coeff_vec(n_vars)),
-        );
+            &i,
+            &j,
+            &val,
+        ));
         let b = DVector::from_iterator(
             self.constraints.len(),
             self.constraints.values().map(|c| -c.constant),
@@ -151,12 +170,11 @@ impl Solver {
         let vt_recons = vt.rows(0, r);
         let sol = svd.solve(&b, EPSILON).unwrap();
 
-        for i in 0..self.next_var {
-            let recons = (vt_recons.transpose() * vt_recons.column(i as usize))[((i as usize), 0)];
-            if !self.solved_vars.contains_key(&Var(i))
-                && relative_eq!(recons, 1., epsilon = EPSILON)
-            {
-                self.solved_vars.insert(Var(i), sol[(i as usize, 0)]);
+        for var in &unsolved_vars {
+            let i = unsolved_vars.get_index_of(var).unwrap();
+            let recons = (vt_recons.transpose() * vt_recons.column(i))[(i, 0)];
+            if relative_eq!(recons, 1., epsilon = EPSILON) {
+                self.solve_var(*var, sol[(i, 0)]);
             }
         }
         for (id, constraint) in self.constraints.iter_mut() {
@@ -209,14 +227,6 @@ pub struct LinearExpr {
 }
 
 impl LinearExpr {
-    pub fn coeff_vec(&self, n_vars: usize) -> Vec<f64> {
-        let mut out = vec![0.; n_vars];
-        for (val, var) in &self.coeffs {
-            out[var.0 as usize] += *val;
-        }
-        out
-    }
-
     pub fn add(lhs: impl Into<LinearExpr>, rhs: impl Into<LinearExpr>) -> Self {
         lhs.into() + rhs.into()
     }
@@ -357,5 +367,8 @@ mod tests {
         assert_relative_eq!(*solver.solved_vars.get(&x).unwrap(), 5., epsilon = EPSILON);
         assert_relative_eq!(*solver.solved_vars.get(&y).unwrap(), 5., epsilon = EPSILON);
         assert!(!solver.solved_vars.contains_key(&z));
+        assert!(!solver.unsolved_vars.contains(&x));
+        assert!(!solver.unsolved_vars.contains(&y));
+        assert!(solver.unsolved_vars.contains(&z));
     }
 }
