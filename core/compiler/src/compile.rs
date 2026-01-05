@@ -509,10 +509,11 @@ pub enum Ty {
 impl Ty {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "Bool" => Some(Ty::Bool),
+            "Int" => Some(Ty::Int),
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
             "Any" => Some(Ty::Any),
-            "Int" => Some(Ty::Int),
             "String" => Some(Ty::String),
             "()" => Some(Ty::Nil),
             "[]" => Some(Ty::SeqNil),
