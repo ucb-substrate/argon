@@ -33,7 +33,8 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 11] = [
+pub const BUILTINS: [&str; 12] = [
+    "list",
     "cons",
     "head",
     "tail",
@@ -523,20 +524,20 @@ impl Ty {
 
     /// Computes the least upper bound (LUB) of self and other.
     /// For use in type promotion.
-    pub fn lub(&self, other: &Self) -> Option<Self> {
+    pub fn lub(&self, other: &Self) -> Self {
         match (self, other) {
             // Unknown promotes to any type.
-            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
+            (Ty::Unknown, other) | (other, Ty::Unknown) => other.clone(),
+            // At least one Any results in Any.
+            (Ty::Any, _) | (_, Ty::Any) => Ty::Any,
             // SeqNil promotes to any sequence type.
-            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => {
-                Some(Ty::Seq(inner.clone()))
-            }
-            // No other types promote.
+            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => Ty::Seq(inner.clone()),
+            // Mismatched types promote to any.
             (a, b) => {
                 if a == b {
-                    Some(a.clone())
+                    a.clone()
                 } else {
-                    None
+                    Ty::Any
                 }
             }
         }
@@ -1212,16 +1213,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
-        let lub_ty = then_ty.lub(&else_ty);
-        if let Some(lub_ty) = lub_ty {
-            lub_ty
-        } else {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BranchesDifferentTypes,
-            });
-            then_ty
-        }
+        then_ty.lub(&else_ty)
     }
 
     fn dispatch_match_expr(
@@ -1251,14 +1243,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
 
                 if let Some(ref inner) = lub_ty {
-                    if let Some(lub) = inner.lub(&arm.expr.ty()) {
-                        lub_ty = Some(lub);
-                    } else {
-                        self.errors.push(StaticError {
-                            span: self.span(arm.expr.span()),
-                            kind: StaticErrorKind::BranchesDifferentTypes,
-                        });
-                    }
+                    lub_ty = Some(inner.lub(&arm.expr.ty()));
                 } else {
                     lub_ty = Some(arm.expr.ty());
                 }
@@ -1339,65 +1324,57 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let left_ty = left.ty();
         let right_ty = right.ty();
         let lub_ty = left_ty.lub(&right_ty);
-        if let Some(lub_ty) = lub_ty {
-            if left_ty == Ty::Float
-                && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::FloatEquality,
-                });
-            }
-            if matches!(left_ty, Ty::Enum(_))
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::EnumsNotOrd,
-                });
-            }
-            if matches!(left_ty, Ty::Nil)
-                && matches!(right_ty, Ty::Nil)
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::NilNotOrd,
-                });
-            }
-            if matches!(left_ty, Ty::SeqNil)
-                && matches!(right_ty, Ty::SeqNil)
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::SeqNilNotOrd,
-                });
-            }
-            if matches!(lub_ty, Ty::Seq(_))
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-                && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::SeqMustCompareEqSeqNil,
-                });
-            }
-            if !matches!(
-                left_ty,
-                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
-            ) {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::ComparisonInvalidType,
-                });
-            }
-        } else {
+        if left_ty == Ty::Float && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne) {
             self.errors.push(StaticError {
                 span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
+                kind: StaticErrorKind::FloatEquality,
             });
         }
+        if matches!(left_ty, Ty::Enum(_))
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::EnumsNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::Nil)
+            && matches!(right_ty, Ty::Nil)
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::NilNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::SeqNil)
+            && matches!(right_ty, Ty::SeqNil)
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::SeqNilNotOrd,
+            });
+        }
+        if matches!(lub_ty, Ty::Seq(_))
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+            });
+        }
+        if !matches!(
+            left_ty,
+            Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+        ) {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::ComparisonInvalidType,
+            });
+        }
+
         Ty::Bool
     }
 
@@ -1528,6 +1505,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         (None, seqty)
                     } else {
                         (None, Ty::SeqNil)
+                    }
+                }
+                "list" => {
+                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    if args.posargs.is_empty() {
+                        self.errors.push(StaticError {
+                            span: self.span(input.span),
+                            kind: StaticErrorKind::EmptyListConstructor,
+                        });
+                        (None, Ty::Nil)
+                    } else {
+                        let elem_ty = args
+                            .posargs
+                            .iter()
+                            .map(Expr::ty)
+                            .reduce(|acc, e| acc.lub(&e))
+                            .unwrap();
+                        (None, Ty::Seq(Box::new(elem_ty)))
                     }
                 }
                 "head" => {
@@ -2844,7 +2839,12 @@ impl<'a> ExecPass<'a> {
             Expr::BinOp(b) => {
                 let lhs = self.visit_expr(loc, &b.left);
                 let rhs = self.visit_expr(loc, &b.right);
-                PartialEvalState::BinOp(PartialBinOp { lhs, rhs, op: b.op })
+                PartialEvalState::BinOp(PartialBinOp {
+                    lhs,
+                    rhs,
+                    op: b.op,
+                    expr: b.clone(),
+                })
             }
             Expr::UnaryOp(u) => {
                 let operand = self.visit_expr(loc, &u.operand);
@@ -3179,6 +3179,23 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                "list" => {
+                    let vals = c
+                        .state
+                        .posargs
+                        .iter()
+                        .map(|v| self.values[v].get_ready())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(vals) = vals {
+                        self.values.insert(
+                            vid,
+                            Defer::Ready(Value::Seq(vals.iter().map(|v| (*v).clone()).collect())),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                }
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
@@ -3473,7 +3490,15 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
                         }
-                        _ => todo!(),
+                        _ => {
+                            let span = self.span(&vref.loc, bin_op.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span.clone()),
+                                cell: vref.loc.cell,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
                     }
                 } else {
                     false
@@ -4336,6 +4361,9 @@ pub enum StaticErrorKind {
     /// Incorrect type category.
     #[error("expected type category {expected}, found {found:?}")]
     IncorrectTyCategory { found: Ty, expected: String },
+    /// Empty list constructor.
+    #[error("list constructors cannot be empty (use `[]` for an empty list)")]
+    EmptyListConstructor,
     /// Called a function or cell with the wrong number of positional arguments.
     #[error("expected {expected} position arguments, found {found}")]
     CallIncorrectPositionalArity { expected: usize, found: usize },
@@ -4462,7 +4490,7 @@ enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
     Match(Box<PartialMatchExpr<T>>),
     Comparison(Box<PartialComparisonExpr<T>>),
-    BinOp(PartialBinOp),
+    BinOp(PartialBinOp<T>),
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
@@ -4487,10 +4515,11 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBinOp {
+struct PartialBinOp<T: AstMetadata> {
     lhs: ValueId,
     rhs: ValueId,
     op: BinOp,
+    expr: Box<BinOpExpr<Substr, T>>,
 }
 
 #[derive(Debug, Clone)]
