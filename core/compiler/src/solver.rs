@@ -20,6 +20,7 @@ pub struct Solver {
     // Solved and unsolved vars are separate to reduce overhead of many solved variables.
     solved_vars: IndexMap<Var, f64>,
     unsolved_vars: IndexSet<Var>,
+    back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
     invalid_rounding: IndexSet<Var>,
 }
@@ -85,18 +86,24 @@ impl Solver {
                 .insert(id);
         }
         self.constraints.insert(id, expr);
-        self.try_back_substitute(id);
+        // Use explicit stack in heap-allocated vector to avoid stack overflow.
+        self.back_substitute_stack.push(id);
+        while !self.back_substitute_stack.is_empty() {
+            self.try_back_substitute();
+        }
         id
     }
 
     // Tries to back substitute using the given [`ConstraintId`].
-    pub fn try_back_substitute(&mut self, constraint_id: ConstraintId) {
+    pub fn try_back_substitute(&mut self) {
         // If coefficient length is not 1, do nothing.
-        if let Some(constraint) = self.constraints.get_mut(&constraint_id) {
+        if let Some(id) = self.back_substitute_stack.pop()
+            && let Some(constraint) = self.constraints.get_mut(&id)
+        {
             constraint.simplify(&self.solved_vars);
             if constraint.coeffs.is_empty() && !relative_eq!(constraint.constant, 0.) {
-                self.inconsistent_constraints.insert(constraint_id);
-                self.constraints.swap_remove(&constraint_id);
+                self.inconsistent_constraints.insert(id);
+                self.constraints.swap_remove(&id);
                 return;
             }
             if constraint.coeffs.len() != 1 {
@@ -108,7 +115,7 @@ impl Solver {
             let val = -constraint.constant / coeff;
             if let Some(old_val) = self.solved_vars.get(&var) {
                 if relative_ne!(*old_val, val, epsilon = EPSILON) {
-                    self.inconsistent_constraints.insert(constraint_id);
+                    self.inconsistent_constraints.insert(id);
                 }
             } else {
                 let rounded_val = round(val);
@@ -117,7 +124,7 @@ impl Solver {
                 }
                 self.solve_var(var, rounded_val);
             }
-            self.constraints.swap_remove(&constraint_id);
+            self.constraints.swap_remove(&id);
             for constraint in self
                 .var_to_constraints
                 .get(&var)
@@ -126,7 +133,7 @@ impl Solver {
                 .copied()
                 .collect_vec()
             {
-                self.try_back_substitute(constraint);
+                self.back_substitute_stack.push(constraint);
             }
         }
     }
