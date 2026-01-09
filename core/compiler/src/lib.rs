@@ -5,7 +5,8 @@ pub mod gds;
 pub mod layer;
 pub mod parse;
 pub mod solver;
-pub mod spqr;
+//pub mod spqr;
+pub mod spqr_eigen;
 
 #[cfg(test)]
 mod tests {

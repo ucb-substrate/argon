@@ -14,7 +14,8 @@ const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
-use crate::spqr::SpqrFactorization;
+//use crate::spqr::SpqrFactorization;
+use crate::spqr_eigen::SpqrFactorization;
 
 #[derive(Clone, Default)]
 pub struct Solver {
@@ -167,6 +168,8 @@ impl Solver {
 
         let x = qr.solve(&b).unwrap();
 
+        //println!("BOR WE'RE HERE \n");
+
         let residual = &b - &a_sparse * &x;
 
         let tolerance = 1e-10;
@@ -178,12 +181,11 @@ impl Solver {
             }
         }
 
-        let ones_vector: DVector<f64> = DVector::from_element(n - rank, 1.0);
-        let null_space_components = qr.get_nspace_sparse().unwrap() * ones_vector;
+        let null_space_mags = qr.get_free_indices().unwrap();
 
         let par_solved_vars: HashMap<Var, f64> = (0..n)
             .into_par_iter()
-            .filter(|&i| null_space_components[i] < tolerance)
+            .filter(|&i| null_space_mags[i] < tolerance)
             .map(|i| {
                 let actual_val = x[(i, 0)];
                 let actual_var = rev_var_map[i];
@@ -192,6 +194,7 @@ impl Solver {
             .collect();
 
         self.solved_vars.extend(par_solved_vars);
+
 
         for constraint in self.constraints.iter_mut() {
             substitute_expr(&self.solved_vars, &mut constraint.expr);
