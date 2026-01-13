@@ -1778,6 +1778,21 @@ pub enum CellArg {
     Seq(Vec<CellArg>),
 }
 
+impl CellArg {
+    pub fn from_value(val: &Value, solver: &Solver) -> Option<Self> {
+        match val {
+            Value::Linear(v) => solver.eval_expr(v).map(CellArg::Float),
+            Value::Int(i) => Some(CellArg::Int(*i)),
+            Value::Seq(s) => s
+                .iter()
+                .map(|v| Self::from_value(v, solver))
+                .collect::<Option<Vec<_>>>()
+                .map(CellArg::Seq),
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
     /// Full path to cell.
@@ -2241,7 +2256,7 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 state.deferred.pop()
             } {
-                progress = self.eval_partial(vid)? || progress;
+                progress = self.eval_partial(cell_id, vid)? || progress;
             }
 
             let state = self.cell_state_mut(cell_id);
@@ -2874,41 +2889,21 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
-    pub fn cell_args_from_value(
-        &mut self,
-        cell_id: CellId,
-        vid: ValueId,
-        val: &Value,
-    ) -> Option<CellArg> {
-        match val {
-            Value::Linear(v) => {
-                if let Some(v) = self.cell_state(cell_id).solver.eval_expr(v) {
-                    Some(CellArg::Float(v))
-                } else {
-                    for (_, var) in v.coeffs.clone() {
-                        self.add_var_dependent(var, vid);
-                    }
-                    None
-                }
-            }
-            Value::Int(i) => Some(CellArg::Int(*i)),
-            Value::Seq(s) => s
-                .iter()
-                .map(|v| self.cell_args_from_value(cell_id, vid, v))
-                .collect::<Option<Vec<_>>>()
-                .map(CellArg::Seq),
-            _ => unreachable!(),
-        }
-    }
-
-    fn eval_partial(&mut self, vid: ValueId) -> Result<bool, ()> {
+    fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
         let v = self.values.get(&vid);
         if v.is_none() {
             return Ok(false);
         }
         let vref = v.as_ref().unwrap();
         let mut vref = match &vref {
-            Defer::Ready(_) => return Ok(true),
+            Defer::Ready(_) => {
+                if let Some(deps) = self.value_dependents.get(&vid) {
+                    for dep_vid in deps.clone() {
+                        self.cell_state_mut(cell_id).deferred.insert(dep_vid);
+                    }
+                }
+                return Ok(true);
+            }
             Defer::Deferred(v) => v.clone(),
         };
         let cell_id = vref.loc.cell;
@@ -3472,8 +3467,7 @@ impl<'a> ExecPass<'a> {
                     let (arg_vals, unready): (Vec<_>, Vec<_>) =
                         c.state.posargs.iter().partition_map(|arg_vid| {
                             if let Defer::Ready(v) = self.values[arg_vid].clone() {
-                                if let Some(arg) = self.cell_args_from_value(cell_id, *arg_vid, &v)
-                                {
+                                if let Some(arg) = CellArg::from_value(&v, &state.solver) {
                                     Either::Left(arg)
                                 } else {
                                     Either::Right(*arg_vid)
