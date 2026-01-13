@@ -33,9 +33,10 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 12] = [
+pub const BUILTINS: [&str; 13] = [
     "list",
     "cons",
+    "array2",
     "head",
     "tail",
     "crect",
@@ -1503,6 +1504,22 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             });
                         }
                         (None, seqty)
+                    } else {
+                        (None, Ty::SeqNil)
+                    }
+                }
+                "array2" => {
+                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_posargs(
+                        input.span,
+                        &args.posargs,
+                        &[Ty::Any, Ty::Int, Ty::Int, Ty::Float, Ty::Float],
+                    );
+                    if args.posargs.len() == 5 {
+                        (
+                            None,
+                            Ty::Seq(Box::new(Ty::Seq(Box::new(args.posargs[0].ty())))),
+                        )
                     } else {
                         (None, Ty::SeqNil)
                     }
@@ -3150,6 +3167,54 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "cons" => {
+                    if let (Defer::Ready(head), Defer::Ready(tail)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let val = match tail {
+                            Value::SeqNil => {
+                                vec![head.clone()]
+                            }
+                            Value::Seq(s) => {
+                                let mut s = s.clone();
+                                s.insert(0, head.clone());
+                                s
+                            }
+                            _ => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: vref.loc.cell,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
+                        };
+                        self.values.insert(vid, Defer::Ready(Value::Seq(val)));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                "array2" => {
+                    let args = c
+                        .state
+                        .posargs
+                        .iter()
+                        .map(|vid| self.values[vid].get_ready())
+                        .collect::<Option<Vec<_>>>();
+                    if let Some(mut args) = args {
+                        assert_eq!(args.len(), 5);
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let dy = args.pop().unwrap().as_ref().unwrap_linear().clone();
+                        let dx = args.pop().unwrap().as_ref().unwrap_linear().clone();
+                        let ny = args.pop().unwrap().as_ref().unwrap_int().clone();
+                        let nx = args.pop().unwrap().as_ref().unwrap_int().clone();
+
+                        let obj = args.pop().unwrap().as_ref();
+                        let text_val = args.pop().unwrap().as_ref().unwrap_string().clone();
+                    }
                     if let (Defer::Ready(head), Defer::Ready(tail)) = (
                         &self.values[&c.state.posargs[0]],
                         &self.values[&c.state.posargs[1]],
