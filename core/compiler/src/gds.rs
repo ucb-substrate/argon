@@ -1,10 +1,11 @@
 use std::{io::BufReader, ops::Deref, path::Path};
 
-use anyhow::{Result, anyhow};
-use gds21::{
+use ::gds::{
     GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPoint, GdsStrans, GdsStruct,
     GdsStructRef, GdsTextElem, GdsUnits,
 };
+use anyhow::{Result, anyhow};
+use arcstr::ArcStr;
 use indexmap::IndexMap;
 use regex::Regex;
 use tracing::trace;
@@ -23,7 +24,7 @@ struct GdsExporter {
 }
 
 impl GdsExporter {
-    fn new(name: impl Into<String>, map: GdsMap, units: GdsUnits) -> Self {
+    fn new(name: impl Into<ArcStr>, map: GdsMap, units: GdsUnits) -> Self {
         let mut lib = GdsLibrary::new(name);
         lib.units = units;
         Self {
@@ -156,7 +157,7 @@ impl CompiledData {
                     let x = text.x as i32;
                     let y = text.y as i32;
                     ocell.elems.push(GdsElement::GdsTextElem(GdsTextElem {
-                        string: text.text.clone(),
+                        string: ArcStr::from(&text.text),
                         layer,
                         texttype,
                         xy: GdsPoint::new(x, y),
@@ -166,7 +167,7 @@ impl CompiledData {
                 SolvedValue::Instance(i) => {
                     self.cell_to_gds(exporter, i.cell)?;
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
-                        name: exporter.names.name(&i.cell).unwrap().to_string(),
+                        name: exporter.names.name(&i.cell).unwrap().clone(),
                         xy: GdsPoint::new(exporter.coord_to_gds(i.x), exporter.coord_to_gds(i.y)),
                         strans: Some(GdsStrans {
                             reflected: i.reflect,

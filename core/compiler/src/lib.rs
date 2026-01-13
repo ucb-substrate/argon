@@ -16,9 +16,9 @@ mod tests {
         gds::GdsMap,
         parse::parse_workspace_with_std,
     };
+    use ::gds::GdsUnits;
     use approx::assert_relative_eq;
     use const_format::concatcp;
-    use gds21::GdsUnits;
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
