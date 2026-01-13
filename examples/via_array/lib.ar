@@ -10,8 +10,8 @@ cell vias() {
     eq(via.y0, 0.);
     let intersection = #scope0 std::intersection(met1, met2);
     let via_array = #scope1 std::max_array(via, intersection.w, intersection.h, 20., 20.);
-    eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
-    eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
+    eq(via_array.x0 - intersection.x0, 0.);
+    eq(via_array.y0 - intersection.y0, 0.);
 
     // Constrain metals.
     eq(met2.x0, 0.);

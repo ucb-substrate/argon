@@ -20,6 +20,7 @@ pub struct Solver {
     // Solved and unsolved vars are separate to reduce overhead of many solved variables.
     solved_vars: IndexMap<Var, f64>,
     unsolved_vars: IndexSet<Var>,
+    updated_vars: IndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
     invalid_rounding: IndexSet<Var>,
@@ -61,6 +62,16 @@ impl Solver {
     }
 
     #[inline]
+    pub fn updated_vars(&self) -> &IndexSet<Var> {
+        &self.updated_vars
+    }
+
+    #[inline]
+    pub fn clear_updated_vars(&mut self) {
+        self.updated_vars.clear()
+    }
+
+    #[inline]
     pub fn invalid_rounding(&self) -> &IndexSet<Var> {
         &self.invalid_rounding
     }
@@ -71,6 +82,7 @@ impl Solver {
 
     pub fn solve_var(&mut self, var: Var, val: f64) {
         self.solved_vars.insert(var, val);
+        self.updated_vars.insert(var);
         self.unsolved_vars.swap_remove(&var);
     }
 
