@@ -1778,21 +1778,6 @@ pub enum CellArg {
     Seq(Vec<CellArg>),
 }
 
-impl CellArg {
-    pub fn from_value(val: &Value, solver: &Solver) -> Option<Self> {
-        match val {
-            Value::Linear(v) => solver.eval_expr(v).map(CellArg::Float),
-            Value::Int(i) => Some(CellArg::Int(*i)),
-            Value::Seq(s) => s
-                .iter()
-                .map(|v| Self::from_value(v, solver))
-                .collect::<Option<Vec<_>>>()
-                .map(CellArg::Seq),
-            _ => unreachable!(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
     /// Full path to cell.
@@ -1948,6 +1933,7 @@ struct CellState {
     fallback_constraints_used: Vec<LinearExpr>,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
+    var_dependents: IndexMap<Var, IndexSet<ValueId>>,
 }
 
 struct ExecPass<'a> {
@@ -1955,7 +1941,6 @@ struct ExecPass<'a> {
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
     value_dependents: IndexMap<ValueId, IndexSet<ValueId>>,
-    var_dependents: IndexMap<Var, IndexSet<ValueId>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
     seq_nil_value: ValueId,
@@ -2015,7 +2000,6 @@ impl<'a> ExecPass<'a> {
                 (4, DeferValue::Ready(Value::SeqNil)),
             ]),
             value_dependents: IndexMap::new(),
-            var_dependents: IndexMap::new(),
             frames: IndexMap::from_iter([(
                 5,
                 Frame {
@@ -2191,6 +2175,7 @@ impl<'a> ExecPass<'a> {
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
                         constraint_span_map: IndexMap::new(),
+                        var_dependents: IndexMap::new(),
                     }
                 )
                 .is_none()
@@ -2264,9 +2249,8 @@ impl<'a> ExecPass<'a> {
             state.solver.solve();
             progress = !state.solver.updated_vars().is_empty() || progress;
             for var in state.solver.updated_vars().clone() {
-                if let Some(deps) = self.var_dependents.get(&var) {
+                if let Some(deps) = state.var_dependents.get(&var) {
                     for dep in deps.clone() {
-                        let state = self.cell_state_mut(cell_id);
                         state.deferred.insert(dep);
                     }
                 }
@@ -2882,11 +2866,39 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
-    fn add_var_dependent(&mut self, var: Var, dependent: ValueId) {
-        self.var_dependents
+    fn add_var_dependent(&mut self, cell_id: CellId, var: Var, dependent: ValueId) {
+        self.cell_state_mut(cell_id)
+            .var_dependents
             .entry(var)
             .or_default()
             .insert(dependent);
+    }
+
+    pub fn cell_arg_from_value(
+        &mut self,
+        cell_id: CellId,
+        dependent_vid: ValueId,
+        val: &Value,
+    ) -> Option<CellArg> {
+        match val {
+            Value::Linear(v) => {
+                if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr(v) {
+                    Some(CellArg::Float(f))
+                } else {
+                    for (_, var) in v.coeffs.clone() {
+                        self.add_var_dependent(cell_id, var, dependent_vid);
+                    }
+                    None
+                }
+            }
+            Value::Int(i) => Some(CellArg::Int(*i)),
+            Value::Seq(s) => s
+                .iter()
+                .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
+                .collect::<Option<Vec<_>>>()
+                .map(CellArg::Seq),
+            _ => unreachable!(),
+        }
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -3467,7 +3479,7 @@ impl<'a> ExecPass<'a> {
                     let (arg_vals, unready): (Vec<_>, Vec<_>) =
                         c.state.posargs.iter().partition_map(|arg_vid| {
                             if let Defer::Ready(v) = self.values[arg_vid].clone() {
-                                if let Some(arg) = CellArg::from_value(&v, &state.solver) {
+                                if let Some(arg) = self.cell_arg_from_value(cell_id, *arg_vid, &v) {
                                     Either::Left(arg)
                                 } else {
                                     Either::Right(*arg_vid)
@@ -3518,7 +3530,7 @@ impl<'a> ExecPass<'a> {
                                         for (_, var) in
                                             vl.coeffs.clone().into_iter().chain(vr.coeffs.clone())
                                         {
-                                            self.add_var_dependent(var, vid);
+                                            self.add_var_dependent(cell_id, var, vid);
                                         }
                                     }
                                     res
@@ -3528,7 +3540,7 @@ impl<'a> ExecPass<'a> {
                                         state.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs);
                                     if res.is_none() {
                                         for (_, var) in vr.coeffs.clone() {
-                                            self.add_var_dependent(var, vid);
+                                            self.add_var_dependent(cell_id, var, vid);
                                         }
                                     }
                                     res
@@ -3747,7 +3759,7 @@ impl<'a> ExecPass<'a> {
                                 for (_, var) in
                                     vl.coeffs.clone().into_iter().chain(vr.coeffs.clone())
                                 {
-                                    self.add_var_dependent(var, vid);
+                                    self.add_var_dependent(cell_id, var, vid);
                                 }
                                 false
                             }
@@ -3852,11 +3864,11 @@ impl<'a> ExecPass<'a> {
                                 "y" => Some(Value::Linear(inst.y.clone())),
                                 field => {
                                     if let Defer::Ready(cell) = &self.values[&inst.cell] {
-                                        let cell_id = *cell.as_ref().unwrap_cell();
+                                        let inst_cell_id = *cell.as_ref().unwrap_cell();
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
-                                        let cell = &self.compiled_cells[&cell_id];
+                                        let cell = &self.compiled_cells[&inst_cell_id];
                                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                                         let obj_id = &mut self.next_id;
                                         Some(Value::from_array(cell.field(field).unwrap().map(
@@ -4030,7 +4042,7 @@ impl<'a> ExecPass<'a> {
                                 .map(|val| Value::Int(val as i64));
                             if res.is_none() {
                                 for (_, var) in expr.coeffs.clone() {
-                                    self.add_var_dependent(var, vid);
+                                    self.add_var_dependent(cell_id, var, vid);
                                 }
                             }
                             res

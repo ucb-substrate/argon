@@ -81,8 +81,10 @@ impl Solver {
     }
 
     pub fn solve_var(&mut self, var: Var, val: f64) {
-        self.solved_vars.insert(var, val);
-        self.updated_vars.insert(var);
+        let old = self.solved_vars.insert(var, val);
+        if old.is_none() {
+            self.updated_vars.insert(var);
+        }
         self.unsolved_vars.swap_remove(&var);
     }
 
@@ -113,7 +115,9 @@ impl Solver {
             && let Some(constraint) = self.constraints.get_mut(&id)
         {
             constraint.simplify(&self.solved_vars);
-            if constraint.coeffs.is_empty() && !relative_eq!(constraint.constant, 0.) {
+            if constraint.coeffs.is_empty()
+                && !relative_eq!(constraint.constant, 0., epsilon = EPSILON)
+            {
                 self.inconsistent_constraints.insert(id);
                 self.constraints.swap_remove(&id);
                 return;
@@ -179,7 +183,6 @@ impl Solver {
             self.constraints.len(),
             self.constraints.values().map(|c| -c.constant),
         );
-
         let svd = a.clone().svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let r = svd.rank(EPSILON);
