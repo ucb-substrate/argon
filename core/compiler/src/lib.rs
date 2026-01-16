@@ -434,7 +434,7 @@ mod tests {
                 lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
-        println!("cells: {cells:?}");
+        // println!("cells: {cells:?}");
 
         assert!(cells.is_valid());
 
