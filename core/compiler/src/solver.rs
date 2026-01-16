@@ -81,7 +81,6 @@ impl Solver {
     }
 
     pub fn solve_var(&mut self, var: Var, val: f64) {
-        println!("{val}");
         let old = self.solved_vars.insert(var, val);
         if old.is_none() {
             self.updated_vars.insert(var);
@@ -119,7 +118,6 @@ impl Solver {
             if constraint.coeffs.is_empty()
                 && !relative_eq!(constraint.constant, 0., epsilon = EPSILON)
             {
-                println!("invalid constraint inconsistency");
                 self.inconsistent_constraints.insert(id);
                 self.constraints.swap_remove(&id);
                 return;
@@ -133,13 +131,11 @@ impl Solver {
             let val = -constraint.constant / coeff;
             if let Some(old_val) = self.solved_vars.get(&var) {
                 if relative_ne!(*old_val, val, epsilon = EPSILON) {
-                    println!("backsub inconsistency");
                     self.inconsistent_constraints.insert(id);
                 }
             } else {
                 let rounded_val = round(val);
                 if relative_ne!(val, rounded_val, epsilon = EPSILON) {
-                    println!("invalid rounding");
                     self.invalid_rounding.insert(var);
                 }
                 self.solve_var(var, rounded_val);
@@ -163,7 +159,6 @@ impl Solver {
     ///
     /// Constraints should be simplified before this function is invoked.
     pub fn solve(&mut self) {
-        println!("solve");
         // Snapshot unsolved variables before solving.
         let unsolved_vars = self.unsolved_vars.clone();
         let n_vars = unsolved_vars.len();
@@ -184,7 +179,6 @@ impl Solver {
             &j,
             &val,
         ));
-        println!("{} {}", self.constraints.len(), n_vars);
         let b = DVector::from_iterator(
             self.constraints.len(),
             self.constraints.values().map(|c| -c.constant),
@@ -215,7 +209,6 @@ impl Solver {
             if constraint.coeffs.is_empty()
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
-                println!("svd inconsistency");
                 self.inconsistent_constraints.insert(*id);
             }
         }
