@@ -20,6 +20,7 @@ pub struct Solver {
     // Solved and unsolved vars are separate to reduce overhead of many solved variables.
     solved_vars: IndexMap<Var, f64>,
     unsolved_vars: IndexSet<Var>,
+    updated_vars: IndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
     invalid_rounding: IndexSet<Var>,
@@ -61,6 +62,16 @@ impl Solver {
     }
 
     #[inline]
+    pub fn updated_vars(&self) -> &IndexSet<Var> {
+        &self.updated_vars
+    }
+
+    #[inline]
+    pub fn clear_updated_vars(&mut self) {
+        self.updated_vars.clear()
+    }
+
+    #[inline]
     pub fn invalid_rounding(&self) -> &IndexSet<Var> {
         &self.invalid_rounding
     }
@@ -70,7 +81,10 @@ impl Solver {
     }
 
     pub fn solve_var(&mut self, var: Var, val: f64) {
-        self.solved_vars.insert(var, val);
+        let old = self.solved_vars.insert(var, val);
+        if old.is_none() {
+            self.updated_vars.insert(var);
+        }
         self.unsolved_vars.swap_remove(&var);
     }
 
@@ -101,7 +115,9 @@ impl Solver {
             && let Some(constraint) = self.constraints.get_mut(&id)
         {
             constraint.simplify(&self.solved_vars);
-            if constraint.coeffs.is_empty() && !relative_eq!(constraint.constant, 0.) {
+            if constraint.coeffs.is_empty()
+                && !relative_eq!(constraint.constant, 0., epsilon = EPSILON)
+            {
                 self.inconsistent_constraints.insert(id);
                 self.constraints.swap_remove(&id);
                 return;
@@ -167,7 +183,6 @@ impl Solver {
             self.constraints.len(),
             self.constraints.values().map(|c| -c.constant),
         );
-
         let svd = a.clone().svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let r = svd.rank(EPSILON);
@@ -181,7 +196,12 @@ impl Solver {
             let i = unsolved_vars.get_index_of(var).unwrap();
             let recons = (vt_recons.transpose() * vt_recons.column(i))[(i, 0)];
             if relative_eq!(recons, 1., epsilon = EPSILON) {
-                self.solve_var(*var, sol[(i, 0)]);
+                let val = sol[(i, 0)];
+                let rounded_val = round(val);
+                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
+                    self.invalid_rounding.insert(*var);
+                }
+                self.solve_var(*var, rounded_val);
             }
         }
         for (id, constraint) in self.constraints.iter_mut() {
@@ -190,16 +210,6 @@ impl Solver {
                 && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
             {
                 self.inconsistent_constraints.insert(*id);
-            }
-        }
-        for i in 0..self.next_var {
-            if let Some(val) = self.solved_vars.get_mut(&Var(i)) {
-                let rounded_val = round(*val);
-                if relative_ne!(*val, rounded_val, epsilon = EPSILON) {
-                    self.invalid_rounding.insert(Var(i));
-                } else {
-                    *val = rounded_val;
-                }
             }
         }
         self.constraints
