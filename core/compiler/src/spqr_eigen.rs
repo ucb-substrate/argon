@@ -1,6 +1,4 @@
 use nalgebra::{DMatrix, DVector};
-use nalgebra_sparse::{CooMatrix, CsrMatrix};
-use rayon::prelude::*;
 use std::ffi::c_void;
 
 unsafe extern "C" {
@@ -40,7 +38,6 @@ impl SpqrFactorization {
         unsafe {
             if m == 0 || n == 0 {
 
-            unsafe {
                 let ptr = eigen_create(m as i32, n as i32);
                 return Ok(SpqrFactorization {
                     ptr: ptr,
@@ -48,7 +45,6 @@ impl SpqrFactorization {
                     n: 0,
                     rank: 0 as usize,
                 });
-            }
             }
 
             let ptr = eigen_create(m as i32, n as i32);
@@ -176,13 +172,11 @@ impl SpqrFactorization {
 
     ///Solves the system and returns the least squares solution in the case where the matrix has m >= n
     pub fn solve_regular(&self, b: &DVector<f64>) -> Result<DVector<f64>, String> {
-        //let q = self.qa_matrix().unwrap();
         let r = self.ra_matrix().unwrap();
 
         let r_r = r.view((0, 0), (self.rank, self.rank));
         let perm_vec = self.permutation_a().unwrap();
 
-        //let c = q.transpose() * b;
         let c = self.apply_qt(&b);
         let c_r = c.rows(0, self.rank);
 
@@ -199,56 +193,7 @@ impl SpqrFactorization {
 
         return Ok(x_prime);
 
-        let mut y = DVector::zeros(self.n);
-
-        println!("c:{}\n", c);
-        println!("r:{}\n", r);
-
-        let r_acc = r.columns(0, self.rank);
-
-        match r_acc.solve_upper_triangular(&c) {
-            Some(y_main) => {
-                y.rows_mut(0, self.rank).copy_from(&y_main);
-            }
-            None => return Err("failed R solving".to_string()),
-        }
-
-        let mut x = DVector::zeros(self.n);
-
-        for i in 0..self.n {
-            x[perm_vec[i]] = y[i];
-        }
-
-        Ok(x)
     }
-    // pub fn solve_regular(&self, b: &DVector<f64>) -> Result<DVector<f64>, String> {
-    //     let q = self.qa_matrix().unwrap();
-    //     let r = self.ra_matrix().unwrap();
-    //     let perm_vec = self.permutation_a().unwrap();
-
-    //     let c = q.transpose() * b;
-    //     let mut y = DVector::zeros(self.n);
-
-    //     println!("c:{}\n", c);
-    //     println!("r:{}\n", r);
-
-    //     let r_acc = r.columns(0, self.rank);
-
-    //     match r_acc.solve_upper_triangular(&c) {
-    //         Some(y_main) => {
-    //             y.rows_mut(0, self.rank).copy_from(&y_main);
-    //         }
-    //         None => return Err("failed R solving".to_string()),
-    //     }
-
-    //     let mut x = DVector::zeros(self.n);
-
-    //     for i in 0..self.n {
-    //         x[perm_vec[i]] = y[i];
-    //     }
-
-    //     Ok(x)
-    // }
 
     ///Solves the system for the underconstrained case when m < n; uses the precomputed QR of AT
     pub fn solve_underconstrained(&self, b: &DVector<f64>) -> Result<DVector<f64>, String> {

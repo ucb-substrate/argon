@@ -36,7 +36,6 @@ const_format = "0.2"
 
 [build-dependencies]
 lrpar = { version = "0.13", features = ["serde"] }
-bindgen = "0.72.1"
 cc = "1.2.51"
 
 cfgrammar = { workspace = true }

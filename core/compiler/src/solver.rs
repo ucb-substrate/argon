@@ -14,7 +14,6 @@ const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
-//use crate::spqr::SpqrFactorization;
 use crate::spqr_eigen::SpqrFactorization;
 
 #[derive(Clone, Default)]
@@ -137,9 +136,6 @@ impl Solver {
         let n = new_index;
         let m = self.constraints.len();
 
-        // println!("MMMMMMMMM: {}\n", m);
-        // println!("NNNNNNNNN: {}\n", n);
-
         let triplets: Vec<(usize, usize, f64)> = old_triplets
             .into_par_iter()
             .map(|(c_index, v_index, val)| {
@@ -167,11 +163,7 @@ impl Solver {
 
         let qr = SpqrFactorization::from_triplets(&triplets, m, n).unwrap();
 
-        let rank = qr.rank();
-
         let x = qr.solve(&b).unwrap();
-
-        //println!("BOR WE'RE HERE \n");
 
         let residual = &b - &a_sparse * &x;
 
