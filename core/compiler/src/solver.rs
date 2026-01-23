@@ -94,10 +94,7 @@ impl Solver {
         let id = self.next_constraint;
         self.next_constraint += 1;
         for (_, var) in &expr.coeffs {
-            self.var_to_constraints
-                .entry(*var)
-                .or_insert(IndexSet::new())
-                .insert(id);
+            self.var_to_constraints.entry(*var).or_default().insert(id);
         }
         self.constraints.insert(id, expr);
         // Use explicit stack in heap-allocated vector to avoid stack overflow.
