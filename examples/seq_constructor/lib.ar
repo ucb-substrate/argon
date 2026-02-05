@@ -1,0 +1,29 @@
+
+cell bot() {
+    let met1 = rect("met1", x0=0., y0=0., x1=100., y1=500.);
+}
+
+fn getx(inst_: Any) -> Float {
+    inst_.x
+}
+
+fn double(cell_: Any) -> [Any] {
+    let lst = list(100., 200., 300., 400.);
+    let i1 = inst(cell_, x=0., y=0.);
+    let i2 = inst(cell_, x=getx(i1) + lst[2] - 100., y=0.);
+    list(i1, i2)
+}
+
+fn index01(one: Bool) -> Int {
+    if one {
+        1
+    } else {
+        0
+    }
+}
+
+cell top() {
+    let bot_cell = bot();
+    let arr = double(bot_cell);
+    arr[index01(true)].met1!;
+}

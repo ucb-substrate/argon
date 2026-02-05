@@ -200,6 +200,15 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_index_expr(
+        &mut self,
+        input: &super::IndexExpr<Self::InputS, Self::InputMetadata>,
+        _base: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+        _index: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
+        input.metadata.clone()
+    }
+
     fn dispatch_call_expr(
         &mut self,
         input: &super::CallExpr<Self::InputS, Self::InputMetadata>,

@@ -5,13 +5,15 @@ edition = "2024"
 
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
-nalgebra = { version = "0.34", features = ["rayon"] }
 nalgebra-sparse = "0.11"
-klayout-lyp = "0.1.1"
 rayon = "1.10"
 libc = "0.2"
 rand = "0.8.5"
 gds21 = "0.2"
+nalgebra = { version = "0.34", features = ["rayon", "sparse"] }
+klayout-lyp = "0.1.1"
+gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
+
 
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }

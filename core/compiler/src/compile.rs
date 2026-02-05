@@ -11,14 +11,15 @@ use arcstr::Substr;
 use enumify::enumify;
 use geometry::transform::{Rotation, TransformationMatrix};
 use indexmap::{IndexMap, IndexSet};
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, KwArgValue,
-    MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp, WorkspaceAst,
+    BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, IndexExpr,
+    KwArgValue, MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr,
+    WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -32,7 +33,8 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 11] = [
+pub const BUILTINS: [&str; 12] = [
+    "list",
     "cons",
     "head",
     "tail",
@@ -276,6 +278,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
     }
 
+    fn dispatch_index_expr(
+        &mut self,
+        _input: &crate::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _index: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
+    }
+
     fn dispatch_call_expr(
         &mut self,
         _input: &CallExpr<Self::InputS, Self::InputMetadata>,
@@ -477,6 +487,10 @@ pub enum Ty {
     /// Suppresses type checking of dependent properties.
     #[default]
     Unknown,
+    /// Catch-all any type.
+    ///
+    /// Should eventually be removed.
+    Any,
     Bool,
     Float,
     Int,
@@ -496,9 +510,11 @@ pub enum Ty {
 impl Ty {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "Bool" => Some(Ty::Bool),
+            "Int" => Some(Ty::Int),
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
-            "Int" => Some(Ty::Int),
+            "Any" => Some(Ty::Any),
             "String" => Some(Ty::String),
             "()" => Some(Ty::Nil),
             "[]" => Some(Ty::SeqNil),
@@ -508,20 +524,20 @@ impl Ty {
 
     /// Computes the least upper bound (LUB) of self and other.
     /// For use in type promotion.
-    pub fn lub(&self, other: &Self) -> Option<Self> {
+    pub fn lub(&self, other: &Self) -> Self {
         match (self, other) {
             // Unknown promotes to any type.
-            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
+            (Ty::Unknown, other) | (other, Ty::Unknown) => other.clone(),
+            // At least one Any results in Any.
+            (Ty::Any, _) | (_, Ty::Any) => Ty::Any,
             // SeqNil promotes to any sequence type.
-            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => {
-                Some(Ty::Seq(inner.clone()))
-            }
-            // No other types promote.
+            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => Ty::Seq(inner.clone()),
+            // Mismatched types promote to any.
             (a, b) => {
                 if a == b {
-                    Some(a.clone())
+                    a.clone()
                 } else {
-                    None
+                    Ty::Any
                 }
             }
         }
@@ -567,6 +583,7 @@ impl AstMetadata for VarIdTyMetadata {
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
+    type IndexExpr = Ty;
     type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
     type Args = ();
@@ -727,8 +744,16 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
+    fn cannot_index<M: AstMetadata>(&mut self, base: &Expr<Substr, M>, ty: Ty) -> Ty {
+        self.errors.push(StaticError {
+            span: self.span(base.span()),
+            kind: StaticErrorKind::CannotIndex { ty },
+        });
+        Ty::Unknown
+    }
+
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if *found != *expected {
+        if *found != *expected && !(*found == Ty::Any || *expected == Ty::Any) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
@@ -740,7 +765,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Cell(_)) {
+        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
@@ -752,7 +777,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Enum(_)) {
+        if !matches!(ty, Ty::Enum(_) | Ty::Any) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
@@ -878,6 +903,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
             Expr::SeqNil(_) => Ty::SeqNil,
             Expr::FloatLiteral(_) => Ty::Float,
@@ -1187,16 +1213,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
-        let lub_ty = then_ty.lub(&else_ty);
-        if let Some(lub_ty) = lub_ty {
-            lub_ty
-        } else {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BranchesDifferentTypes,
-            });
-            then_ty
-        }
+        then_ty.lub(&else_ty)
     }
 
     fn dispatch_match_expr(
@@ -1226,14 +1243,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
 
                 if let Some(ref inner) = lub_ty {
-                    if let Some(lub) = inner.lub(&arm.expr.ty()) {
-                        lub_ty = Some(lub);
-                    } else {
-                        self.errors.push(StaticError {
-                            span: self.span(arm.expr.span()),
-                            kind: StaticErrorKind::BranchesDifferentTypes,
-                        });
-                    }
+                    lub_ty = Some(inner.lub(&arm.expr.ty()));
                 } else {
                     lub_ty = Some(arm.expr.ty());
                 }
@@ -1314,65 +1324,57 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let left_ty = left.ty();
         let right_ty = right.ty();
         let lub_ty = left_ty.lub(&right_ty);
-        if let Some(lub_ty) = lub_ty {
-            if left_ty == Ty::Float
-                && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::FloatEquality,
-                });
-            }
-            if matches!(left_ty, Ty::Enum(_))
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::EnumsNotOrd,
-                });
-            }
-            if matches!(left_ty, Ty::Nil)
-                && matches!(right_ty, Ty::Nil)
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::NilNotOrd,
-                });
-            }
-            if matches!(left_ty, Ty::SeqNil)
-                && matches!(right_ty, Ty::SeqNil)
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::SeqNilNotOrd,
-                });
-            }
-            if matches!(lub_ty, Ty::Seq(_))
-                && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-                && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
-            {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::SeqMustCompareEqSeqNil,
-                });
-            }
-            if !matches!(
-                left_ty,
-                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
-            ) {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::ComparisonInvalidType,
-                });
-            }
-        } else {
+        if left_ty == Ty::Float && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne) {
             self.errors.push(StaticError {
                 span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
+                kind: StaticErrorKind::FloatEquality,
             });
         }
+        if matches!(left_ty, Ty::Enum(_))
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::EnumsNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::Nil)
+            && matches!(right_ty, Ty::Nil)
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::NilNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::SeqNil)
+            && matches!(right_ty, Ty::SeqNil)
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::SeqNilNotOrd,
+            });
+        }
+        if matches!(lub_ty, Ty::Seq(_))
+            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
+            && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
+        {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+            });
+        }
+        if !matches!(
+            left_ty,
+            Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+        ) {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::ComparisonInvalidType,
+            });
+        }
+
         Ty::Bool
     }
 
@@ -1397,9 +1399,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .cloned()
                     .unwrap_or_else(|| self.no_field_on_ty(field, base_ty.clone())),
             },
-            // Propagate unknown types without throwing an error.
+            // Propagate any and unknown types without throwing an error.
+            Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             _ => self.no_field_on_ty(field, base_ty.clone()),
+        }
+    }
+
+    fn dispatch_index_expr(
+        &mut self,
+        _input: &crate::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
+        base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        index: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
+        let base_ty = base.ty();
+        self.assert_eq_ty(index.span(), &index.ty(), &Ty::Int);
+        match base_ty {
+            Ty::Seq(s) => (*s).clone(),
+            // Propagate any and unknown types without throwing an error.
+            Ty::Any => Ty::Any,
+            Ty::Unknown => Ty::Unknown,
+            _ => self.cannot_index(base, base_ty.clone()),
         }
     }
 
@@ -1485,6 +1505,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         (None, seqty)
                     } else {
                         (None, Ty::SeqNil)
+                    }
+                }
+                "list" => {
+                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    if args.posargs.is_empty() {
+                        self.errors.push(StaticError {
+                            span: self.span(input.span),
+                            kind: StaticErrorKind::EmptyListConstructor,
+                        });
+                        (None, Ty::Nil)
+                    } else {
+                        let elem_ty = args
+                            .posargs
+                            .iter()
+                            .map(Expr::ty)
+                            .reduce(|acc, e| acc.lub(&e))
+                            .unwrap();
+                        (None, Ty::Seq(Box::new(elem_ty)))
                     }
                 }
                 "head" => {
@@ -1740,21 +1778,6 @@ pub enum CellArg {
     Seq(Vec<CellArg>),
 }
 
-impl CellArg {
-    pub fn from_value(val: &Value, solver: &Solver) -> Option<Self> {
-        match val {
-            Value::Linear(v) => solver.eval_expr(v).map(CellArg::Float),
-            Value::Int(i) => Some(CellArg::Int(*i)),
-            Value::Seq(s) => s
-                .iter()
-                .map(|v| Self::from_value(v, solver))
-                .collect::<Option<Vec<_>>>()
-                .map(CellArg::Seq),
-            _ => unreachable!(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
     /// Full path to cell.
@@ -1910,12 +1933,14 @@ struct CellState {
     fallback_constraints_used: Vec<LinearExpr>,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
+    var_dependents: IndexMap<Var, IndexSet<ValueId>>,
 }
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
+    value_dependents: IndexMap<ValueId, IndexSet<ValueId>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
     seq_nil_value: ValueId,
@@ -1974,6 +1999,7 @@ impl<'a> ExecPass<'a> {
                 (3, DeferValue::Ready(Value::Bool(false))),
                 (4, DeferValue::Ready(Value::SeqNil)),
             ]),
+            value_dependents: IndexMap::new(),
             frames: IndexMap::from_iter([(
                 5,
                 Frame {
@@ -2044,7 +2070,15 @@ impl<'a> ExecPass<'a> {
             ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
             _ => None,
         }) {
-            let cell_id = self.execute_cell(vid, input.args, Some("TOP"));
+            let cell_id = match self.execute_cell(vid, input.args, Some("TOP")) {
+                Ok(cell_id) => cell_id,
+                Err(()) => {
+                    return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                        errors: self.errors,
+                        output: None,
+                    });
+                }
+            };
             let layers = if let Ok(layers) = std::fs::File::open(input.lyp_file)
                 .map_err(|_| ())
                 .and_then(|f| klayout_lyp::from_reader(BufReader::new(f)).map_err(|_| ()))
@@ -2094,7 +2128,7 @@ impl<'a> ExecPass<'a> {
         cell: VarId,
         args: Vec<CellArg>,
         scope_annotation: Option<&str>,
-    ) -> CellId {
+    ) -> Result<CellId, ()> {
         let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
@@ -2141,6 +2175,7 @@ impl<'a> ExecPass<'a> {
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
                         constraint_span_map: IndexMap::new(),
+                        var_dependents: IndexMap::new(),
                     }
                 )
                 .is_none()
@@ -2151,7 +2186,7 @@ impl<'a> ExecPass<'a> {
                 cell: cell_id,
                 kind: ExecErrorKind::InvalidCell,
             });
-            return cell_id;
+            return Ok(cell_id);
         }
         for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
@@ -2197,22 +2232,36 @@ impl<'a> ExecPass<'a> {
             }
         }
 
-        let mut require_progress = false;
-        let mut progress = false;
         while {
             let state = self.cell_state(cell_id);
             !state.deferred.is_empty() || !state.solver.fully_solved()
         } {
-            let deferred = self.cell_state(cell_id).deferred.clone();
-            progress = false;
-            for vid in deferred {
-                progress = progress || self.eval_partial(vid);
+            let mut progress = false;
+            while let Some(vid) = {
+                let state = self.cell_state_mut(cell_id);
+                state.deferred.pop()
+            } {
+                progress = self.eval_partial(cell_id, vid)? || progress;
             }
 
-            if require_progress && !progress {
+            let state = self.cell_state_mut(cell_id);
+            state.solve_iters += 1;
+            state.solver.solve();
+            progress = !state.solver.updated_vars().is_empty() || progress;
+            for var in state.solver.updated_vars().clone() {
+                if let Some(deps) = state.var_dependents.get(&var) {
+                    for dep in deps.clone() {
+                        state.deferred.insert(dep);
+                    }
+                }
+            }
+            let state = self.cell_state_mut(cell_id);
+            state.solver.clear_updated_vars();
+
+            if !progress {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
-                    state.unsolved_vars = Some(state.solver.unsolved_vars());
+                    state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
                     self.errors.push(ExecError {
                         span: None,
                         cell: cell_id,
@@ -2241,22 +2290,9 @@ impl<'a> ExecPass<'a> {
                     state.solver.force_solution();
                 }
             }
-
-            require_progress = false;
-
-            if !progress {
-                let state = self.cell_state_mut(cell_id);
-                state.solve_iters += 1;
-                state.solver.solve();
-                require_progress = true;
-            }
         }
 
         let state = self.cell_state_mut(cell_id);
-        if progress {
-            state.solve_iters += 1;
-            state.solver.solve();
-        }
         for constraint in state.solver.inconsistent_constraints().clone() {
             let span = self
                 .cell_state(cell_id)
@@ -2269,6 +2305,18 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
+        for var in self
+            .cell_state_mut(cell_id)
+            .solver
+            .invalid_rounding()
+            .clone()
+        {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidRounding(var),
+            });
+        }
 
         self.partial_cells
             .pop_back()
@@ -2276,7 +2324,7 @@ impl<'a> ExecPass<'a> {
 
         let cell = self.emit(cell_id);
         assert!(self.compiled_cells.insert(cell_id, cell).is_none());
-        cell_id
+        Ok(cell_id)
     }
 
     fn emit(&mut self, cell: CellId) -> CompiledCell {
@@ -2589,50 +2637,49 @@ impl<'a> ExecPass<'a> {
             .unwrap_or(self.nil_value)
     }
 
+    fn new_ready_value(&mut self, val: Value) -> ValueId {
+        let vid = self.value_id();
+        self.values.insert(vid, Defer::Ready(val));
+        vid
+    }
+
+    // Takes in a closure so that the parent can be added to the stack first.
+    fn new_deferred_value(
+        &mut self,
+        loc: DynLoc,
+        state: impl FnOnce(&mut Self) -> PartialEvalState<VarIdTyMetadata>,
+    ) -> ValueId {
+        let vid = self.value_id();
+        self.cell_state_mut(loc.cell).deferred.insert(vid);
+        let state = state(self);
+        self.values
+            .insert(vid, Defer::Deferred(PartialEval { state, loc }));
+        vid
+    }
+
     fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<Substr, VarIdTyMetadata>) -> ValueId {
-        let partial_eval_state = match expr {
-            Expr::Nil(_) => {
-                return self.nil_value;
-            }
-            Expr::SeqNil(_) => {
-                return self.seq_nil_value;
-            }
-            Expr::FloatLiteral(f) => {
-                let vid = self.value_id();
-                self.values
-                    .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(f.value))));
-                return vid;
-            }
-            Expr::IntLiteral(i) => {
-                let vid = self.value_id();
-                self.values.insert(vid, Defer::Ready(Value::Int(i.value)));
-                return vid;
-            }
+        match expr {
+            Expr::Nil(_) => self.nil_value,
+            Expr::SeqNil(_) => self.seq_nil_value,
+            Expr::FloatLiteral(f) => self.new_ready_value(Value::Linear(LinearExpr::from(f.value))),
+            Expr::IntLiteral(i) => self.new_ready_value(Value::Int(i.value)),
             Expr::BoolLiteral(b) => {
-                return if b.value {
+                if b.value {
                     self.true_value
                 } else {
                     self.false_value
-                };
+                }
             }
-            Expr::StringLiteral(s) => {
-                let vid = self.value_id();
-                self.values
-                    .insert(vid, Defer::Ready(Value::String(s.value.to_string())));
-                return vid;
-            }
+            Expr::StringLiteral(s) => self.new_ready_value(Value::String(s.value.to_string())),
             Expr::IdentPath(path) => {
                 if let Some(var_id) = path.metadata.0 {
-                    return self.lookup(loc.frame, var_id).unwrap();
+                    self.lookup(loc.frame, var_id).unwrap()
                 } else {
                     // must be an enum value
                     assert!(path.path.len() >= 2);
-                    let vid = self.value_id();
-                    self.values.insert(
-                        vid,
-                        Defer::Ready(Value::EnumValue(path.path.last().unwrap().name.to_string())),
-                    );
-                    return vid;
+                    self.new_ready_value(Value::EnumValue(
+                        path.path.last().unwrap().name.to_string(),
+                    ))
                 }
             }
             Expr::Emit(e) => {
@@ -2643,27 +2690,29 @@ impl<'a> ExecPass<'a> {
                     value,
                     span,
                 });
-                return value;
+                value
             }
             Expr::Call(c) => {
                 if BUILTINS.contains(&c.func.path.last().unwrap().name.as_str()) {
-                    PartialEvalState::Call(Box::new(PartialCallExpr {
-                        expr: c.clone(),
-                        state: CallExprState {
-                            posargs: c
-                                .args
-                                .posargs
-                                .iter()
-                                .map(|arg| self.visit_expr(loc, arg))
-                                .collect(),
-                            kwargs: c
-                                .args
-                                .kwargs
-                                .iter()
-                                .map(|arg| self.visit_expr(loc, &arg.value))
-                                .collect(),
-                        },
-                    }))
+                    self.new_deferred_value(loc, |this| {
+                        PartialEvalState::Call(Box::new(PartialCallExpr {
+                            expr: c.clone(),
+                            state: CallExprState {
+                                posargs: c
+                                    .args
+                                    .posargs
+                                    .iter()
+                                    .map(|arg| this.visit_expr(loc, arg))
+                                    .collect(),
+                                kwargs: c
+                                    .args
+                                    .kwargs
+                                    .iter()
+                                    .map(|arg| this.visit_expr(loc, &arg.value))
+                                    .collect(),
+                            },
+                        }))
+                    })
                 } else {
                     let arg_vals = c
                         .args
@@ -2711,46 +2760,50 @@ impl<'a> ExecPass<'a> {
                             );
                             let fid = self.frame_id();
                             self.frames.insert(fid, call_frame);
-                            return self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope);
+                            self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope)
                         }
-                        ValueRef::CellFn(_) => PartialEvalState::Call(Box::new(PartialCallExpr {
-                            expr: c.clone(),
-                            state: CallExprState {
-                                posargs: arg_vals,
-                                kwargs: c
-                                    .args
-                                    .kwargs
-                                    .iter()
-                                    .map(|arg| self.visit_expr(loc, &arg.value))
-                                    .collect(),
-                            },
-                        })),
+                        ValueRef::CellFn(_) => self.new_deferred_value(loc, |this| {
+                            PartialEvalState::Call(Box::new(PartialCallExpr {
+                                expr: c.clone(),
+                                state: CallExprState {
+                                    posargs: arg_vals,
+                                    kwargs: c
+                                        .args
+                                        .kwargs
+                                        .iter()
+                                        .map(|arg| this.visit_expr(loc, &arg.value))
+                                        .collect(),
+                                },
+                            }))
+                        }),
                         _ => todo!("cannot call value: not a function or cell generator"),
                     }
                 }
             }
             Expr::If(if_expr) => {
                 let cond = self.visit_expr(loc, &if_expr.cond);
-                PartialEvalState::If(Box::new(PartialIfExpr {
-                    expr: (**if_expr).clone(),
-                    state: IfExprState::Cond(cond),
-                }))
+                self.new_deferred_value(loc, |_| {
+                    PartialEvalState::If(Box::new(PartialIfExpr {
+                        expr: (**if_expr).clone(),
+                        state: IfExprState::Cond(cond),
+                    }))
+                })
             }
-            Expr::Match(match_expr) => {
-                let scrutinee = self.visit_expr(loc, &match_expr.scrutinee);
+            Expr::Match(match_expr) => self.new_deferred_value(loc, |this| {
+                let scrutinee = this.visit_expr(loc, &match_expr.scrutinee);
                 PartialEvalState::Match(Box::new(PartialMatchExpr {
                     expr: (**match_expr).clone(),
                     state: MatchExprState::Scrutinee(scrutinee),
                 }))
-            }
-            Expr::Comparison(comparison_expr) => {
-                let left = self.visit_expr(loc, &comparison_expr.left);
-                let right = self.visit_expr(loc, &comparison_expr.right);
+            }),
+            Expr::Comparison(comparison_expr) => self.new_deferred_value(loc, |this| {
+                let left = this.visit_expr(loc, &comparison_expr.left);
+                let right = this.visit_expr(loc, &comparison_expr.right);
                 PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
                     expr: (**comparison_expr).clone(),
                     state: ComparisonExprState { left, right },
                 }))
-            }
+            }),
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
@@ -2761,57 +2814,112 @@ impl<'a> ExecPass<'a> {
                     },
                     self.span(&loc, s.span),
                 );
-                return self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s);
+                self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s)
             }
-            Expr::FieldAccess(f) => {
-                let base = self.visit_expr(loc, &f.base);
+            Expr::FieldAccess(f) => self.new_deferred_value(loc, |this| {
+                let base = this.visit_expr(loc, &f.base);
                 PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
                     expr: (**f).clone(),
                     state: FieldAccessExprState { base },
                 }))
-            }
-            Expr::BinOp(b) => {
-                let lhs = self.visit_expr(loc, &b.left);
-                let rhs = self.visit_expr(loc, &b.right);
-                PartialEvalState::BinOp(PartialBinOp { lhs, rhs, op: b.op })
-            }
-            Expr::UnaryOp(u) => {
-                let operand = self.visit_expr(loc, &u.operand);
-                PartialEvalState::UnaryOp(PartialUnaryOp { operand, op: u.op })
-            }
-            Expr::Cast(cast) => {
-                let value = self.visit_expr(loc, &cast.value);
+            }),
+            Expr::Index(i) => self.new_deferred_value(loc, |this| {
+                let base = this.visit_expr(loc, &i.base);
+                let index = this.visit_expr(loc, &i.index);
+                PartialEvalState::Index(Box::new(PartialIndexExpr {
+                    expr: (**i).clone(),
+                    state: IndexExprState { base, index },
+                }))
+            }),
+            Expr::BinOp(b) => self.new_deferred_value(loc, |this| {
+                let lhs = this.visit_expr(loc, &b.left);
+                let rhs = this.visit_expr(loc, &b.right);
+                PartialEvalState::BinOp(PartialBinOp {
+                    lhs,
+                    rhs,
+                    op: b.op,
+                    expr: b.clone(),
+                })
+            }),
+            Expr::UnaryOp(u) => self.new_deferred_value(loc, |this| {
+                let operand = this.visit_expr(loc, &u.operand);
+                PartialEvalState::UnaryOp(PartialUnaryOp {
+                    operand,
+                    op: u.op,
+                    expr: u.clone(),
+                })
+            }),
+            Expr::Cast(cast) => self.new_deferred_value(loc, |this| {
+                let value = this.visit_expr(loc, &cast.value);
                 PartialEvalState::Cast(PartialCast {
                     value,
                     ty: cast.metadata.clone(),
                 })
-            }
-        };
-        let vid = self.value_id();
-        self.cell_state_mut(loc.cell).deferred.insert(vid);
-        self.values.insert(
-            vid,
-            DeferValue::Deferred(PartialEval {
-                state: partial_eval_state,
-                loc,
             }),
-        );
-        vid
+        }
     }
 
-    fn eval_partial(&mut self, vid: ValueId) -> bool {
-        let v = self.values.swap_remove(&vid);
+    fn add_value_dependent(&mut self, vid: ValueId, dependent: ValueId) {
+        self.value_dependents
+            .entry(vid)
+            .or_default()
+            .insert(dependent);
+    }
+
+    fn add_var_dependent(&mut self, cell_id: CellId, var: Var, dependent: ValueId) {
+        self.cell_state_mut(cell_id)
+            .var_dependents
+            .entry(var)
+            .or_default()
+            .insert(dependent);
+    }
+
+    pub fn cell_arg_from_value(
+        &mut self,
+        cell_id: CellId,
+        dependent_vid: ValueId,
+        val: &Value,
+    ) -> Option<CellArg> {
+        match val {
+            Value::Linear(v) => {
+                if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr(v) {
+                    Some(CellArg::Float(f))
+                } else {
+                    for (_, var) in v.coeffs.clone() {
+                        self.add_var_dependent(cell_id, var, dependent_vid);
+                    }
+                    None
+                }
+            }
+            Value::Int(i) => Some(CellArg::Int(*i)),
+            Value::Seq(s) => s
+                .iter()
+                .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
+                .collect::<Option<Vec<_>>>()
+                .map(CellArg::Seq),
+            _ => unreachable!(),
+        }
+    }
+
+    fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
+        let v = self.values.get(&vid);
         if v.is_none() {
-            return false;
+            return Ok(false);
         }
-        let mut v = v.unwrap();
-        let vref = v.as_mut();
-        if vref.is_ready() {
-            self.values.insert(vid, v);
-            return false;
-        }
-        let vref = vref.unwrap_deferred();
-        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+        let vref = v.as_ref().unwrap();
+        let mut vref = match &vref {
+            Defer::Ready(_) => {
+                if let Some(deps) = self.value_dependents.get(&vid) {
+                    for dep_vid in deps.clone() {
+                        self.cell_state_mut(cell_id).deferred.insert(dep_vid);
+                    }
+                }
+                return Ok(true);
+            }
+            Defer::Deferred(v) => v.clone(),
+        };
+        let cell_id = vref.loc.cell;
+        let state = self.cell_states.get_mut(&cell_id).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
                 f @ "crect" | f @ "rect" => {
@@ -2822,18 +2930,22 @@ impl<'a> ExecPass<'a> {
                             .iter()
                             .zip(c.state.kwargs.iter())
                             .find(|(k, _)| k.name.name == "layer")
-                            .map(|(_, vid)| {
-                                self.values[vid]
-                                    .as_ref()
-                                    .get_ready()
-                                    .map(|layer| layer.as_ref().unwrap_string().clone())
+                            .map(|(_, arg_vid)| {
+                                if let Defer::Ready(layer) = &self.values[arg_vid] {
+                                    Some(layer.as_ref().unwrap_string().clone())
+                                } else {
+                                    self.add_value_dependent(*arg_vid, vid);
+                                    None
+                                }
                             })
                     } else {
-                        c.state.posargs.first().map(|vid| {
-                            self.values[vid]
-                                .as_ref()
-                                .get_ready()
-                                .map(|layer| layer.as_ref().unwrap_string().clone())
+                        c.state.posargs.first().map(|arg_vid| {
+                            if let Defer::Ready(layer) = &self.values[arg_vid] {
+                                Some(layer.as_ref().unwrap_string().clone())
+                            } else {
+                                self.add_value_dependent(*arg_vid, vid);
+                                None
+                            }
                         })
                     };
                     let layer = match layer {
@@ -2844,7 +2956,7 @@ impl<'a> ExecPass<'a> {
                     if let Some(layer) = layer {
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_state_mut(vref.loc.cell);
+                        let state = self.cell_state_mut(cell_id);
                         let rect = Rect {
                             id,
                             layer,
@@ -2910,21 +3022,15 @@ impl<'a> ExecPass<'a> {
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
                             let span = self.span(&vref.loc, kwarg.span);
-                            let defer = self.value_id();
-                            self.values.insert(
-                                defer,
-                                DeferValue::Deferred(PartialEval {
-                                    state: PartialEvalState::Constraint(PartialConstraint {
-                                        lhs,
-                                        rhs: *rhs,
-                                        fallback: kwarg.name.name.ends_with('i'),
-                                        priority,
-                                        span,
-                                    }),
-                                    loc: vref.loc,
-                                }),
-                            );
-                            self.cell_state_mut(vref.loc.cell).deferred.insert(defer);
+                            self.new_deferred_value(vref.loc, |_| {
+                                PartialEvalState::Constraint(PartialConstraint {
+                                    lhs,
+                                    rhs: *rhs,
+                                    fallback: kwarg.name.name.ends_with('i'),
+                                    priority,
+                                    span,
+                                })
+                            });
                         }
                         true
                     } else {
@@ -2932,17 +3038,19 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "text" => {
-                    let args = c
-                        .state
-                        .posargs
-                        .iter()
-                        .map(|vid| self.values[vid].get_ready())
-                        .collect::<Option<Vec<_>>>();
-                    if let Some(mut args) = args {
+                    let (mut args, unready): (Vec<_>, Vec<_>) =
+                        c.state.posargs.iter().partition_map(|v| {
+                            if let Defer::Ready(v) = &self.values[v] {
+                                Either::Left(v)
+                            } else {
+                                Either::Right(*v)
+                            }
+                        });
+                    if unready.is_empty() {
                         assert_eq!(args.len(), 4);
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let y = args.pop().unwrap().as_ref().unwrap_linear().clone();
                         let x = args.pop().unwrap().as_ref().unwrap_linear().clone();
                         let layer = args.pop().unwrap().as_ref().unwrap_string().clone();
@@ -2964,6 +3072,9 @@ impl<'a> ExecPass<'a> {
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
+                        for arg_vid in unready {
+                            self.add_value_dependent(arg_vid, vid);
+                        }
                         false
                     }
                 }
@@ -2980,16 +3091,24 @@ impl<'a> ExecPass<'a> {
                                             .map(|r| r.transform(i.reflect, i.angle)),
                                     )
                                 } else {
+                                    self.add_value_dependent(i.cell, vid);
                                     None
                                 }
                             }
                             Value::Cell(c) => Some(self.bbox(*c)),
-                            _ => unreachable!(),
+                            _ => {
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
                         };
                         if let Some(r) = r {
                             if let Some(r) = r {
                                 let id = object_id(&mut self.next_id);
-                                let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                let state = self.cell_states.get_mut(&cell_id).unwrap();
                                 let orect = Rect {
                                     id,
                                     layer: None,
@@ -3012,11 +3131,11 @@ impl<'a> ExecPass<'a> {
                                 // default to a zero rectangle
                                 self.errors.push(ExecError {
                                     span: Some(span.clone()),
-                                    cell: vref.loc.cell,
+                                    cell: cell_id,
                                     kind: ExecErrorKind::EmptyBbox,
                                 });
                                 let id = object_id(&mut self.next_id);
-                                let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                let state = self.cell_states.get_mut(&cell_id).unwrap();
                                 let orect = Rect {
                                     id,
                                     layer: None,
@@ -3035,6 +3154,7 @@ impl<'a> ExecPass<'a> {
                             false
                         }
                     } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
                         false
                     }
                 }
@@ -3064,6 +3184,8 @@ impl<'a> ExecPass<'a> {
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
+                        self.add_value_dependent(c.state.posargs[1], vid);
                         false
                     }
                 }
@@ -3081,11 +3203,43 @@ impl<'a> ExecPass<'a> {
                                 s.insert(0, head.clone());
                                 s
                             }
-                            _ => unreachable!(),
+                            _ => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
                         };
                         self.values.insert(vid, Defer::Ready(Value::Seq(val)));
                         true
                     } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
+                        self.add_value_dependent(c.state.posargs[1], vid);
+                        false
+                    }
+                }
+                "list" => {
+                    let (ready, unready): (Vec<_>, Vec<_>) =
+                        c.state.posargs.iter().partition_map(|v| {
+                            if let Defer::Ready(v) = &self.values[v] {
+                                Either::Left(v)
+                            } else {
+                                Either::Right(*v)
+                            }
+                        });
+                    if unready.is_empty() {
+                        self.values.insert(
+                            vid,
+                            Defer::Ready(Value::Seq(ready.iter().map(|v| (*v).clone()).collect())),
+                        );
+                        true
+                    } else {
+                        for arg_vid in unready {
+                            self.add_value_dependent(arg_vid, vid);
+                        }
                         false
                     }
                 }
@@ -3094,11 +3248,20 @@ impl<'a> ExecPass<'a> {
                         let val = match head {
                             Value::SeqNil => Value::Nil,
                             Value::Seq(s) => s.first().cloned().unwrap_or(Value::Nil),
-                            _ => unreachable!(),
+                            _ => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
                         };
                         self.values.insert(vid, Defer::Ready(val));
                         true
                     } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
                         false
                     }
                 }
@@ -3107,26 +3270,37 @@ impl<'a> ExecPass<'a> {
                         let val = match lst {
                             Value::SeqNil => Value::SeqNil,
                             Value::Seq(s) => Value::Seq(s[1..].to_vec()),
-                            _ => unreachable!(),
+                            _ => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
                         };
                         self.values.insert(vid, Defer::Ready(val));
                         true
                     } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
                         false
                     }
                 }
                 "dimension" => {
-                    let args = c
-                        .state
-                        .posargs
-                        .iter()
-                        .map(|vid| self.values[vid].get_ready())
-                        .collect::<Option<Vec<_>>>();
-                    if let Some(mut args) = args {
+                    let (mut args, unready): (Vec<_>, Vec<_>) =
+                        c.state.posargs.iter().partition_map(|v| {
+                            if let Defer::Ready(v) = &self.values[v] {
+                                Either::Left(v)
+                            } else {
+                                Either::Right(*v)
+                            }
+                        });
+                    if unready.is_empty() {
                         assert_eq!(args.len(), 7);
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let horiz = *args.pop().unwrap().as_ref().unwrap_bool();
                         let mut arg = || args.pop().unwrap().as_ref().unwrap_linear().clone();
                         let (nstop, pstop, coord, value, n, p) =
@@ -3155,6 +3329,9 @@ impl<'a> ExecPass<'a> {
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
+                        for arg_vid in unready {
+                            self.add_value_dependent(arg_vid, vid);
+                        }
                         false
                     }
                 }
@@ -3165,14 +3342,14 @@ impl<'a> ExecPass<'a> {
                         .kwargs
                         .iter()
                         .zip(c.state.kwargs.iter())
-                        .find_map(|(kwarg, vid)| {
+                        .find_map(|(kwarg, arg_vid)| {
                             if kwarg.name.name == "reflect" {
-                                Some(
-                                    self.values[vid]
-                                        .as_ref()
-                                        .get_ready()
-                                        .map(|refl| *refl.as_ref().unwrap_bool()),
-                                )
+                                Some(if let Defer::Ready(refl) = &self.values[arg_vid] {
+                                    Some(*refl.as_ref().unwrap_bool())
+                                } else {
+                                    self.add_value_dependent(*arg_vid, vid);
+                                    None
+                                })
                             } else {
                                 None
                             }
@@ -3188,11 +3365,11 @@ impl<'a> ExecPass<'a> {
                         .kwargs
                         .iter()
                         .zip(c.state.kwargs.iter())
-                        .find_map(|(kwarg, vid)| {
+                        .find_map(|(kwarg, arg_vid)| {
                             if kwarg.name.name == "angle" {
                                 let span = self.span(&vref.loc, kwarg.value.span());
-                                Some(self.values[vid].as_ref().get_ready().map(|refl| {
-                                    match ((*refl.as_ref().unwrap_int() % 360) + 360) % 360 {
+                                Some(if let Defer::Ready(refl) = &self.values[arg_vid] {
+                                    Some(match ((*refl.as_ref().unwrap_int() % 360) + 360) % 360 {
                                         0 => Rotation::R0,
                                         90 => Rotation::R90,
                                         180 => Rotation::R180,
@@ -3200,13 +3377,16 @@ impl<'a> ExecPass<'a> {
                                         _ => {
                                             self.errors.push(ExecError {
                                                 span: Some(span),
-                                                cell: vref.loc.cell,
+                                                cell: cell_id,
                                                 kind: ExecErrorKind::InvalidRotation,
                                             });
                                             Rotation::R0
                                         }
-                                    }
-                                }))
+                                    })
+                                } else {
+                                    self.add_value_dependent(*arg_vid, vid);
+                                    None
+                                })
                             } else {
                                 None
                             }
@@ -3222,14 +3402,14 @@ impl<'a> ExecPass<'a> {
                         .kwargs
                         .iter()
                         .zip(c.state.kwargs.iter())
-                        .find_map(|(kwarg, vid)| {
+                        .find_map(|(kwarg, arg_vid)| {
                             if kwarg.name.name == "construction" {
-                                Some(
-                                    self.values[vid]
-                                        .as_ref()
-                                        .get_ready()
-                                        .map(|v| *v.as_ref().unwrap_bool()),
-                                )
+                                Some(if let Defer::Ready(v) = &self.values[arg_vid] {
+                                    Some(*v.as_ref().unwrap_bool())
+                                } else {
+                                    self.add_value_dependent(*arg_vid, vid);
+                                    None
+                                })
                             } else {
                                 None
                             }
@@ -3244,7 +3424,7 @@ impl<'a> ExecPass<'a> {
                     {
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let inst = Instance {
                             id,
                             x: state.solver.new_var().into(),
@@ -3277,21 +3457,15 @@ impl<'a> ExecPass<'a> {
                                 _ => continue,
                             };
                             let span = self.span(&vref.loc, kwarg.span);
-                            let defer = self.value_id();
-                            self.values.insert(
-                                defer,
-                                DeferValue::Deferred(PartialEval {
-                                    state: PartialEvalState::Constraint(PartialConstraint {
-                                        lhs,
-                                        rhs: *rhs,
-                                        fallback: kwarg.name.name.ends_with('i'),
-                                        priority,
-                                        span,
-                                    }),
-                                    loc: vref.loc,
-                                }),
-                            );
-                            self.cell_state_mut(vref.loc.cell).deferred.insert(defer);
+                            self.new_deferred_value(vref.loc, |_| {
+                                PartialEvalState::Constraint(PartialConstraint {
+                                    lhs,
+                                    rhs: *rhs,
+                                    fallback: kwarg.name.name.ends_with('i'),
+                                    priority,
+                                    span,
+                                })
+                            });
                         }
                         self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
                         true
@@ -3302,17 +3476,19 @@ impl<'a> ExecPass<'a> {
                 _ => {
                     // Must be calling a cell generator.
                     // User functions are never deferred.
-                    let arg_vals = c
-                        .state
-                        .posargs
-                        .iter()
-                        .map(|v| {
-                            self.values[v]
-                                .get_ready()
-                                .and_then(|v| CellArg::from_value(v, &state.solver))
-                        })
-                        .collect::<Option<Vec<CellArg>>>();
-                    if let Some(arg_vals) = arg_vals {
+                    let (arg_vals, unready): (Vec<_>, Vec<_>) =
+                        c.state.posargs.iter().partition_map(|arg_vid| {
+                            if let Defer::Ready(v) = self.values[arg_vid].clone() {
+                                if let Some(arg) = self.cell_arg_from_value(cell_id, *arg_vid, &v) {
+                                    Either::Left(arg)
+                                } else {
+                                    Either::Right(*arg_vid)
+                                }
+                            } else {
+                                Either::Right(*arg_vid)
+                            }
+                        });
+                    if unready.is_empty() {
                         let cell = self.execute_cell(
                             c.expr.metadata.0.unwrap(),
                             arg_vals,
@@ -3320,10 +3496,13 @@ impl<'a> ExecPass<'a> {
                                 .scope_annotation
                                 .as_ref()
                                 .map(|anno| anno.name.as_str()),
-                        );
+                        )?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {
+                        for arg_vid in unready {
+                            self.add_value_dependent(arg_vid, vid);
+                        }
                         false
                     }
                 }
@@ -3338,15 +3517,33 @@ impl<'a> ExecPass<'a> {
                                 BinOp::Add => Some(vl.clone() + vr.clone()),
                                 BinOp::Sub => Some(vl.clone() - vr.clone()),
                                 BinOp::Mul => {
-                                    match (state.solver.eval_expr(vl), state.solver.eval_expr(vr)) {
+                                    let res = match (
+                                        state.solver.eval_expr(vl),
+                                        state.solver.eval_expr(vr),
+                                    ) {
                                         (Some(vl), Some(vr)) => Some((vl * vr).into()),
                                         (Some(vl), None) => Some(vr.clone() * vl),
                                         (None, Some(vr)) => Some(vl.clone() * vr),
                                         (None, None) => None,
+                                    };
+                                    if res.is_none() {
+                                        for (_, var) in
+                                            vl.coeffs.clone().into_iter().chain(vr.coeffs.clone())
+                                        {
+                                            self.add_var_dependent(cell_id, var, vid);
+                                        }
                                     }
+                                    res
                                 }
                                 BinOp::Div => {
-                                    state.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs)
+                                    let res =
+                                        state.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs);
+                                    if res.is_none() {
+                                        for (_, var) in vr.coeffs.clone() {
+                                            self.add_var_dependent(cell_id, var, vid);
+                                        }
+                                    }
+                                    res
                                 }
                             };
                             if let Some(res) = res {
@@ -3367,9 +3564,19 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
                         }
-                        _ => todo!(),
+                        _ => {
+                            let span = self.span(&vref.loc, bin_op.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span.clone()),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
                     }
                 } else {
+                    self.add_value_dependent(bin_op.lhs, vid);
+                    self.add_value_dependent(bin_op.rhs, vid);
                     false
                 }
             }
@@ -3386,7 +3593,15 @@ impl<'a> ExecPass<'a> {
                                         .collect(),
                                     constant: -v.constant,
                                 },
-                                _ => unreachable!(),
+                                _ => {
+                                    let span = self.span(&vref.loc, unary_op.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
                             };
                             self.values
                                 .insert(vid, DeferValue::Ready(Value::Linear(res)));
@@ -3395,7 +3610,15 @@ impl<'a> ExecPass<'a> {
                         Value::Int(v) => {
                             let res = match unary_op.op {
                                 UnaryOp::Neg => -v,
-                                _ => unreachable!(),
+                                _ => {
+                                    let span = self.span(&vref.loc, unary_op.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
@@ -3403,6 +3626,7 @@ impl<'a> ExecPass<'a> {
                         _ => todo!(),
                     }
                 } else {
+                    self.add_value_dependent(unary_op.operand, vid);
                     false
                 }
             }
@@ -3423,7 +3647,7 @@ impl<'a> ExecPass<'a> {
                                 self.span(&vref.loc, if_.expr.then.span),
                             );
                             let then = self.visit_scope_expr_inner(
-                                vref.loc.cell,
+                                cell_id,
                                 vref.loc.frame,
                                 scope,
                                 &if_.expr.then,
@@ -3443,15 +3667,18 @@ impl<'a> ExecPass<'a> {
                                 self.span(&vref.loc, if_.expr.else_.span),
                             );
                             let else_ = self.visit_scope_expr_inner(
-                                vref.loc.cell,
+                                cell_id,
                                 vref.loc.frame,
                                 scope,
                                 &if_.expr.else_,
                             );
                             if_.state = IfExprState::Else(else_);
                         }
+                        self.values.insert(vid, Defer::Deferred(vref));
+                        self.cell_state_mut(cell_id).deferred.insert(vid);
                         true
                     } else {
+                        self.add_value_dependent(cond, vid);
                         false
                     }
                 }
@@ -3460,6 +3687,7 @@ impl<'a> ExecPass<'a> {
                         self.values.insert(vid, Defer::Ready(val.clone()));
                         true
                     } else {
+                        self.add_value_dependent(then, vid);
                         false
                     }
                 }
@@ -3468,6 +3696,7 @@ impl<'a> ExecPass<'a> {
                         self.values.insert(vid, Defer::Ready(val.clone()));
                         true
                     } else {
+                        self.add_value_dependent(else_, vid);
                         false
                     }
                 }
@@ -3484,8 +3713,11 @@ impl<'a> ExecPass<'a> {
                             .unwrap();
                         let value = self.visit_expr(vref.loc, &arm.expr);
                         match_.state = MatchExprState::Value(value);
+                        self.values.insert(vid, Defer::Deferred(vref));
+                        self.cell_state_mut(cell_id).deferred.insert(vid);
                         true
                     } else {
+                        self.add_value_dependent(scrutinee, vid);
                         false
                     }
                 }
@@ -3494,6 +3726,7 @@ impl<'a> ExecPass<'a> {
                         self.values.insert(vid, Defer::Ready(val.clone()));
                         true
                     } else {
+                        self.add_value_dependent(value, vid);
                         false
                     }
                 }
@@ -3523,6 +3756,11 @@ impl<'a> ExecPass<'a> {
                                 self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                                 true
                             } else {
+                                for (_, var) in
+                                    vl.coeffs.clone().into_iter().chain(vr.coeffs.clone())
+                                {
+                                    self.add_var_dependent(cell_id, var, vid);
+                                }
                                 false
                             }
                         }
@@ -3577,6 +3815,8 @@ impl<'a> ExecPass<'a> {
                         _ => unreachable!(),
                     }
                 } else {
+                    self.add_value_dependent(comparison_expr.state.left, vid);
+                    self.add_value_dependent(comparison_expr.state.right, vid);
                     false
                 }
             }
@@ -3599,13 +3839,21 @@ impl<'a> ExecPass<'a> {
                                             self.span(&vref.loc, field_access_expr.expr.span);
                                         self.errors.push(ExecError {
                                             span: Some(span),
-                                            cell: vref.loc.cell,
+                                            cell: cell_id,
                                             kind: ExecErrorKind::InvalidRotation,
                                         });
                                         Value::String("".to_string())
                                     }
                                 }
-                                f => unreachable!("invalid field `{f}`"),
+                                _ => {
+                                    let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
@@ -3616,13 +3864,12 @@ impl<'a> ExecPass<'a> {
                                 "y" => Some(Value::Linear(inst.y.clone())),
                                 field => {
                                     if let Defer::Ready(cell) = &self.values[&inst.cell] {
-                                        let cell_id = *cell.as_ref().unwrap_cell();
+                                        let inst_cell_id = *cell.as_ref().unwrap_cell();
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
-                                        let cell = &self.compiled_cells[&cell_id];
-                                        let state =
-                                            self.cell_states.get_mut(&vref.loc.cell).unwrap();
+                                        let cell = &self.compiled_cells[&inst_cell_id];
+                                        let state = self.cell_states.get_mut(&cell_id).unwrap();
                                         let obj_id = &mut self.next_id;
                                         Some(Value::from_array(cell.field(field).unwrap().map(
                                             &mut move |v| match v {
@@ -3695,15 +3942,64 @@ impl<'a> ExecPass<'a> {
                                 self.values.insert(vid, DeferValue::Ready(val));
                                 true
                             } else {
+                                self.add_value_dependent(inst.cell, vid);
                                 false
                             }
                         }
                         _ => {
-                            // Should abort compilation after VarIdTyPass; should not get here.
-                            unreachable!("field access expressions not supported on this type")
+                            let span = self.span(&vref.loc, field_access_expr.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
                         }
                     }
                 } else {
+                    self.add_value_dependent(field_access_expr.state.base, vid);
+                    false
+                }
+            }
+            PartialEvalState::Index(index_expr) => {
+                if let Defer::Ready(base) = &self.values[&index_expr.state.base]
+                    && let Defer::Ready(index) = &self.values[&index_expr.state.index]
+                {
+                    if let ValueRef::Seq(s) = base.as_ref() {
+                        if let ValueRef::Int(i) = index.as_ref() {
+                            if let Some(v) = usize::try_from(*i).ok().and_then(|i| s.get(i)) {
+                                self.values.insert(vid, DeferValue::Ready(v.clone()));
+                                true
+                            } else {
+                                let span = self.span(&vref.loc, index_expr.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::IndexOutOfBounds,
+                                });
+                                return Err(());
+                            }
+                        } else {
+                            let span = self.span(&vref.loc, index_expr.expr.index.span());
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
+                    } else {
+                        let span = self.span(&vref.loc, index_expr.expr.base.span());
+                        self.errors.push(ExecError {
+                            span: Some(span),
+                            cell: cell_id,
+                            kind: ExecErrorKind::InvalidType,
+                        });
+                        return Err(());
+                    }
+                } else {
+                    self.add_value_dependent(index_expr.state.base, vid);
+                    self.add_value_dependent(index_expr.state.index, vid);
                     false
                 }
             }
@@ -3727,6 +4023,8 @@ impl<'a> ExecPass<'a> {
                     self.values.insert(vid, DeferValue::Ready(Value::Nil));
                     true
                 } else {
+                    self.add_value_dependent(c.lhs, vid);
+                    self.add_value_dependent(c.rhs, vid);
                     false
                 }
             }
@@ -3737,10 +4035,18 @@ impl<'a> ExecPass<'a> {
                             Some(Value::Linear(LinearExpr::from(*x as f64)))
                         }
                         (x @ Value::Int(_), Ty::Int) => Some(x.clone()),
-                        (Value::Linear(expr), Ty::Int) => state
-                            .solver
-                            .eval_expr(expr)
-                            .map(|val| Value::Int(val as i64)),
+                        (Value::Linear(expr), Ty::Int) => {
+                            let res = state
+                                .solver
+                                .eval_expr(expr)
+                                .map(|val| Value::Int(val as i64));
+                            if res.is_none() {
+                                for (_, var) in expr.coeffs.clone() {
+                                    self.add_var_dependent(cell_id, var, vid);
+                                }
+                            }
+                            res
+                        }
                         (expr @ Value::Linear(_), Ty::Float) => Some(expr.clone()),
                         _ => unreachable!("invalid cast"),
                     };
@@ -3751,17 +4057,20 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 } else {
+                    self.add_value_dependent(c.value, vid);
                     false
                 }
             }
         };
 
-        let cell_id = vref.loc.cell;
-        self.values.entry(vid).or_insert(v);
-        if self.values[&vid].is_ready() {
-            self.cell_state_mut(cell_id).deferred.swap_remove(&vid);
+        if self.values[&vid].is_ready()
+            && let Some(deps) = self.value_dependents.get(&vid)
+        {
+            for dep_vid in deps.clone() {
+                self.cell_state_mut(cell_id).deferred.insert(dep_vid);
+            }
         }
-        progress
+        Ok(progress)
     }
 
     pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
@@ -4152,12 +4461,18 @@ pub enum StaticErrorKind {
     /// No field on object of the given type.
     #[error("no field {field} on type {ty:?}")]
     NoFieldOnTy { field: String, ty: Ty },
+    /// Cannot index the given type.
+    #[error("type {ty:?} cannot be indexed")]
+    CannotIndex { ty: Ty },
     /// Incorrect type.
     #[error("expected type {expected:?}, found {found:?}")]
     IncorrectTy { expected: Ty, found: Ty },
     /// Incorrect type category.
     #[error("expected type category {expected}, found {found:?}")]
     IncorrectTyCategory { found: Ty, expected: String },
+    /// Empty list constructor.
+    #[error("list constructors cannot be empty (use `[]` for an empty list)")]
+    EmptyListConstructor,
     /// Called a function or cell with the wrong number of positional arguments.
     #[error("expected {expected} position arguments, found {found}")]
     CallIncorrectPositionalArity { expected: usize, found: usize },
@@ -4217,6 +4532,9 @@ pub enum ExecErrorKind {
     /// Inconsistent constraint.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
+    /// Invalid rounding (e.g. solved value is not sufficiently close to a rounding step).
+    #[error("invalid rounding")]
+    InvalidRounding(Var),
     /// A cell or instance had an empty bounding box.
     #[error("empty bbox")]
     EmptyBbox,
@@ -4226,6 +4544,12 @@ pub enum ExecErrorKind {
     /// Edges of a rect are in the wrong order (e.g. x0 > x1 or y0 > y1).
     #[error("rect edges are in the wrong order: {0}")]
     FlippedRect(String),
+    /// Operation on an incompatible type, usually due to erroneous use of `Any`.
+    #[error("operation on an incompatible type (check usage of `Any`)")]
+    InvalidType,
+    /// Index out of bounds.
+    #[error("index out of bounds")]
+    IndexOutOfBounds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4275,10 +4599,11 @@ enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
     Match(Box<PartialMatchExpr<T>>),
     Comparison(Box<PartialComparisonExpr<T>>),
-    BinOp(PartialBinOp),
-    UnaryOp(PartialUnaryOp),
+    BinOp(PartialBinOp<T>),
+    UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
+    Index(Box<PartialIndexExpr<T>>),
     Constraint(PartialConstraint),
     Cast(PartialCast),
 }
@@ -4299,16 +4624,18 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBinOp {
+struct PartialBinOp<T: AstMetadata> {
     lhs: ValueId,
     rhs: ValueId,
     op: BinOp,
+    expr: Box<BinOpExpr<Substr, T>>,
 }
 
 #[derive(Debug, Clone)]
-struct PartialUnaryOp {
+struct PartialUnaryOp<T: AstMetadata> {
     operand: ValueId,
     op: UnaryOp,
+    expr: Box<UnaryOpExpr<Substr, T>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4367,8 +4694,20 @@ struct PartialFieldAccessExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialIndexExpr<T: AstMetadata> {
+    expr: IndexExpr<Substr, T>,
+    state: IndexExprState,
+}
+
+#[derive(Debug, Clone)]
 pub struct FieldAccessExprState {
     base: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexExprState {
+    base: ValueId,
+    index: ValueId,
 }
 
 pub fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {

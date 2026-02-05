@@ -20,21 +20,15 @@ use crate::spqr_eigen::SpqrFactorization;
 pub struct Solver {
     next_var: u64,
     next_constraint: ConstraintId,
-    constraints: Vec<SolverConstraint>,
+    constraints: IndexMap<ConstraintId, LinearExpr>,
+    var_to_constraints: IndexMap<Var, IndexSet<ConstraintId>>,
+    // Solved and unsolved vars are separate to reduce overhead of many solved variables.
     solved_vars: IndexMap<Var, f64>,
+    unsolved_vars: IndexSet<Var>,
+    updated_vars: IndexSet<Var>,
+    back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
-}
-
-pub fn substitute_expr(table: &IndexMap<Var, f64>, expr: &mut LinearExpr) {
-    let (l, r): (Vec<f64>, Vec<_>) = expr.coeffs.iter().partition_map(|a @ (coeff, var)| {
-        if let Some(s) = table.get(var) {
-            Either::Left(coeff * s)
-        } else {
-            Either::Right(*a)
-        }
-    });
-    expr.coeffs = r;
-    expr.constant += l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
+    invalid_rounding: IndexSet<Var>,
 }
 
 fn round(x: f64) -> f64 {
@@ -48,22 +42,21 @@ impl Solver {
 
     pub fn new_var(&mut self) -> Var {
         let var = Var(self.next_var);
+        self.unsolved_vars.insert(var);
         self.next_var += 1;
         var
     }
 
     /// Returns true if all variables have been solved.
     pub fn fully_solved(&self) -> bool {
-        self.solved_vars.len() == self.next_var as usize
+        self.unsolved_vars.is_empty()
     }
 
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
             // Find any unsolved variable and constrain it to equal 0.
-            let v = (0..self.next_var)
-                .find(|&i| !self.solved_vars.contains_key(&Var(i)))
-                .unwrap();
-            self.constrain_eq0(LinearExpr::from(Var(v)));
+            let v = self.unsolved_vars.first().unwrap();
+            self.constrain_eq0(LinearExpr::from(*v));
             self.solve();
         }
     }
@@ -73,8 +66,31 @@ impl Solver {
         &self.inconsistent_constraints
     }
 
-    pub fn unsolved_vars(&self) -> IndexSet<Var> {
-        IndexSet::from_iter((0..self.next_var).map(Var).filter(|&v| !self.is_solved(v)))
+    #[inline]
+    pub fn updated_vars(&self) -> &IndexSet<Var> {
+        &self.updated_vars
+    }
+
+    #[inline]
+    pub fn clear_updated_vars(&mut self) {
+        self.updated_vars.clear()
+    }
+
+    #[inline]
+    pub fn invalid_rounding(&self) -> &IndexSet<Var> {
+        &self.invalid_rounding
+    }
+
+    pub fn unsolved_vars(&self) -> &IndexSet<Var> {
+        &self.unsolved_vars
+    }
+
+    pub fn solve_var(&mut self, var: Var, val: f64) {
+        let old = self.solved_vars.insert(var, val);
+        if old.is_none() {
+            self.updated_vars.insert(var);
+        }
+        self.unsolved_vars.swap_remove(&var);
     }
 
     /// Constrains the value of `expr` to 0.
@@ -82,17 +98,72 @@ impl Solver {
     pub fn constrain_eq0(&mut self, expr: LinearExpr) -> ConstraintId {
         let id = self.next_constraint;
         self.next_constraint += 1;
-        let mut constraint = SolverConstraint { id, expr };
-        substitute_expr(&self.solved_vars, &mut constraint.expr);
-        self.constraints.push(constraint);
-        self.solve();
+        for (_, var) in &expr.coeffs {
+            self.var_to_constraints.entry(*var).or_default().insert(id);
+        }
+        self.constraints.insert(id, expr);
+        // Use explicit stack in heap-allocated vector to avoid stack overflow.
+        self.back_substitute_stack.push(id);
+        while !self.back_substitute_stack.is_empty() {
+            self.try_back_substitute();
+        }
         id
+    }
+
+    // Tries to back substitute using the given [`ConstraintId`].
+    pub fn try_back_substitute(&mut self) {
+        // If coefficient length is not 1, do nothing.
+        if let Some(id) = self.back_substitute_stack.pop()
+            && let Some(constraint) = self.constraints.get_mut(&id)
+        {
+            constraint.simplify(&self.solved_vars);
+            if constraint.coeffs.is_empty()
+                && !relative_eq!(constraint.constant, 0., epsilon = EPSILON)
+            {
+                self.inconsistent_constraints.insert(id);
+                self.constraints.swap_remove(&id);
+                return;
+            }
+            if constraint.coeffs.len() != 1 {
+                return;
+            }
+            // If constraint solves a variable, insert it into the solved vars and traverse all
+            // constraints involving the variable.
+            let (coeff, var) = constraint.coeffs[0];
+            let val = -constraint.constant / coeff;
+            if let Some(old_val) = self.solved_vars.get(&var) {
+                if relative_ne!(*old_val, val, epsilon = EPSILON) {
+                    self.inconsistent_constraints.insert(id);
+                }
+            } else {
+                let rounded_val = round(val);
+                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
+                    self.invalid_rounding.insert(var);
+                }
+                self.solve_var(var, rounded_val);
+            }
+            self.constraints.swap_remove(&id);
+            for constraint in self
+                .var_to_constraints
+                .get(&var)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect_vec()
+            {
+                self.back_substitute_stack.push(constraint);
+            }
+        }
     }
 
     /// Solves for as many variables as possible and substitutes their values into existing constraints.
     /// Deletes constraints that no longer contain unsolved variables.
+    ///
+    /// Constraints should be simplified before this function is invoked.
     pub fn solve(&mut self) {
-        let n_vars = self.next_var as usize;
+        // Snapshot unsolved variables before solving.
+        let unsolved_vars = self.unsolved_vars.clone();
+        let n_vars = unsolved_vars.len();
         if n_vars == 0 || self.constraints.is_empty() {
             return;
         }
@@ -196,11 +267,11 @@ impl Solver {
             if constraint.expr.coeffs.is_empty()
                 && approx::relative_ne!(constraint.expr.constant, 0., epsilon = EPSILON)
             {
-                self.inconsistent_constraints.insert(constraint.id);
+                self.inconsistent_constraints.insert(*id);
             }
         }
         self.constraints
-            .retain(|constraint| !constraint.expr.coeffs.is_empty());
+            .retain(|_, constraint| !constraint.coeffs.is_empty());
     }
 
     pub fn value_of(&self, var: Var) -> Option<f64> {
@@ -225,28 +296,30 @@ impl Solver {
 pub type ConstraintId = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
-pub struct SolverConstraint {
-    pub id: ConstraintId,
-    pub expr: LinearExpr,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
 pub struct LinearExpr {
     pub coeffs: Vec<(f64, Var)>,
     pub constant: f64,
 }
 
 impl LinearExpr {
-    pub fn coeff_vec(&self, n_vars: usize) -> Vec<f64> {
-        let mut out = vec![0.; n_vars];
-        for (val, var) in &self.coeffs {
-            out[var.0 as usize] += *val;
-        }
-        out
-    }
-
     pub fn add(lhs: impl Into<LinearExpr>, rhs: impl Into<LinearExpr>) -> Self {
         lhs.into() + rhs.into()
+    }
+
+    /// Substitutes variables in `table` and removes entries with coefficient 0.
+    pub fn simplify(&mut self, table: &IndexMap<Var, f64>) {
+        let (l, r): (Vec<f64>, Vec<_>) = self.coeffs.iter().partition_map(|a @ (coeff, var)| {
+            if relative_eq!(*coeff, 0., epsilon = EPSILON) {
+                return Either::Left(0.);
+            }
+            if let Some(s) = table.get(var) {
+                Either::Left(coeff * s)
+            } else {
+                Either::Right(*a)
+            }
+        });
+        self.coeffs = r;
+        self.constant += l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
     }
 }
 
@@ -369,6 +442,9 @@ mod tests {
         assert_relative_eq!(*solver.solved_vars.get(&x).unwrap(), 5., epsilon = EPSILON);
         assert_relative_eq!(*solver.solved_vars.get(&y).unwrap(), 5., epsilon = EPSILON);
         assert!(!solver.solved_vars.contains_key(&z));
+        assert!(!solver.unsolved_vars.contains(&x));
+        assert!(!solver.unsolved_vars.contains(&y));
+        assert!(solver.unsolved_vars.contains(&z));
     }
 
     #[test]

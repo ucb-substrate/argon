@@ -1,6 +1,9 @@
 ### Argon ###
 *.gui
 
+### Illustrator ###
+*.tmp
+
 ### Linux ###
 *~
 

@@ -167,6 +167,14 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
     }
 
+    fn dispatch_index_expr(
+        &mut self,
+        _input: &compiler::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _index: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
+    }
+
     fn dispatch_call_expr(
         &mut self,
         input: &CallExpr<Substr, Self::InputMetadata>,
@@ -298,6 +306,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
             Expr::FieldAccess(field_access_expr) => Expr::FieldAccess(Box::new(
                 self.transform_field_access_expr(field_access_expr),
             )),
+            Expr::Index(index_expr) => Expr::Index(Box::new(self.transform_index_expr(index_expr))),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::Nil(nil) => Expr::Nil(*nil),
             Expr::SeqNil(nil) => Expr::SeqNil(*nil),

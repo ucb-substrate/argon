@@ -87,7 +87,15 @@ fn array2(r: Rect, nx: Int, ny: Int, xpitch: Float, ypitch: Float) -> Rect {
 fn max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect {
     let nx = (((w - r.w) / xpitch) as Int + 1);
     let ny = (((h - r.h) / ypitch) as Int + 1);
-    #scope0 array2(r, nx, ny, xpitch, ypitch)
+    if nx >= 1 {
+        if ny >= 1 {
+            #scope0 array2(r, nx, ny, xpitch, ypitch)
+        } else {
+            crect(w=0., h=0.)
+        }
+    } else {
+        crect(w=0., h=0.)
+    }
 }
 
 fn eq_rect(r1: Rect, r2: Rect) {
