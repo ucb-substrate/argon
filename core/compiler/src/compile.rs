@@ -1620,10 +1620,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     );
                     if let Some(ty) = args.posargs.first() {
                         self.assert_ty_is_cell(ty.span(), &ty.ty());
-                        if let Ty::Cell(c) = ty.ty() {
-                            (None, Ty::Inst(c.clone()))
-                        } else {
-                            (None, Ty::Unknown)
+                        match ty.ty() {
+                            Ty::Cell(c) => (None, Ty::Inst(c.clone())),
+                            Ty::Any => (None, Ty::Any),
+                            _ => (None, Ty::Unknown),
                         }
                     } else {
                         (None, Ty::Unknown)
