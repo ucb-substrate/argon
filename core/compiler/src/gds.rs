@@ -165,7 +165,9 @@ impl CompiledData {
                     }));
                 }
                 SolvedValue::Instance(i) => {
-                    self.cell_to_gds(exporter, i.cell)?;
+                    if exporter.names.name(&i.cell).is_none() {
+                        self.cell_to_gds(exporter, i.cell)?;
+                    }
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
                         name: exporter.names.name(&i.cell).unwrap().clone(),
                         xy: GdsPoint::new(exporter.coord_to_gds(i.x), exporter.coord_to_gds(i.y)),
