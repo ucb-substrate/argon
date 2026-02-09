@@ -1,4 +1,5 @@
 use arcstr::ArcStr;
+use cfgrammar::Span;
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
 use tower_lsp_server::lsp_types::{Position, Range};
 
@@ -34,6 +35,13 @@ impl Document {
 
     pub(crate) fn offset_to_pos(&self, offset: usize) -> Position {
         pos2position(self.contents.offset_to_pos(offset).unwrap())
+    }
+
+    pub(crate) fn span_to_range(&self, span: Span) -> Range {
+        Range::new(
+            self.offset_to_pos(span.start()),
+            self.offset_to_pos(span.end()),
+        )
     }
 
     pub(crate) fn substr(&self, range: std::ops::Range<Position>) -> &str {
