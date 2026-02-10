@@ -753,7 +753,17 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if *found != *expected && !(*found == Ty::Any || *expected == Ty::Any) {
+        if *found == Ty::Any || *expected == Ty::Any {
+            return;
+        }
+
+        if let Ty::Seq(found) = found
+            && let Ty::Seq(expected) = expected
+        {
+            return self.assert_eq_ty(span, found, expected);
+        }
+
+        if *found != *expected {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
