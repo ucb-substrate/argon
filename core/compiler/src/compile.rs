@@ -3881,7 +3881,22 @@ impl<'a> ExecPass<'a> {
                                         let cell = &self.compiled_cells[&inst_cell_id];
                                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                                         let obj_id = &mut self.next_id;
-                                        Some(Value::from_array(cell.field(field).unwrap().map(
+                                        let field_value =
+                                            if let Some(field_value) = cell.field(field) {
+                                                field_value
+                                            } else {
+                                                self.errors.push(ExecError {
+                                                    span: Some(self.span(
+                                                        &vref.loc,
+                                                        field_access_expr.expr.span,
+                                                    )),
+                                                    cell: cell_id,
+                                                    // TODO: More descriptive error
+                                                    kind: ExecErrorKind::EmptyBbox,
+                                                });
+                                                return Err(());
+                                            };
+                                        Some(Value::from_array(field_value.map(
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
                                                     let id = object_id(obj_id);
