@@ -144,6 +144,7 @@ impl StateMut {
             let static_output = compile::static_compile(&self.ast);
             // If GUI is connected, must annotate scopes.
             if self.gui_client.is_some() {
+                let mut to_save = Vec::new();
                 for (_, ast) in &self.ast {
                     let scope_annotation = ScopeAnnotationPass::new(ast);
                     let mut text_edits = scope_annotation.execute();
@@ -161,14 +162,15 @@ impl StateMut {
                             .await
                             .unwrap();
 
-                        client
-                            .send_request::<ForceSave>(ast.path.clone())
-                            .await
-                            .unwrap();
-
-                        // `compile` will be reinvoked upon save.
-                        return;
+                        to_save.push(ast.path.clone());
                     }
+                }
+                let should_return = !to_save.is_empty();
+                for path in to_save {
+                    client.send_request::<ForceSave>(path).await.unwrap();
+                }
+                if should_return {
+                    return;
                 }
             }
 

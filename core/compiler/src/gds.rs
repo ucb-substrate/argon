@@ -35,7 +35,7 @@ impl GdsExporter {
     }
 
     fn coord_to_gds(&self, coord: f64) -> i32 {
-        (coord * 1e-9 / self.lib.units.db_unit()) as i32
+        (coord * 1e-9 / self.lib.units.db_unit()).round() as i32
     }
 }
 
@@ -154,8 +154,8 @@ impl CompiledData {
                         layer,
                         xtype: texttype,
                     } = exporter.map[&text.layer];
-                    let x = text.x as i32;
-                    let y = text.y as i32;
+                    let x = exporter.coord_to_gds(text.x);
+                    let y = exporter.coord_to_gds(text.y);
                     ocell.elems.push(GdsElement::GdsTextElem(GdsTextElem {
                         string: ArcStr::from(&text.text),
                         layer,
@@ -165,7 +165,9 @@ impl CompiledData {
                     }));
                 }
                 SolvedValue::Instance(i) => {
-                    self.cell_to_gds(exporter, i.cell)?;
+                    if exporter.names.name(&i.cell).is_none() {
+                        self.cell_to_gds(exporter, i.cell)?;
+                    }
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
                         name: exporter.names.name(&i.cell).unwrap().clone(),
                         xy: GdsPoint::new(exporter.coord_to_gds(i.x), exporter.coord_to_gds(i.y)),

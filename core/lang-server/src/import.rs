@@ -16,8 +16,7 @@ use crate::document::Document;
 pub(crate) struct ScopeAnnotationPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
     content: Document,
-    assigned_names: Vec<IndexSet<String>>,
-    to_add: Vec<Vec<Range>>,
+    annotations: Vec<Vec<(Option<Substr>, Range)>>,
     edits: Vec<TextEdit>,
 }
 
@@ -26,8 +25,7 @@ impl<'a> ScopeAnnotationPass<'a> {
         Self {
             ast,
             content: Document::new(&ast.text, 0),
-            assigned_names: vec![Default::default()],
-            to_add: vec![Default::default()],
+            annotations: vec![Default::default()],
             edits: vec![],
         }
     }
@@ -50,6 +48,36 @@ impl<'a> ScopeAnnotationPass<'a> {
         }
 
         self.edits
+    }
+}
+
+fn increment_or_add_zero(input: &str) -> String {
+    // Find the index where the trailing digits start
+    let split_idx = input
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit())
+        .last()
+        .map(|(i, _)| i);
+
+    match split_idx {
+        Some(idx) => {
+            let (prefix, suffix) = input.split_at(idx);
+
+            // Parse the number
+            if let Ok(num) = suffix.parse::<u64>() {
+                // Increment and maintain the original width for leading zeros
+                let incremented = num + 1;
+                format!("{}{:0width$}", prefix, incremented, width = suffix.len())
+            } else {
+                // Handle cases where the number is too large for u64
+                format!("{}0", input)
+            }
+        }
+        None => {
+            // No digits at the end, just add '0'
+            format!("{}0", input)
+        }
     }
 }
 
@@ -115,16 +143,16 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         _else_: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         if let Some(scope_annotation) = &input.scope_annotation {
-            self.assigned_names
-                .last_mut()
-                .unwrap()
-                .insert(scope_annotation.name.to_string());
+            self.annotations.last_mut().unwrap().push((
+                Some(scope_annotation.name.clone()),
+                self.content.span_to_range(scope_annotation.span),
+            ));
         } else {
             let start = self.content.offset_to_pos(input.span.start());
-            self.to_add
+            self.annotations
                 .last_mut()
                 .unwrap()
-                .push(Range::new(start, start));
+                .push((None, Range::new(start, start)));
         }
     }
 
@@ -185,22 +213,21 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
             return;
         }
         if let Some(scope_annotation) = &input.scope_annotation {
-            self.assigned_names
-                .last_mut()
-                .unwrap()
-                .insert(scope_annotation.name.to_string());
+            self.annotations.last_mut().unwrap().push((
+                Some(scope_annotation.name.clone()),
+                self.content.span_to_range(scope_annotation.span),
+            ));
         } else {
             let start = self.content.offset_to_pos(input.span.start());
-            self.to_add
+            self.annotations
                 .last_mut()
                 .unwrap()
-                .push(Range::new(start, start));
+                .push((None, Range::new(start, start)));
         }
     }
 
     fn enter_scope(&mut self, _input: &Scope<Substr, Self::InputMetadata>) {
-        self.assigned_names.push(Default::default());
-        self.to_add.push(Default::default());
+        self.annotations.push(Default::default());
     }
 
     fn exit_scope(
@@ -208,24 +235,42 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
         _input: &Scope<Substr, Self::InputMetadata>,
         _output: &Scope<Substr, Self::OutputMetadata>,
     ) {
-        if let Some(mut to_add) = self.to_add.pop()
-            && let Some(mut assigned_names) = self.assigned_names.pop()
-        {
-            to_add.reverse();
-            let mut id = 0;
-            while let Some(range) = to_add.pop() {
-                let name = loop {
-                    let name = format!("scope{}", id);
-                    id += 1;
-                    if !assigned_names.contains(&name) {
-                        assigned_names.insert(name.clone());
-                        break name;
+        if let Some(mut annotations) = self.annotations.pop() {
+            let mut assigned_names = IndexSet::new();
+            for (annotation, range) in &annotations {
+                if let Some(annotation) = annotation {
+                    if assigned_names.contains(annotation) {
+                        let mut new_name = increment_or_add_zero(annotation);
+                        while assigned_names.contains(new_name.as_str()) {
+                            new_name = increment_or_add_zero(&new_name);
+                        }
+                        self.edits.push(TextEdit {
+                            range: *range,
+                            new_text: new_name.clone(),
+                        });
+                        assigned_names.insert(Substr::from(new_name));
+                    } else {
+                        assigned_names.insert(annotation.clone());
                     }
-                };
-                self.edits.push(TextEdit {
-                    range,
-                    new_text: format!("#{name} "),
-                });
+                }
+            }
+            annotations.reverse();
+            let mut id = 0;
+            for (annotation, range) in annotations {
+                if annotation.is_none() {
+                    let name = loop {
+                        let name = Substr::from(format!("scope{}", id));
+                        id += 1;
+                        if !assigned_names.contains(&name) {
+                            assigned_names.insert(name.clone());
+                            break name;
+                        }
+                    };
+                    self.edits.push(TextEdit {
+                        range,
+                        new_text: format!("#{name} "),
+                    });
+                }
             }
         }
     }
@@ -316,16 +361,16 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
             Expr::StringLiteral(string_literal) => Expr::StringLiteral(string_literal.clone()),
             Expr::Scope(scope) => {
                 if let Some(scope_annotation) = &scope.scope_annotation {
-                    self.assigned_names
-                        .last_mut()
-                        .unwrap()
-                        .insert(scope_annotation.name.to_string());
+                    self.annotations.last_mut().unwrap().push((
+                        Some(scope_annotation.name.clone()),
+                        self.content.span_to_range(scope_annotation.span),
+                    ));
                 } else {
                     let start = self.content.offset_to_pos(scope.span.start());
-                    self.to_add
+                    self.annotations
                         .last_mut()
                         .unwrap()
-                        .push(Range::new(start, start));
+                        .push((None, Range::new(start, start)));
                 }
                 Expr::Scope(Box::new(self.transform_scope(scope)))
             }

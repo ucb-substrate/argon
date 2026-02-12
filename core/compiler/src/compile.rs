@@ -753,7 +753,17 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if *found != *expected && !(*found == Ty::Any || *expected == Ty::Any) {
+        if *found == Ty::Any || *expected == Ty::Any {
+            return;
+        }
+
+        if let Ty::Seq(found) = found
+            && let Ty::Seq(expected) = expected
+        {
+            return self.assert_eq_ty(span, found, expected);
+        }
+
+        if *found != *expected {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
@@ -1620,10 +1630,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     );
                     if let Some(ty) = args.posargs.first() {
                         self.assert_ty_is_cell(ty.span(), &ty.ty());
-                        if let Ty::Cell(c) = ty.ty() {
-                            (None, Ty::Inst(c.clone()))
-                        } else {
-                            (None, Ty::Unknown)
+                        match ty.ty() {
+                            Ty::Cell(c) => (None, Ty::Inst(c.clone())),
+                            Ty::Any => (None, Ty::Any),
+                            _ => (None, Ty::Unknown),
                         }
                     } else {
                         (None, Ty::Unknown)
@@ -3871,7 +3881,22 @@ impl<'a> ExecPass<'a> {
                                         let cell = &self.compiled_cells[&inst_cell_id];
                                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                                         let obj_id = &mut self.next_id;
-                                        Some(Value::from_array(cell.field(field).unwrap().map(
+                                        let field_value =
+                                            if let Some(field_value) = cell.field(field) {
+                                                field_value
+                                            } else {
+                                                self.errors.push(ExecError {
+                                                    span: Some(self.span(
+                                                        &vref.loc,
+                                                        field_access_expr.expr.span,
+                                                    )),
+                                                    cell: cell_id,
+                                                    // TODO: More descriptive error
+                                                    kind: ExecErrorKind::EmptyBbox,
+                                                });
+                                                return Err(());
+                                            };
+                                        Some(Value::from_array(field_value.map(
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
                                                     let id = object_id(obj_id);
