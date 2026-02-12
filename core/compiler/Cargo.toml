@@ -5,7 +5,12 @@ edition = "2024"
 
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
-nalgebra = { version = "0.34", features = ["sparse"] }
+nalgebra-sparse = "0.11"
+rayon = "1.10"
+libc = "0.2"
+rand = "0.8.5"
+gds21 = "0.2"
+nalgebra = { version = "0.34", features = ["rayon", "sparse"] }
 klayout-lyp = "0.1.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 
@@ -33,6 +38,7 @@ const_format = "0.2"
 
 [build-dependencies]
 lrpar = { version = "0.13", features = ["serde"] }
+cc = "1.2.51"
 
 cfgrammar = { workspace = true }
 lrlex = { workspace = true }
