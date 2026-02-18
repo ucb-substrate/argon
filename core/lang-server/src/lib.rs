@@ -511,8 +511,12 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
 
 pub async fn main() {
     // Start server for communication with GUI.
+    let port = std::env::var("ARGON_LANG_SERVER_DEFAULT_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(12345);
     let mut listener = if let Ok(listener) =
-        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12345), Json::default).await
+        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default).await
     {
         listener
     } else {
