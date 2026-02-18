@@ -63,8 +63,12 @@ impl SyncLangServerClient {
         let background_executor = self.app.background_executor().clone();
         let mut listener = self.app.background_executor().block(
             async {
+                let port = std::env::var("ARGON_GUI_DEFAULT_PORT")
+                    .ok()
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(12346);
                 if let Ok(listener) =
-                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 12346), Json::default)
+                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default)
                         .await
                 {
                     listener
