@@ -752,18 +752,22 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
-    fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if *found == Ty::Any || *expected == Ty::Any {
-            return;
+    fn is_eq_ty(&mut self, a: &Ty, b: &Ty) -> bool {
+        if *a == Ty::Any || *b == Ty::Any {
+            return true;
         }
 
-        if let Ty::Seq(found) = found
-            && let Ty::Seq(expected) = expected
+        if let Ty::Seq(a) = a
+            && let Ty::Seq(b) = b
         {
-            return self.assert_eq_ty(span, found, expected);
+            return self.is_eq_ty(a, b);
         }
 
-        if *found != *expected {
+        *a == *b
+    }
+
+    fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
+        if !self.is_eq_ty(found, expected) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
@@ -1278,7 +1282,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        if left_ty != right_ty {
+        if !self.is_eq_ty(&left_ty, &right_ty) {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::BinOpMismatchedTypes,
@@ -1704,6 +1708,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             | (Ty::Float, Ty::Int)
             | (Ty::Float, Ty::Float) => (),
             (_, Ty::Unknown) => (),
+            (Ty::Any, _) | (_, Ty::Any) => (),
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
