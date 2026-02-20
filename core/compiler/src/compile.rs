@@ -1314,7 +1314,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
             UnaryOp::Neg => {
                 let operand_ty = operand.ty();
-                if ![Ty::Float, Ty::Int].contains(&operand_ty) {
+                if ![Ty::Float, Ty::Int, Ty::Any].contains(&operand_ty) {
                     self.errors.push(StaticError {
                         span: self.span(operand.span()),
                         kind: StaticErrorKind::UnaryOpInvalidType,
