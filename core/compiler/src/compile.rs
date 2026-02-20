@@ -1708,6 +1708,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             | (Ty::Float, Ty::Int)
             | (Ty::Float, Ty::Float) => (),
             (_, Ty::Unknown) => (),
+            (Ty::Any, _) | (_, Ty::Any) => (),
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
