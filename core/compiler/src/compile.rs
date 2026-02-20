@@ -1284,16 +1284,16 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::BinOpMismatchedTypes,
             });
         }
-        if ![Ty::Float, Ty::Int].contains(&left_ty) {
+        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
             self.errors.push(StaticError {
                 span: self.span(left.span()),
-                kind: StaticErrorKind::BinOpInvalidType,
+                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
             });
         }
-        if ![Ty::Float, Ty::Int].contains(&right_ty) {
+        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
             self.errors.push(StaticError {
                 span: self.span(right.span()),
-                kind: StaticErrorKind::BinOpInvalidType,
+                kind: StaticErrorKind::BinOpInvalidType(right_ty),
             });
         }
         left_ty
@@ -4472,8 +4472,8 @@ pub enum StaticErrorKind {
     #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
     SeqMustCompareEqSeqNil,
     /// A type cannot be used in a binary expression.
-    #[error("type cannot be used in a binary expression")]
-    BinOpInvalidType,
+    #[error("type cannot be used in a binary expression: {0:?}")]
+    BinOpInvalidType(Ty),
     /// A type cannot be used in a unary operation.
     #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,
