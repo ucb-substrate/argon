@@ -1116,12 +1116,38 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
+        self.enter_scope(&input.scope);
+        // TODO: this code is mostly duplicated from `transform_scope`.
         let args: Vec<_> = input
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
-        let scope = self.transform_scope(&input.scope);
+        let scope_annotation = input
+            .scope
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
+        let stmts = input
+            .scope
+            .stmts
+            .iter()
+            .map(|stmt| self.transform_statement(stmt))
+            .collect_vec();
+        let tail = input
+            .scope
+            .tail
+            .as_ref()
+            .map(|stmt| self.transform_expr(stmt));
+        let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
+        let scope = Scope {
+            scope_annotation,
+            span: input.span,
+            stmts,
+            tail,
+            metadata,
+        };
+        self.exit_scope(&input.scope, &scope);
         if let Some(tail) = scope.tail.as_ref() {
             self.errors.push(StaticError {
                 span: self.span(tail.span()),

@@ -1,0 +1,8 @@
+cell square(size: Float) {
+    let shape = rect("met1", x0=0., y0=0., x1=size, y1=size);
+}
+
+cell top() {
+    let sq = inst(square(100.));
+    let shape = rect("met2", x0=0., y0=0., x1=200., y1=size);
+}
