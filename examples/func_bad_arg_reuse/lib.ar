@@ -1,0 +1,16 @@
+fn double(argument: Float) -> Float {
+    if argument > 0.0 {
+        let argument = argument;
+    } else {
+        let argument = -argument;
+    };
+    2. * argument
+}
+
+cell top() {
+    let shape = rect("met1");
+    eq(shape.x0, 0.);
+    eq(shape.y0, 0.);
+    eq(shape.x1, double(100.));
+    eq(shape.y1, argument);
+}

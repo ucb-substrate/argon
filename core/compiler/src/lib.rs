@@ -12,7 +12,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        compile::{ExecErrorKind, SolvedValue},
+        compile::{ExecErrorKind, SolvedValue, StaticErrorKind},
         gds::GdsMap,
         parse::parse_workspace_with_std,
     };
@@ -59,6 +59,8 @@ mod tests {
     const ARGON_ANY_TYPE: &str = concatcp!(EXAMPLES_DIR, "/any_type/lib.ar");
     const ARGON_SEQ_INDEX: &str = concatcp!(EXAMPLES_DIR, "/seq_index/lib.ar");
     const ARGON_SEQ_CONSTRUCTOR: &str = concatcp!(EXAMPLES_DIR, "/seq_constructor/lib.ar");
+    const ARGON_FUNC_BAD_ARG_REUSE: &str = concatcp!(EXAMPLES_DIR, "/func_bad_arg_reuse/lib.ar");
+    const ARGON_CELL_BAD_ARG_REUSE: &str = concatcp!(EXAMPLES_DIR, "/cell_bad_arg_reuse/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -780,5 +782,53 @@ mod tests {
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 300., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 500., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_func_bad_arg_reuse() {
+        let o = parse_workspace_with_std(ARGON_FUNC_BAD_ARG_REUSE);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let errors = cells.unwrap_static_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
+    }
+
+    #[test]
+    fn argon_cell_bad_arg_reuse() {
+        let o = parse_workspace_with_std(ARGON_CELL_BAD_ARG_REUSE);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let errors = cells.unwrap_static_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
     }
 }
