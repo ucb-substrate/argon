@@ -2277,7 +2277,6 @@ impl<'a> ExecPass<'a> {
             let state = self.cell_state(cell_id);
             !state.deferred.is_empty() || !state.solver.fully_solved()
         } {
-            println!("begin iter");
             let mut progress = false;
             while let Some(vid) = {
                 let state = self.cell_state_mut(cell_id);
@@ -2336,10 +2335,8 @@ impl<'a> ExecPass<'a> {
                 }
             }
         }
-        println!("done solving");
         {
             let state = self.cell_state(cell_id);
-            println!("deferred = {:?}", state.deferred);
         }
 
         let state = self.cell_state_mut(cell_id);
@@ -2957,7 +2954,6 @@ impl<'a> ExecPass<'a> {
     }
 
     fn add_value_dependent(&mut self, vid: ValueId, dependent: ValueId) {
-        println!("add dependent, {dependent:?} requires {vid:?}");
         self.value_dependents
             .entry(vid)
             .or_default()
@@ -4173,14 +4169,11 @@ impl<'a> ExecPass<'a> {
                     };
                     if let Some(value) = value {
                         self.values.insert(vid, DeferValue::Ready(value));
-                        println!("cast complete");
                         true
                     } else {
-                        println!("cast incomplete");
                         false
                     }
                 } else {
-                    println!("cast requires dependency");
                     self.add_value_dependent(c.state.value, vid);
                     false
                 }
