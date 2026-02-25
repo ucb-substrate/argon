@@ -17,9 +17,9 @@ use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath, IndexExpr,
-    KwArgValue, MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr,
-    WorkspaceAst,
+    BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath,
+    IndexExpr, KwArgValue, MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp,
+    UnaryOpExpr, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -2277,27 +2277,30 @@ impl<'a> ExecPass<'a> {
             let state = self.cell_state(cell_id);
             !state.deferred.is_empty() || !state.solver.fully_solved()
         } {
+            println!("begin iter");
             let mut progress = false;
             while let Some(vid) = {
                 let state = self.cell_state_mut(cell_id);
                 state.deferred.pop()
             } {
-                progress = self.eval_partial(cell_id, vid)? || progress;
+                progress |= self.eval_partial(cell_id, vid)?;
             }
 
             let state = self.cell_state_mut(cell_id);
             state.solve_iters += 1;
             state.solver.solve();
             progress = !state.solver.updated_vars().is_empty() || progress;
-            for var in state.solver.updated_vars().clone() {
-                if let Some(deps) = state.var_dependents.get(&var) {
-                    for dep in deps.clone() {
-                        state.deferred.insert(dep);
+            let update_var_dependents = |state: &mut CellState| {
+                for var in state.solver.updated_vars().clone() {
+                    if let Some(deps) = state.var_dependents.get(&var) {
+                        for dep in deps.clone() {
+                            state.deferred.insert(dep);
+                        }
                     }
                 }
-            }
-            let state = self.cell_state_mut(cell_id);
-            state.solver.clear_updated_vars();
+                state.solver.clear_updated_vars();
+            };
+            update_var_dependents(state);
 
             if !progress {
                 let state = self.cell_state_mut(cell_id);
@@ -2329,8 +2332,14 @@ impl<'a> ExecPass<'a> {
                 }
                 if !constraint_added {
                     state.solver.force_solution();
+                    update_var_dependents(state);
                 }
             }
+        }
+        println!("done solving");
+        {
+            let state = self.cell_state(cell_id);
+            println!("deferred = {:?}", state.deferred);
         }
 
         let state = self.cell_state_mut(cell_id);
@@ -2373,10 +2382,22 @@ impl<'a> ExecPass<'a> {
         let mut emit_obj = |obj: &Object| -> SolvedValue {
             match obj {
                 Object::Rect(rect) => {
-                    let x0 = state.solver.eval_expr(&rect.x0).unwrap();
-                    let y0 = state.solver.eval_expr(&rect.y0).unwrap();
-                    let x1 = state.solver.eval_expr(&rect.x1).unwrap();
-                    let y1 = state.solver.eval_expr(&rect.y1).unwrap();
+                    let x0 = state
+                        .solver
+                        .eval_expr(&rect.x0)
+                        .expect("rect x0 not solved");
+                    let y0 = state
+                        .solver
+                        .eval_expr(&rect.y0)
+                        .expect("rect y0 not solved");
+                    let x1 = state
+                        .solver
+                        .eval_expr(&rect.x1)
+                        .expect("rect x1 not solved");
+                    let y1 = state
+                        .solver
+                        .eval_expr(&rect.y1)
+                        .expect("rect y1 not solved");
                     if x0 > x1 {
                         self.errors.push(ExecError {
                             span: rect.span.clone(),
@@ -2406,34 +2427,48 @@ impl<'a> ExecPass<'a> {
                     id: text.id,
                     text: text.text.clone(),
                     layer: text.layer.clone(),
-                    x: state.solver.eval_expr(&text.x).unwrap(),
-                    y: state.solver.eval_expr(&text.y).unwrap(),
+                    x: state.solver.eval_expr(&text.x).expect("text x not solved"),
+                    y: state.solver.eval_expr(&text.y).expect("text x not solved"),
                     span: text.span.clone(),
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
-                    p: state.solver.eval_expr(&dim.p).unwrap(),
-                    n: state.solver.eval_expr(&dim.n).unwrap(),
-                    value: state.solver.eval_expr(&dim.value).unwrap(),
-                    coord: state.solver.eval_expr(&dim.coord).unwrap(),
-                    pstop: state.solver.eval_expr(&dim.pstop).unwrap(),
-                    nstop: state.solver.eval_expr(&dim.nstop).unwrap(),
+                    p: state.solver.eval_expr(&dim.p).expect("dim p not solved"),
+                    n: state.solver.eval_expr(&dim.n).expect("dim n not solved"),
+                    value: state
+                        .solver
+                        .eval_expr(&dim.value)
+                        .expect("dim value not solved"),
+                    coord: state
+                        .solver
+                        .eval_expr(&dim.coord)
+                        .expect("dim coord not solved"),
+                    pstop: state
+                        .solver
+                        .eval_expr(&dim.pstop)
+                        .expect("dim pstop not solved"),
+                    nstop: state
+                        .solver
+                        .eval_expr(&dim.nstop)
+                        .expect("dim nstop not solved"),
                     horiz: dim.horiz,
                     constraint: dim.constraint,
                     span: dim.span.clone(),
                 }),
                 Object::Inst(inst) => SolvedValue::Instance(SolvedInstance {
                     id: inst.id,
-                    x: state.solver.eval_expr(&inst.x).unwrap(),
-                    y: state.solver.eval_expr(&inst.y).unwrap(),
+                    x: state.solver.eval_expr(&inst.x).expect("inst x not solved"),
+                    y: state.solver.eval_expr(&inst.y).expect("inst y not solved"),
                     angle: inst.angle,
                     reflect: inst.reflect,
                     construction: inst.construction,
                     cell: *self.values[&inst.cell]
                         .as_ref()
-                        .unwrap_ready()
+                        .into_ready()
+                        .expect("inst parent cell not ready")
                         .as_ref()
-                        .unwrap_cell(),
+                        .into_cell()
+                        .expect("inst parent not a cell"),
                     span: inst.span.clone(),
                     cell_vid: inst.cell,
                 }),
@@ -2441,7 +2476,12 @@ impl<'a> ExecPass<'a> {
         };
         let emit_value = |vid: ValueId| -> Option<Arrayed<ObjectId>> {
             let value = &self.values[&vid];
-            value.as_ref().unwrap_ready().obj_ids()
+            tracing::error!("emitting value: {value:?}");
+            value
+                .as_ref()
+                .into_ready()
+                .expect("emitted values must be ready")
+                .obj_ids()
         };
 
         let mut ccell = CompiledCell {
@@ -2461,22 +2501,35 @@ impl<'a> ExecPass<'a> {
         }
 
         for emit in state.emit.iter() {
-            let obj_id = emit_value(emit.value).unwrap().unwrap_elem();
-            ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
-                obj_id,
-                CompiledEmit {
-                    span: emit.span.clone(),
-                },
-            ));
+            let obj_id = emit_value(emit.value)
+                .expect("failed to emit")
+                .into_elem()
+                .expect("emitted non-element object");
+            ccell
+                .scopes
+                .get_mut(&emit.scope)
+                .expect("cell scope not found for element emission")
+                .emit
+                .push((
+                    obj_id,
+                    CompiledEmit {
+                        span: emit.span.clone(),
+                    },
+                ));
         }
 
         for emit in state.object_emit.iter() {
-            ccell.scopes.get_mut(&emit.scope).unwrap().emit.push((
-                emit.object,
-                CompiledEmit {
-                    span: emit.span.clone(),
-                },
-            ));
+            ccell
+                .scopes
+                .get_mut(&emit.scope)
+                .expect("cell scope not found for object emission")
+                .emit
+                .push((
+                    emit.object,
+                    CompiledEmit {
+                        span: emit.span.clone(),
+                    },
+                ));
         }
 
         for (id, scope) in state.scopes.iter() {
@@ -2485,7 +2538,7 @@ impl<'a> ExecPass<'a> {
                     ccell
                         .scopes
                         .get_mut(id)
-                        .unwrap()
+                        .expect("scope not found")
                         .bindings
                         .insert(*seq_num, (name.clone(), obj_id));
                 }
@@ -2892,15 +2945,19 @@ impl<'a> ExecPass<'a> {
             }),
             Expr::Cast(cast) => self.new_deferred_value(loc, |this| {
                 let value = this.visit_expr(loc, &cast.value);
-                PartialEvalState::Cast(PartialCast {
-                    value,
-                    ty: cast.metadata.clone(),
-                })
+                PartialEvalState::Cast(Box::new(PartialCastExpr {
+                    expr: (**cast).clone(),
+                    state: PartialCastState {
+                        value,
+                        ty: cast.metadata.clone(),
+                    },
+                }))
             }),
         }
     }
 
     fn add_value_dependent(&mut self, vid: ValueId, dependent: ValueId) {
+        println!("add dependent, {dependent:?} requires {vid:?}");
         self.value_dependents
             .entry(vid)
             .or_default()
@@ -4085,8 +4142,8 @@ impl<'a> ExecPass<'a> {
                 }
             }
             PartialEvalState::Cast(c) => {
-                if let Defer::Ready(val) = &self.values[&c.value] {
-                    let value = match (val, &c.ty) {
+                if let Defer::Ready(val) = &self.values[&c.state.value] {
+                    let value = match (val, &c.state.ty) {
                         (Value::Int(x), Ty::Float) => {
                             Some(Value::Linear(LinearExpr::from(*x as f64)))
                         }
@@ -4104,16 +4161,27 @@ impl<'a> ExecPass<'a> {
                             res
                         }
                         (expr @ Value::Linear(_), Ty::Float) => Some(expr.clone()),
-                        _ => unreachable!("invalid cast"),
+                        _ => {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidCast,
+                            });
+                            return Err(());
+                        }
                     };
                     if let Some(value) = value {
                         self.values.insert(vid, DeferValue::Ready(value));
+                        println!("cast complete");
                         true
                     } else {
+                        println!("cast incomplete");
                         false
                     }
                 } else {
-                    self.add_value_dependent(c.value, vid);
+                    println!("cast requires dependency");
+                    self.add_value_dependent(c.state.value, vid);
                     false
                 }
             }
@@ -4603,6 +4671,9 @@ pub enum ExecErrorKind {
     /// Operation on an incompatible type, usually due to erroneous use of `Any`.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,
+    /// Attempted to cast a type to an incompatible type.
+    #[error("cast to an incompatible type (check usage of `Any`)")]
+    InvalidCast,
     /// Index out of bounds.
     #[error("index out of bounds")]
     IndexOutOfBounds,
@@ -4661,11 +4732,11 @@ enum PartialEvalState<T: AstMetadata> {
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
     Index(Box<PartialIndexExpr<T>>),
     Constraint(PartialConstraint),
-    Cast(PartialCast),
+    Cast(Box<PartialCastExpr<T>>),
 }
 
 #[derive(Debug, Clone)]
-struct PartialCast {
+struct PartialCastState {
     value: ValueId,
     ty: Ty,
 }
@@ -4753,6 +4824,12 @@ struct PartialFieldAccessExpr<T: AstMetadata> {
 struct PartialIndexExpr<T: AstMetadata> {
     expr: IndexExpr<Substr, T>,
     state: IndexExprState,
+}
+
+#[derive(Debug, Clone)]
+struct PartialCastExpr<T: AstMetadata> {
+    expr: CastExpr<Substr, T>,
+    state: PartialCastState,
 }
 
 #[derive(Debug, Clone)]

@@ -61,6 +61,9 @@ mod tests {
     const ARGON_SEQ_CONSTRUCTOR: &str = concatcp!(EXAMPLES_DIR, "/seq_constructor/lib.ar");
     const ARGON_FUNC_BAD_ARG_REUSE: &str = concatcp!(EXAMPLES_DIR, "/func_bad_arg_reuse/lib.ar");
     const ARGON_CELL_BAD_ARG_REUSE: &str = concatcp!(EXAMPLES_DIR, "/cell_bad_arg_reuse/lib.ar");
+    const ARGON_PARTIALLY_CONSTRAINED_INST: &str =
+        concatcp!(EXAMPLES_DIR, "/partially_constrained_inst/lib.ar");
+    const ARGON_INVALID_CAST: &str = concatcp!(EXAMPLES_DIR, "/invalid_cast/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -829,6 +832,54 @@ mod tests {
                 .errors
                 .iter()
                 .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
+    }
+
+    #[test]
+    fn argon_partially_constrained_inst() {
+        let o = parse_workspace_with_std(ARGON_PARTIALLY_CONSTRAINED_INST);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let errors = cells.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
+        );
+    }
+
+    #[test]
+    fn argon_invalid_cast() {
+        let o = parse_workspace_with_std(ARGON_INVALID_CAST);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let errors = cells.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast))
         );
     }
 }
