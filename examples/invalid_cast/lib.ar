@@ -1,0 +1,12 @@
+fn make_num() -> Any {
+    3.
+}
+
+fn make_rect() -> Any {
+    rect("met1", x0=0., y0=0., x1=100., y1=100.)
+}
+
+cell top() {
+    let n1 = make_num() as Int;
+    let n2 = make_rect() as Int;
+}
