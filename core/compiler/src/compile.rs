@@ -18,8 +18,8 @@ use thiserror::Error;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath,
-    IndexExpr, KwArgValue, MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp,
-    UnaryOpExpr, WorkspaceAst,
+    IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope, Span,
+    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -278,6 +278,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
     }
 
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        _input: &IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
+    }
+
     fn dispatch_index_expr(
         &mut self,
         _input: &crate::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -505,6 +513,7 @@ pub enum Ty {
     Enum(EnumTy),
     CellFn(Box<CellFnTy>),
     Seq(Box<Ty>),
+    Tuple(Vec<Ty>),
 }
 
 impl Ty {
@@ -583,6 +592,7 @@ impl AstMetadata for VarIdTyMetadata {
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
+    type IndexFieldAccessExpr = Ty;
     type IndexExpr = Ty;
     type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
@@ -917,6 +927,9 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::IndexFieldAccess(index_field_access_expr) => {
+                index_field_access_expr.metadata.clone()
+            }
             Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
             Expr::SeqNil(_) => Ty::SeqNil,
@@ -1443,6 +1456,44 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             _ => self.no_field_on_ty(field, base_ty.clone()),
+        }
+    }
+
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        _input: &crate::ast::IndexFieldAccessExpr<Substr, Self::InputMetadata>,
+        base: &Expr<Substr, Self::OutputMetadata>,
+        field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
+        let base_ty = base.ty();
+        match base_ty {
+            Ty::Tuple(t) => usize::try_from(field.value)
+                .map(|i| {
+                    t.get(i).cloned().unwrap_or_else(|| {
+                        self.errors.push(StaticError {
+                            span: self.span(field.span),
+                            kind: StaticErrorKind::TupleIndexOutOfRange,
+                        });
+                        Ty::Unknown
+                    })
+                })
+                .unwrap_or_else(|_| {
+                    self.errors.push(StaticError {
+                        span: self.span(field.span),
+                        kind: StaticErrorKind::TupleIndexOutOfRange,
+                    });
+                    Ty::Unknown
+                }),
+            // Propagate any and unknown types without throwing an error.
+            Ty::Any => Ty::Any,
+            Ty::Unknown => Ty::Unknown,
+            _ => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CannotIndexFieldAccess { ty: base_ty },
+                });
+                Ty::Unknown
+            }
         }
     }
 
@@ -2914,6 +2965,13 @@ impl<'a> ExecPass<'a> {
                     state: FieldAccessExprState { base },
                 }))
             }),
+            Expr::IndexFieldAccess(f) => self.new_deferred_value(loc, |this| {
+                let base = this.visit_expr(loc, &f.base);
+                PartialEvalState::IndexFieldAccess(Box::new(PartialIndexFieldAccessExpr {
+                    expr: (**f).clone(),
+                    state: IndexFieldAccessExprState { base },
+                }))
+            }),
             Expr::Index(i) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &i.base);
                 let index = this.visit_expr(loc, &i.index);
@@ -4070,6 +4128,24 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::IndexFieldAccess(field_access_expr) => {
+                if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
+                    match base.as_ref() {
+                        _ => {
+                            let span = self.span(&vref.loc, field_access_expr.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
+                    }
+                } else {
+                    self.add_value_dependent(field_access_expr.state.base, vid);
+                    false
+                }
+            }
             PartialEvalState::Index(index_expr) => {
                 if let Defer::Ready(base) = &self.values[&index_expr.state.base]
                     && let Defer::Ready(index) = &self.values[&index_expr.state.index]
@@ -4578,6 +4654,12 @@ pub enum StaticErrorKind {
     /// No field on object of the given type.
     #[error("no field {field} on type {ty:?}")]
     NoFieldOnTy { field: String, ty: Ty },
+    /// Tuple index out of range.
+    #[error("tuple index out of range")]
+    TupleIndexOutOfRange,
+    /// The fields of the given type cannot be accessed via index field access.
+    #[error("the fields of type {ty:?} cannot be accessed via index field access")]
+    CannotIndexFieldAccess { ty: Ty },
     /// Cannot index the given type.
     #[error("type {ty:?} cannot be indexed")]
     CannotIndex { ty: Ty },
@@ -4723,6 +4805,7 @@ enum PartialEvalState<T: AstMetadata> {
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
+    IndexFieldAccess(Box<PartialIndexFieldAccessExpr<T>>),
     Index(Box<PartialIndexExpr<T>>),
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
@@ -4814,6 +4897,12 @@ struct PartialFieldAccessExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialIndexFieldAccessExpr<T: AstMetadata> {
+    expr: IndexFieldAccessExpr<Substr, T>,
+    state: IndexFieldAccessExprState,
+}
+
+#[derive(Debug, Clone)]
 struct PartialIndexExpr<T: AstMetadata> {
     expr: IndexExpr<Substr, T>,
     state: IndexExprState,
@@ -4827,6 +4916,11 @@ struct PartialCastExpr<T: AstMetadata> {
 
 #[derive(Debug, Clone)]
 pub struct FieldAccessExprState {
+    base: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexFieldAccessExprState {
     base: ValueId,
 }
 

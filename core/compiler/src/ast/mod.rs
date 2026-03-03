@@ -207,6 +207,7 @@ pub enum Expr<S, T: AstMetadata> {
     Call(CallExpr<S, T>),
     Emit(Box<EmitExpr<S, T>>),
     FieldAccess(Box<FieldAccessExpr<S, T>>),
+    IndexFieldAccess(Box<IndexFieldAccessExpr<S, T>>),
     Index(Box<IndexExpr<S, T>>),
     IdentPath(IdentPath<S, T>),
     Nil(NilLiteral),
@@ -276,6 +277,14 @@ pub struct FieldAccessExpr<S, T: AstMetadata> {
     pub field: Ident<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::FieldAccessExpr,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct IndexFieldAccessExpr<S, T: AstMetadata> {
+    pub base: Expr<S, T>,
+    pub field: IntLiteral,
+    pub span: cfgrammar::Span,
+    pub metadata: T::IndexFieldAccessExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -359,6 +368,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::Emit(x) => x.span,
             Self::IdentPath(x) => x.span,
             Self::FieldAccess(x) => x.span,
+            Self::IndexFieldAccess(x) => x.span,
             Self::Index(x) => x.span,
             Self::Nil(x) => x.span,
             Self::SeqNil(x) => x.span,
@@ -388,6 +398,7 @@ pub trait AstMetadata {
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
     type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type IndexFieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IndexExpr: Debug + Clone + Serialize + DeserializeOwned;
     type CallExpr: Debug + Clone + Serialize + DeserializeOwned;
     type EmitExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -489,6 +500,12 @@ pub trait AstTransformer {
         base: &Expr<Self::OutputS, Self::OutputMetadata>,
         field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr;
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        input: &IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
+        base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr;
     fn dispatch_index_expr(
         &mut self,
         input: &IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -796,6 +813,19 @@ pub trait AstTransformer {
             metadata,
         }
     }
+    fn transform_index_field_access_expr(
+        &mut self,
+        input: &IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
+    ) -> IndexFieldAccessExpr<Self::OutputS, Self::OutputMetadata> {
+        let base = self.transform_expr(&input.base);
+        let metadata = self.dispatch_index_field_access_expr(input, &base, &input.field);
+        IndexFieldAccessExpr {
+            base,
+            field: input.field,
+            span: input.span,
+            metadata,
+        }
+    }
     fn transform_index_expr(
         &mut self,
         input: &IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -963,6 +993,9 @@ pub trait AstTransformer {
             Expr::Emit(emit_expr) => Expr::Emit(Box::new(self.transform_emit_expr(emit_expr))),
             Expr::FieldAccess(field_access_expr) => Expr::FieldAccess(Box::new(
                 self.transform_field_access_expr(field_access_expr),
+            )),
+            Expr::IndexFieldAccess(field_access_expr) => Expr::IndexFieldAccess(Box::new(
+                self.transform_index_field_access_expr(field_access_expr),
             )),
             Expr::Index(index_expr) => Expr::Index(Box::new(self.transform_index_expr(index_expr))),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
