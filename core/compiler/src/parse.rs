@@ -51,6 +51,7 @@ impl AstMetadata for ParseMetadata {
     type Typ = ();
     type FnDecl = ();
     type CastExpr = ();
+    type TupleExpr = ();
 }
 
 pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, anyhow::Error> {

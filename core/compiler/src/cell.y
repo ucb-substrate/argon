@@ -14,12 +14,6 @@ IdentPath -> Result<IdentPath<&'input str, ParseMetadata>, ()>
   }
   ;
 
-FloatLiteral -> Result<FloatLiteral, ()>
-  : 'FLOATLIT' {
-  let v = $1.map_err(|_| ())?;
-  Ok(FloatLiteral { span: v.span(), value: parse_float($lexer.span_str(v.span()))?, }) }
-  ;
-
 IntLiteral -> Result<IntLiteral, ()>
   : 'INTLIT' {
   let v = $1.map_err(|_| ())?;
@@ -42,7 +36,6 @@ CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
 Expr -> Result<Expr<&'input str, ParseMetadata>, ()>
   : IdentPath { Ok(Expr::IdentPath($1?)) }
   | IntLiteral { Ok(Expr::IntLiteral($1?)) }
-  | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   ;
 
 Args -> Result<Args<&'input str, ParseMetadata>, ()>

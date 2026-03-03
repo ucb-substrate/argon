@@ -124,6 +124,7 @@ pub struct CellDecl<S, T: AstMetadata> {
 pub enum TySpecKind<S, T: AstMetadata> {
     Ident(Ident<S, T>),
     Seq(Box<TySpec<S, T>>),
+    Tuple(Vec<TySpec<S, T>>),
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -218,6 +219,7 @@ pub enum Expr<S, T: AstMetadata> {
     BoolLiteral(BoolLiteral),
     Scope(Box<Scope<S, T>>),
     Cast(Box<CastExpr<S, T>>),
+    Tuple(TupleExpr<S, T>),
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -342,6 +344,13 @@ pub struct CastExpr<S, T: AstMetadata> {
     pub metadata: T::CastExpr,
 }
 
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct TupleExpr<S, T: AstMetadata> {
+    pub items: Vec<Expr<S, T>>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::TupleExpr,
+}
+
 pub(crate) fn parse_float(s: &str) -> Result<f64, ()> {
     s.parse::<f64>().map_err(|_| ())
 }
@@ -378,6 +387,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::BoolLiteral(x) => x.span,
             Self::Scope(x) => x.span,
             Self::Cast(x) => x.span,
+            Self::Tuple(x) => x.span,
         }
     }
 }
@@ -408,6 +418,7 @@ pub trait AstMetadata {
     type Scope: Debug + Clone + Serialize + DeserializeOwned;
     type Typ: Debug + Clone + Serialize + DeserializeOwned;
     type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type TupleExpr: Debug + Clone + Serialize + DeserializeOwned;
 }
 
 pub trait AstTransformer {
@@ -494,6 +505,11 @@ pub trait AstTransformer {
         value: &Expr<Self::OutputS, Self::OutputMetadata>,
         ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr;
+    fn dispatch_tuple_expr(
+        &mut self,
+        input: &TupleExpr<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr;
     fn dispatch_field_access_expr(
         &mut self,
         input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -593,6 +609,9 @@ pub trait AstTransformer {
         let kind = match &input.kind {
             TySpecKind::Ident(inner) => TySpecKind::Ident(self.transform_ident(inner)),
             TySpecKind::Seq(inner) => TySpecKind::Seq(Box::new(self.transform_ty_spec(inner))),
+            TySpecKind::Tuple(t) => {
+                TySpecKind::Tuple(t.iter().map(|x| self.transform_ty_spec(x)).collect())
+            }
         };
         TySpec {
             kind,
@@ -962,6 +981,23 @@ pub trait AstTransformer {
         }
     }
 
+    fn transform_tuple_expr(
+        &mut self,
+        input: &TupleExpr<Self::InputS, Self::InputMetadata>,
+    ) -> TupleExpr<Self::OutputS, Self::OutputMetadata> {
+        let items = input
+            .items
+            .iter()
+            .map(|i| self.transform_expr(i))
+            .collect::<Vec<_>>();
+        let metadata = self.dispatch_tuple_expr(input, &items);
+        TupleExpr {
+            items,
+            span: input.span,
+            metadata,
+        }
+    }
+
     fn transform_string_literal(
         &mut self,
         input: &StringLiteral<Self::InputS>,
@@ -1009,6 +1045,7 @@ pub trait AstTransformer {
             }
             Expr::Scope(scope) => Expr::Scope(Box::new(self.transform_scope(scope))),
             Expr::Cast(cast) => Expr::Cast(Box::new(self.transform_cast(cast))),
+            Expr::Tuple(tuple) => Expr::Tuple(self.transform_tuple_expr(tuple)),
         }
     }
 }

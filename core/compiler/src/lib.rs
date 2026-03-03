@@ -64,6 +64,8 @@ mod tests {
     const ARGON_PARTIALLY_CONSTRAINED_INST: &str =
         concatcp!(EXAMPLES_DIR, "/partially_constrained_inst/lib.ar");
     const ARGON_INVALID_CAST: &str = concatcp!(EXAMPLES_DIR, "/invalid_cast/lib.ar");
+    const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
+    const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -881,5 +883,72 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast))
         );
+    }
+
+    #[test]
+    fn argon_tuple_basic() {
+        let o = parse_workspace_with_std(ARGON_TUPLE_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 2);
+
+        let r = cell
+            .objects
+            .iter()
+            .find_map(|(_, v)| v.get_rect().filter(|&r| r.layer == Some("met1".into())))
+            .unwrap();
+        assert_relative_eq!(r.x0.0, 100., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 200., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 300., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 400., epsilon = EPSILON);
+
+        let r = cell
+            .objects
+            .iter()
+            .find_map(|(_, v)| v.get_rect().filter(|&r| r.layer == Some("met2".into())))
+            .unwrap();
+        assert_relative_eq!(r.x0.0, 3., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 25., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 53., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_tuple_any() {
+        let o = parse_workspace_with_std(ARGON_TUPLE_ANY);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 60., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 40., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 140., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 150., epsilon = EPSILON);
     }
 }

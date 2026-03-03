@@ -191,6 +191,14 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_tuple_expr(
+        &mut self,
+        input: &super::TupleExpr<Self::InputS, Self::InputMetadata>,
+        _items: &[super::Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+        input.metadata.clone()
+    }
+
     fn dispatch_field_access_expr(
         &mut self,
         input: &super::FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -203,8 +211,8 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
     fn dispatch_index_field_access_expr(
         &mut self,
         input: &super::IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
-        base: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-        field: &super::IntLiteral,
+        _base: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+        _field: &super::IntLiteral,
     ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
         input.metadata.clone()
     }

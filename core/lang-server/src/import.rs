@@ -299,6 +299,13 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
+    fn dispatch_tuple_expr(
+        &mut self,
+        _input: &compiler::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
+        _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+    }
+
     fn dispatch_emit_expr(
         &mut self,
         _input: &compiler::ast::EmitExpr<Substr, Self::InputMetadata>,
@@ -386,6 +393,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
                 Expr::Scope(Box::new(self.transform_scope(scope)))
             }
             Expr::Cast(cast) => Expr::Cast(Box::new(self.transform_cast(cast))),
+            Expr::Tuple(tuple) => Expr::Tuple(self.transform_tuple_expr(tuple)),
         }
     }
 

@@ -270,6 +270,13 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
+    fn dispatch_tuple_expr(
+        &mut self,
+        _input: &crate::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
+        _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+    }
+
     fn dispatch_field_access_expr(
         &mut self,
         _input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -602,6 +609,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Scope = Ty;
     type Typ = ();
     type CastExpr = Ty;
+    type TupleExpr = Ty;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -740,6 +748,7 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }),
             TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
+            TySpecKind::Tuple(t) => Ty::Tuple(t.iter().map(|x| self.ty_from_spec(x)).collect()),
         }
     }
 
@@ -771,6 +780,15 @@ impl<'a> VarIdTyPass<'a> {
             && let Ty::Seq(b) = b
         {
             return self.is_eq_ty(a, b);
+        }
+
+        if let Ty::Tuple(a) = a
+            && let Ty::Tuple(b) = b
+        {
+            if a.len() != b.len() {
+                return false;
+            }
+            return a.iter().zip(b.iter()).all(|(a, b)| self.is_eq_ty(a, b));
         }
 
         *a == *b
@@ -940,6 +958,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Scope(scope) => scope.metadata.clone(),
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
+            Expr::Tuple(t) => t.metadata.clone(),
         }
     }
 }
@@ -1796,6 +1815,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         ty
     }
 
+    fn dispatch_tuple_expr(
+        &mut self,
+        _input: &crate::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+        Ty::Tuple(items.iter().map(|i| i.ty()).collect())
+    }
+
     fn dispatch_kw_arg_value(
         &mut self,
         _input: &crate::ast::KwArgValue<Substr, Self::InputMetadata>,
@@ -2385,9 +2412,6 @@ impl<'a> ExecPass<'a> {
                     update_var_dependents(state);
                 }
             }
-        }
-        {
-            let state = self.cell_state(cell_id);
         }
 
         let state = self.cell_state_mut(cell_id);
@@ -3007,6 +3031,15 @@ impl<'a> ExecPass<'a> {
                         ty: cast.metadata.clone(),
                     },
                 }))
+            }),
+            Expr::Tuple(tuple) => self.new_deferred_value(loc, |this| {
+                PartialEvalState::Tuple(PartialTupleExpr {
+                    items: tuple
+                        .items
+                        .iter()
+                        .map(|i| this.visit_expr(loc, i))
+                        .collect(),
+                })
             }),
         }
     }
@@ -4131,6 +4164,23 @@ impl<'a> ExecPass<'a> {
             PartialEvalState::IndexFieldAccess(field_access_expr) => {
                 if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
                     match base.as_ref() {
+                        ValueRef::Tuple(t) => {
+                            if let Some(v) = usize::try_from(field_access_expr.expr.field.value)
+                                .ok()
+                                .and_then(|i| t.get(i))
+                            {
+                                self.values.insert(vid, DeferValue::Ready(v.clone()));
+                                true
+                            } else {
+                                let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
+                        }
                         _ => {
                             let span = self.span(&vref.loc, field_access_expr.expr.span);
                             self.errors.push(ExecError {
@@ -4254,6 +4304,26 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::Tuple(tuple) => {
+                let items = tuple
+                    .items
+                    .iter()
+                    .map(|i| self.values[i].get_ready().cloned())
+                    .collect::<Option<Vec<_>>>();
+                if let Some(items) = items {
+                    self.values
+                        .insert(vid, DeferValue::Ready(Value::Tuple(items)));
+                    true
+                } else {
+                    let dep = tuple
+                        .items
+                        .iter()
+                        .find(|&i| !self.values[i].is_ready())
+                        .unwrap();
+                    self.add_value_dependent(*dep, vid);
+                    false
+                }
+            }
         };
 
         if self.values[&vid].is_ready()
@@ -4331,6 +4401,7 @@ pub enum Value {
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
     Seq(Vec<Value>),
+    Tuple(Vec<Value>),
     SeqNil,
     Nil,
 }
@@ -4809,6 +4880,7 @@ enum PartialEvalState<T: AstMetadata> {
     Index(Box<PartialIndexExpr<T>>),
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
+    Tuple(PartialTupleExpr),
 }
 
 #[derive(Debug, Clone)]
@@ -4912,6 +4984,11 @@ struct PartialIndexExpr<T: AstMetadata> {
 struct PartialCastExpr<T: AstMetadata> {
     expr: CastExpr<Substr, T>,
     state: PartialCastState,
+}
+
+#[derive(Debug, Clone)]
+struct PartialTupleExpr {
+    items: Vec<ValueId>,
 }
 
 #[derive(Debug, Clone)]
