@@ -1,0 +1,16 @@
+fn make_tuple() -> (Int, Int) {
+    (3, 5,)
+}
+
+fn make_rect_coords(t: (Int, Int)) -> ((Int, Int), (Int, Int)) {
+    ((t.0, t.1,), (t.1 + 20, t.0 + 50,),)
+}
+
+cell top() {
+    let tuple = (100.0, 200., 300., 400.,);
+    let r1 = rect("met1", x0=tuple.0 as Float, y0=tuple.1 as Float, x1=tuple.2 as Float, y1=tuple.3 as Float);
+    let tup = make_tuple();
+    let v = make_rect_coords(tup);
+    let r2 = rect("met2", x0=(v.0.0 as Float), y0=v.0.1 as Float, x1=v.1.0 as Float, y1=v.1.1 as Float);
+}
+

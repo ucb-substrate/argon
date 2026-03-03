@@ -18,8 +18,8 @@ use thiserror::Error;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath,
-    IndexExpr, KwArgValue, MatchExpr, ModPath, Scope, Span, TySpec, TySpecKind, UnaryOp,
-    UnaryOpExpr, WorkspaceAst,
+    IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope, Span,
+    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -270,12 +270,27 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
+    fn dispatch_tuple_expr(
+        &mut self,
+        _input: &crate::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
+        _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+    }
+
     fn dispatch_field_access_expr(
         &mut self,
         _input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
         _base: &Expr<Self::OutputS, Self::OutputMetadata>,
         _field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
+    }
+
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        _input: &IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
+        _base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
     }
 
     fn dispatch_index_expr(
@@ -505,6 +520,7 @@ pub enum Ty {
     Enum(EnumTy),
     CellFn(Box<CellFnTy>),
     Seq(Box<Ty>),
+    Tuple(Vec<Ty>),
 }
 
 impl Ty {
@@ -583,6 +599,7 @@ impl AstMetadata for VarIdTyMetadata {
     type UnaryOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
+    type IndexFieldAccessExpr = Ty;
     type IndexExpr = Ty;
     type CallExpr = (Option<VarId>, Ty);
     type EmitExpr = Ty;
@@ -592,6 +609,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Scope = Ty;
     type Typ = ();
     type CastExpr = Ty;
+    type TupleExpr = Ty;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -730,6 +748,7 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }),
             TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
+            TySpecKind::Tuple(t) => Ty::Tuple(t.iter().map(|x| self.ty_from_spec(x)).collect()),
         }
     }
 
@@ -761,6 +780,15 @@ impl<'a> VarIdTyPass<'a> {
             && let Ty::Seq(b) = b
         {
             return self.is_eq_ty(a, b);
+        }
+
+        if let Ty::Tuple(a) = a
+            && let Ty::Tuple(b) = b
+        {
+            if a.len() != b.len() {
+                return false;
+            }
+            return a.iter().zip(b.iter()).all(|(a, b)| self.is_eq_ty(a, b));
         }
 
         *a == *b
@@ -917,6 +945,9 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
             Expr::FieldAccess(field_access_expr) => field_access_expr.metadata.clone(),
+            Expr::IndexFieldAccess(index_field_access_expr) => {
+                index_field_access_expr.metadata.clone()
+            }
             Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
             Expr::SeqNil(_) => Ty::SeqNil,
@@ -927,6 +958,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Scope(scope) => scope.metadata.clone(),
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
+            Expr::Tuple(t) => t.metadata.clone(),
         }
     }
 }
@@ -1446,6 +1478,44 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         }
     }
 
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        _input: &crate::ast::IndexFieldAccessExpr<Substr, Self::InputMetadata>,
+        base: &Expr<Substr, Self::OutputMetadata>,
+        field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
+        let base_ty = base.ty();
+        match base_ty {
+            Ty::Tuple(t) => usize::try_from(field.value)
+                .map(|i| {
+                    t.get(i).cloned().unwrap_or_else(|| {
+                        self.errors.push(StaticError {
+                            span: self.span(field.span),
+                            kind: StaticErrorKind::TupleIndexOutOfRange,
+                        });
+                        Ty::Unknown
+                    })
+                })
+                .unwrap_or_else(|_| {
+                    self.errors.push(StaticError {
+                        span: self.span(field.span),
+                        kind: StaticErrorKind::TupleIndexOutOfRange,
+                    });
+                    Ty::Unknown
+                }),
+            // Propagate any and unknown types without throwing an error.
+            Ty::Any => Ty::Any,
+            Ty::Unknown => Ty::Unknown,
+            _ => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CannotIndexFieldAccess { ty: base_ty },
+                });
+                Ty::Unknown
+            }
+        }
+    }
+
     fn dispatch_index_expr(
         &mut self,
         _input: &crate::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -1743,6 +1813,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         };
         ty
+    }
+
+    fn dispatch_tuple_expr(
+        &mut self,
+        _input: &crate::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+        Ty::Tuple(items.iter().map(|i| i.ty()).collect())
     }
 
     fn dispatch_kw_arg_value(
@@ -2335,9 +2413,6 @@ impl<'a> ExecPass<'a> {
                 }
             }
         }
-        {
-            let state = self.cell_state(cell_id);
-        }
 
         let state = self.cell_state_mut(cell_id);
         for constraint in state.solver.inconsistent_constraints().clone() {
@@ -2914,6 +2989,13 @@ impl<'a> ExecPass<'a> {
                     state: FieldAccessExprState { base },
                 }))
             }),
+            Expr::IndexFieldAccess(f) => self.new_deferred_value(loc, |this| {
+                let base = this.visit_expr(loc, &f.base);
+                PartialEvalState::IndexFieldAccess(Box::new(PartialIndexFieldAccessExpr {
+                    expr: (**f).clone(),
+                    state: IndexFieldAccessExprState { base },
+                }))
+            }),
             Expr::Index(i) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &i.base);
                 let index = this.visit_expr(loc, &i.index);
@@ -2949,6 +3031,15 @@ impl<'a> ExecPass<'a> {
                         ty: cast.metadata.clone(),
                     },
                 }))
+            }),
+            Expr::Tuple(tuple) => self.new_deferred_value(loc, |this| {
+                PartialEvalState::Tuple(PartialTupleExpr {
+                    items: tuple
+                        .items
+                        .iter()
+                        .map(|i| this.visit_expr(loc, i))
+                        .collect(),
+                })
             }),
         }
     }
@@ -4070,6 +4161,41 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::IndexFieldAccess(field_access_expr) => {
+                if let Defer::Ready(base) = &self.values[&field_access_expr.state.base] {
+                    match base.as_ref() {
+                        ValueRef::Tuple(t) => {
+                            if let Some(v) = usize::try_from(field_access_expr.expr.field.value)
+                                .ok()
+                                .and_then(|i| t.get(i))
+                            {
+                                self.values.insert(vid, DeferValue::Ready(v.clone()));
+                                true
+                            } else {
+                                let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
+                        }
+                        _ => {
+                            let span = self.span(&vref.loc, field_access_expr.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
+                    }
+                } else {
+                    self.add_value_dependent(field_access_expr.state.base, vid);
+                    false
+                }
+            }
             PartialEvalState::Index(index_expr) => {
                 if let Defer::Ready(base) = &self.values[&index_expr.state.base]
                     && let Defer::Ready(index) = &self.values[&index_expr.state.index]
@@ -4178,6 +4304,26 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::Tuple(tuple) => {
+                let items = tuple
+                    .items
+                    .iter()
+                    .map(|i| self.values[i].get_ready().cloned())
+                    .collect::<Option<Vec<_>>>();
+                if let Some(items) = items {
+                    self.values
+                        .insert(vid, DeferValue::Ready(Value::Tuple(items)));
+                    true
+                } else {
+                    let dep = tuple
+                        .items
+                        .iter()
+                        .find(|&i| !self.values[i].is_ready())
+                        .unwrap();
+                    self.add_value_dependent(*dep, vid);
+                    false
+                }
+            }
         };
 
         if self.values[&vid].is_ready()
@@ -4255,6 +4401,7 @@ pub enum Value {
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
     Seq(Vec<Value>),
+    Tuple(Vec<Value>),
     SeqNil,
     Nil,
 }
@@ -4578,6 +4725,12 @@ pub enum StaticErrorKind {
     /// No field on object of the given type.
     #[error("no field {field} on type {ty:?}")]
     NoFieldOnTy { field: String, ty: Ty },
+    /// Tuple index out of range.
+    #[error("tuple index out of range")]
+    TupleIndexOutOfRange,
+    /// The fields of the given type cannot be accessed via index field access.
+    #[error("the fields of type {ty:?} cannot be accessed via index field access")]
+    CannotIndexFieldAccess { ty: Ty },
     /// Cannot index the given type.
     #[error("type {ty:?} cannot be indexed")]
     CannotIndex { ty: Ty },
@@ -4723,9 +4876,11 @@ enum PartialEvalState<T: AstMetadata> {
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
+    IndexFieldAccess(Box<PartialIndexFieldAccessExpr<T>>),
     Index(Box<PartialIndexExpr<T>>),
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
+    Tuple(PartialTupleExpr),
 }
 
 #[derive(Debug, Clone)]
@@ -4814,6 +4969,12 @@ struct PartialFieldAccessExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialIndexFieldAccessExpr<T: AstMetadata> {
+    expr: IndexFieldAccessExpr<Substr, T>,
+    state: IndexFieldAccessExprState,
+}
+
+#[derive(Debug, Clone)]
 struct PartialIndexExpr<T: AstMetadata> {
     expr: IndexExpr<Substr, T>,
     state: IndexExprState,
@@ -4826,7 +4987,17 @@ struct PartialCastExpr<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
+struct PartialTupleExpr {
+    items: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FieldAccessExprState {
+    base: ValueId,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexFieldAccessExprState {
     base: ValueId,
 }
 

@@ -124,6 +124,7 @@ pub struct CellDecl<S, T: AstMetadata> {
 pub enum TySpecKind<S, T: AstMetadata> {
     Ident(Ident<S, T>),
     Seq(Box<TySpec<S, T>>),
+    Tuple(Vec<TySpec<S, T>>),
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -207,6 +208,7 @@ pub enum Expr<S, T: AstMetadata> {
     Call(CallExpr<S, T>),
     Emit(Box<EmitExpr<S, T>>),
     FieldAccess(Box<FieldAccessExpr<S, T>>),
+    IndexFieldAccess(Box<IndexFieldAccessExpr<S, T>>),
     Index(Box<IndexExpr<S, T>>),
     IdentPath(IdentPath<S, T>),
     Nil(NilLiteral),
@@ -217,6 +219,7 @@ pub enum Expr<S, T: AstMetadata> {
     BoolLiteral(BoolLiteral),
     Scope(Box<Scope<S, T>>),
     Cast(Box<CastExpr<S, T>>),
+    Tuple(TupleExpr<S, T>),
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -279,6 +282,14 @@ pub struct FieldAccessExpr<S, T: AstMetadata> {
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct IndexFieldAccessExpr<S, T: AstMetadata> {
+    pub base: Expr<S, T>,
+    pub field: IntLiteral,
+    pub span: cfgrammar::Span,
+    pub metadata: T::IndexFieldAccessExpr,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct IndexExpr<S, T: AstMetadata> {
     pub base: Expr<S, T>,
     pub index: Expr<S, T>,
@@ -333,6 +344,13 @@ pub struct CastExpr<S, T: AstMetadata> {
     pub metadata: T::CastExpr,
 }
 
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct TupleExpr<S, T: AstMetadata> {
+    pub items: Vec<Expr<S, T>>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::TupleExpr,
+}
+
 pub(crate) fn parse_float(s: &str) -> Result<f64, ()> {
     s.parse::<f64>().map_err(|_| ())
 }
@@ -359,6 +377,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::Emit(x) => x.span,
             Self::IdentPath(x) => x.span,
             Self::FieldAccess(x) => x.span,
+            Self::IndexFieldAccess(x) => x.span,
             Self::Index(x) => x.span,
             Self::Nil(x) => x.span,
             Self::SeqNil(x) => x.span,
@@ -368,6 +387,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::BoolLiteral(x) => x.span,
             Self::Scope(x) => x.span,
             Self::Cast(x) => x.span,
+            Self::Tuple(x) => x.span,
         }
     }
 }
@@ -388,6 +408,7 @@ pub trait AstMetadata {
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
     type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type IndexFieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IndexExpr: Debug + Clone + Serialize + DeserializeOwned;
     type CallExpr: Debug + Clone + Serialize + DeserializeOwned;
     type EmitExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -397,6 +418,7 @@ pub trait AstMetadata {
     type Scope: Debug + Clone + Serialize + DeserializeOwned;
     type Typ: Debug + Clone + Serialize + DeserializeOwned;
     type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type TupleExpr: Debug + Clone + Serialize + DeserializeOwned;
 }
 
 pub trait AstTransformer {
@@ -483,12 +505,23 @@ pub trait AstTransformer {
         value: &Expr<Self::OutputS, Self::OutputMetadata>,
         ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr;
+    fn dispatch_tuple_expr(
+        &mut self,
+        input: &TupleExpr<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr;
     fn dispatch_field_access_expr(
         &mut self,
         input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
         base: &Expr<Self::OutputS, Self::OutputMetadata>,
         field: &Ident<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr;
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        input: &IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
+        base: &Expr<Self::OutputS, Self::OutputMetadata>,
+        field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr;
     fn dispatch_index_expr(
         &mut self,
         input: &IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -576,6 +609,9 @@ pub trait AstTransformer {
         let kind = match &input.kind {
             TySpecKind::Ident(inner) => TySpecKind::Ident(self.transform_ident(inner)),
             TySpecKind::Seq(inner) => TySpecKind::Seq(Box::new(self.transform_ty_spec(inner))),
+            TySpecKind::Tuple(t) => {
+                TySpecKind::Tuple(t.iter().map(|x| self.transform_ty_spec(x)).collect())
+            }
         };
         TySpec {
             kind,
@@ -796,6 +832,19 @@ pub trait AstTransformer {
             metadata,
         }
     }
+    fn transform_index_field_access_expr(
+        &mut self,
+        input: &IndexFieldAccessExpr<Self::InputS, Self::InputMetadata>,
+    ) -> IndexFieldAccessExpr<Self::OutputS, Self::OutputMetadata> {
+        let base = self.transform_expr(&input.base);
+        let metadata = self.dispatch_index_field_access_expr(input, &base, &input.field);
+        IndexFieldAccessExpr {
+            base,
+            field: input.field,
+            span: input.span,
+            metadata,
+        }
+    }
     fn transform_index_expr(
         &mut self,
         input: &IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -932,6 +981,23 @@ pub trait AstTransformer {
         }
     }
 
+    fn transform_tuple_expr(
+        &mut self,
+        input: &TupleExpr<Self::InputS, Self::InputMetadata>,
+    ) -> TupleExpr<Self::OutputS, Self::OutputMetadata> {
+        let items = input
+            .items
+            .iter()
+            .map(|i| self.transform_expr(i))
+            .collect::<Vec<_>>();
+        let metadata = self.dispatch_tuple_expr(input, &items);
+        TupleExpr {
+            items,
+            span: input.span,
+            metadata,
+        }
+    }
+
     fn transform_string_literal(
         &mut self,
         input: &StringLiteral<Self::InputS>,
@@ -964,6 +1030,9 @@ pub trait AstTransformer {
             Expr::FieldAccess(field_access_expr) => Expr::FieldAccess(Box::new(
                 self.transform_field_access_expr(field_access_expr),
             )),
+            Expr::IndexFieldAccess(field_access_expr) => Expr::IndexFieldAccess(Box::new(
+                self.transform_index_field_access_expr(field_access_expr),
+            )),
             Expr::Index(index_expr) => Expr::Index(Box::new(self.transform_index_expr(index_expr))),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::Nil(nil) => Expr::Nil(*nil),
@@ -976,6 +1045,7 @@ pub trait AstTransformer {
             }
             Expr::Scope(scope) => Expr::Scope(Box::new(self.transform_scope(scope))),
             Expr::Cast(cast) => Expr::Cast(Box::new(self.transform_cast(cast))),
+            Expr::Tuple(tuple) => Expr::Tuple(self.transform_tuple_expr(tuple)),
         }
     }
 }

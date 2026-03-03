@@ -53,9 +53,13 @@ SeqNilLiteral -> Result<SeqNilLiteral, ()>
   ;
 
 FloatLiteral -> Result<FloatLiteral, ()>
-  : 'FLOATLIT' {
-  let v = $1.map_err(|_| ())?;
-  Ok(FloatLiteral { span: v.span(), value: parse_float($lexer.span_str(v.span()))?, }) }
+  : 'INTLIT' '.' {
+    let v = $1.map_err(|_| ())?;
+    Ok(FloatLiteral { span: $span, value: parse_float($lexer.span_str(v.span()))?, })
+  }
+  | 'INTLIT' '.' 'INTLIT' {
+    Ok(FloatLiteral { span: $span, value: parse_float($lexer.span_str($span))?, })
+  }
   ;
 
 IntLiteral -> Result<IntLiteral, ()>
@@ -343,21 +347,39 @@ Factor -> Result<Expr<&'input str, ParseMetadata>, ()>
   ;
 
 SubFactor -> Result<Expr<&'input str, ParseMetadata>, ()>
-  : '(' Expr ')' { $2 }
-  | CallExpr { Ok(Expr::Call($1?)) }
-  | SubFactor '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
-  | SubFactor '[' Expr ']' { Ok(Expr::Index(Box::new(IndexExpr { base: $1?, index: $3?, span: $span, metadata: () }))) }
-  | SubFactor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
-  | IdentPath { Ok(Expr::IdentPath($1?)) }
-  | IntLiteral { Ok(Expr::IntLiteral($1?)) }
+  : IntLiteral { Ok(Expr::IntLiteral($1?)) }
   | FloatLiteral { Ok(Expr::FloatLiteral($1?)) }
   | StringLiteral { Ok(Expr::StringLiteral($1?)) }
   | BoolLiteral { Ok(Expr::BoolLiteral($1?)) }
   | NilLiteral { Ok(Expr::Nil($1?)) }
   | SeqNilLiteral { Ok(Expr::SeqNil($1?)) }
   | SubFactor 'AS' TySpec { Ok(Expr::Cast(Box::new(CastExpr { value: $1?, ty: $3?, span: $span, metadata: (), }))) }
+  | ObjExpr { $1 }
   ;
 
+ObjExpr -> Result<Expr<&'input str, ParseMetadata>, ()>
+  : '(' Expr ')' { $2 }
+  | TupleExpr { Ok(Expr::Tuple($1?)) }
+  | CallExpr { Ok(Expr::Call($1?)) }
+  | ObjExpr '.' Ident { Ok(Expr::FieldAccess(Box::new(FieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
+  | ObjExpr '.' IntLiteral { Ok(Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr { base: $1?, field: $3?, span: $span, metadata: (), }))) }
+  | SubFactor '[' Expr ']' { Ok(Expr::Index(Box::new(IndexExpr { base: $1?, index: $3?, span: $span, metadata: () }))) }
+  | SubFactor '!' { Ok(Expr::Emit(Box::new(EmitExpr { value: $1?, span: $span, metadata: (), }))) }
+  | IdentPath { Ok(Expr::IdentPath($1?)) }
+  ;
+
+TupleExpr -> Result<TupleExpr<&'input str, ParseMetadata>, ()>
+  : '(' TupleExprList ')' { Ok(TupleExpr { items: $2?, span: $span, metadata: () }) }
+  ;
+
+TupleExprList -> Result<Vec<Expr<&'input str, ParseMetadata>>, ()>
+  : Expr ',' { Ok(vec![$1?]) }
+  | TupleExprList Expr ',' {
+      let mut __tmp = $1?;
+      __tmp.push($2?);
+      Ok(__tmp)
+  }
+  ;
 
 CallExpr -> Result<CallExpr<&'input str, ParseMetadata>, ()>
   : ScopeAnnotation IdentPath '(' Args ')'
@@ -400,6 +422,16 @@ ArgDecl -> Result<ArgDecl<&'input str, ParseMetadata>, ()>
 TySpec -> Result<TySpec<&'input str, ParseMetadata>, ()>
   : Ident { Ok(TySpec { kind: TySpecKind::Ident($1?), span: $span, }) }
   | '[' TySpec ']' { Ok(TySpec { kind: TySpecKind::Seq(Box::new($2?)), span: $span, }) }
+  | '(' TySpecList ')' { Ok(TySpec { kind: TySpecKind::Tuple($2?), span: $span, }) }
+  ;
+
+TySpecList -> Result<Vec<TySpec<&'input str, ParseMetadata>>, ()>
+  : TySpec { Ok(vec![$1?]) }
+  | TySpecList ',' TySpec {
+      let mut __tmp = $1?;
+      __tmp.push($3?);
+      Ok(__tmp)
+  }
   ;
 
 Args -> Result<Args<&'input str, ParseMetadata>, ()>

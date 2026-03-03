@@ -3,7 +3,7 @@ use compiler::{
     ast::{
         ArgDecl, Args, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
         ConstantDecl, Decl, EnumDecl, Expr, FieldAccessExpr, FnDecl, Ident, IdentPath, IfExpr,
-        Scope, TySpec, UnaryOpExpr, annotated::AnnotatedAst,
+        IndexFieldAccessExpr, IntLiteral, Scope, TySpec, UnaryOpExpr, annotated::AnnotatedAst,
     },
     compile::BUILTINS,
     parse::ParseMetadata,
@@ -195,6 +195,14 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
     }
 
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        _input: &IndexFieldAccessExpr<Substr, Self::InputMetadata>,
+        _base: &Expr<Substr, Self::OutputMetadata>,
+        _field: &IntLiteral,
+    ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
+    }
+
     fn dispatch_index_expr(
         &mut self,
         _input: &compiler::ast::IndexExpr<Self::InputS, Self::InputMetadata>,
@@ -291,6 +299,13 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
     }
 
+    fn dispatch_tuple_expr(
+        &mut self,
+        _input: &compiler::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
+        _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+    }
+
     fn dispatch_emit_expr(
         &mut self,
         _input: &compiler::ast::EmitExpr<Substr, Self::InputMetadata>,
@@ -351,6 +366,9 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
             Expr::FieldAccess(field_access_expr) => Expr::FieldAccess(Box::new(
                 self.transform_field_access_expr(field_access_expr),
             )),
+            Expr::IndexFieldAccess(field_access_expr) => Expr::IndexFieldAccess(Box::new(
+                self.transform_index_field_access_expr(field_access_expr),
+            )),
             Expr::Index(index_expr) => Expr::Index(Box::new(self.transform_index_expr(index_expr))),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::Nil(nil) => Expr::Nil(*nil),
@@ -375,6 +393,7 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
                 Expr::Scope(Box::new(self.transform_scope(scope)))
             }
             Expr::Cast(cast) => Expr::Cast(Box::new(self.transform_cast(cast))),
+            Expr::Tuple(tuple) => Expr::Tuple(self.transform_tuple_expr(tuple)),
         }
     }
 

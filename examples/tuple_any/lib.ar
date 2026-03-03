@@ -1,0 +1,31 @@
+fn make_tuple() -> (Int, Int) {
+    (40, 60,)
+}
+
+fn ident(x: Any) -> Any {
+    x
+}
+
+fn erase(x: (Int, Any)) -> Any {
+    x
+}
+
+fn recover(x: Any) -> (Int, Any) {
+    x
+}
+
+fn transpose_any(x: (Int, Any)) -> (Any, Int) {
+    x
+}
+
+fn safe_transpose(x: (Int, Any)) -> (Any, Int) {
+    (x.1, x.0,)
+}
+
+
+cell top() {
+    let tuple = make_tuple();
+    let tuple2 = recover(erase(safe_transpose(transpose_any(recover(erase(ident(tuple)))))));
+    let r1 = rect("met1", x0=tuple2.0 as Float, y0=tuple2.1 as Float, x1=(tuple2.0 + 80) as Float, y1=(tuple2.1 + 110) as Float);
+}
+
