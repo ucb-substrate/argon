@@ -2,9 +2,21 @@ fn prepend(lst: [Any]) -> [Float] {
     cons(100., lst)
 }
 
+fn prependany(lst: Any) -> Any {
+    cons(1400., lst)
+}
+
+fn headany(lst: Any) -> Any {
+    head(lst)
+}
+
+fn tailany(lst: Any) -> Any {
+    tail(lst)
+}
+
 cell top() {
     let r = rect("met1", x0=0., y0=0., x1=400.)!;
-    let lst = prepend(cons(500., cons(300., cons(800., cons(200., cons(1400., []))))));
-    let v = head(tail(tail(tail(tail(lst)))));
+    let lst = prepend(prependany(cons(500., cons(300., cons(800., cons(200., cons(1400., [])))))));
+    let v = headany(tail(tailany(tail(tailany(tail(lst))))));
     eq(r.y1, v);
 }
