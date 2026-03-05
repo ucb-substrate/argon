@@ -1639,38 +1639,46 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
                     if args.posargs.len() == 1 {
                         let argty = args.posargs[0].ty();
-                        if let Ty::Seq(i) = argty {
-                            (None, *i)
-                        } else {
-                            self.errors.push(StaticError {
-                                span: self.span(input.span),
-                                kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: argty,
-                                    expected: "Seq".to_string(),
-                                },
-                            });
-                            (None, Ty::Nil)
-                        }
+                        let vty = match argty {
+                            Ty::Seq(i) => *i,
+                            Ty::Any => Ty::Any,
+                            Ty::Unknown => Ty::Unknown,
+                            _ => {
+                                self.errors.push(StaticError {
+                                    span: self.span(input.span),
+                                    kind: StaticErrorKind::IncorrectTyCategory {
+                                        found: argty,
+                                        expected: "Seq".to_string(),
+                                    },
+                                });
+                                Ty::Unknown
+                            }
+                        };
+                        (None, vty)
                     } else {
-                        (None, Ty::Nil)
+                        (None, Ty::Unknown)
                     }
                 }
                 "tail" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
                     if args.posargs.len() == 1 {
                         let argty = args.posargs[0].ty();
-                        if let Ty::Seq(_) = argty {
-                            (None, argty)
-                        } else {
-                            self.errors.push(StaticError {
-                                span: self.span(input.span),
-                                kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: argty,
-                                    expected: "Seq".to_string(),
-                                },
-                            });
-                            (None, Ty::Nil)
-                        }
+                        let vty = match argty {
+                            Ty::Seq(_) => argty,
+                            Ty::Any => Ty::Any,
+                            Ty::Unknown => Ty::Unknown,
+                            _ => {
+                                self.errors.push(StaticError {
+                                    span: self.span(input.span),
+                                    kind: StaticErrorKind::IncorrectTyCategory {
+                                        found: argty,
+                                        expected: "Seq".to_string(),
+                                    },
+                                });
+                                Ty::Unknown
+                            }
+                        };
+                        (None, vty)
                     } else {
                         (None, Ty::Nil)
                     }
