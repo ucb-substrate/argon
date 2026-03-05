@@ -49,6 +49,7 @@ mod tests {
     const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
+    const ARGON_SEQ_ANY: &str = concatcp!(EXAMPLES_DIR, "/seq_any/lib.ar");
     const ARGON_SEQ_FN: &str = concatcp!(EXAMPLES_DIR, "/seq_fn/lib.ar");
     const ARGON_SEQ_RECUR: &str = concatcp!(EXAMPLES_DIR, "/seq_recur/lib.ar");
     const ARGON_LUB_MATCH: &str = concatcp!(EXAMPLES_DIR, "/lub_match/lib.ar");
@@ -551,6 +552,31 @@ mod tests {
     #[test]
     fn argon_seq_basic() {
         let o = parse_workspace_with_std(ARGON_SEQ_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 1);
+        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
+        assert_eq!(r.layer.as_ref().unwrap(), "met1");
+        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
+        assert_relative_eq!(r.y1.0, 200., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_seq_any() {
+        let o = parse_workspace_with_std(ARGON_SEQ_ANY);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
         let cells = compile(
