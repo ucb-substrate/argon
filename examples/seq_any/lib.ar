@@ -1,0 +1,10 @@
+fn prepend(lst: [Any]) -> [Float] {
+    cons(100., lst)
+}
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., x1=400.)!;
+    let lst = prepend(cons(500., cons(300., cons(800., cons(200., cons(1400., []))))));
+    let v = head(tail(tail(tail(tail(lst)))));
+    eq(r.y1, v);
+}

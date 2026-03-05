@@ -1603,7 +1603,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     if args.posargs.len() == 2 {
                         let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
                         let tailty = args.posargs[1].ty();
-                        if !(tailty == Ty::SeqNil || tailty == seqty) {
+                        if !(tailty == Ty::SeqNil || self.is_eq_ty(&tailty, &seqty)) {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
