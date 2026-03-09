@@ -1,3 +1,4 @@
 cell test() {
+    sub_crate::Test::Test;
     rect("met1", x0=0., y0=0., x1=sub_crate::x1(), y1=sub_crate::y1());
 }
