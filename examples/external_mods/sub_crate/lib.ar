@@ -1,4 +1,9 @@
+enum Test {
+    Test,
+}
+
 fn x1() -> Float {
+    Test::Test;
     10.
 }
 
