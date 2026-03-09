@@ -2556,7 +2556,6 @@ impl<'a> ExecPass<'a> {
         };
         let emit_value = |vid: ValueId| -> Option<Arrayed<ObjectId>> {
             let value = &self.values[&vid];
-            tracing::error!("emitting value: {value:?}");
             value
                 .as_ref()
                 .into_ready()
@@ -3439,8 +3438,28 @@ impl<'a> ExecPass<'a> {
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
-                            Value::SeqNil => Value::Nil,
-                            Value::Seq(s) => s.first().cloned().unwrap_or(Value::Nil),
+                            Value::SeqNil => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::HeadEmptyList,
+                                });
+                                return Err(());
+                            }
+                            Value::Seq(s) => {
+                                if let Some(s) = s.first() {
+                                    s.clone()
+                                } else {
+                                    let span = self.span(&vref.loc, c.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::HeadEmptyList,
+                                    });
+                                    return Err(());
+                                }
+                            }
                             _ => {
                                 let span = self.span(&vref.loc, c.expr.span);
                                 self.errors.push(ExecError {
@@ -3461,8 +3480,28 @@ impl<'a> ExecPass<'a> {
                 "tail" => {
                     if let Defer::Ready(lst) = &self.values[&c.state.posargs[0]] {
                         let val = match lst {
-                            Value::SeqNil => Value::SeqNil,
-                            Value::Seq(s) => Value::Seq(s[1..].to_vec()),
+                            Value::SeqNil => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span.clone()),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::TailEmptyList,
+                                });
+                                return Err(());
+                            }
+                            Value::Seq(s) => {
+                                if s.len() > 0 {
+                                    Value::Seq(s[1..].to_vec())
+                                } else {
+                                    let span = self.span(&vref.loc, c.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::TailEmptyList,
+                                    });
+                                    return Err(());
+                                }
+                            }
                             _ => {
                                 let span = self.span(&vref.loc, c.expr.span);
                                 self.errors.push(ExecError {
@@ -4831,6 +4870,12 @@ pub enum ExecErrorKind {
     /// Index out of bounds.
     #[error("index out of bounds")]
     IndexOutOfBounds,
+    /// Attempt to access the head of an empty list.
+    #[error("attempted to access the head of an empty list")]
+    HeadEmptyList,
+    /// Attempt to access the tail of an empty list.
+    #[error("attempted to access the tail of an empty list")]
+    TailEmptyList,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
