@@ -1029,7 +1029,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     .collect_vec(),
             };
             let enum_ = &input.path[input.path.len() - 2];
-            let lookup = if path.is_empty() {
+            let lookup = if path.is_empty() || &path == self.current_path {
                 self.lookup(&enum_.name)
             } else {
                 self.mod_bindings
