@@ -179,8 +179,9 @@ impl StateMut {
                     static_output.errors.extend(parse_errs);
                     Some(CompileOutput::StaticErrors(static_output))
                 } else if let Some(cell) = &self.cell {
-                    if let Ok(cell_ast) = parse::parse_cell(cell) {
-                        Some(compile::dynamic_compile(
+                    let input = parse::format_cell_input(cell);
+                    match parse::parse_cell(&input) {
+                        Ok(cell_ast) => Some(compile::dynamic_compile(
                             &ast,
                             CompileInput {
                                 cell: &cell_ast
@@ -205,12 +206,16 @@ impl StateMut {
                                     .collect(),
                                 lyp_file: &lyp,
                             },
-                        ))
-                    } else {
-                        client
-                            .show_message(MessageType::ERROR, "Open cell is invalid")
-                            .await;
-                        None
+                        )),
+                        Err(e) => {
+                            client
+                                .show_message(
+                                    MessageType::ERROR,
+                                    format!("Open cell is invalid: {e}"),
+                                )
+                                .await;
+                            None
+                        }
                     }
                 } else {
                     None
