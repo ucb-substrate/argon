@@ -225,6 +225,16 @@ Statement -> Result<Statement<&'input str, ParseMetadata>, ()>
   {
     Ok(Statement::Expr { value: $1?, semicolon: false, })
   }
+  | 'FOR' Ident 'IN' Expr Scope
+  {
+    Ok(Statement::ForLoop(ForLoop {
+      var: $2?,
+      seq: $4?,
+      body: $5?,
+      span: $span,
+      metadata: (),
+    }))
+  }
   ;
 
 ScopeAnnotation -> Result<Ident<&'input str, ParseMetadata>, ()>

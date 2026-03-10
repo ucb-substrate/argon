@@ -17,9 +17,9 @@ use thiserror::Error;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, IdentPath,
-    IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope, Span,
-    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
+    BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
+    IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
+    Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::WorkspaceParseAst;
@@ -220,6 +220,15 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _value: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
+    }
+
+    fn dispatch_for_loop(
+        &mut self,
+        _input: &crate::ast::ForLoop<Self::InputS, Self::InputMetadata>,
+        _var: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _seq: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _body: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
     }
 
     fn dispatch_if_expr(
@@ -592,6 +601,7 @@ impl AstMetadata for VarIdTyMetadata {
     type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
+    type ForLoop = VarId; // the var ID of the var Ident
     type FnDecl = (PathBuf, VarId);
     type IfExpr = Ty;
     type MatchExpr = Ty;
@@ -1893,6 +1903,66 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         self.alloc(&name.name, value.ty())
     }
 
+    fn transform_for_loop(
+        &mut self,
+        input: &crate::ast::ForLoop<Self::InputS, Self::InputMetadata>,
+    ) -> crate::ast::ForLoop<Self::OutputS, Self::OutputMetadata> {
+        let var = self.transform_ident(&input.var);
+        // TODO: this code is mostly duplicated from `transform_scope`.
+        let seq = self.transform_expr(&input.seq);
+        let elem_ty = match seq.ty() {
+            Ty::Any => Ty::Any,
+            Ty::Unknown => Ty::Unknown,
+            Ty::Seq(t) => (*t).clone(),
+            Ty::SeqNil => Ty::Any,
+            _ => todo!(),
+        };
+        self.enter_scope(&input.body);
+        let scope_annotation = input
+            .body
+            .scope_annotation
+            .as_ref()
+            .map(|ident| self.transform_ident(ident));
+        let var_id = self.alloc(&input.var.name, elem_ty);
+        let stmts = input
+            .body
+            .stmts
+            .iter()
+            .map(|stmt| self.transform_statement(stmt))
+            .collect_vec();
+        let tail = input
+            .body
+            .tail
+            .as_ref()
+            .map(|stmt| self.transform_expr(stmt));
+        let metadata = self.dispatch_scope(&input.body, &stmts, &tail);
+        let body = Scope {
+            scope_annotation,
+            span: input.span,
+            stmts,
+            tail,
+            metadata,
+        };
+        self.exit_scope(&input.body, &body);
+        let metadata = var_id;
+        ForLoop {
+            var,
+            seq,
+            body,
+            metadata,
+            span: input.span,
+        }
+    }
+    fn dispatch_for_loop(
+        &mut self,
+        _input: &crate::ast::ForLoop<Self::InputS, Self::InputMetadata>,
+        _var: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _seq: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _body: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
+        todo!()
+    }
+
     fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
         s.clone()
     }
@@ -2356,6 +2426,9 @@ impl<'a> ExecPass<'a> {
                 Statement::Expr { value, .. } => {
                     self.visit_expr(loc, value);
                 }
+                Statement::ForLoop(f) => {
+                    self.eval_for_loop(loc, f);
+                }
             }
         }
 
@@ -2707,6 +2780,16 @@ impl<'a> ExecPass<'a> {
         }
     }
 
+    fn eval_for_loop(&mut self, loc: DynLoc, f: &ForLoop<Substr, VarIdTyMetadata>) {
+        let seq = self.visit_expr(loc, &f.seq);
+        self.new_deferred_value(loc, |_| {
+            PartialEvalState::ForLoop(PartialForLoop {
+                for_loop: f.clone(),
+                state: ForLoopState::Seq(seq),
+            })
+        });
+    }
+
     fn eval_stmt(&mut self, loc: DynLoc, stmt: &Statement<Substr, VarIdTyMetadata>) {
         match stmt {
             Statement::LetBinding(binding) => {
@@ -2725,6 +2808,9 @@ impl<'a> ExecPass<'a> {
             }
             Statement::Expr { value, .. } => {
                 self.visit_expr(loc, value);
+            }
+            Statement::ForLoop(f) => {
+                self.eval_for_loop(loc, f);
             }
         }
     }
@@ -4371,6 +4457,54 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::ForLoop(f) => match f.state {
+                ForLoopState::Seq(seq) => {
+                    if let Defer::Ready(val) = &self.values[&seq] {
+                        let seq = match val.as_ref() {
+                            ValueRef::Seq(s) => s.clone(),
+                            ValueRef::SeqNil => Vec::new(),
+                            _ => todo!(),
+                        };
+                        for (i, elem) in seq.iter().enumerate() {
+                            let mut frame = Frame {
+                                bindings: Default::default(),
+                                parent: Some(vref.loc.frame),
+                            };
+
+                            let elem_vid = self.value_id();
+                            self.values
+                                .insert(elem_vid, DeferValue::Ready(elem.clone()));
+                            frame.bindings.insert(f.for_loop.metadata, elem_vid);
+                            let scope = self.create_exec_scope_at_loc(
+                                vref.loc,
+                                if let Some(scope_annotation) = &f.for_loop.body.scope_annotation {
+                                    ExecScopeName::Specified(format!(
+                                        "{} {i}",
+                                        scope_annotation.name
+                                    ))
+                                } else {
+                                    ExecScopeName::Prefix(format!("for {i}"))
+                                },
+                                self.span(&vref.loc, f.for_loop.body.span),
+                            );
+                            let fid = self.frame_id();
+                            self.frames.insert(fid, frame);
+                            self.visit_scope_expr_inner(
+                                vref.loc.cell,
+                                fid,
+                                scope,
+                                &f.for_loop.body,
+                            );
+                        }
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
+                        true
+                    } else {
+                        self.add_value_dependent(seq, vid);
+                        false
+                    }
+                }
+                _ => todo!(),
+            },
         };
 
         if self.values[&vid].is_ready()
@@ -4934,6 +5068,7 @@ enum PartialEvalState<T: AstMetadata> {
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
+    ForLoop(PartialForLoop<T>),
 }
 
 #[derive(Debug, Clone)]
@@ -5042,6 +5177,18 @@ struct PartialCastExpr<T: AstMetadata> {
 #[derive(Debug, Clone)]
 struct PartialTupleExpr {
     items: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone)]
+enum ForLoopState {
+    Seq(ValueId),
+    Body,
+}
+
+#[derive(Debug, Clone)]
+struct PartialForLoop<T: AstMetadata> {
+    for_loop: ForLoop<Substr, T>,
+    state: ForLoopState,
 }
 
 #[derive(Debug, Clone)]

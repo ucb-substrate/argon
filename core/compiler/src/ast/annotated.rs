@@ -137,6 +137,16 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_for_loop(
+        &mut self,
+        input: &super::ForLoop<Self::InputS, Self::InputMetadata>,
+        _var: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _seq: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+        _body: &super::Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
+        input.metadata.clone()
+    }
+
     fn dispatch_if_expr(
         &mut self,
         input: &super::IfExpr<Self::InputS, Self::InputMetadata>,

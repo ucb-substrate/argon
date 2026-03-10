@@ -164,6 +164,7 @@ pub struct Scope<S, T: AstMetadata> {
 pub enum Statement<S, T: AstMetadata> {
     Expr { value: Expr<S, T>, semicolon: bool },
     LetBinding(LetBinding<S, T>),
+    ForLoop(ForLoop<S, T>),
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -171,6 +172,15 @@ pub struct LetBinding<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub value: Expr<S, T>,
     pub metadata: T::LetBinding,
+    pub span: cfgrammar::Span,
+}
+
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct ForLoop<S, T: AstMetadata> {
+    pub var: Ident<S, T>,
+    pub seq: Expr<S, T>,
+    pub body: Scope<S, T>,
+    pub metadata: T::ForLoop,
     pub span: cfgrammar::Span,
 }
 
@@ -402,6 +412,7 @@ pub trait AstMetadata {
     type FnDecl: Debug + Clone + Serialize + DeserializeOwned;
     type ConstantDecl: Debug + Clone + Serialize + DeserializeOwned;
     type LetBinding: Debug + Clone + Serialize + DeserializeOwned;
+    type ForLoop: Debug + Clone + Serialize + DeserializeOwned;
     type IfExpr: Debug + Clone + Serialize + DeserializeOwned;
     type MatchExpr: Debug + Clone + Serialize + DeserializeOwned;
     type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -469,6 +480,13 @@ pub trait AstTransformer {
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
         value: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding;
+    fn dispatch_for_loop(
+        &mut self,
+        input: &ForLoop<Self::InputS, Self::InputMetadata>,
+        var: &Ident<Self::OutputS, Self::OutputMetadata>,
+        seq: &Expr<Self::OutputS, Self::OutputMetadata>,
+        body: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ForLoop;
     fn dispatch_if_expr(
         &mut self,
         input: &IfExpr<Self::InputS, Self::InputMetadata>,
@@ -716,6 +734,7 @@ pub trait AstTransformer {
                 semicolon: *semicolon,
             },
             Statement::LetBinding(l) => Statement::LetBinding(self.transform_let_binding(l)),
+            Statement::ForLoop(l) => Statement::ForLoop(self.transform_for_loop(l)),
         }
     }
     fn transform_let_binding(
@@ -728,6 +747,22 @@ pub trait AstTransformer {
         LetBinding {
             name,
             value,
+            metadata,
+            span: input.span,
+        }
+    }
+    fn transform_for_loop(
+        &mut self,
+        input: &ForLoop<Self::InputS, Self::InputMetadata>,
+    ) -> ForLoop<Self::OutputS, Self::OutputMetadata> {
+        let var = self.transform_ident(&input.var);
+        let seq = self.transform_expr(&input.seq);
+        let body = self.transform_scope(&input.body);
+        let metadata = self.dispatch_for_loop(input, &var, &seq, &body);
+        ForLoop {
+            var,
+            seq,
+            body,
             metadata,
             span: input.span,
         }
