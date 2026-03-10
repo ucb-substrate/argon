@@ -10,15 +10,16 @@ use lrlex::{DefaultLexerTypes, lrlex_mod};
 use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, lrpar_mod};
 
 use crate::{
-    ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
+    ast::{
+        Ast, AstMetadata, CallExpr, Decl, Expr, ModPath, Span, Statement, WorkspaceAst,
+        annotated::AnnotatedAst,
+    },
     compile::{StaticError, StaticErrorKind},
     config::parse_config,
 };
 
 lrlex_mod!("argon.l");
 lrpar_mod!("argon.y");
-lrlex_mod!("cell.l");
-lrpar_mod!("cell.y");
 
 pub struct ParseMetadata;
 pub type ParseAst<'a> = Ast<&'a str, ParseMetadata>;
@@ -295,24 +296,40 @@ pub fn parse(path: impl Into<PathBuf>) -> (ParseResult, LexParseErrors) {
     }
 }
 
+pub fn format_cell_input(input: &str) -> String {
+    format!("cell __dummy__() {{ {input}; }}")
+}
+
+// Input should first be formatted with `format_cell_input`.
 pub fn parse_cell(input: &str) -> Result<CallExpr<&'_ str, ParseMetadata>, anyhow::Error> {
     // Get the `LexerDef` for the `argon` language.
-    let lexerdef = cell_l::lexerdef();
+    let lexerdef = argon_l::lexerdef();
     // Now we create a lexer with the `lexer` method with which
     // we can lex an input.
     let lexer = lexerdef.lexer(input);
     // Pass the lexer to the parser and lex and parse the input.
-    let (res, errs) = cell_y::parse(&lexer);
+    let (res, errs) = argon_y::parse(&lexer);
     if !errs.is_empty() {
         let mut err = String::new();
         for e in errs {
-            write!(&mut err, "{}", e.pp(&lexer, &cell_y::token_epp))
+            write!(&mut err, "{}", e.pp(&lexer, &argon_y::token_epp))
                 .with_context(|| "failed to write to string buffer")?;
         }
         bail!("{err}");
     }
     match res {
-        Some(Ok(expr)) => Ok(expr),
+        Some(Ok(expr)) => {
+            if let Decl::Cell(c) = expr.decls.into_iter().next().unwrap()
+                && let Statement::Expr {
+                    value: Expr::Call(call),
+                    ..
+                } = c.scope.stmts.into_iter().next().unwrap()
+            {
+                Ok(call)
+            } else {
+                bail!("Unable to evaluate expression.")
+            }
+        }
         _ => bail!("Unable to evaluate expression."),
     }
 }
