@@ -18,6 +18,7 @@ mod tests {
     };
     use ::gds::GdsUnits;
     use approx::assert_relative_eq;
+    use approx::relative_eq;
     use const_format::concatcp;
 
     use crate::compile::{CellArg, CompileInput, compile};
@@ -67,6 +68,7 @@ mod tests {
     const ARGON_INVALID_CAST: &str = concatcp!(EXAMPLES_DIR, "/invalid_cast/lib.ar");
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
+    const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -976,5 +978,41 @@ mod tests {
         assert_relative_eq!(r.y0.0, 40., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 140., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 150., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_for_loop_basic() {
+        let o = parse_workspace_with_std(ARGON_FOR_LOOP_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 5);
+
+        for w in [500., 300., 800., 200., 1400.] {
+            let r = cell
+                .objects
+                .iter()
+                .find_map(|(_, v)| {
+                    v.get_rect()
+                        .filter(|r| relative_eq!(r.x1.0, w, epsilon = EPSILON))
+                })
+                .unwrap();
+            assert_eq!(r.layer.as_ref().unwrap(), "met1");
+            assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
+            assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
+            assert_relative_eq!(r.x1.0, w, epsilon = EPSILON);
+            assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
+        }
     }
 }
