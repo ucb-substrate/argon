@@ -34,6 +34,7 @@ impl AstMetadata for ParseMetadata {
     type CellDecl = ();
     type ConstantDecl = ();
     type LetBinding = ();
+    type ForLoop = ();
     type IfExpr = ();
     type MatchExpr = ();
     type BinOpExpr = ();

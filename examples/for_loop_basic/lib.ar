@@ -1,0 +1,6 @@
+cell top() {
+  let lst = cons(500., cons(300., cons(800., cons(200., cons(1400., [])))));
+  for w in lst {
+    rect("met1", x0=0., y0=0., w=w, h=100.);
+  }
+}

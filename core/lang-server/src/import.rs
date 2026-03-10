@@ -291,6 +291,15 @@ impl<'a> AstTransformer for ScopeAnnotationPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
     }
 
+    fn dispatch_for_loop(
+        &mut self,
+        _input: &compiler::ast::ForLoop<Self::InputS, Self::InputMetadata>,
+        _var: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _seq: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _body: &Scope<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
+    }
+
     fn dispatch_cast(
         &mut self,
         _input: &compiler::ast::CastExpr<Substr, Self::InputMetadata>,
