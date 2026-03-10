@@ -2783,10 +2783,10 @@ impl<'a> ExecPass<'a> {
     fn eval_for_loop(&mut self, loc: DynLoc, f: &ForLoop<Substr, VarIdTyMetadata>) {
         let seq = self.visit_expr(loc, &f.seq);
         self.new_deferred_value(loc, |_| {
-            PartialEvalState::ForLoop(PartialForLoop {
+            PartialEvalState::ForLoop(Box::new(PartialForLoop {
                 for_loop: f.clone(),
-                state: ForLoopState::Seq(seq),
-            })
+                seq,
+            }))
         });
     }
 
@@ -3576,7 +3576,7 @@ impl<'a> ExecPass<'a> {
                                 return Err(());
                             }
                             Value::Seq(s) => {
-                                if s.len() > 0 {
+                                if !s.is_empty() {
                                     Value::Seq(s[1..].to_vec())
                                 } else {
                                     let span = self.span(&vref.loc, c.expr.span);
@@ -4457,54 +4457,43 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
-            PartialEvalState::ForLoop(f) => match f.state {
-                ForLoopState::Seq(seq) => {
-                    if let Defer::Ready(val) = &self.values[&seq] {
-                        let seq = match val.as_ref() {
-                            ValueRef::Seq(s) => s.clone(),
-                            ValueRef::SeqNil => Vec::new(),
-                            _ => todo!(),
+            PartialEvalState::ForLoop(f) => {
+                if let Defer::Ready(val) = &self.values[&f.seq] {
+                    let seq = match val.as_ref() {
+                        ValueRef::Seq(s) => s.clone(),
+                        ValueRef::SeqNil => Vec::new(),
+                        _ => todo!(),
+                    };
+                    for (i, elem) in seq.iter().enumerate() {
+                        let mut frame = Frame {
+                            bindings: Default::default(),
+                            parent: Some(vref.loc.frame),
                         };
-                        for (i, elem) in seq.iter().enumerate() {
-                            let mut frame = Frame {
-                                bindings: Default::default(),
-                                parent: Some(vref.loc.frame),
-                            };
 
-                            let elem_vid = self.value_id();
-                            self.values
-                                .insert(elem_vid, DeferValue::Ready(elem.clone()));
-                            frame.bindings.insert(f.for_loop.metadata, elem_vid);
-                            let scope = self.create_exec_scope_at_loc(
-                                vref.loc,
-                                if let Some(scope_annotation) = &f.for_loop.body.scope_annotation {
-                                    ExecScopeName::Specified(format!(
-                                        "{} {i}",
-                                        scope_annotation.name
-                                    ))
-                                } else {
-                                    ExecScopeName::Prefix(format!("for {i}"))
-                                },
-                                self.span(&vref.loc, f.for_loop.body.span),
-                            );
-                            let fid = self.frame_id();
-                            self.frames.insert(fid, frame);
-                            self.visit_scope_expr_inner(
-                                vref.loc.cell,
-                                fid,
-                                scope,
-                                &f.for_loop.body,
-                            );
-                        }
-                        self.values.insert(vid, Defer::Ready(Value::Nil));
-                        true
-                    } else {
-                        self.add_value_dependent(seq, vid);
-                        false
+                        let elem_vid = self.value_id();
+                        self.values
+                            .insert(elem_vid, DeferValue::Ready(elem.clone()));
+                        frame.bindings.insert(f.for_loop.metadata, elem_vid);
+                        let scope = self.create_exec_scope_at_loc(
+                            vref.loc,
+                            if let Some(scope_annotation) = &f.for_loop.body.scope_annotation {
+                                ExecScopeName::Specified(format!("{} {i}", scope_annotation.name))
+                            } else {
+                                ExecScopeName::Prefix(format!("for {i}"))
+                            },
+                            self.span(&vref.loc, f.for_loop.body.span),
+                        );
+                        let fid = self.frame_id();
+                        self.frames.insert(fid, frame);
+                        self.visit_scope_expr_inner(vref.loc.cell, fid, scope, &f.for_loop.body);
                     }
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                } else {
+                    self.add_value_dependent(f.seq, vid);
+                    false
                 }
-                _ => todo!(),
-            },
+            }
         };
 
         if self.values[&vid].is_ready()
@@ -5068,7 +5057,7 @@ enum PartialEvalState<T: AstMetadata> {
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
-    ForLoop(PartialForLoop<T>),
+    ForLoop(Box<PartialForLoop<T>>),
 }
 
 #[derive(Debug, Clone)]
@@ -5180,15 +5169,9 @@ struct PartialTupleExpr {
 }
 
 #[derive(Debug, Clone)]
-enum ForLoopState {
-    Seq(ValueId),
-    Body,
-}
-
-#[derive(Debug, Clone)]
 struct PartialForLoop<T: AstMetadata> {
     for_loop: ForLoop<Substr, T>,
-    state: ForLoopState,
+    seq: ValueId,
 }
 
 #[derive(Debug, Clone)]
