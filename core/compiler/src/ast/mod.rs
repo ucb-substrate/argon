@@ -190,6 +190,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Rem,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]

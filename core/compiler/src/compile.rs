@@ -3870,6 +3870,15 @@ impl<'a> ExecPass<'a> {
                                     }
                                     res
                                 }
+                                _ => {
+                                    let span = self.span(&vref.loc, bin_op.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
                             };
                             if let Some(res) = res {
                                 self.values
@@ -3885,6 +3894,7 @@ impl<'a> ExecPass<'a> {
                                 BinOp::Sub => vl - vr,
                                 BinOp::Mul => vl * vr,
                                 BinOp::Div => vl / vr,
+                                BinOp::Rem => vl % vr,
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true

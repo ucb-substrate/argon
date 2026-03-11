@@ -347,6 +347,7 @@ NonComparisonExpr -> Result<Expr<&'input str, ParseMetadata>, ()>
 Term -> Result<Expr<&'input str, ParseMetadata>, ()>
   : Term '*' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Mul, left: $1?, right: $3?, span: $span, metadata: (), }))) }
   | Term '/' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Div, left: $1?, right: $3?, span: $span, metadata: (), }))) }
+  | Term '%' Factor { Ok(Expr::BinOp(Box::new(BinOpExpr { op: BinOp::Rem, left: $1?, right: $3?, span: $span, metadata: (), }))) }
   | Factor { $1 }
   ;
 
