@@ -1910,12 +1910,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let var = self.transform_ident(&input.var);
         // TODO: this code is mostly duplicated from `transform_scope`.
         let seq = self.transform_expr(&input.seq);
-        let elem_ty = match seq.ty() {
+        let seq_ty = seq.ty();
+        let elem_ty = match seq_ty {
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             Ty::Seq(t) => (*t).clone(),
             Ty::SeqNil => Ty::Any,
-            _ => todo!(),
+            _ => {
+                self.errors.push(StaticError {
+                    span: self.span(input.seq.span()),
+                    kind: StaticErrorKind::CannotIterate { ty: seq_ty },
+                });
+                Ty::Unknown
+            }
         };
         self.enter_scope(&input.body);
         let scope_annotation = input
@@ -1960,7 +1967,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _seq: &Expr<Self::OutputS, Self::OutputMetadata>,
         _body: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
-        todo!()
+        unreachable!()
     }
 
     fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
@@ -3035,7 +3042,7 @@ impl<'a> ExecPass<'a> {
                                 },
                             }))
                         }),
-                        _ => todo!("cannot call value: not a function or cell generator"),
+                        _ => panic!("cannot call value: not a function or cell generator"),
                     }
                 }
             }
@@ -3941,7 +3948,15 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
                         }
-                        _ => todo!(),
+                        _ => {
+                            let span = self.span(&vref.loc, unary_op.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span.clone()),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
                     }
                 } else {
                     self.add_value_dependent(unary_op.operand, vid);
@@ -4462,7 +4477,15 @@ impl<'a> ExecPass<'a> {
                     let seq = match val.as_ref() {
                         ValueRef::Seq(s) => s.clone(),
                         ValueRef::SeqNil => Vec::new(),
-                        _ => todo!(),
+                        _ => {
+                            let span = self.span(&vref.loc, f.for_loop.seq.span());
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
                     };
                     for (i, elem) in seq.iter().enumerate() {
                         let mut frame = Frame {
@@ -4904,6 +4927,9 @@ pub enum StaticErrorKind {
     /// Cannot index the given type.
     #[error("type {ty:?} cannot be indexed")]
     CannotIndex { ty: Ty },
+    /// Cannot iterate over the given type.
+    #[error("cannot iterate over type {ty:?}")]
+    CannotIterate { ty: Ty },
     /// Incorrect type.
     #[error("expected type {expected:?}, found {found:?}")]
     IncorrectTy { expected: Ty, found: Ty },
