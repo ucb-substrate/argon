@@ -1,0 +1,48 @@
+version: 2
+updates:
+  # Rust dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    # No pull request limit - create PRs for all updates
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+  
+  # VS Code extension dependencies
+  - package-ecosystem: "npm"
+    directory: "/plugins/vscode"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    # No pull request limit - create PRs for all updates
+    labels:
+      - "dependencies"
+      - "typescript"
+      - "vscode-extension"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    versioning-strategy: increase
+  
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    # No pull request limit - create PRs for all updates
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
