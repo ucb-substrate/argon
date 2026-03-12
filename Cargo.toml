@@ -15,7 +15,7 @@ indexmap = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 rgb = { version = "0.8", features = ["serde"] }
 thiserror = "2"
-toml = "0.9"
+toml = "1.0"
 regex = "1"
 arcstr = { version = "1", features = ["serde"] }
 itertools = "0.14"
