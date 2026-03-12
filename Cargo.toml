@@ -5,7 +5,7 @@ members = ["core/compiler", "core/gui", "core/lang-server"]
 
 [workspace.dependencies]
 anyhow = "1"
-cfgrammar = { version = "0.13", features = ["serde"] }
+cfgrammar = { version = "0.14", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 approx = "0.5"
