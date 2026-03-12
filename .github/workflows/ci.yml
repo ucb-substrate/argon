@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ main, eigen, ci-test ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, eigen, ci-test ]
+    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -58,7 +58,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-  # Build and test on macOS and Windows
+  # Build and test
   test:
     name: Test Suite
     runs-on: ${{ matrix.os }}
