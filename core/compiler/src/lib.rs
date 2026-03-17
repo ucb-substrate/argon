@@ -69,6 +69,7 @@ mod tests {
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
+    const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -1014,5 +1015,26 @@ mod tests {
             assert_relative_eq!(r.x1.0, w, epsilon = EPSILON);
             assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
         }
+    }
+
+    #[test]
+    fn argon_sse_basic() {
+        let o = parse_workspace_with_std(ARGON_SSE_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_exec_errors().output.unwrap();
+        let cell = &cells.cells[&cells.top];
+        println!("rowspace vecs = {:?}", cell.rowspace_vecs);
+        assert_eq!(cell.rowspace_vecs.len(), 1);
     }
 }

@@ -213,6 +213,49 @@ impl Solver {
             .retain(|_, constraint| !constraint.coeffs.is_empty());
     }
 
+    pub fn rowspace_vecs(&mut self) -> Vec<Vec<(f64, Var)>> {
+        // Snapshot unsolved variables before solving.
+        let unsolved_vars = self.unsolved_vars.clone();
+        let n_vars = unsolved_vars.len();
+        if n_vars == 0 || self.constraints.is_empty() {
+            return Vec::new();
+        }
+        let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
+            multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
+                expr.coeffs.iter().map({
+                    let unsolved_vars = &unsolved_vars;
+                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
+                })
+            }));
+        let a = DMatrix::from(CsMatrix::from_triplet(
+            self.constraints.len(),
+            n_vars,
+            &i,
+            &j,
+            &val,
+        ));
+        let svd = a.clone().svd(false, true);
+        let vt = svd.v_t.as_ref().expect("No V^T matrix");
+        let r = svd.rank(EPSILON);
+
+        (0..r)
+            .map(|i| {
+                unsolved_vars
+                    .iter()
+                    .filter_map(|v| {
+                        let j = unsolved_vars.get_index_of(v).unwrap();
+                        let coeff = vt[(i, j)];
+                        if relative_ne!(coeff, 0., epsilon = EPSILON) {
+                            Some((coeff, *v))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    }
+
     pub fn value_of(&self, var: Var) -> Option<f64> {
         self.solved_vars.get(&var).copied()
     }

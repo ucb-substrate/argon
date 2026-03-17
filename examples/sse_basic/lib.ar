@@ -1,0 +1,5 @@
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., x1i=100., y1i=200.);
+    eq(r.x1, r.y1);
+}
