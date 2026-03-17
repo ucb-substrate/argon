@@ -2135,7 +2135,7 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<LinearExpr>,
-    nullspace_vecs: Vec<Vec<(f64, Var)>>,
+    rowspace_vecs: Vec<Vec<(f64, Var)>>,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
@@ -2376,7 +2376,7 @@ impl<'a> ExecPass<'a> {
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
-                        nullspace_vecs: Vec::new(),
+                        rowspace_vecs: Vec::new(),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
@@ -2473,13 +2473,12 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
                     state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
-                    state.nullspace_vecs = state.solver.nullspace_vecs();
+                    state.rowspace_vecs = state.solver.rowspace_vecs();
                     self.errors.push(ExecError {
                         span: None,
                         cell: cell_id,
                         kind: ExecErrorKind::Underconstrained,
                     });
-                    todo!("nullspace_vecs");
                 }
                 let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);
@@ -2650,7 +2649,7 @@ impl<'a> ExecPass<'a> {
         let mut ccell = CompiledCell {
             scopes: IndexMap::new(),
             root: state.root_scope,
-            nullspace_vecs: state.nullspace_vecs.clone(),
+            rowspace_vecs: state.rowspace_vecs.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
             inconsistent_constraints: state.solver.inconsistent_constraints().clone(),
@@ -4736,7 +4735,7 @@ pub struct CompiledScope {
 pub struct CompiledCell {
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
-    pub nullspace_vecs: Vec<Vec<(f64, Var)>>,
+    pub rowspace_vecs: Vec<Vec<(f64, Var)>>,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
     pub unsolved_vars: IndexSet<Var>,

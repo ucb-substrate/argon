@@ -21,7 +21,7 @@ mod tests {
     use approx::relative_eq;
     use const_format::concatcp;
 
-    use crate::compile::{compile, CellArg, CompileInput};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -834,10 +834,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
     }
 
     #[test]
@@ -856,10 +858,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
     }
 
     #[test]
@@ -878,10 +882,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
+        );
     }
 
     #[test]
@@ -900,10 +906,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast))
+        );
     }
 
     #[test]
@@ -1024,9 +1032,9 @@ mod tests {
         );
         println!("{cells:#?}");
 
-        let cells = cells.unwrap_valid();
+        let cells = cells.unwrap_exec_errors().output.unwrap();
         let cell = &cells.cells[&cells.top];
-        assert_eq!(cell.nullspace_vecs.len(), 1);
-        println!("nullspace vecs = {:?}", cell.nullspace_vecs);
+        println!("rowspace vecs = {:?}", cell.rowspace_vecs);
+        assert_eq!(cell.rowspace_vecs.len(), 1);
     }
 }

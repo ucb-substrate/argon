@@ -213,7 +213,7 @@ impl Solver {
             .retain(|_, constraint| !constraint.coeffs.is_empty());
     }
 
-    pub fn nullspace_vecs(&mut self) -> Vec<Vec<(f64, Var)>> {
+    pub fn rowspace_vecs(&mut self) -> Vec<Vec<(f64, Var)>> {
         // Snapshot unsolved variables before solving.
         let unsolved_vars = self.unsolved_vars.clone();
         let n_vars = unsolved_vars.len();
@@ -239,7 +239,7 @@ impl Solver {
         let r = svd.rank(EPSILON);
         println!("shape = {:?}, r = {r}, n_vars = {n_vars}", vt.shape());
 
-        (r..n_vars)
+        (0..r)
             .map(|i| {
                 unsolved_vars
                     .iter()

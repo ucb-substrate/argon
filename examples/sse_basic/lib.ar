@@ -1,11 +1,5 @@
-fn make_rect() -> Rect {
-    let r = rect("met1", x0=0., y0=0., x1i=100., y1i=200.);
-    eq(r.x1, r.y1);
-    r
-}
 
 cell top() {
-    let r1 = make_rect();
-    let r2 = make_rect();
-    eq(r2.x1, 2. * r1.x1);
+    let r = rect("met1", x0=0., y0=0., x1i=100., y1i=200.);
+    eq(r.x1, r.y1);
 }
