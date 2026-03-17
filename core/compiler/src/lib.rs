@@ -21,7 +21,7 @@ mod tests {
     use approx::relative_eq;
     use const_format::concatcp;
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::compile::{compile, CellArg, CompileInput};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -69,6 +69,7 @@ mod tests {
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
+    const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -833,12 +834,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
     }
 
     #[test]
@@ -857,12 +856,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
     }
 
     #[test]
@@ -881,12 +878,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained)));
     }
 
     #[test]
@@ -905,12 +900,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast)));
     }
 
     #[test]
@@ -1014,5 +1007,26 @@ mod tests {
             assert_relative_eq!(r.x1.0, w, epsilon = EPSILON);
             assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
         }
+    }
+
+    #[test]
+    fn argon_sse_basic() {
+        let o = parse_workspace_with_std(ARGON_SSE_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.nullspace_vecs.len(), 1);
+        println!("nullspace vecs = {:?}", cell.nullspace_vecs);
     }
 }
