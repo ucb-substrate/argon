@@ -22,6 +22,7 @@ use indexmap::IndexSet;
 use itertools::Itertools;
 use lang_server::rpc::DimensionParams;
 use tower_lsp_server::lsp_types::MessageType;
+use tracing::info;
 
 use crate::{
     actions::*,
@@ -36,6 +37,8 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
+const DRAG_HANDLE_SIZE: Pixels = px(10.);
+const DRAG_HANDLE_BORDER_WIDTH: Pixels = px(2.);
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
@@ -48,6 +51,7 @@ pub struct Rect {
     pub object_path: Vec<ObjectId>,
     pub border_widths: Edges<Pixels>,
     pub border_styles: Edges<BorderStyle>,
+    pub edge_vars: Edges<Option<Var>>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -93,6 +97,7 @@ impl From<compile::Rect<f64>> for Rect {
             object_path: Vec::new(),
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
             border_styles: Edges::all(BorderStyle::Solid),
+            edge_vars: Edges::all(None),
         }
     }
 }
@@ -108,6 +113,12 @@ impl From<editor::Rect<(f64, Var)>> for Rect {
             object_path: Vec::new(),
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
             border_styles: Edges::all(BorderStyle::Solid),
+            edge_vars: Edges {
+                top: Some(value.y1.1),
+                right: Some(value.x1.1),
+                bottom: Some(value.y0.1),
+                left: Some(value.x0.1),
+            },
         }
     }
 }
@@ -125,8 +136,98 @@ impl Rect {
             object_path: self.object_path.clone(),
             border_widths: self.border_widths,
             border_styles: self.border_styles,
+            edge_vars: self.edge_vars,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DragHandle {
+    var: Var,
+    edge: RectEdge,
+    bounds: Bounds<Pixels>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RectEdge {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HandleDragState {
+    var: Var,
+    edge: RectEdge,
+    last_layout_position: Point<f32>,
+}
+
+fn unconstrained_var(
+    expr: &compiler::solver::LinearExpr,
+    unsolved_vars: &IndexSet<Var>,
+) -> Option<Var> {
+    let vars = expr
+        .coeffs
+        .iter()
+        .filter_map(|(_, var)| unsolved_vars.contains(var).then_some(*var))
+        .unique()
+        .collect_vec();
+    (vars.len() == 1).then_some(vars[0])
+}
+
+fn rect_drag_handles(
+    rect: &Rect,
+    screen_bounds: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Vec<DragHandle> {
+    let bounds = get_rect_bounds(rect, screen_bounds, scale, offset);
+    let center_x = bounds.center().x;
+    let center_y = bounds.center().y;
+    let half = DRAG_HANDLE_SIZE / 2.;
+    [
+        (
+            rect.edge_vars.top,
+            RectEdge::Top,
+            Point::new(center_x - half, bounds.top() - half),
+        ),
+        (
+            rect.edge_vars.right,
+            RectEdge::Right,
+            Point::new(bounds.right() - half, center_y - half),
+        ),
+        (
+            rect.edge_vars.bottom,
+            RectEdge::Bottom,
+            Point::new(center_x - half, bounds.bottom() - half),
+        ),
+        (
+            rect.edge_vars.left,
+            RectEdge::Left,
+            Point::new(bounds.left() - half, center_y - half),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(var, edge, origin)| {
+        Some(DragHandle {
+            var: var?,
+            edge,
+            bounds: Bounds::new(origin, Size::new(DRAG_HANDLE_SIZE, DRAG_HANDLE_SIZE)),
+        })
+    })
+    .collect()
+}
+
+fn handle_drag_delta(edge: RectEdge, previous: Point<f32>, current: Point<f32>) -> f64 {
+    match edge {
+        RectEdge::Top | RectEdge::Bottom => f64::from(current.y - previous.y),
+        RectEdge::Left | RectEdge::Right => f64::from(current.x - previous.x),
+    }
+}
+
+fn drag_variable(var: Var, amount: f64) {
+    info!("drag_variable({var:?}, {amount})");
 }
 
 pub fn intersect(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> Option<Bounds<Pixels>> {
@@ -208,6 +309,7 @@ pub struct LayoutCanvas {
     drag_start: Point<Pixels>,
     offset_start: Point<Pixels>,
     mouse_position: Point<Pixels>,
+    active_handle_drag: Option<HandleDragState>,
     // zoom state
     scale: f32,
     screen_bounds: Bounds<Pixels>,
@@ -216,6 +318,7 @@ pub struct LayoutCanvas {
     rects: Vec<(Rect, LayerState)>,
     scope_rects: Vec<Rect>,
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
+    drag_handles: Vec<DragHandle>,
     // True if waiting on render step to finish some initialization.
     //
     // Final bounds of layout canvas only determined in paint step.
@@ -347,10 +450,20 @@ impl Element for CanvasElement {
                 inner.fit_to_screen(cx);
             }
         });
-        let inner = self.inner.read(cx);
-        let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
-        let hide_external_geometry = &inner.state.read(cx).hide_external_geometry;
-        let state = inner.state.read(cx);
+        let (state_entity, bg_style, scale, offset, mouse_position, layout_mouse_position) = {
+            let inner = self.inner.read(cx);
+            (
+                inner.state.clone(),
+                inner.bg_style.clone(),
+                inner.scale,
+                inner.offset,
+                inner.mouse_position,
+                inner.px_to_layout(inner.mouse_position),
+            )
+        };
+        let state = state_entity.read(cx);
+        let solved_cell = &state.solved_cell.read(cx);
+        let hide_external_geometry = &state.hide_external_geometry;
         let tool = state.tool.read(cx).clone();
         let layers = state.layers.read(cx);
 
@@ -359,7 +472,6 @@ impl Element for CanvasElement {
         let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
         let mut select_rects = Vec::new();
-        let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let mut queue = VecDeque::from_iter([(
@@ -408,6 +520,7 @@ impl Element for CanvasElement {
                             object_path: Vec::new(),
                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                             border_styles: Edges::all(BorderStyle::Solid),
+                            edge_vars: Edges::all(None),
                         };
                         if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                             && &rect.id == selected_obj
@@ -478,6 +591,24 @@ impl Element for CanvasElement {
                                                 BorderStyle::Solid
                                             },
                                         },
+                                        edge_vars: Edges {
+                                            top: unconstrained_var(
+                                                &rect.y1.1,
+                                                &cell_info.unsolved_vars,
+                                            ),
+                                            right: unconstrained_var(
+                                                &rect.x1.1,
+                                                &cell_info.unsolved_vars,
+                                            ),
+                                            bottom: unconstrained_var(
+                                                &rect.y0.1,
+                                                &cell_info.unsolved_vars,
+                                            ),
+                                            left: unconstrained_var(
+                                                &rect.x0.1,
+                                                &cell_info.unsolved_vars,
+                                            ),
+                                        },
                                     };
                                 if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                                     && rect.id.is_some()
@@ -523,6 +654,7 @@ impl Element for CanvasElement {
                                         object_path: object_path.clone(),
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                         border_styles: Edges::all(BorderStyle::Solid),
+                                        edge_vars: Edges::all(None),
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         &tool
@@ -573,6 +705,7 @@ impl Element for CanvasElement {
                         id: None,
                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                         border_styles: Edges::all(BorderStyle::Dashed),
+                        edge_vars: Edges::all(None),
                     },
                     layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
                 ));
@@ -583,17 +716,13 @@ impl Element for CanvasElement {
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
             .collect_vec();
-        let scale = inner.scale;
-        let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
-        let theme = inner.state.read(cx).theme();
-        inner
-            .bg_style
-            .clone()
-            .paint(bounds, window, cx, |window, cx| {
+        let mut drag_handles = Vec::new();
+        let theme = state.theme();
+        bg_style.paint(bounds, window, cx, |window, cx| {
                 window.paint_layer(bounds, |window| {
                     // Draw origin lines.
-                    let origin_coords = self.inner.read(cx).layout_to_px(Point::new(0., 0.));
+                    let origin_coords = offset + bounds.origin;
                     let y_axis = Edge {
                         dir: Dir::Vert,
                         coord: origin_coords.x,
@@ -646,6 +775,32 @@ impl Element for CanvasElement {
                             r.border_styles,
                         ));
                     }
+                    if let ToolState::Select(SelectToolState {
+                        selected_obj: Some(selected_obj),
+                    }) = &tool
+                        && let Some(selected_rect) = rects
+                            .iter()
+                            .map(|(rect, _)| rect)
+                            .chain(scope_rects.iter())
+                            .find(|rect| rect.id.as_ref() == Some(selected_obj))
+                    {
+                        drag_handles = rect_drag_handles(selected_rect, bounds, scale, offset);
+                        for handle in &drag_handles {
+                            let border_color = if handle.bounds.contains(&mouse_position) {
+                                rgb(0xffff00)
+                            } else {
+                                theme.text
+                            };
+                            window.paint_quad(get_paint_quad(
+                                handle.bounds,
+                                ShapeFill::Solid,
+                                theme.bg,
+                                border_color,
+                                Edges::all(DRAG_HANDLE_BORDER_WIDTH),
+                                Edges::all(BorderStyle::Solid),
+                            ));
+                        }
+                    }
 
                     let mut draw_dim =
                         |p: f32,
@@ -691,6 +846,7 @@ impl Element for CanvasElement {
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                 border_styles: Edges::all(BorderStyle::Solid),
+                                edge_vars: Edges::all(None),
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (
@@ -726,6 +882,7 @@ impl Element for CanvasElement {
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                 border_styles: Edges::all(BorderStyle::Solid),
+                                edge_vars: Edges::all(None),
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (p, coord, n, coord)
@@ -741,6 +898,7 @@ impl Element for CanvasElement {
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                 border_styles: Edges::all(BorderStyle::Solid),
+                                edge_vars: Edges::all(None),
                             };
                             for r in &[start_line, stop_line, dim_line] {
                                 window.paint_quad(get_paint_path(
@@ -882,7 +1040,8 @@ impl Element for CanvasElement {
                                             y1,
                                             id: None,
                                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                border_styles: Edges::all(BorderStyle::Solid),
+                                            border_styles: Edges::all(BorderStyle::Solid),
+                                            edge_vars: Edges::all(None),
                                         },
                                         bounds,
                                         scale,
@@ -909,16 +1068,10 @@ impl Element for CanvasElement {
                                 let scale = inner.scale;
                                 let offset = inner.offset;
                                 let mut selected = None;
-                                if x_axis
-                                    .select_bounds(SELECT_WIDTH)
-                                    .contains(&inner.mouse_position)
-                                {
+                                if x_axis.select_bounds(SELECT_WIDTH).contains(&mouse_position) {
                                     selected = Some(DimEdge::Y0);
                                 }
-                                if y_axis
-                                    .select_bounds(SELECT_WIDTH)
-                                    .contains(&inner.mouse_position)
-                                {
+                                if y_axis.select_bounds(SELECT_WIDTH).contains(&mouse_position) {
                                     selected = Some(DimEdge::X0);
                                 }
                                 for (rect, r) in rects.map(|r| {
@@ -998,7 +1151,7 @@ impl Element for CanvasElement {
                                         ),
                                     ] {
                                         let bounds = edge_px.select_bounds(SELECT_WIDTH);
-                                        if bounds.contains(&inner.mouse_position)
+                                        if bounds.contains(&mouse_position)
                                             && rect.id.is_some()
                                         {
                                             selected =
@@ -1010,7 +1163,7 @@ impl Element for CanvasElement {
                                 match selected {
                                     Some(DimEdge::Edge((r, _, edge))) => {
                                         let path = {
-                                            let cell = inner.state.read(cx).solved_cell.read(cx);
+                                            let cell = state_entity.read(cx).solved_cell.read(cx);
                                             if let Some(cell) = cell
                                                 && let selected_scope_addr =
                                                     cell.state[&cell.selected_scope].address
@@ -1055,8 +1208,8 @@ impl Element for CanvasElement {
                                                         y1,
                                                         id: None,
                                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                border_styles: Edges::all(BorderStyle::Solid),
-
+                                                        border_styles: Edges::all(BorderStyle::Solid),
+                                                        edge_vars: Edges::all(None),
                                                     },
                                                     bounds,
                                                     scale,
@@ -1116,7 +1269,7 @@ impl Element for CanvasElement {
                                         .flat_map(|(_, hitboxes, _)| hitboxes.iter().copied()),
                                 )
                             {
-                                if hitbox.contains(&inner.mouse_position) {
+                                if hitbox.contains(&mouse_position) {
                                     window.paint_quad(get_paint_quad(
                                         hitbox,
                                         ShapeFill::Solid,
@@ -1137,6 +1290,7 @@ impl Element for CanvasElement {
             inner.rects = rects;
             inner.scope_rects = scope_rects;
             inner.dim_hitboxes = dim_hitboxes;
+            inner.drag_handles = drag_handles;
             cx.notify();
         });
     }
@@ -1170,6 +1324,8 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
             .on_drag_move(cx.listener(Self::on_drag_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -1207,6 +1363,7 @@ impl LayoutCanvas {
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
+            active_handle_drag: None,
             scale: 1.0,
             screen_bounds: Bounds::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
@@ -1214,6 +1371,7 @@ impl LayoutCanvas {
             rects: Vec::new(),
             scope_rects: Vec::new(),
             dim_hitboxes: Vec::new(),
+            drag_handles: Vec::new(),
             pending_init: true,
         }
     }
@@ -1743,6 +1901,19 @@ impl LayoutCanvas {
                     }
                 }
                 ToolState::Select(select_tool) => {
+                    if let Some(handle) = self
+                        .drag_handles
+                        .iter()
+                        .find(|handle| handle.bounds.contains(&event.position))
+                        .copied()
+                    {
+                        self.active_handle_drag = Some(HandleDragState {
+                            var: handle.var,
+                            edge: handle.edge,
+                            last_layout_position: layout_mouse_position,
+                        });
+                        return false;
+                    }
                     let rects = self
                         .rects
                         .iter()
@@ -1959,6 +2130,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        self.active_handle_drag = None;
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
@@ -1971,7 +2143,18 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         self.mouse_position = event.position;
-        if self.is_dragging {
+        let current_layout_position = self.px_to_layout(event.position);
+        if let Some(handle_drag) = self.active_handle_drag.as_mut() {
+            let delta = handle_drag_delta(
+                handle_drag.edge,
+                handle_drag.last_layout_position,
+                current_layout_position,
+            );
+            if delta != 0.0 {
+                drag_variable(handle_drag.var, delta);
+                handle_drag.last_layout_position = current_layout_position;
+            }
+        } else if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
         }
         cx.notify();
@@ -1984,6 +2167,7 @@ impl LayoutCanvas {
         _cx: &mut Context<Self>,
     ) {
         self.is_dragging = false;
+        self.active_handle_drag = None;
     }
 
     pub(crate) fn on_mouse_up(
@@ -1993,6 +2177,7 @@ impl LayoutCanvas {
         _cx: &mut Context<Self>,
     ) {
         self.is_dragging = false;
+        self.active_handle_drag = None;
     }
 
     pub(crate) fn on_scroll_wheel(
@@ -2001,7 +2186,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_dragging {
+        if self.is_dragging || self.active_handle_drag.is_some() {
             // Do not allow zooming during a drag.
             return;
         }
@@ -2066,4 +2251,87 @@ pub(crate) fn find_obj_path(
         reachable = false;
     }
     (reachable, string_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rect, RectEdge, handle_drag_delta, rect_drag_handles, unconstrained_var};
+    use compiler::solver::{LinearExpr, Solver};
+    use gpui::{BorderStyle, Bounds, Edges, Point, px, size};
+    use indexmap::IndexSet;
+
+    #[test]
+    fn unconstrained_var_requires_exactly_one_unsolved_var() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+
+        let mut unsolved = IndexSet::new();
+        unsolved.insert(x);
+        unsolved.insert(y);
+
+        assert_eq!(
+            unconstrained_var(
+                &LinearExpr {
+                    coeffs: vec![(1.0, x)],
+                    constant: 0.0,
+                },
+                &unsolved,
+            ),
+            Some(x)
+        );
+        assert_eq!(
+            unconstrained_var(
+                &LinearExpr {
+                    coeffs: vec![(1.0, x), (1.0, y)],
+                    constant: 0.0,
+                },
+                &unsolved,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rect_drag_handles_only_cover_edges_with_vars() {
+        let mut solver = Solver::new();
+        let top = solver.new_var();
+        let left = solver.new_var();
+        let rect = Rect {
+            x0: 0.0,
+            x1: 20.0,
+            y0: 0.0,
+            y1: 10.0,
+            id: None,
+            object_path: Vec::new(),
+            border_widths: Edges::all(px(1.0)),
+            border_styles: Edges::all(BorderStyle::Solid),
+            edge_vars: Edges {
+                top: Some(top),
+                right: None,
+                bottom: None,
+                left: Some(left),
+            },
+        };
+
+        let handles = rect_drag_handles(
+            &rect,
+            Bounds::new(Point::new(px(0.0), px(0.0)), size(px(100.0), px(100.0))),
+            1.0,
+            Point::new(px(0.0), px(0.0)),
+        );
+
+        assert_eq!(handles.len(), 2);
+        assert!(handles.iter().any(|handle| handle.edge == RectEdge::Top));
+        assert!(handles.iter().any(|handle| handle.edge == RectEdge::Left));
+    }
+
+    #[test]
+    fn handle_drag_delta_tracks_the_perpendicular_axis() {
+        let previous = Point::<f32>::new(1.0, 2.0);
+        let current = Point::<f32>::new(4.5, 9.0);
+
+        assert_eq!(handle_drag_delta(RectEdge::Left, previous, current), 3.5);
+        assert_eq!(handle_drag_delta(RectEdge::Top, previous, current), 7.0);
+    }
 }
