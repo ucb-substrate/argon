@@ -234,10 +234,9 @@ impl Solver {
             &j,
             &val,
         ));
-        let svd = a.clone().svd(true, true);
+        let svd = a.clone().svd(false, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let r = svd.rank(EPSILON);
-        println!("shape = {:?}, r = {r}, n_vars = {n_vars}", vt.shape());
 
         (0..r)
             .map(|i| {
