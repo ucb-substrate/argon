@@ -58,7 +58,8 @@
         "vscode:prepublish": "npm run compile",
         "compile": "tsc -b",
         "watch": "tsc -b -w",
-        "lint": "eslint"
+        "lint": "eslint",
+        "test": "npm run compile && mocha test/**/*.test.cjs"
     },
     "dependencies": {
         "glob": "^11.0.0",
