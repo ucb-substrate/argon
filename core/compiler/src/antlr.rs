@@ -97,7 +97,7 @@ pub fn parse_errors(input: &str) -> Vec<AntlrParseError> {
         errors: Rc::clone(&errors),
     }));
 
-    let _ = parser.compilationUnit();
+    let _ = parser.ast();
     errors.borrow().clone()
 }
 
@@ -112,7 +112,7 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
     let mut parser = ArgonParser::new(tokens);
     parser.remove_error_listeners();
 
-    let tree = match parser.compilationUnit() {
+    let tree = match parser.ast() {
         Ok(tree) => tree,
         Err(err) => {
             return Err(vec![AntlrParseError {
@@ -125,38 +125,22 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
     let mut builder = AstBuilder {
         input: normalized_input,
         offset_base,
-        errors: Vec::new(),
     };
-    let ast = builder.build_compilation_unit(tree.as_ref());
-    if builder.errors.is_empty() {
-        Ok(AnnotatedAst::new(input_for_ast, &ast, path))
-    } else {
-        Err(builder.errors)
-    }
+    let ast = builder.build_ast(tree.as_ref());
+    Ok(AnnotatedAst::new(input_for_ast, &ast, path))
 }
 
 struct AstBuilder<'input> {
     input: &'input str,
     offset_base: usize,
-    errors: Vec<AntlrParseError>,
 }
 
 impl<'input> AstBuilder<'input> {
-    fn build_compilation_unit(
-        &mut self,
-        ctx: &CompilationUnitContext<'input>,
-    ) -> Ast<&'input str, ParseMetadata> {
+    fn build_ast(&mut self, ctx: &AstContext<'input>) -> Ast<&'input str, ParseMetadata> {
         let mut decls = Vec::new();
-        for item in ctx.children_of_type::<SourceItemContext<'input>>() {
-            if let Some(decl_ctx) = item.decl() {
-                if let Some(decl) = self.build_decl(decl_ctx.as_ref()) {
-                    decls.push(decl);
-                }
-            } else if let Some(stmt) = item.topLevelStatement() {
-                self.unsupported(
-                    self.span_of(stmt.as_ref()),
-                    "top-level statements are not supported",
-                );
+        for decl_ctx in ctx.children_of_type::<DeclContext<'input>>() {
+            if let Some(decl) = self.build_decl(decl_ctx.as_ref()) {
+                decls.push(decl);
             }
         }
         Ast {
@@ -177,7 +161,7 @@ impl<'input> AstBuilder<'input> {
             Some(Decl::Cell(self.build_cell_decl(ctx.as_ref())))
         } else if let Some(ctx) = ctx.fnDecl() {
             Some(Decl::Fn(self.build_fn_decl(ctx.as_ref())))
-        } else if let Some(ctx) = ctx.constDecl() {
+        } else if let Some(ctx) = ctx.constantDecl() {
             Some(Decl::Constant(self.build_const_decl(ctx.as_ref())))
         } else {
             ctx.modDecl()
@@ -190,7 +174,7 @@ impl<'input> AstBuilder<'input> {
         ctx: &EnumDeclContext<'input>,
     ) -> EnumDecl<&'input str, ParseMetadata> {
         EnumDecl {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
+            name: self.build_ident(ctx.ident().unwrap().as_ref()),
             variants: ctx
                 .enumVariants()
                 .map(|ctx| self.build_enum_variants(ctx.as_ref()))
@@ -203,15 +187,10 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &EnumVariantsContext<'input>,
     ) -> Vec<Ident<&'input str, ParseMetadata>> {
-        let mut variants = ctx
-            .children_of_type::<EnumVariantsContext<'input>>()
+        ctx.children_of_type::<IdentContext<'input>>()
             .into_iter()
-            .flat_map(|prev| self.build_enum_variants(prev.as_ref()))
-            .collect::<Vec<_>>();
-        if let Some(ident) = ctx.IDENT() {
-            variants.push(self.ident_from_token(&ident));
-        }
-        variants
+            .map(|ident| self.build_ident(ident.as_ref()))
+            .collect()
     }
 
     fn build_struct_decl(
@@ -219,7 +198,7 @@ impl<'input> AstBuilder<'input> {
         ctx: &StructDeclContext<'input>,
     ) -> StructDecl<&'input str, ParseMetadata> {
         StructDecl {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
+            name: self.build_ident(ctx.ident().unwrap().as_ref()),
             fields: ctx
                 .structFields()
                 .map(|ctx| self.build_struct_fields(ctx.as_ref()))
@@ -233,32 +212,19 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &StructFieldsContext<'input>,
     ) -> Vec<StructField<&'input str, ParseMetadata>> {
-        let mut fields = ctx
-            .children_of_type::<StructFieldsContext<'input>>()
+        ctx.children_of_type::<StructFieldContext<'input>>()
             .into_iter()
-            .flat_map(|prev| self.build_struct_fields(prev.as_ref()))
-            .collect::<Vec<_>>();
-        if let Some(field) = ctx.structField() {
-            fields.push(self.build_struct_field(field.as_ref()));
-        }
-        fields
+            .map(|field| self.build_struct_field(field.as_ref()))
+            .collect()
     }
 
     fn build_struct_field(
         &mut self,
         ctx: &StructFieldContext<'input>,
     ) -> StructField<&'input str, ParseMetadata> {
-        let ty_spec = self.build_ty_spec(ctx.tySpec().unwrap().as_ref());
-        let ty = match ty_spec.kind {
-            TySpecKind::Ident(ident) => ident,
-            _ => {
-                self.unsupported(self.span_of(ctx), "struct field types must be identifiers");
-                self.empty_ident(self.span_of(ctx))
-            }
-        };
         StructField {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
-            ty,
+            name: self.build_ident(ctx.ident(0).unwrap().as_ref()),
+            ty: self.build_ident(ctx.ident(1).unwrap().as_ref()),
             span: self.span_of(ctx),
             metadata: (),
         }
@@ -269,7 +235,7 @@ impl<'input> AstBuilder<'input> {
         ctx: &CellDeclContext<'input>,
     ) -> CellDecl<&'input str, ParseMetadata> {
         CellDecl {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
+            name: self.build_ident(ctx.ident().unwrap().as_ref()),
             args: self.build_arg_decls(ctx.argDecls().unwrap().as_ref()),
             scope: self.build_scope(ctx.scope().unwrap().as_ref()),
             span: self.span_of(ctx),
@@ -279,7 +245,7 @@ impl<'input> AstBuilder<'input> {
 
     fn build_fn_decl(&mut self, ctx: &FnDeclContext<'input>) -> FnDecl<&'input str, ParseMetadata> {
         FnDecl {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
+            name: self.build_ident(ctx.ident().unwrap().as_ref()),
             args: self.build_arg_decls(ctx.argDecls().unwrap().as_ref()),
             return_ty: ctx.tySpec().map(|ty| self.build_ty_spec(ty.as_ref())),
             scope: self.build_scope(ctx.scope().unwrap().as_ref()),
@@ -290,19 +256,11 @@ impl<'input> AstBuilder<'input> {
 
     fn build_const_decl(
         &mut self,
-        ctx: &ConstDeclContext<'input>,
+        ctx: &ConstantDeclContext<'input>,
     ) -> ConstantDecl<&'input str, ParseMetadata> {
-        let ty_spec = self.build_ty_spec(ctx.tySpec().unwrap().as_ref());
-        let ty = match ty_spec.kind {
-            TySpecKind::Ident(ident) => ident,
-            _ => {
-                self.unsupported(self.span_of(ctx), "const types must be identifiers");
-                self.empty_ident(self.span_of(ctx))
-            }
-        };
         ConstantDecl {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
-            ty,
+            name: self.build_ident(ctx.ident(0).unwrap().as_ref()),
+            ty: self.build_ident(ctx.ident(1).unwrap().as_ref()),
             value: self.build_expr(ctx.expr().unwrap().as_ref()),
             metadata: (),
         }
@@ -313,7 +271,7 @@ impl<'input> AstBuilder<'input> {
         ctx: &ModDeclContext<'input>,
     ) -> ModDecl<&'input str, ParseMetadata> {
         ModDecl {
-            ident: self.ident_from_token(&ctx.IDENT().unwrap()),
+            ident: self.build_ident(ctx.ident().unwrap().as_ref()),
             span: self.span_of(ctx),
         }
     }
@@ -322,46 +280,28 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &ArgDeclsContext<'input>,
     ) -> Vec<ArgDecl<&'input str, ParseMetadata>> {
-        ctx.argDeclList()
-            .map(|list| self.build_arg_decl_list(list.as_ref()))
+        ctx.argDecls1()
+            .map(|list| self.build_arg_decls1(list.as_ref()))
             .unwrap_or_default()
     }
 
-    fn build_arg_decl_list(
+    fn build_arg_decls1(
         &mut self,
-        ctx: &ArgDeclListContext<'input>,
+        ctx: &ArgDecls1Context<'input>,
     ) -> Vec<ArgDecl<&'input str, ParseMetadata>> {
-        let mut decls = ctx
-            .children_of_type::<ArgDeclListContext<'input>>()
+        ctx.children_of_type::<ArgDeclContext<'input>>()
             .into_iter()
-            .flat_map(|prev| self.build_arg_decl_list(prev.as_ref()))
-            .collect::<Vec<_>>();
-        if let Some(arg) = ctx.argDecl() {
-            decls.push(self.build_arg_decl(arg.as_ref()));
-        }
-        decls
+            .map(|arg| self.build_arg_decl(arg.as_ref()))
+            .collect()
     }
 
     fn build_arg_decl(
         &mut self,
         ctx: &ArgDeclContext<'input>,
     ) -> ArgDecl<&'input str, ParseMetadata> {
-        let ty = ctx
-            .tySpec()
-            .map(|ctx| self.build_ty_spec(ctx.as_ref()))
-            .unwrap_or_else(|| {
-                self.unsupported(
-                    self.span_of(ctx),
-                    "function arguments require explicit types",
-                );
-                TySpec {
-                    kind: TySpecKind::Ident(self.empty_ident(self.span_of(ctx))),
-                    span: self.span_of(ctx),
-                }
-            });
         ArgDecl {
-            name: self.ident_from_token(&ctx.IDENT().unwrap()),
-            ty,
+            name: self.build_ident(ctx.ident().unwrap().as_ref()),
+            ty: self.build_ty_spec(ctx.tySpec().unwrap().as_ref()),
             metadata: (),
         }
     }
@@ -369,8 +309,8 @@ impl<'input> AstBuilder<'input> {
     fn build_scope(&mut self, ctx: &ScopeContext<'input>) -> Scope<&'input str, ParseMetadata> {
         let mut scope = self.build_unannotated_scope(ctx.unannotatedScope().unwrap().as_ref());
         scope.scope_annotation = ctx
-            .annotation()
-            .map(|annotation| self.build_annotation(annotation.as_ref()));
+            .scopeAnnotation()
+            .map(|annotation| self.build_scope_annotation(annotation.as_ref()));
         scope
     }
 
@@ -379,11 +319,12 @@ impl<'input> AstBuilder<'input> {
         ctx: &UnannotatedScopeContext<'input>,
     ) -> Scope<&'input str, ParseMetadata> {
         let mut stmts = ctx
-            .children_of_type::<StatementContext<'input>>()
-            .into_iter()
-            .filter_map(|stmt| self.build_statement(stmt.as_ref()))
-            .collect::<Vec<_>>();
-        let mut tail = ctx.expr().map(|expr| self.build_expr(expr.as_ref()));
+            .statements()
+            .map(|stmts| self.build_statements(stmts.as_ref()))
+            .unwrap_or_default();
+        let mut tail = ctx
+            .nonBlockExpr()
+            .map(|expr| self.build_non_block_expr(expr.as_ref()));
         if tail.is_none()
             && let Some(Statement::Expr {
                 value,
@@ -402,26 +343,27 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
+    fn build_statements(
+        &mut self,
+        ctx: &StatementsContext<'input>,
+    ) -> Vec<Statement<&'input str, ParseMetadata>> {
+        ctx.children_of_type::<StatementContext<'input>>()
+            .into_iter()
+            .filter_map(|stmt| self.build_statement(stmt.as_ref()))
+            .collect()
+    }
+
     fn build_statement(
         &mut self,
         ctx: &StatementContext<'input>,
     ) -> Option<Statement<&'input str, ParseMetadata>> {
         if let Some(let_stmt) = ctx.letStmt() {
-            let names = self.build_ident_list(let_stmt.identList().unwrap().as_ref());
-            if names.len() != 1 || let_stmt.expr().is_none() {
-                self.unsupported(
-                    self.span_of(let_stmt.as_ref()),
-                    "only single-name let bindings with values are supported",
-                );
-                None
-            } else {
-                Some(Statement::LetBinding(LetBinding {
-                    name: names.into_iter().next().unwrap(),
-                    value: self.build_expr(let_stmt.expr().unwrap().as_ref()),
-                    span: self.span_of(let_stmt.as_ref()),
-                    metadata: (),
-                }))
-            }
+            Some(Statement::LetBinding(LetBinding {
+                name: self.build_ident(let_stmt.ident().unwrap().as_ref()),
+                value: self.build_expr(let_stmt.expr().unwrap().as_ref()),
+                span: self.span_of(let_stmt.as_ref()),
+                metadata: (),
+            }))
         } else if let Some(for_stmt) = ctx.forStmt() {
             Some(Statement::ForLoop(self.build_for_stmt(for_stmt.as_ref())))
         } else if let Some(block_expr) = ctx.blockExpr() {
@@ -437,25 +379,12 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_ident_list(
-        &mut self,
-        ctx: &IdentListContext<'input>,
-    ) -> Vec<Ident<&'input str, ParseMetadata>> {
-        let mut names = Vec::new();
-        let mut i = 0;
-        while let Some(ident) = ctx.IDENT(i) {
-            names.push(self.ident_from_token(&ident));
-            i += 1;
-        }
-        names
-    }
-
     fn build_for_stmt(
         &mut self,
         ctx: &ForStmtContext<'input>,
     ) -> ForLoop<&'input str, ParseMetadata> {
         ForLoop {
-            var: self.ident_from_token(&ctx.IDENT().unwrap()),
+            var: self.build_ident(ctx.ident().unwrap().as_ref()),
             seq: self.build_expr(ctx.expr().unwrap().as_ref()),
             body: self.build_scope(ctx.scope().unwrap().as_ref()),
             span: self.span_of(ctx),
@@ -467,7 +396,7 @@ impl<'input> AstBuilder<'input> {
         if let Some(block) = ctx.blockExpr() {
             self.build_block_expr(block.as_ref())
         } else {
-            self.build_comparison_expr(ctx.comparisonExpr().unwrap().as_ref())
+            self.build_non_block_expr(ctx.nonBlockExpr().unwrap().as_ref())
         }
     }
 
@@ -475,32 +404,44 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &BlockExprContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        let scopes = ctx.children_of_type::<ScopeContext<'input>>();
-        let arms = ctx.children_of_type::<MatchArmContext<'input>>();
-        if !arms.is_empty() {
-            Expr::Match(Box::new(MatchExpr {
-                scrutinee: self.build_expr(ctx.expr().unwrap().as_ref()),
-                arms: arms
-                    .into_iter()
-                    .map(|arm| self.build_match_arm(arm.as_ref()))
-                    .collect(),
-                span: self.span_of(ctx),
-                metadata: (),
-            }))
-        } else if scopes.len() == 1 {
-            Expr::Scope(Box::new(self.build_scope(scopes[0].as_ref())))
+        if let Some(match_expr) = ctx.matchExpr() {
+            Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
+        } else if ctx.expr().is_none() {
+            Expr::Scope(Box::new(self.build_scope(ctx.scope(0).unwrap().as_ref())))
         } else {
             Expr::If(Box::new(IfExpr {
                 scope_annotation: ctx
-                    .annotation()
-                    .map(|annotation| self.build_annotation(annotation.as_ref())),
+                    .scopeAnnotation()
+                    .map(|annotation| self.build_scope_annotation(annotation.as_ref())),
                 cond: self.build_expr(ctx.expr().unwrap().as_ref()),
-                then: self.build_scope(scopes[0].as_ref()),
-                else_: self.build_scope(scopes[1].as_ref()),
+                then: self.build_scope(ctx.scope(0).unwrap().as_ref()),
+                else_: self.build_scope(ctx.scope(1).unwrap().as_ref()),
                 span: self.span_of(ctx),
                 metadata: (),
             }))
         }
+    }
+
+    fn build_match_expr(
+        &mut self,
+        ctx: &MatchExprContext<'input>,
+    ) -> MatchExpr<&'input str, ParseMetadata> {
+        MatchExpr {
+            scrutinee: self.build_expr(ctx.expr().unwrap().as_ref()),
+            arms: self.build_match_arms(ctx.matchArms().unwrap().as_ref()),
+            span: self.span_of(ctx),
+            metadata: (),
+        }
+    }
+
+    fn build_match_arms(
+        &mut self,
+        ctx: &MatchArmsContext<'input>,
+    ) -> Vec<MatchArm<&'input str, ParseMetadata>> {
+        ctx.children_of_type::<MatchArmContext<'input>>()
+            .into_iter()
+            .map(|arm| self.build_match_arm(arm.as_ref()))
+            .collect()
     }
 
     fn build_match_arm(
@@ -514,13 +455,14 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_comparison_expr(
+    fn build_non_block_expr(
         &mut self,
-        ctx: &ComparisonExprContext<'input>,
+        ctx: &NonBlockExprContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_additive_expr(ctx.additiveExpr(0).unwrap().as_ref());
+        let mut expr = self.build_non_comparison_expr(ctx.nonComparisonExpr(0).unwrap().as_ref());
         for (i, op) in self.comparison_ops(ctx).into_iter().enumerate() {
-            let rhs = self.build_additive_expr(ctx.additiveExpr(i + 1).unwrap().as_ref());
+            let rhs =
+                self.build_non_comparison_expr(ctx.nonComparisonExpr(i + 1).unwrap().as_ref());
             let span = Span::new(expr.span().start(), rhs.span().end());
             expr = Expr::Comparison(Box::new(ComparisonExpr {
                 op,
@@ -533,14 +475,13 @@ impl<'input> AstBuilder<'input> {
         expr
     }
 
-    fn build_additive_expr(
+    fn build_non_comparison_expr(
         &mut self,
-        ctx: &AdditiveExprContext<'input>,
+        ctx: &NonComparisonExprContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_multiplicative_expr(ctx.multiplicativeExpr(0).unwrap().as_ref());
+        let mut expr = self.build_term(ctx.term(0).unwrap().as_ref());
         for (i, op) in self.additive_ops(ctx).into_iter().enumerate() {
-            let rhs =
-                self.build_multiplicative_expr(ctx.multiplicativeExpr(i + 1).unwrap().as_ref());
+            let rhs = self.build_term(ctx.term(i + 1).unwrap().as_ref());
             let span = Span::new(expr.span().start(), rhs.span().end());
             expr = Expr::BinOp(Box::new(BinOpExpr {
                 op,
@@ -553,13 +494,10 @@ impl<'input> AstBuilder<'input> {
         expr
     }
 
-    fn build_multiplicative_expr(
-        &mut self,
-        ctx: &MultiplicativeExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_unary_expr(ctx.unaryExpr(0).unwrap().as_ref());
+    fn build_term(&mut self, ctx: &TermContext<'input>) -> Expr<&'input str, ParseMetadata> {
+        let mut expr = self.build_factor(ctx.factor(0).unwrap().as_ref());
         for (i, op) in self.multiplicative_ops(ctx).into_iter().enumerate() {
-            let rhs = self.build_unary_expr(ctx.unaryExpr(i + 1).unwrap().as_ref());
+            let rhs = self.build_factor(ctx.factor(i + 1).unwrap().as_ref());
             let span = Span::new(expr.span().start(), rhs.span().end());
             expr = Expr::BinOp(Box::new(BinOpExpr {
                 op,
@@ -572,12 +510,9 @@ impl<'input> AstBuilder<'input> {
         expr
     }
 
-    fn build_unary_expr(
-        &mut self,
-        ctx: &UnaryExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
+    fn build_factor(&mut self, ctx: &FactorContext<'input>) -> Expr<&'input str, ParseMetadata> {
         if ctx.BANG().is_some() {
-            let operand = self.build_unary_expr(ctx.unaryExpr().unwrap().as_ref());
+            let operand = self.build_factor(ctx.factor().unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
                 op: UnaryOp::Not,
                 operand,
@@ -585,29 +520,23 @@ impl<'input> AstBuilder<'input> {
                 metadata: (),
             }))
         } else if ctx.MINUS().is_some() {
-            let operand = self.build_unary_expr(ctx.unaryExpr().unwrap().as_ref());
+            let operand = self.build_factor(ctx.factor().unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
                 op: UnaryOp::Neg,
                 operand,
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else if let Some(cast) = ctx.castExpr() {
-            self.build_cast_expr(cast.as_ref())
         } else {
-            self.unsupported(
-                self.span_of(ctx),
-                "parenthesized prefix casts are not supported",
-            );
-            self.build_unary_expr(ctx.unaryExpr().unwrap().as_ref())
+            self.build_sub_factor(ctx.subFactor().unwrap().as_ref())
         }
     }
 
-    fn build_cast_expr(
+    fn build_sub_factor(
         &mut self,
-        ctx: &CastExprContext<'input>,
+        ctx: &SubFactorContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_postfix_expr(ctx.postfixExpr().unwrap().as_ref());
+        let mut expr = self.build_obj_expr(ctx.objExpr().unwrap().as_ref());
         for ty in ctx.children_of_type::<TySpecContext<'input>>() {
             let ty = self.build_ty_spec(ty.as_ref());
             let span = Span::new(expr.span().start(), ty.span.end());
@@ -621,10 +550,7 @@ impl<'input> AstBuilder<'input> {
         expr
     }
 
-    fn build_postfix_expr(
-        &mut self,
-        ctx: &PostfixExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
+    fn build_obj_expr(&mut self, ctx: &ObjExprContext<'input>) -> Expr<&'input str, ParseMetadata> {
         let mut expr = self.build_primary_expr(ctx.primaryExpr().unwrap().as_ref());
         for op in ctx.children_of_type::<PostfixOpContext<'input>>() {
             expr = self.apply_postfix(expr, op.as_ref());
@@ -637,17 +563,17 @@ impl<'input> AstBuilder<'input> {
         base: Expr<&'input str, ParseMetadata>,
         ctx: &PostfixOpContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        if let Some(ident) = ctx.IDENT() {
+        if let Some(ident) = ctx.ident() {
             Expr::FieldAccess(Box::new(FieldAccessExpr {
                 base,
-                field: self.ident_from_token(&ident),
+                field: self.build_ident(ident.as_ref()),
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else if let Some(intlit) = ctx.INTLIT() {
+        } else if let Some(intlit) = ctx.intLiteral() {
             Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
                 base,
-                field: self.int_literal_from_token(&intlit),
+                field: self.build_int_literal(intlit.as_ref()),
                 span: self.span_of(ctx),
                 metadata: (),
             }))
@@ -671,35 +597,24 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &PrimaryExprContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        if let Some(tuple) = ctx.tupleExpr() {
+        if let Some(nil) = ctx.nilLiteral() {
+            Expr::Nil(NilLiteral {
+                span: self.span_of(nil.as_ref()),
+            })
+        } else if let Some(seq_nil) = ctx.seqNilLiteral() {
+            Expr::SeqNil(SeqNilLiteral {
+                span: self.span_of(seq_nil.as_ref()),
+            })
+        } else if let Some(tuple) = ctx.tupleExpr() {
             Expr::Tuple(self.build_tuple_expr(tuple.as_ref()))
         } else if let Some(expr) = ctx.expr() {
             self.build_expr(expr.as_ref())
-        } else if let Some(block) = ctx.blockExpr() {
-            self.build_block_expr(block.as_ref())
-        } else if let Some(call) = ctx.scopedCallExpr() {
+        } else if let Some(call) = ctx.callExpr() {
             Expr::Call(self.build_call_expr(call.as_ref()))
         } else if let Some(path) = ctx.identPath() {
             Expr::IdentPath(self.build_ident_path(path.as_ref()))
         } else if let Some(literal) = ctx.literal() {
             self.build_literal(literal.as_ref())
-        } else if ctx.LBRACK().is_some() {
-            Expr::SeqNil(SeqNilLiteral {
-                span: self.span_of(ctx),
-            })
-        } else if ctx.structLiteralExpr().is_some() {
-            self.unsupported(
-                self.span_of(ctx),
-                "struct literal expressions are not supported",
-            );
-            Expr::Nil(NilLiteral {
-                span: self.span_of(ctx),
-            })
-        } else if ctx.deferExpr().is_some() {
-            self.unsupported(self.span_of(ctx), "defer expressions are not supported");
-            Expr::Nil(NilLiteral {
-                span: self.span_of(ctx),
-            })
         } else {
             Expr::Nil(NilLiteral {
                 span: self.span_of(ctx),
@@ -711,14 +626,13 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &TupleExprContext<'input>,
     ) -> TupleExpr<&'input str, ParseMetadata> {
-        let mut items = vec![self.build_expr(ctx.expr().unwrap().as_ref())];
-        if let Some(rest) = ctx.tupleExprRest() {
-            items.extend(
-                rest.children_of_type::<ExprContext<'input>>()
-                    .into_iter()
-                    .map(|expr| self.build_expr(expr.as_ref())),
-            );
-        }
+        let items = ctx
+            .tupleExprList()
+            .unwrap()
+            .children_of_type::<ExprContext<'input>>()
+            .into_iter()
+            .map(|expr| self.build_expr(expr.as_ref()))
+            .collect();
         TupleExpr {
             items,
             span: self.span_of(ctx),
@@ -728,12 +642,12 @@ impl<'input> AstBuilder<'input> {
 
     fn build_call_expr(
         &mut self,
-        ctx: &ScopedCallExprContext<'input>,
+        ctx: &CallExprContext<'input>,
     ) -> CallExpr<&'input str, ParseMetadata> {
         CallExpr {
             scope_annotation: ctx
-                .annotation()
-                .map(|annotation| self.build_annotation(annotation.as_ref())),
+                .scopeAnnotation()
+                .map(|annotation| self.build_scope_annotation(annotation.as_ref())),
             func: self.build_ident_path(ctx.identPath().unwrap().as_ref()),
             args: self.build_args(ctx.args().unwrap().as_ref()),
             span: self.span_of(ctx),
@@ -745,41 +659,18 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &ArgsContext<'input>,
     ) -> crate::ast::Args<&'input str, ParseMetadata> {
-        if let Some(argument_list) = ctx.argumentList() {
-            self.build_argument_list(argument_list.as_ref())
+        let (posargs, kwargs) = if let Some(posargs) = ctx.posArgsTrailingComma() {
+            (
+                self.build_pos_args_trailing_comma(posargs.as_ref()),
+                self.build_kw_args(ctx.kwArgs().unwrap().as_ref()),
+            )
+        } else if let Some(kwargs) = ctx.kwArgs() {
+            (Vec::new(), self.build_kw_args(kwargs.as_ref()))
+        } else if let Some(posargs) = ctx.posArgs() {
+            (self.build_pos_args(posargs.as_ref()), Vec::new())
         } else {
-            crate::ast::Args {
-                posargs: Vec::new(),
-                kwargs: Vec::new(),
-                span: self.span_of(ctx),
-                metadata: (),
-            }
-        }
-    }
-
-    fn build_argument_list(
-        &mut self,
-        ctx: &ArgumentListContext<'input>,
-    ) -> crate::ast::Args<&'input str, ParseMetadata> {
-        let mut posargs = Vec::new();
-        let mut kwargs = Vec::new();
-        for argument in ctx.children_of_type::<ArgumentContext<'input>>() {
-            if let Some(ident) = argument.IDENT() {
-                kwargs.push(KwArgValue {
-                    name: self.ident_from_token(&ident),
-                    value: self.build_expr(argument.expr().unwrap().as_ref()),
-                    span: self.span_of(argument.as_ref()),
-                    metadata: (),
-                });
-            } else if kwargs.is_empty() {
-                posargs.push(self.build_expr(argument.expr().unwrap().as_ref()));
-            } else {
-                self.unsupported(
-                    self.span_of(argument.as_ref()),
-                    "positional arguments cannot follow keyword arguments",
-                );
-            }
-        }
+            (Vec::new(), Vec::new())
+        };
         crate::ast::Args {
             posargs,
             kwargs,
@@ -788,16 +679,101 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
+    fn build_kw_arg_value(
+        &mut self,
+        ctx: &KwArgValueContext<'input>,
+    ) -> KwArgValue<&'input str, ParseMetadata> {
+        KwArgValue {
+            name: self.build_ident(ctx.ident().unwrap().as_ref()),
+            value: self.build_expr(ctx.expr().unwrap().as_ref()),
+            span: self.span_of(ctx),
+            metadata: (),
+        }
+    }
+
+    fn build_kw_args(
+        &mut self,
+        ctx: &KwArgsContext<'input>,
+    ) -> Vec<KwArgValue<&'input str, ParseMetadata>> {
+        if let Some(trailing) = ctx.kwArgsTrailingComma() {
+            self.build_kw_args_trailing_comma(trailing.as_ref())
+        } else {
+            self.build_kw_args_no_comma(ctx.kwArgsNoComma().unwrap().as_ref())
+        }
+    }
+
+    fn build_kw_args_trailing_comma(
+        &mut self,
+        ctx: &KwArgsTrailingCommaContext<'input>,
+    ) -> Vec<KwArgValue<&'input str, ParseMetadata>> {
+        let mut kwargs = ctx
+            .kwArgsTrailingComma()
+            .map(|prev| self.build_kw_args_trailing_comma(prev.as_ref()))
+            .unwrap_or_default();
+        kwargs.push(self.build_kw_arg_value(ctx.kwArgValue().unwrap().as_ref()));
+        kwargs
+    }
+
+    fn build_kw_args_no_comma(
+        &mut self,
+        ctx: &KwArgsNoCommaContext<'input>,
+    ) -> Vec<KwArgValue<&'input str, ParseMetadata>> {
+        let mut kwargs = ctx
+            .kwArgsTrailingComma()
+            .map(|prev| self.build_kw_args_trailing_comma(prev.as_ref()))
+            .unwrap_or_default();
+        if let Some(value) = ctx.kwArgValue() {
+            kwargs.push(self.build_kw_arg_value(value.as_ref()));
+        }
+        kwargs
+    }
+
+    fn build_pos_args(
+        &mut self,
+        ctx: &PosArgsContext<'input>,
+    ) -> Vec<Expr<&'input str, ParseMetadata>> {
+        if let Some(trailing) = ctx.posArgsTrailingComma() {
+            self.build_pos_args_trailing_comma(trailing.as_ref())
+        } else {
+            self.build_pos_args_no_comma(ctx.posArgsNoComma().unwrap().as_ref())
+        }
+    }
+
+    fn build_pos_args_trailing_comma(
+        &mut self,
+        ctx: &PosArgsTrailingCommaContext<'input>,
+    ) -> Vec<Expr<&'input str, ParseMetadata>> {
+        let mut posargs = ctx
+            .posArgsTrailingComma()
+            .map(|prev| self.build_pos_args_trailing_comma(prev.as_ref()))
+            .unwrap_or_default();
+        posargs.push(self.build_expr(ctx.expr().unwrap().as_ref()));
+        posargs
+    }
+
+    fn build_pos_args_no_comma(
+        &mut self,
+        ctx: &PosArgsNoCommaContext<'input>,
+    ) -> Vec<Expr<&'input str, ParseMetadata>> {
+        let mut posargs = ctx
+            .posArgsTrailingComma()
+            .map(|prev| self.build_pos_args_trailing_comma(prev.as_ref()))
+            .unwrap_or_default();
+        if let Some(expr) = ctx.expr() {
+            posargs.push(self.build_expr(expr.as_ref()));
+        }
+        posargs
+    }
+
     fn build_ident_path(
         &mut self,
         ctx: &IdentPathContext<'input>,
     ) -> IdentPath<&'input str, ParseMetadata> {
-        let mut path = Vec::new();
-        let mut i = 0;
-        while let Some(ident) = ctx.IDENT(i) {
-            path.push(self.ident_from_token(&ident));
-            i += 1;
-        }
+        let path = ctx
+            .children_of_type::<IdentContext<'input>>()
+            .into_iter()
+            .map(|ident| self.build_ident(ident.as_ref()))
+            .collect();
         IdentPath {
             path,
             metadata: (),
@@ -806,8 +782,8 @@ impl<'input> AstBuilder<'input> {
     }
 
     fn build_ty_spec(&mut self, ctx: &TySpecContext<'input>) -> TySpec<&'input str, ParseMetadata> {
-        let kind = if let Some(ident) = ctx.IDENT() {
-            TySpecKind::Ident(self.ident_from_token(&ident))
+        let kind = if let Some(ident) = ctx.ident() {
+            TySpecKind::Ident(self.build_ident(ident.as_ref()))
         } else if let Some(inner) = ctx.tySpec() {
             TySpecKind::Seq(Box::new(self.build_ty_spec(inner.as_ref())))
         } else {
@@ -836,24 +812,17 @@ impl<'input> AstBuilder<'input> {
     fn build_literal(&mut self, ctx: &LiteralContext<'input>) -> Expr<&'input str, ParseMetadata> {
         if let Some(float_ctx) = ctx.floatLiteral() {
             Expr::FloatLiteral(self.build_float_literal(float_ctx.as_ref()))
-        } else if let Some(token) = ctx.INTLIT() {
-            Expr::IntLiteral(self.int_literal_from_token(&token))
-        } else if let Some(token) = ctx.STRLIT() {
+        } else if let Some(int_ctx) = ctx.intLiteral() {
+            Expr::IntLiteral(self.build_int_literal(int_ctx.as_ref()))
+        } else if let Some(string_ctx) = ctx.stringLiteral() {
+            let token = string_ctx.STRLIT().unwrap();
             let span = self.span_of_token(&token);
             Expr::StringLiteral(StringLiteral {
                 span,
                 value: self.slice(span).trim_matches('"'),
             })
-        } else if ctx.TRUE().is_some() {
-            Expr::BoolLiteral(BoolLiteral {
-                span: self.span_of(ctx),
-                value: true,
-            })
         } else {
-            Expr::BoolLiteral(BoolLiteral {
-                span: self.span_of(ctx),
-                value: false,
-            })
+            Expr::BoolLiteral(self.build_bool_literal(ctx.boolLiteral().unwrap().as_ref()))
         }
     }
 
@@ -865,9 +834,16 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_annotation(
+    fn build_bool_literal(&self, ctx: &BoolLiteralContext<'input>) -> BoolLiteral {
+        BoolLiteral {
+            span: self.span_of(ctx),
+            value: ctx.TRUE().is_some(),
+        }
+    }
+
+    fn build_scope_annotation(
         &mut self,
-        ctx: &AnnotationContext<'input>,
+        ctx: &ScopeAnnotationContext<'input>,
     ) -> Ident<&'input str, ParseMetadata> {
         let token = ctx.get_token(ANNOTATION, 0).unwrap();
         let span = self.span_of_token(&token);
@@ -879,6 +855,14 @@ impl<'input> AstBuilder<'input> {
             name: self.slice(span),
             metadata: (),
         }
+    }
+
+    fn build_ident(&self, ctx: &IdentContext<'input>) -> Ident<&'input str, ParseMetadata> {
+        self.ident_from_token(&ctx.IDENT().unwrap())
+    }
+
+    fn build_int_literal(&self, ctx: &IntLiteralContext<'input>) -> IntLiteral {
+        self.int_literal_from_token(&ctx.INTLIT().unwrap())
     }
 
     fn ident_from_token(
@@ -904,15 +888,7 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn empty_ident(&self, span: Span) -> Ident<&'input str, ParseMetadata> {
-        Ident {
-            span,
-            name: "",
-            metadata: (),
-        }
-    }
-
-    fn comparison_ops(&self, ctx: &ComparisonExprContext<'input>) -> Vec<ComparisonOp> {
+    fn comparison_ops(&self, ctx: &NonBlockExprContext<'input>) -> Vec<ComparisonOp> {
         self.terminal_types(ctx)
             .into_iter()
             .filter_map(|ttype| match ttype {
@@ -927,7 +903,7 @@ impl<'input> AstBuilder<'input> {
             .collect()
     }
 
-    fn additive_ops(&self, ctx: &AdditiveExprContext<'input>) -> Vec<BinOp> {
+    fn additive_ops(&self, ctx: &NonComparisonExprContext<'input>) -> Vec<BinOp> {
         self.terminal_types(ctx)
             .into_iter()
             .filter_map(|ttype| match ttype {
@@ -938,7 +914,7 @@ impl<'input> AstBuilder<'input> {
             .collect()
     }
 
-    fn multiplicative_ops(&self, ctx: &MultiplicativeExprContext<'input>) -> Vec<BinOp> {
+    fn multiplicative_ops(&self, ctx: &TermContext<'input>) -> Vec<BinOp> {
         self.terminal_types(ctx)
             .into_iter()
             .filter_map(|ttype| match ttype {
@@ -990,13 +966,6 @@ impl<'input> AstBuilder<'input> {
 
     fn slice(&self, span: Span) -> &'input str {
         &self.input[span.start() - self.offset_base..span.end() - self.offset_base]
-    }
-
-    fn unsupported(&mut self, span: Span, message: impl Into<String>) {
-        self.errors.push(AntlrParseError {
-            span,
-            message: message.into(),
-        });
     }
 }
 

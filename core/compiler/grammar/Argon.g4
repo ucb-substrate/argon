@@ -1,19 +1,7 @@
 grammar Argon;
 
-compilationUnit
-    : sourceItem* EOF
-    ;
-
-sourceItem
-    : decl
-    | topLevelStatement
-    ;
-
-topLevelStatement
-    : letStmt SEMI?
-    | forStmt
-    | bareCallStmt SEMI?
-    | expr SEMI?
+ast
+    : decl* EOF
     ;
 
 decl
@@ -21,69 +9,116 @@ decl
     | structDecl
     | cellDecl
     | fnDecl
-    | constDecl
+    | constantDecl
     | modDecl
     ;
 
-enumDecl
-    : ENUM IDENT LBRACE enumVariants? RBRACE
+ident
+    : IDENT
     ;
 
-enumVariants
-    : IDENT COMMA
-    | enumVariants IDENT COMMA
+identPath
+    : ident (PATHSEP ident)*
+    ;
+
+nilLiteral
+    : LPAREN RPAREN
+    ;
+
+seqNilLiteral
+    : LBRACK RBRACK
+    ;
+
+floatLiteral
+    : INTLIT DOT INTLIT?
+    ;
+
+intLiteral
+    : INTLIT
+    ;
+
+stringLiteral
+    : STRLIT
+    ;
+
+boolLiteral
+    : TRUE
+    | FALSE
+    ;
+
+literal
+    : floatLiteral
+    | intLiteral
+    | stringLiteral
+    | boolLiteral
+    ;
+
+enumDecl
+    : ENUM ident LBRACE enumVariants RBRACE
     ;
 
 structDecl
-    : STRUCT IDENT LBRACE structFields? RBRACE
+    : STRUCT ident LBRACE structFields RBRACE
     ;
 
-structFields
-    : structField COMMA
-    | structFields structField COMMA
-    ;
-
-structField
-    : IDENT COLON tySpec
-    ;
-
-cellDecl
-    : CELL IDENT LPAREN argDecls RPAREN scope
-    ;
-
-fnDecl
-    : FN IDENT LPAREN argDecls RPAREN ARROW tySpec scope
-    | FN IDENT LPAREN argDecls RPAREN scope
-    ;
-
-constDecl
-    : CONST IDENT COLON tySpec EQ expr SEMI
+constantDecl
+    : CONST ident COLON ident EQ expr SEMI
     ;
 
 modDecl
-    : MOD IDENT SEMI
+    : MOD ident SEMI
+    ;
+
+enumVariants
+    : (ident COMMA)*
+    ;
+
+structFields
+    : (structField COMMA)*
+    ;
+
+structField
+    : ident COLON ident
+    ;
+
+cellDecl
+    : CELL ident LPAREN argDecls RPAREN scope
+    ;
+
+fnDecl
+    : FN ident LPAREN argDecls RPAREN ARROW tySpec scope
+    | FN ident LPAREN argDecls RPAREN scope
     ;
 
 argDecls
-    : argDeclList COMMA?
+    : argDecls1 COMMA?
     |
     ;
 
-argDeclList
-    : argDecl
-    | argDeclList COMMA argDecl
+argDecls1
+    : argDecl (COMMA argDecl)*
     ;
 
 argDecl
-    : IDENT (COLON tySpec)?
+    : ident COLON tySpec
     ;
 
 scope
-    : annotation? unannotatedScope
+    : scopeAnnotation unannotatedScope
+    | unannotatedScope
+    ;
+
+scopeAnnotation
+    : ANNOTATION
     ;
 
 unannotatedScope
-    : LBRACE statement* expr? RBRACE
+    : LBRACE statements RBRACE
+    | LBRACE statements nonBlockExpr RBRACE
+    ;
+
+statements
+    : statement*
     ;
 
 statement
@@ -94,160 +129,142 @@ statement
     ;
 
 letStmt
-    : LET identList (EQ expr)?
-    ;
-
-identList
-    : IDENT (COMMA IDENT)*
+    : LET ident EQ expr
     ;
 
 forStmt
-    : FOR IDENT IN expr scope
+    : FOR ident IN expr scope
     ;
 
 expr
-    : blockExpr
-    | comparisonExpr
+    : nonBlockExpr
+    | blockExpr
     ;
 
 blockExpr
-    : annotation? IF expr scope ELSE scope
-    | MATCH expr LBRACE matchArm+ RBRACE
+    : IF expr scope ELSE scope
+    | scopeAnnotation IF expr scope ELSE scope
+    | matchExpr
     | scope
+    ;
+
+matchExpr
+    : MATCH expr LBRACE matchArms RBRACE
+    ;
+
+matchArms
+    : matchArm+
     ;
 
 matchArm
     : identPath FAT_ARROW expr COMMA
     ;
 
-comparisonExpr
-    : additiveExpr ((EQEQ | NEQ | GEQ | GT | LEQ | LT) additiveExpr)*
+nonBlockExpr
+    : nonComparisonExpr ((EQEQ | NEQ | GEQ | GT | LEQ | LT) nonComparisonExpr)*
     ;
 
-additiveExpr
-    : multiplicativeExpr ((PLUS | MINUS) multiplicativeExpr)*
+nonComparisonExpr
+    : term ((PLUS | MINUS) term)*
     ;
 
-multiplicativeExpr
-    : unaryExpr ((STAR | SLASH | PERCENT) unaryExpr)*
+term
+    : factor ((STAR | SLASH | PERCENT) factor)*
     ;
 
-unaryExpr
-    : BANG unaryExpr
-    | MINUS unaryExpr
-    | LPAREN IDENT RPAREN unaryExpr
-    | castExpr
+factor
+    : BANG factor
+    | MINUS factor
+    | subFactor
     ;
 
-castExpr
-    : postfixExpr (AS tySpec)*
+subFactor
+    : objExpr (AS tySpec)*
     ;
 
-postfixExpr
+objExpr
     : primaryExpr postfixOp*
     ;
 
 postfixOp
-    : DOT IDENT
-    | DOT INTLIT
+    : DOT ident
+    | DOT intLiteral
     | LBRACK expr RBRACK
     | BANG
     ;
 
 primaryExpr
-    : LPAREN RPAREN
-    | LBRACK RBRACK
+    : nilLiteral
+    | seqNilLiteral
     | tupleExpr
     | LPAREN expr RPAREN
-    | blockExpr
-    | structLiteralExpr
-    | deferExpr
-    | scopedCallExpr
+    | callExpr
     | identPath
     | literal
     ;
 
-structLiteralExpr
-    : identPath LBRACE structLiteralFields? RBRACE
-    ;
-
-structLiteralFields
-    : structLiteralField (COMMA structLiteralField)* COMMA?
-    ;
-
-structLiteralField
-    : IDENT (EQ expr)?
-    ;
-
-deferExpr
-    : DEFER IDENT scope
-    ;
-
-bareCallStmt
-    : identPath bareArg+
-    ;
-
-bareArg
-    : identPath
-    | literal
-    | LPAREN expr RPAREN
-    | scope
-    ;
-
 tupleExpr
-    : LPAREN expr COMMA tupleExprRest? RPAREN
+    : LPAREN tupleExprList RPAREN
     ;
 
-tupleExprRest
-    : expr (COMMA expr)* COMMA?
+tupleExprList
+    : expr COMMA (expr COMMA)*
     ;
 
-scopedCallExpr
-    : annotation? identPath LPAREN args RPAREN
+callExpr
+    : scopeAnnotation identPath LPAREN args RPAREN
+    | identPath LPAREN args RPAREN
     ;
 
 args
-    : argumentList?
+    : posArgsTrailingComma kwArgs
+    | kwArgs
+    | posArgs
     ;
 
-argumentList
-    : argument (COMMA argument)* COMMA?
+kwArgValue
+    : ident EQ expr
     ;
 
-argument
-    : IDENT EQ expr
+kwArgs
+    : kwArgsTrailingComma
+    | kwArgsNoComma
+    ;
+
+kwArgsTrailingComma
+    : kwArgValue COMMA
+    | kwArgsTrailingComma kwArgValue COMMA
+    ;
+
+kwArgsNoComma
+    : kwArgValue
+    | kwArgsTrailingComma kwArgValue
+    ;
+
+posArgs
+    : posArgsTrailingComma
+    | posArgsNoComma
+    ;
+
+posArgsTrailingComma
+    : expr COMMA
+    | posArgsTrailingComma expr COMMA
+    ;
+
+posArgsNoComma
+    :
     | expr
-    ;
-
-identPath
-    : IDENT (PATHSEP IDENT)*
+    | posArgsTrailingComma expr
     ;
 
 tySpec
-    : IDENT
+    : ident
     | LBRACK tySpec RBRACK
     | LPAREN tySpecList RPAREN
     ;
 
 tySpecList
     : tySpec (COMMA tySpec)*
-    ;
-
-literal
-    : floatLiteral
-    | INTLIT
-    | STRLIT
-    | TRUE
-    | FALSE
-    ;
-
-floatLiteral
-    : INTLIT DOT
-    | INTLIT DOT INTLIT
-    ;
-
-annotation
-    : ANNOTATION
     ;
 
 ENUM: 'enum';
@@ -263,7 +280,6 @@ LET: 'let';
 FOR: 'for';
 IN: 'in';
 AS: 'as';
-DEFER: 'defer';
 TRUE: 'true';
 FALSE: 'false';
 
