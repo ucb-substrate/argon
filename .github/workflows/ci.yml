@@ -16,7 +16,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,7 +31,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -46,25 +46,25 @@ jobs:
           components: clippy
       
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache ANTLR toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.ARGON_TOOLCHAIN_DIR }}
           key: ${{ runner.os }}-antlr-toolchain-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs') }}
@@ -85,7 +85,7 @@ jobs:
         os: [macos-latest, windows-latest, ubuntu-latest]
         rust: [stable]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -106,25 +106,25 @@ jobs:
           sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
       
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Cache cargo index
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
       
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache ANTLR toolchain
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.ARGON_TOOLCHAIN_DIR }}
           key: ${{ runner.os }}-antlr-toolchain-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs') }}
@@ -134,13 +134,10 @@ jobs:
         run: ./scripts/bootstrap-antlr.sh
       
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --release
       
       - name: Run tests
-        run: cargo test --verbose
-      
-      # - name: Build release
-      #   run: cargo build --release --verbose
+        run: cargo test --release
 
   # Checks if dependencies have vulnerabilties
   security-audit:
@@ -148,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       
       - name: Install cargo-audit
         run: cargo install cargo-audit

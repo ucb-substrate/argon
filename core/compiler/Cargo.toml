@@ -6,11 +6,9 @@ edition = "2024"
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.34", features = ["sparse"] }
-klayout-lyp = "0.1.1"
+klayout-lyp = "0.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
-antlr-rust = { path = "../../../.argon-toolchain/antlr4rust" }
-
-
+antlr-rust = "0.3.0-beta"
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }
 itertools = { workspace = true }

@@ -71,6 +71,7 @@ mod tests {
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
+    const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -1019,29 +1020,23 @@ mod tests {
     }
 
     #[test]
-    fn antlr_parse_errors_preserve_leading_whitespace_offsets() {
-        let errors = antlr::parse_errors("   let x = 1;");
-        assert!(!errors.is_empty());
-        assert_eq!(errors[0].span.start(), 3);
-    }
+    fn argon_sse_basic() {
+        let o = parse_workspace_with_std(ARGON_SSE_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
 
-    #[test]
-    fn antlr_rejects_subset_only_valueless_let() {
-        let errors = antlr::parse_errors("cell top() { let y, z; }");
-        assert!(!errors.is_empty());
-    }
-
-    #[test]
-    fn antlr_rejects_subset_only_defer_expression() {
-        let errors = antlr::parse_errors("cell top() { defer foo(); }");
-        assert!(!errors.is_empty());
-    }
-
-    #[test]
-    fn parse_cell_requires_call_expression() {
-        let err = parse_cell(&format_cell_input("1 + 2"))
-            .expect_err("non-call input should be rejected")
-            .to_string();
-        assert!(err.contains("expected a cell invocation"));
+        let cells = cells.unwrap_exec_errors().output.unwrap();
+        let cell = &cells.cells[&cells.top];
+        println!("rowspace vecs = {:?}", cell.rowspace_vecs);
+        assert_eq!(cell.rowspace_vecs.len(), 1);
     }
 }

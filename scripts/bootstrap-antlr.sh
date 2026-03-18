@@ -3,12 +3,9 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-TOOLCHAIN_DIR="${ARGON_TOOLCHAIN_DIR:-$ROOT_DIR/../.argon-toolchain}"
-ANTLR4RUST_DIR="$TOOLCHAIN_DIR/antlr4rust"
+TOOLCHAIN_DIR="${ARGON_TOOLCHAIN_DIR:-$ROOT_DIR/.argon-toolchain}"
 ANTLR4_TOOL_DIR="$TOOLCHAIN_DIR/antlr4-tool"
 
-ANTLR4RUST_REPO="${ANTLR4RUST_REPO:-https://github.com/rrevenantt/antlr4rust.git}"
-ANTLR4RUST_COMMIT="${ANTLR4RUST_COMMIT:-4779134a583a3bf20ae68b4377ade94d32cee69c}"
 ANTLR4_TOOL_REPO="${ANTLR4_TOOL_REPO:-https://github.com/rrevenantt/antlr4.git}"
 ANTLR4_TOOL_BRANCH="${ANTLR4_TOOL_BRANCH:-rust-target}"
 ANTLR4_TOOL_COMMIT="${ANTLR4_TOOL_COMMIT:-e157622876d58b5858147a31ee88aca394a07af8}"
@@ -22,7 +19,6 @@ Bootstraps the pinned antlr4rust runtime and Rust-target ANTLR tool into:
 
 Overrides:
   ARGON_TOOLCHAIN_DIR  Change the toolchain directory location.
-  ANTLR4RUST_REPO      Override the antlr4rust runtime repository.
   ANTLR4RUST_COMMIT    Override the antlr4rust runtime commit.
   ANTLR4_TOOL_REPO     Override the ANTLR tool repository.
   ANTLR4_TOOL_BRANCH   Override the ANTLR tool branch.
@@ -78,14 +74,11 @@ require_cmd install
 
 install -d "$TOOLCHAIN_DIR"
 
-echo "[1/5] syncing antlr4rust runtime"
-ensure_repo "$ANTLR4RUST_REPO" "$ANTLR4RUST_DIR" "$ANTLR4RUST_COMMIT"
-
-echo "[2/5] syncing antlr4 rust-target tool"
+echo "[1/4] syncing antlr4 rust-target tool"
 ensure_repo "$ANTLR4_TOOL_REPO" "$ANTLR4_TOOL_DIR" "$ANTLR4_TOOL_COMMIT" --branch "$ANTLR4_TOOL_BRANCH" --recurse-submodules
 git -C "$ANTLR4_TOOL_DIR" submodule update --init --recursive
 
-echo "[3/5] applying compatibility patches"
+echo "[2/4] applying compatibility patches"
 patch_file \
     "$ANTLR4_TOOL_DIR/pom.xml" \
     "<maven.compiler.source>1.7</maven.compiler.source>" \
@@ -110,24 +103,12 @@ patch_file \
     "$ANTLR4_TOOL_DIR/tool/pom.xml" \
     "<targetVersion>1.7</targetVersion>" \
     "<targetVersion>1.8</targetVersion>"
-patch_file \
-    "$ANTLR4RUST_DIR/src/vocabulary.rs" \
-    "pub trait Vocabulary: Sync + Debug" \
-    "pub trait Vocabulary: Send + Sync + Debug"
 
-echo "[4/5] syncing Rust target templates"
+echo "[3/4] syncing Rust target templates"
 install -d "$ANTLR4_TOOL_DIR/runtime/Rust/templates"
 install -d "$ANTLR4_TOOL_DIR/tool/resources/org/antlr/v4/tool/templates/codegen/Rust"
-install -m 0644 "$ANTLR4RUST_DIR/templates/BaseRustTest.java" \
-    "$ANTLR4_TOOL_DIR/runtime/Rust/templates/BaseRustTest.java"
-install -m 0644 "$ANTLR4RUST_DIR/templates/Rust.stg" \
-    "$ANTLR4_TOOL_DIR/runtime/Rust/templates/Rust.stg"
-install -m 0644 "$ANTLR4RUST_DIR/templates/Rust.test.stg" \
-    "$ANTLR4_TOOL_DIR/runtime/Rust/templates/Rust.test.stg"
-install -m 0644 "$ANTLR4RUST_DIR/templates/Rust.test.stg" \
-    "$ANTLR4_TOOL_DIR/tool/resources/org/antlr/v4/tool/templates/codegen/Rust/Rust.test.stg"
 
-echo "[5/5] building ANTLR tool jar"
+echo "[4/4] building ANTLR tool jar"
 (
     cd "$ANTLR4_TOOL_DIR"
     mvn -pl tool -am -DskipTests package
@@ -135,7 +116,6 @@ echo "[5/5] building ANTLR tool jar"
 
 echo
 echo "ANTLR bootstrap complete."
-echo "Runtime: $ANTLR4RUST_DIR"
 echo "Tool jar: $ANTLR4_TOOL_DIR/tool/target/antlr4-4.8-2-SNAPSHOT-complete.jar"
 echo
 echo "You can now run:"
