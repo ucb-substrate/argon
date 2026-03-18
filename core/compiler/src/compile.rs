@@ -1184,7 +1184,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
         let scope = Scope {
             scope_annotation,
-            span: input.span,
+            span: input.scope.span,
             stmts,
             tail,
             metadata,
