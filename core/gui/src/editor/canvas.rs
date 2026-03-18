@@ -173,7 +173,7 @@ fn unconstrained_var(
         .filter_map(|(_, var)| unsolved_vars.contains(var).then_some(*var))
         .unique()
         .collect_vec();
-    (vars.len() == 1).then_some(vars[0])
+    (vars.len() == 1).then(|| vars[0])
 }
 
 fn rect_drag_handles(
@@ -227,7 +227,7 @@ fn handle_drag_delta(edge: RectEdge, previous: Point<f32>, current: Point<f32>) 
 }
 
 fn drag_variable(var: Var, amount: f64) {
-    info!("drag_variable({var:?}, {amount})");
+    tracing::error!("drag_variable({var:?}, {amount})");
 }
 
 pub fn intersect(a: &Bounds<Pixels>, b: &Bounds<Pixels>) -> Option<Bounds<Pixels>> {
