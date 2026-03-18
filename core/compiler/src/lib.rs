@@ -13,9 +13,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
+        antlr,
         compile::{ExecErrorKind, SolvedValue, StaticErrorKind},
         gds::GdsMap,
-        parse::parse_workspace_with_std,
+        parse::{format_cell_input, parse_cell, parse_workspace_with_std},
     };
     use ::gds::GdsUnits;
     use approx::assert_relative_eq;
@@ -1015,5 +1016,32 @@ mod tests {
             assert_relative_eq!(r.x1.0, w, epsilon = EPSILON);
             assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
         }
+    }
+
+    #[test]
+    fn antlr_parse_errors_preserve_leading_whitespace_offsets() {
+        let errors = antlr::parse_errors("   let x = 1;");
+        assert!(!errors.is_empty());
+        assert_eq!(errors[0].span.start(), 3);
+    }
+
+    #[test]
+    fn antlr_rejects_subset_only_valueless_let() {
+        let errors = antlr::parse_errors("cell top() { let y, z; }");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn antlr_rejects_subset_only_defer_expression() {
+        let errors = antlr::parse_errors("cell top() { defer foo(); }");
+        assert!(!errors.is_empty());
+    }
+
+    #[test]
+    fn parse_cell_requires_call_expression() {
+        let err = parse_cell(&format_cell_input("1 + 2"))
+            .expect_err("non-call input should be rejected")
+            .to_string();
+        assert!(err.contains("expected a cell invocation"));
     }
 }

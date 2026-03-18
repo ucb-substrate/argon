@@ -70,11 +70,11 @@ modDecl
     ;
 
 enumVariants
-    : (ident COMMA)*
+    : (ident (COMMA ident)* COMMA?)?
     ;
 
 structFields
-    : (structField COMMA)*
+    : (structField (COMMA structField)* COMMA?)?
     ;
 
 structField
@@ -86,17 +86,11 @@ cellDecl
     ;
 
 fnDecl
-    : FN ident LPAREN argDecls RPAREN ARROW tySpec scope
-    | FN ident LPAREN argDecls RPAREN scope
+    : FN ident LPAREN argDecls RPAREN (ARROW tySpec)? scope
     ;
 
 argDecls
-    : argDecls1 COMMA?
-    |
-    ;
-
-argDecls1
-    : argDecl (COMMA argDecl)*
+    : (argDecl (COMMA argDecl)* COMMA?)?
     ;
 
 argDecl
@@ -104,8 +98,7 @@ argDecl
     ;
 
 scope
-    : scopeAnnotation unannotatedScope
-    | unannotatedScope
+    : scopeAnnotation? unannotatedScope
     ;
 
 scopeAnnotation
@@ -146,8 +139,7 @@ expr
     ;
 
 ifExpr
-    : IF expr scope ELSE scope
-    | scopeAnnotation IF expr scope ELSE scope
+    : scopeAnnotation? IF expr scope ELSE scope
     ;
 
 matchExpr
@@ -195,8 +187,7 @@ tupleExprList
     ;
 
 callExpr
-    : scopeAnnotation identPath LPAREN args RPAREN
-    | identPath LPAREN args RPAREN
+    : scopeAnnotation? identPath LPAREN args RPAREN
     ;
 
 args
