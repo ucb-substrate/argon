@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  ARGON_TOOLCHAIN_DIR: ${{ github.workspace }}/../.argon-toolchain
+  ARGON_TOOLCHAIN_DIR: ${{ github.workspace }}/.argon-toolchain
 
 jobs:
   format:
