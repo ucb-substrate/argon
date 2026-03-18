@@ -8,7 +8,7 @@ derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.34", features = ["sparse"] }
 klayout-lyp = "0.1.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
-antlr-rust = { path = "../../../antlr4rust" }
+antlr-rust = { path = "../../../.argon-toolchain/antlr4rust" }
 
 
 anyhow = { workspace = true }

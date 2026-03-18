@@ -2,21 +2,23 @@ use std::{fs, path::PathBuf, process::Command};
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let repo_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap();
     let grammar_dir = manifest_dir.join("grammar");
+    let toolchain_dir = repo_root.parent().unwrap().join(".argon-toolchain");
     let output_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("antlr");
-    let antlr_jar = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .unwrap()
-        .join("antlr4-tool")
-        .join("tool")
-        .join("target")
-        .join("antlr4-4.8-2-SNAPSHOT-complete.jar");
+    let antlr_jar = std::env::var_os("ARGON_ANTLR_JAR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            toolchain_dir
+                .join("antlr4-tool")
+                .join("tool")
+                .join("target")
+                .join("antlr4-4.8-2-SNAPSHOT-complete.jar")
+        });
 
     assert!(
         antlr_jar.is_file(),
-        "missing ANTLR tool jar at {}. Build ~/antlr4rust-work/antlr4-tool first.",
+        "missing ANTLR tool jar at {}. Run ./scripts/build-compiler.sh, ./scripts/bootstrap-antlr.sh, or set ARGON_ANTLR_JAR.",
         antlr_jar.display()
     );
 
@@ -45,4 +47,5 @@ fn main() {
 
     println!("cargo:rerun-if-changed=grammar/Argon.g4");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=ARGON_ANTLR_JAR");
 }

@@ -31,17 +31,48 @@ Future versions of Argon will hopefully support:
 
 ## Installation
 
-To use Argon, you will need:
-- [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
-- One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
+### Build The Compiler From Scratch
 
-Begin by cloning and compiling the Argon source code:
+To build the Argon compiler and regenerate its ANTLR parser from a fresh clone, you will need:
+- [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
+- Java 8+
+- [Maven](https://maven.apache.org/install.html)
+
+Then run:
 
 ```bash
 git clone https://github.com/ucb-substrate/argon.git
 cd argon
-cargo b --release
+./scripts/build-compiler.sh --release
 ```
+
+That command:
+- bootstraps the pinned `antlr4rust` runtime and Rust-target ANTLR tool into a sibling `.argon-toolchain/` directory
+- applies the small compatibility patches needed by the Rust target
+- builds the ANTLR jar consumed by `core/compiler/build.rs`
+- runs `cargo build -p compiler --release`
+
+After the first run, rebuilding the compiler is just Cargo:
+
+```bash
+cargo build -p compiler --release
+```
+
+If you want the full Argon workspace instead of just the compiler, bootstrap once and then build the workspace:
+
+```bash
+./scripts/bootstrap-antlr.sh
+cargo build --workspace --release
+```
+
+The ANTLR toolchain lives outside the repo tree, so it does not become part of the Cargo workspace itself.
+
+If you already have a compatible ANTLR jar elsewhere, you can skip the default jar and point the build
+at it with `ARGON_ANTLR_JAR=/absolute/path/to/antlr4-4.8-2-SNAPSHOT-complete.jar cargo build -p compiler`.
+
+To use the editor integrations and GUI, you will additionally need one of:
+- [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
+- [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
 
 ### Neovim
 
