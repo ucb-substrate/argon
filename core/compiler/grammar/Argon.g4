@@ -123,29 +123,31 @@ statements
 
 statement
     : expr SEMI
-    | blockExpr
-    | letStmt SEMI
-    | forStmt
+    | ifExpr
+    | matchExpr
+    | scope
+    | letBinding SEMI
+    | forLoop
     ;
 
-letStmt
+letBinding
     : LET ident EQ expr
     ;
 
-forStmt
+forLoop
     : FOR ident IN expr scope
     ;
 
 expr
     : nonBlockExpr
-    | blockExpr
-    ;
-
-blockExpr
-    : IF expr scope ELSE scope
-    | scopeAnnotation IF expr scope ELSE scope
+    | ifExpr
     | matchExpr
     | scope
+    ;
+
+ifExpr
+    : IF expr scope ELSE scope
+    | scopeAnnotation IF expr scope ELSE scope
     ;
 
 matchExpr
@@ -161,36 +163,17 @@ matchArm
     ;
 
 nonBlockExpr
-    : nonComparisonExpr ((EQEQ | NEQ | GEQ | GT | LEQ | LT) nonComparisonExpr)*
-    ;
-
-nonComparisonExpr
-    : term ((PLUS | MINUS) term)*
-    ;
-
-term
-    : factor ((STAR | SLASH | PERCENT) factor)*
-    ;
-
-factor
-    : BANG factor
-    | MINUS factor
-    | subFactor
-    ;
-
-subFactor
-    : objExpr (AS tySpec)*
-    ;
-
-objExpr
-    : primaryExpr postfixOp*
-    ;
-
-postfixOp
-    : DOT ident
-    | DOT intLiteral
-    | LBRACK expr RBRACK
-    | BANG
+    : BANG nonBlockExpr
+    | MINUS nonBlockExpr
+    | nonBlockExpr DOT ident
+    | nonBlockExpr DOT intLiteral
+    | nonBlockExpr LBRACK expr RBRACK
+    | nonBlockExpr BANG
+    | nonBlockExpr AS tySpec
+    | nonBlockExpr (STAR | SLASH | PERCENT) nonBlockExpr
+    | nonBlockExpr (PLUS | MINUS) nonBlockExpr
+    | nonBlockExpr (EQEQ | NEQ | GEQ | GT | LEQ | LT) nonBlockExpr
+    | primaryExpr
     ;
 
 primaryExpr

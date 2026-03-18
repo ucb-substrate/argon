@@ -357,18 +357,28 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &StatementContext<'input>,
     ) -> Option<Statement<&'input str, ParseMetadata>> {
-        if let Some(let_stmt) = ctx.letStmt() {
+        if let Some(let_binding) = ctx.letBinding() {
             Some(Statement::LetBinding(LetBinding {
-                name: self.build_ident(let_stmt.ident().unwrap().as_ref()),
-                value: self.build_expr(let_stmt.expr().unwrap().as_ref()),
-                span: self.span_of(let_stmt.as_ref()),
+                name: self.build_ident(let_binding.ident().unwrap().as_ref()),
+                value: self.build_expr(let_binding.expr().unwrap().as_ref()),
+                span: self.span_of(let_binding.as_ref()),
                 metadata: (),
             }))
-        } else if let Some(for_stmt) = ctx.forStmt() {
-            Some(Statement::ForLoop(self.build_for_stmt(for_stmt.as_ref())))
-        } else if let Some(block_expr) = ctx.blockExpr() {
+        } else if let Some(for_loop) = ctx.forLoop() {
+            Some(Statement::ForLoop(self.build_for_loop(for_loop.as_ref())))
+        } else if let Some(if_expr) = ctx.ifExpr() {
             Some(Statement::Expr {
-                value: self.build_block_expr(block_expr.as_ref()),
+                value: Expr::If(Box::new(self.build_if_expr(if_expr.as_ref()))),
+                semicolon: false,
+            })
+        } else if let Some(match_expr) = ctx.matchExpr() {
+            Some(Statement::Expr {
+                value: Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref()))),
+                semicolon: false,
+            })
+        } else if let Some(scope) = ctx.scope() {
+            Some(Statement::Expr {
+                value: Expr::Scope(Box::new(self.build_scope(scope.as_ref()))),
                 semicolon: false,
             })
         } else {
@@ -379,9 +389,9 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_for_stmt(
+    fn build_for_loop(
         &mut self,
-        ctx: &ForStmtContext<'input>,
+        ctx: &ForLoopContext<'input>,
     ) -> ForLoop<&'input str, ParseMetadata> {
         ForLoop {
             var: self.build_ident(ctx.ident().unwrap().as_ref()),
@@ -393,32 +403,27 @@ impl<'input> AstBuilder<'input> {
     }
 
     fn build_expr(&mut self, ctx: &ExprContext<'input>) -> Expr<&'input str, ParseMetadata> {
-        if let Some(block) = ctx.blockExpr() {
-            self.build_block_expr(block.as_ref())
+        if let Some(if_expr) = ctx.ifExpr() {
+            Expr::If(Box::new(self.build_if_expr(if_expr.as_ref())))
+        } else if let Some(match_expr) = ctx.matchExpr() {
+            Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
+        } else if let Some(scope) = ctx.scope() {
+            Expr::Scope(Box::new(self.build_scope(scope.as_ref())))
         } else {
             self.build_non_block_expr(ctx.nonBlockExpr().unwrap().as_ref())
         }
     }
 
-    fn build_block_expr(
-        &mut self,
-        ctx: &BlockExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        if let Some(match_expr) = ctx.matchExpr() {
-            Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
-        } else if ctx.expr().is_none() {
-            Expr::Scope(Box::new(self.build_scope(ctx.scope(0).unwrap().as_ref())))
-        } else {
-            Expr::If(Box::new(IfExpr {
-                scope_annotation: ctx
-                    .scopeAnnotation()
-                    .map(|annotation| self.build_scope_annotation(annotation.as_ref())),
-                cond: self.build_expr(ctx.expr().unwrap().as_ref()),
-                then: self.build_scope(ctx.scope(0).unwrap().as_ref()),
-                else_: self.build_scope(ctx.scope(1).unwrap().as_ref()),
-                span: self.span_of(ctx),
-                metadata: (),
-            }))
+    fn build_if_expr(&mut self, ctx: &IfExprContext<'input>) -> IfExpr<&'input str, ParseMetadata> {
+        IfExpr {
+            scope_annotation: ctx
+                .scopeAnnotation()
+                .map(|annotation| self.build_scope_annotation(annotation.as_ref())),
+            cond: self.build_expr(ctx.expr().unwrap().as_ref()),
+            then: self.build_scope(ctx.scope(0).unwrap().as_ref()),
+            else_: self.build_scope(ctx.scope(1).unwrap().as_ref()),
+            span: self.span_of(ctx),
+            metadata: (),
         }
     }
 
@@ -459,111 +464,57 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &NonBlockExprContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_non_comparison_expr(ctx.nonComparisonExpr(0).unwrap().as_ref());
-        for (i, op) in self.comparison_ops(ctx).into_iter().enumerate() {
-            let rhs =
-                self.build_non_comparison_expr(ctx.nonComparisonExpr(i + 1).unwrap().as_ref());
-            let span = Span::new(expr.span().start(), rhs.span().end());
-            expr = Expr::Comparison(Box::new(ComparisonExpr {
-                op,
-                left: expr,
-                right: rhs,
-                span,
-                metadata: (),
-            }));
-        }
-        expr
-    }
-
-    fn build_non_comparison_expr(
-        &mut self,
-        ctx: &NonComparisonExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_term(ctx.term(0).unwrap().as_ref());
-        for (i, op) in self.additive_ops(ctx).into_iter().enumerate() {
-            let rhs = self.build_term(ctx.term(i + 1).unwrap().as_ref());
-            let span = Span::new(expr.span().start(), rhs.span().end());
-            expr = Expr::BinOp(Box::new(BinOpExpr {
-                op,
-                left: expr,
-                right: rhs,
-                span,
-                metadata: (),
-            }));
-        }
-        expr
-    }
-
-    fn build_term(&mut self, ctx: &TermContext<'input>) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_factor(ctx.factor(0).unwrap().as_ref());
-        for (i, op) in self.multiplicative_ops(ctx).into_iter().enumerate() {
-            let rhs = self.build_factor(ctx.factor(i + 1).unwrap().as_ref());
-            let span = Span::new(expr.span().start(), rhs.span().end());
-            expr = Expr::BinOp(Box::new(BinOpExpr {
-                op,
-                left: expr,
-                right: rhs,
-                span,
-                metadata: (),
-            }));
-        }
-        expr
-    }
-
-    fn build_factor(&mut self, ctx: &FactorContext<'input>) -> Expr<&'input str, ParseMetadata> {
-        if ctx.BANG().is_some() {
-            let operand = self.build_factor(ctx.factor().unwrap().as_ref());
+        if let Some(primary) = ctx.primaryExpr() {
+            self.build_primary_expr(primary.as_ref())
+        } else if ctx.start().get_token_type() == BANG {
+            let operand = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
                 op: UnaryOp::Not,
                 operand,
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else if ctx.MINUS().is_some() {
-            let operand = self.build_factor(ctx.factor().unwrap().as_ref());
+        } else if ctx.start().get_token_type() == MINUS {
+            let operand = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
                 op: UnaryOp::Neg,
                 operand,
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else {
-            self.build_sub_factor(ctx.subFactor().unwrap().as_ref())
-        }
-    }
-
-    fn build_sub_factor(
-        &mut self,
-        ctx: &SubFactorContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_obj_expr(ctx.objExpr().unwrap().as_ref());
-        for ty in ctx.children_of_type::<TySpecContext<'input>>() {
+        } else if let Some(rhs) = ctx.nonBlockExpr(1) {
+            let left = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
+            let right = self.build_non_block_expr(rhs.as_ref());
+            let span = Span::new(left.span().start(), right.span().end());
+            if let Some(op) = self.single_comparison_op(ctx) {
+                Expr::Comparison(Box::new(ComparisonExpr {
+                    op,
+                    left,
+                    right,
+                    span,
+                    metadata: (),
+                }))
+            } else {
+                Expr::BinOp(Box::new(BinOpExpr {
+                    op: self.single_bin_op(ctx),
+                    left,
+                    right,
+                    span,
+                    metadata: (),
+                }))
+            }
+        } else if let Some(ty) = ctx.tySpec() {
+            let value = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             let ty = self.build_ty_spec(ty.as_ref());
-            let span = Span::new(expr.span().start(), ty.span.end());
-            expr = Expr::Cast(Box::new(CastExpr {
-                value: expr,
+            let span = Span::new(value.span().start(), ty.span.end());
+            Expr::Cast(Box::new(CastExpr {
+                value,
                 ty,
                 span,
                 metadata: (),
-            }));
-        }
-        expr
-    }
-
-    fn build_obj_expr(&mut self, ctx: &ObjExprContext<'input>) -> Expr<&'input str, ParseMetadata> {
-        let mut expr = self.build_primary_expr(ctx.primaryExpr().unwrap().as_ref());
-        for op in ctx.children_of_type::<PostfixOpContext<'input>>() {
-            expr = self.apply_postfix(expr, op.as_ref());
-        }
-        expr
-    }
-
-    fn apply_postfix(
-        &mut self,
-        base: Expr<&'input str, ParseMetadata>,
-        ctx: &PostfixOpContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        if let Some(ident) = ctx.ident() {
+            }))
+        } else if let Some(ident) = ctx.ident() {
+            let base = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             Expr::FieldAccess(Box::new(FieldAccessExpr {
                 base,
                 field: self.build_ident(ident.as_ref()),
@@ -571,6 +522,7 @@ impl<'input> AstBuilder<'input> {
                 metadata: (),
             }))
         } else if let Some(intlit) = ctx.intLiteral() {
+            let base = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
                 base,
                 field: self.build_int_literal(intlit.as_ref()),
@@ -578,6 +530,7 @@ impl<'input> AstBuilder<'input> {
                 metadata: (),
             }))
         } else if let Some(expr) = ctx.expr() {
+            let base = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             Expr::Index(Box::new(IndexExpr {
                 base,
                 index: self.build_expr(expr.as_ref()),
@@ -586,7 +539,7 @@ impl<'input> AstBuilder<'input> {
             }))
         } else {
             Expr::Emit(Box::new(EmitExpr {
-                value: base,
+                value: self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref()),
                 span: self.span_of(ctx),
                 metadata: (),
             }))
@@ -888,7 +841,7 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn comparison_ops(&self, ctx: &NonBlockExprContext<'input>) -> Vec<ComparisonOp> {
+    fn single_comparison_op(&self, ctx: &NonBlockExprContext<'input>) -> Option<ComparisonOp> {
         self.terminal_types(ctx)
             .into_iter()
             .filter_map(|ttype| match ttype {
@@ -900,30 +853,21 @@ impl<'input> AstBuilder<'input> {
                 LT => Some(ComparisonOp::Lt),
                 _ => None,
             })
-            .collect()
+            .next()
     }
 
-    fn additive_ops(&self, ctx: &NonComparisonExprContext<'input>) -> Vec<BinOp> {
+    fn single_bin_op(&self, ctx: &NonBlockExprContext<'input>) -> BinOp {
         self.terminal_types(ctx)
             .into_iter()
-            .filter_map(|ttype| match ttype {
+            .find_map(|ttype| match ttype {
                 PLUS => Some(BinOp::Add),
                 MINUS => Some(BinOp::Sub),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn multiplicative_ops(&self, ctx: &TermContext<'input>) -> Vec<BinOp> {
-        self.terminal_types(ctx)
-            .into_iter()
-            .filter_map(|ttype| match ttype {
                 STAR => Some(BinOp::Mul),
                 SLASH => Some(BinOp::Div),
                 PERCENT => Some(BinOp::Rem),
                 _ => None,
             })
-            .collect()
+            .unwrap()
     }
 
     fn terminal_types<T>(&self, ctx: &T) -> Vec<isize>
