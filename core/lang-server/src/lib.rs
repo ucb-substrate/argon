@@ -36,9 +36,9 @@ use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
-use tower_lsp_server::lsp_types::{request::Request, *};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{request::Request, *};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
-use tower_lsp_server::{UriExt, jsonrpc::Result};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
