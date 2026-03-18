@@ -4971,11 +4971,11 @@ pub enum StaticErrorKind {
     #[error("module doesn't exist")]
     InvalidMod,
     /// Error during lexing.
-    #[error("error during lexing")]
-    LexError,
+    #[error("error during lexing: {0}")]
+    LexError(String),
     /// Error during parsing.
-    #[error("error during parsing")]
-    ParseError,
+    #[error("error during parsing: {0}")]
+    ParseError(String),
     /// Invalid LYP file.
     #[error("invalid LYP file")]
     InvalidLyp,

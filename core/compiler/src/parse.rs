@@ -6,10 +6,9 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use arcstr::{ArcStr, Substr};
 use indexmap::IndexMap;
-use lrlex::{DefaultLexerTypes, lrlex_mod};
-use lrpar::{LexError, LexParseError, Lexeme, NonStreamingLexer, lrpar_mod};
 
 use crate::{
+    antlr,
     ast::{
         Ast, AstMetadata, CallExpr, Decl, Expr, ModPath, Span, Statement, WorkspaceAst,
         annotated::AnnotatedAst,
@@ -18,11 +17,7 @@ use crate::{
     config::parse_config,
 };
 
-lrlex_mod!("argon.l");
-lrpar_mod!("argon.y");
-
 pub struct ParseMetadata;
-pub type ParseAst<'a> = Ast<&'a str, ParseMetadata>;
 pub type AnnotatedParseAst = AnnotatedAst<ParseMetadata>;
 pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;
 
@@ -84,12 +79,18 @@ pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, an
 }
 
 type ParseResult = (AnnotatedParseAst, Option<anyhow::Error>);
-type LexParseErrors = Vec<LexParseError<u32, DefaultLexerTypes>>;
+type ParseDiagnostics = Vec<ParseDiagnostic>;
 type ModSpans = Vec<(cfgrammar::Span, ModPath)>;
+
+#[derive(Debug, Clone)]
+pub struct ParseDiagnostic {
+    span: cfgrammar::Span,
+    kind: StaticErrorKind,
+}
 
 pub struct ParseOutput {
     pub asts: IndexMap<ModPath, ParseResult>,
-    pub errs: IndexMap<PathBuf, (LexParseErrors, ModSpans)>,
+    pub errs: IndexMap<PathBuf, (ParseDiagnostics, ModSpans)>,
 }
 
 impl ParseOutput {
@@ -102,21 +103,12 @@ impl ParseOutput {
             .flat_map(|(path, (lex_errs, mod_errs))| {
                 lex_errs
                     .iter()
-                    .map(|err| match err {
-                        LexParseError::LexError(e) => StaticError {
-                            span: Span {
-                                path: path.clone(),
-                                span: e.span(),
-                            },
-                            kind: StaticErrorKind::LexError,
+                    .map(|err| StaticError {
+                        span: Span {
+                            path: path.clone(),
+                            span: err.span,
                         },
-                        LexParseError::ParseError(e) => StaticError {
-                            span: Span {
-                                path: path.clone(),
-                                span: e.lexeme().span(),
-                            },
-                            kind: StaticErrorKind::ParseError,
-                        },
+                        kind: err.kind.clone(),
                     })
                     .chain(mod_errs.iter().filter_map(|(span, mod_path)| {
                         if self.asts.get(mod_path)?.1.is_some() {
@@ -133,6 +125,62 @@ impl ParseOutput {
                     }))
             })
             .collect()
+    }
+}
+
+fn make_backup_ast(input: ArcStr, path: PathBuf) -> AnnotatedParseAst {
+    let input_len = input.len();
+    AnnotatedParseAst::new(
+        input,
+        &Ast::<Substr, _> {
+            decls: vec![],
+            span: cfgrammar::Span::new(0, input_len),
+        },
+        path,
+    )
+}
+
+fn antlr_diagnostics(input: &str) -> ParseDiagnostics {
+    antlr::parse_errors(input)
+        .into_iter()
+        .map(|err| ParseDiagnostic {
+            span: err.span,
+            kind: StaticErrorKind::ParseError(err.message),
+        })
+        .collect()
+}
+
+fn parse_result_from_antlr(
+    input: ArcStr,
+    path: PathBuf,
+    diagnostics: &[ParseDiagnostic],
+) -> ParseResult {
+    if !diagnostics.is_empty() {
+        let mut err = String::new();
+        for diagnostic in diagnostics {
+            if let Err(write_err) = writeln!(&mut err, "{}", diagnostic.kind)
+                .with_context(|| "failed to write to string buffer")
+            {
+                return (make_backup_ast(input, path), Some(anyhow!("{write_err}")));
+            }
+        }
+        return (
+            make_backup_ast(input, path),
+            Some(anyhow!(err.trim_end().to_string())),
+        );
+    }
+    match antlr::parse_ast(input.clone(), path.clone()) {
+        Ok(ast) => (ast, None),
+        Err(errs) => {
+            let diagnostics = errs
+                .into_iter()
+                .map(|err| ParseDiagnostic {
+                    span: err.span,
+                    kind: StaticErrorKind::ParseError(err.message),
+                })
+                .collect::<Vec<_>>();
+            parse_result_from_antlr(input, path, &diagnostics)
+        }
     }
 }
 
@@ -227,70 +275,19 @@ pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
     }
 }
 
-fn parse_inner(
-    input: ArcStr,
-    path: PathBuf,
-    res: Option<Result<ParseAst<'_>, ()>>,
-    lexer: &dyn NonStreamingLexer<DefaultLexerTypes>,
-    errs: &[LexParseError<u32, DefaultLexerTypes>],
-) -> ParseResult {
-    let make_backup_ast = |input: ArcStr, path: PathBuf| {
-        let input_len = input.len();
-        AnnotatedParseAst::new(
-            input,
-            &Ast::<Substr, _> {
-                decls: vec![],
-                span: cfgrammar::Span::new(0, input_len),
-            },
-            path,
-        )
-    };
-    if !errs.is_empty() {
-        let mut err = String::new();
-        for e in errs {
-            if let Err(e) = write!(&mut err, "{}", e.pp(lexer, &argon_y::token_epp))
-                .with_context(|| "failed to write to string buffer")
-            {
-                return (make_backup_ast(input, path), Some(anyhow!("{e}")));
-            }
-        }
-        return (make_backup_ast(input, path), Some(anyhow!("{err}")));
-    }
-    match res {
-        Some(Ok(ast)) => (AnnotatedAst::new(input, &ast, path), None),
-        _ => (
-            make_backup_ast(input, path),
-            Some(anyhow!("Unable to evaluate expression.")),
-        ),
-    }
-}
-
-pub fn parse(path: impl Into<PathBuf>) -> (ParseResult, LexParseErrors) {
+fn parse(path: impl Into<PathBuf>) -> (ParseResult, ParseDiagnostics) {
     let path = path.into();
     match std::fs::read_to_string(&path) {
         Ok(input) => {
             let input = ArcStr::from(input);
-            // Get the `LexerDef` for the `argon` language.
-            let lexerdef = argon_l::lexerdef();
-            // Now we create a lexer with the `lexer` method with which
-            // we can lex an input.
-            let lexer = lexerdef.lexer(&input);
-            // Pass the lexer to the parser and lex and parse the input.
-            let (res, errs) = argon_y::parse(&lexer);
-            (parse_inner(input.clone(), path, res, &lexer, &errs), errs)
+            let antlr_errs = antlr_diagnostics(&input);
+            (
+                parse_result_from_antlr(input.clone(), path, &antlr_errs),
+                antlr_errs,
+            )
         }
         Err(e) => (
-            (
-                AnnotatedParseAst::new(
-                    "".into(),
-                    &Ast::<Substr, _> {
-                        decls: vec![],
-                        span: cfgrammar::Span::new(0, 0),
-                    },
-                    path,
-                ),
-                Some(e.into()),
-            ),
+            (make_backup_ast("".into(), path), Some(e.into())),
             Vec::new(),
         ),
     }
@@ -301,25 +298,19 @@ pub fn format_cell_input(input: &str) -> String {
 }
 
 // Input should first be formatted with `format_cell_input`.
-pub fn parse_cell(input: &str) -> Result<CallExpr<&'_ str, ParseMetadata>, anyhow::Error> {
-    // Get the `LexerDef` for the `argon` language.
-    let lexerdef = argon_l::lexerdef();
-    // Now we create a lexer with the `lexer` method with which
-    // we can lex an input.
-    let lexer = lexerdef.lexer(input);
-    // Pass the lexer to the parser and lex and parse the input.
-    let (res, errs) = argon_y::parse(&lexer);
+pub fn parse_cell(input: &str) -> Result<CallExpr<Substr, ParseMetadata>, anyhow::Error> {
+    let errs = antlr_diagnostics(input);
     if !errs.is_empty() {
         let mut err = String::new();
-        for e in errs {
-            write!(&mut err, "{}", e.pp(&lexer, &argon_y::token_epp))
+        for diagnostic in errs {
+            writeln!(&mut err, "{}", diagnostic.kind)
                 .with_context(|| "failed to write to string buffer")?;
         }
-        bail!("{err}");
+        bail!("{}", err.trim_end());
     }
-    match res {
-        Some(Ok(expr)) => {
-            if let Decl::Cell(c) = expr.decls.into_iter().next().unwrap()
+    match antlr::parse_ast(ArcStr::from(input), PathBuf::from("__cell__.ar")) {
+        Ok(ast) => {
+            if let Decl::Cell(c) = ast.ast.decls.into_iter().next().unwrap()
                 && let Statement::Expr {
                     value: Expr::Call(call),
                     ..
@@ -330,6 +321,13 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<&'_ str, ParseMetadata>, anyho
                 bail!("Unable to evaluate expression.")
             }
         }
-        _ => bail!("Unable to evaluate expression."),
+        Err(errs) => {
+            let mut err = String::new();
+            for err_item in errs {
+                writeln!(&mut err, "{}", err_item.message)
+                    .with_context(|| "failed to write to string buffer")?;
+            }
+            bail!("{}", err.trim_end());
+        }
     }
 }

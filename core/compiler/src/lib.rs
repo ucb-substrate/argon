@@ -1,3 +1,4 @@
+mod antlr;
 pub mod ast;
 pub mod compile;
 pub mod config;
