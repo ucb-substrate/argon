@@ -38,7 +38,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: maven
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -62,6 +61,12 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('scripts/bootstrap-antlr.sh') }}
 
       - name: Cache ANTLR toolchain
         uses: actions/cache@v5
@@ -92,7 +97,6 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: maven
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -122,6 +126,12 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('scripts/bootstrap-antlr.sh') }}
 
       - name: Cache ANTLR toolchain
         uses: actions/cache@v5
