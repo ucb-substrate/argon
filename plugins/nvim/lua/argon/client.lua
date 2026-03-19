@@ -4,8 +4,8 @@
 local M = {}
 
 local function normalize_path(path)
-  if package.config:sub(1, 1) == '\\' then
-    return path:gsub('/', '\\')
+  if shell.is_windows() and starts_with_windows_drive_letter(path) then
+    return path:sub(1, 1):lower() .. path:sub(2):gsub('/+', '\\')
   end
   return path
 end
