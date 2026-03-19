@@ -9,7 +9,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  ARGON_TOOLCHAIN_DIR: ${{ github.workspace }}/.argon-toolchain
 
 jobs:
   format:
@@ -17,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,6 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -71,15 +74,17 @@ jobs:
       - name: Cache ANTLR toolchain
         uses: actions/cache@v5
         with:
-          path: ${{ env.ARGON_TOOLCHAIN_DIR }}
-          key: ${{ runner.os }}-antlr-toolchain-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs') }}
+          path: |
+            antlr4/runtime/Java/target
+            antlr4/tool/target
+          key: ${{ runner.os }}-antlr-tool-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs', '.gitmodules', 'antlr4/.gitmodules') }}
 
       - name: Bootstrap ANTLR toolchain
         shell: bash
         run: ./scripts/bootstrap-antlr.sh
       
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
   # Build and test
   test:
@@ -91,6 +96,8 @@ jobs:
         rust: [stable]
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -136,8 +143,10 @@ jobs:
       - name: Cache ANTLR toolchain
         uses: actions/cache@v5
         with:
-          path: ${{ env.ARGON_TOOLCHAIN_DIR }}
-          key: ${{ runner.os }}-antlr-toolchain-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs') }}
+          path: |
+            antlr4/runtime/Java/target
+            antlr4/tool/target
+          key: ${{ runner.os }}-antlr-tool-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs', '.gitmodules', 'antlr4/.gitmodules') }}
 
       - name: Bootstrap ANTLR toolchain
         shell: bash
@@ -156,6 +165,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       
       - name: Install cargo-audit
         run: cargo install cargo-audit

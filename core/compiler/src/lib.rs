@@ -13,10 +13,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        antlr,
         compile::{ExecErrorKind, SolvedValue, StaticErrorKind},
         gds::GdsMap,
-        parse::{format_cell_input, parse_cell, parse_workspace_with_std},
+        parse::parse_workspace_with_std,
     };
     use ::gds::GdsUnits;
     use approx::assert_relative_eq;

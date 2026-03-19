@@ -46,9 +46,8 @@ cd argon
 ```
 
 That command:
-- bootstraps the pinned `antlr4rust` runtime and Rust-target ANTLR tool into a sibling `.argon-toolchain/` directory
-- applies the small compatibility patches needed by the Rust target
-- builds the ANTLR jar consumed by `core/compiler/build.rs`
+- initializes the checked-in `antlr4` submodule and its nested `antlr4rust` submodule
+- builds the ANTLR jar used by `core/compiler/build.rs`
 - runs `cargo build --release`
 
 After the first run, rebuilding Argon only requires Cargo:
