@@ -32,7 +32,6 @@ tracing = { workspace = true }
 const_format = "0.2"
 
 [build-dependencies]
-lrpar = { version = "0.13", features = ["serde"] }
-
 cfgrammar = { workspace = true }
+lrpar = { workspace = true, features = ["serde"] }
 lrlex = { workspace = true }

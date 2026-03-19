@@ -5,7 +5,7 @@ members = ["core/compiler", "core/gui", "core/lang-server"]
 
 [workspace.dependencies]
 anyhow = "1"
-cfgrammar = { version = "0.13", features = ["serde"] }
+cfgrammar = { version = "0.14", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 approx = "0.5"
@@ -15,19 +15,19 @@ indexmap = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 rgb = { version = "0.8", features = ["serde"] }
 thiserror = "2"
-toml = "0.9"
+toml = "1"
 regex = "1"
 arcstr = { version = "1", features = ["serde"] }
 itertools = "0.14"
 tarpc = { version = "0.37", features = ["full"] }
-lrlex = "0.13"
-lrpar = "0.13"
+lrlex = "0.14"
+lrpar = "0.14"
 bytes = "1"
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-tower-lsp-server = "0.22"
+tower-lsp-server = "0.23"
 
 geometry = { version = "0.7", registry = "substrate" }
 enumify = { version = "0.2", registry = "substrate" }

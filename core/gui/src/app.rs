@@ -23,7 +23,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use lang_server::rpc::{DimensionParams, LangServerAction};
 use rgb::Rgb;
-use tower_lsp_server::lsp_types::MessageType;
+use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     rpc::{GuiEvent, SyncLangServerClient},

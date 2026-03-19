@@ -14,7 +14,7 @@ use futures::StreamExt;
 use lang_server::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient};
 use tarpc::{context, server::Channel, tokio_serde::formats::Json};
 use tokio::runtime::Runtime;
-use tower_lsp_server::lsp_types::MessageType;
+use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
