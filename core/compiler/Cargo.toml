@@ -8,7 +8,7 @@ derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.34", features = ["sparse"] }
 klayout-lyp = "0.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
-antlr-rust = "0.3.0-beta"
+antlr-rust = { git = "https://github.com/ucb-substrate/antlr4rust.git", branch = "dev" }
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }
 itertools = { workspace = true }
