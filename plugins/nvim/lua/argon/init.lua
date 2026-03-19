@@ -3,21 +3,6 @@ local M = {}
 local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
-local uv = vim.uv or vim.loop
-
-local function find_root_dir(path)
-  local dir = vim.fs.dirname(path)
-  while dir and #dir > 0 do
-    if uv.fs_stat(dir .. '/lib.ar') then
-      return dir
-    end
-    local parent = vim.fs.dirname(dir)
-    if not parent or parent == dir then
-      return nil
-    end
-    dir = parent
-  end
-end
 
 ---LSP restart internal implementations
 ---@param bufnr? number The buffer number, defaults to the current buffer
@@ -27,7 +12,7 @@ end
 local function restart(bufnr, filter, callback)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local clients = M.stop(bufnr, filter)
-  local timer, _, _ = uv.new_timer()
+  local timer, _, _ = vim.uv.new_timer()
   if not timer then
     vim.schedule(function()
       vim.notify('argon: Failed to initialise timer for LSP client restart.', vim.log.levels.ERROR)
@@ -70,14 +55,13 @@ end
 M.get_root_dir = function(bufnr)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
     local bufname = vim.api.nvim_buf_get_name(bufnr)
-    return find_root_dir(bufname)
+    local crate_dir = vim.fs.root(bufname, { 'lib.ar' })
+    return crate_dir
 end
 
 --- Start or attach the LSP client
 ---@param bufnr? number The buffer number (optional), defaults to the current buffer
 M.start = function(bufnr)
-    bufnr = bufnr or vim.api.nvim_get_current_buf()
-    local bufname = vim.api.nvim_buf_get_name(bufnr)
     local root_dir = M.get_root_dir(bufnr)
     if not root_dir then
         vim.notify(
@@ -86,17 +70,13 @@ M.start = function(bufnr)
         )
         root_dir = vim.fs.dirname(bufname)
     end
-    local server_cmd = config.argon_repo_path
-        and #config.argon_repo_path > 0
-        and (config.argon_repo_path .. '/target/release/lang-server')
-        or 'lang-server'
     local cmd_env = {}
     if config.log.level then
         cmd_env.ARGON_LOG = config.log.level
     end
     local lsp_start_config = { 
         name = 'argon',
-        cmd = { server_cmd },
+        cmd = { config.argon_repo_path ..'/target/release/lang-server' },
         cmd_env = cmd_env,
         handlers = {
             ['custom/forceSave'] = function(err, result, ctx)
@@ -163,10 +143,19 @@ end
 ---Stop the LSP client.
 ---@param bufnr? number The buffer number, defaults to the current buffer
 ---@return vim.lsp.Client[] clients A list of clients that will be stopped
-M.stop = function(bufnr, filter)
+M.stop = function(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local clients = client.get_active_argon_lsp_clients(bufnr, filter)
   vim.lsp.stop_client(clients)
+  if type(clients) == 'table' then
+    ---@cast clients vim.lsp.Client[]
+    for _, client in ipairs(clients) do
+      server_status.reset_client_state(client.id)
+    end
+  else
+    ---@cast clients vim.lsp.Client
+    server_status.reset_client_state(clients.id)
+  end
   return clients
 end
 

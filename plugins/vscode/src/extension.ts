@@ -4,6 +4,7 @@
     * ------------------------------------------------------------------------------------------ */
 
 import * as path from "path";
+import * as fs from 'fs';
 import * as os from 'os';
 import { commands, window, workspace, WorkspaceFolder, ExtensionContext, Uri } from "vscode";
 
@@ -14,15 +15,32 @@ import {
     TransportKind
 } from "vscode-languageclient/node";
 
-import { buildServerCommand, findWorkspaceRoot } from "./helpers";
-
 let client: LanguageClient;
+
+/**
+    * Find the first enclosing folder (upwards) that contains `lib.ar`.
+    */
+function findWorkspaceRoot(startPath: string): string | undefined {
+    let dir = path.dirname(startPath);
+
+    while (true) {
+        const candidate = path.join(dir, 'lib.ar');
+        if (fs.existsSync(candidate)) {
+            return dir;
+        }
+
+        const parent = path.dirname(dir);
+        if (parent === dir) break; // reached filesystem root
+        dir = parent;
+    }
+
+    return undefined;
+}
 
 export function activate(context: ExtensionContext) {
     let config = workspace.getConfiguration(undefined, undefined)
-    const serverModule = buildServerCommand(
-        config.argon.argonRepoPath ?? config.argon.argonRepoDir
-    );
+    // The server is implemented in node
+    const serverModule = path.join(config.argon.argonRepoDir, 'target', 'release', 'lang-server')
 
     let env: any = {}
     if (config.argon.log.level) {
