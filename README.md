@@ -37,7 +37,7 @@ To use Argon, you will need:
 - Java 8+
 - [Maven](https://maven.apache.org/install.html)
 
-Then run:
+Begin by cloning and compiling the Argon source code:
 
 ```bash
 git clone https://github.com/ucb-substrate/argon.git
