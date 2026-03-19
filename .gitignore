@@ -93,4 +93,3 @@ out
 node_modules
 .vscode-test
 *.tsbuildinfo
-.argon-toolchain
