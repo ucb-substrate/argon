@@ -24,6 +24,14 @@ use crate::ast::{
 };
 use crate::parse::{AnnotatedParseAst, ParseMetadata};
 
+#[allow(
+    clippy::all,
+    dead_code,
+    non_snake_case,
+    non_camel_case_types,
+    non_upper_case_globals,
+    unused_parens
+)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/antlr/mod.rs"));
 }
@@ -105,22 +113,43 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
     let input_for_ast = input.clone();
     let normalized_input = input.trim_start_matches(char::is_whitespace);
     let offset_base = input.len() - normalized_input.len();
+    let input_rc: Rc<str> = Rc::from(normalized_input);
+    let errors = Rc::new(RefCell::new(Vec::new()));
 
     let mut lexer = ArgonLexer::new(InputStream::new(normalized_input));
     lexer.remove_error_listeners();
+    lexer.add_error_listener(Box::new(CollectingErrorListener {
+        input: Rc::clone(&input_rc),
+        offset_base,
+        errors: Rc::clone(&errors),
+    }));
     let tokens = CommonTokenStream::new(lexer);
     let mut parser = ArgonParser::new(tokens);
     parser.remove_error_listeners();
+    parser.add_error_listener(Box::new(CollectingErrorListener {
+        input: Rc::clone(&input_rc),
+        offset_base,
+        errors: Rc::clone(&errors),
+    }));
 
     let tree = match parser.ast() {
         Ok(tree) => tree,
         Err(err) => {
-            return Err(vec![AntlrParseError {
-                span: Span::new(0, input.len()),
-                message: err.to_string(),
-            }]);
+            let collected = errors.borrow().clone();
+            return Err(if collected.is_empty() {
+                vec![AntlrParseError {
+                    span: Span::new(offset_base, input.len()),
+                    message: err.to_string(),
+                }]
+            } else {
+                collected
+            });
         }
     };
+    let collected = errors.borrow().clone();
+    if !collected.is_empty() {
+        return Err(collected);
+    }
 
     let mut builder = AstBuilder {
         input: normalized_input,
@@ -279,15 +308,6 @@ impl<'input> AstBuilder<'input> {
     fn build_arg_decls(
         &mut self,
         ctx: &ArgDeclsContext<'input>,
-    ) -> Vec<ArgDecl<&'input str, ParseMetadata>> {
-        ctx.argDecls1()
-            .map(|list| self.build_arg_decls1(list.as_ref()))
-            .unwrap_or_default()
-    }
-
-    fn build_arg_decls1(
-        &mut self,
-        ctx: &ArgDecls1Context<'input>,
     ) -> Vec<ArgDecl<&'input str, ParseMetadata>> {
         ctx.children_of_type::<ArgDeclContext<'input>>()
             .into_iter()
@@ -569,9 +589,7 @@ impl<'input> AstBuilder<'input> {
         } else if let Some(literal) = ctx.literal() {
             self.build_literal(literal.as_ref())
         } else {
-            Expr::Nil(NilLiteral {
-                span: self.span_of(ctx),
-            })
+            unreachable!("primaryExpr should always contain exactly one expression form")
         }
     }
 
@@ -581,7 +599,7 @@ impl<'input> AstBuilder<'input> {
     ) -> TupleExpr<&'input str, ParseMetadata> {
         let items = ctx
             .tupleExprList()
-            .unwrap()
+            .unwrap_or_else(|| unreachable!("tupleExpr always contains tupleExprList"))
             .children_of_type::<ExprContext<'input>>()
             .into_iter()
             .map(|expr| self.build_expr(expr.as_ref()))
@@ -615,7 +633,15 @@ impl<'input> AstBuilder<'input> {
         let (posargs, kwargs) = if let Some(posargs) = ctx.posArgsTrailingComma() {
             (
                 self.build_pos_args_trailing_comma(posargs.as_ref()),
-                self.build_kw_args(ctx.kwArgs().unwrap().as_ref()),
+                self.build_kw_args(
+                    ctx.kwArgs()
+                        .unwrap_or_else(|| {
+                            unreachable!(
+                                "args with trailing positional args must contain keyword args"
+                            )
+                        })
+                        .as_ref(),
+                ),
             )
         } else if let Some(kwargs) = ctx.kwArgs() {
             (Vec::new(), self.build_kw_args(kwargs.as_ref()))
@@ -867,7 +893,9 @@ impl<'input> AstBuilder<'input> {
                 PERCENT => Some(BinOp::Rem),
                 _ => None,
             })
-            .unwrap()
+            .unwrap_or_else(|| {
+                unreachable!("binary nonBlockExpr must contain an arithmetic operator")
+            })
     }
 
     fn terminal_types<T>(&self, ctx: &T) -> Vec<isize>

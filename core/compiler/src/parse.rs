@@ -53,23 +53,23 @@ impl AstMetadata for ParseMetadata {
 
 pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, anyhow::Error> {
     let root_lib = root_lib.as_ref();
-    if path.is_empty() {
+    let Some(last) = path.last() else {
         return Ok(PathBuf::from(root_lib));
-    }
+    };
     let mut base_path = PathBuf::from(root_lib);
     base_path.pop();
     for m in &path[0..path.len() - 1] {
         base_path.push(m);
     }
     let mut direct_path = base_path.clone();
-    direct_path.push(format!("{}.ar", path.last().unwrap()));
-    base_path.push(path.last().unwrap());
+    direct_path.push(format!("{last}.ar"));
+    base_path.push(last);
     base_path.push("mod.ar");
     if direct_path.is_file() && base_path.is_file() {
-        bail!("both mod paths exists for mod {}", path.last().unwrap());
+        bail!("both mod paths exists for mod {last}");
     }
     if direct_path == root_lib {
-        bail!("circular mods: {}", path.last().unwrap());
+        bail!("circular mods: {last}");
     }
     if direct_path.is_file() {
         Ok(direct_path)
@@ -309,18 +309,7 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<Substr, ParseMetadata>, anyhow
         bail!("{}", err.trim_end());
     }
     match antlr::parse_ast(ArcStr::from(input), PathBuf::from("__cell__.ar")) {
-        Ok(ast) => {
-            if let Decl::Cell(c) = ast.ast.decls.into_iter().next().unwrap()
-                && let Statement::Expr {
-                    value: Expr::Call(call),
-                    ..
-                } = c.scope.stmts.into_iter().next().unwrap()
-            {
-                Ok(call)
-            } else {
-                bail!("Unable to evaluate expression.")
-            }
-        }
+        Ok(ast) => extract_cell_invocation(ast),
         Err(errs) => {
             let mut err = String::new();
             for err_item in errs {
@@ -329,5 +318,34 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<Substr, ParseMetadata>, anyhow
             }
             bail!("{}", err.trim_end());
         }
+    }
+}
+
+fn extract_cell_invocation(
+    ast: AnnotatedParseAst,
+) -> Result<CallExpr<Substr, ParseMetadata>, anyhow::Error> {
+    let mut decls = ast.ast.decls.into_iter();
+    let Some(Decl::Cell(cell)) = decls.next() else {
+        unreachable!("format_cell_input should always parse into a single wrapper cell")
+    };
+    if decls.next().is_some() {
+        unreachable!("format_cell_input should not emit additional top-level declarations");
+    }
+
+    let mut stmts = cell.scope.stmts.into_iter();
+    let Some(stmt) = stmts.next() else {
+        bail!("expected a cell invocation");
+    };
+    if stmts.next().is_some() || cell.scope.tail.is_some() {
+        bail!("expected a single cell invocation");
+    }
+
+    match stmt {
+        Statement::Expr {
+            value: Expr::Call(call),
+            ..
+        } => Ok(call),
+        Statement::Expr { .. } => bail!("expected a cell invocation"),
+        _ => unreachable!("format_cell_input only emits expression statements"),
     }
 }

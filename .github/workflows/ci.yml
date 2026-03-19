@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  ARGON_TOOLCHAIN_DIR: ${{ github.workspace }}/.argon-toolchain
 
 jobs:
   format:
@@ -31,6 +32,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -54,6 +61,22 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('scripts/bootstrap-antlr.sh') }}
+
+      - name: Cache ANTLR toolchain
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.ARGON_TOOLCHAIN_DIR }}
+          key: ${{ runner.os }}-antlr-toolchain-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs') }}
+
+      - name: Bootstrap ANTLR toolchain
+        shell: bash
+        run: ./scripts/bootstrap-antlr.sh
       
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -68,6 +91,12 @@ jobs:
         rust: [stable]
     steps:
       - uses: actions/checkout@v6
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
@@ -97,6 +126,22 @@ jobs:
         with:
           path: target
           key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache Maven repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('scripts/bootstrap-antlr.sh') }}
+
+      - name: Cache ANTLR toolchain
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.ARGON_TOOLCHAIN_DIR }}
+          key: ${{ runner.os }}-antlr-toolchain-${{ hashFiles('scripts/bootstrap-antlr.sh', 'core/compiler/build.rs') }}
+
+      - name: Bootstrap ANTLR toolchain
+        shell: bash
+        run: ./scripts/bootstrap-antlr.sh
       
       - name: Build
         run: cargo build --release
