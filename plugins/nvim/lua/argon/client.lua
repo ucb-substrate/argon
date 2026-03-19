@@ -3,6 +3,13 @@
 ---@class argon.client.ClientAdapter
 local M = {}
 
+local function normalize_path(path)
+  if package.config:sub(1, 1) == '\\' then
+    return path:gsub('/', '\\')
+  end
+  return path
+end
+
 ---@param bufnr number | nil 0 for the current buffer, `nil` for no buffer filter
 ---@param filter? vim.lsp.get_clients.Filter
 ---@return vim.lsp.Client[]
@@ -65,7 +72,7 @@ end
 M.get_client_for_file = function(file_path, method)
   for _, client in ipairs(M.get_active_argon_lsp_clients(nil, { method = method })) do
     local root_dir = client.config.root_dir
-    if root_dir and vim.startswith(os.normalize_path_on_windows(file_path), root_dir) then
+    if root_dir and vim.startswith(normalize_path(file_path), root_dir) then
       return client
     end
   end
@@ -85,4 +92,3 @@ M.notify = function(method, params)
 end
 
 return M
-

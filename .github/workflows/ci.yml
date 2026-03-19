@@ -104,6 +104,27 @@ jobs:
       - name: Run tests
         run: cargo test --release
 
+  plugin-tests:
+    name: Plugin Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: plugins/vscode/package-lock.json
+
+      - name: Install Neovim
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y neovim
+
+      - name: Run plugin tests
+        run: ./scripts/test-plugins.sh
+
   # Checks if dependencies have vulnerabilties
   security-audit:
     name: Security Audit
