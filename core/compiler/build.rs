@@ -6,6 +6,10 @@ fn main() {
     let grammar_dir = manifest_dir.join("grammar");
     let antlr_dir = repo_root.join("antlr4");
     let output_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("antlr");
+    let antlr_jar = antlr_dir
+                .join("tool")
+                .join("target")
+                .join("antlr4-4.8-2-SNAPSHOT-complete.jar");
 
     // Build JAR
     let status = Command::new("mvn")
@@ -18,11 +22,6 @@ fn main() {
         .status()
         .expect("failed to start ANTLR tool");
     assert!(status.success(), "ANTLR tool failed");
-
-    let antlr_jar = antlr_dir
-                .join("tool")
-                .join("target")
-                .join("antlr4-4.8-2-SNAPSHOT-complete.jar");
 
     assert!(
         antlr_jar.is_file(),
@@ -59,6 +58,13 @@ fn main() {
         "cargo:rerun-if-changed={}",
         antlr_dir
             .join("tool")
+            .join("src")
+            .display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        antlr_dir
+            .join("tool")
             .join("resources")
             .join("org")
             .join("antlr")
@@ -70,5 +76,4 @@ fn main() {
             .join("Rust.stg")
             .display()
     );
-    println!("cargo:rerun-if-changed={}", antlr_jar.display());
 }
