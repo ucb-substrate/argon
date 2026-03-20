@@ -34,13 +34,17 @@ Future versions of Argon will hopefully support:
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
 - One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
+- Git
+- Java 25+
+- [Maven](https://maven.apache.org/install.html)
 
 Begin by cloning and compiling the Argon source code:
 
 ```bash
 git clone https://github.com/ucb-substrate/argon.git
 cd argon
-cargo b --release
+git submodule update --init --recursive
+cargo build --release
 ```
 
 ### Neovim

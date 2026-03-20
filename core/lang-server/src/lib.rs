@@ -181,32 +181,35 @@ impl StateMut {
                 } else if let Some(cell) = &self.cell {
                     let input = parse::format_cell_input(cell);
                     match parse::parse_cell(&input) {
-                        Ok(cell_ast) => Some(compile::dynamic_compile(
-                            &ast,
-                            CompileInput {
-                                cell: &cell_ast
-                                    .func
-                                    .path
-                                    .iter()
-                                    .map(|ident| ident.name)
-                                    .collect_vec(),
-                                args: cell_ast
-                                    .args
-                                    .posargs
-                                    .iter()
-                                    .map(|arg| match arg {
-                                        Expr::FloatLiteral(float_literal) => {
-                                            CellArg::Float(float_literal.value)
-                                        }
-                                        Expr::IntLiteral(int_literal) => {
-                                            CellArg::Int(int_literal.value)
-                                        }
-                                        _ => panic!("must be int or float literal for now"),
-                                    })
-                                    .collect(),
-                                lyp_file: &lyp,
-                            },
-                        )),
+                        Ok(cell_ast) => {
+                            let cell_path = cell_ast
+                                .func
+                                .path
+                                .iter()
+                                .map(|ident| ident.name.as_str())
+                                .collect_vec();
+                            Some(compile::dynamic_compile(
+                                &ast,
+                                CompileInput {
+                                    cell: &cell_path,
+                                    args: cell_ast
+                                        .args
+                                        .posargs
+                                        .iter()
+                                        .map(|arg| match arg {
+                                            Expr::FloatLiteral(float_literal) => {
+                                                CellArg::Float(float_literal.value)
+                                            }
+                                            Expr::IntLiteral(int_literal) => {
+                                                CellArg::Int(int_literal.value)
+                                            }
+                                            _ => panic!("must be int or float literal for now"),
+                                        })
+                                        .collect(),
+                                    lyp_file: &lyp,
+                                },
+                            ))
+                        }
                         Err(e) => {
                             client
                                 .show_message(

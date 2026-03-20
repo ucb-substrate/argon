@@ -20,8 +20,6 @@ regex = "1"
 arcstr = { version = "1", features = ["serde"] }
 itertools = "0.14"
 tarpc = { version = "0.37", features = ["full"] }
-lrlex = "0.14"
-lrpar = "0.14"
 bytes = "1"
 futures = "0.3"
 tracing = "0.1"

@@ -362,20 +362,6 @@ pub struct TupleExpr<S, T: AstMetadata> {
     pub metadata: T::TupleExpr,
 }
 
-pub(crate) fn parse_float(s: &str) -> Result<f64, ()> {
-    s.parse::<f64>().map_err(|_| ())
-}
-
-pub(crate) fn parse_int(s: &str) -> Result<i64, ()> {
-    s.parse::<i64>().map_err(|_| ())
-}
-
-pub(crate) fn flatten<T>(lhs: Result<Vec<T>, ()>, rhs: Result<T, ()>) -> Result<Vec<T>, ()> {
-    let mut flt = lhs?;
-    flt.push(rhs?);
-    Ok(flt)
-}
-
 impl<S, T: AstMetadata> Expr<S, T> {
     pub fn span(&self) -> cfgrammar::Span {
         match self {
