@@ -65,7 +65,11 @@ fn main() {
             .current_dir(&grammar_dir)
             .arg("bash")
             .arg("-c")
-            .arg(format!("java -cp {} org.antlr.v4.Tool -Dlanguage=Rust -visitor -o {} Argon.g4", antlr_jar.display(), output_dir.display()))
+            .arg(format!(
+                "java -cp {} org.antlr.v4.Tool -Dlanguage=Rust -visitor -o {} Argon.g4",
+                antlr_jar.display(),
+                output_dir.display()
+            ))
             .status()
             .expect("failed to start ANTLR tool");
 
