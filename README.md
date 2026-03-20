@@ -43,6 +43,7 @@ Begin by cloning and compiling the Argon source code:
 ```bash
 git clone https://github.com/ucb-substrate/argon.git
 cd argon
+git submodule update --init --recursive
 cargo build --release
 ```
 
