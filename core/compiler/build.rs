@@ -22,6 +22,7 @@ fn main() {
     let output_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("antlr");
     let grammar = grammar_dir.join("Argon.g4");
     let antlr_jar = antlr_dir.join("tool").join("target").join(ANTLR_JAR_NAME);
+    let maven = antlr_dir.join(if cfg!(windows) { "mvnw.cmd" } else { "mvnw" });
 
     let jar_inputs = [
         antlr_dir.join("pom.xml"),
@@ -42,11 +43,13 @@ fn main() {
     ];
 
     if output_is_stale(&antlr_jar, &jar_inputs) {
-        let status = Command::new("/usr/bin/env")
+        let status = Command::new(&maven)
             .current_dir(&antlr_dir)
-            .arg("bash")
-            .arg("-c")
-            .arg("mvn -pl tool -am -DskipTests package")
+            .arg("-pl")
+            .arg("tool")
+            .arg("-am")
+            .arg("-DskipTests")
+            .arg("package")
             .status()
             .expect("failed to compile ANTLR tool");
         assert!(status.success(), "ANTLR tool compilation failed");
@@ -61,15 +64,16 @@ fn main() {
     fs::create_dir_all(&output_dir).unwrap();
 
     if generated_parser_is_stale(&output_dir, &[grammar.clone(), antlr_jar.clone()]) {
-        let status = Command::new("/usr/bin/env")
+        let status = Command::new("java")
             .current_dir(&grammar_dir)
-            .arg("bash")
-            .arg("-c")
-            .arg(format!(
-                "java -cp {} org.antlr.v4.Tool -Dlanguage=Rust -visitor -o {} Argon.g4",
-                antlr_jar.display(),
-                output_dir.display()
-            ))
+            .arg("-cp")
+            .arg(&antlr_jar)
+            .arg("org.antlr.v4.Tool")
+            .arg("-Dlanguage=Rust")
+            .arg("-visitor")
+            .arg("-o")
+            .arg(&output_dir)
+            .arg("Argon.g4")
             .status()
             .expect("failed to start ANTLR tool");
 
@@ -87,6 +91,18 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         antlr_dir.join("pom.xml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        antlr_dir.join("mvnw").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        antlr_dir.join("mvnw.cmd").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        antlr_dir.join(".mvn").join("wrapper").display()
     );
     println!(
         "cargo:rerun-if-changed={}",
