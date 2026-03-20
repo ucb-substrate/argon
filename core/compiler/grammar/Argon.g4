@@ -165,11 +165,7 @@ nonBlockExpr
     | nonBlockExpr (STAR | SLASH | PERCENT) nonBlockExpr
     | nonBlockExpr (PLUS | MINUS) nonBlockExpr
     | nonBlockExpr (EQEQ | NEQ | GEQ | GT | LEQ | LT) nonBlockExpr
-    | primaryExpr
-    ;
-
-primaryExpr
-    : nilLiteral
+    | nilLiteral
     | seqNilLiteral
     | tupleExpr
     | LPAREN expr RPAREN
@@ -191,44 +187,21 @@ callExpr
     ;
 
 args
-    : posArgsTrailingComma kwArgs
-    | kwArgs
-    | posArgs
+    : posArgList (COMMA kwArgList)? COMMA?
+    | kwArgList COMMA?
+    |
     ;
 
 kwArgValue
     : ident EQ expr
     ;
 
-kwArgs
-    : kwArgsTrailingComma
-    | kwArgsNoComma
+kwArgList
+    : kwArgValue (COMMA kwArgValue)*
     ;
 
-kwArgsTrailingComma
-    : kwArgValue COMMA
-    | kwArgsTrailingComma kwArgValue COMMA
-    ;
-
-kwArgsNoComma
-    : kwArgValue
-    | kwArgsTrailingComma kwArgValue
-    ;
-
-posArgs
-    : posArgsTrailingComma
-    | posArgsNoComma
-    ;
-
-posArgsTrailingComma
-    : expr COMMA
-    | posArgsTrailingComma expr COMMA
-    ;
-
-posArgsNoComma
-    :
-    | expr
-    | posArgsTrailingComma expr
+posArgList
+    : expr (COMMA expr)*
     ;
 
 tySpec

@@ -484,9 +484,7 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &NonBlockExprContext<'input>,
     ) -> Expr<&'input str, ParseMetadata> {
-        if let Some(primary) = ctx.primaryExpr() {
-            self.build_primary_expr(primary.as_ref())
-        } else if ctx.start().get_token_type() == BANG {
+        if ctx.start().get_token_type() == BANG {
             let operand = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
                 op: UnaryOp::Not,
@@ -550,27 +548,17 @@ impl<'input> AstBuilder<'input> {
                 metadata: (),
             }))
         } else if let Some(expr) = ctx.expr() {
-            let base = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
-            Expr::Index(Box::new(IndexExpr {
-                base,
-                index: self.build_expr(expr.as_ref()),
-                span: self.span_of(ctx),
-                metadata: (),
-            }))
-        } else {
-            Expr::Emit(Box::new(EmitExpr {
-                value: self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref()),
-                span: self.span_of(ctx),
-                metadata: (),
-            }))
-        }
-    }
-
-    fn build_primary_expr(
-        &mut self,
-        ctx: &PrimaryExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        if let Some(nil) = ctx.nilLiteral() {
+            if let Some(base) = ctx.nonBlockExpr(0) {
+                Expr::Index(Box::new(IndexExpr {
+                    base: self.build_non_block_expr(base.as_ref()),
+                    index: self.build_expr(expr.as_ref()),
+                    span: self.span_of(ctx),
+                    metadata: (),
+                }))
+            } else {
+                self.build_expr(expr.as_ref())
+            }
+        } else if let Some(nil) = ctx.nilLiteral() {
             Expr::Nil(NilLiteral {
                 span: self.span_of(nil.as_ref()),
             })
@@ -580,8 +568,6 @@ impl<'input> AstBuilder<'input> {
             })
         } else if let Some(tuple) = ctx.tupleExpr() {
             Expr::Tuple(self.build_tuple_expr(tuple.as_ref()))
-        } else if let Some(expr) = ctx.expr() {
-            self.build_expr(expr.as_ref())
         } else if let Some(call) = ctx.callExpr() {
             Expr::Call(self.build_call_expr(call.as_ref()))
         } else if let Some(path) = ctx.identPath() {
@@ -589,7 +575,11 @@ impl<'input> AstBuilder<'input> {
         } else if let Some(literal) = ctx.literal() {
             self.build_literal(literal.as_ref())
         } else {
-            unreachable!("primaryExpr should always contain exactly one expression form")
+            Expr::Emit(Box::new(EmitExpr {
+                value: self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref()),
+                span: self.span_of(ctx),
+                metadata: (),
+            }))
         }
     }
 
@@ -630,29 +620,15 @@ impl<'input> AstBuilder<'input> {
         &mut self,
         ctx: &ArgsContext<'input>,
     ) -> crate::ast::Args<&'input str, ParseMetadata> {
-        let (posargs, kwargs) = if let Some(posargs) = ctx.posArgsTrailingComma() {
-            (
-                self.build_pos_args_trailing_comma(posargs.as_ref()),
-                self.build_kw_args(
-                    ctx.kwArgs()
-                        .unwrap_or_else(|| {
-                            unreachable!(
-                                "args with trailing positional args must contain keyword args"
-                            )
-                        })
-                        .as_ref(),
-                ),
-            )
-        } else if let Some(kwargs) = ctx.kwArgs() {
-            (Vec::new(), self.build_kw_args(kwargs.as_ref()))
-        } else if let Some(posargs) = ctx.posArgs() {
-            (self.build_pos_args(posargs.as_ref()), Vec::new())
-        } else {
-            (Vec::new(), Vec::new())
-        };
         crate::ast::Args {
-            posargs,
-            kwargs,
+            posargs: ctx
+                .posArgList()
+                .map(|posargs| self.build_pos_arg_list(posargs.as_ref()))
+                .unwrap_or_default(),
+            kwargs: ctx
+                .kwArgList()
+                .map(|kwargs| self.build_kw_arg_list(kwargs.as_ref()))
+                .unwrap_or_default(),
             span: self.span_of(ctx),
             metadata: (),
         }
@@ -670,78 +646,24 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_kw_args(
+    fn build_kw_arg_list(
         &mut self,
-        ctx: &KwArgsContext<'input>,
+        ctx: &KwArgListContext<'input>,
     ) -> Vec<KwArgValue<&'input str, ParseMetadata>> {
-        if let Some(trailing) = ctx.kwArgsTrailingComma() {
-            self.build_kw_args_trailing_comma(trailing.as_ref())
-        } else {
-            self.build_kw_args_no_comma(ctx.kwArgsNoComma().unwrap().as_ref())
-        }
+        ctx.children_of_type::<KwArgValueContext<'input>>()
+            .into_iter()
+            .map(|kwarg| self.build_kw_arg_value(kwarg.as_ref()))
+            .collect()
     }
 
-    fn build_kw_args_trailing_comma(
+    fn build_pos_arg_list(
         &mut self,
-        ctx: &KwArgsTrailingCommaContext<'input>,
-    ) -> Vec<KwArgValue<&'input str, ParseMetadata>> {
-        let mut kwargs = ctx
-            .kwArgsTrailingComma()
-            .map(|prev| self.build_kw_args_trailing_comma(prev.as_ref()))
-            .unwrap_or_default();
-        kwargs.push(self.build_kw_arg_value(ctx.kwArgValue().unwrap().as_ref()));
-        kwargs
-    }
-
-    fn build_kw_args_no_comma(
-        &mut self,
-        ctx: &KwArgsNoCommaContext<'input>,
-    ) -> Vec<KwArgValue<&'input str, ParseMetadata>> {
-        let mut kwargs = ctx
-            .kwArgsTrailingComma()
-            .map(|prev| self.build_kw_args_trailing_comma(prev.as_ref()))
-            .unwrap_or_default();
-        if let Some(value) = ctx.kwArgValue() {
-            kwargs.push(self.build_kw_arg_value(value.as_ref()));
-        }
-        kwargs
-    }
-
-    fn build_pos_args(
-        &mut self,
-        ctx: &PosArgsContext<'input>,
+        ctx: &PosArgListContext<'input>,
     ) -> Vec<Expr<&'input str, ParseMetadata>> {
-        if let Some(trailing) = ctx.posArgsTrailingComma() {
-            self.build_pos_args_trailing_comma(trailing.as_ref())
-        } else {
-            self.build_pos_args_no_comma(ctx.posArgsNoComma().unwrap().as_ref())
-        }
-    }
-
-    fn build_pos_args_trailing_comma(
-        &mut self,
-        ctx: &PosArgsTrailingCommaContext<'input>,
-    ) -> Vec<Expr<&'input str, ParseMetadata>> {
-        let mut posargs = ctx
-            .posArgsTrailingComma()
-            .map(|prev| self.build_pos_args_trailing_comma(prev.as_ref()))
-            .unwrap_or_default();
-        posargs.push(self.build_expr(ctx.expr().unwrap().as_ref()));
-        posargs
-    }
-
-    fn build_pos_args_no_comma(
-        &mut self,
-        ctx: &PosArgsNoCommaContext<'input>,
-    ) -> Vec<Expr<&'input str, ParseMetadata>> {
-        let mut posargs = ctx
-            .posArgsTrailingComma()
-            .map(|prev| self.build_pos_args_trailing_comma(prev.as_ref()))
-            .unwrap_or_default();
-        if let Some(expr) = ctx.expr() {
-            posargs.push(self.build_expr(expr.as_ref()));
-        }
-        posargs
+        ctx.children_of_type::<ExprContext<'input>>()
+            .into_iter()
+            .map(|expr| self.build_expr(expr.as_ref()))
+            .collect()
     }
 
     fn build_ident_path(
