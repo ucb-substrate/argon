@@ -42,16 +42,13 @@ fn main() {
     ];
 
     if output_is_stale(&antlr_jar, &jar_inputs) {
-        let status = Command::new("mvn")
+        let status = Command::new("bash")
             .current_dir(&antlr_dir)
-            .arg("-pl")
-            .arg("tool")
-            .arg("-am")
-            .arg("-DskipTests")
-            .arg("package")
+            .arg("-c")
+            .arg("mvn -pl tool -am -DskipTests package")
             .status()
-            .expect("failed to start ANTLR tool");
-        assert!(status.success(), "ANTLR tool failed");
+            .expect("failed to compile ANTLR tool");
+        assert!(status.success(), "ANTLR tool compilation failed");
     }
 
     assert!(
