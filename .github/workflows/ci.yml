@@ -86,7 +86,7 @@ jobs:
           distribution: temurin
           java-version: "25"
           cache: maven
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -97,6 +97,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+
+      - name: Install Maven on Windows
+        if: runner.os == 'Windows'
+        uses: stCarolas/setup-maven@v5
+        with:
+          maven-version: 3.8.7
 
       - name: Cache Rust artifacts
         uses: swatinem/rust-cache@v2
