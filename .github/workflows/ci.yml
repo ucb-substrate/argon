@@ -65,10 +65,6 @@ jobs:
             antlr4/runtime/Java/target
             antlr4/tool/target
           key: ${{ runner.os }}-antlr-tool-${{ steps.antlr-hash.outputs.sha }}
-
-      - name: Bootstrap ANTLR toolchain
-        shell: bash
-        run: ./scripts/bootstrap-antlr.sh
       
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
@@ -122,10 +118,6 @@ jobs:
             antlr4/runtime/Java/target
             antlr4/tool/target
           key: ${{ runner.os }}-antlr-tool-${{ steps.antlr-hash.outputs.sha }}
-
-      - name: Bootstrap ANTLR toolchain
-        shell: bash
-        run: ./scripts/bootstrap-antlr.sh
       
       - name: Build
         run: cargo build --release

@@ -6,18 +6,27 @@ fn main() {
     let grammar_dir = manifest_dir.join("grammar");
     let antlr_dir = repo_root.join("antlr4");
     let output_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("antlr");
-    let antlr_jar = std::env::var_os("ARGON_ANTLR_JAR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            antlr_dir
+
+    // Build JAR
+    let status = Command::new("mvn")
+        .current_dir(&antlr_dir)
+        .arg("-pl")
+        .arg("tool")
+        .arg("-am")
+        .arg("-DskipTests")
+        .arg("package")
+        .status()
+        .expect("failed to start ANTLR tool");
+    assert!(status.success(), "ANTLR tool failed");
+
+    let antlr_jar = antlr_dir
                 .join("tool")
                 .join("target")
-                .join("antlr4-4.8-2-SNAPSHOT-complete.jar")
-        });
+                .join("antlr4-4.8-2-SNAPSHOT-complete.jar");
 
     assert!(
         antlr_jar.is_file(),
-        "missing ANTLR tool jar at {}. Run ./scripts/bootstrap.sh, ./scripts/bootstrap-antlr.sh, or set ARGON_ANTLR_JAR.",
+        "missing ANTLR tool jar at {}.",
         antlr_jar.display()
     );
 
@@ -62,5 +71,4 @@ fn main() {
             .display()
     );
     println!("cargo:rerun-if-changed={}", antlr_jar.display());
-    println!("cargo:rerun-if-env-changed=ARGON_ANTLR_JAR");
 }

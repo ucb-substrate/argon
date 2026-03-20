@@ -34,6 +34,7 @@ Future versions of Argon will hopefully support:
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
 - One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
+- Git
 - Java 8+
 - [Maven](https://maven.apache.org/install.html)
 
@@ -42,22 +43,8 @@ Begin by cloning and compiling the Argon source code:
 ```bash
 git clone https://github.com/ucb-substrate/argon.git
 cd argon
-./scripts/bootstrap.sh --release
-```
-
-That command:
-- initializes the checked-in `antlr4` submodule and its nested `antlr4rust` submodule
-- builds the ANTLR jar used by `core/compiler/build.rs`
-- runs `cargo build --release`
-
-After the first run, rebuilding Argon only requires Cargo:
-
-```bash
 cargo build --release
 ```
-
-If you already have a compatible ANTLR jar elsewhere, you can skip the default jar and point the build
-at it with `ARGON_ANTLR_JAR=/absolute/path/to/antlr4-4.8-2-SNAPSHOT-complete.jar cargo build -p compiler`.
 
 ### Neovim
 
