@@ -42,8 +42,9 @@ fn main() {
     ];
 
     if output_is_stale(&antlr_jar, &jar_inputs) {
-        let status = Command::new("bash")
+        let status = Command::new("/usr/bin/env")
             .current_dir(&antlr_dir)
+            .arg("bash")
             .arg("-c")
             .arg("mvn -pl tool -am -DskipTests package")
             .status()
@@ -60,16 +61,11 @@ fn main() {
     fs::create_dir_all(&output_dir).unwrap();
 
     if generated_parser_is_stale(&output_dir, &[grammar.clone(), antlr_jar.clone()]) {
-        let status = Command::new("java")
+        let status = Command::new("/usr/bin/env")
             .current_dir(&grammar_dir)
-            .arg("-cp")
-            .arg(&antlr_jar)
-            .arg("org.antlr.v4.Tool")
-            .arg("-Dlanguage=Rust")
-            .arg("-visitor")
-            .arg("-o")
-            .arg(&output_dir)
-            .arg("Argon.g4")
+            .arg("bash")
+            .arg("-c")
+            .arg(format!("java -cp {} org.antlr.v4.Tool -Dlanguage=Rust -visitor -o {} Argon.g4", antlr_jar.display(), output_dir.display()))
             .status()
             .expect("failed to start ANTLR tool");
 
