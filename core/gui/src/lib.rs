@@ -15,6 +15,7 @@ pub mod actions;
 pub mod assets;
 pub mod editor;
 pub mod rpc;
+pub mod sse;
 pub mod theme;
 
 #[derive(Parser, Debug)]

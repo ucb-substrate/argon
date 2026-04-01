@@ -277,7 +277,7 @@ impl Solver {
 
 pub type ConstraintId = u64;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
 pub struct LinearExpr {
     pub coeffs: Vec<(f64, Var)>,
     pub constant: f64,
