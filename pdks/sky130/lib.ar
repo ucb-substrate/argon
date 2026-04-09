@@ -17,7 +17,7 @@ cell fet1v8(nfet: Int, w: Float, nf: Int) {
     let sdm = rect(#scope2 if nfet == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
 
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
-    let ny = (((diff.h - licon.h - 80.) / 340.) as Int + 1);
+    let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
     #scope4 std::center_rects(li1_bbox, #scope3 std::array2(licon, nf + 1, ny, 430., 340.));
 }
 
@@ -232,5 +232,5 @@ fn centered_via_array(r1: Rect, r2: Rect, via: Rect, xpitch: Float, ypitch: Floa
 
 cell top() {
     // let inner = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
-    let vco_elem = inst(#scope0 vco_elem(1000., 1600., 4, 1), x=0., y=0.);
+    let vco_elem = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
 }
