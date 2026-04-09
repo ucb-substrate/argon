@@ -69,7 +69,7 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     eq(li1_bbox_top.y1, ntap.li1.y1);
 
     // Connect gates to input LI1 rectangle.
-    let a_poly_mid = rect("poly.drawing", x0=nmos.poly_bbox.x0 - 80., x1=nmos.poly_bbox.x1 + 80., h=270.)!;
+    let a_poly_mid = rect("poly.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., h=270.)!;
     eq(a_poly_mid.y0 + a_poly_mid.y1, a_li_mid.y0 + a_li_mid.y1);
     let a_npc_mid = rect("npc.drawing", x0=nmos.poly_bbox.x0 - 110., x1=nmos.poly_bbox.x1 + 110., h=370.)!;
     eq(a_poly_mid.y0 + a_poly_mid.y1, a_npc_mid.y0 + a_npc_mid.y1);
