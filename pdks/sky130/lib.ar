@@ -231,5 +231,6 @@ fn centered_via_array(r1: Rect, r2: Rect, via: Rect, xpitch: Float, ypitch: Floa
 }
 
 cell top() {
-    let inner = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
+    // let inner = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
+    let vco_elem = inst(#scope0 vco_elem(1000., 1600., 4, 1), x=0., y=0.);
 }
