@@ -131,12 +131,12 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     let vss2 = rect("met1.drawing", x0=main_n.ptap.li1.x0, x1=keeper_n.ptap.li1.x1, y0=main_n.ptap.li1.y0, y1=main_n.ptap.li1.y1);
 
     let via = crect(layer="mcon.drawing", w=170., h=170., x0=0., y0=0.);
-    #scope9 centered_via_array(vss1, main_p.ptap.li1, via, 340., 340.);
-    #scope8 centered_via_array(vss1, keeper_p.ptap.li1, via, 340., 340.);
-    #scope7 centered_via_array(vdd_m1, main_p.ntap.li1, via, 340., 340.);
-    #scope6 centered_via_array(vdd_m1, keeper_p.ntap.li1, via, 340., 340.);
-    #scope5 centered_via_array(vss2, main_n.ptap.li1, via, 340., 340.);
-    #scope4 centered_via_array(vss2, keeper_n.ptap.li1, via, 340., 340.);
+    #scope9 centered_via_array(vss1, main_p.ptap.li1, via, 360., 360.);
+    #scope8 centered_via_array(vss1, keeper_p.ptap.li1, via, 360., 360.);
+    #scope7 centered_via_array(vdd_m1, main_p.ntap.li1, via, 360., 360.);
+    #scope6 centered_via_array(vdd_m1, keeper_p.ntap.li1, via, 360., 360.);
+    #scope5 centered_via_array(vss2, main_n.ptap.li1, via, 360., 360.);
+    #scope4 centered_via_array(vss2, keeper_n.ptap.li1, via, 360., 360.);
     
     let vdd_m2 = rect("met2.drawing", y0=vss1.y0, y1=vss2.y1, w=300.);
     let vss_m2 = rect("met2.drawing", y0=vss1.y0, y1=vss2.y1, w=300.);
