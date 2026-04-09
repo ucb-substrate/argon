@@ -99,8 +99,8 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     eq(m2p.x1 + 300., m2n.x0);
     let cyp = (keeper_p.o_li_right.y1 + keeper_p.o_li_right.y0) / 2.;
     let cyn = (keeper_n.o_li_right.y1 + keeper_n.o_li_right.y0) / 2.;
-    let m1p = rect("met1.drawing", h=300., x0=m2p.x0, x1=keeper_n.o_li_right.x1+60., y0=cyp-150., x0i = 3369.288330078125, y0i = 1701.7315673828125, x1i = 5803.3955078125, y1i = 1990.16162109375)!;
-    let m1n = rect("met1.drawing", h=300., x0=m2p.x0, x1=keeper_p.o_li_right.x1+60., y0=cyn-150., x0i = 3217.6982421875, y0i = 7734.6845703125, x1i = 5704.67529296875, y1i = 8059.05712890625)!;
+    let m1p = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=keeper_n.o_li_right.x1+60., y0=cyp-150.)!;
+    let m1n = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=keeper_p.o_li_right.x1+60., y0=cyn-150.)!;
     eq(m2p.x0, main_p.o_li_right.x1+340.);
     eq(m2n.x1, keeper_p.pmos.sdm.x0-340.);
     eq(m2p.y1, m1n.y1+10.);
