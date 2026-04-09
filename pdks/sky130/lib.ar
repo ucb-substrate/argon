@@ -94,8 +94,8 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     let keeper_n = inst(#scope3 inv(nw, pw, nf_keeper), x=keeper_p.x, reflect=true);
     eq(keeper_p.ntap.tap.x0, keeper_n.ntap.tap.x0);
     eq(keeper_p.ntap.tap.y0, keeper_n.ntap.tap.y0);
-    let m2p = rect("met2.drawing", w=300., x0i = 2401.723388671875, y0i = 1300.8970947265625, x1i = 2642.437255859375, y1i = 8299.193359375)!;
-    let m2n = rect("met2.drawing", w=300., x0i = 3441.57373046875, y0i = 1310.76025390625, x1i = 3728.759765625, y1i = 8271.248046875)!;
+    let m2p = rect("met2.drawing", w=300.)!;
+    let m2n = rect("met2.drawing", w=300.)!;
     eq(m2p.x1 + 300., m2n.x0);
     let cyp = (keeper_p.o_li_right.y1 + keeper_p.o_li_right.y0) / 2.;
     let cyn = (keeper_n.o_li_right.y1 + keeper_n.o_li_right.y0) / 2.;
@@ -103,15 +103,15 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     let m1n = rect("met1.drawing", h=300., x0=m2p.x0, x1=keeper_p.o_li_right.x1+60., y0=cyn-150., x0i = 3217.6982421875, y0i = 7734.6845703125, x1i = 5704.67529296875, y1i = 8059.05712890625)!;
     eq(m2p.x0, main_p.o_li_right.x1+340.);
     eq(m2n.x1, keeper_p.pmos.sdm.x0-340.);
-    eq(m2p.y1, m1n.y1);
-    eq(m2n.y1, m1n.y1);
-    eq(m2p.y0, m1p.y0);
-    eq(m2n.y0, m1p.y0);
+    eq(m2p.y1, m1n.y1+10.);
+    eq(m2n.y1, m1n.y1+10.);
+    eq(m2p.y0, m1p.y0-10.);
+    eq(m2n.y0, m1p.y0-10.);
     let li_top = rect("li1.drawing", h=170., y0=cyn-85., x0=main_p.o_li_right.x0, x1=keeper_p.a_li_mid.x1);
     let li_bot = rect("li1.drawing", h=170., y0=cyp-85., x0=main_p.o_li_right.x0, x1=keeper_p.a_li_mid.x1);
 
-    let m1_int_top = rect("met1.drawing", w=300., h=300., y1=m1n.y0-300., x0=m2p.x0);
-    let m1_int_bot = rect("met1.drawing", w=300., h=300., y0=m1p.y1+300., x0=m2n.x0);
+    let m1_int_top = rect("met1.drawing", w=320., h=300., y1=m1n.y0-300., x0=m2p.x0-10.);
+    let m1_int_bot = rect("met1.drawing", w=320., h=300., y0=m1p.y1+300., x0=m2n.x0-10.);
     let via_bot = rect("mcon.drawing", w=170., h=170.);
     eq(via_bot.x0 - m1_int_bot.x0, m1_int_bot.x1 - via_bot.x1);
     eq(via_bot.y0 - m1_int_bot.y0, m1_int_bot.y1 - via_bot.y1);
@@ -175,24 +175,24 @@ cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     rect("met1.drawing", x0=inst0.m1p.x0, x1=inst1.vinn.x1, y0=inst1.vinn.y0, y1=inst1.vinn.y1);
     rect("met1.drawing", x0=inst3.vinp.x0, x1=inst2.m1n.x1, y0=inst3.vinp.y0, y1=inst3.vinp.y1);
     rect("met1.drawing", x0=inst3.vinn.x0, x1=inst2.m1p.x1, y0=inst3.vinn.y0, y1=inst3.vinn.y1);
-    let x12a = rect("met2.drawing", x0=inst1.m1n.x1+300., w=300., y0=inst2.vinn.y0, y1=inst1.m1n.y1);
-    let x12b = rect("met2.drawing", x0=x12a.x1+300., w=300., y0=inst2.vinn.y0, y1=inst1.m1n.y1);
-    let m11 = rect("met1.drawing", x0=inst1.m1n.x0, x1=x12b.x1, y0=inst1.m1n.y0, y1=inst1.m1n.y1);
-    let m12 = rect("met1.drawing", x0=inst1.m1p.x0, x1=x12b.x1, y0=inst1.m1p.y0, y1=inst1.m1p.y1);
-    let m13 = rect("met1.drawing", x0=inst2.vinp.x0, x1=x12b.x1, y0=inst2.vinp.y0, y1=inst2.vinp.y1);
-    let m14 = rect("met1.drawing", x0=inst2.vinn.x0, x1=x12b.x1, y0=inst2.vinn.y0, y1=inst2.vinn.y1);
+    let x12a = rect("met2.drawing", x0=inst1.m1n.x1+300., w=300., y0=inst2.vinn.y0-10., y1=inst1.m1n.y1+10.);
+    let x12b = rect("met2.drawing", x0=x12a.x1+300., w=300., y0=inst2.vinn.y0-10., y1=inst1.m1n.y1+10.);
+    let m11 = rect("met1.drawing", x0=inst1.m1n.x0-10., x1=x12b.x1+10., y0=inst1.m1n.y0, y1=inst1.m1n.y1);
+    let m12 = rect("met1.drawing", x0=inst1.m1p.x0-10., x1=x12b.x1+10., y0=inst1.m1p.y0, y1=inst1.m1p.y1);
+    let m13 = rect("met1.drawing", x0=inst2.vinp.x0-10., x1=x12b.x1+10., y0=inst2.vinp.y0, y1=inst2.vinp.y1);
+    let m14 = rect("met1.drawing", x0=inst2.vinn.x0-10., x1=x12b.x1+10., y0=inst2.vinn.y0, y1=inst2.vinn.y1);
 
     #scope1 v12_array(x12a, m11);
     #scope2 v12_array(x12a, m13);
     #scope4 v12_array(x12b, m12);
     #scope3 v12_array(x12b, m14);
 
-    let y30a = rect("met2.drawing", x1=inst0.vinp.x0-300., w=300., y1=inst0.vinp.y1, y0=inst3.m1p.y0);
-    let y30b = rect("met2.drawing", x1=y30a.x0-300., w=300., y1=inst0.vinp.y1, y0=inst3.m1p.y0);
-    let n11 = rect("met1.drawing", x0=y30b.x0, x1=inst0.vinp.x1, y0=inst0.vinp.y0, y1=inst0.vinp.y1);
-    let n12 = rect("met1.drawing", x0=y30b.x0, x1=inst0.vinn.x1, y0=inst0.vinn.y0, y1=inst0.vinn.y1);
-    let n13 = rect("met1.drawing", x0=y30b.x0, x1=inst3.m1n.x1, y0=inst3.m1n.y0, y1=inst3.m1n.y1);
-    let n14 = rect("met1.drawing", x0=y30b.x0, x1=inst3.m1p.x1, y0=inst3.m1p.y0, y1=inst3.m1p.y1);
+    let y30a = rect("met2.drawing", x1=inst0.vinp.x0-300., w=300., y1=inst0.vinp.y1+10., y0=inst3.m1p.y0-10.);
+    let y30b = rect("met2.drawing", x1=y30a.x0-300., w=300., y1=inst0.vinp.y1+10., y0=inst3.m1p.y0-10.);
+    let n11 = rect("met1.drawing", x0=y30b.x0-10., x1=inst0.vinp.x1+10., y0=inst0.vinp.y0, y1=inst0.vinp.y1);
+    let n12 = rect("met1.drawing", x0=y30b.x0-10., x1=inst0.vinn.x1+10., y0=inst0.vinn.y0, y1=inst0.vinn.y1);
+    let n13 = rect("met1.drawing", x0=y30b.x0-10., x1=inst3.m1n.x1+10., y0=inst3.m1n.y0, y1=inst3.m1n.y1);
+    let n14 = rect("met1.drawing", x0=y30b.x0-10., x1=inst3.m1p.x1+10., y0=inst3.m1p.y0, y1=inst3.m1p.y1);
 
     #scope5 v12_array(y30a, n14);
     #scope8 v12_array(y30a, n11);
