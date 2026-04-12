@@ -21,6 +21,7 @@ mod tests {
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
+    use pegasus::drc::{DrcParams, run_drc};
 
     use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
@@ -1037,5 +1038,47 @@ mod tests {
         let cell = &cells.cells[&cells.top];
         println!("rowspace vecs = {:?}", cell.rowspace_vecs);
         assert_eq!(cell.rowspace_vecs.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires Pegasus"]
+    fn argon_sky130_vco() {
+        let o = parse_workspace_with_std(ARGON_SKY130_LIB);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["diff_vco_top"],
+                args: vec![],
+                lyp_file: &PathBuf::from(SKY130_LYP),
+            },
+        );
+        println!("cells: {cells:?}");
+
+        assert!(cells.is_valid());
+
+        let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_vco");
+        let gds_path = work_dir.join("layout.gds");
+        cells
+            .to_gds(
+                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                &gds_path,
+            )
+            .expect("Failed to write to GDS");
+
+        use sky130::{sky130_drc, sky130_drc_rules_path};
+
+        let drc_dir = work_dir.join("drc");
+        let data = run_drc(&DrcParams {
+            work_dir: &drc_dir,
+            layout_path: &gds_path,
+            cell_name: "diff_vco_top",
+            rules_dir: &sky130_drc(),
+            rules_path: &sky130_drc_rules_path(),
+        })
+        .expect("failed to run drc");
+        assert!(data.rule_checks.is_empty());
     }
 }

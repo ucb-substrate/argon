@@ -1979,6 +1979,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 pub enum CellArg {
     Float(f64),
     Int(i64),
+    Bool(bool),
     Seq(Vec<CellArg>),
 }
 
@@ -3181,12 +3182,13 @@ impl<'a> ExecPass<'a> {
                 }
             }
             Value::Int(i) => Some(CellArg::Int(*i)),
+            Value::Bool(b) => Some(CellArg::Bool(*b)),
             Value::Seq(s) => s
                 .iter()
                 .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
                 .collect::<Option<Vec<_>>>()
                 .map(CellArg::Seq),
-            _ => unreachable!(),
+            v => unreachable!("invalid cell arg {v:?}"),
         }
     }
 
@@ -4625,6 +4627,7 @@ impl Value {
     pub fn from_arg(arg: &CellArg) -> Self {
         match arg {
             CellArg::Int(i) => Value::Int(*i),
+            CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
         }

@@ -27,3 +27,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 const_format = "0.2"
+pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
+sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
