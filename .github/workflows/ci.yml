@@ -38,6 +38,8 @@ jobs:
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -85,6 +87,8 @@ jobs:
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Java
         uses: actions/setup-java@v4
