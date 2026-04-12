@@ -189,14 +189,15 @@ fn diff_vco_row(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, n: Int, rev:
     }
 }
 
-cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, nstages: Int) {
+// The number of stages is `half_stages` * 2.
+cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, half_stages: Int) {
     let vco_elem = #scope0 vco_elem(nw, pw, nf_main, nf_keeper);
-    let top = #scope15 diff_vco_row(nw, pw, nf_main, nf_keeper, nstages, false);
+    let top = #scope15 diff_vco_row(nw, pw, nf_main, nf_keeper, half_stages, false);
     let topl = head(top);
     let topr = #scope16 std::last(top);
     eq(topl.x, 0.);
     eq(topl.y, 0.);
-    let bot = #scope18 diff_vco_row(nw, pw, nf_main, nf_keeper, nstages, true);
+    let bot = #scope18 diff_vco_row(nw, pw, nf_main, nf_keeper, half_stages, true);
     let botl = #scope17 std::last(bot);
     let botr = head(bot);
     eq(botr.vss2.x1, topr.vss1.x1);
@@ -235,7 +236,7 @@ cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, nstages: Int) 
     let m1_vss_bot =rect("met1.drawing", x0=botl.vss1.x0, x1=botr.vss1.x1, y0=botl.vss1.y0, y1=botl.vss1.y1);
     let m1_vdd_2 = rect("met1.drawing", x0=botl.vdd_m1.x0, x1=botr.vdd_m1.x1, y0=botl.vdd_m1.y0, y1=botl.vdd_m1.y1);
 
-    for i in #scope9 std::range(nstages - 1) {
+    for i in #scope9 std::range(half_stages - 1) {
         let vss_m2 = rect("met2.drawing", w=300., y0=m1_vss_bot.y0, y1=m1_vss_top.y1, x0=top[i].keeper_p.pmos.sdm.x1-160.);
         let vdd_m2 = rect("met2.drawing", w=300., y0=m1_vss_bot.y0, y1=m1_vss_top.y1, x0=vss_m2.x1+300.);
 
