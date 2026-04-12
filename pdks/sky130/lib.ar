@@ -260,7 +260,6 @@ fn centered_via_array(r1: Rect, r2: Rect, via: Rect, xpitch: Float, ypitch: Floa
     eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
 }
 
-cell top() {
+cell diff_vco_top() {
     let vco = inst(#scope0 diff_vco(1000., 1600., 4, 1, 2), x=0., y=0.);
-    // let main_n = inst(#scope1 inv(1000., 1600., 4), x=0., y=0.);
 }

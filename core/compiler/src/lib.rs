@@ -21,9 +21,9 @@ mod tests {
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
-    use pegasus::drc::{DrcParams, run_drc};
+    use pegasus::drc::{run_drc, DrcParams};
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::compile::{compile, CellArg, CompileInput};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -836,12 +836,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
     }
 
     #[test]
@@ -860,12 +858,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
     }
 
     #[test]
@@ -884,12 +880,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained)));
     }
 
     #[test]
@@ -908,12 +902,10 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast))
-        );
+        assert!(errors
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast)));
     }
 
     #[test]
@@ -1048,7 +1040,7 @@ mod tests {
         let cells = compile(
             &ast,
             CompileInput {
-                cell: &["top"],
+                cell: &["diff_vco_top"],
                 args: vec![],
                 lyp_file: &PathBuf::from(SKY130_LYP),
             },
@@ -1073,7 +1065,7 @@ mod tests {
         let data = run_drc(&DrcParams {
             work_dir: &drc_dir,
             layout_path: &gds_path,
-            cell_name: "top",
+            cell_name: "diff_vco_top",
             rules_dir: &sky130_drc(),
             rules_path: &sky130_drc_rules_path(),
         })
