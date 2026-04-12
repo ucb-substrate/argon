@@ -21,9 +21,9 @@ mod tests {
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
-    use pegasus::drc::{run_drc, DrcParams};
+    use pegasus::drc::{DrcParams, run_drc};
 
-    use crate::compile::{compile, CellArg, CompileInput};
+    use crate::compile::{CellArg, CompileInput, compile};
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -836,10 +836,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
     }
 
     #[test]
@@ -858,10 +860,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+        );
     }
 
     #[test]
@@ -880,10 +884,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
+        );
     }
 
     #[test]
@@ -902,10 +908,12 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(errors
-            .errors
-            .iter()
-            .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast)));
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCast))
+        );
     }
 
     #[test]
@@ -1070,5 +1078,6 @@ mod tests {
             rules_path: &sky130_drc_rules_path(),
         })
         .expect("failed to run drc");
+        assert!(data.rule_checks.is_empty());
     }
 }

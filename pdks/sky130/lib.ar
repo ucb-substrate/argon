@@ -1,4 +1,4 @@
-cell fet1v8(nfet: Int, w: Float, nf: Int) {
+cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
     let poly_bbox = #scope0 std::array(poly, nf, 430., 0.);
     eq(poly_bbox.x0, 0.);
@@ -14,7 +14,7 @@ cell fet1v8(nfet: Int, w: Float, nf: Int) {
     let li1_bbox = #scope1 std::array(li1, nf + 1, 430., 0.);
     eq(li1_bbox.x0, li1.x0);
     eq(li1_bbox.y0, li1.y0);
-    let sdm = rect(#scope2 if nfet == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
+    let sdm = rect(#scope2 if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
 
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
@@ -31,14 +31,16 @@ cell tap(ntap: Int, w: Float, h: Float) {
 }
 
 cell inv(nw: Float, pw: Float, nf: Int) {
-    let nmos = inst(#scope0 fet1v8(1, nw, nf), x=0., y=0.);
+    let nmos = inst(#scope0 fet1v8(true, nw, nf), x=0., y=0.);
     let ptap = inst(#scope1 tap(0, nmos.sdm.w - 260., 800.));
     eq(ptap.sdm.y1 + 100., nmos.sdm.y0);
     eq(ptap.sdm.x0, nmos.sdm.x0);
-    let pmos = inst(#scope2 fet1v8(0, pw, nf), x=0.);
+    let pmos = inst(#scope2 fet1v8(false, pw, nf), x=0.);
     let ntap = inst(#scope3 tap(1, pmos.sdm.w - 260., 800.));
     eq(pmos.li1_bbox.y1 + 100., ntap.sdm.y0);
     eq(ntap.sdm.x0, pmos.sdm.x0);
+
+    let nwell = rect("nwell.drawing", x0=pmos.sdm.x0-180., x1=pmos.sdm.x1+180., y0=pmos.sdm.y0-180., y1=ntap.sdm.y1+180.);
 
     // Draw horizontal LI1 rails.
     let o_li_bot = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., y0=nmos.li1_bbox.y1 + 170., h=170.);
@@ -171,6 +173,8 @@ cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     eq(inst2.vss2.x1, inst1.vss1.x1);
     let inst3 = inst(vco_elem, y=inst2.y, reflect=true, angle=180);
     eq(inst3.main_p.pmos.sdm.x1, inst2.keeper_p.pmos.sdm.x0-380.);
+    rect("nwell.drawing", x0=inst0.main_p.nwell.x0, x1=inst1.keeper_p.nwell.x1, y0=inst0.main_p.nwell.y0, y1=inst0.main_n.nwell.y1);
+    rect("nwell.drawing", x0=inst3.keeper_p.nwell.x0, x1=inst2.main_p.nwell.x1, y0=inst3.main_p.nwell.y0, y1=inst3.main_n.nwell.y1);
     rect("met1.drawing", x0=inst0.m1n.x0, x1=inst1.vinp.x1, y0=inst1.vinp.y0, y1=inst1.vinp.y1);
     rect("met1.drawing", x0=inst0.m1p.x0, x1=inst1.vinn.x1, y0=inst1.vinn.y0, y1=inst1.vinn.y1);
     rect("met1.drawing", x0=inst3.vinp.x0, x1=inst2.m1n.x1, y0=inst3.vinp.y0, y1=inst3.vinp.y1);
@@ -231,6 +235,6 @@ fn centered_via_array(r1: Rect, r2: Rect, via: Rect, xpitch: Float, ypitch: Floa
 }
 
 cell top() {
-    // let inner = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
-    let vco_elem = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
+    let vco = inst(#scope0 diff_vco(1000., 1600., 4, 1), x=0., y=0.);
+    // let main_n = inst(#scope1 inv(1000., 1600., 4), x=0., y=0.);
 }
