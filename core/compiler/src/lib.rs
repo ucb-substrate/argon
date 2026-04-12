@@ -1033,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires Pegasus"]
     fn argon_sky130_vco() {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
