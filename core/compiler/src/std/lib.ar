@@ -133,3 +133,15 @@ fn last(lst: [Any]) -> Any {
         #scope0 last(tail(lst))
     }
 }
+
+fn range(stop: Int) -> [Int] {
+    #scope0 range_full(0, stop, 1)
+}
+
+fn range_full(start: Int, stop: Int, step: Int) -> [Int] {
+    #scope0 if start >= stop {
+        []
+    } else {
+        cons(start, #scope0 range_full(start + step, stop, step))
+    }
+}
