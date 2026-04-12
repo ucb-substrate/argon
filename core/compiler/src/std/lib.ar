@@ -125,3 +125,11 @@ fn center_rects(r1: Rect, r2: Rect) {
 fn crect2rect(r: Rect) -> Rect {
     rect(r.layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
 }
+
+fn last(lst: [Any]) -> Any {
+    #scope0 if tail(lst) == [] {
+        head(lst)
+    } else {
+        #scope0 last(tail(lst))
+    }
+}
