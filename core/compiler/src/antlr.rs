@@ -82,33 +82,6 @@ where
     }
 }
 
-pub fn parse_errors(input: &str) -> Vec<AntlrParseError> {
-    let normalized_input = input.trim_start_matches(char::is_whitespace);
-    let offset_base = input.len() - normalized_input.len();
-    let input_rc: Rc<str> = Rc::from(normalized_input);
-    let errors = Rc::new(RefCell::new(Vec::new()));
-
-    let mut lexer = ArgonLexer::new(InputStream::new(normalized_input));
-    lexer.remove_error_listeners();
-    lexer.add_error_listener(Box::new(CollectingErrorListener {
-        input: Rc::clone(&input_rc),
-        offset_base,
-        errors: Rc::clone(&errors),
-    }));
-
-    let tokens = CommonTokenStream::new(lexer);
-    let mut parser = ArgonParser::new(tokens);
-    parser.remove_error_listeners();
-    parser.add_error_listener(Box::new(CollectingErrorListener {
-        input: Rc::clone(&input_rc),
-        offset_base,
-        errors: Rc::clone(&errors),
-    }));
-
-    let _ = parser.ast();
-    errors.borrow().clone()
-}
-
 pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<AntlrParseError>> {
     let input_for_ast = input.clone();
     let normalized_input = input.trim_start_matches(char::is_whitespace);
