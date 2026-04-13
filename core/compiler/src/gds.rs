@@ -177,7 +177,9 @@ fn parse_layer_source(source: &str) -> Result<(i16, i16)> {
     let (layer, datatype) = source
         .split_once('/')
         .ok_or_else(|| anyhow!("parse error"))?;
-    let datatype = datatype.split_once('@').map_or(datatype, |(datatype, _)| datatype);
+    let datatype = datatype
+        .split_once('@')
+        .map_or(datatype, |(datatype, _)| datatype);
     Ok((layer.parse()?, datatype.parse()?))
 }
 

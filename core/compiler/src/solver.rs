@@ -181,7 +181,9 @@ impl Solver {
         }
         self.constraint_components()
             .into_iter()
-            .flat_map(|component| self.rowspace_component_vecs(&component.vars, &component.constraints))
+            .flat_map(|component| {
+                self.rowspace_component_vecs(&component.vars, &component.constraints)
+            })
             .collect()
     }
 
@@ -217,7 +219,13 @@ impl Solver {
                     move |(coeff, var)| (row, var_indices[var], *coeff)
                 })
             }));
-        let a = DMatrix::from(CsMatrix::from_triplet(constraints.len(), n_vars, &i, &j, &val));
+        let a = DMatrix::from(CsMatrix::from_triplet(
+            constraints.len(),
+            n_vars,
+            &i,
+            &j,
+            &val,
+        ));
         let b = DVector::from_iterator(
             constraints.len(),
             constraints.iter().map(|id| -self.constraints[id].constant),
@@ -266,7 +274,13 @@ impl Solver {
                     move |(coeff, var)| (row, var_indices[var], *coeff)
                 })
             }));
-        let a = DMatrix::from(CsMatrix::from_triplet(constraints.len(), n_vars, &i, &j, &val));
+        let a = DMatrix::from(CsMatrix::from_triplet(
+            constraints.len(),
+            n_vars,
+            &i,
+            &j,
+            &val,
+        ));
         let svd = a.svd(false, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let r = svd.rank(EPSILON);
@@ -311,7 +325,8 @@ impl Solver {
                         }
                         constraints.push(constraint_id);
                         for &(_, next_var) in &self.constraints[&constraint_id].coeffs {
-                            if self.unsolved_vars.contains(&next_var) && visited_vars.insert(next_var)
+                            if self.unsolved_vars.contains(&next_var)
+                                && visited_vars.insert(next_var)
                             {
                                 vars.insert(next_var);
                                 queue.push_back(next_var);

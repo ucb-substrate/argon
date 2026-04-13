@@ -781,7 +781,7 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
-    fn is_eq_ty(&mut self, a: &Ty, b: &Ty) -> bool {
+    fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
         if *a == Ty::Any || *b == Ty::Any {
             return true;
         }
@@ -789,7 +789,7 @@ impl<'a> VarIdTyPass<'a> {
         if let Ty::Seq(a) = a
             && let Ty::Seq(b) = b
         {
-            return self.is_eq_ty(a, b);
+            return VarIdTyPass::is_eq_ty(a, b);
         }
 
         if let Ty::Tuple(a) = a
@@ -798,14 +798,17 @@ impl<'a> VarIdTyPass<'a> {
             if a.len() != b.len() {
                 return false;
             }
-            return a.iter().zip(b.iter()).all(|(a, b)| self.is_eq_ty(a, b));
+            return a
+                .iter()
+                .zip(b.iter())
+                .all(|(a, b)| VarIdTyPass::is_eq_ty(a, b));
         }
 
         *a == *b
     }
 
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if !self.is_eq_ty(found, expected) {
+        if !VarIdTyPass::is_eq_ty(found, expected) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
@@ -1350,7 +1353,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        if !self.is_eq_ty(&left_ty, &right_ty) {
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::BinOpMismatchedTypes,
@@ -1613,7 +1616,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     if args.posargs.len() == 2 {
                         let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
                         let tailty = args.posargs[1].ty();
-                        if !(tailty == Ty::SeqNil || self.is_eq_ty(&tailty, &seqty)) {
+                        if !(tailty == Ty::SeqNil || VarIdTyPass::is_eq_ty(&tailty, &seqty)) {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
@@ -2740,7 +2743,9 @@ impl<'a> ExecPass<'a> {
             for (seq_num, (name, value)) in scope.bindings.iter() {
                 if let Some(obj_id) = emit_value(*value) {
                     let scope = ccell.scopes.get_mut(id).expect("scope not found");
-                    scope.bindings.insert(*seq_num, (name.clone(), obj_id.clone()));
+                    scope
+                        .bindings
+                        .insert(*seq_num, (name.clone(), obj_id.clone()));
                     if *id == ccell.root {
                         ccell.fields.insert(name.clone(), obj_id);
                     }
@@ -4259,8 +4264,7 @@ impl<'a> ExecPass<'a> {
                                         .cloned()
                                     {
                                         Some(val)
-                                    } else 
-                                    if let Defer::Ready(cell) = &self.values[&inst.cell] {
+                                    } else if let Defer::Ready(cell) = &self.values[&inst.cell] {
                                         let inst_cell_id = *cell.as_ref().unwrap_cell();
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
@@ -4282,8 +4286,11 @@ impl<'a> ExecPass<'a> {
                                                 return Err(());
                                             };
                                         let obj_id = &mut self.next_id;
-                                        let objects =
-                                            &mut self.cell_states.get_mut(&cell_id).unwrap().objects;
+                                        let objects = &mut self
+                                            .cell_states
+                                            .get_mut(&cell_id)
+                                            .unwrap()
+                                            .objects;
                                         let transformed = Value::from_array(field_value.map(
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
@@ -4828,7 +4835,9 @@ impl<T> Arrayed<T> {
 
 impl CompiledCell {
     pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
-        self.fields.get(name).map(|o| o.map(&mut |id| &self.objects[id]))
+        self.fields
+            .get(name)
+            .map(|o| o.map(&mut |id| &self.objects[id]))
     }
 }
 
