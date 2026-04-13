@@ -2366,7 +2366,7 @@ impl<'a> ExecPass<'a> {
         let cache_key = CellExecKey {
             cell,
             args: args.iter().map(CellArgKey::from).collect(),
-            scope_annotation: scope_annotation.map(str::to_owned),
+            scope_annotation: scope_annotation.map(|s| s.to_string()),
         };
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
