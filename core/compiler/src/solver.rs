@@ -162,13 +162,11 @@ impl Solver {
         if n_vars == 0 || self.constraints.is_empty() {
             return;
         }
-        let unsolved_var_indices: IndexMap<Var, usize> =
-            IndexMap::from_iter(unsolved_vars.iter().enumerate().map(|(idx, var)| (*var, idx)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
                 expr.coeffs.iter().map({
-                    let unsolved_var_indices = &unsolved_var_indices;
-                    move |(coeff, var)| (i, unsolved_var_indices[var], *coeff)
+                    let unsolved_vars = &unsolved_vars;
+                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
                 })
             }));
         let a = DMatrix::from(CsMatrix::from_triplet(
@@ -225,13 +223,11 @@ impl Solver {
         if n_vars == 0 || self.constraints.is_empty() {
             return Vec::new();
         }
-        let unsolved_var_indices: IndexMap<Var, usize> =
-            IndexMap::from_iter(unsolved_vars.iter().enumerate().map(|(idx, var)| (*var, idx)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
                 expr.coeffs.iter().map({
-                    let unsolved_var_indices = &unsolved_var_indices;
-                    move |(coeff, var)| (i, unsolved_var_indices[var], *coeff)
+                    let unsolved_vars = &unsolved_vars;
+                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
                 })
             }));
         let a = DMatrix::from(CsMatrix::from_triplet(
