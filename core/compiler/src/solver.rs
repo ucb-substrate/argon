@@ -162,11 +162,13 @@ impl Solver {
         if n_vars == 0 || self.constraints.is_empty() {
             return;
         }
+        let unsolved_var_indices: IndexMap<Var, usize> =
+            IndexMap::from_iter(unsolved_vars.iter().enumerate().map(|(idx, var)| (*var, idx)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
                 expr.coeffs.iter().map({
-                    let unsolved_vars = &unsolved_vars;
-                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
+                    let unsolved_var_indices = &unsolved_var_indices;
+                    move |(coeff, var)| (i, unsolved_var_indices[var], *coeff)
                 })
             }));
         let a = DMatrix::from(CsMatrix::from_triplet(
@@ -180,18 +182,21 @@ impl Solver {
             self.constraints.len(),
             self.constraints.values().map(|c| -c.constant),
         );
-        let svd = a.clone().svd(true, true);
+        let svd = a.svd(true, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let r = svd.rank(EPSILON);
         if r == 0 {
             return;
         }
-        let vt_recons = vt.rows(0, r);
         let sol = svd.solve(&b, EPSILON).unwrap();
 
-        for var in &unsolved_vars {
-            let i = unsolved_vars.get_index_of(var).unwrap();
-            let recons = (vt_recons.transpose() * vt_recons.column(i))[(i, 0)];
+        for (i, var) in unsolved_vars.iter().enumerate() {
+            let recons = (0..r)
+                .map(|row| {
+                    let coeff = vt[(row, i)];
+                    coeff * coeff
+                })
+                .sum::<f64>();
             if relative_eq!(recons, 1., epsilon = EPSILON) {
                 let val = sol[(i, 0)];
                 let rounded_val = round(val);
@@ -220,11 +225,13 @@ impl Solver {
         if n_vars == 0 || self.constraints.is_empty() {
             return Vec::new();
         }
+        let unsolved_var_indices: IndexMap<Var, usize> =
+            IndexMap::from_iter(unsolved_vars.iter().enumerate().map(|(idx, var)| (*var, idx)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
                 expr.coeffs.iter().map({
-                    let unsolved_vars = &unsolved_vars;
-                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
+                    let unsolved_var_indices = &unsolved_var_indices;
+                    move |(coeff, var)| (i, unsolved_var_indices[var], *coeff)
                 })
             }));
         let a = DMatrix::from(CsMatrix::from_triplet(
@@ -234,7 +241,7 @@ impl Solver {
             &j,
             &val,
         ));
-        let svd = a.clone().svd(false, true);
+        let svd = a.svd(false, true);
         let vt = svd.v_t.as_ref().expect("No V^T matrix");
         let r = svd.rank(EPSILON);
 
@@ -242,8 +249,8 @@ impl Solver {
             .map(|i| {
                 unsolved_vars
                     .iter()
-                    .filter_map(|v| {
-                        let j = unsolved_vars.get_index_of(v).unwrap();
+                    .enumerate()
+                    .filter_map(|(j, v)| {
                         let coeff = vt[(i, j)];
                         if relative_ne!(coeff, 0., epsilon = EPSILON) {
                             Some((coeff, *v))
