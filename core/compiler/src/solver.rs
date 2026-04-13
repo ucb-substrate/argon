@@ -3,6 +3,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools, multiunzip};
 use nalgebra::{CsMatrix, DMatrix, DVector};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 const EPSILON: f64 = 1e-8;
 const ROUND_STEP: f64 = 0.1;
@@ -156,53 +157,11 @@ impl Solver {
     ///
     /// Constraints should be simplified before this function is invoked.
     pub fn solve(&mut self) {
-        // Snapshot unsolved variables before solving.
-        let unsolved_vars = self.unsolved_vars.clone();
-        let n_vars = unsolved_vars.len();
-        if n_vars == 0 || self.constraints.is_empty() {
+        if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
             return;
         }
-        let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
-            multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
-                expr.coeffs.iter().map({
-                    let unsolved_vars = &unsolved_vars;
-                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
-                })
-            }));
-        let a = DMatrix::from(CsMatrix::from_triplet(
-            self.constraints.len(),
-            n_vars,
-            &i,
-            &j,
-            &val,
-        ));
-        let b = DVector::from_iterator(
-            self.constraints.len(),
-            self.constraints.values().map(|c| -c.constant),
-        );
-        let svd = a.svd(true, true);
-        let vt = svd.v_t.as_ref().expect("No V^T matrix");
-        let r = svd.rank(EPSILON);
-        if r == 0 {
-            return;
-        }
-        let sol = svd.solve(&b, EPSILON).unwrap();
-
-        for (i, var) in unsolved_vars.iter().enumerate() {
-            let recons = (0..r)
-                .map(|row| {
-                    let coeff = vt[(row, i)];
-                    coeff * coeff
-                })
-                .sum::<f64>();
-            if relative_eq!(recons, 1., epsilon = EPSILON) {
-                let val = sol[(i, 0)];
-                let rounded_val = round(val);
-                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
-                    self.invalid_rounding.insert(*var);
-                }
-                self.solve_var(*var, rounded_val);
-            }
+        for component in self.constraint_components() {
+            self.solve_component(&component.vars, &component.constraints);
         }
         for (id, constraint) in self.constraints.iter_mut() {
             constraint.simplify(&self.solved_vars);
@@ -217,46 +176,13 @@ impl Solver {
     }
 
     pub fn rowspace_vecs(&mut self) -> Vec<Vec<(f64, Var)>> {
-        // Snapshot unsolved variables before solving.
-        let unsolved_vars = self.unsolved_vars.clone();
-        let n_vars = unsolved_vars.len();
-        if n_vars == 0 || self.constraints.is_empty() {
+        if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
             return Vec::new();
         }
-        let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
-            multiunzip(self.constraints.values().enumerate().flat_map(|(i, expr)| {
-                expr.coeffs.iter().map({
-                    let unsolved_vars = &unsolved_vars;
-                    move |(coeff, var)| (i, unsolved_vars.get_index_of(var).unwrap(), *coeff)
-                })
-            }));
-        let a = DMatrix::from(CsMatrix::from_triplet(
-            self.constraints.len(),
-            n_vars,
-            &i,
-            &j,
-            &val,
-        ));
-        let svd = a.svd(false, true);
-        let vt = svd.v_t.as_ref().expect("No V^T matrix");
-        let r = svd.rank(EPSILON);
-
-        (0..r)
-            .map(|i| {
-                unsolved_vars
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(j, v)| {
-                        let coeff = vt[(i, j)];
-                        if relative_ne!(coeff, 0., epsilon = EPSILON) {
-                            Some((coeff, *v))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+        self.constraint_components()
+            .into_iter()
+            .flat_map(|component| self.rowspace_component_vecs(&component.vars, &component.constraints))
+            .collect()
     }
 
     pub fn value_of(&self, var: Var) -> Option<f64> {
@@ -276,6 +202,137 @@ impl Solver {
                 + expr.constant,
         ))
     }
+
+    fn solve_component(&mut self, vars: &IndexSet<Var>, constraints: &[ConstraintId]) {
+        let n_vars = vars.len();
+        if n_vars == 0 || constraints.is_empty() {
+            return;
+        }
+        let var_indices: IndexMap<Var, usize> =
+            IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
+            multiunzip(constraints.iter().enumerate().flat_map(|(row, id)| {
+                self.constraints[id].coeffs.iter().map({
+                    let var_indices = &var_indices;
+                    move |(coeff, var)| (row, var_indices[var], *coeff)
+                })
+            }));
+        let a = DMatrix::from(CsMatrix::from_triplet(constraints.len(), n_vars, &i, &j, &val));
+        let b = DVector::from_iterator(
+            constraints.len(),
+            constraints.iter().map(|id| -self.constraints[id].constant),
+        );
+        let svd = a.svd(true, true);
+        let vt = svd.v_t.as_ref().expect("No V^T matrix");
+        let r = svd.rank(EPSILON);
+        if r == 0 {
+            return;
+        }
+        let sol = svd.solve(&b, EPSILON).unwrap();
+
+        for (i, var) in vars.iter().enumerate() {
+            let recons = (0..r)
+                .map(|row| {
+                    let coeff = vt[(row, i)];
+                    coeff * coeff
+                })
+                .sum::<f64>();
+            if relative_eq!(recons, 1., epsilon = EPSILON) {
+                let val = sol[(i, 0)];
+                let rounded_val = round(val);
+                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
+                    self.invalid_rounding.insert(*var);
+                }
+                self.solve_var(*var, rounded_val);
+            }
+        }
+    }
+
+    fn rowspace_component_vecs(
+        &self,
+        vars: &IndexSet<Var>,
+        constraints: &[ConstraintId],
+    ) -> Vec<Vec<(f64, Var)>> {
+        let n_vars = vars.len();
+        if n_vars == 0 || constraints.is_empty() {
+            return Vec::new();
+        }
+        let var_indices: IndexMap<Var, usize> =
+            IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
+            multiunzip(constraints.iter().enumerate().flat_map(|(row, id)| {
+                self.constraints[id].coeffs.iter().map({
+                    let var_indices = &var_indices;
+                    move |(coeff, var)| (row, var_indices[var], *coeff)
+                })
+            }));
+        let a = DMatrix::from(CsMatrix::from_triplet(constraints.len(), n_vars, &i, &j, &val));
+        let svd = a.svd(false, true);
+        let vt = svd.v_t.as_ref().expect("No V^T matrix");
+        let r = svd.rank(EPSILON);
+
+        (0..r)
+            .map(|i| {
+                vars.iter()
+                    .enumerate()
+                    .filter_map(|(j, v)| {
+                        let coeff = vt[(i, j)];
+                        if relative_ne!(coeff, 0., epsilon = EPSILON) {
+                            Some((coeff, *v))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn constraint_components(&self) -> Vec<ConstraintComponent> {
+        let mut visited_vars = IndexSet::new();
+        let mut visited_constraints = IndexSet::new();
+        let mut components = Vec::new();
+
+        for &root_var in &self.unsolved_vars {
+            if !visited_vars.insert(root_var) {
+                continue;
+            }
+            let mut queue = VecDeque::from([root_var]);
+            let mut vars = IndexSet::from([root_var]);
+            let mut constraints = Vec::new();
+
+            while let Some(var) = queue.pop_front() {
+                if let Some(var_constraints) = self.var_to_constraints.get(&var) {
+                    for &constraint_id in var_constraints {
+                        if !self.constraints.contains_key(&constraint_id)
+                            || !visited_constraints.insert(constraint_id)
+                        {
+                            continue;
+                        }
+                        constraints.push(constraint_id);
+                        for &(_, next_var) in &self.constraints[&constraint_id].coeffs {
+                            if self.unsolved_vars.contains(&next_var) && visited_vars.insert(next_var)
+                            {
+                                vars.insert(next_var);
+                                queue.push_back(next_var);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !constraints.is_empty() {
+                components.push(ConstraintComponent { vars, constraints });
+            }
+        }
+
+        components
+    }
+}
+
+struct ConstraintComponent {
+    vars: IndexSet<Var>,
+    constraints: Vec<ConstraintId>,
 }
 
 pub type ConstraintId = u64;

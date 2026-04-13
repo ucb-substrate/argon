@@ -140,9 +140,8 @@ fn make_backup_ast(input: ArcStr, path: PathBuf) -> AnnotatedParseAst {
     )
 }
 
-fn antlr_diagnostics(input: &str) -> ParseDiagnostics {
-    antlr::parse_errors(input)
-        .into_iter()
+fn diagnostics_from_errors(errs: Vec<antlr::AntlrParseError>) -> ParseDiagnostics {
+    errs.into_iter()
         .map(|err| ParseDiagnostic {
             span: err.span,
             kind: StaticErrorKind::ParseError(err.message),
@@ -150,38 +149,32 @@ fn antlr_diagnostics(input: &str) -> ParseDiagnostics {
         .collect()
 }
 
-fn parse_result_from_antlr(
+fn parse_result_from_errors(
     input: ArcStr,
     path: PathBuf,
-    diagnostics: &[ParseDiagnostic],
-) -> ParseResult {
+    diagnostics: Vec<ParseDiagnostic>,
+) -> (ParseResult, ParseDiagnostics) {
     if !diagnostics.is_empty() {
         let mut err = String::new();
-        for diagnostic in diagnostics {
+        for diagnostic in &diagnostics {
             if let Err(write_err) = writeln!(&mut err, "{}", diagnostic.kind)
                 .with_context(|| "failed to write to string buffer")
             {
-                return (make_backup_ast(input, path), Some(anyhow!("{write_err}")));
+                return (
+                    (make_backup_ast(input, path), Some(anyhow!("{write_err}"))),
+                    diagnostics,
+                );
             }
         }
         return (
-            make_backup_ast(input, path),
-            Some(anyhow!(err.trim_end().to_string())),
+            (
+                make_backup_ast(input, path),
+                Some(anyhow!(err.trim_end().to_string())),
+            ),
+            diagnostics,
         );
     }
-    match antlr::parse_ast(input.clone(), path.clone()) {
-        Ok(ast) => (ast, None),
-        Err(errs) => {
-            let diagnostics = errs
-                .into_iter()
-                .map(|err| ParseDiagnostic {
-                    span: err.span,
-                    kind: StaticErrorKind::ParseError(err.message),
-                })
-                .collect::<Vec<_>>();
-            parse_result_from_antlr(input, path, &diagnostics)
-        }
-    }
+    ((make_backup_ast(input, path), None), diagnostics)
 }
 
 pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
@@ -280,11 +273,10 @@ fn parse(path: impl Into<PathBuf>) -> (ParseResult, ParseDiagnostics) {
     match std::fs::read_to_string(&path) {
         Ok(input) => {
             let input = ArcStr::from(input);
-            let antlr_errs = antlr_diagnostics(&input);
-            (
-                parse_result_from_antlr(input.clone(), path, &antlr_errs),
-                antlr_errs,
-            )
+            match antlr::parse_ast(input.clone(), path.clone()) {
+                Ok(ast) => ((ast, None), Vec::new()),
+                Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
+            }
         }
         Err(e) => (
             (make_backup_ast("".into(), path), Some(e.into())),
@@ -299,21 +291,13 @@ pub fn format_cell_input(input: &str) -> String {
 
 // Input should first be formatted with `format_cell_input`.
 pub fn parse_cell(input: &str) -> Result<CallExpr<Substr, ParseMetadata>, anyhow::Error> {
-    let errs = antlr_diagnostics(input);
-    if !errs.is_empty() {
-        let mut err = String::new();
-        for diagnostic in errs {
-            writeln!(&mut err, "{}", diagnostic.kind)
-                .with_context(|| "failed to write to string buffer")?;
-        }
-        bail!("{}", err.trim_end());
-    }
     match antlr::parse_ast(ArcStr::from(input), PathBuf::from("__cell__.ar")) {
         Ok(ast) => extract_cell_invocation(ast),
         Err(errs) => {
+            let diagnostics = diagnostics_from_errors(errs);
             let mut err = String::new();
-            for err_item in errs {
-                writeln!(&mut err, "{}", err_item.message)
+            for diagnostic in diagnostics {
+                writeln!(&mut err, "{}", diagnostic.kind)
                     .with_context(|| "failed to write to string buffer")?;
             }
             bail!("{}", err.trim_end());
