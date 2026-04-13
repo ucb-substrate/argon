@@ -2157,7 +2157,6 @@ struct CellState {
     solve_iters: u64,
     solver: Solver,
     fields: IndexMap<String, ValueId>,
-    inst_field_cache: HashMap<(ObjectId, String), Value>,
     emit: Vec<Emit>,
     object_emit: Vec<ObjectEmit>,
     objects: IndexMap<ObjectId, Object>,
@@ -2411,7 +2410,6 @@ impl<'a> ExecPass<'a> {
                         solve_iters: 0,
                         solver: Solver::new(),
                         fields: Default::default(),
-                        inst_field_cache: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
                         deferred: Default::default(),
@@ -4256,15 +4254,7 @@ impl<'a> ExecPass<'a> {
                                 "x" => Some(Value::Linear(inst.x.clone())),
                                 "y" => Some(Value::Linear(inst.y.clone())),
                                 field => {
-                                    let cache_key = (inst.id, field.to_string());
-                                    if let Some(val) = self
-                                        .cell_state(cell_id)
-                                        .inst_field_cache
-                                        .get(&cache_key)
-                                        .cloned()
-                                    {
-                                        Some(val)
-                                    } else if let Defer::Ready(cell) = &self.values[&inst.cell] {
+                                    if let Defer::Ready(cell) = &self.values[&inst.cell] {
                                         let inst_cell_id = *cell.as_ref().unwrap_cell();
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
@@ -4349,11 +4339,6 @@ impl<'a> ExecPass<'a> {
                                                 _ => unreachable!(),
                                             },
                                         ));
-                                        self.cell_states
-                                            .get_mut(&cell_id)
-                                            .unwrap()
-                                            .inst_field_cache
-                                            .insert(cache_key, transformed.clone());
                                         Some(transformed)
                                     } else {
                                         None
