@@ -3,7 +3,7 @@
 //! Pass 1: import resolution
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -1983,6 +1983,32 @@ pub enum CellArg {
     Seq(Vec<CellArg>),
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CellExecKey {
+    cell: VarId,
+    args: Vec<CellArgKey>,
+    scope_annotation: Option<String>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum CellArgKey {
+    Float(u64),
+    Int(i64),
+    Bool(bool),
+    Seq(Vec<CellArgKey>),
+}
+
+impl From<&CellArg> for CellArgKey {
+    fn from(value: &CellArg) -> Self {
+        match value {
+            CellArg::Float(f) => Self::Float(f.to_bits()),
+            CellArg::Int(i) => Self::Int(*i),
+            CellArg::Bool(b) => Self::Bool(*b),
+            CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompileInput<'a> {
     /// Full path to cell.
@@ -2160,6 +2186,7 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
+    compiled_cell_cache: HashMap<CellExecKey, CellId>,
     errors: Vec<ExecError>,
 }
 
@@ -2221,6 +2248,7 @@ impl<'a> ExecPass<'a> {
             next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            compiled_cell_cache: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -2335,6 +2363,14 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_annotation: Option<&str>,
     ) -> Result<CellId, ()> {
+        let cache_key = CellExecKey {
+            cell,
+            args: args.iter().map(CellArgKey::from).collect(),
+            scope_annotation: scope_annotation.map(|s| s.to_string()),
+        };
+        if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
+            return Ok(*cell_id);
+        }
         let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
@@ -2538,6 +2574,7 @@ impl<'a> ExecPass<'a> {
 
         let cell = self.emit(cell_id);
         assert!(self.compiled_cells.insert(cell_id, cell).is_none());
+        self.compiled_cell_cache.insert(cache_key, cell_id);
         Ok(cell_id)
     }
 
