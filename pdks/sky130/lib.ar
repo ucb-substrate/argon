@@ -87,30 +87,30 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     eq(licon_bbox.y0, a_li_mid.y0);
 }
 
-cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
+cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     let main_p = inst(#scope0 inv(nw, pw, nf_main), x=0., y=0.);
     let main_n = inst(#scope1 inv(nw, pw, nf_main), reflect=true);
     eq(main_p.ntap.tap.x0, main_n.ntap.tap.x0);
     eq(main_p.ntap.tap.y0, main_n.ntap.tap.y0);
-    let keeper_p = inst(#scope2 inv(nw, pw, nf_keeper), y=0.);
-    let keeper_n = inst(#scope3 inv(nw, pw, nf_keeper), x=keeper_p.x, reflect=true);
-    eq(keeper_p.ntap.tap.x0, keeper_n.ntap.tap.x0);
-    eq(keeper_p.ntap.tap.y0, keeper_n.ntap.tap.y0);
+    let xcoupled_p = inst(#scope2 inv(nw, pw, nf_xcoupled), y=0.);
+    let xcoupled_n = inst(#scope3 inv(nw, pw, nf_xcoupled), x=xcoupled_p.x, reflect=true);
+    eq(xcoupled_p.ntap.tap.x0, xcoupled_n.ntap.tap.x0);
+    eq(xcoupled_p.ntap.tap.y0, xcoupled_n.ntap.tap.y0);
     let m2p = rect("met2.drawing", w=300.)!;
     let m2n = rect("met2.drawing", w=300.)!;
     eq(m2p.x1 + 300., m2n.x0);
-    let cyp = (keeper_p.o_li_right.y1 + keeper_p.o_li_right.y0) / 2.;
-    let cyn = (keeper_n.o_li_right.y1 + keeper_n.o_li_right.y0) / 2.;
-    let m1p = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=keeper_n.o_li_right.x1+60., y0=cyp-150.)!;
-    let m1n = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=keeper_p.o_li_right.x1+60., y0=cyn-150.)!;
+    let cyp = (xcoupled_p.o_li_right.y1 + xcoupled_p.o_li_right.y0) / 2.;
+    let cyn = (xcoupled_n.o_li_right.y1 + xcoupled_n.o_li_right.y0) / 2.;
+    let m1p = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=xcoupled_n.o_li_right.x1+60., y0=cyp-150.)!;
+    let m1n = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=xcoupled_p.o_li_right.x1+60., y0=cyn-150.)!;
     eq(m2p.x0, main_p.o_li_right.x1+340.);
-    eq(m2n.x1, keeper_p.pmos.sdm.x0-340.);
+    eq(m2n.x1, xcoupled_p.pmos.sdm.x0-340.);
     eq(m2p.y1, m1n.y1+10.);
     eq(m2n.y1, m1n.y1+10.);
     eq(m2p.y0, m1p.y0-10.);
     eq(m2n.y0, m1p.y0-10.);
-    let li_top = rect("li1.drawing", h=170., y0=cyn-85., x0=main_p.o_li_right.x0, x1=keeper_p.a_li_mid.x1);
-    let li_bot = rect("li1.drawing", h=170., y0=cyp-85., x0=main_p.o_li_right.x0, x1=keeper_p.a_li_mid.x1);
+    let li_top = rect("li1.drawing", h=170., y0=cyn-85., x0=main_p.o_li_right.x0, x1=xcoupled_p.a_li_mid.x1);
+    let li_bot = rect("li1.drawing", h=170., y0=cyp-85., x0=main_p.o_li_right.x0, x1=xcoupled_p.a_li_mid.x1);
 
     let m1_int_top = rect("met1.drawing", w=320., h=300., y1=m1n.y0-300., x0=m2p.x0-10.);
     let m1_int_bot = rect("met1.drawing", w=320., h=300., y0=m1p.y1+300., x0=m2n.x0-10.);
@@ -123,22 +123,22 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
     eq(via_top.y0 - m1_int_top.y0, m1_int_top.y1 - via_top.y1);
     rect("li1.drawing", w=170., x0=via_top.x0, y0=via_top.y0 - 85., y1=li_top.y1);
 
-    rect("mcon.drawing", w=170., h=170., x0=keeper_p.o_li_right.x0, y0=cyp-85.);
+    rect("mcon.drawing", w=170., h=170., x0=xcoupled_p.o_li_right.x0, y0=cyp-85.);
     rect("via.drawing", w=150., h=150., x0=m2p.x0 + m2p.w/2.-75., y0=cyp-75.);
-    rect("mcon.drawing", w=170., h=170., x0=keeper_p.o_li_right.x0, y0=cyn-85.);
+    rect("mcon.drawing", w=170., h=170., x0=xcoupled_p.o_li_right.x0, y0=cyn-85.);
     rect("via.drawing", w=150., h=150., x0=m2n.x0 + m2n.w/2.-75., y0=cyn-75.);
 
-    let vss1 = rect("met1.drawing", x0=main_p.ptap.li1.x0, x1=keeper_p.ptap.li1.x1, y0=main_p.ptap.li1.y0, y1=main_p.ptap.li1.y1);
-    let vdd_m1 = rect("met1.drawing", x0=main_p.ntap.li1.x0, x1=keeper_p.ntap.li1.x1, y0=main_p.ntap.li1.y0, y1=main_p.ntap.li1.y1);
-    let vss2 = rect("met1.drawing", x0=main_n.ptap.li1.x0, x1=keeper_n.ptap.li1.x1, y0=main_n.ptap.li1.y0, y1=main_n.ptap.li1.y1);
+    let vss1 = rect("met1.drawing", x0=main_p.ptap.li1.x0, x1=xcoupled_p.ptap.li1.x1, y0=main_p.ptap.li1.y0, y1=main_p.ptap.li1.y1);
+    let vdd_m1 = rect("met1.drawing", x0=main_p.ntap.li1.x0, x1=xcoupled_p.ntap.li1.x1, y0=main_p.ntap.li1.y0, y1=main_p.ntap.li1.y1);
+    let vss2 = rect("met1.drawing", x0=main_n.ptap.li1.x0, x1=xcoupled_n.ptap.li1.x1, y0=main_n.ptap.li1.y0, y1=main_n.ptap.li1.y1);
 
     let via = crect(layer="mcon.drawing", w=170., h=170., x0=0., y0=0.);
     #scope9 centered_via_array(vss1, main_p.ptap.li1, via, 360., 360.);
-    #scope8 centered_via_array(vss1, keeper_p.ptap.li1, via, 360., 360.);
+    #scope8 centered_via_array(vss1, xcoupled_p.ptap.li1, via, 360., 360.);
     #scope7 centered_via_array(vdd_m1, main_p.ntap.li1, via, 360., 360.);
-    #scope6 centered_via_array(vdd_m1, keeper_p.ntap.li1, via, 360., 360.);
+    #scope6 centered_via_array(vdd_m1, xcoupled_p.ntap.li1, via, 360., 360.);
     #scope5 centered_via_array(vss2, main_n.ptap.li1, via, 360., 360.);
-    #scope4 centered_via_array(vss2, keeper_n.ptap.li1, via, 360., 360.);
+    #scope4 centered_via_array(vss2, xcoupled_n.ptap.li1, via, 360., 360.);
     
     let vdd_m2 = rect("met2.drawing", y0=vss1.y0, y1=vss2.y1, w=300.);
     let vss_m2 = rect("met2.drawing", y0=vss1.y0, y1=vss2.y1, w=300.);
@@ -163,8 +163,8 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int) {
 
 }
 
-fn diff_vco_row(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, n: Int, rev: Bool) -> [Any] {
-    let vco_elem = #scope0 vco_elem(nw, pw, nf_main, nf_keeper);
+fn diff_vco_row(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int, n: Int, rev: Bool) -> [Any] {
+    let vco_elem = #scope0 vco_elem(nw, pw, nf_main, nf_xcoupled);
     #scope1 if n == 0 {
         []
     } else {
@@ -172,14 +172,14 @@ fn diff_vco_row(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, n: Int, rev:
         #scope0 if n == 1 {
             cons(child, [])
         } else {
-            let lst = #scope0 diff_vco_row(nw, pw, nf_main, nf_keeper, n - 1, rev);
+            let lst = #scope0 diff_vco_row(nw, pw, nf_main, nf_xcoupled, n - 1, rev);
             let next = head(lst);
             #scope1 if rev {
-                eq(next.main_p.pmos.sdm.x1, child.keeper_p.pmos.sdm.x0-380.);
+                eq(next.main_p.pmos.sdm.x1, child.xcoupled_p.pmos.sdm.x0-380.);
                 rect("met1.drawing", x0=next.vinp.x0, x1=child.m1n.x1, y0=next.vinp.y0, y1=next.vinp.y1);
                 rect("met1.drawing", x0=next.vinn.x0, x1=child.m1p.x1, y0=next.vinn.y0, y1=next.vinn.y1);
             } else {
-                eq(next.main_p.pmos.sdm.x0, child.keeper_p.pmos.sdm.x1+380.);
+                eq(next.main_p.pmos.sdm.x0, child.xcoupled_p.pmos.sdm.x1+380.);
                 rect("met1.drawing", x0=child.m1n.x0, x1=next.vinp.x1, y0=next.vinp.y0, y1=next.vinp.y1);
                 rect("met1.drawing", x0=child.m1p.x0, x1=next.vinn.x1, y0=next.vinn.y0, y1=next.vinn.y1);
             }
@@ -190,20 +190,20 @@ fn diff_vco_row(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, n: Int, rev:
 }
 
 // The number of stages is `half_stages` * 2.
-cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, half_stages: Int) {
-    let vco_elem = #scope0 vco_elem(nw, pw, nf_main, nf_keeper);
-    let top = #scope15 diff_vco_row(nw, pw, nf_main, nf_keeper, half_stages, false);
+cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int, half_stages: Int) {
+    let vco_elem = #scope0 vco_elem(nw, pw, nf_main, nf_xcoupled);
+    let top = #scope15 diff_vco_row(nw, pw, nf_main, nf_xcoupled, half_stages, false);
     let topl = head(top);
     let topr = #scope16 std::last(top);
     eq(topl.x, 0.);
     eq(topl.y, 0.);
-    let bot = #scope18 diff_vco_row(nw, pw, nf_main, nf_keeper, half_stages, true);
+    let bot = #scope18 diff_vco_row(nw, pw, nf_main, nf_xcoupled, half_stages, true);
     let botl = #scope17 std::last(bot);
     let botr = head(bot);
     eq(botr.vss2.x1, topr.vss1.x1);
     eq(botr.main_n.ptap.sdm.y1, topr.main_p.ptap.sdm.y0-380.);
-    rect("nwell.drawing", x0=topl.main_p.nwell.x0, x1=topr.keeper_p.nwell.x1, y0=topl.main_p.nwell.y0, y1=topl.main_n.nwell.y1);
-    rect("nwell.drawing", x0=botl.keeper_p.nwell.x0, x1=botr.main_p.nwell.x1, y0=botl.main_p.nwell.y0, y1=botl.main_n.nwell.y1);
+    rect("nwell.drawing", x0=topl.main_p.nwell.x0, x1=topr.xcoupled_p.nwell.x1, y0=topl.main_p.nwell.y0, y1=topl.main_n.nwell.y1);
+    rect("nwell.drawing", x0=botl.xcoupled_p.nwell.x0, x1=botr.main_p.nwell.x1, y0=botl.main_p.nwell.y0, y1=botl.main_n.nwell.y1);
     let x12a = rect("met2.drawing", x0=topr.m1n.x1+300., w=300., y0=botr.vinn.y0-10., y1=topr.m1n.y1+10.);
     let x12b = rect("met2.drawing", x0=x12a.x1+300., w=300., y0=botr.vinn.y0-10., y1=topr.m1n.y1+10.);
     let m11 = rect("met1.drawing", x0=topr.m1n.x0-10., x1=x12b.x1+10., y0=topr.m1n.y0, y1=topr.m1n.y1);
@@ -237,7 +237,7 @@ cell diff_vco(nw: Float, pw: Float, nf_main: Int, nf_keeper: Int, half_stages: I
     let m1_vdd_2 = rect("met1.drawing", x0=botl.vdd_m1.x0, x1=botr.vdd_m1.x1, y0=botl.vdd_m1.y0, y1=botl.vdd_m1.y1);
 
     for i in #scope9 std::range(half_stages - 1) {
-        let vss_m2 = rect("met2.drawing", w=300., y0=m1_vss_bot.y0, y1=m1_vss_top.y1, x0=top[i].keeper_p.pmos.sdm.x1-160.);
+        let vss_m2 = rect("met2.drawing", w=300., y0=m1_vss_bot.y0, y1=m1_vss_top.y1, x0=top[i].xcoupled_p.pmos.sdm.x1-160.);
         let vdd_m2 = rect("met2.drawing", w=300., y0=m1_vss_bot.y0, y1=m1_vss_top.y1, x0=vss_m2.x1+300.);
 
         #scope14 v12_array(vss_m2, m1_vss_top);
