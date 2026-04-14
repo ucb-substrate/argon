@@ -73,6 +73,11 @@ impl Solver {
     }
 
     #[inline]
+    pub fn take_updated_vars(&mut self) -> IndexSet<Var> {
+        std::mem::take(&mut self.updated_vars)
+    }
+
+    #[inline]
     pub fn invalid_rounding(&self) -> &IndexSet<Var> {
         &self.invalid_rounding
     }

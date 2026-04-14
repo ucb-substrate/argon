@@ -1994,6 +1994,12 @@ struct CellExecKey {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CellShapeKey {
+    cell: VarId,
+    args: Vec<CellArgKey>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 enum CellArgKey {
     Float(u64),
     Int(i64),
@@ -2190,6 +2196,7 @@ struct ExecPass<'a> {
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    compiled_cell_shape_cache: HashMap<CellShapeKey, CellId>,
     errors: Vec<ExecError>,
 }
 
@@ -2198,6 +2205,18 @@ enum ExecScopeName {
     Specified(String),
     // Exact name has not been specified, need to generate unique identifier based on prefix.
     Prefix(String),
+}
+
+fn root_cell_scope_name(
+    scope_annotation: Option<&str>,
+    cell_name: &str,
+    root_scope_id: ScopeId,
+) -> String {
+    if let Some(anno) = scope_annotation {
+        format!("{anno} cell {cell_name}")
+    } else {
+        format!("cell {cell_name} {}", root_scope_id.0)
+    }
 }
 
 fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
@@ -2252,6 +2271,7 @@ impl<'a> ExecPass<'a> {
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
             compiled_cell_cache: HashMap::new(),
+            compiled_cell_shape_cache: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -2371,6 +2391,10 @@ impl<'a> ExecPass<'a> {
             args: args.iter().map(CellArgKey::from).collect(),
             scope_annotation: scope_annotation.map(|s| s.to_string()),
         };
+        let shape_key = CellShapeKey {
+            cell,
+            args: cache_key.args.clone(),
+        };
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
         }
@@ -2384,6 +2408,17 @@ impl<'a> ExecPass<'a> {
             .as_ref()
             .unwrap_cell_fn()
             .clone();
+        if scope_annotation.is_some()
+            && let Some(base_cell_id) = self.compiled_cell_shape_cache.get(&shape_key)
+        {
+            let mut cloned = self.compiled_cells[base_cell_id].clone();
+            cloned.scopes.get_mut(&cloned.root).unwrap().name =
+                root_cell_scope_name(scope_annotation, &cell_decl.name.name, cloned.root);
+            let cloned_cell_id = self.alloc_id();
+            self.compiled_cells.insert(cloned_cell_id, cloned);
+            self.compiled_cell_cache.insert(cache_key, cloned_cell_id);
+            return Ok(cloned_cell_id);
+        }
         let root_scope_id = self.scope_id();
         let root_scope = ExecScope {
             parent: None,
@@ -2392,11 +2427,7 @@ impl<'a> ExecPass<'a> {
                 path: cell_decl.metadata.0.clone(),
                 span: cell_decl.scope.span,
             },
-            name: if let Some(anno) = scope_annotation {
-                format!("{} cell {}", anno, &cell_decl.name.name)
-            } else {
-                format!("cell {} {}", &cell_decl.name.name, root_scope_id.0)
-            },
+            name: root_cell_scope_name(scope_annotation, &cell_decl.name.name, root_scope_id),
             bindings: Default::default(),
         };
 
@@ -2498,14 +2529,13 @@ impl<'a> ExecPass<'a> {
             state.solver.solve();
             progress = !state.solver.updated_vars().is_empty() || progress;
             let update_var_dependents = |state: &mut CellState| {
-                for var in state.solver.updated_vars().clone() {
-                    if let Some(deps) = state.var_dependents.get(&var) {
-                        for dep in deps.clone() {
+                for var in state.solver.take_updated_vars() {
+                    if let Some((_, deps)) = state.var_dependents.swap_remove_entry(&var) {
+                        for dep in deps {
                             state.deferred.insert(dep);
                         }
                     }
                 }
-                state.solver.clear_updated_vars();
             };
             update_var_dependents(state);
 
@@ -2578,6 +2608,7 @@ impl<'a> ExecPass<'a> {
         let cell = self.emit(cell_id);
         assert!(self.compiled_cells.insert(cell_id, cell).is_none());
         self.compiled_cell_cache.insert(cache_key, cell_id);
+        self.compiled_cell_shape_cache.entry(shape_key).or_insert(cell_id);
         Ok(cell_id)
     }
 
@@ -3095,28 +3126,74 @@ impl<'a> ExecPass<'a> {
             }
             Expr::If(if_expr) => {
                 let cond = self.visit_expr(loc, &if_expr.cond);
-                self.new_deferred_value(loc, |_| {
-                    PartialEvalState::If(Box::new(PartialIfExpr {
-                        expr: (**if_expr).clone(),
-                        state: IfExprState::Cond(cond),
-                    }))
-                })
+                if let Some(val) = self.values[&cond].get_ready() {
+                    if *val.as_ref().unwrap_bool() {
+                        let scope = self.create_exec_scope_at_loc(
+                            loc,
+                            if let Some(scope_annotation) = &if_expr.scope_annotation {
+                                ExecScopeName::Specified(format!("{} if", scope_annotation.name))
+                            } else {
+                                ExecScopeName::Prefix("if".to_string())
+                            },
+                            self.span(&loc, if_expr.then.span),
+                        );
+                        self.visit_scope_expr_inner(loc.cell, loc.frame, scope, &if_expr.then)
+                    } else {
+                        let scope = self.create_exec_scope_at_loc(
+                            loc,
+                            if let Some(scope_annotation) = &if_expr.scope_annotation {
+                                ExecScopeName::Specified(format!("{} else", scope_annotation.name))
+                            } else {
+                                ExecScopeName::Prefix("else".to_string())
+                            },
+                            self.span(&loc, if_expr.else_.span),
+                        );
+                        self.visit_scope_expr_inner(loc.cell, loc.frame, scope, &if_expr.else_)
+                    }
+                } else {
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::If(Box::new(PartialIfExpr {
+                            expr: (**if_expr).clone(),
+                            state: IfExprState::Cond(cond),
+                        }))
+                    })
+                }
             }
-            Expr::Match(match_expr) => self.new_deferred_value(loc, |this| {
-                let scrutinee = this.visit_expr(loc, &match_expr.scrutinee);
-                PartialEvalState::Match(Box::new(PartialMatchExpr {
-                    expr: (**match_expr).clone(),
-                    state: MatchExprState::Scrutinee(scrutinee),
-                }))
-            }),
-            Expr::Comparison(comparison_expr) => self.new_deferred_value(loc, |this| {
-                let left = this.visit_expr(loc, &comparison_expr.left);
-                let right = this.visit_expr(loc, &comparison_expr.right);
-                PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
-                    expr: (**comparison_expr).clone(),
-                    state: ComparisonExprState { left, right },
-                }))
-            }),
+            Expr::Match(match_expr) => {
+                let scrutinee = self.visit_expr(loc, &match_expr.scrutinee);
+                if let Some(val) = self.values[&scrutinee].get_ready() {
+                    let variant = val.as_ref().unwrap_enum_value();
+                    let arm = match_expr
+                        .arms
+                        .iter()
+                        .find(|arm| *variant == arm.pattern.path.last().unwrap().name)
+                        .unwrap();
+                    self.visit_expr(loc, &arm.expr)
+                } else {
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::Match(Box::new(PartialMatchExpr {
+                            expr: (**match_expr).clone(),
+                            state: MatchExprState::Scrutinee(scrutinee),
+                        }))
+                    })
+                }
+            }
+            Expr::Comparison(comparison_expr) => {
+                let left = self.visit_expr(loc, &comparison_expr.left);
+                let right = self.visit_expr(loc, &comparison_expr.right);
+                if let Some(res) =
+                    self.try_ready_comparison(loc.cell, left, right, comparison_expr.op)
+                {
+                    self.new_ready_value(Value::Bool(res))
+                } else {
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
+                            expr: (**comparison_expr).clone(),
+                            state: ComparisonExprState { left, right },
+                        }))
+                    })
+                }
+            }
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
@@ -3129,28 +3206,46 @@ impl<'a> ExecPass<'a> {
                 );
                 self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s)
             }
-            Expr::FieldAccess(f) => self.new_deferred_value(loc, |this| {
-                let base = this.visit_expr(loc, &f.base);
-                PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
-                    expr: (**f).clone(),
-                    state: FieldAccessExprState { base },
-                }))
-            }),
-            Expr::IndexFieldAccess(f) => self.new_deferred_value(loc, |this| {
-                let base = this.visit_expr(loc, &f.base);
-                PartialEvalState::IndexFieldAccess(Box::new(PartialIndexFieldAccessExpr {
-                    expr: (**f).clone(),
-                    state: IndexFieldAccessExprState { base },
-                }))
-            }),
-            Expr::Index(i) => self.new_deferred_value(loc, |this| {
-                let base = this.visit_expr(loc, &i.base);
-                let index = this.visit_expr(loc, &i.index);
-                PartialEvalState::Index(Box::new(PartialIndexExpr {
-                    expr: (**i).clone(),
-                    state: IndexExprState { base, index },
-                }))
-            }),
+            Expr::FieldAccess(f) => {
+                let base = self.visit_expr(loc, &f.base);
+                if let Some(val) = self.try_ready_field_access(base, &f.field.name) {
+                    self.new_ready_value(val)
+                } else {
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
+                            expr: (**f).clone(),
+                            state: FieldAccessExprState { base },
+                        }))
+                    })
+                }
+            }
+            Expr::IndexFieldAccess(f) => {
+                let base = self.visit_expr(loc, &f.base);
+                if let Some(val) = self.try_ready_index_field_access(base, f.field.value) {
+                    self.new_ready_value(val)
+                } else {
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::IndexFieldAccess(Box::new(PartialIndexFieldAccessExpr {
+                            expr: (**f).clone(),
+                            state: IndexFieldAccessExprState { base },
+                        }))
+                    })
+                }
+            }
+            Expr::Index(i) => {
+                let base = self.visit_expr(loc, &i.base);
+                let index = self.visit_expr(loc, &i.index);
+                if let Some(val) = self.try_ready_index(base, index) {
+                    self.new_ready_value(val)
+                } else {
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::Index(Box::new(PartialIndexExpr {
+                            expr: (**i).clone(),
+                            state: IndexExprState { base, index },
+                        }))
+                    })
+                }
+            }
             Expr::BinOp(b) => self.new_deferred_value(loc, |this| {
                 let lhs = this.visit_expr(loc, &b.left);
                 let rhs = this.visit_expr(loc, &b.right);
@@ -3234,22 +3329,135 @@ impl<'a> ExecPass<'a> {
         }
     }
 
+    fn try_ready_comparison(
+        &mut self,
+        cell_id: CellId,
+        left: ValueId,
+        right: ValueId,
+        op: ComparisonOp,
+    ) -> Option<bool> {
+        let (left, right) = match (
+            self.values[&left].get_ready().cloned(),
+            self.values[&right].get_ready().cloned(),
+        ) {
+            (Some(left), Some(right)) => (left, right),
+            _ => return None,
+        };
+        match (&left, &right) {
+            (Value::Linear(vl), Value::Linear(vr)) => {
+                let (Some(vl), Some(vr)) = (
+                    self.cell_state_mut(cell_id).solver.eval_expr(vl),
+                    self.cell_state_mut(cell_id).solver.eval_expr(vr),
+                ) else {
+                    return None;
+                };
+                Some(match op {
+                    ComparisonOp::Geq => vl >= vr,
+                    ComparisonOp::Gt => vl > vr,
+                    ComparisonOp::Leq => vl <= vr,
+                    ComparisonOp::Lt => vl < vr,
+                    ComparisonOp::Eq | ComparisonOp::Ne => return None,
+                })
+            }
+            (Value::Int(vl), Value::Int(vr)) => Some(match op {
+                ComparisonOp::Eq => vl == vr,
+                ComparisonOp::Ne => vl != vr,
+                ComparisonOp::Geq => vl >= vr,
+                ComparisonOp::Gt => vl > vr,
+                ComparisonOp::Leq => vl <= vr,
+                ComparisonOp::Lt => vl < vr,
+            }),
+            (Value::EnumValue(vl), Value::EnumValue(vr)) => Some(match op {
+                ComparisonOp::Eq => vl == vr,
+                ComparisonOp::Ne => vl != vr,
+                _ => return None,
+            }),
+            (Value::Nil, Value::Nil) => Some(match op {
+                ComparisonOp::Eq => true,
+                ComparisonOp::Ne => false,
+                _ => return None,
+            }),
+            (Value::SeqNil, Value::SeqNil) => Some(match op {
+                ComparisonOp::Eq => true,
+                ComparisonOp::Ne => false,
+                _ => return None,
+            }),
+            (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => Some(match op {
+                ComparisonOp::Eq => x.is_empty(),
+                ComparisonOp::Ne => !x.is_empty(),
+                _ => return None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn try_ready_field_access(&self, base: ValueId, field: &str) -> Option<Value> {
+        let base = self.values[&base].get_ready().cloned()?;
+        match base {
+            Value::Rect(rect) => match field {
+                "x0" => Some(Value::Linear(rect.x0.clone())),
+                "x1" => Some(Value::Linear(rect.x1.clone())),
+                "y0" => Some(Value::Linear(rect.y0.clone())),
+                "y1" => Some(Value::Linear(rect.y1.clone())),
+                "w" => Some(Value::Linear(rect.x1.clone() - rect.x0.clone())),
+                "h" => Some(Value::Linear(rect.y1.clone() - rect.y0.clone())),
+                "layer" => rect.layer.map(Value::String),
+                _ => None,
+            },
+            Value::Inst(inst) => match field {
+                "x" => Some(Value::Linear(inst.x.clone())),
+                "y" => Some(Value::Linear(inst.y.clone())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn try_ready_index_field_access(&self, base: ValueId, index: i64) -> Option<Value> {
+        let base = self.values[&base].get_ready().cloned()?;
+        match base {
+            Value::Tuple(items) => usize::try_from(index)
+                .ok()
+                .and_then(|i| items.get(i))
+                .cloned(),
+            _ => None,
+        }
+    }
+
+    fn try_ready_index(&self, base: ValueId, index: ValueId) -> Option<Value> {
+        let base = self.values[&base].get_ready().cloned()?;
+        let index = self.values[&index].get_ready().cloned()?;
+        match (base, index) {
+            (Value::Seq(items), Value::Int(i)) => usize::try_from(i)
+                .ok()
+                .and_then(|i| items.get(i))
+                .cloned(),
+            _ => None,
+        }
+    }
+
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
-        let v = self.values.get(&vid);
-        if v.is_none() {
+        if !self.values.contains_key(&vid) {
             return Ok(false);
         }
-        let vref = v.as_ref().unwrap();
-        let mut vref = match &vref {
+        if self.values[&vid].is_ready() {
+            if let Some((_, deps)) = self.value_dependents.swap_remove_entry(&vid) {
+                for dep_vid in deps {
+                    self.cell_state_mut(cell_id).deferred.insert(dep_vid);
+                }
+            }
+            return Ok(true);
+        }
+        let mut vref = match self.values.swap_remove(&vid).unwrap() {
             Defer::Ready(_) => {
-                if let Some(deps) = self.value_dependents.get(&vid) {
-                    for dep_vid in deps.clone() {
+                if let Some((_, deps)) = self.value_dependents.swap_remove_entry(&vid) {
+                    for dep_vid in deps {
                         self.cell_state_mut(cell_id).deferred.insert(dep_vid);
                     }
                 }
                 return Ok(true);
             }
-            Defer::Deferred(v) => v.clone(),
+            Defer::Deferred(v) => v,
         };
         let cell_id = vref.loc.cell;
         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -4065,7 +4273,6 @@ impl<'a> ExecPass<'a> {
                             );
                             if_.state = IfExprState::Else(else_);
                         }
-                        self.values.insert(vid, Defer::Deferred(vref));
                         self.cell_state_mut(cell_id).deferred.insert(vid);
                         true
                     } else {
@@ -4104,7 +4311,6 @@ impl<'a> ExecPass<'a> {
                             .unwrap();
                         let value = self.visit_expr(vref.loc, &arm.expr);
                         match_.state = MatchExprState::Value(value);
-                        self.values.insert(vid, Defer::Deferred(vref));
                         self.cell_state_mut(cell_id).deferred.insert(vid);
                         true
                     } else {
@@ -4577,11 +4783,14 @@ impl<'a> ExecPass<'a> {
                 }
             }
         };
+        if !self.values.contains_key(&vid) {
+            self.values.insert(vid, Defer::Deferred(vref));
+        }
 
         if self.values[&vid].is_ready()
-            && let Some(deps) = self.value_dependents.get(&vid)
+            && let Some((_, deps)) = self.value_dependents.swap_remove_entry(&vid)
         {
-            for dep_vid in deps.clone() {
+            for dep_vid in deps {
                 self.cell_state_mut(cell_id).deferred.insert(dep_vid);
             }
         }
