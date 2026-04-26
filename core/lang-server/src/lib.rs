@@ -186,7 +186,7 @@ impl StateMut {
                                 .func
                                 .path
                                 .iter()
-                                .map(|ident| ident.name.as_str())
+                                .map(|ident| ident.name)
                                 .collect_vec();
                             Some(compile::dynamic_compile(
                                 &ast,

@@ -9,10 +9,7 @@ use indexmap::IndexMap;
 
 use crate::{
     antlr,
-    ast::{
-        Ast, AstMetadata, CallExpr, Decl, Expr, ModPath, Span, Statement, WorkspaceAst,
-        annotated::AnnotatedAst,
-    },
+    ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
     compile::{StaticError, StaticErrorKind},
     config::parse_config,
 };
@@ -290,9 +287,9 @@ pub fn format_cell_input(input: &str) -> String {
 }
 
 // Input should first be formatted with `format_cell_input`.
-pub fn parse_cell(input: &str) -> Result<CallExpr<Substr, ParseMetadata>, anyhow::Error> {
-    match antlr::parse_ast(ArcStr::from(input), PathBuf::from("__cell__.ar")) {
-        Ok(ast) => extract_cell_invocation(ast),
+pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, anyhow::Error> {
+    match antlr::parse_cell(input) {
+        Ok(ast) => Ok(ast),
         Err(errs) => {
             let diagnostics = diagnostics_from_errors(errs);
             let mut err = String::new();
@@ -305,31 +302,12 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<Substr, ParseMetadata>, anyhow
     }
 }
 
-fn extract_cell_invocation(
-    ast: AnnotatedParseAst,
-) -> Result<CallExpr<Substr, ParseMetadata>, anyhow::Error> {
-    let mut decls = ast.ast.decls.into_iter();
-    let Some(Decl::Cell(cell)) = decls.next() else {
-        unreachable!("format_cell_input should always parse into a single wrapper cell")
-    };
-    if decls.next().is_some() {
-        unreachable!("format_cell_input should not emit additional top-level declarations");
-    }
+#[cfg(test)]
+mod tests {
+    use crate::parse::parse_cell;
 
-    let mut stmts = cell.scope.stmts.into_iter();
-    let Some(stmt) = stmts.next() else {
-        bail!("expected a cell invocation");
-    };
-    if stmts.next().is_some() || cell.scope.tail.is_some() {
-        bail!("expected a single cell invocation");
-    }
-
-    match stmt {
-        Statement::Expr {
-            value: Expr::Call(call),
-            ..
-        } => Ok(call),
-        Statement::Expr { .. } => bail!("expected a cell invocation"),
-        _ => unreachable!("format_cell_input only emits expression statements"),
+    #[test]
+    fn cell_invocation_parses() {
+        parse_cell("test(1., 5)").expect("failed to parse cell");
     }
 }
