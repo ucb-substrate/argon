@@ -132,6 +132,55 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
     Ok(AnnotatedAst::new(input_for_ast, &ast, path))
 }
 
+pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, Vec<AntlrParseError>> {
+    let normalized_input = input.trim_start_matches(char::is_whitespace);
+    let offset_base = input.len() - normalized_input.len();
+    let input_rc: Rc<str> = Rc::from(normalized_input);
+    let errors = Rc::new(RefCell::new(Vec::new()));
+
+    let mut lexer = ArgonLexer::new(InputStream::new(normalized_input));
+    lexer.remove_error_listeners();
+    lexer.add_error_listener(Box::new(CollectingErrorListener {
+        input: Rc::clone(&input_rc),
+        offset_base,
+        errors: Rc::clone(&errors),
+    }));
+    let tokens = CommonTokenStream::new(lexer);
+    let mut parser = ArgonParser::new(tokens);
+    parser.remove_error_listeners();
+    parser.add_error_listener(Box::new(CollectingErrorListener {
+        input: Rc::clone(&input_rc),
+        offset_base,
+        errors: Rc::clone(&errors),
+    }));
+
+    let tree = match parser.callExpr() {
+        Ok(tree) => tree,
+        Err(err) => {
+            let collected = errors.borrow().clone();
+            return Err(if collected.is_empty() {
+                vec![AntlrParseError {
+                    span: Span::new(offset_base, input.len()),
+                    message: err.to_string(),
+                }]
+            } else {
+                collected
+            });
+        }
+    };
+    let collected = errors.borrow().clone();
+    if !collected.is_empty() {
+        return Err(collected);
+    }
+
+    let mut builder = AstBuilder {
+        input: normalized_input,
+        offset_base,
+    };
+    let ast = builder.build_call_expr(tree.as_ref());
+    Ok(ast)
+}
+
 struct AstBuilder<'input> {
     input: &'input str,
     offset_base: usize,
