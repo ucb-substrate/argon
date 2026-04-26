@@ -155,8 +155,7 @@ matchArm
     ;
 
 nonBlockExpr
-    : LPAREN expr RPAREN
-    | BANG nonBlockExpr
+    : BANG nonBlockExpr
     | MINUS nonBlockExpr
     | nonBlockExpr DOT ident
     | nonBlockExpr DOT intLiteral
@@ -169,6 +168,7 @@ nonBlockExpr
     | nilLiteral
     | seqNilLiteral
     | tupleExpr
+    | LPAREN expr RPAREN
     | callExpr
     | identPath
     | literal
