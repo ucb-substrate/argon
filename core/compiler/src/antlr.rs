@@ -497,7 +497,7 @@ impl<'input> AstBuilder<'input> {
             };
             let operand = self.build_expr(ctx.expr(0).unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
-                op: UnaryOp::Not,
+                op,
                 operand,
                 span: self.span_of(ctx),
                 metadata: (),
@@ -516,104 +516,86 @@ impl<'input> AstBuilder<'input> {
                 span: self.span_of(ctx),
                 metadata: (),
             }))
+        } else if let Some(base) = &ctx.indexBase {
+            Expr::Index(Box::new(IndexExpr {
+                base: self.build_expr(base),
+                index: self.build_expr(ctx.expr(1).unwrap().as_ref()),
+                span: self.span_of(ctx),
+                metadata: (),
+            }))
+        } else if let Some(value) = &ctx.emitValue {
+            Expr::Emit(Box::new(EmitExpr {
+                value: self.build_expr(value),
+                span: self.span_of(ctx),
+                metadata: (),
+            }))
+        } else if let Some(value) = &ctx.castValue {
+            Expr::Cast(Box::new(CastExpr {
+                value: self.build_expr(value),
+                ty: self.build_ty_spec(ctx.tySpec().unwrap().as_ref()),
+                span: self.span_of(ctx),
+                metadata: (),
+            }))
+        } else if let Some(op) = &ctx.binaryOp {
+            let op = match op.get_token_type() {
+                STAR => BinOp::Mul,
+                SLASH => BinOp::Div,
+                PERCENT => BinOp::Rem,
+                PLUS => BinOp::Add,
+                MINUS => BinOp::Sub,
+                _ => unreachable!("invalid binary op"),
+            };
+            Expr::BinOp(Box::new(BinOpExpr {
+                op,
+                left: self.build_expr(ctx.expr(0).unwrap().as_ref()),
+                right: self.build_expr(ctx.expr(1).unwrap().as_ref()),
+                span: self.span_of(ctx),
+                metadata: (),
+            }))
+        } else if let Some(op) = &ctx.comparisonOp {
+            let op = match op.get_token_type() {
+                EQEQ => ComparisonOp::Eq,
+                NEQ => ComparisonOp::Ne,
+                GEQ => ComparisonOp::Geq,
+                GT => ComparisonOp::Gt,
+                LEQ => ComparisonOp::Leq,
+                LT => ComparisonOp::Lt,
+                _ => unreachable!("invalid comparison op"),
+            };
+            Expr::Comparison(Box::new(ComparisonExpr {
+                op,
+                left: self.build_expr(ctx.expr(0).unwrap().as_ref()),
+                right: self.build_expr(ctx.expr(1).unwrap().as_ref()),
+                span: self.span_of(ctx),
+                metadata: (),
+            }))
+        } else if let Some(nil) = ctx.nilLiteral() {
+            Expr::Nil(NilLiteral {
+                span: self.span_of(nil.as_ref()),
+            })
+        } else if let Some(seq_nil) = ctx.seqNilLiteral() {
+            Expr::SeqNil(SeqNilLiteral {
+                span: self.span_of(seq_nil.as_ref()),
+            })
+        } else if let Some(tuple) = ctx.tupleExpr() {
+            Expr::Tuple(self.build_tuple_expr(tuple.as_ref()))
+        } else if let Some(expr) = ctx.expr(0) {
+            self.build_expr(expr.as_ref())
+        } else if let Some(if_expr) = ctx.ifExpr() {
+            Expr::If(Box::new(self.build_if_expr(if_expr.as_ref())))
+        } else if let Some(match_expr) = ctx.matchExpr() {
+            Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
+        } else if let Some(scope) = ctx.scope() {
+            Expr::Scope(Box::new(self.build_scope(scope.as_ref())))
+        } else if let Some(call) = ctx.callExpr() {
+            Expr::Call(self.build_call_expr(call.as_ref()))
+        } else if let Some(path) = ctx.identPath() {
+            Expr::IdentPath(self.build_ident_path(path.as_ref()))
+        } else if let Some(literal) = ctx.literal() {
+            self.build_literal(literal.as_ref())
         } else {
             unreachable!("should cover all productions");
         }
-        // else if ctx.start().get_token_type() == MINUS {
-        //     let operand = self.build_expr(ctx.expr(0).unwrap().as_ref());
-        //     Expr::UnaryOp(Box::new(UnaryOpExpr {
-        //         op: UnaryOp::Neg,
-        //         operand,
-        //         span: self.span_of(ctx),
-        //         metadata: (),
-        //     }))
-        // } else if let Some(rhs) = ctx.expr(1) {
-        //     let left = self.build_expr(ctx.expr(0).unwrap().as_ref());
-        //     let right = self.build_expr(rhs.as_ref());
-        //     let span = Span::new(left.span().start(), right.span().end());
-        //     if let Some(op) = self.single_comparison_op(ctx) {
-        //         Expr::Comparison(Box::new(ComparisonExpr {
-        //             op,
-        //             left,
-        //             right,
-        //             span,
-        //             metadata: (),
-        //         }))
-        //     } else {
-        //         Expr::BinOp(Box::new(BinOpExpr {
-        //             op: self.single_bin_op(ctx),
-        //             left,
-        //             right,
-        //             span,
-        //             metadata: (),
-        //         }))
-        //     }
-        // } else if let Some(ty) = ctx.tySpec() {
-        //     let value = self.build_expr(ctx.expr(0).unwrap().as_ref());
-        //     let ty = self.build_ty_spec(ty.as_ref());
-        //     let span = Span::new(value.span().start(), ty.span.end());
-        //     Expr::Cast(Box::new(CastExpr {
-        //         value,
-        //         ty,
-        //         span,
-        //         metadata: (),
-        //     }))
-        // } else if let Some(ident) = ctx.ident() {
-        //     let base = self.build_expr(ctx.expr(0).unwrap().as_ref());
-        //     Expr::FieldAccess(Box::new(FieldAccessExpr {
-        //         base,
-        //         field: self.build_ident(ident.as_ref()),
-        //         span: self.span_of(ctx),
-        //         metadata: (),
-        //     }))
-        // } else if let Some(intlit) = ctx.intLiteral() {
-        //     let base = self.build_expr(ctx.expr(0).unwrap().as_ref());
-        //     Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
-        //         base,
-        //         field: self.build_int_literal(intlit.as_ref()),
-        //         span: self.span_of(ctx),
-        //         metadata: (),
-        //     }))
-        // } else if let Some(expr) = ctx.expr(0) {
-        //     if let Some(base) = ctx.expr(1) {
-        //         Expr::Index(Box::new(IndexExpr {
-        //             base: self.build_expr(base.as_ref()),
-        //             index: self.build_expr(expr.as_ref()),
-        //             span: self.span_of(ctx),
-        //             metadata: (),
-        //         }))
-        //     } else {
-        //         self.build_expr(expr.as_ref())
-        //     }
-        // } else if let Some(nil) = ctx.nilLiteral() {
-        //     Expr::Nil(NilLiteral {
-        //         span: self.span_of(nil.as_ref()),
-        //     })
-        // } else if let Some(seq_nil) = ctx.seqNilLiteral() {
-        //     Expr::SeqNil(SeqNilLiteral {
-        //         span: self.span_of(seq_nil.as_ref()),
-        //     })
-        // } else if let Some(tuple) = ctx.tupleExpr() {
-        //     Expr::Tuple(self.build_tuple_expr(tuple.as_ref()))
-        // } else if let Some(if_expr) = ctx.ifExpr() {
-        //     Expr::If(Box::new(self.build_if_expr(if_expr.as_ref())))
-        // } else if let Some(match_expr) = ctx.matchExpr() {
-        //     Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
-        // } else if let Some(scope) = ctx.scope() {
-        //     Expr::Scope(Box::new(self.build_scope(scope.as_ref())))
-        // } else if let Some(call) = ctx.callExpr() {
-        //     Expr::Call(self.build_call_expr(call.as_ref()))
-        // } else if let Some(path) = ctx.identPath() {
-        //     Expr::IdentPath(self.build_ident_path(path.as_ref()))
-        // } else if let Some(literal) = ctx.literal() {
-        //     self.build_literal(literal.as_ref())
-        // } else {
-        //     Expr::Emit(Box::new(EmitExpr {
-        //         value: self.build_expr(ctx.expr(0).unwrap().as_ref()),
-        //         span: self.span_of(ctx),
-        //         metadata: (),
-        //     }))
-        // }
     }
 
     fn build_tuple_expr(
@@ -820,48 +802,6 @@ impl<'input> AstBuilder<'input> {
             span,
             value: self.slice(span).parse::<i64>().unwrap_or_default(),
         }
-    }
-
-    fn single_comparison_op(&self, ctx: &ExprContext<'input>) -> Option<ComparisonOp> {
-        self.terminal_types(ctx)
-            .into_iter()
-            .filter_map(|ttype| match ttype {
-                EQEQ => Some(ComparisonOp::Eq),
-                NEQ => Some(ComparisonOp::Ne),
-                GEQ => Some(ComparisonOp::Geq),
-                GT => Some(ComparisonOp::Gt),
-                LEQ => Some(ComparisonOp::Leq),
-                LT => Some(ComparisonOp::Lt),
-                _ => None,
-            })
-            .next()
-    }
-
-    fn single_bin_op(&self, ctx: &ExprContext<'input>) -> BinOp {
-        self.terminal_types(ctx)
-            .into_iter()
-            .find_map(|ttype| match ttype {
-                PLUS => Some(BinOp::Add),
-                MINUS => Some(BinOp::Sub),
-                STAR => Some(BinOp::Mul),
-                SLASH => Some(BinOp::Div),
-                PERCENT => Some(BinOp::Rem),
-                _ => None,
-            })
-            .unwrap_or_else(|| unreachable!("binary expr must contain an arithmetic operator"))
-    }
-
-    fn terminal_types<T>(&self, ctx: &T) -> Vec<isize>
-    where
-        T: ParserRuleContext<'input, Ctx = ArgonParserContextType>,
-    {
-        let mut tokens = Vec::new();
-        for child in ctx.get_children() {
-            if let Ok(tok) = child.downcast_rc::<TerminalNode<'input, ArgonParserContextType>>() {
-                tokens.push(tok.symbol.get_token_type());
-            }
-        }
-        tokens
     }
 
     fn span_of<T>(&self, ctx: &T) -> Span
