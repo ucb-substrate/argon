@@ -179,8 +179,7 @@ impl StateMut {
                     static_output.errors.extend(parse_errs);
                     Some(CompileOutput::StaticErrors(static_output))
                 } else if let Some(cell) = &self.cell {
-                    let input = parse::format_cell_input(cell);
-                    match parse::parse_cell(&input) {
+                    match parse::parse_cell(cell) {
                         Ok(cell_ast) => {
                             let cell_path = cell_ast
                                 .func
