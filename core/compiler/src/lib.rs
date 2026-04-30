@@ -72,6 +72,7 @@ mod tests {
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
+    const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
 
     #[test]
     fn argon_scopes() {
@@ -1038,6 +1039,37 @@ mod tests {
         let cell = &cells.cells[&cells.top];
         println!("rowspace vecs = {:?}", cell.rowspace_vecs);
         assert_eq!(cell.rowspace_vecs.len(), 1);
+    }
+
+    #[test]
+    fn argon_precedence() {
+        let o = parse_workspace_with_std(ARGON_PRECEDENCE);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["precedence"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(
+            cell.objects
+                .first()
+                .unwrap()
+                .1
+                .clone()
+                .unwrap_rect()
+                .x0
+                .0
+                .round() as i64,
+            -8
+        );
     }
 
     #[test]

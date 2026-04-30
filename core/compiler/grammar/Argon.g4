@@ -107,7 +107,7 @@ scopeAnnotation
 
 unannotatedScope
     : LBRACE statements RBRACE
-    | LBRACE statements nonBlockExpr RBRACE
+    | LBRACE statements expr RBRACE
     ;
 
 statements
@@ -131,13 +131,6 @@ forLoop
     : FOR ident IN expr scope
     ;
 
-expr
-    : nonBlockExpr
-    | ifExpr
-    | matchExpr
-    | scope
-    ;
-
 ifExpr
     : scopeAnnotation? IF expr scope ELSE scope
     ;
@@ -154,21 +147,23 @@ matchArm
     : identPath FAT_ARROW expr COMMA
     ;
 
-nonBlockExpr
-    : BANG nonBlockExpr
-    | MINUS nonBlockExpr
-    | nonBlockExpr DOT ident
-    | nonBlockExpr DOT intLiteral
-    | nonBlockExpr LBRACK expr RBRACK
-    | nonBlockExpr BANG
-    | nonBlockExpr AS tySpec
-    | nonBlockExpr (STAR | SLASH | PERCENT) nonBlockExpr
-    | nonBlockExpr (PLUS | MINUS) nonBlockExpr
-    | nonBlockExpr (EQEQ | NEQ | GEQ | GT | LEQ | LT) nonBlockExpr
+expr
+    : unaryOp=(BANG|MINUS) expr
+    | fieldAccessBase=expr DOT ident
+    | indexFieldAccessBase=expr DOT intLiteral
+    | indexBase=expr LBRACK expr RBRACK
+    | emitValue=expr BANG
+    | castValue=expr AS tySpec
+    | expr binaryOp=(STAR | SLASH | PERCENT) expr
+    | expr binaryOp=(PLUS | MINUS) expr
+    | expr comparisonOp=(EQEQ | NEQ | GEQ | GT | LEQ | LT) expr
     | nilLiteral
     | seqNilLiteral
     | tupleExpr
     | LPAREN expr RPAREN
+    | ifExpr
+    | matchExpr
+    | scope
     | callExpr
     | identPath
     | literal

@@ -364,9 +364,7 @@ impl<'input> AstBuilder<'input> {
             .statements()
             .map(|stmts| self.build_statements(stmts.as_ref()))
             .unwrap_or_default();
-        let mut tail = ctx
-            .nonBlockExpr()
-            .map(|expr| self.build_non_block_expr(expr.as_ref()));
+        let mut tail = ctx.expr().map(|expr| self.build_expr(expr.as_ref()));
         if tail.is_none()
             && let Some(Statement::Expr {
                 value,
@@ -444,18 +442,6 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_expr(&mut self, ctx: &ExprContext<'input>) -> Expr<&'input str, ParseMetadata> {
-        if let Some(if_expr) = ctx.ifExpr() {
-            Expr::If(Box::new(self.build_if_expr(if_expr.as_ref())))
-        } else if let Some(match_expr) = ctx.matchExpr() {
-            Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
-        } else if let Some(scope) = ctx.scope() {
-            Expr::Scope(Box::new(self.build_scope(scope.as_ref())))
-        } else {
-            self.build_non_block_expr(ctx.nonBlockExpr().unwrap().as_ref())
-        }
-    }
-
     fn build_if_expr(&mut self, ctx: &IfExprContext<'input>) -> IfExpr<&'input str, ParseMetadata> {
         IfExpr {
             scope_annotation: ctx
@@ -502,107 +488,132 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn build_non_block_expr(
-        &mut self,
-        ctx: &NonBlockExprContext<'input>,
-    ) -> Expr<&'input str, ParseMetadata> {
-        if ctx.start().get_token_type() == BANG {
-            let operand = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
+    fn build_expr(&mut self, ctx: &ExprContext<'input>) -> Expr<&'input str, ParseMetadata> {
+        if let Some(op) = &ctx.unaryOp {
+            let op = match op.get_token_type() {
+                BANG => UnaryOp::Not,
+                MINUS => UnaryOp::Neg,
+                _ => unreachable!("invalid unary op"),
+            };
+            let operand = self.build_expr(ctx.expr(0).unwrap().as_ref());
             Expr::UnaryOp(Box::new(UnaryOpExpr {
                 op: UnaryOp::Not,
                 operand,
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else if ctx.start().get_token_type() == MINUS {
-            let operand = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
-            Expr::UnaryOp(Box::new(UnaryOpExpr {
-                op: UnaryOp::Neg,
-                operand,
-                span: self.span_of(ctx),
-                metadata: (),
-            }))
-        } else if let Some(rhs) = ctx.nonBlockExpr(1) {
-            let left = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
-            let right = self.build_non_block_expr(rhs.as_ref());
-            let span = Span::new(left.span().start(), right.span().end());
-            if let Some(op) = self.single_comparison_op(ctx) {
-                Expr::Comparison(Box::new(ComparisonExpr {
-                    op,
-                    left,
-                    right,
-                    span,
-                    metadata: (),
-                }))
-            } else {
-                Expr::BinOp(Box::new(BinOpExpr {
-                    op: self.single_bin_op(ctx),
-                    left,
-                    right,
-                    span,
-                    metadata: (),
-                }))
-            }
-        } else if let Some(ty) = ctx.tySpec() {
-            let value = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
-            let ty = self.build_ty_spec(ty.as_ref());
-            let span = Span::new(value.span().start(), ty.span.end());
-            Expr::Cast(Box::new(CastExpr {
-                value,
-                ty,
-                span,
-                metadata: (),
-            }))
-        } else if let Some(ident) = ctx.ident() {
-            let base = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
+        } else if let Some(base) = &ctx.fieldAccessBase {
             Expr::FieldAccess(Box::new(FieldAccessExpr {
-                base,
-                field: self.build_ident(ident.as_ref()),
+                base: self.build_expr(base),
+                field: self.build_ident(ctx.ident().as_ref().unwrap()),
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else if let Some(intlit) = ctx.intLiteral() {
-            let base = self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref());
+        } else if let Some(base) = &ctx.indexFieldAccessBase {
             Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
-                base,
-                field: self.build_int_literal(intlit.as_ref()),
+                base: self.build_expr(base),
+                field: self.build_int_literal(ctx.intLiteral().as_ref().unwrap()),
                 span: self.span_of(ctx),
                 metadata: (),
             }))
-        } else if let Some(expr) = ctx.expr() {
-            if let Some(base) = ctx.nonBlockExpr(0) {
-                Expr::Index(Box::new(IndexExpr {
-                    base: self.build_non_block_expr(base.as_ref()),
-                    index: self.build_expr(expr.as_ref()),
-                    span: self.span_of(ctx),
-                    metadata: (),
-                }))
-            } else {
-                self.build_expr(expr.as_ref())
-            }
-        } else if let Some(nil) = ctx.nilLiteral() {
-            Expr::Nil(NilLiteral {
-                span: self.span_of(nil.as_ref()),
-            })
-        } else if let Some(seq_nil) = ctx.seqNilLiteral() {
-            Expr::SeqNil(SeqNilLiteral {
-                span: self.span_of(seq_nil.as_ref()),
-            })
-        } else if let Some(tuple) = ctx.tupleExpr() {
-            Expr::Tuple(self.build_tuple_expr(tuple.as_ref()))
-        } else if let Some(call) = ctx.callExpr() {
-            Expr::Call(self.build_call_expr(call.as_ref()))
-        } else if let Some(path) = ctx.identPath() {
-            Expr::IdentPath(self.build_ident_path(path.as_ref()))
-        } else if let Some(literal) = ctx.literal() {
-            self.build_literal(literal.as_ref())
         } else {
-            Expr::Emit(Box::new(EmitExpr {
-                value: self.build_non_block_expr(ctx.nonBlockExpr(0).unwrap().as_ref()),
-                span: self.span_of(ctx),
-                metadata: (),
-            }))
+            unreachable!("should cover all productions");
         }
+        // else if ctx.start().get_token_type() == MINUS {
+        //     let operand = self.build_expr(ctx.expr(0).unwrap().as_ref());
+        //     Expr::UnaryOp(Box::new(UnaryOpExpr {
+        //         op: UnaryOp::Neg,
+        //         operand,
+        //         span: self.span_of(ctx),
+        //         metadata: (),
+        //     }))
+        // } else if let Some(rhs) = ctx.expr(1) {
+        //     let left = self.build_expr(ctx.expr(0).unwrap().as_ref());
+        //     let right = self.build_expr(rhs.as_ref());
+        //     let span = Span::new(left.span().start(), right.span().end());
+        //     if let Some(op) = self.single_comparison_op(ctx) {
+        //         Expr::Comparison(Box::new(ComparisonExpr {
+        //             op,
+        //             left,
+        //             right,
+        //             span,
+        //             metadata: (),
+        //         }))
+        //     } else {
+        //         Expr::BinOp(Box::new(BinOpExpr {
+        //             op: self.single_bin_op(ctx),
+        //             left,
+        //             right,
+        //             span,
+        //             metadata: (),
+        //         }))
+        //     }
+        // } else if let Some(ty) = ctx.tySpec() {
+        //     let value = self.build_expr(ctx.expr(0).unwrap().as_ref());
+        //     let ty = self.build_ty_spec(ty.as_ref());
+        //     let span = Span::new(value.span().start(), ty.span.end());
+        //     Expr::Cast(Box::new(CastExpr {
+        //         value,
+        //         ty,
+        //         span,
+        //         metadata: (),
+        //     }))
+        // } else if let Some(ident) = ctx.ident() {
+        //     let base = self.build_expr(ctx.expr(0).unwrap().as_ref());
+        //     Expr::FieldAccess(Box::new(FieldAccessExpr {
+        //         base,
+        //         field: self.build_ident(ident.as_ref()),
+        //         span: self.span_of(ctx),
+        //         metadata: (),
+        //     }))
+        // } else if let Some(intlit) = ctx.intLiteral() {
+        //     let base = self.build_expr(ctx.expr(0).unwrap().as_ref());
+        //     Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
+        //         base,
+        //         field: self.build_int_literal(intlit.as_ref()),
+        //         span: self.span_of(ctx),
+        //         metadata: (),
+        //     }))
+        // } else if let Some(expr) = ctx.expr(0) {
+        //     if let Some(base) = ctx.expr(1) {
+        //         Expr::Index(Box::new(IndexExpr {
+        //             base: self.build_expr(base.as_ref()),
+        //             index: self.build_expr(expr.as_ref()),
+        //             span: self.span_of(ctx),
+        //             metadata: (),
+        //         }))
+        //     } else {
+        //         self.build_expr(expr.as_ref())
+        //     }
+        // } else if let Some(nil) = ctx.nilLiteral() {
+        //     Expr::Nil(NilLiteral {
+        //         span: self.span_of(nil.as_ref()),
+        //     })
+        // } else if let Some(seq_nil) = ctx.seqNilLiteral() {
+        //     Expr::SeqNil(SeqNilLiteral {
+        //         span: self.span_of(seq_nil.as_ref()),
+        //     })
+        // } else if let Some(tuple) = ctx.tupleExpr() {
+        //     Expr::Tuple(self.build_tuple_expr(tuple.as_ref()))
+        // } else if let Some(if_expr) = ctx.ifExpr() {
+        //     Expr::If(Box::new(self.build_if_expr(if_expr.as_ref())))
+        // } else if let Some(match_expr) = ctx.matchExpr() {
+        //     Expr::Match(Box::new(self.build_match_expr(match_expr.as_ref())))
+        // } else if let Some(scope) = ctx.scope() {
+        //     Expr::Scope(Box::new(self.build_scope(scope.as_ref())))
+        // } else if let Some(call) = ctx.callExpr() {
+        //     Expr::Call(self.build_call_expr(call.as_ref()))
+        // } else if let Some(path) = ctx.identPath() {
+        //     Expr::IdentPath(self.build_ident_path(path.as_ref()))
+        // } else if let Some(literal) = ctx.literal() {
+        //     self.build_literal(literal.as_ref())
+        // } else {
+        //     Expr::Emit(Box::new(EmitExpr {
+        //         value: self.build_expr(ctx.expr(0).unwrap().as_ref()),
+        //         span: self.span_of(ctx),
+        //         metadata: (),
+        //     }))
+        // }
     }
 
     fn build_tuple_expr(
@@ -811,7 +822,7 @@ impl<'input> AstBuilder<'input> {
         }
     }
 
-    fn single_comparison_op(&self, ctx: &NonBlockExprContext<'input>) -> Option<ComparisonOp> {
+    fn single_comparison_op(&self, ctx: &ExprContext<'input>) -> Option<ComparisonOp> {
         self.terminal_types(ctx)
             .into_iter()
             .filter_map(|ttype| match ttype {
@@ -826,7 +837,7 @@ impl<'input> AstBuilder<'input> {
             .next()
     }
 
-    fn single_bin_op(&self, ctx: &NonBlockExprContext<'input>) -> BinOp {
+    fn single_bin_op(&self, ctx: &ExprContext<'input>) -> BinOp {
         self.terminal_types(ctx)
             .into_iter()
             .find_map(|ttype| match ttype {
@@ -837,9 +848,7 @@ impl<'input> AstBuilder<'input> {
                 PERCENT => Some(BinOp::Rem),
                 _ => None,
             })
-            .unwrap_or_else(|| {
-                unreachable!("binary nonBlockExpr must contain an arithmetic operator")
-            })
+            .unwrap_or_else(|| unreachable!("binary expr must contain an arithmetic operator"))
     }
 
     fn terminal_types<T>(&self, ctx: &T) -> Vec<isize>
