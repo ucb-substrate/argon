@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use antlr_rust::TidExt;
 use antlr_rust::common_token_stream::CommonTokenStream;
 use antlr_rust::error_listener::ErrorListener;
 use antlr_rust::parser_rule_context::ParserRuleContext;
