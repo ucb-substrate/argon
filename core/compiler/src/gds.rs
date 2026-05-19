@@ -107,10 +107,7 @@ impl CompiledData {
         let mut ocell = GdsStruct::new(name.to_string());
         for (_, obj) in &cell.objects {
             match obj {
-                SolvedValue::Rect(rect) => {
-                    if rect.construction {
-                        continue;
-                    }
+                SolvedValue::Rect(rect) if !rect.construction => {
                     if let Some(layer) = &rect.layer {
                         let GdsLayerSpec {
                             layer,
@@ -148,7 +145,7 @@ impl CompiledData {
                         ..Default::default()
                     }));
                 }
-                SolvedValue::Instance(i) => {
+                SolvedValue::Instance(i) if !i.construction => {
                     if exporter.names.name(&i.cell).is_none() {
                         self.cell_to_gds(exporter, i.cell)?;
                     }
