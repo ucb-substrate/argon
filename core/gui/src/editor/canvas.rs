@@ -494,6 +494,9 @@ impl Element for CanvasElement {
                             }
                         }
                         SolvedValue::Instance(inst) => {
+                            if inst.construction {
+                                continue;
+                            }
                             let mut inst_mat = TransformationMatrix::identity();
                             if inst.reflect {
                                 inst_mat = inst_mat.reflect_vert()
