@@ -26,32 +26,60 @@ cannot be recursive or forward-referenced).
 
 ## Running
 
-The `bench_*` tests are marked `#[ignore]` because the larger sizes take well
-over 6 s in a debug build. Run them in **release**, **serially** (peak-memory
-tracking uses a process-global allocator, so concurrent tests would corrupt the
-measurements):
+The easiest way to run the benchmarks and regenerate every artifact is the
+wrapper script [`run_benchmarks.sh`](run_benchmarks.sh):
+
+```bash
+bench/run_benchmarks.sh                   # all axes
+bench/run_benchmarks.sh bench_instances   # one axis (any libtest name filter)
+```
+
+It rebuilds the compiler in **release**, runs all `bench_*` tests **serially**,
+writes `bench/results/<axis>.csv`, redraws `bench/argon_scaling.{png,pdf}`, and
+prints a fitted-scaling summary table. With the default sweeps it takes about a
+minute and peaks near ~1.3 GiB on the current build. Per-axis sweep sizes pass
+straight through as environment variables (see
+[Configuring the sweeps](#configuring-the-sweeps)):
+
+```bash
+ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
+```
+
+> **Note for AI agents.** Prefer this script over invoking `cargo test`
+> directly — it encodes the flags that are easy to get wrong (release,
+> `--test-threads=1`, the `bench_` name filter) and the figure regeneration.
+> Two things to know:
+>
+> 1. The script regenerates `bench/results/*.csv` and the figure
+>    **deterministically, but it does NOT edit this file.** The
+>    [Results](#results) table and interpretation prose are **hand-written**, so
+>    after a run you must diff the printed summary (and the CSVs) against them
+>    and update anything that changed. Peak-**memory** values are deterministic:
+>    a difference there is a real discrepancy to fix, not noise. Wall-clock
+>    **times** drift a few percent run-to-run, so small changes there are
+>    expected.
+> 2. Do **not** set `RUSTFLAGS` for these runs — building `-p compiler` does not
+>    need the GUI's linker flags. Any you already export are harmless but
+>    unnecessary.
+
+### What the script runs
+
+`run_benchmarks.sh` is a thin wrapper over two steps you can also run by hand
+(e.g. to debug a single axis):
 
 ```bash
 cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_
-```
-
-Each test writes a CSV to `bench/results/<axis>.csv` with columns
-`size,time_s,peak_bytes,n_objects`. Then render the figure (and print a summary
-table of fitted scaling models):
-
-```bash
 python3 bench/plot_scaling.py     # writes bench/argon_scaling.{png,pdf}
 ```
 
-`plot_scaling.py` needs only the standard library to print the summary table;
-`matplotlib` is required to draw the figure.
-
-To run a single axis, e.g. just the instance sweep:
-
-```bash
-cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_instances
-```
-
+The `bench_*` tests are marked `#[ignore]` (the larger sizes take well over 6 s
+in a debug build), so `--ignored` is required. They MUST run in **release** and
+**serially**: peak-memory tracking uses a process-global allocator, so
+concurrent tests would corrupt each other's measurements. The trailing `bench_`
+filter keeps the run from also executing the other (`#[ignore]`'d) tests. Each
+test writes `bench/results/<axis>.csv` with columns
+`size,time_s,peak_bytes,n_objects`. `plot_scaling.py` needs only the standard
+library to print the summary table; `matplotlib` is required to draw the figure.
 The fast `stress_*_smoke` tests (which just check that each example still
 compiles) run in the normal `cargo test` suite and are **not** ignored.
 
@@ -77,8 +105,8 @@ ARGON_BENCH_SHAPES_LOOP=500,1000,2000,4000,8000,16000,32000 \
   cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_shapes_loop
 ```
 
-The defaults are sized so the suite runs in a few minutes within a few GiB on
-the current build; they are not claims about how any axis "should" scale.
+The defaults are sized so the full suite runs in about a minute within ~1.3 GiB
+on the current build; they are not claims about how any axis "should" scale.
 
 ## Methodology
 
