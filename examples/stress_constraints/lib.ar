@@ -1,0 +1,32 @@
+fn coupled_ring(prev: Rect, first: Rect, n: Int) {
+    // Build a *ring* of rectangles whose left edges are mutually coupled.
+    // Each step adds a rectangle `cur` and a two-variable difference
+    // constraint `prev.x0 - cur.x0 = 5` relating it to the previous one.
+    // Because every constraint involves two unknowns, none can be resolved
+    // by back-substitution: the whole ring must be solved simultaneously by
+    // the general linear-constraint solver (a dense SVD over the coupled
+    // component). The base case closes the ring with a single *sum*
+    // constraint, which makes the otherwise-underconstrained chain fully
+    // determined regardless of `n`.
+    #scope0 if n <= 0 {
+        eq(prev.x0 + first.x0, 100.);
+    } else {
+        let cur = crect();
+        eq(cur.y0, 0.);
+        eq(cur.y1, 10.);
+        eq(cur.x1, cur.x0 + 10.);
+        eq(prev.x0 - cur.x0, 5.);
+        #scope1 coupled_ring(cur, first, n - 1);
+    }
+}
+
+// Stress axis: number of *coupled* constraints. `constraints(n)` produces a
+// single connected constraint component spanning `n + 1` rectangles, forcing
+// the general solver to factor an O(n) x O(n) system.
+cell constraints(n: Int) {
+    let first = crect();
+    eq(first.y0, 0.);
+    eq(first.y1, 10.);
+    eq(first.x1, first.x0 + 10.);
+    #scope0 coupled_ring(first, first, n);
+}
