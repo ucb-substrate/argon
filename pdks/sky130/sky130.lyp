@@ -7309,6 +7309,23 @@
   <name>v20.drawing</name>
   <source>74/22@1</source>
  </properties>
+ <properties>
+  <frame-color>#ffe6bf</frame-color>
+  <fill-color>#ffe6bf</fill-color>
+  <frame-brightness>0</frame-brightness>
+  <fill-brightness>0</fill-brightness>
+  <dither-pattern>C21</dither-pattern>
+  <line-style>C1</line-style>
+  <valid>true</valid>
+  <visible>false</visible>
+  <transparent>false</transparent>
+  <width>1</width>
+  <marked>false</marked>
+  <xfill>false</xfill>
+  <animation>0</animation>
+  <name>layout_boundary.boundary</name>
+  <source>236/0@1</source>
+ </properties>
  <name/>
  <custom-dither-pattern>
   <pattern>
