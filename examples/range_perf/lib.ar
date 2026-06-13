@@ -1,0 +1,7 @@
+cell top() {
+  // Performance regression test for for-loops over range. Compiling this is
+  // near-linear; under the old cons-based range it was O(n^2) in the loop count.
+  for i in std::range(20000) {
+    rect("met1", x0=(i as Float), y0=0., w=1., h=1.);
+  }
+}

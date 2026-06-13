@@ -71,6 +71,7 @@ mod tests {
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
+    const ARGON_RANGE_PERF: &str = concatcp!(EXAMPLES_DIR, "/range_perf/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
 
@@ -1018,6 +1019,39 @@ mod tests {
             assert_relative_eq!(r.x1.0, w, epsilon = EPSILON);
             assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
         }
+    }
+
+    /// Regression guard against O(n^2) `for` loops over `range`.
+    ///
+    /// Under the old `cons`-based `range`, building `range(20000)` cloned and
+    /// front-inserted a growing `Vec` per element (~2e8 element copies) and took
+    /// many seconds; with the persistent-vector backing for `Value::Seq` plus the
+    /// native `range_full` builtin it is O(n) and completes near-instantly. The
+    /// generous time bound separates the linear fix from an O(n^2) regression
+    /// (which would take minutes) without being flaky across build profiles.
+    #[test]
+    fn argon_range_perf() {
+        let o = parse_workspace_with_std(ARGON_RANGE_PERF);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let start = std::time::Instant::now();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let elapsed = start.elapsed();
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 20000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "compiling `for i in std::range(20000)` took {elapsed:?}; \
+             expected near-linear time (O(n^2) regression in `range`/`cons`?)"
+        );
     }
 
     #[test]

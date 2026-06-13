@@ -17,6 +17,7 @@ arcstr = { workspace = true }
 serde = { workspace = true }
 approx = { workspace = true }
 indexmap = { workspace = true }
+im = { workspace = true }
 geometry = { workspace = true }
 uniquify = { workspace = true }
 rgb = { workspace = true }
