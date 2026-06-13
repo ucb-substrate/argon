@@ -65,7 +65,7 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | Env var | Axis | Default |
 | ------- | ---- | ------- |
 | `ARGON_BENCH_SHAPES`        | shapes (recursion)   | `500,1000,2000,4000,8000,16000,32000` |
-| `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `250,500,1000,2000` |
+| `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
 | `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024` |
 | `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,48,64,96,128` |
@@ -104,7 +104,7 @@ parameter; "peak" is peak heap allocated during compilation.
 | Instances                    | 64 000 insts   | 3.14 s  | 1.29 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Hierarchy, 1 child ref       | depth 128      | 0.09 s  | 0.12 GiB | **polynomial** (`∝ depth^1.3–1.4`) |
 | Coupled constraints          | 1 024 rects    | 21.7 s  | 0.13 GiB | **super-cubic in time** (see below) |
-| Shapes (`for`-loop)          | 2 000 rects    | 0.59 s  | 4.1 GiB  | **quadratic** (mem `∝ n^2`) |
+| Shapes (`for`-loop)          | 32 000 rects   | 1.07 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Hierarchy, 2 child refs      | depth 18       | 11.5 s  | 3.6 GiB  | **exponential** (`×1.9` per level) |
 
 ### Interpretation
@@ -141,15 +141,19 @@ parameter; "peak" is peak heap allocated during compilation.
   capped). Very deep hierarchies additionally hit a native-recursion stack
   limit in the compiler at a few hundred levels.
 
-- **Recursion vs. iteration measures the list/iteration machinery.** `shapes`
-  and `shapes_loop` emit identical geometry; the only difference is that
-  `shapes_loop` builds and iterates a `std::range` list. On the build measured
-  here that list path is markedly heavier (≈4 GiB to emit 2 000 rectangles via
-  a `for` loop, vs. 32 000 by recursion in under 1 GiB), so the gap between the
-  two series is a direct measure of the cost of the list representation rather
-  than of the geometry or solver. Re-running both series (e.g. with
-  `ARGON_BENCH_SHAPES_LOOP` set to the same sizes as `bench_shapes`) is the way
-  to see that cost change as the iteration/list machinery is optimized.
+- **Recursion and iteration now scale identically.** `shapes` and `shapes_loop`
+  emit identical geometry; the only difference is that `shapes_loop` builds and
+  iterates a `std::range` list. That list path used to be quadratic — emitting
+  just 2 000 rectangles through a `for` loop cost ≈4 GiB (against 32 000 by
+  recursion in under 1 GiB), because `range` was built by repeated `cons` onto a
+  `Vec` (an O(n) clone-and-prepend per element). Backing sequences with a
+  persistent vector and lowering `range` to a native builtin made `cons`
+  O(log n) and `range` O(n); the two series now coincide, both linear in time
+  and memory out to 32 000 rectangles (`shapes_loop`: 1.07 s / 0.85 GiB;
+  `shapes`: 1.53 s / 0.89 GiB). The idiomatic `for i in std::range(n)` loop is
+  no longer a scaling hazard. The gap between the two series is now a small
+  constant — `shapes_loop` is even marginally faster, as the native `range`
+  avoids the per-element recursion overhead of `emit_shapes`.
 
 The takeaways for the paper: editable-object count and instance count scale
 linearly; the practically-relevant limits are the dense general constraint

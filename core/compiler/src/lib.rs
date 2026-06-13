@@ -327,8 +327,9 @@ mod tests {
 
     /// Axis 1b: the same geometry generated with an idiomatic `for` loop over
     /// `std::range`, which additionally exercises Argon's functional list
-    /// representation (`cons`). Capped at a smaller size because list
-    /// construction is super-linear.
+    /// representation. Since sequences are backed by a persistent vector and
+    /// `range` lowers to a native builtin, this path is linear and is swept to
+    /// the same sizes as `bench_shapes` so the two can be compared directly.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
     fn bench_shapes_loop() {
@@ -338,13 +339,15 @@ mod tests {
         let ast = o.ast();
         // This variant generates the same geometry as `bench_shapes` but with a
         // `for` loop over `std::range`, so its cost also includes building and
-        // iterating the list. The default sweep is kept smaller than
-        // `bench_shapes` only so the default run stays bounded in memory on the
-        // current build; override `ARGON_BENCH_SHAPES_LOOP` to sweep to the same
-        // sizes as `bench_shapes` (e.g. to compare the two after changes to the
-        // list representation).
+        // iterating the list. That list/`range` path is now linear (persistent-
+        // vector sequences + a native `range` builtin), so it sweeps to the same
+        // sizes as `bench_shapes` and the two series can be compared directly
+        // (override `ARGON_BENCH_SHAPES_LOOP` to change the range).
         let mut rows = Vec::new();
-        for &n in &bench_sizes("ARGON_BENCH_SHAPES_LOOP", &[250, 500, 1000, 2000]) {
+        for &n in &bench_sizes(
+            "ARGON_BENCH_SHAPES_LOOP",
+            &[500, 1000, 2000, 4000, 8000, 16000, 32000],
+        ) {
             let (dt, mem, out) = measure(2, || {
                 compile(
                     &ast,
