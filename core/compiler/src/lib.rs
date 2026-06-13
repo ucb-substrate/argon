@@ -150,6 +150,7 @@ mod tests {
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
     const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
+    const ARGON_RANGE_PERF: &str = concatcp!(EXAMPLES_DIR, "/range_perf/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
 
@@ -326,8 +327,9 @@ mod tests {
 
     /// Axis 1b: the same geometry generated with an idiomatic `for` loop over
     /// `std::range`, which additionally exercises Argon's functional list
-    /// representation (`cons`). Capped at a smaller size because list
-    /// construction is super-linear.
+    /// representation. Since sequences are backed by a persistent vector and
+    /// `range` lowers to a native builtin, this path is linear and is swept to
+    /// the same sizes as `bench_shapes` so the two can be compared directly.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
     fn bench_shapes_loop() {
@@ -337,13 +339,15 @@ mod tests {
         let ast = o.ast();
         // This variant generates the same geometry as `bench_shapes` but with a
         // `for` loop over `std::range`, so its cost also includes building and
-        // iterating the list. The default sweep is kept smaller than
-        // `bench_shapes` only so the default run stays bounded in memory on the
-        // current build; override `ARGON_BENCH_SHAPES_LOOP` to sweep to the same
-        // sizes as `bench_shapes` (e.g. to compare the two after changes to the
-        // list representation).
+        // iterating the list. That list/`range` path is now linear (persistent-
+        // vector sequences + a native `range` builtin), so it sweeps to the same
+        // sizes as `bench_shapes` and the two series can be compared directly
+        // (override `ARGON_BENCH_SHAPES_LOOP` to change the range).
         let mut rows = Vec::new();
-        for &n in &bench_sizes("ARGON_BENCH_SHAPES_LOOP", &[250, 500, 1000, 2000]) {
+        for &n in &bench_sizes(
+            "ARGON_BENCH_SHAPES_LOOP",
+            &[500, 1000, 2000, 4000, 8000, 16000, 32000],
+        ) {
             let (dt, mem, out) = measure(2, || {
                 compile(
                     &ast,
@@ -1539,6 +1543,39 @@ mod tests {
             assert_relative_eq!(r.x1.0, w, epsilon = EPSILON);
             assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
         }
+    }
+
+    /// Regression guard against O(n^2) `for` loops over `range`.
+    ///
+    /// Under the old `cons`-based `range`, building `range(20000)` cloned and
+    /// front-inserted a growing `Vec` per element (~2e8 element copies) and took
+    /// many seconds; with the persistent-vector backing for `Value::Seq` plus the
+    /// native `range_full` builtin it is O(n) and completes near-instantly. The
+    /// generous time bound separates the linear fix from an O(n^2) regression
+    /// (which would take minutes) without being flaky across build profiles.
+    #[test]
+    fn argon_range_perf() {
+        let o = parse_workspace_with_std(ARGON_RANGE_PERF);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let start = std::time::Instant::now();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let elapsed = start.elapsed();
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        assert_eq!(cell.objects.len(), 20000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "compiling `for i in std::range(20000)` took {elapsed:?}; \
+             expected near-linear time (O(n^2) regression in `range`/`cons`?)"
+        );
     }
 
     #[test]

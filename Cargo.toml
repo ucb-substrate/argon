@@ -12,6 +12,7 @@ approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
 indexmap = { version = "2", features = ["serde"] }
+im = "15"
 clap = { version = "4", features = ["derive"] }
 rgb = { version = "0.8", features = ["serde"] }
 thiserror = "2"

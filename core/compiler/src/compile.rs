@@ -33,11 +33,12 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 12] = [
+pub const BUILTINS: [&str; 13] = [
     "list",
     "cons",
     "head",
     "tail",
+    "range_full",
     "crect",
     "rect",
     "text",
@@ -1647,6 +1648,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             .unwrap();
                         (None, Ty::Seq(Box::new(elem_ty)))
                     }
+                }
+                "range_full" => {
+                    // Native builtin backing `std::range`/`std::range_full`: builds the
+                    // whole `[Int]` in one pass instead of recursive `cons`.
+                    self.typecheck_posargs(input.span, &args.posargs, &[Ty::Int, Ty::Int, Ty::Int]);
+                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    (None, Ty::Seq(Box::new(Ty::Int)))
                 }
                 "head" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
@@ -3529,11 +3537,15 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let val = match tail {
                             Value::SeqNil => {
-                                vec![head.clone()]
+                                let mut s = Seq::new();
+                                s.push_back(head.clone());
+                                s
                             }
                             Value::Seq(s) => {
+                                // O(1) structural clone + O(log n) prepend (was O(n) deep
+                                // clone + O(n) front-insert, making `range` O(n^2)).
                                 let mut s = s.clone();
-                                s.insert(0, head.clone());
+                                s.push_front(head.clone());
                                 s
                             }
                             _ => {
@@ -3576,6 +3588,44 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                "range_full" => {
+                    if let (Defer::Ready(start), Defer::Ready(stop), Defer::Ready(step)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                        &self.values[&c.state.posargs[2]],
+                    ) {
+                        if let (Value::Int(start), Value::Int(stop), Value::Int(step)) =
+                            (start, stop, step)
+                        {
+                            // Build the whole `[Int]` in one O(n) pass (O(log n) pushes),
+                            // avoiding the per-element interpreter overhead (frame, scope,
+                            // deferred value) of the old recursive `cons` definition.
+                            let mut seq = Seq::new();
+                            if *step > 0 {
+                                let mut i = *start;
+                                while i < *stop {
+                                    seq.push_back(Value::Int(i));
+                                    i += *step;
+                                }
+                            }
+                            self.values.insert(vid, Defer::Ready(Value::Seq(seq)));
+                            true
+                        } else {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
+                    } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
+                        self.add_value_dependent(c.state.posargs[1], vid);
+                        self.add_value_dependent(c.state.posargs[2], vid);
+                        false
+                    }
+                }
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
@@ -3589,7 +3639,7 @@ impl<'a> ExecPass<'a> {
                                 return Err(());
                             }
                             Value::Seq(s) => {
-                                if let Some(s) = s.first() {
+                                if let Some(s) = s.front() {
                                     s.clone()
                                 } else {
                                     let span = self.span(&vref.loc, c.expr.span);
@@ -3632,7 +3682,12 @@ impl<'a> ExecPass<'a> {
                             }
                             Value::Seq(s) => {
                                 if !s.is_empty() {
-                                    Value::Seq(s[1..].to_vec())
+                                    // Drop the head: O(1) structural clone + O(log n)
+                                    // pop_front (was O(n) `s[1..].to_vec()`, which made
+                                    // `tail`-recursion such as `std::last` O(n^2)).
+                                    let mut s = s.clone();
+                                    s.pop_front();
+                                    Value::Seq(s)
                                 } else {
                                     let span = self.span(&vref.loc, c.expr.span);
                                     self.errors.push(ExecError {
@@ -4534,8 +4589,9 @@ impl<'a> ExecPass<'a> {
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
+                        // `s.clone()` is now an O(1) refcount bump (was an O(n) deep copy).
                         ValueRef::Seq(s) => s.clone(),
-                        ValueRef::SeqNil => Vec::new(),
+                        ValueRef::SeqNil => Seq::new(),
                         _ => {
                             let span = self.span(&vref.loc, f.for_loop.seq.span());
                             self.errors.push(ExecError {
@@ -4605,6 +4661,16 @@ impl<'a> ExecPass<'a> {
     }
 }
 
+/// Persistent immutable sequence backing `Value::Seq`.
+///
+/// Backed by an RRB-tree (`im::Vector`): O(1) clone (structural sharing) and
+/// O(log n) `push_front`/`get`/`pop_front`. This keeps `cons` (used to build
+/// `range`) at O(log n) instead of the O(n) clone+prepend a `Vec` requires, so
+/// building `range(n)` is O(n log n) rather than O(n^2), while random indexing
+/// (`arr[i]`) stays O(log n). `im::Vector` is `Arc`-backed, so `Seq` is `Send`
+/// exactly when `Value` is — no regression for the (tokio) language server.
+type Seq = im::Vector<Value>;
+
 #[enumify]
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -4652,7 +4718,7 @@ pub enum Value {
     ///
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
-    Seq(Vec<Value>),
+    Seq(Seq),
     Tuple(Vec<Value>),
     SeqNil,
     Nil,
