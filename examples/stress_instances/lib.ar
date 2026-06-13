@@ -1,0 +1,26 @@
+cell leaf() {
+    // A small leaf cell that is instantiated many times below. It is compiled
+    // exactly once and cached; every instance simply references it.
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+}
+
+fn place(c: Any, n: Int) {
+    // Recursively create `n` instances of cell `c`, each fully constrained to
+    // an absolute location. Every instance adds two solver variables (its x/y
+    // origin) resolved by back-substitution.
+    #scope0 if n <= 0 {
+    } else {
+        let it = inst(c);
+        eq(it.x, (n as Float) * 20.);
+        eq(it.y, 0.);
+        #scope1 place(c, n - 1);
+    }
+}
+
+// Stress axis: number of cell instances. `instances(n)` places `n` copies of
+// the (cached) `leaf` cell, stressing instance bookkeeping and GDS hierarchy
+// emission while keeping per-leaf compilation cost constant.
+cell instances(n: Int) {
+    let c = leaf();
+    #scope0 place(c, n);
+}

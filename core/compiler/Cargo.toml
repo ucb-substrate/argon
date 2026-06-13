@@ -6,20 +6,18 @@ edition = "2024"
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.34", features = ["sparse"] }
-klayout-lyp = "0.1.1"
+klayout-lyp = "0.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
-
-
+antlr-rust = { path = "../../antlr4/runtime/Rust" }
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }
-lrlex = { workspace = true }
-lrpar = { workspace = true }
 itertools = { workspace = true }
 enumify = { workspace = true }
 arcstr = { workspace = true }
 serde = { workspace = true }
 approx = { workspace = true }
 indexmap = { workspace = true }
+im = { workspace = true }
 geometry = { workspace = true }
 uniquify = { workspace = true }
 rgb = { workspace = true }
@@ -30,9 +28,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 const_format = "0.2"
-
-[build-dependencies]
-lrpar = { version = "0.13", features = ["serde"] }
-
-cfgrammar = { workspace = true }
-lrlex = { workspace = true }
+pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
+sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }

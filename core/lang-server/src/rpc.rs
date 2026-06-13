@@ -7,12 +7,9 @@ use compiler::{
 
 use serde::{Deserialize, Serialize};
 use tarpc::tokio_serde::formats::Json;
-use tower_lsp_server::{
-    UriExt,
-    lsp_types::{
-        Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
-        Uri, WorkspaceEdit,
-    },
+use tower_lsp_server::ls_types::{
+    Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
+    Uri, WorkspaceEdit,
 };
 
 use crate::{ForceSave, Redo, State, Undo, document::Document};

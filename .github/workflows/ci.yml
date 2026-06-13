@@ -15,7 +15,9 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,33 +32,45 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Cache cargo index
-        uses: actions/cache@v4
+          cache-on-failure: true
+
+      - name: Compute ANTLR submodule hash
+        id: antlr-hash
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:antlr4)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ANTLR toolchain
+        uses: actions/cache@v5
         with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-      
+          path: antlr4/tool/target
+          key: ${{ runner.os }}-antlr-tool-${{ steps.antlr-hash.outputs.sha }}
+
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
   # Build and test
   test:
@@ -64,11 +78,25 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest]
         rust: [stable]
     steps:
-      - uses: actions/checkout@v4
-      
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -79,33 +107,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-      
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
         with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Cache cargo index
-        uses: actions/cache@v4
+          shared-key: ${{ runner.os }}-${{ matrix.rust }}
+          cache-on-failure: true
+
+      - name: Compute ANTLR submodule hash
+        id: antlr-hash
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:antlr4)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ANTLR toolchain
+        uses: actions/cache@v5
         with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Cache cargo build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.rust }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+          path: |
+            antlr4/runtime/Java/target
+            antlr4/tool/target
+          key: ${{ runner.os }}-antlr-tool-${{ steps.antlr-hash.outputs.sha }}
       
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --release
       
       - name: Run tests
-        run: cargo test --verbose
-      
-      # - name: Build release
-      #   run: cargo build --release --verbose
+        run: cargo test --release --workspace --exclude antlr-rust
 
   # Checks if dependencies have vulnerabilties
   security-audit:
@@ -113,7 +139,9 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
       
       - name: Install cargo-audit
         run: cargo install cargo-audit

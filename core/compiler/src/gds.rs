@@ -7,7 +7,6 @@ use ::gds::{
 use anyhow::{Result, anyhow};
 use arcstr::ArcStr;
 use indexmap::IndexMap;
-use regex::Regex;
 use tracing::trace;
 use uniquify::Names;
 
@@ -62,20 +61,7 @@ impl GdsMap {
             lyp.layers
                 .into_iter()
                 .map(|layer_prop| {
-                    let re = Regex::new(r"(\d*)/(\d*)(@\d*)?")?;
-                    let caps = re
-                        .captures(&layer_prop.source)
-                        .ok_or_else(|| anyhow!("parse error"))?;
-                    let layer = caps
-                        .get(1)
-                        .ok_or_else(|| anyhow!("parse error"))?
-                        .as_str()
-                        .parse()?;
-                    let datatype = caps
-                        .get(2)
-                        .ok_or_else(|| anyhow!("parse error"))?
-                        .as_str()
-                        .parse()?;
+                    let (layer, datatype) = parse_layer_source(&layer_prop.source)?;
                     Ok((
                         layer_prop.name,
                         GdsLayerSpec {
@@ -116,17 +102,12 @@ impl CompiledData {
         trace!("Exporting cell {id}");
         let cell = &self.cells[&id];
         let name = &cell.scopes[&cell.root].name;
-        let re = Regex::new(r".*cell ([a-zA-Z0-9_]*)")?;
-        let caps = re.captures(name).ok_or_else(|| anyhow!("parse error"))?;
-        let name = caps.get(1).ok_or_else(|| anyhow!("parse error"))?.as_str();
+        let name = parse_cell_name(name)?;
         let name = exporter.names.assign_name(id, name);
         let mut ocell = GdsStruct::new(name.to_string());
         for (_, obj) in &cell.objects {
             match obj {
-                SolvedValue::Rect(rect) => {
-                    if rect.construction {
-                        continue;
-                    }
+                SolvedValue::Rect(rect) if !rect.construction => {
                     if let Some(layer) = &rect.layer {
                         let GdsLayerSpec {
                             layer,
@@ -164,7 +145,7 @@ impl CompiledData {
                         ..Default::default()
                     }));
                 }
-                SolvedValue::Instance(i) => {
+                SolvedValue::Instance(i) if !i.construction => {
                     if exporter.names.name(&i.cell).is_none() {
                         self.cell_to_gds(exporter, i.cell)?;
                     }
@@ -187,4 +168,21 @@ impl CompiledData {
         exporter.lib.structs.push(ocell);
         Ok(())
     }
+}
+
+fn parse_layer_source(source: &str) -> Result<(i16, i16)> {
+    let (layer, datatype) = source
+        .split_once('/')
+        .ok_or_else(|| anyhow!("parse error"))?;
+    let datatype = datatype
+        .split_once('@')
+        .map_or(datatype, |(datatype, _)| datatype);
+    Ok((layer.parse()?, datatype.parse()?))
+}
+
+fn parse_cell_name(name: &str) -> Result<&str> {
+    name.rsplit("cell ")
+        .next()
+        .and_then(|suffix| suffix.split_whitespace().next())
+        .ok_or_else(|| anyhow!("parse error"))
 }

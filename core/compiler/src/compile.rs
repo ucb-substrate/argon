@@ -3,9 +3,10 @@
 //! Pass 1: import resolution
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arcstr::Substr;
 use enumify::enumify;
@@ -33,11 +34,12 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 12] = [
+pub const BUILTINS: [&str; 13] = [
     "list",
     "cons",
     "head",
     "tail",
+    "range_full",
     "crect",
     "rect",
     "text",
@@ -520,8 +522,8 @@ pub enum Ty {
     Int,
     Rect,
     String,
-    Cell(Box<CellTy>),
-    Inst(Box<CellTy>),
+    Cell(Arc<CellTy>),
+    Inst(Arc<CellTy>),
     Nil,
     SeqNil,
     Fn(Box<FnTy>),
@@ -578,7 +580,14 @@ pub struct FnTy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
     args: Vec<Ty>,
-    data: IndexMap<String, Ty>,
+    /// The structural type produced when this cell function is called.
+    ///
+    /// Stored behind an `Arc` so that every caller (and every `inst` of the
+    /// resulting cell) shares one allocation instead of deep-copying it. This
+    /// keeps the type representation a DAG rather than a tree: a cell that
+    /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
+    /// type size stays linear in hierarchy depth instead of doubling per level.
+    cell: Arc<CellTy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -781,7 +790,7 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
-    fn is_eq_ty(&mut self, a: &Ty, b: &Ty) -> bool {
+    fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
         if *a == Ty::Any || *b == Ty::Any {
             return true;
         }
@@ -789,7 +798,7 @@ impl<'a> VarIdTyPass<'a> {
         if let Ty::Seq(a) = a
             && let Ty::Seq(b) = b
         {
-            return self.is_eq_ty(a, b);
+            return VarIdTyPass::is_eq_ty(a, b);
         }
 
         if let Ty::Tuple(a) = a
@@ -798,14 +807,17 @@ impl<'a> VarIdTyPass<'a> {
             if a.len() != b.len() {
                 return false;
             }
-            return a.iter().zip(b.iter()).all(|(a, b)| self.is_eq_ty(a, b));
+            return a
+                .iter()
+                .zip(b.iter())
+                .all(|(a, b)| VarIdTyPass::is_eq_ty(a, b));
         }
 
         *a == *b
     }
 
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if !self.is_eq_ty(found, expected) {
+        if !VarIdTyPass::is_eq_ty(found, expected) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
@@ -919,12 +931,7 @@ impl<'a> VarIdTyPass<'a> {
                 }
                 Ty::CellFn(ty) => {
                     self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
-                    (
-                        Some(varid),
-                        Ty::Cell(Box::new(CellTy {
-                            data: ty.data.clone(),
-                        })),
-                    )
+                    (Some(varid), Ty::Cell(ty.cell.clone()))
                 }
                 ty => {
                     self.errors.push(StaticError {
@@ -1184,7 +1191,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
         let scope = Scope {
             scope_annotation,
-            span: input.span,
+            span: input.scope.span,
             stmts,
             tail,
             metadata,
@@ -1196,25 +1203,26 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::CellWithTailExpr,
             });
         }
+        let data = scope
+            .stmts
+            .iter()
+            .filter_map(|stmt| {
+                if let Statement::LetBinding(lt) = stmt {
+                    if ["x", "y"].contains(&lt.name.name.as_str()) {
+                        self.errors.push(StaticError {
+                            span: self.span(lt.name.span),
+                            kind: StaticErrorKind::RedeclarationOfBuiltin,
+                        });
+                    }
+                    Some((lt.name.name.to_string(), lt.value.ty()))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            data: scope
-                .stmts
-                .iter()
-                .filter_map(|stmt| {
-                    if let Statement::LetBinding(lt) = stmt {
-                        if ["x", "y"].contains(&lt.name.name.as_str()) {
-                            self.errors.push(StaticError {
-                                span: self.span(lt.name.span),
-                                kind: StaticErrorKind::RedeclarationOfBuiltin,
-                            });
-                        }
-                        Some((lt.name.name.to_string(), lt.value.ty()))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
+            cell: Arc::new(CellTy { data }),
         }));
         self.alloc(&input.name.name, ty);
         let name = self.transform_ident(&input.name);
@@ -1350,7 +1358,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         let left_ty = left.ty();
         let right_ty = right.ty();
-        if !self.is_eq_ty(&left_ty, &right_ty) {
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::BinOpMismatchedTypes,
@@ -1613,7 +1621,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     if args.posargs.len() == 2 {
                         let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
                         let tailty = args.posargs[1].ty();
-                        if !(tailty == Ty::SeqNil || self.is_eq_ty(&tailty, &seqty)) {
+                        if !(tailty == Ty::SeqNil || VarIdTyPass::is_eq_ty(&tailty, &seqty)) {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
@@ -1644,6 +1652,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             .unwrap();
                         (None, Ty::Seq(Box::new(elem_ty)))
                     }
+                }
+                "range_full" => {
+                    // Native builtin backing `std::range`/`std::range_full`: builds the
+                    // whole `[Int]` in one pass instead of recursive `cons`.
+                    self.typecheck_posargs(input.span, &args.posargs, &[Ty::Int, Ty::Int, Ty::Int]);
+                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    (None, Ty::Seq(Box::new(Ty::Int)))
                 }
                 "head" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
@@ -1979,7 +1994,34 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 pub enum CellArg {
     Float(f64),
     Int(i64),
+    Bool(bool),
     Seq(Vec<CellArg>),
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CellExecKey {
+    cell: VarId,
+    args: Vec<CellArgKey>,
+    scope_annotation: Option<String>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum CellArgKey {
+    Float(u64),
+    Int(i64),
+    Bool(bool),
+    Seq(Vec<CellArgKey>),
+}
+
+impl From<&CellArg> for CellArgKey {
+    fn from(value: &CellArg) -> Self {
+        match value {
+            CellArg::Float(f) => Self::Float(f.to_bits()),
+            CellArg::Int(i) => Self::Int(*i),
+            CellArg::Bool(b) => Self::Bool(*b),
+            CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2159,6 +2201,7 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
+    compiled_cell_cache: HashMap<CellExecKey, CellId>,
     errors: Vec<ExecError>,
 }
 
@@ -2220,6 +2263,7 @@ impl<'a> ExecPass<'a> {
             next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            compiled_cell_cache: HashMap::new(),
             errors: Vec::new(),
         }
     }
@@ -2334,6 +2378,14 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_annotation: Option<&str>,
     ) -> Result<CellId, ()> {
+        let cache_key = CellExecKey {
+            cell,
+            args: args.iter().map(CellArgKey::from).collect(),
+            scope_annotation: scope_annotation.map(|s| s.to_string()),
+        };
+        if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
+            return Ok(*cell_id);
+        }
         let mut frame = Frame {
             bindings: Default::default(),
             parent: Some(self.global_frame),
@@ -2537,6 +2589,7 @@ impl<'a> ExecPass<'a> {
 
         let cell = self.emit(cell_id);
         assert!(self.compiled_cells.insert(cell_id, cell).is_none());
+        self.compiled_cell_cache.insert(cache_key, cell_id);
         Ok(cell_id)
     }
 
@@ -2649,6 +2702,7 @@ impl<'a> ExecPass<'a> {
         let mut ccell = CompiledCell {
             scopes: IndexMap::new(),
             root: state.root_scope,
+            fields: IndexMap::new(),
             rowspace_vecs: state.rowspace_vecs.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
@@ -2698,12 +2752,13 @@ impl<'a> ExecPass<'a> {
         for (id, scope) in state.scopes.iter() {
             for (seq_num, (name, value)) in scope.bindings.iter() {
                 if let Some(obj_id) = emit_value(*value) {
-                    ccell
-                        .scopes
-                        .get_mut(id)
-                        .expect("scope not found")
+                    let scope = ccell.scopes.get_mut(id).expect("scope not found");
+                    scope
                         .bindings
-                        .insert(*seq_num, (name.clone(), obj_id));
+                        .insert(*seq_num, (name.clone(), obj_id.clone()));
+                    if *id == ccell.root {
+                        ccell.fields.insert(name.clone(), obj_id);
+                    }
                 }
             }
         }
@@ -3181,12 +3236,13 @@ impl<'a> ExecPass<'a> {
                 }
             }
             Value::Int(i) => Some(CellArg::Int(*i)),
+            Value::Bool(b) => Some(CellArg::Bool(*b)),
             Value::Seq(s) => s
                 .iter()
                 .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
                 .collect::<Option<Vec<_>>>()
                 .map(CellArg::Seq),
-            _ => unreachable!(),
+            v => unreachable!("invalid cell arg {v:?}"),
         }
     }
 
@@ -3485,11 +3541,15 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let val = match tail {
                             Value::SeqNil => {
-                                vec![head.clone()]
+                                let mut s = Seq::new();
+                                s.push_back(head.clone());
+                                s
                             }
                             Value::Seq(s) => {
+                                // O(1) structural clone + O(log n) prepend (was O(n) deep
+                                // clone + O(n) front-insert, making `range` O(n^2)).
                                 let mut s = s.clone();
-                                s.insert(0, head.clone());
+                                s.push_front(head.clone());
                                 s
                             }
                             _ => {
@@ -3532,6 +3592,44 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                "range_full" => {
+                    if let (Defer::Ready(start), Defer::Ready(stop), Defer::Ready(step)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                        &self.values[&c.state.posargs[2]],
+                    ) {
+                        if let (Value::Int(start), Value::Int(stop), Value::Int(step)) =
+                            (start, stop, step)
+                        {
+                            // Build the whole `[Int]` in one O(n) pass (O(log n) pushes),
+                            // avoiding the per-element interpreter overhead (frame, scope,
+                            // deferred value) of the old recursive `cons` definition.
+                            let mut seq = Seq::new();
+                            if *step > 0 {
+                                let mut i = *start;
+                                while i < *stop {
+                                    seq.push_back(Value::Int(i));
+                                    i += *step;
+                                }
+                            }
+                            self.values.insert(vid, Defer::Ready(Value::Seq(seq)));
+                            true
+                        } else {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return Err(());
+                        }
+                    } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
+                        self.add_value_dependent(c.state.posargs[1], vid);
+                        self.add_value_dependent(c.state.posargs[2], vid);
+                        false
+                    }
+                }
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
@@ -3545,7 +3643,7 @@ impl<'a> ExecPass<'a> {
                                 return Err(());
                             }
                             Value::Seq(s) => {
-                                if let Some(s) = s.first() {
+                                if let Some(s) = s.front() {
                                     s.clone()
                                 } else {
                                     let span = self.span(&vref.loc, c.expr.span);
@@ -3588,7 +3686,12 @@ impl<'a> ExecPass<'a> {
                             }
                             Value::Seq(s) => {
                                 if !s.is_empty() {
-                                    Value::Seq(s[1..].to_vec())
+                                    // Drop the head: O(1) structural clone + O(log n)
+                                    // pop_front (was O(n) `s[1..].to_vec()`, which made
+                                    // `tail`-recursion such as `std::last` O(n^2)).
+                                    let mut s = s.clone();
+                                    s.pop_front();
+                                    Value::Seq(s)
                                 } else {
                                     let span = self.span(&vref.loc, c.expr.span);
                                     self.errors.push(ExecError {
@@ -4216,8 +4319,6 @@ impl<'a> ExecPass<'a> {
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
                                         let cell = &self.compiled_cells[&inst_cell_id];
-                                        let state = self.cell_states.get_mut(&cell_id).unwrap();
-                                        let obj_id = &mut self.next_id;
                                         let field_value =
                                             if let Some(field_value) = cell.field(field) {
                                                 field_value
@@ -4233,7 +4334,13 @@ impl<'a> ExecPass<'a> {
                                                 });
                                                 return Err(());
                                             };
-                                        Some(Value::from_array(field_value.map(
+                                        let obj_id = &mut self.next_id;
+                                        let objects = &mut self
+                                            .cell_states
+                                            .get_mut(&cell_id)
+                                            .unwrap()
+                                            .objects;
+                                        let transformed = Value::from_array(field_value.map(
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
                                                     let id = object_id(obj_id);
@@ -4262,9 +4369,7 @@ impl<'a> ExecPass<'a> {
                                                         construction: rect.construction,
                                                         span: rect.span.clone(),
                                                     };
-                                                    state
-                                                        .objects
-                                                        .insert(xrect.id, xrect.clone().into());
+                                                    objects.insert(xrect.id, xrect.clone().into());
                                                     Value::Rect(xrect)
                                                 }
                                                 SolvedValue::Instance(cinst) => {
@@ -4287,14 +4392,13 @@ impl<'a> ExecPass<'a> {
                                                         construction: cinst.construction,
                                                         span: cinst.span.clone(),
                                                     };
-                                                    state
-                                                        .objects
-                                                        .insert(oinst.id, oinst.clone().into());
+                                                    objects.insert(oinst.id, oinst.clone().into());
                                                     Value::Inst(oinst)
                                                 }
                                                 _ => unreachable!(),
                                             },
-                                        )))
+                                        ));
+                                        Some(transformed)
                                     } else {
                                         None
                                     }
@@ -4489,8 +4593,9 @@ impl<'a> ExecPass<'a> {
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
+                        // `s.clone()` is now an O(1) refcount bump (was an O(n) deep copy).
                         ValueRef::Seq(s) => s.clone(),
-                        ValueRef::SeqNil => Vec::new(),
+                        ValueRef::SeqNil => Seq::new(),
                         _ => {
                             let span = self.span(&vref.loc, f.for_loop.seq.span());
                             self.errors.push(ExecError {
@@ -4560,6 +4665,16 @@ impl<'a> ExecPass<'a> {
     }
 }
 
+/// Persistent immutable sequence backing `Value::Seq`.
+///
+/// Backed by an RRB-tree (`im::Vector`): O(1) clone (structural sharing) and
+/// O(log n) `push_front`/`get`/`pop_front`. This keeps `cons` (used to build
+/// `range`) at O(log n) instead of the O(n) clone+prepend a `Vec` requires, so
+/// building `range(n)` is O(n log n) rather than O(n^2), while random indexing
+/// (`arr[i]`) stays O(log n). `im::Vector` is `Arc`-backed, so `Seq` is `Send`
+/// exactly when `Value` is — no regression for the (tokio) language server.
+type Seq = im::Vector<Value>;
+
 #[enumify]
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -4607,7 +4722,7 @@ pub enum Value {
     ///
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
-    Seq(Vec<Value>),
+    Seq(Seq),
     Tuple(Vec<Value>),
     SeqNil,
     Nil,
@@ -4625,6 +4740,7 @@ impl Value {
     pub fn from_arg(arg: &CellArg) -> Self {
         match arg {
             CellArg::Int(i) => Value::Int(*i),
+            CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
         }
@@ -4735,6 +4851,7 @@ pub struct CompiledScope {
 pub struct CompiledCell {
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
+    pub fields: IndexMap<String, Arrayed<ObjectId>>,
     pub rowspace_vecs: Vec<Vec<(f64, Var)>>,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<LinearExpr>,
@@ -4773,14 +4890,9 @@ impl<T> Arrayed<T> {
 
 impl CompiledCell {
     pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
-        let scope = &self.scopes[&self.root];
-        scope.bindings.values().find_map(|(n, o)| {
-            if n == name {
-                Some(o.map(&mut |id| &self.objects[id]))
-            } else {
-                None
-            }
-        })
+        self.fields
+            .get(name)
+            .map(|o| o.map(&mut |id| &self.objects[id]))
     }
 }
 
@@ -4976,11 +5088,11 @@ pub enum StaticErrorKind {
     #[error("module doesn't exist")]
     InvalidMod,
     /// Error during lexing.
-    #[error("error during lexing")]
-    LexError,
+    #[error("error during lexing: {0}")]
+    LexError(String),
     /// Error during parsing.
-    #[error("error during parsing")]
-    ParseError,
+    #[error("error during parsing: {0}")]
+    ParseError(String),
     /// Invalid LYP file.
     #[error("invalid LYP file")]
     InvalidLyp,

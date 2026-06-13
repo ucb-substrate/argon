@@ -36,9 +36,9 @@ use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
-use tower_lsp_server::lsp_types::{request::Request, *};
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::{request::Request, *};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
-use tower_lsp_server::{UriExt, jsonrpc::Result};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -179,34 +179,36 @@ impl StateMut {
                     static_output.errors.extend(parse_errs);
                     Some(CompileOutput::StaticErrors(static_output))
                 } else if let Some(cell) = &self.cell {
-                    let input = parse::format_cell_input(cell);
-                    match parse::parse_cell(&input) {
-                        Ok(cell_ast) => Some(compile::dynamic_compile(
-                            &ast,
-                            CompileInput {
-                                cell: &cell_ast
-                                    .func
-                                    .path
-                                    .iter()
-                                    .map(|ident| ident.name)
-                                    .collect_vec(),
-                                args: cell_ast
-                                    .args
-                                    .posargs
-                                    .iter()
-                                    .map(|arg| match arg {
-                                        Expr::FloatLiteral(float_literal) => {
-                                            CellArg::Float(float_literal.value)
-                                        }
-                                        Expr::IntLiteral(int_literal) => {
-                                            CellArg::Int(int_literal.value)
-                                        }
-                                        _ => panic!("must be int or float literal for now"),
-                                    })
-                                    .collect(),
-                                lyp_file: &lyp,
-                            },
-                        )),
+                    match parse::parse_cell(cell) {
+                        Ok(cell_ast) => {
+                            let cell_path = cell_ast
+                                .func
+                                .path
+                                .iter()
+                                .map(|ident| ident.name)
+                                .collect_vec();
+                            Some(compile::dynamic_compile(
+                                &ast,
+                                CompileInput {
+                                    cell: &cell_path,
+                                    args: cell_ast
+                                        .args
+                                        .posargs
+                                        .iter()
+                                        .map(|arg| match arg {
+                                            Expr::FloatLiteral(float_literal) => {
+                                                CellArg::Float(float_literal.value)
+                                            }
+                                            Expr::IntLiteral(int_literal) => {
+                                                CellArg::Int(int_literal.value)
+                                            }
+                                            _ => panic!("must be int or float literal for now"),
+                                        })
+                                        .collect(),
+                                    lyp_file: &lyp,
+                                },
+                            ))
+                        }
                         Err(e) => {
                             client
                                 .show_message(

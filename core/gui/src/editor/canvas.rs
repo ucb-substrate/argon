@@ -21,7 +21,7 @@ use gpui::{
 use indexmap::IndexSet;
 use itertools::Itertools;
 use lang_server::rpc::DimensionParams;
-use tower_lsp_server::lsp_types::MessageType;
+use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::*,
@@ -550,6 +550,9 @@ impl Element for CanvasElement {
                             }
                         }
                         SolvedValue::Instance(inst) => {
+                            if inst.construction {
+                                continue;
+                            }
                             let mut inst_mat = TransformationMatrix::identity();
                             if inst.reflect {
                                 inst_mat = inst_mat.reflect_vert()
@@ -961,8 +964,8 @@ impl Element for CanvasElement {
                     // highlight hover edges
                     // TODO: reduce repeat code from on_left_mouse_down
                     match tool {
-                        ToolState::DrawDim(dim_tool) => {
-                            if dim_tool.edges.len() < 2 {
+                        ToolState::DrawDim(dim_tool)
+                            if dim_tool.edges.len() < 2 => {
                                 let rects = rects
                                     .iter()
                                     .rev()
@@ -1146,7 +1149,6 @@ impl Element for CanvasElement {
                                     _ => {}
                                 }
                             }
-                        }
                         ToolState::Select(_) => {
                             let rects = inner
                                 .rects

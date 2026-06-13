@@ -125,3 +125,18 @@ fn center_rects(r1: Rect, r2: Rect) {
 fn crect2rect(r: Rect) -> Rect {
     rect(r.layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
 }
+
+fn last(lst: [Any]) -> Any {
+    #scope0 if tail(lst) == [] {
+        head(lst)
+    } else {
+        #scope0 last(tail(lst))
+    }
+}
+
+// `range_full` is a native builtin (see the `"range_full"` arms in compile.rs):
+// it constructs the whole `[Int]` in one O(n) pass rather than via recursive
+// `cons`, so `range(n)` is O(n) instead of O(n^2).
+fn range(stop: Int) -> [Int] {
+    range_full(0, stop, 1)
+}

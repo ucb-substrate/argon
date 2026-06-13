@@ -14,8 +14,6 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 cfgrammar = { workspace = true }
-lrlex = { workspace = true }
-lrpar = { workspace = true }
 itertools = { workspace = true }
 tarpc = { workspace = true }
 lsp-document = "0.6"
