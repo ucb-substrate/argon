@@ -1,0 +1,57 @@
+cell h0() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+}
+
+// Each level `h{k}` instantiates the level below it (`h{k-1}`) and adds one
+// rectangle, building a layout that is `k` cells deep. Compiling `h{k}` therefore
+// exercises `k` levels of hierarchy. The instance is bound to a single variable
+// (`i`); binding the child cell to an additional variable would cause the
+// structural cell type to expand exponentially with depth (see bench/README.md).
+cell h1() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h0());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h2() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h1());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h3() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h2());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h4() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h3());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h5() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h4());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h6() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h5());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h7() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h6());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
+cell h8() {
+    rect("met1", x0=0., y0=0., x1=10., y1=10.);
+    let i = inst(h7());
+    eq(i.x, 0.);
+    eq(i.y, 10.);
+}
