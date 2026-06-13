@@ -371,8 +371,9 @@ mod tests {
         write_bench_csv("shapes_loop", &rows);
     }
 
-    /// Axis 2: number of mutually-coupled constraints solved by the general
-    /// (dense) linear-constraint solver.
+    /// Axis 2: number of mutually-coupled constraints. The coupled ring is reduced by
+    /// the solver's sparse elimination pre-pass (2-variable constraints telescope away);
+    /// the general dense SVD remains as a fallback for any irreducible coupled core.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
     fn bench_constraints() {
@@ -381,7 +382,10 @@ mod tests {
         assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
         let ast = o.ast();
         let mut rows = Vec::new();
-        for &n in &bench_sizes("ARGON_BENCH_CONSTRAINTS", &[32, 64, 128, 256, 512, 1024]) {
+        for &n in &bench_sizes(
+            "ARGON_BENCH_CONSTRAINTS",
+            &[32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+        ) {
             let (dt, mem, out) = measure(1, || {
                 compile(
                     &ast,
