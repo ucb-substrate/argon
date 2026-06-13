@@ -21,15 +21,16 @@ import sys
 
 # Series in the order we want them drawn. Each entry is
 #   (csv_basename, display_label, size_unit, model)
-# where `model` is "poly" (fit a power law y ~ n^k) or "exp" (fit y ~ b^n,
-# appropriate for the exponentially-scaling hierarchy variant).
+# where `model` is "poly" (fit a power law y ~ n^k) or "exp" (fit y ~ b^n). The
+# "exp" model is retained for re-running on builds where an axis scales
+# exponentially; on the current build every axis is sub-exponential.
 SERIES = [
     ("shapes", "Shapes (recursion)", "# rectangles", "poly"),
     ("shapes_loop", "Shapes (for-loop / cons list)", "# rectangles", "poly"),
     ("instances", "Instances", "# instances", "poly"),
     ("constraints", "Coupled constraints", "# coupled rects", "poly"),
     ("hierarchy_single_ref", "Hierarchy (1 child ref)", "depth", "poly"),
-    ("hierarchy_double_ref", "Hierarchy (2 child refs)", "depth", "exp"),
+    ("hierarchy_double_ref", "Hierarchy (2 child refs)", "depth", "poly"),
 ]
 
 

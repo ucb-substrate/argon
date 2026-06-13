@@ -6,6 +6,7 @@
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use arcstr::Substr;
 use enumify::enumify;
@@ -521,8 +522,8 @@ pub enum Ty {
     Int,
     Rect,
     String,
-    Cell(Box<CellTy>),
-    Inst(Box<CellTy>),
+    Cell(Arc<CellTy>),
+    Inst(Arc<CellTy>),
     Nil,
     SeqNil,
     Fn(Box<FnTy>),
@@ -579,7 +580,14 @@ pub struct FnTy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
     args: Vec<Ty>,
-    data: IndexMap<String, Ty>,
+    /// The structural type produced when this cell function is called.
+    ///
+    /// Stored behind an `Arc` so that every caller (and every `inst` of the
+    /// resulting cell) shares one allocation instead of deep-copying it. This
+    /// keeps the type representation a DAG rather than a tree: a cell that
+    /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
+    /// type size stays linear in hierarchy depth instead of doubling per level.
+    cell: Arc<CellTy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,12 +931,7 @@ impl<'a> VarIdTyPass<'a> {
                 }
                 Ty::CellFn(ty) => {
                     self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
-                    (
-                        Some(varid),
-                        Ty::Cell(Box::new(CellTy {
-                            data: ty.data.clone(),
-                        })),
-                    )
+                    (Some(varid), Ty::Cell(ty.cell.clone()))
                 }
                 ty => {
                     self.errors.push(StaticError {
@@ -1200,25 +1203,26 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::CellWithTailExpr,
             });
         }
+        let data = scope
+            .stmts
+            .iter()
+            .filter_map(|stmt| {
+                if let Statement::LetBinding(lt) = stmt {
+                    if ["x", "y"].contains(&lt.name.name.as_str()) {
+                        self.errors.push(StaticError {
+                            span: self.span(lt.name.span),
+                            kind: StaticErrorKind::RedeclarationOfBuiltin,
+                        });
+                    }
+                    Some((lt.name.name.to_string(), lt.value.ty()))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            data: scope
-                .stmts
-                .iter()
-                .filter_map(|stmt| {
-                    if let Statement::LetBinding(lt) = stmt {
-                        if ["x", "y"].contains(&lt.name.name.as_str()) {
-                            self.errors.push(StaticError {
-                                span: self.span(lt.name.span),
-                                kind: StaticErrorKind::RedeclarationOfBuiltin,
-                            });
-                        }
-                        Some((lt.name.name.to_string(), lt.value.ty()))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
+            cell: Arc::new(CellTy { data }),
         }));
         self.alloc(&input.name.name, ty);
         let name = self.transform_ident(&input.name);
