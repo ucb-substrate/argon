@@ -47,6 +47,12 @@ git submodule update --init --recursive
 cargo build --release
 ```
 
+On BWRC servers, you may need to supply `RUSTFLAGS` as follows:
+
+```bash
+RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" cargo b --release
+```
+
 ### Neovim
 
 Add the following to your Neovim Lua configuration:

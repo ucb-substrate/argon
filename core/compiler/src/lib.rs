@@ -273,8 +273,10 @@ mod tests {
     /// Generates a workspace of `depth + 1` cells `h0..h{depth}` where each
     /// `h{k}` instantiates `h{k-1}`. With `double_ref = false` the child is
     /// referenced by a single (instance) binding; with `double_ref = true` the
-    /// child cell is also bound to a `let`, which makes the structural cell type
-    /// of `h{k}` contain two copies of the type of `h{k-1}`.
+    /// child cell is also bound to a `let`, so `h{k}` references the type of
+    /// `h{k-1}` through two bindings rather than one. Because the structural
+    /// cell type is shared (`Arc`-interned) rather than copied per reference,
+    /// both variants scale linearly in `depth`.
     fn gen_hier(depth: usize, double_ref: bool) -> String {
         let mut s =
             String::from("cell h0() {\n    rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n}\n");
@@ -436,8 +438,10 @@ mod tests {
     }
 
     /// Axis 4: depth of cell hierarchy. Two series are produced: `single_ref`
-    /// references each child once (polynomial), and `double_ref` references it
-    /// twice, which triggers exponential structural-type expansion.
+    /// references each child once and `double_ref` references it twice. Both
+    /// are linear in depth because the structural cell type is shared across
+    /// references rather than copied (see `CellFnTy::cell`); `double_ref` is
+    /// kept as a regression guard against the old exponential expansion.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
     fn bench_hierarchy() {
@@ -477,12 +481,13 @@ mod tests {
         }
         write_bench_csv("hierarchy_single_ref", &rows);
 
-        // `double_ref` binds the child cell twice, which (on the current build)
-        // makes the structural cell type grow quickly with depth, so the
-        // default sweep is kept shallow to stay within a few GiB. Override
+        // `double_ref` binds the child cell twice. With the shared (`Arc`)
+        // structural cell type this scales the same as `single_ref`, so it is
+        // swept over the same depths. (Before that fix it expanded
+        // exponentially and had to be capped near depth 18.) Override
         // `ARGON_BENCH_HIER_DOUBLE` to push deeper.
         let mut rows = Vec::new();
-        for depth in bench_sizes("ARGON_BENCH_HIER_DOUBLE", &[2, 4, 6, 8, 10, 12, 14, 16, 18])
+        for depth in bench_sizes("ARGON_BENCH_HIER_DOUBLE", &[4, 8, 16, 32, 48, 64, 96, 128])
             .into_iter()
             .map(|d| d as usize)
         {

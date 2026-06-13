@@ -69,7 +69,7 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
 | `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024` |
 | `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,48,64,96,128` |
-| `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `2,4,6,8,10,12,14,16,18` |
+| `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `4,8,16,32,48,64,96,128` |
 
 ```bash
 # e.g. sweep the for-loop variant out to the same sizes as bench_shapes
@@ -100,12 +100,12 @@ parameter; "peak" is peak heap allocated during compilation.
 
 | Axis | largest `n` | time @ largest | peak mem @ largest | empirical scaling |
 | ---- | ----------- | -------------- | ------------------ | ----------------- |
-| Shapes (recursion)           | 32 000 rects   | 1.53 s  | 0.94 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
-| Instances                    | 64 000 insts   | 3.14 s  | 1.29 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
-| Hierarchy, 1 child ref       | depth 128      | 0.09 s  | 0.12 GiB | **polynomial** (`∝ depth^1.3–1.4`) |
-| Coupled constraints          | 1 024 rects    | 21.7 s  | 0.13 GiB | **super-cubic in time** (see below) |
-| Shapes (`for`-loop)          | 32 000 rects   | 1.07 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
-| Hierarchy, 2 child refs      | depth 18       | 11.5 s  | 3.6 GiB  | **exponential** (`×1.9` per level) |
+| Shapes (recursion)           | 32 000 rects   | 1.52 s  | 0.89 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
+| Instances                    | 64 000 insts   | 3.08 s  | 1.26 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
+| Hierarchy, 1 child ref       | depth 128      | 0.005 s | 11 MiB   | **linear** in depth |
+| Coupled constraints          | 1 024 rects    | 22.0 s  | 0.12 GiB | **super-cubic in time** (see below) |
+| Shapes (`for`-loop)          | 32 000 rects   | 1.06 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
+| Hierarchy, 2 child refs      | depth 128      | 0.006 s | 11 MiB   | **linear** in depth (was exponential before the shared-type fix) |
 
 ### Interpretation
 
@@ -125,21 +125,23 @@ parameter; "peak" is peak heap allocated during compilation.
   of dense factorization (and worse, because `solve()` is re-run as the system
   is assembled). This is the "general linear constraint solving (slow)" caveat
   in the top-level README, quantified: ~1 000 coupled editable variables take
-  ~20 s. Layouts whose constraints decompose into many small independent groups
+  ~22 s. Layouts whose constraints decompose into many small independent groups
   (the typical case) avoid this entirely.
 
-- **Hierarchy depth is limited by the type representation.** A cell's static
-  type (`CellTy`) stores the full structural type of every field, including
-  instantiated sub-cells. If a cell references its child **once** (e.g.
-  `let i = inst(child());`), depth scales polynomially (`~depth^1.4`) and is
-  fine to ~128 levels. If it references the child **twice** (e.g. the
-  `let c = child(); let i = inst(c);` idiom from the tutorial), the type of
-  `h{k}` contains two copies of the type of `h{k-1}`, so the representation —
-  and hence compile time and memory — **doubles with every level** (`×1.9` per
-  level measured). Beyond ~depth 20 this exhausts memory (depth 20 alone needs
-  ~14.5 GiB / 50 s; depth 18 is ~3.6 GiB / 11.5 s, which is where this sweep is
-  capped). Very deep hierarchies additionally hit a native-recursion stack
-  limit in the compiler at a few hundred levels.
+- **Hierarchy depth scales linearly.** A cell's static type (`CellTy`) records
+  the structural type of every field, including instantiated sub-cells. That
+  type is now **shared** (`Arc`-interned via `CellFnTy::cell`) instead of being
+  copied into each reference, so the type representation is a DAG rather than a
+  tree: whether a cell references its child **once** (`let i = inst(child());`)
+  or **twice** (the `let c = child(); let i = inst(c);` idiom from the tutorial),
+  `h{k}` holds shared pointers to the single type of `h{k-1}`, and both variants
+  cost the same — linear in depth (≈11 MiB / 6 ms at depth 128, the two series
+  within ~15% of each other). Before this fix the type was deep-copied per
+  reference, so the single-ref chain was quadratic (`~depth^1.4`) and the
+  double-ref chain **doubled with every level** (`×1.9` measured), exhausting
+  memory beyond ~depth 20 (depth 18 alone took ~3.6 GiB / 11.5 s). The remaining
+  hierarchy limit is unrelated to the type representation: very deep chains hit a
+  native-recursion stack limit in the compiler at a few hundred levels.
 
 - **Recursion and iteration now scale identically.** `shapes` and `shapes_loop`
   emit identical geometry; the only difference is that `shapes_loop` builds and
@@ -149,19 +151,18 @@ parameter; "peak" is peak heap allocated during compilation.
   `Vec` (an O(n) clone-and-prepend per element). Backing sequences with a
   persistent vector and lowering `range` to a native builtin made `cons`
   O(log n) and `range` O(n); the two series now coincide, both linear in time
-  and memory out to 32 000 rectangles (`shapes_loop`: 1.07 s / 0.85 GiB;
-  `shapes`: 1.53 s / 0.89 GiB). The idiomatic `for i in std::range(n)` loop is
+  and memory out to 32 000 rectangles (`shapes_loop`: 1.06 s / 0.85 GiB;
+  `shapes`: 1.52 s / 0.89 GiB). The idiomatic `for i in std::range(n)` loop is
   no longer a scaling hazard. The gap between the two series is now a small
   constant — `shapes_loop` is even marginally faster, as the native `range`
   avoids the per-element recursion overhead of `emit_shapes`.
 
-The takeaways for the paper: editable-object count and instance count scale
-linearly; the practically-relevant limits are the dense general constraint
-solver on large *coupled* systems and structural type expansion on deep
-hierarchies — both of which line up with the future-work items already listed
-in the project README (faster linear constraint solving; incremental
-compilation). The bullets above describe the build at the time of measurement;
-because every axis is re-runnable (and size-configurable), the same harness can
-be used to confirm improvements from compiler optimizations.
+The takeaways for the paper: editable-object count, instance count, and
+hierarchy depth all scale linearly; the one practically-relevant limit is the
+dense general constraint solver on large *coupled* systems, which lines up with
+the future-work item already listed in the project README (faster linear
+constraint solving). The bullets above describe the build at the time of
+measurement; because every axis is re-runnable (and size-configurable), the same
+harness can be used to confirm improvements from compiler optimizations.
 
 ![Argon scaling](argon_scaling.png)
