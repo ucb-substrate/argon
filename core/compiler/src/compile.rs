@@ -2176,7 +2176,7 @@ struct CellState {
     root_scope: ScopeId,
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
-    fallback_constraints_used: Vec<LinearExpr>,
+    fallback_constraints_used: Vec<UsedFallback>,
     rowspace_vecs: Vec<Vec<(f64, Var)>>,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
@@ -2543,7 +2543,10 @@ impl<'a> ExecPass<'a> {
                         .iter()
                         .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
                     {
-                        state.fallback_constraints_used.push(constraint.clone());
+                        state.fallback_constraints_used.push(UsedFallback {
+                            constraint: constraint.clone(),
+                            span: span.clone(),
+                        });
                         let constraint_id = state.solver.constrain_eq0(constraint);
                         state.constraint_span_map.insert(constraint_id, span);
                         constraint_added = true;
@@ -3366,7 +3369,11 @@ impl<'a> ExecPass<'a> {
                                 }
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
-                            let span = self.span(&vref.loc, kwarg.span);
+                            // Use the value expression's span (e.g. `100.` in
+                            // `x1i=100.`) rather than the whole kwarg, so the GUI
+                            // can rewrite just the value when persisting a
+                            // solution-space-exploration drag.
+                            let span = self.span(&vref.loc, kwarg.value.span());
                             self.new_deferred_value(vref.loc, |_| {
                                 PartialEvalState::Constraint(PartialConstraint {
                                     lhs,
@@ -3888,7 +3895,11 @@ impl<'a> ExecPass<'a> {
                                 }
                                 _ => continue,
                             };
-                            let span = self.span(&vref.loc, kwarg.span);
+                            // Use the value expression's span (e.g. `100.` in
+                            // `x1i=100.`) rather than the whole kwarg, so the GUI
+                            // can rewrite just the value when persisting a
+                            // solution-space-exploration drag.
+                            let span = self.span(&vref.loc, kwarg.value.span());
                             self.new_deferred_value(vref.loc, |_| {
                                 PartialEvalState::Constraint(PartialConstraint {
                                     lhs,
@@ -4847,6 +4858,20 @@ pub struct CompiledScope {
     pub emit: Vec<(ObjectId, CompiledEmit)>,
 }
 
+/// A fallback (initial-condition) constraint that was actually applied while
+/// solving a cell. Used by the GUI to persist solution-space-exploration drags:
+/// after a drag, the value text at `span` is rewritten so the new layout sticks
+/// across recompilation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsedFallback {
+    /// The applied constraint, of the form `expr - value` (so the pinned value
+    /// is `-constraint.constant` when `expr` has no constant term).
+    pub constraint: LinearExpr,
+    /// Source span of the initial-condition value expression (e.g. the `100.`
+    /// in `x1i=100.`), so the GUI can rewrite just that value.
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCell {
     pub scopes: IndexMap<ScopeId, CompiledScope>,
@@ -4854,7 +4879,7 @@ pub struct CompiledCell {
     pub fields: IndexMap<String, Arrayed<ObjectId>>,
     pub rowspace_vecs: Vec<Vec<(f64, Var)>>,
     pub objects: IndexMap<ObjectId, SolvedValue>,
-    pub fallback_constraints_used: Vec<LinearExpr>,
+    pub fallback_constraints_used: Vec<UsedFallback>,
     pub unsolved_vars: IndexSet<Var>,
     pub inconsistent_constraints: IndexSet<ConstraintId>,
 }

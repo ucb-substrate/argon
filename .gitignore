@@ -93,3 +93,5 @@ out
 node_modules
 .vscode-test
 *.tsbuildinfo
+
+Argon_ICCAD_2026.pdf

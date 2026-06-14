@@ -15,7 +15,7 @@ use futures::{
     prelude::*,
 };
 use gpui::AsyncApp;
-use lang_server::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient};
+use lang_server::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient, ValueEdit};
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},
@@ -210,6 +210,21 @@ impl SyncLangServerClient {
             .map_err(|_| {
                 anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
             })??)
+    }
+
+    pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<()> {
+        let client_clone = self.client.clone();
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move { client_clone.update_values(context::current(), edits).await }.compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
     }
 
     pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) -> Result<()> {

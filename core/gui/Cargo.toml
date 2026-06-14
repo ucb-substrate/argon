@@ -30,3 +30,6 @@ tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
+
+[dev-dependencies]
+approx = { workspace = true }

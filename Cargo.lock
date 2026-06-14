@@ -3311,6 +3311,7 @@ name = "gui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "approx",
  "arcstr",
  "async-compat",
  "bytes",

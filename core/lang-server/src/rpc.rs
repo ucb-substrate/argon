@@ -14,6 +14,15 @@ use tower_lsp_server::ls_types::{
 
 use crate::{ForceSave, Redo, State, Undo, document::Document};
 
+/// A single source rewrite: replace the text at `span` with `value`. Used to
+/// persist solution-space-exploration drags by updating initial-condition
+/// values (e.g. the `100.` in `x1i=100.`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValueEdit {
+    pub span: Span,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DimensionParams {
     pub p: String,
@@ -38,6 +47,7 @@ pub trait LangServer {
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
+    async fn update_values(edits: Vec<ValueEdit>);
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
@@ -409,6 +419,80 @@ impl LangServer for State {
             })
         } else {
             None
+        }
+    }
+
+    /// Rewrites the value text at each given span in a single workspace edit,
+    /// then saves (triggering recompilation). Used to persist SSE drags so the
+    /// dragged layout survives recompilation instead of snapping back.
+    async fn update_values(self, _: tarpc::context::Context, edits: Vec<ValueEdit>) -> () {
+        if edits.is_empty() {
+            return;
+        }
+        let state_mut = self.state_mut.lock().await;
+
+        if state_mut.ast.values().any(|ast| {
+            state_mut
+                .editor_files
+                .get(&Uri::from_file_path(&ast.path).unwrap())
+                .map(|file| file.contents() != ast.text)
+                .unwrap_or_default()
+        }) {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Editor buffer state is inconsistent with GUI state.",
+                )
+                .await;
+            return;
+        }
+
+        // Build one WorkspaceEdit grouping all rewrites per file. Edits within a
+        // file are sorted by descending start offset so they can be applied
+        // back-to-front without invalidating each other's offsets.
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        let mut offsets: HashMap<Uri, Vec<usize>> = HashMap::new();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for ValueEdit { span, value } in edits {
+            let url = Uri::from_file_path(&span.path).unwrap();
+            if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
+                let doc = Document::new(&ast.text, 0);
+                let start = doc.offset_to_pos(span.span.start());
+                let stop = doc.offset_to_pos(span.span.end());
+                changes.entry(url.clone()).or_default().push(TextEdit {
+                    range: Range::new(start, stop),
+                    new_text: value,
+                });
+                offsets.entry(url).or_default().push(span.span.start());
+                if !paths.contains(&span.path) {
+                    paths.push(span.path.clone());
+                }
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        for (url, edits) in changes.iter_mut() {
+            let starts = &offsets[url];
+            let mut idx: Vec<usize> = (0..edits.len()).collect();
+            idx.sort_by(|&a, &b| starts[b].cmp(&starts[a]));
+            *edits = idx.into_iter().map(|i| edits[i].clone()).collect();
+        }
+
+        self.editor_client
+            .apply_edit(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            })
+            .await
+            .unwrap();
+
+        for path in paths {
+            self.editor_client
+                .send_request::<ForceSave>(path)
+                .await
+                .unwrap();
         }
     }
 

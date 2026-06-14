@@ -7,25 +7,26 @@ use std::{
 use compiler::{
     ast::Span,
     compile::{self, ObjectId, SolvedValue, ifmatvec},
-    solver::Var,
+    solver::{LinearExpr, Var},
 };
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    BorderStyle, Bounds, Context, Corners, DefiniteLength, DragMoveEvent, Edges, Element, Entity,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
+    Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
     ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div, pattern_slash,
     px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
-use lang_server::rpc::DimensionParams;
+use lang_server::rpc::{DimensionParams, ValueEdit};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::*,
     editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
+    sse::SparseVec,
 };
 
 #[derive(Copy, Clone, PartialEq)]
@@ -36,6 +37,25 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
+/// Side length of the square drag handles drawn on unconstrained edges.
+const HANDLE_SIZE: Pixels = px(12.);
+/// Side length of the (larger, invisible) clickable area around each handle, so
+/// the handle is easy to grab without pixel-perfect aim.
+const HANDLE_HIT: Pixels = px(22.);
+/// Fill / border colors of the SSE drag handles.
+const HANDLE_FILL: u32 = 0x3b9dff;
+const HANDLE_BORDER: u32 = 0xffffff;
+
+/// A draggable solution-space-exploration handle, drawn at the midpoint of an
+/// unconstrained (dashed) rectangle edge. Clicking within `bounds` begins an
+/// SSE drag of the edge whose position is the linear expression `expr`, moving
+/// the mouse along the layout-space unit `normal`.
+#[derive(Clone)]
+struct SseHandle {
+    bounds: Bounds<Pixels>,
+    expr: LinearExpr,
+    normal: Point<f32>,
+}
 
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
@@ -48,6 +68,7 @@ pub struct Rect {
     pub object_path: Vec<ObjectId>,
     pub border_widths: Edges<Pixels>,
     pub border_styles: Edges<BorderStyle>,
+    pub cvars: Option<Edges<LinearExpr>>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -93,6 +114,7 @@ impl From<compile::Rect<f64>> for Rect {
             object_path: Vec::new(),
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
             border_styles: Edges::all(BorderStyle::Solid),
+            cvars: None,
         }
     }
 }
@@ -108,6 +130,12 @@ impl From<editor::Rect<(f64, Var)>> for Rect {
             object_path: Vec::new(),
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
             border_styles: Edges::all(BorderStyle::Solid),
+            cvars: Some(Edges {
+                top: LinearExpr::from(value.y1.1),
+                right: LinearExpr::from(value.x1.1),
+                bottom: LinearExpr::from(value.y0.1),
+                left: LinearExpr::from(value.x0.1),
+            }),
         }
     }
 }
@@ -125,6 +153,7 @@ impl Rect {
             object_path: self.object_path.clone(),
             border_widths: self.border_widths,
             border_styles: self.border_styles,
+            cvars: self.cvars.clone(),
         }
     }
 }
@@ -203,10 +232,21 @@ pub struct LayoutCanvas {
     pub offset: Point<Pixels>,
     pub bg_style: Style,
     pub state: Entity<EditorState>,
+    // SSE state
+    is_sse_dragging: bool,
+    sse_expr: LinearExpr,
+    sse_delta: Point<Pixels>,
+    // Unit normal (in layout space) of the edge being dragged: (1, 0) for the
+    // left/right edges, (0, 1) for the top/bottom edges.
+    sse_normal: Point<f32>,
+    // Drag handles for unconstrained edges, recomputed each paint. SSE drags are
+    // only started by clicking one of these.
+    sse_handles: Vec<SseHandle>,
     // drag state
     is_dragging: bool,
-    drag_start: Point<Pixels>,
     offset_start: Point<Pixels>,
+    // shared between SSE and dragging
+    drag_start: Point<Pixels>,
     mouse_position: Point<Pixels>,
     // zoom state
     scale: f32,
@@ -353,6 +393,7 @@ impl Element for CanvasElement {
         let state = inner.state.read(cx);
         let tool = state.tool.read(cx).clone();
         let layers = state.layers.read(cx);
+        let mut sse_dv = None;
 
         // TODO: Clean up code.
         let mut rects = Vec::new();
@@ -361,6 +402,27 @@ impl Element for CanvasElement {
         let mut select_rects = Vec::new();
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(solved_cell) = solved_cell {
+            let top = &solved_cell.output.cells[&solved_cell.output.top];
+            if inner.is_sse_dragging {
+                // Distance the dragged edge should travel along its normal, in
+                // layout units (the n̂ᵀd term of Algorithm 3).
+                let delta = crate::sse::edge_drag_distance(
+                    (
+                        inner.sse_delta.x.to_f64() as f32,
+                        inner.sse_delta.y.to_f64() as f32,
+                    ),
+                    (inner.sse_normal.x, inner.sse_normal.y),
+                    inner.scale,
+                );
+                let u = SparseVec::from(&inner.sse_expr);
+                let rowspace_vecs = top
+                    .rowspace_vecs
+                    .iter()
+                    .map(SparseVec::from)
+                    .collect::<Vec<_>>();
+                sse_dv =
+                    crate::sse::drag_delta(&u, &rowspace_vecs, &top.unsolved_vars, delta as f64);
+            }
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let mut queue = VecDeque::from_iter([(
                 ScopeAddress {
@@ -408,6 +470,7 @@ impl Element for CanvasElement {
                             object_path: Vec::new(),
                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                             border_styles: Edges::all(BorderStyle::Solid),
+                            cvars: None,
                         };
                         if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                             && &rect.id == selected_obj
@@ -438,15 +501,32 @@ impl Element for CanvasElement {
                             if let Some(layer) = layer
                                 && !rect.construction
                             {
+                                let (sse_dx0, sse_dx1, sse_dy0, sse_dy1) = if let Some(ref sse_dv) =
+                                    sse_dv
+                                {
+                                    if depth == 0 {
+                                        (
+                                            crate::sse::dot(&SparseVec::from(&rect.x0.1), sse_dv),
+                                            crate::sse::dot(&SparseVec::from(&rect.x1.1), sse_dv),
+                                            crate::sse::dot(&SparseVec::from(&rect.y0.1), sse_dv),
+                                            crate::sse::dot(&SparseVec::from(&rect.y1.1), sse_dv),
+                                        )
+                                    } else {
+                                        (0., 0., 0., 0.)
+                                    }
+                                } else {
+                                    (0., 0., 0., 0.)
+                                };
                                 let rect =
                                     Rect {
-                                        x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                                        y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                                        x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                                        y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                                        x0: (p0p.0.min(p1p.0) + ofs.0 + sse_dx0) as f32,
+                                        y0: (p0p.1.min(p1p.1) + ofs.1 + sse_dy0) as f32,
+                                        x1: (p0p.0.max(p1p.0) + ofs.0 + sse_dx1) as f32,
+                                        y1: (p0p.1.max(p1p.1) + ofs.1 + sse_dy1) as f32,
                                         id: rect.span.clone(),
                                         object_path,
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                        // TODO: this is wrong for transformed rects
                                         border_styles: Edges {
                                             // TODO: check constrained status and modify widths
                                             top: if rect.y1.1.coeffs.iter().any(|(_, var)| {
@@ -478,6 +558,12 @@ impl Element for CanvasElement {
                                                 BorderStyle::Solid
                                             },
                                         },
+                                        cvars: (depth == 0).then(|| Edges {
+                                            left: rect.x0.1.clone(),
+                                            right: rect.x1.1.clone(),
+                                            bottom: rect.y0.1.clone(),
+                                            top: rect.y1.1.clone(),
+                                        }),
                                     };
                                 if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                                     && rect.id.is_some()
@@ -526,6 +612,7 @@ impl Element for CanvasElement {
                                         object_path: object_path.clone(),
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                         border_styles: Edges::all(BorderStyle::Solid),
+                                        cvars: None,
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         &tool
@@ -576,6 +663,7 @@ impl Element for CanvasElement {
                         id: None,
                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                         border_styles: Edges::all(BorderStyle::Dashed),
+                        cvars: None,
                     },
                     layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
                 ));
@@ -589,6 +677,7 @@ impl Element for CanvasElement {
         let scale = inner.scale;
         let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
+        let mut sse_handles: Vec<SseHandle> = Vec::new();
         let theme = inner.state.read(cx).theme();
         inner
             .bg_style
@@ -649,6 +738,53 @@ impl Element for CanvasElement {
                             r.border_styles,
                         ));
                     }
+                    // Draw a draggable handle at the midpoint of every
+                    // unconstrained (dashed) edge, so the user can see exactly
+                    // where to grab to explore the solution space. The set of
+                    // handles is recorded for hit-testing in `on_left_mouse_down`.
+                    // Only top-level rects expose `cvars`, and an edge is
+                    // draggable iff it was rendered dashed.
+                    if matches!(tool, ToolState::Select(_)) {
+                        for (r, _) in &rects {
+                            let Some(cvars) = &r.cvars else { continue };
+                            let pb = get_rect_bounds(r, bounds, scale, offset);
+                            let center = pb.center();
+                            let draw_half = HANDLE_SIZE.half();
+                            let hit_half = HANDLE_HIT.half();
+                            let edges = [
+                                (r.border_styles.left, Point::new(pb.left(), center.y), &cvars.left, Point::new(1f32, 0.)),
+                                (r.border_styles.right, Point::new(pb.right(), center.y), &cvars.right, Point::new(1f32, 0.)),
+                                (r.border_styles.top, Point::new(center.x, pb.top()), &cvars.top, Point::new(0., 1f32)),
+                                (r.border_styles.bottom, Point::new(center.x, pb.bottom()), &cvars.bottom, Point::new(0., 1f32)),
+                            ];
+                            for (style, mid, expr, normal) in edges {
+                                if style != BorderStyle::Dashed {
+                                    continue;
+                                }
+                                // Draw a small visible handle, but record a
+                                // larger clickable area so it is easy to grab.
+                                window.paint_quad(get_paint_quad(
+                                    Bounds::new(
+                                        Point::new(mid.x - draw_half, mid.y - draw_half),
+                                        Size::new(HANDLE_SIZE, HANDLE_SIZE),
+                                    ),
+                                    ShapeFill::Solid,
+                                    rgb(HANDLE_FILL),
+                                    rgb(HANDLE_BORDER),
+                                    Edges::all(px(1.5)),
+                                    Edges::all(BorderStyle::Solid),
+                                ));
+                                sse_handles.push(SseHandle {
+                                    bounds: Bounds::new(
+                                        Point::new(mid.x - hit_half, mid.y - hit_half),
+                                        Size::new(HANDLE_HIT, HANDLE_HIT),
+                                    ),
+                                    expr: expr.clone(),
+                                    normal,
+                                });
+                            }
+                        }
+                    }
 
                     let mut draw_dim =
                         |p: f32,
@@ -694,6 +830,7 @@ impl Element for CanvasElement {
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                 border_styles: Edges::all(BorderStyle::Solid),
+                                cvars: None,
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (
@@ -729,6 +866,7 @@ impl Element for CanvasElement {
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                 border_styles: Edges::all(BorderStyle::Solid),
+                                cvars: None,
                             };
                             let (x0, y0, x1, y1) = if horiz {
                                 (p, coord, n, coord)
@@ -744,6 +882,7 @@ impl Element for CanvasElement {
                                 id: None,
                                 border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                                 border_styles: Edges::all(BorderStyle::Solid),
+                                cvars: None,
                             };
                             for r in &[start_line, stop_line, dim_line] {
                                 window.paint_quad(get_paint_path(
@@ -885,7 +1024,8 @@ impl Element for CanvasElement {
                                             y1,
                                             id: None,
                                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                border_styles: Edges::all(BorderStyle::Solid),
+                                            border_styles: Edges::all(BorderStyle::Solid),
+                                            cvars: None,
                                         },
                                         bounds,
                                         scale,
@@ -1058,8 +1198,8 @@ impl Element for CanvasElement {
                                                         y1,
                                                         id: None,
                                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                border_styles: Edges::all(BorderStyle::Solid),
-
+                                                        border_styles: Edges::all(BorderStyle::Solid),
+                                                        cvars: None,
                                                     },
                                                     bounds,
                                                     scale,
@@ -1139,6 +1279,7 @@ impl Element for CanvasElement {
             inner.rects = rects;
             inner.scope_rects = scope_rects;
             inner.dim_hitboxes = dim_hitboxes;
+            inner.sse_handles = sse_handles;
             cx.notify();
         });
     }
@@ -1156,9 +1297,8 @@ impl Render for LayoutCanvas {
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
-            // TODO: Uncomment once GPUI mouse movement is fixed.
-            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_mouse_down))
-            // .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::select_mode))
             .on_action(cx.listener(Self::draw_dim))
@@ -1171,9 +1311,10 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
-            .on_drag_move(cx.listener(Self::on_drag_move))
-            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_mouse_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .child(CanvasElement {
                 inner: cx.entity().clone(),
@@ -1206,6 +1347,11 @@ impl LayoutCanvas {
                 ..Style::default()
             },
             is_dragging: false,
+            is_sse_dragging: false,
+            sse_expr: LinearExpr::default(),
+            sse_delta: Point::default(),
+            sse_normal: Point::new(0., 0.),
+            sse_handles: Vec::new(),
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
@@ -1745,53 +1891,70 @@ impl LayoutCanvas {
                     }
                 }
                 ToolState::Select(select_tool) => {
-                    let rects = self
-                        .rects
+                    // Solution space exploration is started ONLY by clicking a
+                    // drag handle, which is drawn at the midpoint of each
+                    // unconstrained edge. Handles are computed during paint and
+                    // stored in `self.sse_handles`.
+                    let handle = self
+                        .sse_handles
                         .iter()
-                        .rev()
-                        .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                        .map(|(r, _)| r);
-                    let scale = self.scale;
-                    let offset = self.offset;
-                    let mut selected_obj = None;
-                    for (span, bounds) in rects
-                        .chain(self.scope_rects.iter())
-                        .filter_map(|r| {
-                            let rect_bounds = Bounds::new(
-                                Point::new(scale * px(r.x0), scale * px(-r.y1))
-                                    + offset
-                                    + self.screen_bounds.origin,
-                                Size::new(scale * px(r.x1 - r.x0), scale * px(r.y1 - r.y0)),
-                            );
-                            Some((r.id.as_ref()?, rect_bounds))
-                        })
-                        .chain(self.dim_hitboxes.iter().flat_map(|(span, hitboxes, _)| {
-                            hitboxes.iter().map(|hitbox| (span, *hitbox)).collect_vec()
-                        }))
-                    {
-                        if bounds.contains(&event.position) {
-                            selected_obj = Some(span);
-                            break;
-                        }
-                    }
-                    if let Some(span) = selected_obj {
-                        select_tool.selected_obj = Some(span.clone());
-                        if let Err(e) = self
-                            .state
-                            .read(cx)
-                            .lang_server_client
-                            .select_rect(span.clone())
-                        {
-                            self.state.update(cx, |state, cx| {
-                                state.fatal_error =
-                                    Some(format!("Editing disabled due to error {e}").into());
-                                cx.notify();
-                            });
-                        }
+                        .find(|h| h.bounds.contains(&event.position))
+                        .cloned();
+                    if let Some(handle) = handle {
+                        self.is_sse_dragging = true;
+                        self.drag_start = event.position;
+                        self.sse_expr = handle.expr;
+                        self.sse_normal = handle.normal;
+                        cx.notify();
                     } else {
-                        select_tool.selected_obj = None;
+                        let rects = self
+                            .rects
+                            .iter()
+                            .rev()
+                            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
+                            .map(|(r, _)| r);
+                        let scale = self.scale;
+                        let offset = self.offset;
+                        let mut selected_obj = None;
+                        for (span, bounds) in rects
+                            .chain(self.scope_rects.iter())
+                            .filter_map(|r| {
+                                let rect_bounds = Bounds::new(
+                                    Point::new(scale * px(r.x0), scale * px(-r.y1))
+                                        + offset
+                                        + self.screen_bounds.origin,
+                                    Size::new(scale * px(r.x1 - r.x0), scale * px(r.y1 - r.y0)),
+                                );
+                                Some((r.id.as_ref()?, rect_bounds))
+                            })
+                            .chain(self.dim_hitboxes.iter().flat_map(|(span, hitboxes, _)| {
+                                hitboxes.iter().map(|hitbox| (span, *hitbox)).collect_vec()
+                            }))
+                        {
+                            if bounds.contains(&event.position) {
+                                selected_obj = Some(span);
+                                break;
+                            }
+                        }
+                        if let Some(span) = selected_obj {
+                            select_tool.selected_obj = Some(span.clone());
+                            if let Err(e) = self
+                                .state
+                                .read(cx)
+                                .lang_server_client
+                                .select_rect(span.clone())
+                            {
+                                self.state.update(cx, |state, cx| {
+                                    state.fatal_error =
+                                        Some(format!("Editing disabled due to error {e}").into());
+                                    cx.notify();
+                                });
+                            }
+                        } else {
+                            select_tool.selected_obj = None;
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
                 }
                 _ => {}
             }
@@ -1955,7 +2118,7 @@ impl LayoutCanvas {
         });
     }
 
-    pub(crate) fn on_mouse_down(
+    pub(crate) fn on_middle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         _window: &mut Window,
@@ -1975,26 +2138,83 @@ impl LayoutCanvas {
         self.mouse_position = event.position;
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
+        } else if self.is_sse_dragging {
+            self.sse_delta = self.mouse_position - self.drag_start;
         }
         cx.notify();
     }
 
-    pub(crate) fn on_drag_move(
-        &mut self,
-        _event: &DragMoveEvent<()>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        self.is_dragging = false;
-    }
-
-    pub(crate) fn on_mouse_up(
+    pub(crate) fn on_middle_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
         self.is_dragging = false;
+        self.is_sse_dragging = false;
+    }
+
+    /// Computes the source rewrites that persist the just-finished SSE drag:
+    /// for every initial condition whose value changed, a [`ValueEdit`] setting
+    /// it to the dragged value. Mirrors the paint-time `sse_dv` computation.
+    fn sse_value_edits(&self, cx: &mut Context<Self>) -> Vec<ValueEdit> {
+        let solved = self.state.read(cx).solved_cell.read(cx);
+        let Some(solved) = solved.as_ref() else {
+            return Vec::new();
+        };
+        let top = &solved.output.cells[&solved.output.top];
+        let delta = crate::sse::edge_drag_distance(
+            (
+                self.sse_delta.x.to_f64() as f32,
+                self.sse_delta.y.to_f64() as f32,
+            ),
+            (self.sse_normal.x, self.sse_normal.y),
+            self.scale,
+        );
+        let u = SparseVec::from(&self.sse_expr);
+        let rowspace_vecs = top
+            .rowspace_vecs
+            .iter()
+            .map(SparseVec::from)
+            .collect::<Vec<_>>();
+        let Some(dv) = crate::sse::drag_delta(&u, &rowspace_vecs, &top.unsolved_vars, delta as f64)
+        else {
+            return Vec::new();
+        };
+        top.fallback_constraints_used
+            .iter()
+            .filter_map(|fb| {
+                crate::sse::updated_initial_condition(&fb.constraint, &dv).map(|value| ValueEdit {
+                    span: fb.span.clone(),
+                    value: crate::sse::format_value(value),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn on_left_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_sse_dragging = self.is_sse_dragging;
+        self.is_dragging = false;
+        self.is_sse_dragging = false;
+        // Persist the drag: rewrite the affected initial conditions in the source
+        // and recompile, so the layout does not snap back on release.
+        if was_sse_dragging {
+            let edits = self.sse_value_edits(cx);
+            if !edits.is_empty()
+                && let Err(e) = self.state.read(cx).lang_server_client.update_values(edits)
+            {
+                self.state.update(cx, |state, cx| {
+                    state.fatal_error = Some(format!("Failed to persist drag: {e}").into());
+                    cx.notify();
+                });
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn on_scroll_wheel(
@@ -2003,7 +2223,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_dragging {
+        if self.is_dragging || self.is_sse_dragging {
             // Do not allow zooming during a drag.
             return;
         }
