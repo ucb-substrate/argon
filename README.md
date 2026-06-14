@@ -17,7 +17,7 @@ Currently, Argon supports the following features:
 - Live reload of GUI upon changes in code editor
 - Parametric cells
 - Hierarchy
-- General linear constraint solving (slow)
+- Linear constraint solving: fast sparse elimination, with a general (dense) solver as fallback
 - Basic diagnostic reporting in the code editor
 - Basic detection of under/overconstrained systems
 
