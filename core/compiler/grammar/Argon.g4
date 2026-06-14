@@ -1,3 +1,9 @@
+// Reference grammar for the Argon language.
+//
+// NOTE: this file is documentation only. Argon is parsed by the hand-written
+// recursive-descent + Pratt parser in `core/compiler/src/parser/`; there is no
+// ANTLR/Java code generation in the build. Keep this grammar in sync with the
+// parser when the language changes.
 grammar Argon;
 
 ast

@@ -8,10 +8,10 @@ use arcstr::{ArcStr, Substr};
 use indexmap::IndexMap;
 
 use crate::{
-    antlr,
     ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
     compile::{StaticError, StaticErrorKind},
     config::parse_config,
+    parser::ParseError,
 };
 
 pub struct ParseMetadata;
@@ -137,7 +137,7 @@ fn make_backup_ast(input: ArcStr, path: PathBuf) -> AnnotatedParseAst {
     )
 }
 
-fn diagnostics_from_errors(errs: Vec<antlr::AntlrParseError>) -> ParseDiagnostics {
+fn diagnostics_from_errors(errs: Vec<ParseError>) -> ParseDiagnostics {
     errs.into_iter()
         .map(|err| ParseDiagnostic {
             span: err.span,
@@ -270,7 +270,7 @@ fn parse(path: impl Into<PathBuf>) -> (ParseResult, ParseDiagnostics) {
     match std::fs::read_to_string(&path) {
         Ok(input) => {
             let input = ArcStr::from(input);
-            match antlr::parse_ast(input.clone(), path.clone()) {
+            match crate::parser::parse_ast(input.clone(), path.clone()) {
                 Ok(ast) => ((ast, None), Vec::new()),
                 Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
             }
@@ -288,7 +288,7 @@ pub fn format_cell_input(input: &str) -> String {
 
 // Input should first be formatted with `format_cell_input`.
 pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, anyhow::Error> {
-    match antlr::parse_cell(input) {
+    match crate::parser::parse_cell(input) {
         Ok(ast) => Ok(ast),
         Err(errs) => {
             let diagnostics = diagnostics_from_errors(errs);

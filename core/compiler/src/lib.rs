@@ -1,10 +1,10 @@
-mod antlr;
 pub mod ast;
 pub mod compile;
 pub mod config;
 pub mod gds;
 pub mod layer;
 pub mod parse;
+mod parser;
 pub mod solver;
 
 /// A global allocator that tracks live and peak heap usage so that the scaling
