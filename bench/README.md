@@ -95,7 +95,7 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | `ARGON_BENCH_SHAPES`        | shapes (recursion)   | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
-| `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024` |
+| `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024,2048,4096,8192,16384` |
 | `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,48,64,96,128` |
 | `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `4,8,16,32,48,64,96,128` |
 
@@ -131,7 +131,7 @@ parameter; "peak" is peak heap allocated during compilation.
 | Shapes (recursion)           | 32 000 rects   | 1.52 s  | 0.89 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Instances                    | 64 000 insts   | 3.08 s  | 1.26 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Hierarchy, 1 child ref       | depth 128      | 0.005 s | 11 MiB   | **linear** in depth |
-| Coupled constraints          | 1 024 rects    | 22.0 s  | 0.12 GiB | **super-cubic in time** (see below) |
+| Coupled constraints          | 16 384 rects   | 1.76 s  | 0.59 GiB | **~linear** (time `∝ n^1.04`, mem `∝ n^0.90`) |
 | Shapes (`for`-loop)          | 32 000 rects   | 1.06 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Hierarchy, 2 child refs      | depth 128      | 0.006 s | 11 MiB   | **linear** in depth (was exponential before the shared-type fix) |
 
@@ -145,16 +145,23 @@ parameter; "peak" is peak heap allocated during compilation.
   back-substitution without ever forming a matrix. This is the common case for
   real parametric cells and it scales comfortably to "thousands of rectangles".
 
-- **Coupled constraints are the expensive axis.** When constraints form one
-  large connected component that *cannot* be back-substituted (here, a ring of
-  mutually-coupled edges), Argon falls back to its general linear solver, which
-  builds a dense matrix and takes an SVD. The per-doubling cost climbs from ~4×
-  at `n=64→128` to ~15× at `n=512→1024`, i.e. it steepens toward the `O(n^3)`
-  of dense factorization (and worse, because `solve()` is re-run as the system
-  is assembled). This is the "general linear constraint solving (slow)" caveat
-  in the top-level README, quantified: ~1 000 coupled editable variables take
-  ~22 s. Layouts whose constraints decompose into many small independent groups
-  (the typical case) avoid this entirely.
+- **Coupled constraints now scale linearly too.** When constraints form one
+  large connected component that 1-variable back-substitution cannot crack
+  (here, a ring of mutually-coupled edges), the solver first runs a sparse
+  *elimination pre-pass*: it generalizes back-substitution to 2-variable
+  "definitional" constraints, expressing one variable in terms of another and
+  substituting it out of the few constraints that mention it. Because a
+  2-variable constraint replaces one variable with one variable, this never
+  increases any constraint's size — the ring's leaf edges drop out and its
+  chain telescopes to a single closure, so the system is solved in `O(n)` and
+  the dense SVD never runs. The general dense solver is retained only as a
+  fallback for an *irreducible* coupled core (a block with no ≤2-variable
+  pivot). This axis used to be **super-cubic** — `~22 s` at `n=1024`, steepening
+  toward the `O(n^3)` of dense factorization — and is now `~n^1.04` in time
+  (`1.76 s` at `n=16384`, 16× larger, in less memory than the old `n=1024`
+  dense matrix used). The "general linear constraint solving (slow)" caveat in
+  the top-level README now bites only for genuinely dense coupled blocks, not
+  for the common sparse-but-coupled case.
 
 - **Hierarchy depth scales linearly.** A cell's static type (`CellTy`) records
   the structural type of every field, including instantiated sub-cells. That
@@ -185,12 +192,14 @@ parameter; "peak" is peak heap allocated during compilation.
   constant — `shapes_loop` is even marginally faster, as the native `range`
   avoids the per-element recursion overhead of `emit_shapes`.
 
-The takeaways for the paper: editable-object count, instance count, and
-hierarchy depth all scale linearly; the one practically-relevant limit is the
-dense general constraint solver on large *coupled* systems, which lines up with
-the future-work item already listed in the project README (faster linear
-constraint solving). The bullets above describe the build at the time of
-measurement; because every axis is re-runnable (and size-configurable), the same
-harness can be used to confirm improvements from compiler optimizations.
+The takeaways for the paper: editable-object count, instance count, hierarchy
+depth, and now coupled-constraint count all scale linearly. The dense general
+solver is no longer a practical limit for sparse-but-coupled systems — the
+elimination pre-pass reduces them first — and remains the fallback only for
+irreducible dense constraint blocks with no ≤2-variable pivot, which lines up
+with the "faster linear constraint solving" future-work item in the project
+README. The bullets above describe the build at the time of measurement; because
+every axis is re-runnable (and size-configurable), the same harness can be used
+to confirm improvements from compiler optimizations.
 
 ![Argon scaling](argon_scaling.png)
