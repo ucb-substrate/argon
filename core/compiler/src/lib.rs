@@ -820,6 +820,40 @@ mod tests {
         println!("{cells:#?}");
     }
 
+    /// Verifies the metadata the GUI relies on to persist solution-space-
+    /// exploration drags: the used fallback's constraint (`x1 - 100`) and the
+    /// source span pointing at the value text `100.` in `x1i=100.`.
+    #[test]
+    fn argon_sse_basic_fallback_metadata() {
+        let o = parse_workspace_with_std(ARGON_SSE_BASIC);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        )
+        .unwrap_exec_errors()
+        .output
+        .unwrap();
+        let used = &cells.cells[&cells.top].fallback_constraints_used;
+        // `eq(x1, y1)` leaves a single degree of freedom, pinned by exactly one
+        // fallback (the higher-priority `x1i`).
+        assert_eq!(used.len(), 1);
+        let fb = &used[0];
+        // Constraint is `x1 - 100`: a single variable with coefficient 1 and a
+        // pinned value of 100 (= -constant).
+        assert_eq!(fb.constraint.coeffs.len(), 1);
+        assert!((fb.constraint.coeffs[0].0 - 1.0).abs() < 1e-9);
+        assert!((-fb.constraint.constant - 100.0).abs() < 1e-9);
+        // The span addresses exactly the value text in the source.
+        let src = std::fs::read_to_string(&fb.span.path).unwrap();
+        assert_eq!(&src[fb.span.span.start()..fb.span.span.end()], "100.");
+    }
+
     #[test]
     fn argon_bool_literal() {
         let o = parse_workspace_with_std(ARGON_BOOL_LITERAL);

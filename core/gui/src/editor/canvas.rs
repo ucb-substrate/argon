@@ -20,7 +20,7 @@ use gpui::{
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
-use lang_server::rpc::DimensionParams;
+use lang_server::rpc::{DimensionParams, ValueEdit};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
@@ -2154,14 +2154,67 @@ impl LayoutCanvas {
         self.is_sse_dragging = false;
     }
 
+    /// Computes the source rewrites that persist the just-finished SSE drag:
+    /// for every initial condition whose value changed, a [`ValueEdit`] setting
+    /// it to the dragged value. Mirrors the paint-time `sse_dv` computation.
+    fn sse_value_edits(&self, cx: &mut Context<Self>) -> Vec<ValueEdit> {
+        let solved = self.state.read(cx).solved_cell.read(cx);
+        let Some(solved) = solved.as_ref() else {
+            return Vec::new();
+        };
+        let top = &solved.output.cells[&solved.output.top];
+        let delta = crate::sse::edge_drag_distance(
+            (
+                self.sse_delta.x.to_f64() as f32,
+                self.sse_delta.y.to_f64() as f32,
+            ),
+            (self.sse_normal.x, self.sse_normal.y),
+            self.scale,
+        );
+        let u = SparseVec::from(&self.sse_expr);
+        let rowspace_vecs = top
+            .rowspace_vecs
+            .iter()
+            .map(SparseVec::from)
+            .collect::<Vec<_>>();
+        let Some(dv) =
+            crate::sse::drag_delta(&u, &rowspace_vecs, &top.unsolved_vars, delta as f64)
+        else {
+            return Vec::new();
+        };
+        top.fallback_constraints_used
+            .iter()
+            .filter_map(|fb| {
+                crate::sse::updated_initial_condition(&fb.constraint, &dv).map(|value| ValueEdit {
+                    span: fb.span.clone(),
+                    value: crate::sse::format_value(value),
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn on_left_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_sse_dragging = self.is_sse_dragging;
         self.is_dragging = false;
         self.is_sse_dragging = false;
+        // Persist the drag: rewrite the affected initial conditions in the source
+        // and recompile, so the layout does not snap back on release.
+        if was_sse_dragging {
+            let edits = self.sse_value_edits(cx);
+            if !edits.is_empty()
+                && let Err(e) = self.state.read(cx).lang_server_client.update_values(edits)
+            {
+                self.state.update(cx, |state, cx| {
+                    state.fatal_error = Some(format!("Failed to persist drag: {e}").into());
+                    cx.notify();
+                });
+            }
+        }
         cx.notify();
     }
 

@@ -120,6 +120,33 @@ pub(crate) fn drag_delta(
     Some(r * (delta / denom))
 }
 
+/// Given a used fallback (initial-condition) constraint of the form
+/// `expr - value` — so the currently pinned value is `-constraint.constant`
+/// when `expr` has no constant term — and the solution-space move `dv` produced
+/// by a drag, returns the new value to write into the source, or `None` if the
+/// drag does not move this fallback's variables.
+///
+/// Persisting a drag means rewriting each affected initial condition to this new
+/// value, so recompilation reproduces the dragged layout instead of snapping
+/// back.
+pub(crate) fn updated_initial_condition(constraint: &LinearExpr, dv: &SparseVec) -> Option<f64> {
+    let delta = dot(&SparseVec::from(constraint), dv);
+    if delta.abs() < EPSILON {
+        return None;
+    }
+    Some(-constraint.constant + delta)
+}
+
+/// Formats a layout value as an Argon float literal (always containing a `.`),
+/// snapped to the solver's 0.1 grid so the written code stays clean and matches
+/// what recompilation produces.
+pub(crate) fn format_value(v: f64) -> String {
+    // `+ 0.0` collapses a possible `-0.0` to `0.0`.
+    let snapped = (v * 10.0).round() / 10.0 + 0.0;
+    let s = format!("{snapped}");
+    if s.contains('.') { s } else { format!("{s}.") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +268,46 @@ mod tests {
         let r = remove_component(&u, &[basis]);
         assert_relative_eq!(*r.get(&x).unwrap(), 0.5, epsilon = 1e-9);
         assert_relative_eq!(*r.get(&y).unwrap(), -0.5, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn updated_initial_condition_adds_drag_delta() {
+        let mut solver = Solver::new();
+        let x1 = solver.new_var();
+        // Fallback `x1 - 100` pins x1 = 100; a drag moved x1 by +2.5.
+        let constraint = LinearExpr {
+            coeffs: vec![(1., x1)],
+            constant: -100.,
+        };
+        let dv = SparseVec([(x1, 2.5)].into_iter().collect());
+        assert_relative_eq!(
+            updated_initial_condition(&constraint, &dv).unwrap(),
+            102.5,
+            epsilon = 1e-9
+        );
+    }
+
+    #[test]
+    fn updated_initial_condition_ignores_unaffected_fallback() {
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        // Fallback on x0; the drag moved only x1, so x0's initial condition is
+        // untouched.
+        let constraint = LinearExpr {
+            coeffs: vec![(1., x0)],
+            constant: 0.,
+        };
+        let dv = SparseVec([(x1, 5.)].into_iter().collect());
+        assert!(updated_initial_condition(&constraint, &dv).is_none());
+    }
+
+    #[test]
+    fn format_value_snaps_to_grid_and_is_float_literal() {
+        assert_eq!(format_value(100.0), "100.");
+        assert_eq!(format_value(0.0), "0.");
+        assert_eq!(format_value(150.37), "150.4"); // snapped to the 0.1 grid
+        assert_eq!(format_value(-0.04), "0."); // snaps to 0, never "-0"
+        assert_eq!(format_value(42.5), "42.5");
     }
 }
