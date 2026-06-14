@@ -57,7 +57,7 @@ impl From<&LinearExpr> for SparseVec {
 impl Mul<f64> for SparseVec {
     type Output = Self;
     fn mul(mut self, rhs: f64) -> Self::Output {
-        self.iter_mut().for_each(|(_, v)| *v = *v * rhs);
+        self.iter_mut().for_each(|(_, v)| *v *= rhs);
         self
     }
 }

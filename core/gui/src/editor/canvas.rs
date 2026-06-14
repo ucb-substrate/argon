@@ -12,8 +12,8 @@ use compiler::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity,
-    FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
+    Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
     ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div, pattern_slash,
     px, rgb, size, solid_background,
@@ -2177,8 +2177,7 @@ impl LayoutCanvas {
             .iter()
             .map(SparseVec::from)
             .collect::<Vec<_>>();
-        let Some(dv) =
-            crate::sse::drag_delta(&u, &rowspace_vecs, &top.unsolved_vars, delta as f64)
+        let Some(dv) = crate::sse::drag_delta(&u, &rowspace_vecs, &top.unsolved_vars, delta as f64)
         else {
             return Vec::new();
         };
