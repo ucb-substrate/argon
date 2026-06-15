@@ -68,11 +68,11 @@
         "@types/vscode": "^1.100.0",
         "@vscode/test-electron": "^2.3.9",
         "@eslint/js": "^9.13.0",
-        "@stylistic/eslint-plugin": "^2.9.0",
+        "@stylistic/eslint-plugin": "^5.10.0",
         "@types/mocha": "^10.0.6",
         "@types/node": "^22",
-        "eslint": "^9.13.0",
-        "mocha": "^10.3.0",
+        "eslint": "^10.0.3",
+        "mocha": "^11.7.5",
         "typescript": "^5.9.2",
         "typescript-eslint": "^8.39.0"
     }
