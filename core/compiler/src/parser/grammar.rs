@@ -41,15 +41,32 @@ const PREFIX_BP: u8 = 9;
 /// Recursion-depth guard for pathological nesting (real programs are shallow).
 const MAX_DEPTH: u32 = 256;
 
-/// Left/right binding power of an infix operator token, or `None` if the token
-/// is not an infix operator.
+/// An infix operator: which AST node family it builds (binary vs comparison)
+/// and the specific op. Carried alongside the binding power by `infix_op` so the
+/// operator set lives in exactly one place.
+enum InfixOp {
+    Bin(BinOp),
+    Cmp(ComparisonOp),
+}
+
+/// The infix operator a token denotes plus its left/right binding power, or
+/// `None` if the token is not an infix operator. Single source of truth for the
+/// infix set: precedence and the AST op are defined together so they can't drift.
 #[inline]
-fn infix_bp(k: TokenKind) -> Option<(u8, u8)> {
+fn infix_op(k: TokenKind) -> Option<(InfixOp, u8, u8)> {
     use TokenKind::*;
     Some(match k {
-        EqEq | Neq | Geq | Gt | Leq | Lt => (1, 2),
-        Plus | Minus => (3, 4),
-        Star | Slash | Percent => (5, 6),
+        EqEq => (InfixOp::Cmp(ComparisonOp::Eq), 1, 2),
+        Neq => (InfixOp::Cmp(ComparisonOp::Ne), 1, 2),
+        Geq => (InfixOp::Cmp(ComparisonOp::Geq), 1, 2),
+        Gt => (InfixOp::Cmp(ComparisonOp::Gt), 1, 2),
+        Leq => (InfixOp::Cmp(ComparisonOp::Leq), 1, 2),
+        Lt => (InfixOp::Cmp(ComparisonOp::Lt), 1, 2),
+        Plus => (InfixOp::Bin(BinOp::Add), 3, 4),
+        Minus => (InfixOp::Bin(BinOp::Sub), 3, 4),
+        Star => (InfixOp::Bin(BinOp::Mul), 5, 6),
+        Slash => (InfixOp::Bin(BinOp::Div), 5, 6),
+        Percent => (InfixOp::Bin(BinOp::Rem), 5, 6),
         _ => return None,
     })
 }
@@ -67,9 +84,6 @@ pub struct Parser<'a> {
     ntok: u64,
     depth: u32,
     pub errors: Vec<ParseError>,
-    /// Start offset of the last reported error, to suppress duplicate errors at
-    /// the same position (cascades from repeated `expect` failures).
-    last_error_pos: Option<u32>,
 }
 
 impl<'a> Parser<'a> {
@@ -87,7 +101,6 @@ impl<'a> Parser<'a> {
             ntok: 0,
             depth: 0,
             errors: Vec::new(),
-            last_error_pos: None,
         }
     }
 
@@ -133,9 +146,69 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a comma-separated list `item (',' item)* ','?` up to `close` (or
+    /// EOF): zero or more items with an **optional trailing comma**, returning
+    /// the collected items (empty if the cursor is already at `close`).
+    ///
+    /// This is the single source of truth for comma-list policy. Every
+    /// comma-separated construct — arg decls, enum variants, struct fields,
+    /// tuple-type elements, keyword args — routes through it, so trailing-comma
+    /// handling and the termination guarantee cannot drift between call sites
+    /// (that drift is what silently accepted an empty tuple type and dropped
+    /// trailing commas on it). Note this is distinct from the *comma-terminated*
+    /// lists (tuple expressions, match arms) where a comma after **every**
+    /// element is mandatory; those keep their own loops.
+    ///
+    /// Termination: every iteration that does not `break` consumes at least the
+    /// separator, so at most one iteration runs per remaining comma — a
+    /// non-consuming `parse_item` cannot spin.
+    fn separated_list<T>(
+        &mut self,
+        close: TokenKind,
+        mut parse_item: impl FnMut(&mut Self) -> T,
+    ) -> Vec<T> {
+        let mut items = Vec::new();
+        while !self.at(close) && !self.at(TokenKind::Eof) {
+            items.push(parse_item(self));
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        items
+    }
+
     #[inline]
     fn span(&self, t: Token) -> Span {
         Span::new(t.start as usize, t.end as usize)
+    }
+
+    /// Close a composite-node span that began at `lo` (the start offset of the
+    /// node's first token) at the end of the last consumed token. On an error
+    /// or recovery path a rule may consume nothing after capturing `lo`, leaving
+    /// `prev_end < lo`; clamp so the span is never inverted (`cfgrammar::Span::new`
+    /// panics when `end < start`). For well-formed nodes `prev_end >= lo`, so this
+    /// is a no-op and spans match the byte ranges ANTLR produced.
+    #[inline]
+    fn finish_span(&self, lo: u32) -> Span {
+        Span::new(lo as usize, self.prev_end.max(lo) as usize)
+    }
+
+    /// Enter a recursive rule, bumping the shared depth guard. Returns `false`
+    /// (leaving the depth unchanged) when the nesting limit is exceeded, so the
+    /// caller can record an error and return a degraded node. Pair every `true`
+    /// with `exit_depth`.
+    fn enter_depth(&mut self) -> bool {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            false
+        } else {
+            true
+        }
+    }
+
+    fn exit_depth(&mut self) {
+        self.depth -= 1;
     }
 
     /// Slice the source for token `t` (offsets are in original coords; subtract
@@ -151,11 +224,19 @@ impl<'a> Parser<'a> {
     }
 
     fn error_at(&mut self, span: Span, message: String) {
-        let pos = span.start() as u32;
-        if self.last_error_pos == Some(pos) {
+        // Suppress only an exact duplicate of the immediately preceding
+        // diagnostic (same start offset *and* same message) — the cascade an
+        // `expect` retry produces while the cursor is stuck on a bad token.
+        // Distinct diagnostics at the same offset are kept: they describe
+        // independent problems (e.g. a token that is simultaneously not an
+        // expression and not the expected `)`), so collapsing them by position
+        // alone dropped diagnostics ANTLR reported.
+        if let Some(last) = self.errors.last()
+            && last.span.start() == span.start()
+            && last.message == message
+        {
             return;
         }
-        self.last_error_pos = Some(pos);
         self.errors.push(ParseError { span, message });
     }
 
@@ -180,7 +261,6 @@ impl<'a> Parser<'a> {
         let mut decls = Vec::new();
         while !self.at(TokenKind::Eof) {
             let mark = self.ntok;
-            self.last_error_pos = None;
             match self.parse_decl() {
                 Some(decl) => decls.push(decl),
                 None => {
@@ -205,21 +285,33 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `callExpr` as a standalone entry (used by `parse_cell`). Returns `None`
-    /// (with an error recorded) if the input does not start a call.
+    /// `callExpr EOF` as a standalone entry (used by `parse_cell`). Returns
+    /// `None` (with an error recorded) unless the input is *exactly* one call
+    /// expression: the whole input must parse to an `Expr::Call` and reach EOF.
+    /// This rejects both trailing garbage (`f() junk`) and suffixed calls
+    /// (`f()!`, `f().x`, `f()[0]`, which parse to an `Emit`/`FieldAccess`/`Index`
+    /// root rather than a `Call`), keeping the "parses exactly a callExpr"
+    /// contract the old ANTLR `callExpr()` entry had.
     pub fn parse_cell_entry(&mut self) -> Option<CallExpr<&'a str, Md>> {
         let expr = self.parse_expr(0);
-        match expr {
-            Expr::Call(call) => Some(call),
-            other => {
-                self.error_at(
-                    self.span(self.cur),
-                    "expected a cell invocation".to_string(),
-                );
-                let _ = other;
-                None
-            }
+        let Expr::Call(call) = expr else {
+            self.error_at(
+                self.span(self.cur),
+                "expected a cell invocation".to_string(),
+            );
+            return None;
+        };
+        if !self.at(TokenKind::Eof) {
+            self.error_at(
+                self.span(self.cur),
+                format!(
+                    "expected end of input after cell invocation, found {}",
+                    self.cur.kind.describe()
+                ),
+            );
+            return None;
         }
+        Some(call)
     }
 
     fn recover_to_decl(&mut self) {
@@ -271,22 +363,12 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::KwStruct);
         let name = self.ident();
         self.expect(TokenKind::LBrace);
-        let mut fields = Vec::new();
-        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-            let mark = self.ntok;
-            fields.push(self.parse_struct_field());
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-            if self.ntok == mark {
-                self.bump();
-            }
-        }
+        let fields = self.separated_list(TokenKind::RBrace, |p| p.parse_struct_field());
         self.expect(TokenKind::RBrace);
         StructDecl {
             name,
             fields,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -300,7 +382,7 @@ impl<'a> Parser<'a> {
         StructField {
             name,
             ty,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -330,7 +412,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Semi);
         ModDecl {
             ident,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
         }
     }
 
@@ -347,7 +429,7 @@ impl<'a> Parser<'a> {
             name,
             args,
             scope,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -372,25 +454,14 @@ impl<'a> Parser<'a> {
             args,
             return_ty,
             scope,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
 
     /// `argDecls : (argDecl (COMMA argDecl)* COMMA?)?`
     fn parse_arg_decls(&mut self) -> Vec<ArgDecl<&'a str, Md>> {
-        let mut v = Vec::new();
-        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-            let mark = self.ntok;
-            v.push(self.parse_arg_decl());
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-            if self.ntok == mark {
-                self.bump();
-            }
-        }
-        v
+        self.separated_list(TokenKind::RParen, |p| p.parse_arg_decl())
     }
 
     /// `argDecl : ident COLON tySpec`
@@ -407,23 +478,20 @@ impl<'a> Parser<'a> {
 
     /// `enumVariants : (ident (COMMA ident)* COMMA?)?`
     fn parse_ident_list(&mut self) -> Vec<Ident<&'a str, Md>> {
-        let mut v = Vec::new();
-        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
-            let mark = self.ntok;
-            v.push(self.ident());
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-            if self.ntok == mark {
-                self.bump();
-            }
-        }
-        v
+        self.separated_list(TokenKind::RBrace, |p| p.ident())
     }
 
     /// `tySpec : ident | LBRACK tySpec RBRACK | LPAREN tySpecList RPAREN`
     fn parse_ty_spec(&mut self) -> TySpec<&'a str, Md> {
         let lo = self.cur.start;
+        // `[..]`/`(..)` nest recursively; guard the native stack like parse_expr.
+        if !self.enter_depth() {
+            self.error_at(self.span(self.cur), "type nesting too deep".to_string());
+            return TySpec {
+                kind: TySpecKind::Tuple(Vec::new()),
+                span: self.finish_span(lo),
+            };
+        }
         let kind = match self.cur.kind {
             TokenKind::LBrack => {
                 self.bump();
@@ -433,17 +501,12 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                let mut list = Vec::new();
-                if !self.at(TokenKind::RParen) {
-                    list.push(self.parse_ty_spec());
-                    while self.eat(TokenKind::Comma) {
-                        let mark = self.ntok;
-                        list.push(self.parse_ty_spec());
-                        if self.ntok == mark {
-                            break;
-                        }
-                    }
-                }
+                // `()` yields the empty (unit) tuple type; a trailing comma is
+                // allowed like every other comma list. `ty_from_spec` lowers the
+                // empty tuple to the unit type `Ty::Nil` (the type of the `()`
+                // value), so an empty tuple type is a real, usable type rather
+                // than an unhandled edge case.
+                let list = self.separated_list(TokenKind::RParen, |p| p.parse_ty_spec());
                 self.expect(TokenKind::RParen);
                 TySpecKind::Tuple(list)
             }
@@ -456,9 +519,10 @@ impl<'a> Parser<'a> {
                 TySpecKind::Tuple(Vec::new())
             }
         };
+        self.exit_depth();
         TySpec {
             kind,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
         }
     }
 
@@ -482,9 +546,7 @@ impl<'a> Parser<'a> {
     /// `Scope.span` covers only the braces (the annotation, if any, has its own
     /// span and is excluded), matching the ANTLR `AstBuilder`.
     fn parse_unannotated_scope(&mut self, ann: Option<Ident<&'a str, Md>>) -> Scope<&'a str, Md> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
+        if !self.enter_depth() {
             self.error_at(self.span(self.cur), "nesting too deep".to_string());
             let lo = self.cur.start;
             return Scope {
@@ -502,7 +564,6 @@ impl<'a> Parser<'a> {
 
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let mark = self.ntok;
-            self.last_error_pos = None;
             match self.cur.kind {
                 TokenKind::KwLet => {
                     let lb = self.parse_let_binding();
@@ -552,21 +613,18 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokenKind::RBrace);
 
-        // Tail fixup: a trailing un-semicoloned block-expr statement becomes the
-        // scope's tail (mirrors AstBuilder::build_unannotated_scope).
-        if tail.is_none()
-            && let Some(Statement::Expr {
-                semicolon: false, ..
-            }) = stmts.last()
-            && let Some(Statement::Expr { value, .. }) = stmts.pop()
-        {
-            tail = Some(value);
-        }
+        // No separate tail fixup is needed: the statement loop above already
+        // routes a trailing un-semicoloned expression into `tail` (the
+        // `at(RBrace) || at(Eof)` arm), and only ever pushes a `semicolon: false`
+        // statement when more tokens follow it — so a `semicolon: false`
+        // statement is never the last element here. (ANTLR's
+        // `build_unannotated_scope` built statements and the tail separately and
+        // did need the fixup; this single-pass loop does not.)
 
-        self.depth -= 1;
+        self.exit_depth();
         Scope {
             scope_annotation: ann,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             stmts,
             tail,
             metadata: (),
@@ -585,7 +643,7 @@ impl<'a> Parser<'a> {
             name,
             value,
             metadata: (),
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
         }
     }
 
@@ -602,7 +660,7 @@ impl<'a> Parser<'a> {
             seq,
             body,
             metadata: (),
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
         }
     }
 
@@ -619,7 +677,7 @@ impl<'a> Parser<'a> {
             cond,
             then,
             else_,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -629,7 +687,7 @@ impl<'a> Parser<'a> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwMatch);
         let scrutinee = self.parse_expr(0);
-        self.expect(TokenKind::LBrace);
+        let lbrace = self.expect(TokenKind::LBrace);
         let mut arms = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let mark = self.ntok;
@@ -638,11 +696,20 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.expect(TokenKind::RBrace);
+        let rbrace = self.expect(TokenKind::RBrace);
+        if arms.is_empty() {
+            // `matchArms : matchArm+` requires at least one arm; `match k {}` is
+            // a syntax error, not a degenerate empty-arm AST flowing into the
+            // type checker. Point the diagnostic at the empty `{}`.
+            self.error_at(
+                Span::new(lbrace.start as usize, rbrace.end as usize),
+                "match requires at least one arm".to_string(),
+            );
+        }
         MatchExpr {
             scrutinee,
             arms,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -657,7 +724,7 @@ impl<'a> Parser<'a> {
         MatchArm {
             pattern,
             expr,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
         }
     }
 
@@ -666,9 +733,7 @@ impl<'a> Parser<'a> {
     // ------------------------------------------------------------------
 
     fn parse_expr(&mut self, min_bp: u8) -> Expr<&'a str, Md> {
-        self.depth += 1;
-        if self.depth > MAX_DEPTH {
-            self.depth -= 1;
+        if !self.enter_depth() {
             self.error_at(
                 self.span(self.cur),
                 "expression nesting too deep".to_string(),
@@ -698,19 +763,19 @@ impl<'a> Parser<'a> {
                 continue;
             }
             // Infix binary / comparison.
-            if let Some((l_bp, r_bp)) = infix_bp(k) {
+            if let Some((op, l_bp, r_bp)) = infix_op(k) {
                 if l_bp < min_bp {
                     break;
                 }
                 self.bump();
                 let rhs = self.parse_expr(r_bp);
-                lhs = self.make_infix(k, lhs, rhs, lhs_start);
+                lhs = self.make_infix(op, lhs, rhs, lhs_start);
                 continue;
             }
             break;
         }
 
-        self.depth -= 1;
+        self.exit_depth();
         lhs
     }
 
@@ -727,7 +792,7 @@ impl<'a> Parser<'a> {
                 Expr::UnaryOp(Box::new(UnaryOpExpr {
                     op,
                     operand,
-                    span: Span::new(op_tok.start as usize, self.prev_end as usize),
+                    span: self.finish_span(op_tok.start),
                     metadata: (),
                 }))
             }
@@ -737,57 +802,33 @@ impl<'a> Parser<'a> {
 
     fn make_infix(
         &self,
-        k: TokenKind,
+        op: InfixOp,
         left: Expr<&'a str, Md>,
         right: Expr<&'a str, Md>,
         lhs_start: u32,
     ) -> Expr<&'a str, Md> {
-        let span = Span::new(lhs_start as usize, self.prev_end as usize);
-        match k {
-            TokenKind::Star
-            | TokenKind::Slash
-            | TokenKind::Percent
-            | TokenKind::Plus
-            | TokenKind::Minus => {
-                let op = match k {
-                    TokenKind::Star => BinOp::Mul,
-                    TokenKind::Slash => BinOp::Div,
-                    TokenKind::Percent => BinOp::Rem,
-                    TokenKind::Plus => BinOp::Add,
-                    _ => BinOp::Sub,
-                };
-                Expr::BinOp(Box::new(BinOpExpr {
-                    op,
-                    left,
-                    right,
-                    span,
-                    metadata: (),
-                }))
-            }
-            _ => {
-                let op = match k {
-                    TokenKind::EqEq => ComparisonOp::Eq,
-                    TokenKind::Neq => ComparisonOp::Ne,
-                    TokenKind::Geq => ComparisonOp::Geq,
-                    TokenKind::Gt => ComparisonOp::Gt,
-                    TokenKind::Leq => ComparisonOp::Leq,
-                    _ => ComparisonOp::Lt,
-                };
-                Expr::Comparison(Box::new(ComparisonExpr {
-                    op,
-                    left,
-                    right,
-                    span,
-                    metadata: (),
-                }))
-            }
+        let span = self.finish_span(lhs_start);
+        match op {
+            InfixOp::Bin(op) => Expr::BinOp(Box::new(BinOpExpr {
+                op,
+                left,
+                right,
+                span,
+                metadata: (),
+            })),
+            InfixOp::Cmp(op) => Expr::Comparison(Box::new(ComparisonExpr {
+                op,
+                left,
+                right,
+                span,
+                metadata: (),
+            })),
         }
     }
 
     /// Apply one suffix (`.field`, `.idx`, `[index]`, postfix `!`, `as ty`).
     /// `lhs_start` is the lexical start of the whole expression (see `parse_expr`).
     fn parse_suffix(&mut self, lhs: Expr<&'a str, Md>, lhs_start: u32) -> Expr<&'a str, Md> {
-        let start = lhs_start as usize;
         match self.cur.kind {
             TokenKind::Dot => {
                 self.bump();
@@ -797,7 +838,7 @@ impl<'a> Parser<'a> {
                         Expr::FieldAccess(Box::new(FieldAccessExpr {
                             base: lhs,
                             field,
-                            span: Span::new(start, self.prev_end as usize),
+                            span: self.finish_span(lhs_start),
                             metadata: (),
                         }))
                     }
@@ -810,7 +851,7 @@ impl<'a> Parser<'a> {
                         Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
                             base: lhs,
                             field,
-                            span: Span::new(start, self.prev_end as usize),
+                            span: self.finish_span(lhs_start),
                             metadata: (),
                         }))
                     }
@@ -833,7 +874,7 @@ impl<'a> Parser<'a> {
                 Expr::Index(Box::new(IndexExpr {
                     base: lhs,
                     index,
-                    span: Span::new(start, self.prev_end as usize),
+                    span: self.finish_span(lhs_start),
                     metadata: (),
                 }))
             }
@@ -841,7 +882,7 @@ impl<'a> Parser<'a> {
                 let t = self.bump();
                 Expr::Emit(Box::new(EmitExpr {
                     value: lhs,
-                    span: Span::new(start, t.end as usize),
+                    span: Span::new(lhs_start as usize, t.end as usize),
                     metadata: (),
                 }))
             }
@@ -851,7 +892,7 @@ impl<'a> Parser<'a> {
                 Expr::Cast(Box::new(CastExpr {
                     value: lhs,
                     ty,
-                    span: Span::new(start, self.prev_end as usize),
+                    span: self.finish_span(lhs_start),
                     metadata: (),
                 }))
             }
@@ -964,7 +1005,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen);
         Expr::Tuple(TupleExpr {
             items,
-            span: Span::new(lp.start as usize, self.prev_end as usize),
+            span: self.finish_span(lp.start),
             metadata: (),
         })
     }
@@ -989,7 +1030,7 @@ impl<'a> Parser<'a> {
         IdentPath {
             path,
             metadata: (),
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
         }
     }
 
@@ -1007,7 +1048,7 @@ impl<'a> Parser<'a> {
             scope_annotation: ann,
             func,
             args,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -1030,10 +1071,12 @@ impl<'a> Parser<'a> {
         }
 
         if self.is_kwarg_start() {
-            self.parse_kwargs(&mut kwargs);
+            kwargs = self.parse_kwargs();
         } else {
+            // Positional args until a `)`, a trailing comma, or the first
+            // keyword arg (after which only keyword args may follow). Each
+            // iteration consumes at least the separator, so the loop terminates.
             loop {
-                let mark = self.ntok;
                 posargs.push(self.parse_expr(0));
                 if !self.eat(TokenKind::Comma) {
                     break;
@@ -1042,11 +1085,8 @@ impl<'a> Parser<'a> {
                     break; // trailing comma
                 }
                 if self.is_kwarg_start() {
-                    self.parse_kwargs(&mut kwargs);
+                    kwargs = self.parse_kwargs();
                     break;
-                }
-                if self.ntok == mark {
-                    self.bump();
                 }
             }
         }
@@ -1054,7 +1094,7 @@ impl<'a> Parser<'a> {
         Args {
             posargs,
             kwargs,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -1064,20 +1104,9 @@ impl<'a> Parser<'a> {
         self.cur.kind == TokenKind::Ident && self.nxt.kind == TokenKind::Eq
     }
 
-    fn parse_kwargs(&mut self, kwargs: &mut Vec<KwArgValue<&'a str, Md>>) {
-        loop {
-            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
-                break;
-            }
-            let mark = self.ntok;
-            kwargs.push(self.parse_kw_arg_value());
-            if !self.eat(TokenKind::Comma) {
-                break;
-            }
-            if self.ntok == mark {
-                self.bump();
-            }
-        }
+    /// `kwArgList : kwArgValue (COMMA kwArgValue)* COMMA?`
+    fn parse_kwargs(&mut self) -> Vec<KwArgValue<&'a str, Md>> {
+        self.separated_list(TokenKind::RParen, |p| p.parse_kw_arg_value())
     }
 
     /// `kwArgValue : ident EQ expr`
@@ -1089,7 +1118,7 @@ impl<'a> Parser<'a> {
         KwArgValue {
             name,
             value,
-            span: Span::new(lo as usize, self.prev_end as usize),
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
@@ -1099,7 +1128,13 @@ impl<'a> Parser<'a> {
     /// defaults to 0 on failure, matching the ANTLR `AstBuilder`.
     fn parse_int_or_float(&mut self) -> Expr<&'a str, Md> {
         let i0 = self.bump();
-        if self.at(TokenKind::Dot) {
+        // `INTLIT .` forms a float (`1.`, `1.5`) — except when the `.` is
+        // immediately followed by an identifier, which is a field-access suffix
+        // on the integer (`1.foo`); leave that `.` for the Pratt suffix loop so
+        // an integer can be the base of `.field`/`.idx` like every other
+        // primary. A `.` before another `INTLIT`, or before any non-identifier
+        // token (e.g. `1.`), still assembles a float, matching prior behavior.
+        if self.at(TokenKind::Dot) && self.nxt.kind != TokenKind::Ident {
             let dot = self.bump();
             let end = if self.at(TokenKind::IntLit) {
                 self.bump().end

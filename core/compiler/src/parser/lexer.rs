@@ -172,27 +172,20 @@ impl<'a> Lexer<'a> {
             b';' => (TokenKind::Semi, 1),
             b',' => (TokenKind::Comma, 1),
             _ => {
-                // Unknown byte: emit a one-char Error token, advancing to the
-                // next UTF-8 boundary so spans stay char-aligned.
-                let w = utf8_width(b);
-                let end = (start + w).min(n);
+                // Unknown byte: emit a one-char Error token spanning the whole
+                // UTF-8 character. Advance past any continuation bytes
+                // (`0b10xx_xxxx`) to the next char boundary — the same rule as
+                // `str::is_char_boundary` — so subsequent spans stay aligned to
+                // char boundaries (the source is valid UTF-8).
+                let mut end = start + 1;
+                while end < n && self.src[end] & 0xC0 == 0x80 {
+                    end += 1;
+                }
                 self.pos = end;
                 return self.tok(TokenKind::Error, start, end);
             }
         };
         self.pos = start + len;
         self.tok(kind, start, start + len)
-    }
-}
-
-/// Width in bytes of the UTF-8 character whose leading byte is `b`.
-#[inline]
-fn utf8_width(b: u8) -> usize {
-    match b {
-        0x00..=0x7f => 1,
-        0xc0..=0xdf => 2,
-        0xe0..=0xef => 3,
-        0xf0..=0xf7 => 4,
-        _ => 1,
     }
 }

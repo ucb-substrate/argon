@@ -87,6 +87,8 @@ mod tests {
             "let x = a as Float!;",
             "let x = 1.0.2;",
             "let x = 100.;",
+            "let x = 1.foo;", // `<int>.field` is field access, not a float
+            "let x = 1.0.bar;",
             "let x = f();",
             "let x = (a,);",
             "let x = (a, b,);",
@@ -123,6 +125,7 @@ mod tests {
             "let x = foo(x=1, 2);", // positional after keyword
             "let x = ;",            // missing expression
             "let x = (a, b;",       // unterminated tuple
+            "let x = match k {};",  // empty match: `matchArms` requires >= 1 arm
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
@@ -139,23 +142,174 @@ mod tests {
 
     #[test]
     fn literal_values_and_spans() {
-        // Float value and span (covers the `100.` form), string trimming, and
-        // that an annotation strips the leading `#`.
-        let ast =
-            parse("cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n}\n").expect("parses");
-        let dump = format!("{:#?}", ast.ast);
-        assert!(dump.contains("value: 100.0"), "float value 100.0:\n{dump}");
+        use crate::ast::{Decl, Expr, Statement};
+
+        // Assert the concrete AST variant *and* that each node's span re-slices
+        // to exactly the source text it covers (the annotation pass relies on
+        // byte-exact spans), rather than fuzzy-matching a `{:#?}` dump.
+        let src = "cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n}\n";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell decl, got {:?}", ast.decls[0]);
+        };
+
+        // `let f = 100.;` — a FloatLiteral whose span is exactly `100.`.
+        let Statement::LetBinding(let_f) = &cell.scope.stmts[0] else {
+            panic!("expected a let binding, got {:?}", cell.scope.stmts[0]);
+        };
+        let Expr::FloatLiteral(f) = &let_f.value else {
+            panic!("expected a FloatLiteral, got {:?}", let_f.value);
+        };
+        assert_eq!(f.value, 100.0);
+        assert_eq!(&src[f.span.start()..f.span.end()], "100.");
+
+        // `let s = rect("met1");` — the StringLiteral value trims the quotes,
+        // but its span still covers them.
+        let Statement::LetBinding(let_s) = &cell.scope.stmts[1] else {
+            panic!("expected a let binding, got {:?}", cell.scope.stmts[1]);
+        };
+        let Expr::Call(call) = &let_s.value else {
+            panic!("expected a call, got {:?}", let_s.value);
+        };
+        let Expr::StringLiteral(s) = &call.args.posargs[0] else {
+            panic!("expected a StringLiteral, got {:?}", call.args.posargs[0]);
+        };
+        assert_eq!(s.value, "met1");
+        assert_eq!(&src[s.span.start()..s.span.end()], "\"met1\"");
+
+        // A scope annotation strips the leading `#`: `scope0`, not `#scope0`.
+        let src = "cell c() {\n  #scope0 foo();\n}\n";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell decl, got {:?}", ast.decls[0]);
+        };
+        let Statement::Expr {
+            value: Expr::Call(call),
+            ..
+        } = &cell.scope.stmts[0]
+        else {
+            panic!("expected an annotated call, got {:?}", cell.scope.stmts[0]);
+        };
+        let ann = call
+            .scope_annotation
+            .as_ref()
+            .expect("the call carries a scope annotation");
+        assert_eq!(ann.name, "scope0");
+        // The span excludes the `#` (so re-slicing yields `scope0`, not `#scope0`).
+        assert_eq!(&src[ann.span.start()..ann.span.end()], "scope0");
+    }
+
+    #[test]
+    fn int_dot_field_access_parses() {
+        use crate::ast::{Decl, Expr, Statement};
+
+        // `1.foo` is field access on an integer (`(1).foo`), not a malformed
+        // float: the `.` before an identifier is a suffix, not a fractional
+        // part. The greedy float assembly used to eat `1.` and strand `foo` (F4).
+        let src = "cell c() { let x = 1.foo; }";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
         assert!(
-            dump.contains("\"met1\""),
-            "string value met1 (quotes trimmed)"
+            parser.errors.is_empty(),
+            "`1.foo` should parse: {:?}",
+            parser.errors
+        );
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!()
+        };
+        let Statement::LetBinding(b) = &cell.scope.stmts[0] else {
+            panic!()
+        };
+        let Expr::FieldAccess(fa) = &b.value else {
+            panic!("expected a FieldAccess, got {:?}", b.value);
+        };
+        assert!(
+            matches!(fa.base, Expr::IntLiteral(_)),
+            "base should be an int literal, got {:?}",
+            fa.base
+        );
+        assert_eq!(fa.field.name, "foo");
+        assert_eq!(&src[fa.field.span.start()..fa.field.span.end()], "foo");
+    }
+
+    #[test]
+    fn non_ascii_char_is_one_full_width_error_token() {
+        use super::lexer::Lexer;
+        use super::token::TokenKind;
+
+        // `€` is a 3-byte UTF-8 char that begins no valid token. The lexer must
+        // emit a single Error token spanning the whole char (advancing past its
+        // continuation bytes to the next char boundary), so the following token
+        // starts on a char boundary and slicing never lands mid-char (F12).
+        let mut lex = Lexer::new("€x", 0);
+        let err = lex.next_token();
+        assert_eq!(err.kind, TokenKind::Error);
+        assert_eq!(
+            (err.start, err.end),
+            (0, 3),
+            "Error token should span all of `€`"
+        );
+        let ident = lex.next_token();
+        assert_eq!(ident.kind, TokenKind::Ident);
+        assert_eq!(
+            (ident.start, ident.end),
+            (3, 4),
+            "`x` lexes cleanly after the bad char"
         );
 
-        let ann = parse("cell c() {\n  #scope0 foo();\n}\n").expect("parses");
-        let dump = format!("{:#?}", ann.ast);
-        // The scope-annotation ident is `scope0` (no `#`).
+        // An ASCII byte that begins no token stays one byte wide.
+        let mut lex = Lexer::new("@", 0);
+        let err = lex.next_token();
+        assert_eq!(err.kind, TokenKind::Error);
+        assert_eq!((err.start, err.end), (0, 1));
+    }
+
+    #[test]
+    fn parse_cell_requires_a_single_invocation() {
+        // The cell entry must parse to exactly one call expression and reach EOF.
+        assert!(super::parse_cell("top()").is_ok());
+        assert!(super::parse_cell("top(1., 5)").is_ok());
+        // Trailing tokens after the call are no longer silently dropped (F3).
+        assert!(super::parse_cell("top() junk").is_err());
+        // Suffixed calls parse to a non-`Call` root, so they're rejected too.
+        assert!(super::parse_cell("top()!").is_err());
+        assert!(super::parse_cell("top().x").is_err());
+        assert!(super::parse_cell("top()[0]").is_err());
+        // Not a call at all.
+        assert!(super::parse_cell("1 + 2").is_err());
+    }
+
+    #[test]
+    fn tuple_types_parse() {
+        // Empty tuple type `()` (the unit type), trailing commas, and nesting all
+        // parse. Tuple types appear in `fn` signatures, so use whole programs (F2).
+        for src in [
+            "fn f() -> () {}",
+            "fn f(x: ()) {}",
+            "fn f(x: (Float, Int)) {}",
+            "fn f(x: (Float, Int,)) {}",
+            "fn f(x: [(Float, Int)]) -> (Int,) {}",
+        ] {
+            assert!(parse(src).is_ok(), "should parse: `{src}`");
+        }
+    }
+
+    #[test]
+    fn distinct_diagnostics_at_same_offset_are_kept() {
+        // `foo(` then `}`: the `}` is simultaneously where an expression, a `)`,
+        // and a `;` were expected — independent diagnostics at one byte offset.
+        // They must not collapse into a single error keyed only on position (F6).
+        let errs = parse("cell c() { let x = foo( }").unwrap_err();
+        let distinct: std::collections::BTreeSet<_> =
+            errs.iter().map(|e| e.message.clone()).collect();
         assert!(
-            dump.contains("name: \"scope0\""),
-            "annotation strips '#':\n{dump}"
+            distinct.len() >= 2,
+            "distinct diagnostics collapsed to one: {errs:#?}"
         );
     }
 

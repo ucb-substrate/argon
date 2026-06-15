@@ -282,11 +282,22 @@ fn parse(path: impl Into<PathBuf>) -> (ParseResult, ParseDiagnostics) {
     }
 }
 
+/// Wrap a cell-body snippet (a single statement, written without its trailing
+/// `;`) into a complete program by placing it in a throwaway cell:
+/// `cell __dummy__() { <input>; }`. The result is intended for the whole-file
+/// parser `parser::parse_ast` — e.g. to parse/annotate a snippet in the context
+/// of a full program.
+///
+/// This is **not** a preprocessing step for `parse_cell`: that function parses a
+/// bare invocation directly and would reject the `cell { ... }` wrapper.
 pub fn format_cell_input(input: &str) -> String {
     format!("cell __dummy__() {{ {input}; }}")
 }
 
-// Input should first be formatted with `format_cell_input`.
+/// Parse a single bare cell invocation — a `callExpr` such as `top(1., 5)` — and
+/// return it. The input is the invocation itself; do **not** wrap it with
+/// `format_cell_input` first. Used by the language server to read the target
+/// cell's name and literal arguments.
 pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, anyhow::Error> {
     match crate::parser::parse_cell(input) {
         Ok(ast) => Ok(ast),

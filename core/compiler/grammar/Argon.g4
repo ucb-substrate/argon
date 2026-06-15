@@ -211,8 +211,10 @@ tySpec
     | LPAREN tySpecList RPAREN
     ;
 
+// Zero or more types with an optional trailing comma. Empty (`()`) is the unit
+// type; a single element (`(T,)` or `(T)`) is a 1-tuple.
 tySpecList
-    : tySpec (COMMA tySpec)*
+    : (tySpec (COMMA tySpec)* COMMA?)?
     ;
 
 ENUM: 'enum';
