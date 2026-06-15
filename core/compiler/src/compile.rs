@@ -767,6 +767,11 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }),
             TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
+            // The empty tuple type `()` is the unit type, i.e. the type of the
+            // `()` value (`Expr::Nil` => `Ty::Nil`). Lower it to `Ty::Nil` so the
+            // two agree — otherwise `Ty::Tuple([])` would be a distinct type no
+            // value could inhabit (`is_eq_ty` never equates it with `Ty::Nil`).
+            TySpecKind::Tuple(t) if t.is_empty() => Ty::Nil,
             TySpecKind::Tuple(t) => Ty::Tuple(t.iter().map(|x| self.ty_from_spec(x)).collect()),
         }
     }

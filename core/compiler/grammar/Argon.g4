@@ -1,3 +1,9 @@
+// Reference grammar for the Argon language.
+//
+// NOTE: this file is documentation only. Argon is parsed by the hand-written
+// recursive-descent + Pratt parser in `core/compiler/src/parser/`; there is no
+// ANTLR/Java code generation in the build. Keep this grammar in sync with the
+// parser when the language changes.
 grammar Argon;
 
 ast
@@ -205,8 +211,10 @@ tySpec
     | LPAREN tySpecList RPAREN
     ;
 
+// Zero or more types with an optional trailing comma. Empty (`()`) is the unit
+// type; a single element (`(T,)` or `(T)`) is a 1-tuple.
 tySpecList
-    : tySpec (COMMA tySpec)*
+    : (tySpec (COMMA tySpec)* COMMA?)?
     ;
 
 ENUM: 'enum';
