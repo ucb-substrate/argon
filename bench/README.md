@@ -80,8 +80,13 @@ filter keeps the run from also executing the other (`#[ignore]`'d) tests. Each
 test writes `bench/results/<axis>.csv` with columns
 `size,time_s,peak_bytes,n_objects`. `plot_scaling.py` needs only the standard
 library to print the summary table; `matplotlib` is required to draw the figure.
-The fast `stress_*_smoke` tests (which just check that each example still
-compiles) run in the normal `cargo test` suite and are **not** ignored.
+The figure is drawn for the ACM `acmart` `sigconf` camera-ready format: it is
+sized to the full two-column text width (~7 in, i.e. a `figure*`), uses a
+colorblind-safe palette with distinct markers (legible in grayscale), and
+embeds its fonts as Type 42 — never Type 3, which ACM's TAPS pipeline rejects —
+so the PDF drops into the paper at `width=\textwidth` with no font-shrinking
+rescale. The fast `stress_*_smoke` tests (which just check that each example
+still compiles) run in the normal `cargo test` suite and are **not** ignored.
 
 ### Configuring the sweeps
 
@@ -128,12 +133,12 @@ parameter; "peak" is peak heap allocated during compilation.
 
 | Axis | largest `n` | time @ largest | peak mem @ largest | empirical scaling |
 | ---- | ----------- | -------------- | ------------------ | ----------------- |
-| Shapes (recursion)           | 32 000 rects   | 1.52 s  | 0.89 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
+| Shapes (recursion)           | 32 000 rects   | 1.54 s  | 0.89 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Instances                    | 64 000 insts   | 3.08 s  | 1.26 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Hierarchy, 1 child ref       | depth 128      | 0.005 s | 11 MiB   | **linear** in depth |
-| Coupled constraints          | 16 384 rects   | 1.76 s  | 0.59 GiB | **~linear** (time `∝ n^1.04`, mem `∝ n^0.90`) |
+| Coupled constraints          | 16 384 rects   | 1.37 s  | 0.59 GiB | **~linear** (time `∝ n^1.0`, mem `∝ n^0.90`) |
 | Shapes (`for`-loop)          | 32 000 rects   | 1.06 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
-| Hierarchy, 2 child refs      | depth 128      | 0.006 s | 11 MiB   | **linear** in depth (was exponential before the shared-type fix) |
+| Hierarchy, 2 child refs      | depth 128      | 0.005 s | 11 MiB   | **linear** in depth (was exponential before the shared-type fix) |
 
 ### Interpretation
 
@@ -157,8 +162,8 @@ parameter; "peak" is peak heap allocated during compilation.
   the dense SVD never runs. The general dense solver is retained only as a
   fallback for an *irreducible* coupled core (a block with no ≤2-variable
   pivot). This axis used to be **super-cubic** — `~22 s` at `n=1024`, steepening
-  toward the `O(n^3)` of dense factorization — and is now `~n^1.04` in time
-  (`1.76 s` at `n=16384`, 16× larger, in less memory than the old `n=1024`
+  toward the `O(n^3)` of dense factorization — and is now `~n^1.0` in time
+  (`1.37 s` at `n=16384`, 16× larger, in less memory than the old `n=1024`
   dense matrix used). The "general linear constraint solving (slow)" caveat in
   the top-level README now bites only for genuinely dense coupled blocks, not
   for the common sparse-but-coupled case.
@@ -170,8 +175,8 @@ parameter; "peak" is peak heap allocated during compilation.
   tree: whether a cell references its child **once** (`let i = inst(child());`)
   or **twice** (the `let c = child(); let i = inst(c);` idiom from the tutorial),
   `h{k}` holds shared pointers to the single type of `h{k-1}`, and both variants
-  cost the same — linear in depth (≈11 MiB / 6 ms at depth 128, the two series
-  within ~15% of each other). Before this fix the type was deep-copied per
+  cost the same — linear in depth (≈11 MiB / 5 ms at depth 128, the two series
+  within ~5% of each other). Before this fix the type was deep-copied per
   reference, so the single-ref chain was quadratic (`~depth^1.4`) and the
   double-ref chain **doubled with every level** (`×1.9` measured), exhausting
   memory beyond ~depth 20 (depth 18 alone took ~3.6 GiB / 11.5 s). The remaining
@@ -187,7 +192,7 @@ parameter; "peak" is peak heap allocated during compilation.
   persistent vector and lowering `range` to a native builtin made `cons`
   O(log n) and `range` O(n); the two series now coincide, both linear in time
   and memory out to 32 000 rectangles (`shapes_loop`: 1.06 s / 0.85 GiB;
-  `shapes`: 1.52 s / 0.89 GiB). The idiomatic `for i in std::range(n)` loop is
+  `shapes`: 1.54 s / 0.89 GiB). The idiomatic `for i in std::range(n)` loop is
   no longer a scaling hazard. The gap between the two series is now a small
   constant — `shapes_loop` is even marginally faster, as the native `range`
   avoids the per-element recursion overhead of `emit_shapes`.
