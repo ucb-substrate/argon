@@ -71,6 +71,34 @@ fn infix_op(k: TokenKind) -> Option<(InfixOp, u8, u8)> {
     })
 }
 
+/// A single-pass recursive-descent + Pratt parser over the [`Lexer`] token
+/// stream.
+///
+/// **Two-token lookahead.** The parser keeps a sliding window of `cur` (the
+/// token to act on) and `nxt` (one token of lookahead), refilled by
+/// [`Parser::bump`]. One token of lookahead is enough for every decision in the
+/// grammar — e.g. telling a keyword argument `name = expr` from a positional one
+/// requires peeking past the identifier at the `=` (see `is_kwarg_start`).
+///
+/// **Zero-copy.** Tokens carry only a kind and a byte span; identifier and
+/// string text is borrowed straight from the source `&'a str` by slicing that
+/// span (`slice_tok`/`slice_span`). No intermediate concrete syntax tree is
+/// built — AST nodes are produced directly during the walk.
+///
+/// **Accumulate-and-recover, never panic.** Diagnostics are pushed onto `errors`
+/// instead of aborting: a failed [`Parser::expect`] records an error and returns
+/// a zero-width synthetic token, and every list/statement loop carries a
+/// *progress guard* — it remembers `ntok` (the monotonic consumed-token count)
+/// at the top of the iteration and force-advances past a stuck token if nothing
+/// was consumed — so malformed input can never spin forever. A parse therefore
+/// reports many diagnostics in one pass and always yields a (possibly degraded)
+/// AST, which the language server relies on to analyze incomplete files on every
+/// keystroke.
+///
+/// **Spans.** Every node records a byte-offset [`Span`] into the *original*
+/// (untrimmed) input; composite-node spans are closed panic-safely by
+/// [`Parser::finish_span`]. The annotation pass later re-slices names and
+/// literal values from these spans, so they must be byte-exact.
 pub struct Parser<'a> {
     src: &'a str,
     base: usize,
@@ -732,6 +760,18 @@ impl<'a> Parser<'a> {
     // Expressions (Pratt)
     // ------------------------------------------------------------------
 
+    /// Parse an expression by **precedence climbing** (the Pratt loop).
+    ///
+    /// `min_bp` is the minimum left binding power an operator must have to bind
+    /// at this point. After parsing a prefix operand, the loop keeps folding
+    /// trailing suffix/infix operators into `lhs` while their *left* binding
+    /// power is `>= min_bp`, recursing with the operator's *right* binding power
+    /// for the right operand. Higher power binds tighter; a right power strictly
+    /// greater than the left power makes an operator left-associative (so
+    /// `a - b - c` parses as `(a - b) - c`). The powers live in one table,
+    /// [`infix_op`]; the suffix cluster (`.field`, `.idx`, `[]`, `!`, `as`) sits
+    /// at [`SUFFIX_BP`], tighter than any binary operator. A caller wanting a
+    /// full expression passes `min_bp == 0`.
     fn parse_expr(&mut self, min_bp: u8) -> Expr<&'a str, Md> {
         if !self.enter_depth() {
             self.error_at(
@@ -900,6 +940,13 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a primary expression: the atomic operand at the head of an
+    /// expression (the Pratt "null denotation"). Covers literals, identifier
+    /// paths and calls, the parenthesized/tuple/`nil` forms, sequence-nil `[]`,
+    /// and the block-form primaries `if`/`match`/`{…}` — which are themselves
+    /// expressions in Argon, so [`Self::parse_expr`] can still extend them with
+    /// trailing operators (e.g. `if c {a} else {b} + 1`). Trailing suffixes and
+    /// infix operators are applied by [`Self::parse_expr`], not here.
     fn parse_primary(&mut self) -> Expr<&'a str, Md> {
         match self.cur.kind {
             TokenKind::LParen => self.parse_paren(),
