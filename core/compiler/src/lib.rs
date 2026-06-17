@@ -450,12 +450,28 @@ mod tests {
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
     fn bench_hierarchy() {
         let _g = bench_guard();
+        // Deep hierarchies are traversed by native recursion in the compiler,
+        // so compiling `h{depth}` needs ~O(depth) native stack frames. The
+        // default ~2 MiB test-thread stack overflows past ~150 levels, so run
+        // the whole axis on a thread with a 512 MiB stack: that reaches a few
+        // thousand levels (the sweep below goes to 2048) and leaves headroom
+        // to push further via `ARGON_BENCH_HIER_*`. The thread is spawned once,
+        // outside the timed `measure()` loop, so it does not perturb timings.
+        std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(bench_hierarchy_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn bench_hierarchy_body() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/bench_hier");
         std::fs::create_dir_all(&dir).unwrap();
         let lib = dir.join("lib.ar");
 
         let mut rows = Vec::new();
-        for depth in bench_sizes("ARGON_BENCH_HIER_SINGLE", &[4, 8, 16, 32, 48, 64, 96, 128])
+        for depth in bench_sizes("ARGON_BENCH_HIER_SINGLE", &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
             .into_iter()
             .map(|d| d as usize)
         {
@@ -491,7 +507,7 @@ mod tests {
         // exponentially and had to be capped near depth 18.) Override
         // `ARGON_BENCH_HIER_DOUBLE` to push deeper.
         let mut rows = Vec::new();
-        for depth in bench_sizes("ARGON_BENCH_HIER_DOUBLE", &[4, 8, 16, 32, 48, 64, 96, 128])
+        for depth in bench_sizes("ARGON_BENCH_HIER_DOUBLE", &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
             .into_iter()
             .map(|d| d as usize)
         {
