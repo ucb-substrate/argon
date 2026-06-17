@@ -101,8 +101,8 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
 | `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024,2048,4096,8192,16384` |
-| `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,48,64,96,128` |
-| `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `4,8,16,32,48,64,96,128` |
+| `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,64,128,256,512,1024,2048` |
+| `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `4,8,16,32,64,128,256,512,1024,2048` |
 
 ```bash
 # e.g. sweep the for-loop variant out to the same sizes as bench_shapes
@@ -135,10 +135,10 @@ parameter; "peak" is peak heap allocated during compilation.
 | ---- | ----------- | -------------- | ------------------ | ----------------- |
 | Shapes (recursion)           | 32 000 rects   | 1.54 s  | 0.89 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
 | Instances                    | 64 000 insts   | 3.08 s  | 1.26 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
-| Hierarchy, 1 child ref       | depth 128      | 0.005 s | 11 MiB   | **linear** in depth |
+| Hierarchy, 1 child ref       | depth 2048     | 0.15 s  | 160 MiB  | **linear** in depth |
 | Coupled constraints          | 16 384 rects   | 1.37 s  | 0.59 GiB | **~linear** (time `∝ n^1.0`, mem `∝ n^0.90`) |
 | Shapes (`for`-loop)          | 32 000 rects   | 1.06 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
-| Hierarchy, 2 child refs      | depth 128      | 0.005 s | 11 MiB   | **linear** in depth (was exponential before the shared-type fix) |
+| Hierarchy, 2 child refs      | depth 2048     | 0.14 s  | 163 MiB  | **linear** in depth (was exponential before the shared-type fix) |
 
 ### Interpretation
 
@@ -175,13 +175,15 @@ parameter; "peak" is peak heap allocated during compilation.
   tree: whether a cell references its child **once** (`let i = inst(child());`)
   or **twice** (the `let c = child(); let i = inst(c);` idiom from the tutorial),
   `h{k}` holds shared pointers to the single type of `h{k-1}`, and both variants
-  cost the same — linear in depth (≈11 MiB / 5 ms at depth 128, the two series
-  within ~5% of each other). Before this fix the type was deep-copied per
+  cost the same — linear in depth (≈160 MiB / 0.15 s at depth 2048, the two
+  series within ~2% of each other). Before this fix the type was deep-copied per
   reference, so the single-ref chain was quadratic (`~depth^1.4`) and the
   double-ref chain **doubled with every level** (`×1.9` measured), exhausting
   memory beyond ~depth 20 (depth 18 alone took ~3.6 GiB / 11.5 s). The remaining
-  hierarchy limit is unrelated to the type representation: very deep chains hit a
-  native-recursion stack limit in the compiler at a few hundred levels.
+  hierarchy limit is unrelated to the type representation: the compiler walks the
+  hierarchy by native recursion, so depth is bounded by the stack — the benchmark
+  runs this axis on a 512 MiB stack (reaching a few thousand levels), and lifting
+  the cap entirely would mean turning that recursion into an explicit work-stack.
 
 - **Recursion and iteration now scale identically.** `shapes` and `shapes_loop`
   emit identical geometry; the only difference is that `shapes_loop` builds and

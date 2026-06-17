@@ -48,24 +48,27 @@ def apply_pub_style(matplotlib):
 
     The critical setting is ``fonttype = 42``: it embeds text as subsetted
     TrueType (Type 42) glyphs instead of matplotlib's default Type 3 fonts,
-    which ACM's TAPS pipeline (and IEEE PDF eXpress) reject. The serif face
-    (STIX -- a Times-metric font bundled with matplotlib, so no missing-font
-    fallback) matches the acmart body text. Sizes are chosen so that the
-    figure, dropped into a full-width ``figure*`` at the sigconf text width
-    (~7 in), renders its labels at roughly 7-9 pt without any rescaling.
+    which ACM's TAPS pipeline (and IEEE PDF eXpress) reject. The figure uses a
+    sans-serif (Arial) face; ``Arial`` is listed first for portability, then the
+    metric-identical open clones (Liberation Sans / Arimo), then ``Nimbus Sans``
+    (a Helvetica/Arial-metric clone -- the fallback present on this machine when
+    Arial proper is not installed). Every text element is >= 8 pt, so the figure,
+    dropped into a full-width ``figure*`` at the sigconf text width (~7 in),
+    renders all text at 8-9 pt without any rescaling.
     """
     matplotlib.rcParams.update({
         "pdf.fonttype": 42,
         "ps.fonttype": 42,
-        "font.family": "serif",
-        "font.serif": ["STIXGeneral", "Times New Roman", "DejaVu Serif"],
-        "mathtext.fontset": "stix",
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Arial", "Liberation Sans", "Arimo",
+                            "Nimbus Sans", "Helvetica", "DejaVu Sans"],
+        "mathtext.fontset": "dejavusans",
         "font.size": 8,
         "axes.titlesize": 9,
         "axes.labelsize": 8.5,
-        "xtick.labelsize": 7.5,
-        "ytick.labelsize": 7.5,
-        "legend.fontsize": 7.0,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 8,
+        "legend.fontsize": 8,
         "axes.linewidth": 0.7,
         "lines.linewidth": 1.3,
         "lines.markersize": 4.2,
@@ -173,17 +176,15 @@ def main():
         if key not in data:
             continue
         label, unit, model, xs, ts, ms = data[key]
-        t_suffix, _ = describe(model, xs, ts)
-        m_suffix, _ = describe(model, xs, ms)
         style = dict(marker=marker, color=color,
                      markeredgecolor="white", markeredgewidth=0.5)
-        ax_t.plot(xs, ts, label=f"{label} ({t_suffix})", **style)
-        ax_m.plot(xs, [m / 2**20 for m in ms], label=f"{label} ({m_suffix})", **style)
+        ax_t.plot(xs, ts, label=label, **style)
+        ax_m.plot(xs, [m / 2**20 for m in ms], label=label, **style)
 
     for ax in (ax_t, ax_m):
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.set_xlabel("problem size $n$")
+        ax.set_xlabel("problem size n")
         ax.grid(True, which="major", ls=":", alpha=0.45)
         ax.grid(True, which="minor", ls=":", alpha=0.2)
         ax.tick_params(which="both", direction="in", top=True, right=True)
