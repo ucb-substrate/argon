@@ -1,0 +1,4 @@
+cell test() {
+    dependency::Test::Test;
+    rect("met1", x0=0., y0=0., x1=dependency::x1(), y1=dependency::y1());
+}

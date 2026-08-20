@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
 
-use analyzer::config::default_argon_home;
+use analyzer::default_argon_home;
 use clap::Parser;
 use editor::Editor;
 use gpui::*;

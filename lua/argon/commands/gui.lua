@@ -7,9 +7,12 @@ function M.start_gui()
 end
 
 function M.open_cell(cell)
-    client.buf_request(0, "custom/openCell", {
+    local client_found = client.buf_request(0, "custom/openCell", {
         cell = cell
     }, client.print_error)
+    if not client_found then
+        vim.notify('No Argon language server is attached to this buffer', vim.log.levels.ERROR)
+    end
 end
 
 function M.set(kv)

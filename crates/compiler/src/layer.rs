@@ -1,3 +1,6 @@
+use std::{fs::File, io::BufReader, path::Path};
+
+use anyhow::{Context, Result, anyhow};
 use klayout_lyp::KlayoutLayerProperties;
 use rgb::Rgb;
 use serde::{Deserialize, Serialize};
@@ -28,4 +31,15 @@ impl From<KlayoutLayerProperties> for LayerProperties {
                 .collect(),
         }
     }
+}
+
+/// Load a KLayout layer-properties file while preserving useful path and parser
+/// context for command-line and editor diagnostics.
+pub fn read_lyp(path: impl AsRef<Path>) -> Result<LayerProperties> {
+    let path = path.as_ref();
+    let file = File::open(path)
+        .with_context(|| format!("could not read LYP file `{}`", path.display()))?;
+    let properties = klayout_lyp::from_reader(BufReader::new(file))
+        .map_err(|error| anyhow!("could not parse LYP file `{}`: {error}", path.display()))?;
+    Ok(properties.into())
 }

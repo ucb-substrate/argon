@@ -5,8 +5,8 @@ use std::{
 
 use analyzer::rpc::LangServerAction;
 use argonc::compile::{
-    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, ExecErrorKind, Rect, ScopeId,
-    SolvedValue, bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
+    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
+    bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
 };
 use canvas::{LayoutCanvas, ShapeFill};
 use futures::StreamExt;
@@ -235,10 +235,7 @@ impl EditorState {
                 output: Some(d),
                 errors,
             }) => {
-                if errors
-                    .iter()
-                    .any(|e| matches!(e.kind, ExecErrorKind::InvalidCell))
-                {
+                if errors.iter().any(|error| error.kind.is_invalid_cell()) {
                     let _ = self
                         .lang_server_client
                         .show_message(MessageType::ERROR, "Open cell is invalid");

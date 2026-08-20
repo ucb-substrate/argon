@@ -1,6 +1,7 @@
+pub mod artifact;
 pub mod ast;
 pub mod compile;
-pub mod config;
+pub mod diagnostics;
 pub mod gds;
 pub mod layer;
 pub mod parse;
@@ -94,7 +95,7 @@ mod tests {
     use crate::{
         compile::{ExecErrorKind, SolvedValue, StaticErrorKind},
         gds::GdsMap,
-        parse::parse_workspace_with_std,
+        parse::{parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
     use ::gds::GdsUnits;
     use approx::assert_relative_eq;
@@ -136,8 +137,9 @@ mod tests {
     const ARGON_SEQ_RECUR: &str = concatcp!(EXAMPLES_DIR, "/seq_recur/lib.ar");
     const ARGON_LUB_MATCH: &str = concatcp!(EXAMPLES_DIR, "/lub_match/lib.ar");
     const ARGON_SEQ_CELL: &str = concatcp!(EXAMPLES_DIR, "/seq_cell/lib.ar");
-    const ARGON_WORKSPACE: &str = concatcp!(EXAMPLES_DIR, "/argon_workspace/lib.ar");
-    const ARGON_EXTERNAL_MODS: &str = concatcp!(EXAMPLES_DIR, "/external_mods/main_crate/lib.ar");
+    const ARGON_LIBRARY: &str = concatcp!(EXAMPLES_DIR, "/argon_library/lib.ar");
+    const ARGON_PATH_DEPENDENCIES: &str =
+        concatcp!(EXAMPLES_DIR, "/path_dependencies/root_library/lib.ar");
     const ARGON_TEXT: &str = concatcp!(EXAMPLES_DIR, "/text/lib.ar");
     const ARGON_ANY_TYPE: &str = concatcp!(EXAMPLES_DIR, "/any_type/lib.ar");
     const ARGON_SEQ_INDEX: &str = concatcp!(EXAMPLES_DIR, "/seq_index/lib.ar");
@@ -977,8 +979,8 @@ mod tests {
     }
 
     #[test]
-    fn argon_workspace() {
-        let o = parse_workspace_with_std(ARGON_WORKSPACE);
+    fn argon_library() {
+        let o = parse_workspace_with_std(ARGON_LIBRARY);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
         let cells = compile(
@@ -1001,8 +1003,14 @@ mod tests {
     }
 
     #[test]
-    fn argon_external_mods() {
-        let o = parse_workspace_with_std(ARGON_EXTERNAL_MODS);
+    fn argon_path_dependencies() {
+        let o = parse_workspace_with_std_and_deps(
+            ARGON_PATH_DEPENDENCIES,
+            [(
+                "dependency".to_string(),
+                PathBuf::from(EXAMPLES_DIR).join("path_dependencies/dependency_library"),
+            )],
+        );
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
         let cells = compile(

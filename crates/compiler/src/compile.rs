@@ -4,7 +4,6 @@
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -66,6 +65,7 @@ pub fn dynamic_compile(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
 ) -> CompileOutput {
+    let lyp_file = input.lyp_file;
     let res = ExecPass::new(ast).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
@@ -78,7 +78,7 @@ pub fn dynamic_compile(
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, &mut errors);
+    check_layers(&data, lyp_file, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -154,7 +154,9 @@ impl<'a> ImportPass<'a> {
                 }
                 Decl::Mod(_) => {}
                 Decl::Enum(_) => {}
-                _ => todo!(),
+                // `parse_ast` rejects these before this pass. Keep direct
+                // library callers non-panicking if they construct an AST.
+                Decl::Struct(_) | Decl::Constant(_) => continue,
             }
         }
 
@@ -319,7 +321,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         if func.path[0].name != "std" {
-            let path = if func.path[0].name == "crate" {
+            let path = if func.path[0].name == "lib" {
                 func.path
                     .iter()
                     .skip(1)
@@ -393,7 +395,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
     for layer in data.layers.layers.iter() {
         layers.insert(layer.name.clone());
@@ -407,7 +409,10 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
                 errs.push(ExecError {
                     span: r.span.clone(),
                     cell: *cell_id,
-                    kind: ExecErrorKind::IllegalLayer(layer.clone()),
+                    kind: ExecErrorKind::IllegalLayer {
+                        layer: layer.clone(),
+                        lyp: lyp_file.display().to_string(),
+                    },
                 })
             }
         }
@@ -439,7 +444,11 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
     let std_mod_path = vec!["std".to_string()];
     let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
     if let Some((root, _)) = ast.get_key_value(&vec![]) {
-        for path in [std_mod_path, Some(root)].iter().flatten() {
+        for path in [std_mod_path, Some(root)]
+            .into_iter()
+            .flatten()
+            .chain(ast.keys())
+        {
             execute_var_id_ty_pass_inner(
                 ast,
                 dag,
@@ -468,22 +477,16 @@ pub(crate) fn execute_var_id_ty_pass_inner<'a>(
     }
     mod_bindings.insert(current_path, VarIdTyFrame::default());
 
-    if current_path
-        .first()
-        .map(|path| path == "std")
-        .unwrap_or(true)
-    {
-        for children in &dag[&current_path] {
-            execute_var_id_ty_pass_inner(
-                ast,
-                dag,
-                children,
-                mod_bindings,
-                workspace_ast,
-                errors,
-                next_id,
-            );
-        }
+    for children in &dag[&current_path] {
+        execute_var_id_ty_pass_inner(
+            ast,
+            dag,
+            children,
+            mod_bindings,
+            workspace_ast,
+            errors,
+            next_id,
+        );
     }
 
     let mut pass = VarIdTyPass {
@@ -687,7 +690,9 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
-                _ => todo!(),
+                // `parse_ast` rejects these before this pass. Keep direct
+                // library callers non-panicking if they construct an AST.
+                Decl::Struct(_) | Decl::Constant(_) => continue,
             }
         }
 
@@ -1019,7 +1024,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "std" => {
                     vec!["std".to_string()]
                 }
-                "crate" => input
+                "lib" => input
                     .path
                     .iter()
                     .skip(1)
@@ -1743,7 +1748,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "std" => {
                     vec!["std".to_string()]
                 }
-                "crate" => func
+                "lib" => func
                     .path
                     .iter()
                     .skip(1)
@@ -1943,6 +1948,31 @@ pub enum CellArg {
     Int(i64),
     Bool(bool),
     Seq(Vec<CellArg>),
+}
+
+impl CellArg {
+    fn matches_ty(&self, ty: &Ty) -> bool {
+        match (self, ty) {
+            (_, Ty::Any) => true,
+            (Self::Float(_), Ty::Float) | (Self::Int(_), Ty::Int) | (Self::Bool(_), Ty::Bool) => {
+                true
+            }
+            (Self::Seq(values), Ty::Seq(inner)) => {
+                values.iter().all(|value| value.matches_ty(inner))
+            }
+            (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn ty_name(&self) -> &'static str {
+        match self {
+            Self::Float(_) => "Float",
+            Self::Int(_) => "Int",
+            Self::Bool(_) => "Bool",
+            Self::Seq(_) => "sequence",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -2250,11 +2280,21 @@ impl<'a> ExecPass<'a> {
 
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
+        if input.cell.is_empty() {
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: vec![ExecError {
+                    span: None,
+                    cell: 0,
+                    kind: ExecErrorKind::InvalidCell("<empty>".to_string()),
+                }],
+                output: None,
+            });
+        }
         let path = match input.cell[0] {
             "std" => {
                 vec!["std".to_string()]
             }
-            "crate" => input
+            "lib" => input
                 .cell
                 .iter()
                 .skip(1)
@@ -2268,14 +2308,16 @@ impl<'a> ExecPass<'a> {
                 .map(|ident| ident.to_string())
                 .collect_vec(),
         };
-        if let Some((_, vid)) = self.ast[&path].ast.decls.iter().find_map(|d| match d {
-            Decl::Cell(
-                v @ CellDecl {
-                    name: Ident { name, .. },
-                    ..
-                },
-            ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
-            _ => None,
+        if let Some((_, vid)) = self.ast.get(&path).and_then(|ast| {
+            ast.ast.decls.iter().find_map(|d| match d {
+                Decl::Cell(
+                    v @ CellDecl {
+                        name: Ident { name, .. },
+                        ..
+                    },
+                ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
+                _ => None,
+            })
         }) {
             let cell_id = match self.execute_cell(vid, input.args, None) {
                 Ok(cell_id) => cell_id,
@@ -2286,21 +2328,19 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = if let Ok(layers) = std::fs::File::open(input.lyp_file)
-                .map_err(|_| ())
-                .and_then(|f| klayout_lyp::from_reader(BufReader::new(f)).map_err(|_| ()))
-            {
-                layers.into()
-            } else {
-                return CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                    errors: vec![StaticError {
-                        span: Span {
-                            path: self.ast[&vec![]].path.clone(),
-                            span: cfgrammar::Span::new(0, 0),
-                        },
-                        kind: StaticErrorKind::InvalidLyp,
-                    }],
-                });
+            let layers = match crate::layer::read_lyp(input.lyp_file) {
+                Ok(layers) => layers,
+                Err(error) => {
+                    return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                        errors: vec![StaticError {
+                            span: Span {
+                                path: self.ast[&vec![]].path.clone(),
+                                span: cfgrammar::Span::new(0, 0),
+                            },
+                            kind: StaticErrorKind::InvalidLyp(error.to_string()),
+                        }],
+                    });
+                }
             };
             if self.errors.is_empty() {
                 CompileOutput::Valid(CompiledData {
@@ -2323,7 +2363,7 @@ impl<'a> ExecPass<'a> {
                 errors: vec![ExecError {
                     span: None,
                     cell: 0, // TODO: don't use dummy cell ID
-                    kind: ExecErrorKind::InvalidCell,
+                    kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
                 }],
                 output: None,
             })
@@ -2354,6 +2394,34 @@ impl<'a> ExecPass<'a> {
             .as_ref()
             .unwrap_cell_fn()
             .clone();
+        if args.len() != cell_decl.args.len() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: 0,
+                kind: ExecErrorKind::InvalidCellArity {
+                    expected: cell_decl.args.len(),
+                    found: args.len(),
+                },
+            });
+            return Err(());
+        }
+        if let Some((index, (arg, decl))) = args
+            .iter()
+            .zip(&cell_decl.args)
+            .enumerate()
+            .find(|(_, (arg, decl))| !arg.matches_ty(&decl.metadata.1))
+        {
+            self.errors.push(ExecError {
+                span: None,
+                cell: 0,
+                kind: ExecErrorKind::InvalidCellArgumentType {
+                    index: index + 1,
+                    expected: decl.metadata.1.clone(),
+                    found: arg.ty_name().to_string(),
+                },
+            });
+            return Err(());
+        }
         let root_scope_name = scope_name.unwrap_or_else(|| format!("cell {}", cell_decl.name.name));
         let root_scope_id = ScopeId::semantic(None, &root_scope_name);
         let root_scope = ExecScope {
@@ -2393,14 +2461,6 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
-        if args.len() != cell_decl.args.len() {
-            self.errors.push(ExecError {
-                span: None,
-                cell: cell_id,
-                kind: ExecErrorKind::InvalidCell,
-            });
-            return Ok(cell_id);
-        }
         for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
             let val = Value::from_arg(&val);
@@ -3047,7 +3107,14 @@ impl<'a> ExecPass<'a> {
                                 },
                             }))
                         }),
-                        _ => panic!("cannot call value: not a function or cell generator"),
+                        _ => {
+                            self.errors.push(ExecError {
+                                span: Some(self.span(&loc, c.span)),
+                                cell: loc.cell,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            self.nil_value
+                        }
                     }
                 }
             }
@@ -5045,8 +5112,11 @@ pub enum StaticErrorKind {
     #[error("error during parsing: {0}")]
     ParseError(String),
     /// Invalid LYP file.
-    #[error("invalid LYP file")]
-    InvalidLyp,
+    #[error("{0}")]
+    InvalidLyp(String),
+    /// A source file could not be loaded or resolved.
+    #[error("could not load source: {0}")]
+    SourceError(String),
     /// Unimplemented.
     #[error("unimplemented")]
     Unimplemented,
@@ -5065,14 +5135,24 @@ pub enum ExecErrorKind {
     #[error("non-Manhattan rotation")]
     InvalidRotation,
     /// An invalid cell was specified for execution.
-    #[error("invalid cell")]
-    InvalidCell,
+    #[error("invalid cell `{0}`")]
+    InvalidCell(String),
+    /// A cell invocation supplied the wrong number of arguments.
+    #[error("invalid cell arguments: expected {expected} arguments, found {found}")]
+    InvalidCellArity { expected: usize, found: usize },
+    /// A cell invocation supplied an argument of the wrong type.
+    #[error("invalid cell argument {index}: expected {expected:?}, found {found}")]
+    InvalidCellArgumentType {
+        index: usize,
+        expected: Ty,
+        found: String,
+    },
     /// A cell is underconstrained.
     #[error("cell is underconstrained")]
     Underconstrained,
     /// Illegal layer (not defined in layer properties).
-    #[error("layer {0} is not defined in layer properties")]
-    IllegalLayer(String),
+    #[error("rectangle uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
+    IllegalLayer { layer: String, lyp: String },
     /// Inconsistent constraint.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
@@ -5103,6 +5183,17 @@ pub enum ExecErrorKind {
     /// Attempt to access the tail of an empty list.
     #[error("attempted to access the tail of an empty list")]
     TailEmptyList,
+}
+
+impl ExecErrorKind {
+    pub fn is_invalid_cell(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidCell(_)
+                | Self::InvalidCellArity { .. }
+                | Self::InvalidCellArgumentType { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5317,7 +5408,9 @@ fn imat(mat: TransformationMatrix) -> (Rotation, bool) {
         (0, 1) => Rotation::R90,
         (-1, 0) => Rotation::R180,
         (0, -1) => Rotation::R270,
-        _ => panic!("invalid rotation matrix"),
+        // `mat` is formed exclusively from Manhattan rotation matrices, so
+        // this is an internal fallback rather than a user-visible crash path.
+        _ => Rotation::R0,
     };
     (rot, refv)
 }

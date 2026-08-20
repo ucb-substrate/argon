@@ -36,14 +36,39 @@ To use Argon, you will need:
 - [Neovim (version 0.12.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
-Install the Argon analyzer and Argone layout editor from GitHub. Cargo places
-`argon-analyzer` and `argone` in its binary directory,
-which should be on your `PATH` after installing Rust with rustup.
+Install Argon from source:
 
 ```bash
 cargo install --git https://github.com/ucb-substrate/argon --locked \
-    argon-analyzer argone
+    argonc arc argon-analyzer argone
 ```
+
+## Command-line compilation
+
+Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
+manifest names the library and can set its layer-properties file and path
+dependencies:
+
+```toml
+name = "my-library"
+lyp = "layers.lyp"
+
+[dependencies]
+pdk = "../pdk"
+```
+
+From the library directory, check the source or run a cell:
+
+```bash
+arc check
+arc run --cell 'top(10., 20.)'
+arc run --cell 'top()' --gds
+```
+
+`arc check` checks the library without executing a cell. `arc run` writes the
+result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
+Dependency cells use their dependency name, for example
+`arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
 
 ### Neovim
 
@@ -66,13 +91,13 @@ in both Neovim and the GUI.
 
 ## Parametric Cell Tutorial
 
-Create a new Argon workspace with the following command:
+Create a new Argon library with the following command:
 
 ```bash
 mkdir tutorial && touch tutorial/lib.ar
 ```
 
-Your workspace directory should look like this:
+Your library directory should look like this:
 
 ```
 tutorial

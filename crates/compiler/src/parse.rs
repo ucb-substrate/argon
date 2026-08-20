@@ -10,13 +10,17 @@ use indexmap::IndexMap;
 use crate::{
     ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
     compile::{StaticError, StaticErrorKind},
-    config::parse_config,
     parser::ParseError,
 };
 
 pub struct ParseMetadata;
 pub type AnnotatedParseAst = AnnotatedAst<ParseMetadata>;
 pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;
+
+/// Virtual path used for diagnostics originating in the embedded standard library.
+pub const STD_PATH: &str = "<argon-std>/lib.ar";
+/// Source text embedded into the compiler for the Argon standard library.
+pub const STD_SOURCE: &str = include_str!("std/lib.ar");
 
 impl AstMetadata for ParseMetadata {
     type Ident = ();
@@ -121,6 +125,22 @@ impl ParseOutput {
                         }
                     }))
             })
+            .chain(self.asts.values().filter_map(|(ast, error)| {
+                let has_parse_diagnostics = self
+                    .errs
+                    .get(&ast.path)
+                    .is_some_and(|(diagnostics, _)| !diagnostics.is_empty());
+                (!has_parse_diagnostics)
+                    .then_some(error.as_ref())
+                    .flatten()
+                    .map(|error| StaticError {
+                        span: Span {
+                            path: ast.path.clone(),
+                            span: cfgrammar::Span::new(0, 0),
+                        },
+                        kind: StaticErrorKind::SourceError(error.to_string()),
+                    })
+            }))
             .collect()
     }
 }
@@ -175,33 +195,38 @@ fn parse_result_from_errors(
 }
 
 pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
+    parse_workspace_with_std_and_deps(root_lib, std::iter::empty::<(String, PathBuf)>())
+}
+
+/// Parses a library, its explicitly supplied path dependencies, and the Argon
+/// standard library. This function deliberately performs no manifest or
+/// configuration discovery; callers such as `arc` are responsible for
+/// resolving library configuration into concrete paths.
+pub fn parse_workspace_with_std_and_deps(
+    root_lib: impl AsRef<Path>,
+    dependencies: impl IntoIterator<Item = (String, PathBuf)>,
+) -> ParseOutput {
     let root_lib = root_lib.as_ref();
     let mut ast = IndexMap::new();
     let mut err = IndexMap::new();
-    let root_dir = root_lib.parent().unwrap();
-    if let Ok(config) = parse_config(root_dir.join("Argon.toml")) {
-        for (name, mod_path) in config.mods {
-            let ParseOutput { asts, errs } = parse_workspace(
-                if mod_path.is_relative() {
-                    root_dir.join(mod_path)
-                } else {
-                    mod_path
-                }
-                .join("lib.ar"),
-            );
-            ast.extend(asts.into_iter().map(|(mut k, v)| {
-                k.insert(0, name.clone());
-                (k, v)
-            }));
-            err.extend(errs);
-        }
+    for (name, path) in dependencies {
+        let dep_root = if path.is_dir() {
+            path.join("lib.ar")
+        } else {
+            path
+        };
+        let ParseOutput { asts, errs } = parse_workspace(dep_root);
+        ast.extend(asts.into_iter().map(|(mut k, v)| {
+            k.insert(0, name.clone());
+            (k, v)
+        }));
+        err.extend(errs);
     }
     let ParseOutput { asts, errs } = parse_workspace(root_lib);
     ast.extend(asts);
     err.extend(errs);
-    let std_path = PathBuf::from("<argon-std>/lib.ar");
-    let (std_ast, std_diagnostics) =
-        parse_source(ArcStr::from(include_str!("std/lib.ar")), std_path.clone());
+    let std_path = PathBuf::from(STD_PATH);
+    let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
     // TODO: fix std library overwriting user-defined std mods.
     ast.insert(vec!["std".to_string()], std_ast);
     err.insert(std_path, (std_diagnostics, Vec::new()));

@@ -167,6 +167,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argonc",
+ "clap",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
 name = "archery"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -196,6 +209,7 @@ dependencies = [
 name = "argon-analyzer"
 version = "0.1.0"
 dependencies = [
+ "arc",
  "arcstr",
  "argonc",
  "bytes",
@@ -223,7 +237,9 @@ dependencies = [
  "anyhow",
  "approx",
  "arcstr",
+ "bincode",
  "cfgrammar",
+ "clap",
  "const_format",
  "derive-where",
  "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
@@ -238,9 +254,9 @@ dependencies = [
  "regex",
  "rgb",
  "serde",
+ "serde_json",
  "sky130",
  "thiserror 2.0.20",
- "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
 ]

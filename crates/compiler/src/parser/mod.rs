@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use arcstr::ArcStr;
 use cfgrammar::Span;
 
-use crate::ast::CallExpr;
 use crate::ast::annotated::AnnotatedAst;
+use crate::ast::{CallExpr, Decl};
 use crate::parse::{AnnotatedParseAst, ParseMetadata};
 
 /// A syntax error with the byte span (into the original input) it occurred at.
@@ -41,6 +41,24 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
     let ast = parser.parse_root();
     if !parser.errors.is_empty() {
         return Err(parser.finish_errors(offset_base, input.len()));
+    }
+    let unsupported = ast
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::Struct(decl) => Some(ParseError {
+                span: decl.name.span,
+                message: "struct declarations are not implemented".to_string(),
+            }),
+            Decl::Constant(decl) => Some(ParseError {
+                span: decl.name.span,
+                message: "constant declarations are not implemented".to_string(),
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return Err(unsupported);
     }
     Ok(AnnotatedAst::new(input_for_ast, &ast, path))
 }

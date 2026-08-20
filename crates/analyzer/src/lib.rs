@@ -1,4 +1,3 @@
-pub mod config;
 pub mod document;
 pub mod rpc;
 
@@ -9,13 +8,13 @@ use std::{
     sync::Arc,
 };
 
+use arc::Library;
 use argonc::{
     ast::{Expr, Span},
     compile::{
         self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
         StaticErrorCompileOutput,
     },
-    config::{Config, parse_config},
     parse::{self, WorkspaceParseAst},
 };
 use futures::prelude::*;
@@ -39,10 +38,12 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    config::{default_argon_home, default_lyp_path},
-    document::{Document, DocumentChange},
-};
+use crate::document::{Document, DocumentChange};
+
+// TODO: Allow configuration via ARGON_HOME environment variable.
+pub fn default_argon_home() -> Option<PathBuf> {
+    Some(homedir::my_home().ok()??.join(".local/state/argon"))
+}
 
 // TODO: finer-grained synchronization?
 // TODO: Verify synchronization between GUI and editor files when appropriate.
@@ -50,13 +51,46 @@ use crate::{
 pub struct StateMut {
     gui: Option<Child>,
     root_dir: Option<PathBuf>,
-    config: Option<Config>,
+    config: Option<Library>,
     ast: WorkspaceParseAst,
     prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     compile_output: Option<CompileOutput>,
     cell: Option<String>,
     gui_client: Option<GuiClient>,
     editor_files: IndexMap<Uri, Document>,
+}
+
+fn cell_arg_from_expr(
+    expr: &Expr<&str, parse::ParseMetadata>,
+) -> std::result::Result<CellArg, String> {
+    match expr {
+        Expr::FloatLiteral(value) => Ok(CellArg::Float(value.value)),
+        Expr::IntLiteral(value) => Ok(CellArg::Int(value.value)),
+        Expr::BoolLiteral(value) => Ok(CellArg::Bool(value.value)),
+        Expr::SeqNil(_) => Ok(CellArg::Seq(Vec::new())),
+        _ => Err(
+            "cell arguments must be integer, float, boolean, or empty-list literals".to_string(),
+        ),
+    }
+}
+
+fn compile_error_messages(output: &CompileOutput) -> Vec<String> {
+    match output {
+        CompileOutput::FatalParseErrors => {
+            vec!["fatal parse errors encountered, unable to compile".to_string()]
+        }
+        CompileOutput::StaticErrors(output) => output
+            .errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect(),
+        CompileOutput::ExecErrors(output) => output
+            .errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect(),
+        CompileOutput::Valid(_) => Vec::new(),
+    }
 }
 
 impl StateMut {
@@ -115,23 +149,29 @@ impl StateMut {
 
     async fn compile(&mut self, client: &Client, update: bool) {
         if let Some(root_dir) = &self.root_dir {
-            self.config = parse_config(root_dir.join("Argon.toml")).ok();
-            let lyp = self
+            let manifest_path = root_dir.join("Argon.toml");
+            self.config = if manifest_path.is_file() {
+                match Library::load(&manifest_path) {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        client
+                            .show_message(MessageType::ERROR, error.to_string())
+                            .await;
+                        self.compile_output = None;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let lyp = self.config.as_ref().and_then(|config| config.lyp.clone());
+            let dependencies = self
                 .config
                 .as_ref()
-                .and_then(|config| {
-                    let lyp = config.lyp.as_ref()?;
-                    Some(if lyp.is_relative() {
-                        root_dir.join(lyp)
-                    } else {
-                        lyp.clone()
-                    })
-                })
-                .unwrap_or_else(|| {
-                    default_lyp_path()
-                        .unwrap_or_else(|| PathBuf::from("<argon-default-sky130.lyp>"))
-                });
-            let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
+                .map(|config| config.dependencies.clone())
+                .unwrap_or_default();
+            let parse_output =
+                parse::parse_workspace_with_std_and_deps(root_dir.join("lib.ar"), dependencies);
             let parse_errs = parse_output.static_errors();
             let ast = parse_output.ast();
             self.ast = ast;
@@ -142,6 +182,37 @@ impl StateMut {
                     static_output.errors.extend(parse_errs);
                     Some(CompileOutput::StaticErrors(static_output))
                 } else if let Some(cell) = &self.cell {
+                    let Some(lyp) = lyp.as_deref() else {
+                        let message = if manifest_path.is_file() {
+                            format!(
+                                "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
+                                manifest_path.display()
+                            )
+                        } else {
+                            format!(
+                                "no library manifest found at `{}`; create it and set `lyp = \"path/to/layers.lyp\"`",
+                                manifest_path.display()
+                            )
+                        };
+                        client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Could not open cell: {message}"),
+                            )
+                            .await;
+                        self.compile_output = None;
+                        return;
+                    };
+                    if let Err(error) = argonc::layer::read_lyp(lyp) {
+                        client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Could not open cell: {error}"),
+                            )
+                            .await;
+                        self.compile_output = None;
+                        return;
+                    }
                     match parse::parse_cell(cell) {
                         Ok(cell_ast) => {
                             let cell_path = cell_ast
@@ -150,27 +221,38 @@ impl StateMut {
                                 .iter()
                                 .map(|ident| ident.name)
                                 .collect_vec();
-                            Some(compile::dynamic_compile(
-                                &ast,
-                                CompileInput {
-                                    cell: &cell_path,
-                                    args: cell_ast
-                                        .args
-                                        .posargs
-                                        .iter()
-                                        .map(|arg| match arg {
-                                            Expr::FloatLiteral(float_literal) => {
-                                                CellArg::Float(float_literal.value)
-                                            }
-                                            Expr::IntLiteral(int_literal) => {
-                                                CellArg::Int(int_literal.value)
-                                            }
-                                            _ => panic!("must be int or float literal for now"),
-                                        })
-                                        .collect(),
-                                    lyp_file: &lyp,
-                                },
-                            ))
+                            if !cell_ast.args.kwargs.is_empty() {
+                                client
+                                    .show_message(
+                                        MessageType::ERROR,
+                                        "Open cell does not support keyword arguments yet",
+                                    )
+                                    .await;
+                                None
+                            } else if let Ok(args) = cell_ast
+                                .args
+                                .posargs
+                                .iter()
+                                .map(cell_arg_from_expr)
+                                .collect::<std::result::Result<Vec<_>, _>>()
+                            {
+                                Some(compile::dynamic_compile(
+                                    &ast,
+                                    CompileInput {
+                                        cell: &cell_path,
+                                        args,
+                                        lyp_file: lyp,
+                                    },
+                                ))
+                            } else {
+                                client
+                                    .show_message(
+                                        MessageType::ERROR,
+                                        "Open cell arguments must be integer, float, boolean, or empty-list literals",
+                                    )
+                                    .await;
+                                None
+                            }
                         }
                         Err(e) => {
                             client
@@ -189,6 +271,16 @@ impl StateMut {
                 Some(CompileOutput::FatalParseErrors)
             };
             self.compile_output = o;
+            if !update && let Some(output) = &self.compile_output {
+                for message in compile_error_messages(output) {
+                    client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("Could not open cell: {message}"),
+                        )
+                        .await;
+                }
+            }
             let mut tmp = self.diagnostics();
             let mut diagnostics = tmp.clone();
             std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
@@ -452,10 +544,7 @@ impl Backend {
             .editor_client
             .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            self_clone.compile_cell(params.cell).await;
-        });
+        self.compile_cell(params.cell).await;
         Ok(())
     }
 
@@ -553,4 +642,18 @@ pub async fn main() {
 
     // Start actual LSP server.
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use argonc::{compile::CellArg, parse};
+
+    use super::cell_arg_from_expr;
+
+    #[test]
+    fn open_cell_accepts_boolean_literals() {
+        let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
+        let arg = cell_arg_from_expr(&call.args.posargs[0]).expect("boolean should convert");
+        assert!(matches!(arg, CellArg::Bool(true)));
+    }
 }
