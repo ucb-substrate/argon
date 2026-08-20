@@ -1,6 +1,5 @@
 use std::{
     collections::HashSet,
-    ffi::OsStr,
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -26,9 +25,8 @@ enum ErrorFormat {
 #[derive(Debug, Parser)]
 #[command(version, about = "The Argon compiler")]
 struct Args {
-    /// Root Argon source file. Additional files are compiled as path modules.
-    #[arg(required = true)]
-    inputs: Vec<PathBuf>,
+    /// Argon library root. May be a directory or its lib.ar file.
+    root: PathBuf,
 
     /// Cell invocation to instantiate, for example `top(10., 20.)`.
     #[arg(long)]
@@ -39,10 +37,10 @@ struct Args {
     lyp: Option<PathBuf>,
 
     /// Path dependency in NAME=PATH form. PATH may be a directory or lib.ar.
-    #[arg(long = "dependency", alias = "extern", value_parser = parse_dependency)]
+    #[arg(long = "dependency", value_parser = parse_dependency)]
     dependencies: Vec<(String, PathBuf)>,
 
-    /// Binary compiler-output path. Defaults to the root source with a .bin suffix.
+    /// Binary compiler-output path. Defaults to lib.bin beside the root lib.ar.
     #[arg(short, long, requires = "cell")]
     output: Option<PathBuf>,
 
@@ -92,23 +90,15 @@ struct Failed(ErrorFormat, Vec<Diagnostic>);
 
 fn run(args: Args) -> Result<(), Failed> {
     let format = args.error_format;
-    let root = source_root(&args.inputs[0]);
-    let mut dependencies = args.dependencies;
-    let mut names: HashSet<String> = dependencies.iter().map(|(name, _)| name.clone()).collect();
-    for input in args.inputs.iter().skip(1) {
-        let Some(stem) = dependency_name(input) else {
-            return Err(fail(
-                format,
-                format!("cannot derive a module name from `{}`", input.display()),
-            ));
-        };
-        if !names.insert(stem.to_string()) {
-            return Err(fail(format, format!("duplicate path module `{stem}`")));
+    let root = source_root(&args.root);
+    let mut names = HashSet::new();
+    for (name, _) in &args.dependencies {
+        if !names.insert(name) {
+            return Err(fail(format, format!("duplicate path dependency `{name}`")));
         }
-        dependencies.push((stem.to_string(), input.clone()));
     }
 
-    let parse_output = parse_workspace_with_std_and_deps(&root, dependencies);
+    let parse_output = parse_workspace_with_std_and_deps(&root, args.dependencies);
     let parse_errors = parse_output.static_errors();
     let ast = parse_output.ast();
     let Some((typed_ast, mut static_output)) = compile::static_compile(&ast) else {
@@ -205,14 +195,6 @@ fn source_root(path: &Path) -> PathBuf {
     }
 }
 
-fn dependency_name(path: &Path) -> Option<&str> {
-    if path.file_name() == Some(OsStr::new("lib.ar")) {
-        path.parent()?.file_name()?.to_str()
-    } else {
-        path.file_stem()?.to_str()
-    }
-}
-
 fn cell_arg(expr: &Expr<&str, parse::ParseMetadata>) -> Result<CellArg, String> {
     match expr {
         Expr::FloatLiteral(value) => Ok(CellArg::Float(value.value)),
@@ -239,4 +221,258 @@ fn fail(format: ErrorFormat, message: impl Into<String>) -> Failed {
 
 fn compile_failed(format: ErrorFormat, output: CompileOutput) -> Failed {
     Failed(format, diagnostics::from_compile_output(&output))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use argonc::{artifact, compile::CompileOutput};
+    use clap::{CommandFactory, Parser};
+
+    use super::{Args, ErrorFormat, Failed, run};
+
+    fn temp_source(name: &str, source: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("argonc-{name}-{nonce}"));
+        fs::create_dir_all(&directory).expect("temporary directory should be created");
+        let path = directory.join("lib.ar");
+        fs::write(&path, source).expect("temporary source should be written");
+        path
+    }
+
+    fn basic_lyp() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp")
+    }
+
+    fn check_args(root: PathBuf) -> Args {
+        Args {
+            root,
+            cell: None,
+            lyp: None,
+            dependencies: Vec::new(),
+            output: None,
+            gds: None,
+            check: true,
+            error_format: ErrorFormat::Human,
+        }
+    }
+
+    fn execution_args(root: PathBuf, cell: &str, lyp: PathBuf) -> Args {
+        Args {
+            root,
+            cell: Some(cell.to_owned()),
+            lyp: Some(lyp),
+            dependencies: Vec::new(),
+            output: None,
+            gds: None,
+            check: false,
+            error_format: ErrorFormat::Human,
+        }
+    }
+
+    fn failed(args: Args) -> Failed {
+        match run(args) {
+            Ok(()) => panic!("compilation should fail"),
+            Err(error) => error,
+        }
+    }
+
+    fn render_failed(error: Failed) -> String {
+        let mut output = Vec::new();
+        for diagnostic in error.1 {
+            argonc::diagnostics::render(&mut output, &diagnostic, false)
+                .expect("diagnostic should render");
+        }
+        String::from_utf8(output).expect("diagnostics should be UTF-8")
+    }
+
+    #[test]
+    fn checks_a_source_file() {
+        let source = temp_source("valid", "cell top() {}\n");
+        assert!(run(check_args(source)).is_ok());
+    }
+
+    #[test]
+    fn checks_a_library_directory() {
+        let source = temp_source("directory-root", "cell top() {}\n");
+        let directory = source
+            .parent()
+            .expect("source should have a parent")
+            .to_owned();
+        assert!(run(check_args(directory)).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_second_positional_root() {
+        let first = temp_source("first-root", "cell first() {}\n");
+        let second = temp_source("second-root", "cell second() {}\n");
+        let error = Args::try_parse_from([
+            "argonc",
+            first.to_str().expect("path should be UTF-8"),
+            second.to_str().expect("path should be UTF-8"),
+            "--check",
+        ])
+        .expect_err("a second root should be rejected");
+        assert!(error.to_string().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn unsupported_source_is_a_diagnostic_not_a_panic() {
+        let source = temp_source("unsupported", "struct Point {}\n");
+        let diagnostic = render_failed(failed(check_args(source)));
+        assert!(
+            diagnostic.contains("error: error during parsing"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn missing_input_is_reported_cleanly() {
+        let diagnostic = render_failed(failed(check_args(PathBuf::from(
+            "/path/that/does/not/exist/lib.ar",
+        ))));
+        assert!(diagnostic.contains("could not load source"), "{diagnostic}");
+    }
+
+    #[test]
+    fn execution_writes_binary_output_without_gds_by_default() {
+        let source = temp_source(
+            "run",
+            "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.); }\n",
+        );
+        let directory = source.parent().expect("source should have a parent");
+        let artifact_path = directory.join("top.bin");
+        let implicit_gds_path = source.with_extension("gds");
+        let mut args = execution_args(source, "top()", basic_lyp());
+        args.output = Some(artifact_path.clone());
+
+        assert!(run(args).is_ok());
+        assert!(matches!(
+            artifact::read(artifact_path).expect("artifact should decode"),
+            CompileOutput::Valid(_)
+        ));
+        assert!(!implicit_gds_path.exists());
+    }
+
+    #[test]
+    fn execution_accepts_a_boolean_cell_argument() {
+        let source = temp_source("bool-root", "");
+        let dependency = temp_source(
+            "bool-dependency",
+            r#"cell device(enabled: Bool, w: Float, count: Int) {
+    if enabled {
+        rect("met1", x0=0., y0=0., w=w, h=10.);
+    } else {
+        rect("met1", x0=0., y0=0., w=w, h=20.);
+    };
+}
+"#,
+        );
+        let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_lyp());
+        args.dependencies.push(("devices".to_owned(), dependency));
+        args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
+        assert!(run(args).is_ok());
+    }
+
+    #[test]
+    fn invalid_cell_argument_type_is_reported_cleanly() {
+        let source = temp_source("invalid-argument-root", "");
+        let dependency = temp_source(
+            "invalid-argument-dependency",
+            "cell device(enabled: Bool, w: Float, count: Int) {}\n",
+        );
+        let mut args = execution_args(source, "devices::device(1, 150., 5)", basic_lyp());
+        args.dependencies.push(("devices".to_owned(), dependency));
+        args.output = Some(std::env::temp_dir().join("argonc-invalid-argument.bin"));
+        let diagnostic = render_failed(failed(args));
+        assert!(
+            diagnostic.contains("invalid cell argument 1: expected Bool, found Int"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn missing_lyp_is_reported_with_its_path() {
+        let source = temp_source("missing-lyp", "cell top() {}\n");
+        let missing = source
+            .parent()
+            .expect("source should have a parent")
+            .join("missing.lyp");
+        let diagnostic = render_failed(failed(execution_args(source, "top()", missing.clone())));
+        assert!(
+            diagnostic.contains("could not read LYP file"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&missing.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn malformed_lyp_is_reported_with_its_path() {
+        let source = temp_source("malformed-lyp", "cell top() {}\n");
+        let malformed = source
+            .parent()
+            .expect("source should have a parent")
+            .join("malformed.lyp");
+        fs::write(&malformed, "not XML").expect("malformed LYP should be written");
+        let diagnostic = render_failed(failed(execution_args(source, "top()", malformed.clone())));
+        assert!(
+            diagnostic.contains("could not parse LYP file"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&malformed.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn standard_library_errors_show_embedded_source_lines() {
+        let source = temp_source(
+            "std-diagnostic",
+            r#"cell top() {
+    let r = crect(layer="missing.drawing", x0=0., y0=0., w=10., h=10.);
+    std::array(r, 2, 20., 0.);
+}
+"#,
+        );
+        let lyp = basic_lyp();
+        let diagnostic = render_failed(failed(execution_args(source, "top()", lyp.clone())));
+        assert!(
+            diagnostic.contains(&format!(
+                "rectangle uses layer `missing.drawing`, which is not defined in LYP file `{}`",
+                lyp.display()
+            )),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("--> <argon-std>/lib.ar:"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("let first_rect = rect(r.layer);"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains("<argon-std>/lib.ar:1:1"));
+    }
+
+    #[test]
+    fn help_uses_dependency_terminology() {
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("<ROOT>"), "{help}");
+        assert!(!help.contains("<INPUTS>..."), "{help}");
+        assert!(!help.contains("path modules"), "{help}");
+        assert!(help.contains("--dependency"), "{help}");
+        assert!(!help.contains("--extern"), "{help}");
+    }
 }

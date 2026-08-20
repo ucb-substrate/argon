@@ -7,35 +7,17 @@ use anyhow::{Context, Result, bail};
 use indexmap::{IndexMap, IndexSet};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Human-readable library name shown by `arc`.
-    #[serde(default)]
-    pub name: Option<String>,
+    pub name: String,
     /// KLayout layer-properties file, relative to the manifest directory.
     #[serde(default)]
     pub lyp: Option<PathBuf>,
-    /// Legacy spelling for path dependencies. Retained for existing libraries.
-    #[serde(default)]
-    pub mods: IndexMap<String, PathBuf>,
     /// Path library dependencies.
     #[serde(default)]
-    pub dependencies: IndexMap<String, Dependency>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum Dependency {
-    Path(PathBuf),
-    Detailed { path: PathBuf },
-}
-
-impl Dependency {
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::Path(path) | Self::Detailed { path } => path,
-        }
-    }
+    pub dependencies: IndexMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,15 +37,8 @@ impl Library {
         let mut dependencies = IndexMap::new();
         let mut manifests = IndexSet::from_iter([manifest_key(manifest_path)]);
         collect_dependencies(&manifest, directory, &mut dependencies, &mut manifests)?;
-        let name = manifest.name.unwrap_or_else(|| {
-            directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("argon-library")
-                .to_string()
-        });
         Ok(Self {
-            name,
+            name: manifest.name,
             manifest_path: manifest_path.to_path_buf(),
             root: directory.join("lib.ar"),
             lyp: manifest.lyp.map(|path| resolve(directory, path)),
@@ -77,11 +52,7 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
         .with_context(|| format!("could not read manifest `{}`", path.display()))?;
     let manifest: Manifest = toml::from_str(&text)
         .with_context(|| format!("could not parse manifest `{}`", path.display()))?;
-    if manifest
-        .name
-        .as_deref()
-        .is_some_and(|name| name.trim().is_empty())
-    {
+    if manifest.name.trim().is_empty() {
         bail!(
             "library name in manifest `{}` cannot be empty",
             path.display()
@@ -96,17 +67,9 @@ fn collect_dependencies(
     resolved: &mut IndexMap<String, PathBuf>,
     manifests: &mut IndexSet<PathBuf>,
 ) -> Result<()> {
-    let mut direct = manifest.mods.clone();
     for (name, dependency) in &manifest.dependencies {
-        if direct.contains_key(name) {
-            bail!("dependency `{name}` is declared in both [mods] and [dependencies]");
-        }
-        direct.insert(name.clone(), dependency.path().to_path_buf());
-    }
-
-    for (name, path) in direct {
-        let path = resolve(directory, path);
-        if let Some(previous) = resolved.get(&name) {
+        let path = resolve(directory, dependency.clone());
+        if let Some(previous) = resolved.get(name) {
             if previous != &path {
                 bail!(
                     "path dependency `{name}` resolves to both `{}` and `{}`",
@@ -116,7 +79,7 @@ fn collect_dependencies(
             }
             continue;
         }
-        resolved.insert(name, path.clone());
+        resolved.insert(name.clone(), path.clone());
 
         let dependency_directory = if path.is_dir() {
             path.as_path()
@@ -161,32 +124,45 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Dependency, Library, Manifest};
+    use super::{Library, Manifest};
 
     #[test]
-    fn parses_legacy_short_and_detailed_dependencies() {
+    fn parses_manifest() {
         let manifest: Manifest = toml::from_str(
             r#"
                 name = "test-library"
                 lyp = "layers.lyp"
-                [mods]
-                old = "../old"
                 [dependencies]
-                short = "../short"
-                detailed = { path = "../detailed" }
+                dependency = "../dependency"
             "#,
         )
         .expect("manifest should parse");
-        assert_eq!(manifest.name.as_deref(), Some("test-library"));
-        assert_eq!(manifest.mods["old"], PathBuf::from("../old"));
-        assert!(matches!(
-            manifest.dependencies["short"],
-            Dependency::Path(_)
-        ));
-        assert!(matches!(
-            manifest.dependencies["detailed"],
-            Dependency::Detailed { .. }
-        ));
+        assert_eq!(manifest.name, "test-library");
+        assert_eq!(
+            manifest.dependencies["dependency"],
+            PathBuf::from("../dependency")
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_manifest_formats() {
+        let mods = toml::from_str::<Manifest>(
+            r#"
+                name = "test-library"
+                [mods]
+                dependency = "../dependency"
+            "#,
+        );
+        assert!(mods.is_err());
+
+        let detailed_dependency = toml::from_str::<Manifest>(
+            r#"
+                name = "test-library"
+                [dependencies]
+                dependency = { path = "../dependency" }
+            "#,
+        );
+        assert!(detailed_dependency.is_err());
     }
 
     #[test]
@@ -204,12 +180,12 @@ mod tests {
         }
         fs::write(
             app.join("Argon.toml"),
-            "name = \"app\"\n[dependencies]\nfirst = { path = \"../first\" }\n",
+            "name = \"app\"\n[dependencies]\nfirst = \"../first\"\n",
         )
         .expect("root manifest should be written");
         fs::write(
             first.join("Argon.toml"),
-            "name = \"first\"\n[dependencies]\nsecond = { path = \"../second\" }\n",
+            "name = \"first\"\n[dependencies]\nsecond = \"../second\"\n",
         )
         .expect("dependency manifest should be written");
 
