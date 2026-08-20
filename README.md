@@ -36,9 +36,7 @@ To use Argon, you will need:
 - [Neovim (version 0.12.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
-Install the Argon compiler, library manager, analyzer, and Argone layout editor from GitHub. Cargo places
-`argonc`, `arc`, `argon-analyzer`, and `argone` in its binary directory,
-which should be on your `PATH` after installing Rust with rustup.
+Install Argon from source:
 
 ```bash
 cargo install --git https://github.com/ucb-substrate/argon --locked \
@@ -47,33 +45,19 @@ cargo install --git https://github.com/ucb-substrate/argon --locked \
 
 ## Command-line compilation
 
-`argonc` compiles source directly and never reads a library manifest. `--check`
-runs source loading, dependency and module resolution, parsing, import analysis,
-and static type checking, then stops before executing a cell. Supplying a cell
-executes it and writes the compiler output as a binary artifact; `--gds`
-optionally writes GDS as well:
-
-```bash
-argonc lib.ar --check
-argonc lib.ar --cell 'top(10., 20.)' --lyp layers.lyp -o top.bin
-argonc lib.ar --cell 'top()' --lyp layers.lyp -o top.bin --gds top.gds
-```
-
-Path dependencies are supplied explicitly as `--dependency NAME=PATH`. Within
-an Argon library, `lib::` refers to that library's root module.
-
-`arc` reads `Argon.toml`, resolves library-relative paths, and invokes
-`argonc`. A library manifest can set its layer file and path dependencies:
+Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
+manifest names the library and can set its layer-properties file and path
+dependencies:
 
 ```toml
 name = "my-library"
 lyp = "layers.lyp"
 
 [dependencies]
-pdk = { path = "../pdk" }
+pdk = "../pdk"
 ```
 
-Check the library or execute a cell from the directory containing the manifest:
+From the library directory, check the source or run a cell:
 
 ```bash
 arc check
@@ -81,22 +65,10 @@ arc run --cell 'top(10., 20.)'
 arc run --cell 'top()' --gds
 ```
 
-For compatibility, existing `[mods]` path entries are also accepted.
-
-Argon binaries do not contain a bundled PDK or default layer map. A library
-using the Sky130 PDK must reference a local checkout explicitly, both as a path
-dependency and as the source of its layer-properties file. For example:
-
-```toml
-name = "my-sky130-layout"
-lyp = "../pdks/sky130/sky130.lyp"
-
-[dependencies]
-sky130 = { path = "../pdks/sky130" }
-```
-
-Cells from that dependency are addressed through its dependency name, such as
-`arc run --cell 'sky130::fet1v8(true, 150., 5)'`.
+`arc check` checks the library without executing a cell. `arc run` writes the
+result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
+Dependency cells use their dependency name, for example
+`arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
 
 ### Neovim
 
