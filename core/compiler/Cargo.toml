@@ -2,6 +2,7 @@
 name = "compiler"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }

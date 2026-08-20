@@ -3,6 +3,9 @@
 resolver = "2"
 members = ["core/compiler", "core/gui", "core/lang-server"]
 
+[workspace.package]
+license = "BSD-3-Clause"
+
 [workspace.dependencies]
 anyhow = "1"
 cfgrammar = { version = "0.15", features = ["serde"] }
@@ -12,7 +15,7 @@ approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
 indexmap = { version = "2", features = ["serde"] }
-im = "15"
+im = { package = "imbl", version = "7" }
 clap = { version = "4", features = ["derive"] }
 rgb = { version = "0.8", features = ["serde"] }
 thiserror = "2"

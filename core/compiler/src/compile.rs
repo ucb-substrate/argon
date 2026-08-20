@@ -2410,9 +2410,9 @@ impl<'a> ExecPass<'a> {
                 span: cell_decl.scope.span,
             },
             name: if let Some(anno) = scope_annotation {
-                format!("{} cell {}", anno, &cell_decl.name.name)
+                format!("{} cell {}", anno, cell_decl.name.name)
             } else {
-                format!("cell {} {}", &cell_decl.name.name, root_scope_id.0)
+                format!("cell {} {}", cell_decl.name.name, root_scope_id.0)
             },
             bindings: Default::default(),
         };
