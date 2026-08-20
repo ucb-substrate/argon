@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use compiler::compile::SolvedValue;
+use analyzer::rpc::LangServerAction;
+use argonc::compile::SolvedValue;
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
-use lang_server::rpc::LangServerAction;
 
 use crate::{
     actions::{DrawDim, DrawRect, SelectMode},

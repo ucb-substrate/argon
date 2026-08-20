@@ -307,15 +307,11 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
-        let scope_annotation = input
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let func = self.transform_ident_path(&input.func);
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         let o = CallExpr {
-            scope_annotation,
+            scope_order: input.scope_order,
             func,
             args,
             span: input.span,

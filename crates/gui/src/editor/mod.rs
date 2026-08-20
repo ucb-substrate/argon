@@ -3,16 +3,16 @@ use std::{
     net::SocketAddr,
 };
 
-use canvas::{LayoutCanvas, ShapeFill};
-use compiler::compile::{
+use analyzer::rpc::LangServerAction;
+use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, ExecErrorKind, Rect, ScopeId,
     SolvedValue, bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
 };
+use canvas::{LayoutCanvas, ShapeFill};
 use futures::StreamExt;
 use geometry::transform::TransformationMatrix;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
-use lang_server::rpc::LangServerAction;
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp_server::ls_types::MessageType;

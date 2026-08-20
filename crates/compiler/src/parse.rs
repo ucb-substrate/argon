@@ -199,17 +199,12 @@ pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
     let ParseOutput { asts, errs } = parse_workspace(root_lib);
     ast.extend(asts);
     err.extend(errs);
-    let std_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/std/lib.ar");
-    let ParseOutput {
-        asts: std_asts,
-        errs: std_errs,
-    } = parse_workspace(std_path);
+    let std_path = PathBuf::from("<argon-std>/lib.ar");
+    let (std_ast, std_diagnostics) =
+        parse_source(ArcStr::from(include_str!("std/lib.ar")), std_path.clone());
     // TODO: fix std library overwriting user-defined std mods.
-    ast.extend(std_asts.into_iter().map(|(mut k, v)| {
-        k.insert(0, "std".to_string());
-        (k, v)
-    }));
-    err.extend(std_errs);
+    ast.insert(vec!["std".to_string()], std_ast);
+    err.insert(std_path, (std_diagnostics, Vec::new()));
     ParseOutput {
         asts: ast,
         errs: err,
@@ -268,17 +263,18 @@ pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
 fn parse(path: impl Into<PathBuf>) -> (ParseResult, ParseDiagnostics) {
     let path = path.into();
     match std::fs::read_to_string(&path) {
-        Ok(input) => {
-            let input = ArcStr::from(input);
-            match crate::parser::parse_ast(input.clone(), path.clone()) {
-                Ok(ast) => ((ast, None), Vec::new()),
-                Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
-            }
-        }
+        Ok(input) => parse_source(ArcStr::from(input), path),
         Err(e) => (
             (make_backup_ast("".into(), path), Some(e.into())),
             Vec::new(),
         ),
+    }
+}
+
+fn parse_source(input: ArcStr, path: PathBuf) -> (ParseResult, ParseDiagnostics) {
+    match crate::parser::parse_ast(input.clone(), path.clone()) {
+        Ok(ast) => ((ast, None), Vec::new()),
+        Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
     }
 }
 
@@ -296,7 +292,7 @@ pub fn format_cell_input(input: &str) -> String {
 
 /// Parse a single bare cell invocation — a `callExpr` such as `top(1., 5)` — and
 /// return it. The input is the invocation itself; do **not** wrap it with
-/// `format_cell_input` first. Used by the language server to read the target
+/// `format_cell_input` first. Used by the analyzer to read the target
 /// cell's name and literal arguments.
 pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, anyhow::Error> {
     match crate::parser::parse_cell(input) {

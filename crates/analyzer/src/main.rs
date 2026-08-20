@@ -1,4 +1,4 @@
 #[tokio::main]
 async fn main() {
-    lang_server::main().await;
+    analyzer::main().await;
 }

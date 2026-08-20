@@ -31,7 +31,7 @@ local argon_command_tbl = {
   log = {
       impl = function(args, opts)
           -- TODO: allow configuration of log file name.
-          vim.cmd('tabnew ~/.local/state/argon/lang-server.log')
+          vim.cmd('tabnew ~/.local/state/argon/analyzer.log')
       end
   }
 }
@@ -106,4 +106,3 @@ function M.delete_argon_command()
 end
 
 return M
-

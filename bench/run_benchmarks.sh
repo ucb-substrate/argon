@@ -26,7 +26,7 @@
 #   ARGON_BENCH_INSTANCES, ARGON_BENCH_CONSTRAINTS, ARGON_BENCH_HIER_SINGLE,
 #   ARGON_BENCH_HIER_DOUBLE.
 #
-# Note: building `-p compiler` does not need the GUI's linker flags, so this
+# Note: building `-p argonc` does not need the GUI's linker flags, so this
 # script sets no RUSTFLAGS (any you already export are passed through, and are
 # harmless for the compiler crate).
 set -euo pipefail
@@ -44,7 +44,7 @@ echo "   CSVs   -> $SCRIPT_DIR/results/<axis>.csv"
 echo "   figure -> $SCRIPT_DIR/argon_scaling.{png,pdf}"
 echo
 
-cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture "$FILTER"
+cargo test -p argonc --release -- --ignored --test-threads=1 --nocapture "$FILTER"
 
 echo
 echo ">> Benchmarks finished in ${SECONDS}s. Regenerating figure and summary..."

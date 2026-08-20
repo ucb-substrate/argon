@@ -1,10 +1,10 @@
-use std::path::PathBuf;
-use std::{borrow::Cow, net::SocketAddr};
+use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
 
+use analyzer::config::default_argon_home;
 use clap::Parser;
 use editor::Editor;
 use gpui::*;
-use lang_server::config::default_argon_home;
+use rust_embed::RustEmbed;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -24,30 +24,28 @@ struct Args {
     lang_server_addr: SocketAddr,
 }
 
-struct Assets {
-    base: PathBuf,
-}
+#[derive(RustEmbed)]
+#[folder = "assets/"]
+struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        std::fs::read(self.base.join(path))
-            .map(|data| Some(std::borrow::Cow::Owned(data)))
-            .map_err(|err| err.into())
+        Ok(Self::get(path).map(|asset| Cow::Owned(asset.data.into_owned())))
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        std::fs::read_dir(self.base.join(path))
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| {
-                        entry
-                            .ok()
-                            .and_then(|entry| entry.file_name().into_string().ok())
-                            .map(SharedString::from)
-                    })
-                    .collect()
+        let path = path.trim_matches('/');
+        let prefix = (!path.is_empty()).then(|| format!("{path}/"));
+        let entries = Self::iter()
+            .filter_map(|asset_path| {
+                let relative = match &prefix {
+                    Some(prefix) => asset_path.strip_prefix(prefix)?,
+                    None => asset_path.as_ref(),
+                };
+                relative.split('/').next().map(str::to_string)
             })
-            .map_err(|err| err.into())
+            .collect::<BTreeSet<_>>();
+        Ok(entries.into_iter().map(SharedString::from).collect())
     }
 }
 
@@ -58,15 +56,13 @@ pub fn main() {
     if let Some(log_dir) = default_argon_home() {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
-            .with_writer(tracing_appender::rolling::never(log_dir, "gui.log"))
+            .with_writer(tracing_appender::rolling::never(log_dir, "argone.log"))
             .with_ansi(false)
             .init();
     }
 
     Application::new()
-        .with_assets(Assets {
-            base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets"),
-        })
+        .with_assets(Assets)
         .run(move |cx: &mut App| {
             // Load fonts.
             cx.text_system()

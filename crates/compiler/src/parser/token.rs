@@ -28,8 +28,6 @@ pub enum TokenKind {
 
     // Names & literals.
     Ident,
-    /// `#name` — the leading `#` is part of the token span; the parser strips it.
-    Annotation,
     IntLit,
     /// `"..."` — the span includes both quotes; the parser trims them.
     StrLit,
@@ -93,7 +91,6 @@ impl TokenKind {
             KwTrue => "'true'",
             KwFalse => "'false'",
             Ident => "identifier",
-            Annotation => "annotation",
             IntLit => "integer literal",
             StrLit => "string literal",
             PathSep => "'::'",

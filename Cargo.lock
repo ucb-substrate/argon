@@ -193,6 +193,92 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon-analyzer"
+version = "0.1.0"
+dependencies = [
+ "arcstr",
+ "argonc",
+ "bytes",
+ "cfgrammar",
+ "futures",
+ "homedir",
+ "indexmap",
+ "itertools 0.15.0",
+ "lsp-document",
+ "serde",
+ "serde_json",
+ "tarpc",
+ "tokio",
+ "tokio-util",
+ "tower-lsp-server",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "argonc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "arcstr",
+ "cfgrammar",
+ "const_format",
+ "derive-where",
+ "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
+ "gds",
+ "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
+ "imbl",
+ "indexmap",
+ "itertools 0.15.0",
+ "klayout-lyp",
+ "nalgebra",
+ "pegasus",
+ "regex",
+ "rgb",
+ "serde",
+ "sky130",
+ "thiserror 2.0.20",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
+]
+
+[[package]]
+name = "argone"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "approx",
+ "arcstr",
+ "argon-analyzer",
+ "argonc",
+ "async-compat",
+ "bytes",
+ "cfgrammar",
+ "clap",
+ "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
+ "futures",
+ "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
+ "gpui",
+ "indexmap",
+ "itertools 0.15.0",
+ "lazy_static",
+ "rgb",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tarpc",
+ "tower-lsp-server",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "array_map"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1388,35 +1474,6 @@ checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
 dependencies = [
  "nix 0.31.3",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "compiler"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "arcstr",
- "cfgrammar",
- "const_format",
- "derive-where",
- "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
- "gds",
- "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
- "imbl",
- "indexmap",
- "itertools 0.15.0",
- "klayout-lyp",
- "nalgebra",
- "pegasus",
- "regex",
- "rgb",
- "serde",
- "sky130",
- "thiserror 2.0.20",
- "toml 1.1.4+spec-1.1.0",
- "tracing",
- "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
 ]
 
 [[package]]
@@ -3227,39 +3284,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "approx",
- "arcstr",
- "async-compat",
- "bytes",
- "cfgrammar",
- "clap",
- "compiler",
- "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
- "futures",
- "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
- "gpui",
- "indexmap",
- "itertools 0.15.0",
- "lang-server",
- "lazy_static",
- "rgb",
- "rust-embed",
- "serde",
- "serde_json",
- "smallvec",
- "tarpc",
- "tower-lsp-server",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "unicode-segmentation",
-]
-
-[[package]]
 name = "h2"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4009,30 +4033,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0de8b303297635ad57c9f5059fd9cee7a47f8e8daa09df0fcd07dd39fb22977f"
 dependencies = [
  "log",
-]
-
-[[package]]
-name = "lang-server"
-version = "0.1.0"
-dependencies = [
- "arcstr",
- "bytes",
- "cfgrammar",
- "compiler",
- "futures",
- "homedir",
- "indexmap",
- "itertools 0.15.0",
- "lsp-document",
- "serde",
- "serde_json",
- "tarpc",
- "tokio",
- "tokio-util",
- "tower-lsp-server",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]

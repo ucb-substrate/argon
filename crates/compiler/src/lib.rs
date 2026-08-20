@@ -167,7 +167,7 @@ mod tests {
     // over 6 s in a debug build. Run them in release, serially (peak-memory
     // tracking is process-global), e.g.:
     //
-    //     RUSTFLAGS=... cargo test -p compiler --release -- \
+    //     RUSTFLAGS=... cargo test -p argonc --release -- \
     //         --ignored --test-threads=1 bench_
     //
     // The `stress_*_smoke` tests below run in the normal (debug) test suite and
@@ -241,7 +241,7 @@ mod tests {
     /// scales:
     ///
     ///     ARGON_BENCH_SHAPES_LOOP=500,1000,2000,4000,8000,16000,32000 \
-    ///         cargo test -p compiler --release -- --ignored --test-threads=1 \
+    ///         cargo test -p argonc --release -- --ignored --test-threads=1 \
     ///         --nocapture bench_shapes_loop
     ///
     /// The defaults are chosen so the whole suite runs in a few minutes and
@@ -295,7 +295,7 @@ mod tests {
 
     /// Axis 1: number of independent shapes in a single cell.
     #[test]
-    #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_shapes() {
         let _g = bench_guard();
         let o = parse_workspace_with_std(ARGON_STRESS_SHAPES);
@@ -333,7 +333,7 @@ mod tests {
     /// `range` lowers to a native builtin, this path is linear and is swept to
     /// the same sizes as `bench_shapes` so the two can be compared directly.
     #[test]
-    #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_shapes_loop() {
         let _g = bench_guard();
         let o = parse_workspace_with_std(ARGON_STRESS_SHAPES);
@@ -375,7 +375,7 @@ mod tests {
     /// the solver's sparse elimination pre-pass (2-variable constraints telescope away);
     /// the general dense SVD remains as a fallback for any irreducible coupled core.
     #[test]
-    #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_constraints() {
         let _g = bench_guard();
         let o = parse_workspace_with_std(ARGON_STRESS_CONSTRAINTS);
@@ -409,7 +409,7 @@ mod tests {
 
     /// Axis 3: number of instances of a single (cached) leaf cell.
     #[test]
-    #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_instances() {
         let _g = bench_guard();
         let o = parse_workspace_with_std(ARGON_STRESS_INSTANCES);
@@ -447,7 +447,7 @@ mod tests {
     /// references rather than copied (see `CellFnTy::cell`); `double_ref` is
     /// kept as a regression guard against the old exponential expansion.
     #[test]
-    #[ignore = "scaling benchmark; run in release, serially: cargo test -p compiler --release -- --ignored --test-threads=1 bench_"]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_hierarchy() {
         let _g = bench_guard();
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/bench_hier");
@@ -621,7 +621,15 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
-        println!("{cell:?}");
+        let data = cell.unwrap_valid();
+        let compiled = &data.cells[&data.top];
+        assert_eq!(compiled.scopes[&compiled.root].name, "cell scopes");
+        let child_names = compiled.scopes[&compiled.root]
+            .children
+            .iter()
+            .map(|id| compiled.scopes[id].name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(child_names, ["0 block"]);
     }
 
     #[test]
@@ -764,7 +772,24 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
-        println!("{cells:#?}");
+        let data = match cells {
+            crate::compile::CompileOutput::Valid(data) => data,
+            crate::compile::CompileOutput::ExecErrors(output) => output.output.unwrap(),
+            crate::compile::CompileOutput::StaticErrors(_) => panic!("static compilation failed"),
+            crate::compile::CompileOutput::FatalParseErrors => panic!("parsing failed"),
+        };
+        let scope_names = data
+            .cells
+            .values()
+            .flat_map(|cell| cell.scopes.values().map(|scope| scope.name.as_str()))
+            .collect::<Vec<_>>();
+        assert!(scope_names.contains(&"cell top"));
+        assert!(scope_names.contains(&"0 cell middle"));
+        assert!(scope_names.contains(&"0 cell bot"));
+        assert!(scope_names.contains(&"0 fn make_rect"));
+        assert!(scope_names.contains(&"1 fn emit_rect"));
+        assert!(scope_names.contains(&"1 block"));
+        assert!(scope_names.contains(&"2 else"));
     }
 
     #[test]

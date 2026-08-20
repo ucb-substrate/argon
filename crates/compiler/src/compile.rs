@@ -417,7 +417,6 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
 #[derive(Default, Debug)]
 pub(crate) struct VarIdTyFrame {
     var_bindings: IndexMap<Substr, (VarId, Ty)>,
-    scope_bindings: IndexSet<Substr>,
 }
 
 pub(crate) struct VarIdTyPass<'a> {
@@ -1119,11 +1118,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .map(|spec| self.transform_ty_spec(spec));
         // TODO: this code is mostly duplicated from `transform_scope`.
         self.enter_scope(&input.scope);
-        let scope_annotation = input
-            .scope
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let args: Vec<_> = input
             .args
             .iter()
@@ -1142,7 +1136,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
         let scope = Scope {
-            scope_annotation,
+            scope_order: input.scope.scope_order,
             span: input.span,
             stmts,
             tail,
@@ -1177,11 +1171,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
-        let scope_annotation = input
-            .scope
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let stmts = input
             .scope
             .stmts
@@ -1195,7 +1184,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
         let scope = Scope {
-            scope_annotation,
+            scope_order: input.scope.scope_order,
             span: input.scope.span,
             stmts,
             tail,
@@ -1245,10 +1234,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
-        let scope_annotation = input
-            .scope_annotation
-            .as_ref()
-            .map(|anno| self.transform_ident(anno));
         let func = IdentPath {
             path: input
                 .func
@@ -1262,7 +1247,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
-            scope_annotation,
+            scope_order: input.scope_order,
             func,
             args,
             span: input.span,
@@ -1281,24 +1266,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_if_expr(
         &mut self,
-        input: &IfExpr<Substr, Self::InputMetadata>,
+        _input: &IfExpr<Substr, Self::InputMetadata>,
         cond: &Expr<Substr, Self::OutputMetadata>,
         then: &Scope<Substr, Self::OutputMetadata>,
         else_: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
-        if let Some(scope_annotation) = &input.scope_annotation {
-            let span = self.span(scope_annotation.span);
-            let bindings = self.bindings.last_mut().unwrap();
-            if bindings.scope_bindings.contains(&scope_annotation.name) {
-                self.errors.push(StaticError {
-                    span,
-                    kind: StaticErrorKind::DuplicateNameDeclaration,
-                });
-            }
-            bindings
-                .scope_bindings
-                .insert(scope_annotation.name.clone());
-        }
         let cond_ty = cond.ty();
         let then_ty = then.metadata.clone();
         let else_ty = else_.metadata.clone();
@@ -1562,19 +1534,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         func: &IdentPath<Substr, Self::OutputMetadata>,
         args: &crate::ast::Args<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if let Some(scope_annotation) = &input.scope_annotation {
-            let span = self.span(scope_annotation.span);
-            let bindings = self.bindings.last_mut().unwrap();
-            if bindings.scope_bindings.contains(&scope_annotation.name) {
-                self.errors.push(StaticError {
-                    span,
-                    kind: StaticErrorKind::DuplicateNameDeclaration,
-                });
-            }
-            bindings
-                .scope_bindings
-                .insert(scope_annotation.name.clone());
-        }
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
@@ -1889,20 +1848,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
-    fn enter_scope(&mut self, input: &crate::ast::Scope<Substr, Self::InputMetadata>) {
-        if let Some(scope_annotation) = &input.scope_annotation {
-            let span = self.span(scope_annotation.span);
-            let bindings = self.bindings.last_mut().unwrap();
-            if bindings.scope_bindings.contains(&scope_annotation.name) {
-                self.errors.push(StaticError {
-                    span,
-                    kind: StaticErrorKind::DuplicateNameDeclaration,
-                });
-            }
-            bindings
-                .scope_bindings
-                .insert(scope_annotation.name.clone());
-        }
+    fn enter_scope(&mut self, _input: &crate::ast::Scope<Substr, Self::InputMetadata>) {
         self.bindings.push(Default::default());
     }
 
@@ -1945,11 +1891,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         };
         self.enter_scope(&input.body);
-        let scope_annotation = input
-            .body
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let var_id = self.alloc(&input.var.name, elem_ty);
         let stmts = input
             .body
@@ -1964,7 +1905,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(&input.body, &stmts, &tail);
         let body = Scope {
-            scope_annotation,
+            scope_order: input.body.scope_order,
             span: input.span,
             stmts,
             tail,
@@ -1976,6 +1917,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             var,
             seq,
             body,
+            scope_order: input.scope_order,
             metadata,
             span: input.span,
         }
@@ -2007,7 +1949,7 @@ pub enum CellArg {
 struct CellExecKey {
     cell: VarId,
     args: Vec<CellArgKey>,
-    scope_annotation: Option<String>,
+    scope_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -2105,6 +2047,24 @@ pub struct ObjectId(u64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ScopeId(u64);
+
+impl ScopeId {
+    /// Build a stable ID from the semantic hierarchy rather than execution's
+    /// global allocation order. FNV-1a is deliberately spelled out so IDs do
+    /// not depend on `DefaultHasher` implementation details.
+    fn semantic(parent: Option<Self>, name: &str) -> Self {
+        let mut hash = 0xcbf29ce484222325_u64;
+        if let Some(parent) = parent {
+            for byte in parent.0.to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+            }
+        }
+        for byte in name.bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+        Self(hash)
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub(crate) struct DynLoc {
@@ -2208,13 +2168,6 @@ struct ExecPass<'a> {
     compiled_cells: IndexMap<CellId, CompiledCell>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
     errors: Vec<ExecError>,
-}
-
-enum ExecScopeName {
-    // Exact name has been specified.
-    Specified(String),
-    // Exact name has not been specified, need to generate unique identifier based on prefix.
-    Prefix(String),
 }
 
 fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
@@ -2324,7 +2277,7 @@ impl<'a> ExecPass<'a> {
             ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
             _ => None,
         }) {
-            let cell_id = match self.execute_cell(vid, input.args, Some("TOP")) {
+            let cell_id = match self.execute_cell(vid, input.args, None) {
                 Ok(cell_id) => cell_id,
                 Err(()) => {
                     return CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -2381,12 +2334,12 @@ impl<'a> ExecPass<'a> {
         &mut self,
         cell: VarId,
         args: Vec<CellArg>,
-        scope_annotation: Option<&str>,
+        scope_name: Option<String>,
     ) -> Result<CellId, ()> {
         let cache_key = CellExecKey {
             cell,
             args: args.iter().map(CellArgKey::from).collect(),
-            scope_annotation: scope_annotation.map(|s| s.to_string()),
+            scope_name: scope_name.clone(),
         };
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
@@ -2401,7 +2354,8 @@ impl<'a> ExecPass<'a> {
             .as_ref()
             .unwrap_cell_fn()
             .clone();
-        let root_scope_id = self.scope_id();
+        let root_scope_name = scope_name.unwrap_or_else(|| format!("cell {}", cell_decl.name.name));
+        let root_scope_id = ScopeId::semantic(None, &root_scope_name);
         let root_scope = ExecScope {
             parent: None,
             static_parent: None,
@@ -2409,11 +2363,7 @@ impl<'a> ExecPass<'a> {
                 path: cell_decl.metadata.0.clone(),
                 span: cell_decl.scope.span,
             },
-            name: if let Some(anno) = scope_annotation {
-                format!("{} cell {}", anno, cell_decl.name.name)
-            } else {
-                format!("cell {} {}", cell_decl.name.name, root_scope_id.0)
-            },
+            name: root_scope_name,
             bindings: Default::default(),
         };
 
@@ -2792,10 +2742,6 @@ impl<'a> ExecPass<'a> {
         id
     }
 
-    fn scope_id(&mut self) -> ScopeId {
-        ScopeId(self.alloc_id())
-    }
-
     fn object_id(&mut self) -> ObjectId {
         ObjectId(self.alloc_id())
     }
@@ -2897,14 +2843,14 @@ impl<'a> ExecPass<'a> {
         cell_id: CellId,
         parent: ScopeId,
         static_parent: Option<(ScopeId, SeqNum)>,
-        name: ExecScopeName,
+        name: String,
         span: Span,
     ) -> ScopeId {
-        let id = self.scope_id();
-        let name = match name {
-            ExecScopeName::Specified(name) => name,
-            ExecScopeName::Prefix(prefix) => format!("{} {}", prefix, id.0),
-        };
+        let id = ScopeId::semantic(Some(parent), &name);
+        assert!(
+            !self.cell_state(cell_id).scopes.contains_key(&id),
+            "duplicate semantic scope ID for {name}"
+        );
         self.cell_state_mut(cell_id).scopes.insert(
             id,
             ExecScope {
@@ -2922,12 +2868,7 @@ impl<'a> ExecPass<'a> {
     ///
     /// The scope is inserted in the execution trace at the location specified by `loc`.
     /// The static and dynamic parents of the new scope both point to `loc`.
-    fn create_exec_scope_at_loc(
-        &mut self,
-        loc: DynLoc,
-        name: ExecScopeName,
-        span: Span,
-    ) -> ScopeId {
+    fn create_exec_scope_at_loc(&mut self, loc: DynLoc, name: String, span: Span) -> ScopeId {
         self.create_exec_scope(
             loc.cell,
             loc.scope,
@@ -3078,14 +3019,11 @@ impl<'a> ExecPass<'a> {
                                 loc.cell,
                                 loc.scope,
                                 None,
-                                if let Some(anno) = &c.scope_annotation {
-                                    ExecScopeName::Specified(format!(
-                                        "{} fn {}",
-                                        anno.name, val.name.name
-                                    ))
-                                } else {
-                                    ExecScopeName::Prefix(format!("fn {}", val.name.name))
-                                },
+                                format!(
+                                    "{} fn {}",
+                                    c.scope_order,
+                                    c.func.path.iter().map(|ident| &ident.name).join("::")
+                                ),
                                 Span {
                                     path: val.metadata.0.clone(),
                                     span: val.scope.span,
@@ -3140,11 +3078,7 @@ impl<'a> ExecPass<'a> {
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
-                    if let Some(scope_annotation) = &s.scope_annotation {
-                        ExecScopeName::Specified(scope_annotation.name.to_string())
-                    } else {
-                        ExecScopeName::Prefix("scope".to_string())
-                    },
+                    format!("{} block", s.scope_order),
                     self.span(&loc, s.span),
                 );
                 self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s)
@@ -3937,13 +3871,15 @@ impl<'a> ExecPass<'a> {
                             }
                         });
                     if unready.is_empty() {
+                        let scope_name = format!(
+                            "{} cell {}",
+                            c.expr.scope_order,
+                            c.expr.func.path.iter().map(|ident| &ident.name).join("::")
+                        );
                         let cell = self.execute_cell(
                             c.expr.metadata.0.unwrap(),
                             arg_vals,
-                            c.expr
-                                .scope_annotation
-                                .as_ref()
-                                .map(|anno| anno.name.as_str()),
+                            Some(scope_name),
                         )?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
@@ -4102,14 +4038,7 @@ impl<'a> ExecPass<'a> {
                         if *val.as_ref().unwrap_bool() {
                             let scope = self.create_exec_scope_at_loc(
                                 vref.loc,
-                                if let Some(scope_annotation) = &if_.expr.scope_annotation {
-                                    ExecScopeName::Specified(format!(
-                                        "{} if",
-                                        scope_annotation.name
-                                    ))
-                                } else {
-                                    ExecScopeName::Prefix("if".to_string())
-                                },
+                                format!("{} if", if_.expr.scope_order),
                                 self.span(&vref.loc, if_.expr.then.span),
                             );
                             let then = self.visit_scope_expr_inner(
@@ -4122,14 +4051,7 @@ impl<'a> ExecPass<'a> {
                         } else {
                             let scope = self.create_exec_scope_at_loc(
                                 vref.loc,
-                                if let Some(scope_annotation) = &if_.expr.scope_annotation {
-                                    ExecScopeName::Specified(format!(
-                                        "{} else",
-                                        scope_annotation.name
-                                    ))
-                                } else {
-                                    ExecScopeName::Prefix("else".to_string())
-                                },
+                                format!("{} else", if_.expr.scope_order),
                                 self.span(&vref.loc, if_.expr.else_.span),
                             );
                             let else_ = self.visit_scope_expr_inner(
@@ -4634,11 +4556,10 @@ impl<'a> ExecPass<'a> {
                         frame.bindings.insert(f.for_loop.metadata, elem_vid);
                         let scope = self.create_exec_scope_at_loc(
                             vref.loc,
-                            if let Some(scope_annotation) = &f.for_loop.body.scope_annotation {
-                                ExecScopeName::Specified(format!("{} {i}", scope_annotation.name))
-                            } else {
-                                ExecScopeName::Prefix(format!("for {i}"))
-                            },
+                            format!(
+                                "{} for {}[{i}]",
+                                f.for_loop.scope_order, f.for_loop.var.name
+                            ),
                             self.span(&vref.loc, f.for_loop.body.span),
                         );
                         let fid = self.frame_id();

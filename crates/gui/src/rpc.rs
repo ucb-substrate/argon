@@ -4,18 +4,18 @@ use std::{
     time::Duration,
 };
 
+use analyzer::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient, ValueEdit};
 use anyhow::{Result, anyhow};
-use async_compat::CompatExt;
-use compiler::{
+use argonc::{
     ast::Span,
     compile::{BasicRect, CompileOutput},
 };
+use async_compat::CompatExt;
 use futures::{
     channel::mpsc::{self, Receiver, Sender},
     prelude::*,
 };
 use gpui::AsyncApp;
-use lang_server::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient, ValueEdit};
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},

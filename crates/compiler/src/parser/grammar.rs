@@ -4,8 +4,7 @@
 //! single pass — no intermediate concrete syntax tree. Identifier and string
 //! text is borrowed straight from the source (`&'a str`); every node records a
 //! byte-offset `cfgrammar::Span` that indexes the original (untrimmed) input,
-//! matching the spans the ANTLR integration produced (the annotation pass later
-//! re-slices names/values from these spans).
+//! matching the spans the ANTLR integration produced.
 //!
 //! Expression precedence/associativity mirrors the ANTLR `expr` rule exactly
 //! (validated against the generated `expr_rec`/`precpred`): prefix unary binds
@@ -23,6 +22,7 @@ use crate::ast::{
     SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
     TySpecKind, UnaryOp, UnaryOpExpr,
 };
+use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
 
 use super::ParseError;
@@ -92,13 +92,13 @@ fn infix_op(k: TokenKind) -> Option<(InfixOp, u8, u8)> {
 /// at the top of the iteration and force-advances past a stuck token if nothing
 /// was consumed — so malformed input can never spin forever. A parse therefore
 /// reports many diagnostics in one pass and always yields a (possibly degraded)
-/// AST, which the language server relies on to analyze incomplete files on every
+/// AST, which the analyzer relies on to analyze incomplete files on every
 /// keystroke.
 ///
 /// **Spans.** Every node records a byte-offset [`Span`] into the *original*
 /// (untrimmed) input; composite-node spans are closed panic-safely by
-/// [`Parser::finish_span`]. The annotation pass later re-slices names and
-/// literal values from these spans, so they must be byte-exact.
+/// [`Parser::finish_span`]. Later AST passes re-slice names and literal values
+/// from these spans, so they must be byte-exact.
 pub struct Parser<'a> {
     src: &'a str,
     base: usize,
@@ -110,6 +110,8 @@ pub struct Parser<'a> {
     prev_end: u32,
     /// Monotonic count of consumed tokens, used by loop progress guards.
     ntok: u64,
+    /// Next semantic scope ordinal in each enclosing lexical scope.
+    scope_orders: Vec<u64>,
     depth: u32,
     pub errors: Vec<ParseError>,
 }
@@ -127,6 +129,7 @@ impl<'a> Parser<'a> {
             cur,
             nxt,
             ntok: 0,
+            scope_orders: vec![0],
             depth: 0,
             errors: Vec::new(),
         }
@@ -237,6 +240,17 @@ impl<'a> Parser<'a> {
 
     fn exit_depth(&mut self) {
         self.depth -= 1;
+    }
+
+    fn next_scope_order(&mut self) -> u64 {
+        let next = self.scope_orders.last_mut().unwrap();
+        let order = *next;
+        *next += 1;
+        order
+    }
+
+    fn current_scope_order(&self) -> u64 {
+        *self.scope_orders.last().unwrap()
     }
 
     /// Slice the source for token `t` (offsets are in original coords; subtract
@@ -558,27 +572,17 @@ impl<'a> Parser<'a> {
     // Scopes & statements
     // ------------------------------------------------------------------
 
-    /// `scope : scopeAnnotation? unannotatedScope`
+    /// `scope : LBRACE statements (expr)? RBRACE`
     fn parse_scope(&mut self) -> Scope<&'a str, Md> {
-        let ann = if self.at(TokenKind::Annotation) {
-            let t = self.bump();
-            Some(self.annotation_ident(t))
-        } else {
-            None
-        };
-        self.parse_unannotated_scope(ann)
+        self.parse_unannotated_scope(0)
     }
 
-    /// `unannotatedScope : LBRACE statements (expr)? RBRACE`
-    ///
-    /// `Scope.span` covers only the braces (the annotation, if any, has its own
-    /// span and is excluded), matching the ANTLR `AstBuilder`.
-    fn parse_unannotated_scope(&mut self, ann: Option<Ident<&'a str, Md>>) -> Scope<&'a str, Md> {
+    fn parse_unannotated_scope(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
         if !self.enter_depth() {
             self.error_at(self.span(self.cur), "nesting too deep".to_string());
             let lo = self.cur.start;
             return Scope {
-                scope_annotation: ann,
+                scope_order,
                 span: Span::new(lo as usize, lo as usize),
                 stmts: Vec::new(),
                 tail: None,
@@ -587,6 +591,7 @@ impl<'a> Parser<'a> {
         }
         let lb = self.expect(TokenKind::LBrace);
         let lo = lb.start;
+        self.scope_orders.push(0);
         let mut stmts = Vec::new();
         let mut tail: Option<Expr<&'a str, Md>> = None;
 
@@ -640,6 +645,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RBrace);
+        self.scope_orders.pop();
 
         // No separate tail fixup is needed: the statement loop above already
         // routes a trailing un-semicoloned expression into `tail` (the
@@ -651,7 +657,7 @@ impl<'a> Parser<'a> {
 
         self.exit_depth();
         Scope {
-            scope_annotation: ann,
+            scope_order,
             span: self.finish_span(lo),
             stmts,
             tail,
@@ -678,6 +684,7 @@ impl<'a> Parser<'a> {
     /// `forLoop : FOR ident IN expr scope`
     fn parse_for_loop(&mut self) -> ForLoop<&'a str, Md> {
         let lo = self.cur.start;
+        let scope_order = self.next_scope_order();
         self.expect(TokenKind::KwFor);
         let var = self.ident();
         self.expect(TokenKind::KwIn);
@@ -687,21 +694,20 @@ impl<'a> Parser<'a> {
             var,
             seq,
             body,
+            scope_order,
             metadata: (),
             span: self.finish_span(lo),
         }
     }
 
-    /// `ifExpr : scopeAnnotation? IF expr scope ELSE scope`. `lo` is the start
-    /// offset of the first token (annotation if present, else `if`).
-    fn parse_if(&mut self, ann: Option<Ident<&'a str, Md>>, lo: u32) -> IfExpr<&'a str, Md> {
+    fn parse_if(&mut self, scope_order: u64, lo: u32) -> IfExpr<&'a str, Md> {
         self.expect(TokenKind::KwIf);
         let cond = self.parse_expr(0);
         let then = self.parse_scope();
         self.expect(TokenKind::KwElse);
         let else_ = self.parse_scope();
         IfExpr {
-            scope_annotation: ann,
+            scope_order,
             cond,
             then,
             else_,
@@ -953,16 +959,24 @@ impl<'a> Parser<'a> {
             TokenKind::LBrack => self.parse_seq_nil(),
             TokenKind::KwIf => {
                 let lo = self.cur.start;
-                Expr::If(Box::new(self.parse_if(None, lo)))
+                let scope_order = self.next_scope_order();
+                Expr::If(Box::new(self.parse_if(scope_order, lo)))
             }
             TokenKind::KwMatch => Expr::Match(Box::new(self.parse_match())),
-            TokenKind::LBrace => Expr::Scope(Box::new(self.parse_unannotated_scope(None))),
-            TokenKind::Annotation => self.parse_annotated_primary(),
+            TokenKind::LBrace => {
+                let scope_order = self.next_scope_order();
+                Expr::Scope(Box::new(self.parse_unannotated_scope(scope_order)))
+            }
             TokenKind::Ident => {
                 let path = self.parse_ident_path();
                 if self.at(TokenKind::LParen) {
                     let lo = path.span.start() as u32;
-                    Expr::Call(self.finish_call(None, lo, path))
+                    let scope_order = if BUILTINS.contains(&path.path.last().unwrap().name) {
+                        self.current_scope_order()
+                    } else {
+                        self.next_scope_order()
+                    };
+                    Expr::Call(self.finish_call(scope_order, lo, path))
                 } else {
                     Expr::IdentPath(path)
                 }
@@ -984,39 +998,6 @@ impl<'a> Parser<'a> {
                 );
                 Expr::Nil(NilLiteral {
                     span: Span::new(t.start as usize, t.start as usize),
-                })
-            }
-        }
-    }
-
-    /// An expression starting with `#name`: either an annotated `if`, an
-    /// annotated scope `{...}`, or an annotated call `path(...)`.
-    fn parse_annotated_primary(&mut self) -> Expr<&'a str, Md> {
-        let ann_tok = self.bump();
-        let lo = ann_tok.start;
-        let ann = self.annotation_ident(ann_tok);
-        match self.cur.kind {
-            TokenKind::KwIf => Expr::If(Box::new(self.parse_if(Some(ann), lo))),
-            TokenKind::LBrace => Expr::Scope(Box::new(self.parse_unannotated_scope(Some(ann)))),
-            TokenKind::Ident => {
-                let path = self.parse_ident_path();
-                if self.at(TokenKind::LParen) {
-                    Expr::Call(self.finish_call(Some(ann), lo, path))
-                } else {
-                    self.error_at(
-                        self.span(self.cur),
-                        "annotation is only allowed before a call, `if`, or `{` block".to_string(),
-                    );
-                    Expr::IdentPath(path)
-                }
-            }
-            _ => {
-                self.error_at(
-                    self.span(self.cur),
-                    "annotation is only allowed before a call, `if`, or `{` block".to_string(),
-                );
-                Expr::Nil(NilLiteral {
-                    span: Span::new(lo as usize, lo as usize),
                 })
             }
         }
@@ -1081,10 +1062,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `callExpr : scopeAnnotation? identPath LPAREN args RPAREN`
+    /// `callExpr : identPath LPAREN args RPAREN`
     fn finish_call(
         &mut self,
-        ann: Option<Ident<&'a str, Md>>,
+        scope_order: u64,
         lo: u32,
         func: IdentPath<&'a str, Md>,
     ) -> CallExpr<&'a str, Md> {
@@ -1092,7 +1073,7 @@ impl<'a> Parser<'a> {
         let args = self.parse_args();
         self.expect(TokenKind::RParen);
         CallExpr {
-            scope_annotation: ann,
+            scope_order,
             func,
             args,
             span: self.finish_span(lo),
@@ -1233,16 +1214,6 @@ impl<'a> Parser<'a> {
                 name: "",
                 metadata: (),
             }
-        }
-    }
-
-    /// Build an `Ident` from an `ANNOTATION` token, stripping the leading `#`.
-    fn annotation_ident(&self, t: Token) -> Ident<&'a str, Md> {
-        let span = Span::new(t.start as usize + 1, t.end as usize);
-        Ident {
-            span,
-            name: self.slice_span(span),
-            metadata: (),
         }
     }
 }

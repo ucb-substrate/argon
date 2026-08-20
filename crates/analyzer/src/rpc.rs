@@ -1,6 +1,8 @@
+//! RPC types shared by the analyzer and Argone.
+
 use std::{collections::HashMap, net::SocketAddr};
 
-use compiler::{
+use argonc::{
     ast::Span,
     compile::{BasicRect, CompileOutput},
 };

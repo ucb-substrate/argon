@@ -75,7 +75,6 @@ impl<'a> Lexer<'a> {
         let b = self.src[start];
         match b {
             _ if is_ident_start(b) => self.lex_ident_or_keyword(start),
-            b'#' => self.lex_annotation(start),
             b'0'..=b'9' => self.lex_int(start),
             b'"' => self.lex_string(start),
             _ => self.lex_operator(start, b),
@@ -89,21 +88,6 @@ impl<'a> Lexer<'a> {
         }
         let kind = keyword_or_ident(&self.src[start..self.pos]);
         self.tok(kind, start, self.pos)
-    }
-
-    fn lex_annotation(&mut self, start: usize) -> Token {
-        // ANNOTATION: '#' [_a-zA-Z] [_a-zA-Z0-9]* — the '#' must be followed by
-        // an identifier start, otherwise a lone '#' is not a valid token.
-        let after_hash = start + 1;
-        if after_hash >= self.src.len() || !is_ident_start(self.src[after_hash]) {
-            self.pos = after_hash;
-            return self.tok(TokenKind::Error, start, after_hash);
-        }
-        self.pos = after_hash + 1;
-        while self.pos < self.src.len() && is_ident_continue(self.src[self.pos]) {
-            self.pos += 1;
-        }
-        self.tok(TokenKind::Annotation, start, self.pos)
     }
 
     fn lex_int(&mut self, start: usize) -> Token {
