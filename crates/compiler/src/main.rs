@@ -6,6 +6,7 @@ use std::{
 };
 
 use argonc::{
+    artifact,
     ast::Expr,
     compile::{self, CellArg, CompileInput, CompileOutput},
     diagnostics::{self, Diagnostic},
@@ -34,19 +35,23 @@ struct Args {
     cell: Option<String>,
 
     /// KLayout layer-properties file. Required when a cell is instantiated.
-    #[arg(long)]
+    #[arg(long, requires = "cell")]
     lyp: Option<PathBuf>,
 
     /// Path dependency in NAME=PATH form. PATH may be a directory or lib.ar.
     #[arg(long = "extern", value_parser = parse_extern)]
     dependencies: Vec<(String, PathBuf)>,
 
-    /// GDS output path. Defaults to the root source path with a .gds suffix.
-    #[arg(short, long)]
+    /// Binary compiler-output path. Defaults to the root source with a .bin suffix.
+    #[arg(short, long, requires = "cell")]
     output: Option<PathBuf>,
 
-    /// Check source without instantiating a cell or emitting GDS.
-    #[arg(long, conflicts_with_all = ["cell", "lyp", "output"])]
+    /// Also emit GDS to this path.
+    #[arg(long, requires = "cell")]
+    gds: Option<PathBuf>,
+
+    /// Run all non-executing compiler stages, then stop.
+    #[arg(long, conflicts_with_all = ["cell", "lyp", "output", "gds"])]
     check: bool,
 
     /// Diagnostic output format.
@@ -124,7 +129,7 @@ fn run(args: Args) -> Result<(), Failed> {
     }
 
     let Some(cell) = args.cell.as_deref() else {
-        return Err(fail(format, "--cell is required unless --check is used"));
+        return Err(fail(format, "either --check or --cell is required"));
     };
     let Some(lyp) = args.lyp.as_deref() else {
         return Err(fail(format, "--lyp is required when compiling a cell"));
@@ -161,21 +166,31 @@ fn run(args: Args) -> Result<(), Failed> {
     if !matches!(output, CompileOutput::Valid(_)) {
         return Err(compile_failed(format, output));
     }
-    let map = GdsMap::from_lyp(lyp).map_err(|error| {
+    let output_path = args.output.unwrap_or_else(|| root.with_extension("bin"));
+    artifact::write(&output, &output_path).map_err(|error| {
         fail(
             format,
-            format!("could not read `{}`: {error}", lyp.display()),
+            format!("could not write `{}`: {error}", output_path.display()),
         )
     })?;
-    let output_path = args.output.unwrap_or_else(|| root.with_extension("gds"));
-    output
-        .to_gds(map, GdsUnits::new(1e-3, 1e-9), &output_path)
-        .map_err(|error| {
+
+    if let Some(gds_path) = args.gds {
+        let map = GdsMap::from_lyp(lyp).map_err(|error| {
             fail(
                 format,
-                format!("could not write `{}`: {error}", output_path.display()),
+                format!("could not read `{}`: {error}", lyp.display()),
             )
-        })
+        })?;
+        output
+            .to_gds(map, GdsUnits::new(1e-3, 1e-9), &gds_path)
+            .map_err(|error| {
+                fail(
+                    format,
+                    format!("could not write `{}`: {error}", gds_path.display()),
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn source_root(path: &Path) -> PathBuf {

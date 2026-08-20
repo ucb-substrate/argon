@@ -1,3 +1,4 @@
+pub mod artifact;
 pub mod ast;
 pub mod compile;
 pub mod diagnostics;

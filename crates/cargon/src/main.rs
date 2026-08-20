@@ -19,10 +19,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
-    /// Compile an Argon project and emit GDS.
-    Build(BuildArgs),
-    /// Type-check an Argon project without emitting GDS.
+    /// Parse, resolve, and type-check an Argon project.
     Check(ProjectArgs),
+    /// Execute an Argon cell and write the compiler output.
+    Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -36,21 +36,24 @@ struct ProjectArgs {
 }
 
 #[derive(Debug, Args)]
-struct BuildArgs {
+struct RunArgs {
     #[command(flatten)]
     project: ProjectArgs,
     /// Cell invocation to instantiate, for example `top(10., 20.)`.
     #[arg(long)]
     cell: String,
-    /// GDS output path. Defaults to target/argon.gds beside the manifest.
+    /// Binary compiler-output path. Defaults to target/argon.bin.
     #[arg(short, long)]
     output: Option<PathBuf>,
+    /// Also write target/argon.gds.
+    #[arg(long)]
+    gds: bool,
 }
 
 fn main() -> ExitCode {
     let result = match Cli::parse().command {
-        CommandKind::Build(args) => build(args),
         CommandKind::Check(args) => check(args),
+        CommandKind::Run(args) => run(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -71,7 +74,7 @@ fn check(args: ProjectArgs) -> Result<()> {
     Ok(())
 }
 
-fn build(args: BuildArgs) -> Result<()> {
+fn run(args: RunArgs) -> Result<()> {
     let project = Project::load(&args.project.manifest_path)?;
     let lyp = project.lyp.as_ref().ok_or_else(|| {
         anyhow!(
@@ -79,13 +82,13 @@ fn build(args: BuildArgs) -> Result<()> {
             project.manifest_path.display()
         )
     })?;
-    status("Compiling", project_name(&project));
+    status("Running", &args.cell);
     let output = args.output.unwrap_or_else(|| {
         project
             .manifest_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join("target/argon.gds")
+            .join("target/argon.bin")
     });
     let mut command = compiler_command(&args.project.argonc, &project);
     command
@@ -95,6 +98,14 @@ fn build(args: BuildArgs) -> Result<()> {
         .arg(lyp)
         .arg("--output")
         .arg(&output);
+    if args.gds {
+        let gds = project
+            .manifest_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("target/argon.gds");
+        command.arg("--gds").arg(gds);
+    }
     run_compiler(command)?;
     status(
         "Finished",

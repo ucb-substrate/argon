@@ -224,6 +224,7 @@ dependencies = [
  "anyhow",
  "approx",
  "arcstr",
+ "bincode",
  "cfgrammar",
  "clap",
  "const_format",

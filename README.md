@@ -47,14 +47,16 @@ cargo install --git https://github.com/ucb-substrate/argon --locked \
 
 ## Command-line compilation
 
-`argonc` compiles source directly and never reads a project manifest. Use
-`--check` for static checking, or supply a cell invocation and layer-properties
-file to emit GDS:
+`argonc` compiles source directly and never reads a project manifest. `--check`
+runs source loading, dependency and module resolution, parsing, import analysis,
+and static type checking, then stops before executing a cell. Supplying a cell
+executes it and writes the compiler output as a binary artifact; `--gds`
+optionally writes GDS as well:
 
 ```bash
 argonc lib.ar --check
-argonc lib.ar --cell 'top(10., 20.)' --lyp layers.lyp -o top.gds
-argonc lib.ar --extern pdk=../pdk --cell 'top()' --lyp layers.lyp
+argonc lib.ar --cell 'top(10., 20.)' --lyp layers.lyp -o top.bin
+argonc lib.ar --cell 'top()' --lyp layers.lyp -o top.bin --gds top.gds
 ```
 
 `cargon` reads `Argon.toml`, resolves project-relative paths, and invokes
@@ -67,11 +69,12 @@ lyp = "layers.lyp"
 pdk = { path = "../pdk" }
 ```
 
-Build or check the project from the directory containing the manifest:
+Check the project or execute a cell from the directory containing the manifest:
 
 ```bash
 cargon check
-cargon build --cell 'top(10., 20.)'
+cargon run --cell 'top(10., 20.)'
+cargon run --cell 'top()' --gds
 ```
 
 For compatibility, existing `[mods]` path entries are also accepted.
