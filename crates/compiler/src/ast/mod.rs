@@ -964,6 +964,21 @@ pub trait AstTransformer {
         input: &Scope<Self::InputS, Self::InputMetadata>,
     ) -> Scope<Self::OutputS, Self::OutputMetadata> {
         self.enter_scope(input);
+        let output = self.transform_scope_contents(input);
+        self.exit_scope(input, &output);
+        output
+    }
+
+    /// Transforms a scope after any bindings that must be visible to its body
+    /// have been installed by the caller.
+    ///
+    /// Most scopes can use [`Self::transform_scope`]. Declarations and loops
+    /// use this lower-level helper so their arguments or loop variable are
+    /// bound before the body is visited.
+    fn transform_scope_contents(
+        &mut self,
+        input: &Scope<Self::InputS, Self::InputMetadata>,
+    ) -> Scope<Self::OutputS, Self::OutputMetadata> {
         let stmts = input
             .stmts
             .iter()
@@ -971,15 +986,13 @@ pub trait AstTransformer {
             .collect_vec();
         let tail = input.tail.as_ref().map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(input, &stmts, &tail);
-        let output = Scope {
+        Scope {
             scope_order: input.scope_order,
             span: input.span,
             stmts,
             tail,
             metadata,
-        };
-        self.exit_scope(input, &output);
-        output
+        }
     }
 
     fn transform_cast(

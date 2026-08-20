@@ -6,7 +6,6 @@ use std::{
 
 use argonc::{
     artifact,
-    ast::Expr,
     compile::{self, CellArg, CompileInput, CompileOutput},
     diagnostics::{self, Diagnostic},
     gds::GdsMap,
@@ -146,9 +145,14 @@ fn run(args: Args) -> Result<(), Failed> {
         .args
         .posargs
         .iter()
-        .map(cell_arg)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|message| fail(format, message))?;
+        .map(CellArg::from_literal)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            fail(
+                format,
+                "--cell arguments must be integer, float, boolean, or empty-list literals",
+            )
+        })?;
     let output = compile::dynamic_compile(
         &typed_ast,
         CompileInput {
@@ -192,16 +196,6 @@ fn source_root(path: &Path) -> PathBuf {
         path.join("lib.ar")
     } else {
         path.to_path_buf()
-    }
-}
-
-fn cell_arg(expr: &Expr<&str, parse::ParseMetadata>) -> Result<CellArg, String> {
-    match expr {
-        Expr::FloatLiteral(value) => Ok(CellArg::Float(value.value)),
-        Expr::IntLiteral(value) => Ok(CellArg::Int(value.value)),
-        Expr::BoolLiteral(value) => Ok(CellArg::Bool(value.value)),
-        Expr::SeqNil(_) => Ok(CellArg::Seq(Vec::new())),
-        _ => Err("--cell arguments must be integer, float, boolean, or empty-list literals".into()),
     }
 }
 

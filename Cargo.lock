@@ -217,7 +217,6 @@ dependencies = [
  "futures",
  "homedir",
  "indexmap",
- "itertools 0.15.0",
  "lsp-document",
  "serde",
  "serde_json",

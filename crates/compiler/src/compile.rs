@@ -1121,32 +1121,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .return_ty
             .as_ref()
             .map(|spec| self.transform_ty_spec(spec));
-        // TODO: this code is mostly duplicated from `transform_scope`.
         self.enter_scope(&input.scope);
         let args: Vec<_> = input
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
-        let stmts = input
-            .scope
-            .stmts
-            .iter()
-            .map(|stmt| self.transform_statement(stmt))
-            .collect_vec();
-        let tail = input
-            .scope
-            .tail
-            .as_ref()
-            .map(|stmt| self.transform_expr(stmt));
-        let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
-        let scope = Scope {
-            scope_order: input.scope.scope_order,
-            span: input.span,
-            stmts,
-            tail,
-            metadata,
-        };
+        let scope = self.transform_scope_contents(&input.scope);
         self.exit_scope(&input.scope, &scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
@@ -1170,31 +1151,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             });
         }
         self.enter_scope(&input.scope);
-        // TODO: this code is mostly duplicated from `transform_scope`.
         let args: Vec<_> = input
             .args
             .iter()
             .map(|arg| self.transform_arg_decl(arg))
             .collect();
-        let stmts = input
-            .scope
-            .stmts
-            .iter()
-            .map(|stmt| self.transform_statement(stmt))
-            .collect_vec();
-        let tail = input
-            .scope
-            .tail
-            .as_ref()
-            .map(|stmt| self.transform_expr(stmt));
-        let metadata = self.dispatch_scope(&input.scope, &stmts, &tail);
-        let scope = Scope {
-            scope_order: input.scope.scope_order,
-            span: input.scope.span,
-            stmts,
-            tail,
-            metadata,
-        };
+        let scope = self.transform_scope_contents(&input.scope);
         self.exit_scope(&input.scope, &scope);
         if let Some(tail) = scope.tail.as_ref() {
             self.errors.push(StaticError {
@@ -1879,7 +1841,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         input: &crate::ast::ForLoop<Self::InputS, Self::InputMetadata>,
     ) -> crate::ast::ForLoop<Self::OutputS, Self::OutputMetadata> {
         let var = self.transform_ident(&input.var);
-        // TODO: this code is mostly duplicated from `transform_scope`.
         let seq = self.transform_expr(&input.seq);
         let seq_ty = seq.ty();
         let elem_ty = match seq_ty {
@@ -1897,25 +1858,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         };
         self.enter_scope(&input.body);
         let var_id = self.alloc(&input.var.name, elem_ty);
-        let stmts = input
-            .body
-            .stmts
-            .iter()
-            .map(|stmt| self.transform_statement(stmt))
-            .collect_vec();
-        let tail = input
-            .body
-            .tail
-            .as_ref()
-            .map(|stmt| self.transform_expr(stmt));
-        let metadata = self.dispatch_scope(&input.body, &stmts, &tail);
-        let body = Scope {
-            scope_order: input.body.scope_order,
-            span: input.span,
-            stmts,
-            tail,
-            metadata,
-        };
+        let body = self.transform_scope_contents(&input.body);
         self.exit_scope(&input.body, &body);
         let metadata = var_id;
         ForLoop {
@@ -1951,6 +1894,18 @@ pub enum CellArg {
 }
 
 impl CellArg {
+    /// Converts a literal expression accepted at a compiler entry point into
+    /// its runtime representation.
+    pub fn from_literal(expr: &Expr<&str, ParseMetadata>) -> Option<Self> {
+        match expr {
+            Expr::FloatLiteral(value) => Some(Self::Float(value.value)),
+            Expr::IntLiteral(value) => Some(Self::Int(value.value)),
+            Expr::BoolLiteral(value) => Some(Self::Bool(value.value)),
+            Expr::SeqNil(_) => Some(Self::Seq(Vec::new())),
+            _ => None,
+        }
+    }
+
     fn matches_ty(&self, ty: &Ty) -> bool {
         match (self, ty) {
             (_, Ty::Any) => true,
