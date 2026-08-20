@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
 Argon is a programming language for writing constraint-based integrated circuit layout generators.
-Argon's primary feature is bidirectional editing between a code editor (Neovim or VS Code) and a custom GUI.
+Argon's primary feature is bidirectional editing between Neovim and a custom GUI.
 Simpler geometric constraints can be entered visually in the GUI, while more complex logic can be
 implemented in code.
 
@@ -33,7 +33,7 @@ Future versions of Argon will hopefully support:
 
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
-- One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
+- [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
 Begin by cloning and compiling the Argon source code:
@@ -72,55 +72,6 @@ Start the GUI by running `:Argon gui`.
 
 From within the GUI, type `:openCell inv(1200., 2000., 4)` to open the `inv` cell. You should now be able to edit layouts 
 in both Neovim and the GUI.
-
-### VS Code
-
-To use VS Code as your code editor, you will additionally need:
-- [Node JS (tested on 25.0.0)](https://nodejs.org/en/download)
-
-First, open your VS Code user settings using `Command Palette > Preferences: Open User Settings (JSON)`.
-Add the following key:
-
-```json
-{
-    "argon.argonRepoDir": "<absolute_path_to_argon_repo>"
-}
-```
-
-Compile the VS Code extension by running the following from the root directory of your Argon clone:
-
-```bash
-cd plugins/vscode
-npm install
-npm run compile
-cd ../..
-```
-
-To open an example Argon workspace, run the following from the root directory of your Argon clone:
-
-```bash
-code --extensionDevelopmentPath=$(pwd)/plugins/vscode pdks/sky130/lib.ar
-```
-
-We recommend defining an alias in your shell configuration to simplify future commands:
-
-```bash
-alias codear="code --extensionDevelopmentPath=<absolute_path_to_argon_repo>/plugins/vscode"
-```
-
-With this alias defined, you can now run:
-
-```bash
-codear pdks/sky130
-```
-
-Open the `lib.ar` file within the workspace. You can then start the GUI by running `Command Palette > Argon: Start GUI`.
-
-> [!WARNING]
-> If you cannot find the command for starting the GUI but did not notice any obvious errors, you may be on an old version of VS Code.
-
-From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
-in both VS Code and the GUI.
 
 ## Parametric Cell Tutorial
 
@@ -212,7 +163,7 @@ constituent rectangles.
 <!-- TODO: Implement commands to open GUI log -->
 Argon writes log messages to `~/.local/state/argon/lang-server.log` (language server) and `~/local/state/argon/gui.log` (GUI).
 Log level can be set using the `ARGON_LOG` environment variable
-or in editor-specific configuration. If no configuration is specified, only errors will be logged.
+or in the Neovim configuration. If no configuration is specified, only errors will be logged.
 Log level configuration follows [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
 
 For performance, it is recommended to use `ARGON_LOG=warn` or `ARGON_LOG=error` unless you are troubleshooting an issue.
@@ -233,20 +184,6 @@ vim.g.argon = {
 ```
 
 The Neovim plugin will then supply `ARGON_LOG=debug` when starting the language server and GUI.
-
-### VS Code
-
-While the language is running, you can open the language logs using the `Command Palette > Argon: Open Log` command.
-
-To configure the log level, you can use the `argon.log.level` key:
-
-```json
-{
-    "argon.log.level": "debug"
-}
-```
-
-The VS Code plugin will then supply `ARGON_LOG=debug` when starting the language server and GUI.
 
 ## Contributing
 
