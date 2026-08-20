@@ -36,37 +36,36 @@ To use Argon, you will need:
 - [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
-Begin by cloning and compiling the Argon source code:
+Install the Argon analyzer and Argone layout editor from GitHub. Cargo places
+`argon-analyzer` and `argone` in its binary directory,
+which should be on your `PATH` after installing Rust with rustup.
 
 ```bash
-git clone https://github.com/ucb-substrate/argon.git
-cd argon
-cargo build --release
+cargo install --git https://github.com/ucb-substrate/argon --locked \
+    argon-analyzer argone
 ```
 
 On BWRC servers, you may need to supply `RUSTFLAGS` as follows:
 
 ```bash
-RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" cargo b --release
+RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" \
+    cargo install --git https://github.com/ucb-substrate/argon --locked \
+    argon-analyzer argone
 ```
 
 ### Neovim
 
-Add the following to your Neovim Lua configuration:
+Install the Neovim plugin with your plugin manager. For
+[lazy.nvim](https://github.com/folke/lazy.nvim), add this plugin spec:
 
 ```lua
-vim.g.argon = {
-    argon_repo_path = '<absolute_path_to_argon_repo>'
+{
+    'ucb-substrate/argon',
 }
-vim.opt.runtimepath:append(vim.g.argon.argon_repo_path .. '/nvim')
-vim.cmd([[autocmd BufRead,BufNewFile *.ar setfiletype argon]])
 ```
 
-To open an example Argon workspace, run the following from the root directory of your Argon clone:
-
-```
-nvim pdks/sky130/lib.ar
-```
+The plugin detects `.ar` files and starts `argon-analyzer` from your
+`PATH`; no repository path is needed in your Neovim configuration.
 
 Start the GUI by running `:Argon gui`.
 
@@ -161,16 +160,16 @@ constituent rectangles.
 ## Logs
 
 <!-- TODO: Implement commands to open GUI log -->
-Argon writes log messages to `~/.local/state/argon/lang-server.log` (language server) and `~/local/state/argon/gui.log` (GUI).
+Argon writes log messages to `~/.local/state/argon/analyzer.log` (analyzer) and `~/.local/state/argon/argone.log` (Argone).
 Log level can be set using the `ARGON_LOG` environment variable
 or in the Neovim configuration. If no configuration is specified, only errors will be logged.
 Log level configuration follows [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
 
 For performance, it is recommended to use `ARGON_LOG=warn` or `ARGON_LOG=error` unless you are troubleshooting an issue.
 
-### Neovim
+### Analyzer logs
 
-While the language server is running, you can open the language server logs using the `:Argon log` command 
+While the analyzer is running, you can open its logs using the `:Argon log` command.
 
 To configure the log level, you can use the `vim.g.argon.log.level` key:
 
@@ -183,7 +182,7 @@ vim.g.argon = {
 }
 ```
 
-The Neovim plugin will then supply `ARGON_LOG=debug` when starting the language server and GUI.
+The Neovim plugin will then supply `ARGON_LOG=debug` when starting the analyzer and Argone.
 
 ## Contributing
 

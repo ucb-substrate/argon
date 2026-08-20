@@ -62,6 +62,13 @@ end
 --- Start or attach the LSP client
 ---@param bufnr? number The buffer number (optional), defaults to the current buffer
 M.start = function(bufnr)
+    if vim.fn.executable(config.analyzer) ~= 1 then
+        vim.notify(
+          'argon: Could not find argon-analyzer. Install it with Cargo or configure vim.g.argon.analyzer.',
+          vim.log.levels.ERROR
+        )
+        return
+    end
     local root_dir = M.get_root_dir(bufnr)
     if not root_dir then
         vim.notify(
@@ -76,7 +83,7 @@ M.start = function(bufnr)
     end
     local lsp_start_config = { 
         name = 'argon',
-        cmd = { config.argon_repo_path ..'/target/release/lang-server' },
+        cmd = { config.analyzer },
         cmd_env = cmd_env,
         handlers = {
             ['custom/forceSave'] = function(err, result, ctx)

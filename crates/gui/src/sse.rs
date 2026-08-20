@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut, Mul};
 
-use compiler::solver::{LinearExpr, Var};
+use argonc::solver::{LinearExpr, Var};
 use indexmap::{IndexMap, IndexSet};
 
 /// Values with magnitude below this are treated as zero when deciding whether
@@ -87,7 +87,7 @@ pub(crate) fn edge_drag_distance(pixel_delta: (f32, f32), normal: (f32, f32), sc
 /// - `edge` is the coefficient vector `c` of the dragged edge's position (the
 ///   linear combination of variables that determines where the edge sits).
 /// - `rowspace` is an orthonormal basis `V` of the rowspace of the constraint
-///   matrix `A`, as returned by [`compiler::solver::Solver::rowspace_vecs`].
+///   matrix `A`, as returned by [`argonc::solver::Solver::rowspace_vecs`].
 /// - `unsolved` is the set of variables that are still free to move. Locked
 ///   variables have a fixed value and must never change, so the dragged edge's
 ///   coefficient vector is restricted to `unsolved` before projecting.
@@ -151,7 +151,7 @@ pub(crate) fn format_value(v: f64) -> String {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-    use compiler::solver::Solver;
+    use argonc::solver::Solver;
 
     /// Orthonormal rowspace basis of the solver's constraint matrix.
     fn rowspace(solver: &mut Solver) -> Vec<SparseVec> {

@@ -1,12 +1,19 @@
 [package]
-name = "gui"
+name = "argone"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[lib]
+name = "argone"
+
+[[bin]]
+name = "argone"
+path = "src/main.rs"
+
 [dependencies]
-lang-server = { path = "../lang-server" }
-compiler = { path = "../compiler" }
+analyzer = { package = "argon-analyzer", path = "../analyzer" }
+argonc = { path = "../compiler" }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
 anyhow = { workspace = true }
 smallvec = "1"

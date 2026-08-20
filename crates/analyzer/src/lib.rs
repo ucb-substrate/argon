@@ -1,18 +1,15 @@
 pub mod config;
 pub mod document;
-pub mod import;
 pub mod rpc;
 
 use std::{
-    cmp::Reverse,
-    collections::HashMap,
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
     sync::Arc,
 };
 
-use compiler::{
+use argonc::{
     ast::{Expr, Span},
     compile::{
         self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
@@ -43,9 +40,8 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    config::default_argon_home,
+    config::{default_argon_home, default_lyp_path},
     document::{Document, DocumentChange},
-    import::ScopeAnnotationPass,
 };
 
 // TODO: finer-grained synchronization?
@@ -132,47 +128,14 @@ impl StateMut {
                     })
                 })
                 .unwrap_or_else(|| {
-                    PathBuf::from(concat!(
-                        env!("CARGO_MANIFEST_DIR"),
-                        "/../../pdks/sky130/sky130.lyp"
-                    ))
+                    default_lyp_path()
+                        .unwrap_or_else(|| PathBuf::from("<argon-default-sky130.lyp>"))
                 });
             let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
             let parse_errs = parse_output.static_errors();
             let ast = parse_output.ast();
             self.ast = ast;
             let static_output = compile::static_compile(&self.ast);
-            // If GUI is connected, must annotate scopes.
-            if self.gui_client.is_some() {
-                let mut to_save = Vec::new();
-                for (_, ast) in &self.ast {
-                    let scope_annotation = ScopeAnnotationPass::new(ast);
-                    let mut text_edits = scope_annotation.execute();
-                    text_edits.sort_by_key(|edit| Reverse(edit.range.start));
-                    if !text_edits.is_empty() {
-                        client
-                            .apply_edit(WorkspaceEdit {
-                                changes: Some(HashMap::from_iter([(
-                                    Uri::from_file_path(&ast.path).unwrap(),
-                                    text_edits,
-                                )])),
-                                document_changes: None,
-                                change_annotations: None,
-                            })
-                            .await
-                            .unwrap();
-
-                        to_save.push(ast.path.clone());
-                    }
-                }
-                let should_return = !to_save.is_empty();
-                for path in to_save {
-                    client.send_request::<ForceSave>(path).await.unwrap();
-                }
-                if should_return {
-                    return;
-                }
-            }
 
             let o = if let Some((ast, mut static_output)) = static_output {
                 if !static_output.errors.is_empty() || !parse_errs.is_empty() {
@@ -421,15 +384,12 @@ impl Backend {
         let state = self.state.clone();
 
         tokio::spawn(async move {
-            match Command::new(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../target/release/gui"
-            ))
-            .arg(format!("{}", state.server_addr))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            match Command::new("argone")
+                .arg(format!("{}", state.server_addr))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
             {
                 Ok(mut child) => {
                     if let Some(stdout) = child.stdout.take() {
@@ -458,7 +418,15 @@ impl Backend {
                     }
                     state.state_mut.lock().await.gui = Some(child);
                 }
-                Err(_) => todo!(),
+                Err(err) => {
+                    let message =
+                        format!("failed to start argone: {err}. Is it installed and on PATH?");
+                    error!("{message}");
+                    state
+                        .editor_client
+                        .show_message(MessageType::ERROR, message)
+                        .await;
+                }
             }
         });
 
@@ -578,7 +546,7 @@ pub async fn main() {
     if let Some(log_dir) = default_argon_home() {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
-            .with_writer(tracing_appender::rolling::never(log_dir, "lang-server.log"))
+            .with_writer(tracing_appender::rolling::never(log_dir, "analyzer.log"))
             .with_ansi(false)
             .init();
     }

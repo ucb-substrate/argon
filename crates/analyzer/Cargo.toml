@@ -1,11 +1,18 @@
 [package]
-name = "lang-server"
+name = "argon-analyzer"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[lib]
+name = "analyzer"
+
+[[bin]]
+name = "argon-analyzer"
+path = "src/main.rs"
+
 [dependencies]
-compiler = { version = "0.1.0", path = "../compiler" }
+argonc = { version = "0.1.0", path = "../compiler" }
 
 tokio = { version = "1", features = ["full"] }
 tower-lsp-server = { workspace = true }

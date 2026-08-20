@@ -16,8 +16,8 @@
 
 ---@class argon.Opts
 ---
----The path of the local Argon repository (for development purposes).
----@field argon_repo_path? string
+---Override the `argon-analyzer` executable discovered on PATH.
+---@field analyzer? string
 
 local config = {}
 
@@ -38,9 +38,9 @@ end
 
 ---@class argon.config.Config
 local Config = {
-    --- Defaults to `nil`, which means argon will not use a local development repo as source.
-    ---@type nil | string
-    argon_repo_path = nil,
+    --- Defaults to the `argon-analyzer` executable discovered on PATH.
+    ---@type string
+    analyzer = exepath_or_binary('argon-analyzer'),
     log = {
         --- Log level following [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
         --- Defaults to `nil`.
@@ -53,4 +53,3 @@ local Config = {
 config.config = vim.tbl_deep_extend('force', {}, Config, argon_opts)
 
 return config
-

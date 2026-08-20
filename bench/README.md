@@ -58,7 +58,7 @@ ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 >    a difference there is a real discrepancy to fix, not noise. Wall-clock
 >    **times** drift a few percent run-to-run, so small changes there are
 >    expected.
-> 2. Do **not** set `RUSTFLAGS` for these runs — building `-p compiler` does not
+> 2. Do **not** set `RUSTFLAGS` for these runs — building `-p argonc` does not
 >    need the GUI's linker flags. Any you already export are harmless but
 >    unnecessary.
 
@@ -68,7 +68,7 @@ ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 (e.g. to debug a single axis):
 
 ```bash
-cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_
+cargo test -p argonc --release -- --ignored --test-threads=1 --nocapture bench_
 python3 bench/plot_scaling.py     # writes bench/argon_scaling.{png,pdf}
 ```
 
@@ -102,7 +102,7 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 ```bash
 # e.g. sweep the for-loop variant out to the same sizes as bench_shapes
 ARGON_BENCH_SHAPES_LOOP=500,1000,2000,4000,8000,16000,32000 \
-  cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_shapes_loop
+  cargo test -p argonc --release -- --ignored --test-threads=1 --nocapture bench_shapes_loop
 ```
 
 The defaults are sized so the full suite runs in about a minute within ~1.3 GiB

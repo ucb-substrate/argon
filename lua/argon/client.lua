@@ -85,4 +85,3 @@ M.notify = function(method, params)
 end
 
 return M
-

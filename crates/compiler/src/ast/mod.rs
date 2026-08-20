@@ -153,7 +153,8 @@ pub struct ConstantDecl<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct Scope<S, T: AstMetadata> {
-    pub scope_annotation: Option<Ident<S, T>>,
+    /// Lexical order among scope-producing expressions in the enclosing scope.
+    pub scope_order: u64,
     pub span: cfgrammar::Span,
     pub stmts: Vec<Statement<S, T>>,
     pub tail: Option<Expr<S, T>>,
@@ -180,6 +181,8 @@ pub struct ForLoop<S, T: AstMetadata> {
     pub var: Ident<S, T>,
     pub seq: Expr<S, T>,
     pub body: Scope<S, T>,
+    /// Lexical order among scope-producing expressions in the enclosing scope.
+    pub scope_order: u64,
     pub metadata: T::ForLoop,
     pub span: cfgrammar::Span,
 }
@@ -235,7 +238,8 @@ pub enum Expr<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct IfExpr<S, T: AstMetadata> {
-    pub scope_annotation: Option<Ident<S, T>>,
+    /// Lexical order among scope-producing expressions in the enclosing scope.
+    pub scope_order: u64,
     pub cond: Expr<S, T>,
     pub then: Scope<S, T>,
     pub else_: Scope<S, T>,
@@ -310,7 +314,8 @@ pub struct IndexExpr<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct CallExpr<S, T: AstMetadata> {
-    pub scope_annotation: Option<Ident<S, T>>,
+    /// Lexical order among scope-producing expressions in the enclosing scope.
+    pub scope_order: u64,
     pub func: IdentPath<S, T>,
     pub args: Args<S, T>,
     pub span: cfgrammar::Span,
@@ -750,6 +755,7 @@ pub trait AstTransformer {
             var,
             seq,
             body,
+            scope_order: input.scope_order,
             metadata,
             span: input.span,
         }
@@ -758,16 +764,12 @@ pub trait AstTransformer {
         &mut self,
         input: &IfExpr<Self::InputS, Self::InputMetadata>,
     ) -> IfExpr<Self::OutputS, Self::OutputMetadata> {
-        let scope_annotation = input
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let cond = self.transform_expr(&input.cond);
         let then = self.transform_scope(&input.then);
         let else_ = self.transform_scope(&input.else_);
         let metadata = self.dispatch_if_expr(input, &cond, &then, &else_);
         IfExpr {
-            scope_annotation,
+            scope_order: input.scope_order,
             span: input.span,
             metadata,
             cond,
@@ -886,15 +888,11 @@ pub trait AstTransformer {
         &mut self,
         input: &CallExpr<Self::InputS, Self::InputMetadata>,
     ) -> CallExpr<Self::OutputS, Self::OutputMetadata> {
-        let scope_annotation = input
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let func = self.transform_ident_path(&input.func);
         let args = self.transform_args(&input.args);
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
-            scope_annotation,
+            scope_order: input.scope_order,
             func,
             args,
             span: input.span,
@@ -966,10 +964,6 @@ pub trait AstTransformer {
         input: &Scope<Self::InputS, Self::InputMetadata>,
     ) -> Scope<Self::OutputS, Self::OutputMetadata> {
         self.enter_scope(input);
-        let scope_annotation = input
-            .scope_annotation
-            .as_ref()
-            .map(|ident| self.transform_ident(ident));
         let stmts = input
             .stmts
             .iter()
@@ -978,7 +972,7 @@ pub trait AstTransformer {
         let tail = input.tail.as_ref().map(|stmt| self.transform_expr(stmt));
         let metadata = self.dispatch_scope(input, &stmts, &tail);
         let output = Scope {
-            scope_annotation,
+            scope_order: input.scope_order,
             span: input.span,
             stmts,
             tail,

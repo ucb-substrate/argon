@@ -4,7 +4,8 @@ use std::{
     ops::{Add, Sub},
 };
 
-use compiler::{
+use analyzer::rpc::{DimensionParams, ValueEdit};
+use argonc::{
     ast::Span,
     compile::{self, ObjectId, SolvedValue, ifmatvec},
     solver::{LinearExpr, Var},
@@ -20,7 +21,6 @@ use gpui::{
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
-use lang_server::rpc::{DimensionParams, ValueEdit};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{

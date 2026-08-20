@@ -46,7 +46,7 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
 }
 
 /// Parse a single cell invocation (a `callExpr`) from raw input, as used by the
-/// language server. Returns the borrowed-`&str` AST directly (no annotation
+/// analyzer. Returns the borrowed-`&str` AST directly (no annotation
 /// pass), so its `func`/literal values are read by the caller.
 pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, Vec<ParseError>> {
     let normalized = input.trim_start_matches(char::is_whitespace);
@@ -105,9 +105,9 @@ mod tests {
             "if c {} else {};",
             "if c {} else {}",
             "let v = (t.0, t.1,);",
-            "#scope0 foo();",
-            "#scope0 if a < b {} else {}",
-            "#scope0 { eq(a, b); }",
+            "foo();",
+            "if a < b {} else {}",
+            "{ eq(a, b); }",
             "let r = rect(\"met1\", x0=0., y0=0., x1=400.)!;",
             "for i in range(3) { eq(i, i); }",
             "match k { A => 1, B => 2, }",
@@ -121,7 +121,7 @@ mod tests {
     fn rejects_invalid_constructs() {
         let invalid = [
             "let x = (a, b);",      // tuple requires a trailing comma per element
-            "let x = #y foo;",      // annotation on a bare path
+            "let x = #old foo();",  // scope annotations are no longer syntax
             "let x = foo(x=1, 2);", // positional after keyword
             "let x = ;",            // missing expression
             "let x = (a, b;",       // unterminated tuple
@@ -145,8 +145,8 @@ mod tests {
         use crate::ast::{Decl, Expr, Statement};
 
         // Assert the concrete AST variant *and* that each node's span re-slices
-        // to exactly the source text it covers (the annotation pass relies on
-        // byte-exact spans), rather than fuzzy-matching a `{:#?}` dump.
+        // to exactly the source text it covers, rather than fuzzy-matching a
+        // `{:#?}` dump.
         let src = "cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n}\n";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();
@@ -179,29 +179,84 @@ mod tests {
         };
         assert_eq!(s.value, "met1");
         assert_eq!(&src[s.span.start()..s.span.end()], "\"met1\"");
+        assert_eq!(call.scope_order, 0);
+    }
 
-        // A scope annotation strips the leading `#`: `scope0`, not `#scope0`.
-        let src = "cell c() {\n  #scope0 foo();\n}\n";
+    #[test]
+    fn scope_orders_are_lexical_and_reset_in_nested_scopes() {
+        use crate::ast::{Decl, Expr, Statement};
+
+        let src = "cell c() { rect(); alpha(); if true { beta(); } else {}; for i in range_full(0, 2) { gamma(); } { delta(); }; }";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();
         assert!(parser.errors.is_empty(), "{:?}", parser.errors);
         let Decl::Cell(cell) = &ast.decls[0] else {
-            panic!("expected a cell decl, got {:?}", ast.decls[0]);
+            panic!("expected cell");
         };
+
         let Statement::Expr {
-            value: Expr::Call(call),
+            value: Expr::Call(rect),
             ..
         } = &cell.scope.stmts[0]
         else {
-            panic!("expected an annotated call, got {:?}", cell.scope.stmts[0]);
+            panic!("expected rect call");
         };
-        let ann = call
-            .scope_annotation
-            .as_ref()
-            .expect("the call carries a scope annotation");
-        assert_eq!(ann.name, "scope0");
-        // The span excludes the `#` (so re-slicing yields `scope0`, not `#scope0`).
-        assert_eq!(&src[ann.span.start()..ann.span.end()], "scope0");
+        let Statement::Expr {
+            value: Expr::Call(alpha),
+            ..
+        } = &cell.scope.stmts[1]
+        else {
+            panic!("expected alpha call");
+        };
+        let Statement::Expr {
+            value: Expr::If(if_),
+            ..
+        } = &cell.scope.stmts[2]
+        else {
+            panic!("expected if");
+        };
+        let Statement::ForLoop(for_) = &cell.scope.stmts[3] else {
+            panic!("expected for loop");
+        };
+        let Statement::Expr {
+            value: Expr::Scope(block),
+            ..
+        } = &cell.scope.stmts[4]
+        else {
+            panic!("expected block");
+        };
+
+        // Builtins do not consume ordinals because they do not produce scopes.
+        assert_eq!(rect.scope_order, 0);
+        assert_eq!(alpha.scope_order, 0);
+        assert_eq!(if_.scope_order, 1);
+        assert_eq!(for_.scope_order, 2);
+        assert_eq!(block.scope_order, 3);
+
+        let Statement::Expr {
+            value: Expr::Call(beta),
+            ..
+        } = &if_.then.stmts[0]
+        else {
+            panic!("expected nested call");
+        };
+        let Statement::Expr {
+            value: Expr::Call(gamma),
+            ..
+        } = &for_.body.stmts[0]
+        else {
+            panic!("expected loop call");
+        };
+        let Statement::Expr {
+            value: Expr::Call(delta),
+            ..
+        } = &block.stmts[0]
+        else {
+            panic!("expected block call");
+        };
+        assert_eq!(beta.scope_order, 0);
+        assert_eq!(gamma.scope_order, 0);
+        assert_eq!(delta.scope_order, 0);
     }
 
     #[test]
@@ -358,7 +413,7 @@ mod tests {
     /// Synthetic large program for the throughput benchmark.
     fn gen_program(n_cells: usize) -> String {
         let mut s = String::from(
-            "fn helper(a: Float, b: Float) -> Float {\n  #scope0 if a < b { a } else { b }\n}\n",
+            "fn helper(a: Float, b: Float) -> Float {\n  if a < b { a } else { b }\n}\n",
         );
         for i in 0..n_cells {
             s.push_str(&format!(
@@ -368,7 +423,7 @@ mod tests {
                  let b = helper(a, x);\n    \
                  let c = head(tail(cons(1., cons(2., []))));\n    \
                  eq(r.x1, a + b);\n    \
-                 #scope0 if x < y {{ eq(r.y1, x); }} else {{ eq(r.y1, y); }}\n    \
+                 if x < y {{ eq(r.y1, x); }} else {{ eq(r.y1, y); }}\n    \
                  let t = (x, y, a,);\n    \
                  eq(t.0, t.1);\n\
                  }}\n"
@@ -379,7 +434,7 @@ mod tests {
 
     /// Reports parser throughput (lex + parse to AST, excluding the annotation
     /// pass). Ignored by default; run with:
-    /// `cargo test -p compiler --release -- --ignored --nocapture parser_throughput`.
+    /// `cargo test -p argonc --release -- --ignored --nocapture parser_throughput`.
     #[test]
     #[ignore = "perf benchmark"]
     fn parser_throughput() {

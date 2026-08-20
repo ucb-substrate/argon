@@ -1,7 +1,7 @@
 cell bot() {
     let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
     let met2 = rect("met1", x0=100., y0=0., x1=200., y1=100.);
-    let met3 = #scope0 make_rect(); let met4 = #scope1 emit_rect();
+    let met3 = make_rect(); let met4 = emit_rect();
 }
 
 fn make_rect() -> Rect {
@@ -13,23 +13,22 @@ fn emit_rect() -> Rect {
 }
 
 cell middle() {
-    let bot = inst(#scope0 bot());
+    let bot = inst(bot());
     eq(bot.x, 0.);
     eq(bot.y, 0.);
 }
 
 cell top() {
-    let mid_cell = #scope2 middle();
+    let mid_cell = middle();
     let left = inst(mid_cell);
     let right = inst(mid_cell, angle=90);
-    #scope0
     {
       eq(left.x, 0.);
       eq(left.y, 0.);
       eq(right.x, 300.);
       eq(right.y, 100.);
     }
-    #scope1 if 1 > 2 { } else { }
+    if 1 > 2 { } else { }
     let met3 = rect("met3", x0=left.bot.met1.x0, y0=20., x1=right.bot.met1.x1, y1=80.);
     let duplicate_rect = left.bot.met3!;
     let rect0 = rect("met4", x0i = 405.59417724609375, y0i = 209.0047912597656, x1i = 488.3259582519531, y1i = 294.942626953125)!;
