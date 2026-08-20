@@ -33,7 +33,7 @@ Future versions of Argon will hopefully support:
 
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
-- [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
+- [Neovim (version 0.12.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
 Install the Argon analyzer and Argone layout editor from GitHub. Cargo places
@@ -47,13 +47,13 @@ cargo install --git https://github.com/ucb-substrate/argon --locked \
 
 ### Neovim
 
-Install the Neovim plugin with your plugin manager. For
-[lazy.nvim](https://github.com/folke/lazy.nvim), add this plugin spec:
+Install the Neovim plugin with the built-in `vim.pack` package manager by
+adding this to your `init.lua`:
 
 ```lua
-{
-    'ucb-substrate/argon',
-}
+vim.pack.add({
+    'https://github.com/ucb-substrate/argon',
+})
 ```
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your
