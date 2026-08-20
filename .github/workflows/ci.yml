@@ -89,9 +89,9 @@ jobs:
       - name: Run tests
         run: cargo test --release --workspace
 
-  # Checks if dependencies have vulnerabilties
-  security-audit:
-    name: Security Audit
+  # Checks if dependencies have incompatible licenses or known vulnerabilties
+  audit:
+    name: Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
