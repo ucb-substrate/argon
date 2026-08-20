@@ -154,8 +154,9 @@ impl<'a> ImportPass<'a> {
                 }
                 Decl::Mod(_) => {}
                 Decl::Enum(_) => {}
-                // Unsupported declarations are diagnosed during parsing.
-                Decl::Struct(_) | Decl::Constant(_) => {}
+                // `parse_ast` rejects these before this pass. Keep direct
+                // library callers non-panicking if they construct an AST.
+                Decl::Struct(_) | Decl::Constant(_) => continue,
             }
         }
 
@@ -689,8 +690,9 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
-                // Unsupported declarations are diagnosed during parsing.
-                Decl::Struct(_) | Decl::Constant(_) => {}
+                // `parse_ast` rejects these before this pass. Keep direct
+                // library callers non-panicking if they construct an AST.
+                Decl::Struct(_) | Decl::Constant(_) => continue,
             }
         }
 
