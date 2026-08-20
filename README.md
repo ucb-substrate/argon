@@ -45,14 +45,6 @@ cargo install --git https://github.com/ucb-substrate/argon --locked \
     argon-analyzer argone
 ```
 
-On BWRC servers, you may need to supply `RUSTFLAGS` as follows:
-
-```bash
-RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" \
-    cargo install --git https://github.com/ucb-substrate/argon --locked \
-    argon-analyzer argone
-```
-
 ### Neovim
 
 Install the Neovim plugin with your plugin manager. For
