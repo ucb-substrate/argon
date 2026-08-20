@@ -1,4 +1,3 @@
-pub mod config;
 pub mod document;
 pub mod rpc;
 
@@ -39,10 +38,12 @@ use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    config::default_argon_home,
-    document::{Document, DocumentChange},
-};
+use crate::document::{Document, DocumentChange};
+
+// TODO: Allow configuration via ARGON_HOME environment variable.
+pub fn default_argon_home() -> Option<PathBuf> {
+    Some(homedir::my_home().ok()??.join(".local/state/argon"))
+}
 
 // TODO: finer-grained synchronization?
 // TODO: Verify synchronization between GUI and editor files when appropriate.
