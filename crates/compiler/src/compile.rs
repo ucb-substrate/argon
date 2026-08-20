@@ -1947,6 +1947,31 @@ pub enum CellArg {
     Seq(Vec<CellArg>),
 }
 
+impl CellArg {
+    fn matches_ty(&self, ty: &Ty) -> bool {
+        match (self, ty) {
+            (_, Ty::Any) => true,
+            (Self::Float(_), Ty::Float) | (Self::Int(_), Ty::Int) | (Self::Bool(_), Ty::Bool) => {
+                true
+            }
+            (Self::Seq(values), Ty::Seq(inner)) => {
+                values.iter().all(|value| value.matches_ty(inner))
+            }
+            (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn ty_name(&self) -> &'static str {
+        match self {
+            Self::Float(_) => "Float",
+            Self::Int(_) => "Int",
+            Self::Bool(_) => "Bool",
+            Self::Seq(_) => "sequence",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct CellExecKey {
     cell: VarId,
@@ -2257,7 +2282,7 @@ impl<'a> ExecPass<'a> {
                 errors: vec![ExecError {
                     span: None,
                     cell: 0,
-                    kind: ExecErrorKind::InvalidCell,
+                    kind: ExecErrorKind::InvalidCell("<empty>".to_string()),
                 }],
                 output: None,
             });
@@ -2337,7 +2362,7 @@ impl<'a> ExecPass<'a> {
                 errors: vec![ExecError {
                     span: None,
                     cell: 0, // TODO: don't use dummy cell ID
-                    kind: ExecErrorKind::InvalidCell,
+                    kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
                 }],
                 output: None,
             })
@@ -2368,6 +2393,34 @@ impl<'a> ExecPass<'a> {
             .as_ref()
             .unwrap_cell_fn()
             .clone();
+        if args.len() != cell_decl.args.len() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: 0,
+                kind: ExecErrorKind::InvalidCellArity {
+                    expected: cell_decl.args.len(),
+                    found: args.len(),
+                },
+            });
+            return Err(());
+        }
+        if let Some((index, (arg, decl))) = args
+            .iter()
+            .zip(&cell_decl.args)
+            .enumerate()
+            .find(|(_, (arg, decl))| !arg.matches_ty(&decl.metadata.1))
+        {
+            self.errors.push(ExecError {
+                span: None,
+                cell: 0,
+                kind: ExecErrorKind::InvalidCellArgumentType {
+                    index: index + 1,
+                    expected: decl.metadata.1.clone(),
+                    found: arg.ty_name().to_string(),
+                },
+            });
+            return Err(());
+        }
         let root_scope_name = scope_name.unwrap_or_else(|| format!("cell {}", cell_decl.name.name));
         let root_scope_id = ScopeId::semantic(None, &root_scope_name);
         let root_scope = ExecScope {
@@ -2407,14 +2460,6 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
-        if args.len() != cell_decl.args.len() {
-            self.errors.push(ExecError {
-                span: None,
-                cell: cell_id,
-                kind: ExecErrorKind::InvalidCell,
-            });
-            return Ok(cell_id);
-        }
         for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
             let val = Value::from_arg(&val);
@@ -5089,8 +5134,18 @@ pub enum ExecErrorKind {
     #[error("non-Manhattan rotation")]
     InvalidRotation,
     /// An invalid cell was specified for execution.
-    #[error("invalid cell")]
-    InvalidCell,
+    #[error("invalid cell `{0}`")]
+    InvalidCell(String),
+    /// A cell invocation supplied the wrong number of arguments.
+    #[error("invalid cell arguments: expected {expected} arguments, found {found}")]
+    InvalidCellArity { expected: usize, found: usize },
+    /// A cell invocation supplied an argument of the wrong type.
+    #[error("invalid cell argument {index}: expected {expected:?}, found {found}")]
+    InvalidCellArgumentType {
+        index: usize,
+        expected: Ty,
+        found: String,
+    },
     /// A cell is underconstrained.
     #[error("cell is underconstrained")]
     Underconstrained,
@@ -5127,6 +5182,17 @@ pub enum ExecErrorKind {
     /// Attempt to access the tail of an empty list.
     #[error("attempted to access the tail of an empty list")]
     TailEmptyList,
+}
+
+impl ExecErrorKind {
+    pub fn is_invalid_cell(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidCell(_)
+                | Self::InvalidCellArity { .. }
+                | Self::InvalidCellArgumentType { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

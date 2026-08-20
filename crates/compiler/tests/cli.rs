@@ -92,3 +92,48 @@ fn execution_writes_binary_output_without_gds_by_default() {
     ));
     assert!(!implicit_gds_path.exists());
 }
+
+#[test]
+fn execution_accepts_a_boolean_cell_argument() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = workspace.join("pdks/sky130/lib.ar");
+    let lyp = workspace.join("pdks/sky130/sky130.lyp");
+    let artifact_path = std::env::temp_dir().join("argonc-fet1v8-bool.bin");
+    let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
+        .arg(source)
+        .arg("--cell")
+        .arg("fet1v8(true, 150., 5)")
+        .arg("--lyp")
+        .arg(lyp)
+        .arg("--output")
+        .arg(artifact_path)
+        .output()
+        .expect("argonc should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn invalid_cell_argument_type_is_reported_cleanly() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
+        .arg(workspace.join("pdks/sky130/lib.ar"))
+        .arg("--cell")
+        .arg("fet1v8(1, 150., 5)")
+        .arg("--lyp")
+        .arg(workspace.join("pdks/sky130/sky130.lyp"))
+        .arg("--output")
+        .arg(std::env::temp_dir().join("argonc-fet1v8-invalid.bin"))
+        .output()
+        .expect("argonc should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("invalid cell argument 1: expected Bool, found Int"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}

@@ -59,6 +59,39 @@ pub struct StateMut {
     editor_files: IndexMap<Uri, Document>,
 }
 
+fn cell_arg_from_expr(
+    expr: &Expr<&str, parse::ParseMetadata>,
+) -> std::result::Result<CellArg, String> {
+    match expr {
+        Expr::FloatLiteral(value) => Ok(CellArg::Float(value.value)),
+        Expr::IntLiteral(value) => Ok(CellArg::Int(value.value)),
+        Expr::BoolLiteral(value) => Ok(CellArg::Bool(value.value)),
+        Expr::SeqNil(_) => Ok(CellArg::Seq(Vec::new())),
+        _ => Err(
+            "cell arguments must be integer, float, boolean, or empty-list literals".to_string(),
+        ),
+    }
+}
+
+fn compile_error_messages(output: &CompileOutput) -> Vec<String> {
+    match output {
+        CompileOutput::FatalParseErrors => {
+            vec!["fatal parse errors encountered, unable to compile".to_string()]
+        }
+        CompileOutput::StaticErrors(output) => output
+            .errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect(),
+        CompileOutput::ExecErrors(output) => output
+            .errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect(),
+        CompileOutput::Valid(_) => Vec::new(),
+    }
+}
+
 impl StateMut {
     fn diagnostics(&self) -> IndexMap<Uri, Vec<Diagnostic>> {
         let mut diagnostics = IndexMap::new();
@@ -149,19 +182,21 @@ impl StateMut {
                                 .iter()
                                 .map(|ident| ident.name)
                                 .collect_vec();
-                            let args = cell_ast
+                            if !cell_ast.args.kwargs.is_empty() {
+                                client
+                                    .show_message(
+                                        MessageType::ERROR,
+                                        "Open cell does not support keyword arguments yet",
+                                    )
+                                    .await;
+                                None
+                            } else if let Ok(args) = cell_ast
                                 .args
                                 .posargs
                                 .iter()
-                                .map(|arg| match arg {
-                                    Expr::FloatLiteral(value) => Some(CellArg::Float(value.value)),
-                                    Expr::IntLiteral(value) => Some(CellArg::Int(value.value)),
-                                    Expr::BoolLiteral(value) => Some(CellArg::Bool(value.value)),
-                                    Expr::SeqNil(_) => Some(CellArg::Seq(Vec::new())),
-                                    _ => None,
-                                })
-                                .collect::<Option<Vec<_>>>();
-                            if let Some(args) = args {
+                                .map(cell_arg_from_expr)
+                                .collect::<std::result::Result<Vec<_>, _>>()
+                            {
                                 Some(compile::dynamic_compile(
                                     &ast,
                                     CompileInput {
@@ -197,6 +232,16 @@ impl StateMut {
                 Some(CompileOutput::FatalParseErrors)
             };
             self.compile_output = o;
+            if !update && let Some(output) = &self.compile_output {
+                for message in compile_error_messages(output) {
+                    client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("Could not open cell: {message}"),
+                        )
+                        .await;
+                }
+            }
             let mut tmp = self.diagnostics();
             let mut diagnostics = tmp.clone();
             std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
@@ -460,10 +505,7 @@ impl Backend {
             .editor_client
             .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            self_clone.compile_cell(params.cell).await;
-        });
+        self.compile_cell(params.cell).await;
         Ok(())
     }
 
@@ -561,4 +603,18 @@ pub async fn main() {
 
     // Start actual LSP server.
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use argonc::{compile::CellArg, parse};
+
+    use super::cell_arg_from_expr;
+
+    #[test]
+    fn open_cell_accepts_boolean_literals() {
+        let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
+        let arg = cell_arg_from_expr(&call.args.posargs[0]).expect("boolean should convert");
+        assert!(matches!(arg, CellArg::Bool(true)));
+    }
 }
