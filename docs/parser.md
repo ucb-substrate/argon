@@ -4,7 +4,7 @@ This document describes the hand-written parser that turns Argon source text
 into an abstract syntax tree (AST). It is a reference for anyone modifying the
 parser, the lexer, or the grammar.
 
-The parser lives in `core/compiler/src/parser/`:
+The parser lives in `crates/compiler/src/parser/`:
 
 | File         | Responsibility |
 |--------------|----------------|
@@ -13,9 +13,9 @@ The parser lives in `core/compiler/src/parser/`:
 | `grammar.rs` | `Parser` — a recursive-descent + Pratt parser that builds the AST. Most of the logic lives here. |
 | `mod.rs`     | The public entry points (`parse_ast`, `parse_cell`), the `ParseError` type, and the `#[cfg(test)]` test suite. |
 
-The AST node definitions are in `core/compiler/src/ast/mod.rs`. A descriptive
+The AST node definitions are in `crates/compiler/src/ast/mod.rs`. A descriptive
 (non-executable) reference grammar is kept in sync at
-`core/compiler/grammar/Argon.g4`.
+`crates/compiler/grammar/Argon.g4`.
 
 ---
 
@@ -643,7 +643,7 @@ declaration doesn't poison the rest of the file.
 
 ## 13. Relationship to `Argon.g4`
 
-`core/compiler/grammar/Argon.g4` is a **descriptive reference grammar**, not an
+`crates/compiler/grammar/Argon.g4` is a **descriptive reference grammar**, not an
 input to any build step (nothing generates code from it any more). It documents
 the intended language and should be kept in sync when the parser's accepted
 language changes. Expression precedence and associativity in the Pratt table
@@ -688,7 +688,7 @@ Parser tests live in `mod.rs` under `#[cfg(test)] mod tests`:
 - **`corpus_parses`** — every grammar-valid `.ar` file under `examples/`,
   `pdks/`, and the compiler's `src/std/` must parse without error.
 
-End-to-end coverage (parse → compile → solve) lives in `core/compiler/src/lib.rs`
+End-to-end coverage (parse → compile → solve) lives in `crates/compiler/src/lib.rs`
 as the `argon_*` and `stress_*_smoke` tests. There is no longer a differential
 test against ANTLR (it has been removed), so behavioral changes should be locked
 in with a focused `parser::tests` case.

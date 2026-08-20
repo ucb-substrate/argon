@@ -1,0 +1,4 @@
+[advisories]
+# rust_decimal exposes rkyv 0.7 as an optional feature, but no enabled target
+# uses it (`cargo tree --workspace --target all --invert rkyv@0.7.46` is empty).
+ignore = ["RUSTSEC-2026-0235"]

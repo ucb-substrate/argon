@@ -1,26 +1,29 @@
 [workspace]
 
 resolver = "2"
-members = ["core/compiler", "core/gui", "core/lang-server"]
+members = ["crates/compiler", "crates/gui", "crates/lang-server"]
+
+[workspace.package]
+license = "BSD-3-Clause"
 
 [workspace.dependencies]
 anyhow = "1"
-cfgrammar = { version = "0.14", features = ["serde"] }
+cfgrammar = { version = "0.15", features = ["serde"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 approx = "0.5"
 rust_decimal = "1"
 rust_decimal_macros = "1"
 indexmap = { version = "2", features = ["serde"] }
-im = "15"
+im = { package = "imbl", version = "7" }
 clap = { version = "4", features = ["derive"] }
 rgb = { version = "0.8", features = ["serde"] }
 thiserror = "2"
 toml = "1"
 regex = "1"
 arcstr = { version = "1", features = ["serde"] }
-itertools = "0.14"
-tarpc = { version = "0.37", features = ["full"] }
+itertools = "0.15"
+tarpc = { version = "0.38", features = ["full"] }
 bytes = "1"
 futures = "0.3"
 tracing = "0.1"

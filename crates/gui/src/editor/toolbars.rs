@@ -550,7 +550,7 @@ impl HierarchySideBar {
                             .overflow_hidden()
                             .child(format!(
                                 "{}{}",
-                                &scope_state.name,
+                                scope_state.name,
                                 if count > 1 {
                                     format!(" ({count})")
                                 } else {

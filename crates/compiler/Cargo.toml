@@ -2,10 +2,11 @@
 name = "compiler"
 version = "0.1.0"
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
-nalgebra = { version = "0.34", features = ["sparse"] }
+nalgebra = { version = "0.35", features = ["sparse"] }
 klayout-lyp = "0.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 anyhow = { workspace = true }
