@@ -43,7 +43,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(pass.transform_enum_decl(e)));
                 }
-                _ => todo!(),
+                // Unsupported declaration kinds are rejected by the parser
+                // before the annotation pass is entered.
+                Decl::Struct(_) | Decl::Constant(_) => {}
             }
         }
 

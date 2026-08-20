@@ -15,9 +15,9 @@ use argonc::{
         self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
         StaticErrorCompileOutput,
     },
-    config::{Config, parse_config},
     parse::{self, WorkspaceParseAst},
 };
+use cargon::Project;
 use futures::prelude::*;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -50,7 +50,7 @@ use crate::{
 pub struct StateMut {
     gui: Option<Child>,
     root_dir: Option<PathBuf>,
-    config: Option<Config>,
+    config: Option<Project>,
     ast: WorkspaceParseAst,
     prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     compile_output: Option<CompileOutput>,
@@ -115,23 +115,22 @@ impl StateMut {
 
     async fn compile(&mut self, client: &Client, update: bool) {
         if let Some(root_dir) = &self.root_dir {
-            self.config = parse_config(root_dir.join("Argon.toml")).ok();
+            self.config = Project::load(root_dir.join("Argon.toml")).ok();
             let lyp = self
                 .config
                 .as_ref()
-                .and_then(|config| {
-                    let lyp = config.lyp.as_ref()?;
-                    Some(if lyp.is_relative() {
-                        root_dir.join(lyp)
-                    } else {
-                        lyp.clone()
-                    })
-                })
+                .and_then(|config| config.lyp.clone())
                 .unwrap_or_else(|| {
                     default_lyp_path()
                         .unwrap_or_else(|| PathBuf::from("<argon-default-sky130.lyp>"))
                 });
-            let parse_output = parse::parse_workspace_with_std(root_dir.join("lib.ar"));
+            let dependencies = self
+                .config
+                .as_ref()
+                .map(|config| config.dependencies.clone())
+                .unwrap_or_default();
+            let parse_output =
+                parse::parse_workspace_with_std_and_deps(root_dir.join("lib.ar"), dependencies);
             let parse_errs = parse_output.static_errors();
             let ast = parse_output.ast();
             self.ast = ast;
@@ -150,27 +149,36 @@ impl StateMut {
                                 .iter()
                                 .map(|ident| ident.name)
                                 .collect_vec();
-                            Some(compile::dynamic_compile(
-                                &ast,
-                                CompileInput {
-                                    cell: &cell_path,
-                                    args: cell_ast
-                                        .args
-                                        .posargs
-                                        .iter()
-                                        .map(|arg| match arg {
-                                            Expr::FloatLiteral(float_literal) => {
-                                                CellArg::Float(float_literal.value)
-                                            }
-                                            Expr::IntLiteral(int_literal) => {
-                                                CellArg::Int(int_literal.value)
-                                            }
-                                            _ => panic!("must be int or float literal for now"),
-                                        })
-                                        .collect(),
-                                    lyp_file: &lyp,
-                                },
-                            ))
+                            let args = cell_ast
+                                .args
+                                .posargs
+                                .iter()
+                                .map(|arg| match arg {
+                                    Expr::FloatLiteral(value) => Some(CellArg::Float(value.value)),
+                                    Expr::IntLiteral(value) => Some(CellArg::Int(value.value)),
+                                    Expr::BoolLiteral(value) => Some(CellArg::Bool(value.value)),
+                                    Expr::SeqNil(_) => Some(CellArg::Seq(Vec::new())),
+                                    _ => None,
+                                })
+                                .collect::<Option<Vec<_>>>();
+                            if let Some(args) = args {
+                                Some(compile::dynamic_compile(
+                                    &ast,
+                                    CompileInput {
+                                        cell: &cell_path,
+                                        args,
+                                        lyp_file: &lyp,
+                                    },
+                                ))
+                            } else {
+                                client
+                                    .show_message(
+                                        MessageType::ERROR,
+                                        "Open cell arguments must be integer, float, boolean, or empty-list literals",
+                                    )
+                                    .await;
+                                None
+                            }
                         }
                         Err(e) => {
                             client

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 argonc = { version = "0.1.0", path = "../compiler" }
+cargon = { version = "0.1.0", path = "../cargon" }
 
 tokio = { version = "1", features = ["full"] }
 tower-lsp-server = { workspace = true }

@@ -1,6 +1,6 @@
 pub mod ast;
 pub mod compile;
-pub mod config;
+pub mod diagnostics;
 pub mod gds;
 pub mod layer;
 pub mod parse;
@@ -94,7 +94,7 @@ mod tests {
     use crate::{
         compile::{ExecErrorKind, SolvedValue, StaticErrorKind},
         gds::GdsMap,
-        parse::parse_workspace_with_std,
+        parse::{parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
     use ::gds::GdsUnits;
     use approx::assert_relative_eq;
@@ -1002,7 +1002,13 @@ mod tests {
 
     #[test]
     fn argon_external_mods() {
-        let o = parse_workspace_with_std(ARGON_EXTERNAL_MODS);
+        let o = parse_workspace_with_std_and_deps(
+            ARGON_EXTERNAL_MODS,
+            [(
+                "sub_crate".to_string(),
+                PathBuf::from(EXAMPLES_DIR).join("external_mods/sub_crate"),
+            )],
+        );
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
         let cells = compile(

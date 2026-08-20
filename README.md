@@ -36,14 +36,45 @@ To use Argon, you will need:
 - [Neovim (version 0.12.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
-Install the Argon analyzer and Argone layout editor from GitHub. Cargo places
-`argon-analyzer` and `argone` in its binary directory,
+Install the Argon compiler, package manager, analyzer, and Argone layout editor from GitHub. Cargo places
+`argonc`, `cargon`, `argon-analyzer`, and `argone` in its binary directory,
 which should be on your `PATH` after installing Rust with rustup.
 
 ```bash
 cargo install --git https://github.com/ucb-substrate/argon --locked \
-    argon-analyzer argone
+    argonc cargon argon-analyzer argone
 ```
+
+## Command-line compilation
+
+`argonc` compiles source directly and never reads a project manifest. Use
+`--check` for static checking, or supply a cell invocation and layer-properties
+file to emit GDS:
+
+```bash
+argonc lib.ar --check
+argonc lib.ar --cell 'top(10., 20.)' --lyp layers.lyp -o top.gds
+argonc lib.ar --extern pdk=../pdk --cell 'top()' --lyp layers.lyp
+```
+
+`cargon` reads `Argon.toml`, resolves project-relative paths, and invokes
+`argonc`. A project manifest can set its layer file and path dependencies:
+
+```toml
+lyp = "layers.lyp"
+
+[dependencies]
+pdk = { path = "../pdk" }
+```
+
+Build or check the project from the directory containing the manifest:
+
+```bash
+cargon check
+cargon build --cell 'top(10., 20.)'
+```
+
+For compatibility, existing `[mods]` path entries are also accepted.
 
 ### Neovim
 

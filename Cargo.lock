@@ -199,6 +199,7 @@ dependencies = [
  "arcstr",
  "argonc",
  "bytes",
+ "cargon",
  "cfgrammar",
  "futures",
  "homedir",
@@ -224,6 +225,7 @@ dependencies = [
  "approx",
  "arcstr",
  "cfgrammar",
+ "clap",
  "const_format",
  "derive-where",
  "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
@@ -238,9 +240,9 @@ dependencies = [
  "regex",
  "rgb",
  "serde",
+ "serde_json",
  "sky130",
  "thiserror 2.0.20",
- "toml 1.1.4+spec-1.1.0",
  "tracing",
  "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
 ]
@@ -1157,6 +1159,19 @@ dependencies = [
  "rustix 1.1.4",
  "wayland-backend",
  "wayland-client",
+]
+
+[[package]]
+name = "cargon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argonc",
+ "clap",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

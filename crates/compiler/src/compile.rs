@@ -154,7 +154,8 @@ impl<'a> ImportPass<'a> {
                 }
                 Decl::Mod(_) => {}
                 Decl::Enum(_) => {}
-                _ => todo!(),
+                // Unsupported declarations are diagnosed during parsing.
+                Decl::Struct(_) | Decl::Constant(_) => {}
             }
         }
 
@@ -687,7 +688,8 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
-                _ => todo!(),
+                // Unsupported declarations are diagnosed during parsing.
+                Decl::Struct(_) | Decl::Constant(_) => {}
             }
         }
 
@@ -2250,6 +2252,16 @@ impl<'a> ExecPass<'a> {
 
     pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
         self.declare_globals();
+        if input.cell.is_empty() {
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: vec![ExecError {
+                    span: None,
+                    cell: 0,
+                    kind: ExecErrorKind::InvalidCell,
+                }],
+                output: None,
+            });
+        }
         let path = match input.cell[0] {
             "std" => {
                 vec!["std".to_string()]
@@ -2268,14 +2280,16 @@ impl<'a> ExecPass<'a> {
                 .map(|ident| ident.to_string())
                 .collect_vec(),
         };
-        if let Some((_, vid)) = self.ast[&path].ast.decls.iter().find_map(|d| match d {
-            Decl::Cell(
-                v @ CellDecl {
-                    name: Ident { name, .. },
-                    ..
-                },
-            ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
-            _ => None,
+        if let Some((_, vid)) = self.ast.get(&path).and_then(|ast| {
+            ast.ast.decls.iter().find_map(|d| match d {
+                Decl::Cell(
+                    v @ CellDecl {
+                        name: Ident { name, .. },
+                        ..
+                    },
+                ) if name == input.cell.last().unwrap() => Some(v.metadata.clone()),
+                _ => None,
+            })
         }) {
             let cell_id = match self.execute_cell(vid, input.args, None) {
                 Ok(cell_id) => cell_id,
@@ -3047,7 +3061,14 @@ impl<'a> ExecPass<'a> {
                                 },
                             }))
                         }),
-                        _ => panic!("cannot call value: not a function or cell generator"),
+                        _ => {
+                            self.errors.push(ExecError {
+                                span: Some(self.span(&loc, c.span)),
+                                cell: loc.cell,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            self.nil_value
+                        }
                     }
                 }
             }
@@ -5047,6 +5068,9 @@ pub enum StaticErrorKind {
     /// Invalid LYP file.
     #[error("invalid LYP file")]
     InvalidLyp,
+    /// A source file could not be loaded or resolved.
+    #[error("could not load source: {0}")]
+    SourceError(String),
     /// Unimplemented.
     #[error("unimplemented")]
     Unimplemented,
@@ -5317,7 +5341,9 @@ fn imat(mat: TransformationMatrix) -> (Rotation, bool) {
         (0, 1) => Rotation::R90,
         (-1, 0) => Rotation::R180,
         (0, -1) => Rotation::R270,
-        _ => panic!("invalid rotation matrix"),
+        // `mat` is formed exclusively from Manhattan rotation matrices, so
+        // this is an internal fallback rather than a user-visible crash path.
+        _ => Rotation::R0,
     };
     (rot, refv)
 }
