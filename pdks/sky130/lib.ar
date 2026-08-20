@@ -10,13 +10,13 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
         y0 = poly_bbox.y0 + 130.,
         y1 = poly_bbox.y1 - 130.
     )!;
-    let li1 = crect(layer="li.drawing", x1=poly_bbox.x0 - 55., y0=diff.y0 - 100., w=170., y1=diff.y1 + 100.);
+    let li1 = crect(layer="li1.drawing", x1=poly_bbox.x0 - 55., y0=diff.y0 - 100., w=170., y1=diff.y1 + 100.);
     let li1_bbox = std::array(li1, nf + 1, 430., 0.);
     eq(li1_bbox.x0, li1.x0);
     eq(li1_bbox.y0, li1.y0);
     let sdm = rect(if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
 
-    let licon = crect(layer="licon.drawing", x0=0., x1=170., y0=0., y1=170.);
+    let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
     std::center_rects(li1_bbox, std::array2(licon, nf + 1, ny, 430., 340.));
 }
