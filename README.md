@@ -58,7 +58,7 @@ Add the following to your Neovim Lua configuration:
 vim.g.argon = {
     argon_repo_path = '<absolute_path_to_argon_repo>'
 }
-vim.opt.runtimepath:append(vim.g.argon.argon_repo_path .. '/plugins/nvim')
+vim.opt.runtimepath:append(vim.g.argon.argon_repo_path .. '/nvim')
 vim.cmd([[autocmd BufRead,BufNewFile *.ar setfiletype argon]])
 ```
 

@@ -19,7 +19,7 @@ The Argon sources that are swept live in [`../examples/`](../examples):
 | `examples/stress_hierarchy`      | `h0 .. h8`              | a chain of cells `h{k}` each instantiating `h{k-1}`; compiling `h{k}` exercises `k` levels of hierarchy |
 
 The benchmark *drivers* are the `bench_*` tests in
-[`../core/compiler/src/lib.rs`](../core/compiler/src/lib.rs). For the
+[`../crates/compiler/src/lib.rs`](../crates/compiler/src/lib.rs). For the
 hierarchy axis the driver generates `h0..h{depth}` workspaces on the fly (a
 single `.ar` file cannot express a runtime-variable depth because Argon cells
 cannot be recursive or forward-referenced).

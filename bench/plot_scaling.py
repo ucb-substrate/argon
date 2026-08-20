@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot Argon compile-time and memory scaling from the benchmark CSVs.
 
-The CSVs are produced by the `bench_*` tests in `core/compiler/src/lib.rs`
+The CSVs are produced by the `bench_*` tests in `crates/compiler/src/lib.rs`
 (see ../bench/README.md for how to run them). Each CSV has the columns
 
     size,time_s,peak_bytes,n_objects

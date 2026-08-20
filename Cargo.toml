@@ -1,7 +1,7 @@
 [workspace]
 
 resolver = "2"
-members = ["core/compiler", "core/gui", "core/lang-server"]
+members = ["crates/compiler", "crates/gui", "crates/lang-server"]
 
 [workspace.package]
 license = "BSD-3-Clause"
