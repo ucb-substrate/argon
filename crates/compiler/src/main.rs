@@ -132,8 +132,12 @@ fn run(args: Args) -> Result<(), Failed> {
         return Err(fail(format, "either --check or --cell is required"));
     };
     let Some(lyp) = args.lyp.as_deref() else {
-        return Err(fail(format, "--lyp is required when compiling a cell"));
+        return Err(fail(
+            format,
+            "--lyp is required when compiling a cell; pass the path to a KLayout layer-properties file",
+        ));
     };
+    argonc::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
     let cell_ast = parse::parse_cell(cell)
         .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?;
     if !cell_ast.args.kwargs.is_empty() {

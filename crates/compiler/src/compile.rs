@@ -4,7 +4,6 @@
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -440,7 +439,11 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
     let std_mod_path = vec!["std".to_string()];
     let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
     if let Some((root, _)) = ast.get_key_value(&vec![]) {
-        for path in [std_mod_path, Some(root)].iter().flatten() {
+        for path in [std_mod_path, Some(root)]
+            .into_iter()
+            .flatten()
+            .chain(ast.keys())
+        {
             execute_var_id_ty_pass_inner(
                 ast,
                 dag,
@@ -469,22 +472,16 @@ pub(crate) fn execute_var_id_ty_pass_inner<'a>(
     }
     mod_bindings.insert(current_path, VarIdTyFrame::default());
 
-    if current_path
-        .first()
-        .map(|path| path == "std")
-        .unwrap_or(true)
-    {
-        for children in &dag[&current_path] {
-            execute_var_id_ty_pass_inner(
-                ast,
-                dag,
-                children,
-                mod_bindings,
-                workspace_ast,
-                errors,
-                next_id,
-            );
-        }
+    for children in &dag[&current_path] {
+        execute_var_id_ty_pass_inner(
+            ast,
+            dag,
+            children,
+            mod_bindings,
+            workspace_ast,
+            errors,
+            next_id,
+        );
     }
 
     let mut pass = VarIdTyPass {
@@ -2325,21 +2322,19 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = if let Ok(layers) = std::fs::File::open(input.lyp_file)
-                .map_err(|_| ())
-                .and_then(|f| klayout_lyp::from_reader(BufReader::new(f)).map_err(|_| ()))
-            {
-                layers.into()
-            } else {
-                return CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                    errors: vec![StaticError {
-                        span: Span {
-                            path: self.ast[&vec![]].path.clone(),
-                            span: cfgrammar::Span::new(0, 0),
-                        },
-                        kind: StaticErrorKind::InvalidLyp,
-                    }],
-                });
+            let layers = match crate::layer::read_lyp(input.lyp_file) {
+                Ok(layers) => layers,
+                Err(error) => {
+                    return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                        errors: vec![StaticError {
+                            span: Span {
+                                path: self.ast[&vec![]].path.clone(),
+                                span: cfgrammar::Span::new(0, 0),
+                            },
+                            kind: StaticErrorKind::InvalidLyp(error.to_string()),
+                        }],
+                    });
+                }
             };
             if self.errors.is_empty() {
                 CompileOutput::Valid(CompiledData {
@@ -5111,8 +5106,8 @@ pub enum StaticErrorKind {
     #[error("error during parsing: {0}")]
     ParseError(String),
     /// Invalid LYP file.
-    #[error("invalid LYP file")]
-    InvalidLyp,
+    #[error("{0}")]
+    InvalidLyp(String),
     /// A source file could not be loaded or resolved.
     #[error("could not load source: {0}")]
     SourceError(String),

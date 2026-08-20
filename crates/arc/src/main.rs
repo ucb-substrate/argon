@@ -78,7 +78,7 @@ fn run(args: RunArgs) -> Result<()> {
     let library = Library::load(&args.library.manifest_path)?;
     let lyp = library.lyp.as_ref().ok_or_else(|| {
         anyhow!(
-            "manifest `{}` does not set `lyp`",
+            "cannot run a cell because manifest `{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
             library.manifest_path.display()
         )
     })?;

@@ -79,6 +79,20 @@ arc run --cell 'top()' --gds
 
 For compatibility, existing `[mods]` path entries are also accepted.
 
+Argon binaries do not contain a bundled PDK or default layer map. A library
+using the Sky130 PDK must reference a local checkout explicitly, both as a path
+dependency and as the source of its layer-properties file. For example:
+
+```toml
+lyp = "../pdks/sky130/sky130.lyp"
+
+[dependencies]
+sky130 = { path = "../pdks/sky130" }
+```
+
+Cells from that dependency are addressed through its dependency name, such as
+`arc run --cell 'sky130::fet1v8(true, 150., 5)'`.
+
 ### Neovim
 
 Install the Neovim plugin with the built-in `vim.pack` package manager by

@@ -40,7 +40,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    config::{default_argon_home, default_lyp_path},
+    config::default_argon_home,
     document::{Document, DocumentChange},
 };
 
@@ -148,15 +148,22 @@ impl StateMut {
 
     async fn compile(&mut self, client: &Client, update: bool) {
         if let Some(root_dir) = &self.root_dir {
-            self.config = Library::load(root_dir.join("Argon.toml")).ok();
-            let lyp = self
-                .config
-                .as_ref()
-                .and_then(|config| config.lyp.clone())
-                .unwrap_or_else(|| {
-                    default_lyp_path()
-                        .unwrap_or_else(|| PathBuf::from("<argon-default-sky130.lyp>"))
-                });
+            let manifest_path = root_dir.join("Argon.toml");
+            self.config = if manifest_path.is_file() {
+                match Library::load(&manifest_path) {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        client
+                            .show_message(MessageType::ERROR, error.to_string())
+                            .await;
+                        self.compile_output = None;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            let lyp = self.config.as_ref().and_then(|config| config.lyp.clone());
             let dependencies = self
                 .config
                 .as_ref()
@@ -174,6 +181,37 @@ impl StateMut {
                     static_output.errors.extend(parse_errs);
                     Some(CompileOutput::StaticErrors(static_output))
                 } else if let Some(cell) = &self.cell {
+                    let Some(lyp) = lyp.as_deref() else {
+                        let message = if manifest_path.is_file() {
+                            format!(
+                                "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
+                                manifest_path.display()
+                            )
+                        } else {
+                            format!(
+                                "no library manifest found at `{}`; create it and set `lyp = \"path/to/layers.lyp\"`",
+                                manifest_path.display()
+                            )
+                        };
+                        client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Could not open cell: {message}"),
+                            )
+                            .await;
+                        self.compile_output = None;
+                        return;
+                    };
+                    if let Err(error) = argonc::layer::read_lyp(lyp) {
+                        client
+                            .show_message(
+                                MessageType::ERROR,
+                                format!("Could not open cell: {error}"),
+                            )
+                            .await;
+                        self.compile_output = None;
+                        return;
+                    }
                     match parse::parse_cell(cell) {
                         Ok(cell_ast) => {
                             let cell_path = cell_ast
@@ -202,7 +240,7 @@ impl StateMut {
                                     CompileInput {
                                         cell: &cell_path,
                                         args,
-                                        lyp_file: &lyp,
+                                        lyp_file: lyp,
                                     },
                                 ))
                             } else {

@@ -96,13 +96,16 @@ fn execution_writes_binary_output_without_gds_by_default() {
 #[test]
 fn execution_accepts_a_boolean_cell_argument() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source = workspace.join("pdks/sky130/lib.ar");
-    let lyp = workspace.join("pdks/sky130/sky130.lyp");
+    let source = temp_source("sky130-bool", "");
+    let sky130 = workspace.join("pdks/sky130");
+    let lyp = sky130.join("sky130.lyp");
     let artifact_path = std::env::temp_dir().join("argonc-fet1v8-bool.bin");
     let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
         .arg(source)
+        .arg("--extern")
+        .arg(format!("sky130={}", sky130.display()))
         .arg("--cell")
-        .arg("fet1v8(true, 150., 5)")
+        .arg("sky130::fet1v8(true, 150., 5)")
         .arg("--lyp")
         .arg(lyp)
         .arg("--output")
@@ -119,12 +122,16 @@ fn execution_accepts_a_boolean_cell_argument() {
 #[test]
 fn invalid_cell_argument_type_is_reported_cleanly() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = temp_source("sky130-invalid-argument", "");
+    let sky130 = workspace.join("pdks/sky130");
     let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
-        .arg(workspace.join("pdks/sky130/lib.ar"))
+        .arg(source)
+        .arg("--extern")
+        .arg(format!("sky130={}", sky130.display()))
         .arg("--cell")
-        .arg("fet1v8(1, 150., 5)")
+        .arg("sky130::fet1v8(1, 150., 5)")
         .arg("--lyp")
-        .arg(workspace.join("pdks/sky130/sky130.lyp"))
+        .arg(sky130.join("sky130.lyp"))
         .arg("--output")
         .arg(std::env::temp_dir().join("argonc-fet1v8-invalid.bin"))
         .output()
@@ -133,6 +140,54 @@ fn invalid_cell_argument_type_is_reported_cleanly() {
     assert!(!output.status.success());
     assert!(
         stderr.contains("invalid cell argument 1: expected Bool, found Int"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
+fn missing_lyp_is_reported_with_its_path() {
+    let source = temp_source("missing-lyp", "cell top() {}\n");
+    let missing = source
+        .parent()
+        .expect("source should have a parent")
+        .join("missing.lyp");
+    let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
+        .arg(source)
+        .arg("--cell")
+        .arg("top()")
+        .arg("--lyp")
+        .arg(&missing)
+        .output()
+        .expect("argonc should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("could not read LYP file"), "{stderr}");
+    assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
+fn malformed_lyp_is_reported_with_its_path() {
+    let source = temp_source("malformed-lyp", "cell top() {}\n");
+    let malformed = source
+        .parent()
+        .expect("source should have a parent")
+        .join("malformed.lyp");
+    fs::write(&malformed, "not XML").expect("malformed LYP should be written");
+    let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
+        .arg(source)
+        .arg("--cell")
+        .arg("top()")
+        .arg("--lyp")
+        .arg(&malformed)
+        .output()
+        .expect("argonc should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("could not parse LYP file"), "{stderr}");
+    assert!(
+        stderr.contains(&malformed.display().to_string()),
         "{stderr}"
     );
     assert!(!stderr.contains("panicked at"), "{stderr}");
