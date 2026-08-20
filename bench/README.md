@@ -45,6 +45,19 @@ straight through as environment variables (see
 ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 ```
 
+### BWRC setup
+
+On BWRC servers, installing the full Argon analyzer and Argone application may
+require the following linker flags:
+
+```bash
+RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" \
+  cargo install --git https://github.com/ucb-substrate/argon --locked \
+  argon-analyzer argone
+```
+
+The compiler-only benchmark commands below do not require these flags.
+
 > **Note for AI agents.** Prefer this script over invoking `cargo test`
 > directly — it encodes the flags that are easy to get wrong (release,
 > `--test-threads=1`, the `bench_` name filter) and the figure regeneration.
