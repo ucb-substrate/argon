@@ -12,10 +12,10 @@ pub struct Manifest {
     /// KLayout layer-properties file, relative to the manifest directory.
     #[serde(default)]
     pub lyp: Option<PathBuf>,
-    /// Legacy spelling for path dependencies. Retained for existing projects.
+    /// Legacy spelling for path dependencies. Retained for existing libraries.
     #[serde(default)]
     pub mods: IndexMap<String, PathBuf>,
-    /// Cargo-style path dependencies.
+    /// Path library dependencies.
     #[serde(default)]
     pub dependencies: IndexMap<String, Dependency>,
 }
@@ -36,14 +36,14 @@ impl Dependency {
 }
 
 #[derive(Debug, Clone)]
-pub struct Project {
+pub struct Library {
     pub manifest_path: PathBuf,
     pub root: PathBuf,
     pub lyp: Option<PathBuf>,
     pub dependencies: IndexMap<String, PathBuf>,
 }
 
-impl Project {
+impl Library {
     pub fn load(manifest_path: impl AsRef<Path>) -> Result<Self> {
         let manifest_path = manifest_path.as_ref();
         let manifest = read_manifest(manifest_path)?;
@@ -137,7 +137,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{Dependency, Manifest, Project};
+    use super::{Dependency, Library, Manifest};
 
     #[test]
     fn parses_legacy_and_cargo_style_dependencies() {
@@ -169,12 +169,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after Unix epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("cargon-manifest-{nonce}"));
+        let root = std::env::temp_dir().join(format!("arc-manifest-{nonce}"));
         let app = root.join("app");
         let first = root.join("first");
         let second = root.join("second");
         for directory in [&app, &first, &second] {
-            fs::create_dir_all(directory).expect("test project should be created");
+            fs::create_dir_all(directory).expect("test library should be created");
         }
         fs::write(
             app.join("Argon.toml"),
@@ -187,13 +187,13 @@ mod tests {
         )
         .expect("dependency manifest should be written");
 
-        let project = Project::load(app.join("Argon.toml")).expect("project should resolve");
+        let library = Library::load(app.join("Argon.toml")).expect("library should resolve");
         assert_eq!(
-            project.dependencies["first"],
+            library.dependencies["first"],
             fs::canonicalize(first).expect("dependency path should canonicalize")
         );
         assert_eq!(
-            project.dependencies["second"],
+            library.dependencies["second"],
             fs::canonicalize(second).expect("dependency path should canonicalize")
         );
     }

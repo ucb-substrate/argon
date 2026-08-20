@@ -9,6 +9,7 @@ use std::{
     sync::Arc,
 };
 
+use arc::Library;
 use argonc::{
     ast::{Expr, Span},
     compile::{
@@ -17,7 +18,6 @@ use argonc::{
     },
     parse::{self, WorkspaceParseAst},
 };
-use cargon::Project;
 use futures::prelude::*;
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -50,7 +50,7 @@ use crate::{
 pub struct StateMut {
     gui: Option<Child>,
     root_dir: Option<PathBuf>,
-    config: Option<Project>,
+    config: Option<Library>,
     ast: WorkspaceParseAst,
     prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     compile_output: Option<CompileOutput>,
@@ -148,7 +148,7 @@ impl StateMut {
 
     async fn compile(&mut self, client: &Client, update: bool) {
         if let Some(root_dir) = &self.root_dir {
-            self.config = Project::load(root_dir.join("Argon.toml")).ok();
+            self.config = Library::load(root_dir.join("Argon.toml")).ok();
             let lyp = self
                 .config
                 .as_ref()

@@ -193,10 +193,10 @@ pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
     parse_workspace_with_std_and_deps(root_lib, std::iter::empty::<(String, PathBuf)>())
 }
 
-/// Parses a crate, its explicitly supplied path dependencies, and the Argon
+/// Parses a library, its explicitly supplied path dependencies, and the Argon
 /// standard library. This function deliberately performs no manifest or
-/// configuration discovery; callers such as `cargon` are responsible for
-/// resolving project configuration into concrete paths.
+/// configuration discovery; callers such as `arc` are responsible for
+/// resolving library configuration into concrete paths.
 pub fn parse_workspace_with_std_and_deps(
     root_lib: impl AsRef<Path>,
     dependencies: impl IntoIterator<Item = (String, PathBuf)>,

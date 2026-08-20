@@ -167,6 +167,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argonc",
+ "clap",
+ "indexmap",
+ "serde",
+ "serde_json",
+ "toml 1.1.4+spec-1.1.0",
+]
+
+[[package]]
 name = "archery"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -196,10 +209,10 @@ dependencies = [
 name = "argon-analyzer"
 version = "0.1.0"
 dependencies = [
+ "arc",
  "arcstr",
  "argonc",
  "bytes",
- "cargon",
  "cfgrammar",
  "futures",
  "homedir",
@@ -1160,19 +1173,6 @@ dependencies = [
  "rustix 1.1.4",
  "wayland-backend",
  "wayland-client",
-]
-
-[[package]]
-name = "cargon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argonc",
- "clap",
- "indexmap",
- "serde",
- "serde_json",
- "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

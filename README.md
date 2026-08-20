@@ -36,18 +36,18 @@ To use Argon, you will need:
 - [Neovim (version 0.12.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
-Install the Argon compiler, package manager, analyzer, and Argone layout editor from GitHub. Cargo places
-`argonc`, `cargon`, `argon-analyzer`, and `argone` in its binary directory,
+Install the Argon compiler, library manager, analyzer, and Argone layout editor from GitHub. Cargo places
+`argonc`, `arc`, `argon-analyzer`, and `argone` in its binary directory,
 which should be on your `PATH` after installing Rust with rustup.
 
 ```bash
 cargo install --git https://github.com/ucb-substrate/argon --locked \
-    argonc cargon argon-analyzer argone
+    argonc arc argon-analyzer argone
 ```
 
 ## Command-line compilation
 
-`argonc` compiles source directly and never reads a project manifest. `--check`
+`argonc` compiles source directly and never reads a library manifest. `--check`
 runs source loading, dependency and module resolution, parsing, import analysis,
 and static type checking, then stops before executing a cell. Supplying a cell
 executes it and writes the compiler output as a binary artifact; `--gds`
@@ -59,8 +59,8 @@ argonc lib.ar --cell 'top(10., 20.)' --lyp layers.lyp -o top.bin
 argonc lib.ar --cell 'top()' --lyp layers.lyp -o top.bin --gds top.gds
 ```
 
-`cargon` reads `Argon.toml`, resolves project-relative paths, and invokes
-`argonc`. A project manifest can set its layer file and path dependencies:
+`arc` reads `Argon.toml`, resolves library-relative paths, and invokes
+`argonc`. A library manifest can set its layer file and path dependencies:
 
 ```toml
 lyp = "layers.lyp"
@@ -69,12 +69,12 @@ lyp = "layers.lyp"
 pdk = { path = "../pdk" }
 ```
 
-Check the project or execute a cell from the directory containing the manifest:
+Check the library or execute a cell from the directory containing the manifest:
 
 ```bash
-cargon check
-cargon run --cell 'top(10., 20.)'
-cargon run --cell 'top()' --gds
+arc check
+arc run --cell 'top(10., 20.)'
+arc run --cell 'top()' --gds
 ```
 
 For compatibility, existing `[mods]` path entries are also accepted.

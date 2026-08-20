@@ -114,7 +114,7 @@ fn run(args: Args) -> Result<(), Failed> {
     let Some((typed_ast, mut static_output)) = compile::static_compile(&ast) else {
         return Err(fail(
             format,
-            format!("could not parse crate root `{}`", root.display()),
+            format!("could not parse library root `{}`", root.display()),
         ));
     };
     static_output.errors.extend(parse_errors);

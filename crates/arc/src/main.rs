@@ -6,12 +6,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use arc::Library;
 use argonc::diagnostics::{self, Diagnostic};
-use cargon::Project;
 use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "The Argon package manager")]
+#[command(version, about = "The Argon library manager")]
 struct Cli {
     #[command(subcommand)]
     command: CommandKind,
@@ -19,14 +19,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
-    /// Parse, resolve, and type-check an Argon project.
-    Check(ProjectArgs),
+    /// Parse, resolve, and type-check an Argon library.
+    Check(LibraryArgs),
     /// Execute an Argon cell and write the compiler output.
     Run(RunArgs),
 }
 
 #[derive(Debug, Args)]
-struct ProjectArgs {
+struct LibraryArgs {
     /// Path to Argon.toml.
     #[arg(long, default_value = "Argon.toml")]
     manifest_path: PathBuf,
@@ -38,7 +38,7 @@ struct ProjectArgs {
 #[derive(Debug, Args)]
 struct RunArgs {
     #[command(flatten)]
-    project: ProjectArgs,
+    library: LibraryArgs,
     /// Cell invocation to instantiate, for example `top(10., 20.)`.
     #[arg(long)]
     cell: String,
@@ -64,10 +64,10 @@ fn main() -> ExitCode {
     }
 }
 
-fn check(args: ProjectArgs) -> Result<()> {
-    let project = Project::load(&args.manifest_path)?;
-    status("Checking", project_name(&project));
-    let mut command = compiler_command(&args.argonc, &project);
+fn check(args: LibraryArgs) -> Result<()> {
+    let library = Library::load(&args.manifest_path)?;
+    status("Checking", library_name(&library));
+    let mut command = compiler_command(&args.argonc, &library);
     command.arg("--check");
     run_compiler(command)?;
     status("Finished", "dev profile");
@@ -75,22 +75,22 @@ fn check(args: ProjectArgs) -> Result<()> {
 }
 
 fn run(args: RunArgs) -> Result<()> {
-    let project = Project::load(&args.project.manifest_path)?;
-    let lyp = project.lyp.as_ref().ok_or_else(|| {
+    let library = Library::load(&args.library.manifest_path)?;
+    let lyp = library.lyp.as_ref().ok_or_else(|| {
         anyhow!(
             "manifest `{}` does not set `lyp`",
-            project.manifest_path.display()
+            library.manifest_path.display()
         )
     })?;
     status("Running", &args.cell);
     let output = args.output.unwrap_or_else(|| {
-        project
+        library
             .manifest_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("target/argon.bin")
     });
-    let mut command = compiler_command(&args.project.argonc, &project);
+    let mut command = compiler_command(&args.library.argonc, &library);
     command
         .arg("--cell")
         .arg(args.cell)
@@ -99,7 +99,7 @@ fn run(args: RunArgs) -> Result<()> {
         .arg("--output")
         .arg(&output);
     if args.gds {
-        let gds = project
+        let gds = library
             .manifest_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -114,16 +114,16 @@ fn run(args: RunArgs) -> Result<()> {
     Ok(())
 }
 
-fn compiler_command(argonc: &Path, project: &Project) -> Command {
+fn compiler_command(argonc: &Path, library: &Library) -> Command {
     let compiler = sibling_argonc(argonc);
     let mut command = Command::new(compiler);
     command
-        .arg(&project.root)
+        .arg(&library.root)
         .arg("--error-format")
         .arg("json")
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped());
-    for (name, path) in &project.dependencies {
+    for (name, path) in &library.dependencies {
         command
             .arg("--extern")
             .arg(format!("{name}={}", path.display()));
@@ -161,18 +161,18 @@ fn run_compiler(mut command: Command) -> Result<()> {
         }
     }
     if !output.status.success() {
-        bail!("could not compile project due to previous errors");
+        bail!("could not compile library due to previous errors");
     }
     Ok(())
 }
 
-fn project_name(project: &Project) -> &str {
-    project
+fn library_name(library: &Library) -> &str {
+    library
         .manifest_path
         .parent()
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
-        .unwrap_or("argon-project")
+        .unwrap_or("argon-library")
 }
 
 fn use_color() -> bool {
