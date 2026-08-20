@@ -95,17 +95,26 @@ fn execution_writes_binary_output_without_gds_by_default() {
 
 #[test]
 fn execution_accepts_a_boolean_cell_argument() {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source = temp_source("sky130-bool", "");
-    let sky130 = workspace.join("pdks/sky130");
-    let lyp = sky130.join("sky130.lyp");
-    let artifact_path = std::env::temp_dir().join("argonc-fet1v8-bool.bin");
+    let source = temp_source("bool-root", "");
+    let dependency = temp_source(
+        "bool-dependency",
+        r#"cell device(enabled: Bool, w: Float, count: Int) {
+    if enabled {
+        rect("met1", x0=0., y0=0., w=w, h=10.);
+    } else {
+        rect("met1", x0=0., y0=0., w=w, h=20.);
+    };
+}
+"#,
+    );
+    let lyp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp");
+    let artifact_path = std::env::temp_dir().join("argonc-bool.bin");
     let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
         .arg(source)
-        .arg("--extern")
-        .arg(format!("sky130={}", sky130.display()))
+        .arg("--dependency")
+        .arg(format!("devices={}", dependency.display()))
         .arg("--cell")
-        .arg("sky130::fet1v8(true, 150., 5)")
+        .arg("devices::device(true, 150., 5)")
         .arg("--lyp")
         .arg(lyp)
         .arg("--output")
@@ -121,19 +130,22 @@ fn execution_accepts_a_boolean_cell_argument() {
 
 #[test]
 fn invalid_cell_argument_type_is_reported_cleanly() {
-    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let source = temp_source("sky130-invalid-argument", "");
-    let sky130 = workspace.join("pdks/sky130");
+    let source = temp_source("invalid-argument-root", "");
+    let dependency = temp_source(
+        "invalid-argument-dependency",
+        "cell device(enabled: Bool, w: Float, count: Int) {}\n",
+    );
+    let lyp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp");
     let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
         .arg(source)
-        .arg("--extern")
-        .arg(format!("sky130={}", sky130.display()))
+        .arg("--dependency")
+        .arg(format!("devices={}", dependency.display()))
         .arg("--cell")
-        .arg("sky130::fet1v8(1, 150., 5)")
+        .arg("devices::device(1, 150., 5)")
         .arg("--lyp")
-        .arg(sky130.join("sky130.lyp"))
+        .arg(lyp)
         .arg("--output")
-        .arg(std::env::temp_dir().join("argonc-fet1v8-invalid.bin"))
+        .arg(std::env::temp_dir().join("argonc-invalid-argument.bin"))
         .output()
         .expect("argonc should run");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -191,4 +203,52 @@ fn malformed_lyp_is_reported_with_its_path() {
         "{stderr}"
     );
     assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
+fn standard_library_errors_show_embedded_source_lines() {
+    let source = temp_source(
+        "std-diagnostic",
+        r#"cell top() {
+    let r = crect(layer="missing.drawing", x0=0., y0=0., w=10., h=10.);
+    std::array(r, 2, 20., 0.);
+}
+"#,
+    );
+    let lyp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp");
+    let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
+        .arg(source)
+        .arg("--cell")
+        .arg("top()")
+        .arg("--lyp")
+        .arg(&lyp)
+        .output()
+        .expect("argonc should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains(&format!(
+            "rectangle uses layer `missing.drawing`, which is not defined in LYP file `{}`",
+            lyp.display()
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--> <argon-std>/lib.ar:"), "{stderr}");
+    assert!(
+        stderr.contains("let first_rect = rect(r.layer);"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("<argon-std>/lib.ar:1:1"), "{stderr}");
+}
+
+#[test]
+fn help_uses_dependency_terminology() {
+    let output = Command::new(env!("CARGO_BIN_EXE_argonc"))
+        .arg("--help")
+        .output()
+        .expect("argonc should show help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("--dependency"), "{stdout}");
+    assert!(!stdout.contains("--extern"), "{stdout}");
 }

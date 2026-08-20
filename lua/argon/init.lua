@@ -55,8 +55,8 @@ end
 M.get_root_dir = function(bufnr)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
     local bufname = vim.api.nvim_buf_get_name(bufnr)
-    local crate_dir = vim.fs.root(bufname, { 'lib.ar' })
-    return crate_dir
+    local workspace_dir = vim.fs.root(bufname, { 'lib.ar' })
+    return workspace_dir
 end
 
 --- Start or attach the LSP client

@@ -66,11 +66,11 @@ fn main() -> ExitCode {
 
 fn check(args: LibraryArgs) -> Result<()> {
     let library = Library::load(&args.manifest_path)?;
-    status("Checking", library_name(&library));
+    status("Checking", &library.name);
     let mut command = compiler_command(&args.argonc, &library);
     command.arg("--check");
     run_compiler(command)?;
-    status("Finished", "dev profile");
+    status("Finished", &format!("checking {}", library.name));
     Ok(())
 }
 
@@ -82,7 +82,7 @@ fn run(args: RunArgs) -> Result<()> {
             library.manifest_path.display()
         )
     })?;
-    status("Running", &args.cell);
+    status("Running", &format!("{} in {}", args.cell, library.name));
     let output = args.output.unwrap_or_else(|| {
         library
             .manifest_path
@@ -107,10 +107,7 @@ fn run(args: RunArgs) -> Result<()> {
         command.arg("--gds").arg(gds);
     }
     run_compiler(command)?;
-    status(
-        "Finished",
-        &format!("dev profile; output: {}", output.display()),
-    );
+    status("Finished", &format!("output: {}", output.display()));
     Ok(())
 }
 
@@ -125,7 +122,7 @@ fn compiler_command(argonc: &Path, library: &Library) -> Command {
         .stderr(Stdio::piped());
     for (name, path) in &library.dependencies {
         command
-            .arg("--extern")
+            .arg("--dependency")
             .arg(format!("{name}={}", path.display()));
     }
     command
@@ -164,15 +161,6 @@ fn run_compiler(mut command: Command) -> Result<()> {
         bail!("could not compile library due to previous errors");
     }
     Ok(())
-}
-
-fn library_name(library: &Library) -> &str {
-    library
-        .manifest_path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
-        .unwrap_or("argon-library")
 }
 
 fn use_color() -> bool {

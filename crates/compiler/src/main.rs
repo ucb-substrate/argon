@@ -39,7 +39,7 @@ struct Args {
     lyp: Option<PathBuf>,
 
     /// Path dependency in NAME=PATH form. PATH may be a directory or lib.ar.
-    #[arg(long = "extern", value_parser = parse_extern)]
+    #[arg(long = "dependency", alias = "extern", value_parser = parse_dependency)]
     dependencies: Vec<(String, PathBuf)>,
 
     /// Binary compiler-output path. Defaults to the root source with a .bin suffix.
@@ -223,7 +223,7 @@ fn cell_arg(expr: &Expr<&str, parse::ParseMetadata>) -> Result<CellArg, String> 
     }
 }
 
-fn parse_extern(value: &str) -> Result<(String, PathBuf), String> {
+fn parse_dependency(value: &str) -> Result<(String, PathBuf), String> {
     let (name, path) = value
         .split_once('=')
         .ok_or_else(|| "expected NAME=PATH".to_string())?;

@@ -65,6 +65,7 @@ pub fn dynamic_compile(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
 ) -> CompileOutput {
+    let lyp_file = input.lyp_file;
     let res = ExecPass::new(ast).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
@@ -77,7 +78,7 @@ pub fn dynamic_compile(
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, &mut errors);
+    check_layers(&data, lyp_file, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -319,7 +320,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         if func.path[0].name != "std" {
-            let path = if func.path[0].name == "crate" {
+            let path = if func.path[0].name == "lib" {
                 func.path
                     .iter()
                     .skip(1)
@@ -393,7 +394,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
     for layer in data.layers.layers.iter() {
         layers.insert(layer.name.clone());
@@ -407,7 +408,10 @@ fn check_layers(data: &CompiledData, errs: &mut Vec<ExecError>) {
                 errs.push(ExecError {
                     span: r.span.clone(),
                     cell: *cell_id,
-                    kind: ExecErrorKind::IllegalLayer(layer.clone()),
+                    kind: ExecErrorKind::IllegalLayer {
+                        layer: layer.clone(),
+                        lyp: lyp_file.display().to_string(),
+                    },
                 })
             }
         }
@@ -1018,7 +1022,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "std" => {
                     vec!["std".to_string()]
                 }
-                "crate" => input
+                "lib" => input
                     .path
                     .iter()
                     .skip(1)
@@ -1742,7 +1746,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "std" => {
                     vec!["std".to_string()]
                 }
-                "crate" => func
+                "lib" => func
                     .path
                     .iter()
                     .skip(1)
@@ -2288,7 +2292,7 @@ impl<'a> ExecPass<'a> {
             "std" => {
                 vec!["std".to_string()]
             }
-            "crate" => input
+            "lib" => input
                 .cell
                 .iter()
                 .skip(1)
@@ -5145,8 +5149,8 @@ pub enum ExecErrorKind {
     #[error("cell is underconstrained")]
     Underconstrained,
     /// Illegal layer (not defined in layer properties).
-    #[error("layer {0} is not defined in layer properties")]
-    IllegalLayer(String),
+    #[error("rectangle uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
+    IllegalLayer { layer: String, lyp: String },
     /// Inconsistent constraint.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),

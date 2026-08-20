@@ -59,10 +59,14 @@ argonc lib.ar --cell 'top(10., 20.)' --lyp layers.lyp -o top.bin
 argonc lib.ar --cell 'top()' --lyp layers.lyp -o top.bin --gds top.gds
 ```
 
+Path dependencies are supplied explicitly as `--dependency NAME=PATH`. Within
+an Argon library, `lib::` refers to that library's root module.
+
 `arc` reads `Argon.toml`, resolves library-relative paths, and invokes
 `argonc`. A library manifest can set its layer file and path dependencies:
 
 ```toml
+name = "my-library"
 lyp = "layers.lyp"
 
 [dependencies]
@@ -84,6 +88,7 @@ using the Sky130 PDK must reference a local checkout explicitly, both as a path
 dependency and as the source of its layer-properties file. For example:
 
 ```toml
+name = "my-sky130-layout"
 lyp = "../pdks/sky130/sky130.lyp"
 
 [dependencies]
@@ -114,13 +119,13 @@ in both Neovim and the GUI.
 
 ## Parametric Cell Tutorial
 
-Create a new Argon workspace with the following command:
+Create a new Argon library with the following command:
 
 ```bash
 mkdir tutorial && touch tutorial/lib.ar
 ```
 
-Your workspace directory should look like this:
+Your library directory should look like this:
 
 ```
 tutorial

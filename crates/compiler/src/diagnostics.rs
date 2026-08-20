@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ast::Span,
     compile::{CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput},
+    parse::{STD_PATH, STD_SOURCE},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,9 +112,13 @@ pub fn render(writer: &mut impl Write, diagnostic: &Diagnostic, color: bool) -> 
     let (Some(path), Some(start)) = (&diagnostic.path, diagnostic.start) else {
         return Ok(());
     };
-    let source = fs::read_to_string(path).ok();
+    let file_source = fs::read_to_string(path).ok();
+    let source = if path == Path::new(STD_PATH) {
+        Some(STD_SOURCE)
+    } else {
+        file_source.as_deref()
+    };
     let (line, column, line_text, underline) = source
-        .as_deref()
         .map(|source| source_location(source, start, diagnostic.end.unwrap_or(start)))
         .unwrap_or((1, 1, None, 1));
     writeln!(writer, "  --> {}:{line}:{column}", path.display())?;
@@ -147,10 +152,38 @@ fn source_location(source: &str, start: usize, end: usize) -> (usize, usize, Opt
 
 #[cfg(test)]
 mod tests {
-    use super::source_location;
+    use std::path::PathBuf;
+
+    use crate::{
+        ast::Span,
+        parse::{STD_PATH, STD_SOURCE},
+    };
+
+    use super::{Diagnostic, Level, render, source_location};
 
     #[test]
     fn computes_source_location() {
         assert_eq!(source_location("one\ntwo\n", 5, 7), (2, 2, Some("two"), 2));
+    }
+
+    #[test]
+    fn renders_embedded_standard_library_source() {
+        let needle = "let first_rect = rect(r.layer);";
+        let start = STD_SOURCE
+            .find(needle)
+            .expect("standard-library source should contain array rectangle");
+        let diagnostic = Diagnostic::at(
+            Level::Error,
+            "test standard-library diagnostic",
+            &Span {
+                path: PathBuf::from(STD_PATH),
+                span: cfgrammar::Span::new(start, start + needle.len()),
+            },
+        );
+        let mut output = Vec::new();
+        render(&mut output, &diagnostic, false).expect("diagnostic should render");
+        let output = String::from_utf8(output).expect("diagnostic should be UTF-8");
+        assert!(output.contains(needle), "{output}");
+        assert!(!output.contains("<argon-std>/lib.ar:1:1"), "{output}");
     }
 }

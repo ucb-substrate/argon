@@ -17,6 +17,11 @@ pub struct ParseMetadata;
 pub type AnnotatedParseAst = AnnotatedAst<ParseMetadata>;
 pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;
 
+/// Virtual path used for diagnostics originating in the embedded standard library.
+pub const STD_PATH: &str = "<argon-std>/lib.ar";
+/// Source text embedded into the compiler for the Argon standard library.
+pub const STD_SOURCE: &str = include_str!("std/lib.ar");
+
 impl AstMetadata for ParseMetadata {
     type Ident = ();
     type IdentPath = ();
@@ -220,9 +225,8 @@ pub fn parse_workspace_with_std_and_deps(
     let ParseOutput { asts, errs } = parse_workspace(root_lib);
     ast.extend(asts);
     err.extend(errs);
-    let std_path = PathBuf::from("<argon-std>/lib.ar");
-    let (std_ast, std_diagnostics) =
-        parse_source(ArcStr::from(include_str!("std/lib.ar")), std_path.clone());
+    let std_path = PathBuf::from(STD_PATH);
+    let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
     // TODO: fix std library overwriting user-defined std mods.
     ast.insert(vec!["std".to_string()], std_ast);
     err.insert(std_path, (std_diagnostics, Vec::new()));
