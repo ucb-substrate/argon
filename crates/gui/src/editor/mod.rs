@@ -73,6 +73,7 @@ pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
     pub fatal_error: Option<SharedString>,
+    pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
     pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
@@ -342,6 +343,7 @@ impl Editor {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
                 fatal_error: None,
+                connection_error: None,
                 solved_cell,
                 hide_external_geometry: false,
                 tool,
@@ -394,6 +396,7 @@ impl Editor {
 
     pub fn open_cell(&self, cx: &mut App, output: CompileOutput, update: bool) {
         self.state.update(cx, |state, cx| {
+            state.connection_error = None;
             state.update(cx, output);
             cx.notify();
         });
@@ -442,29 +445,19 @@ impl Editor {
     }
 
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(e) = self
+        let _ = self
             .state
             .read(cx)
             .lang_server_client
-            .dispatch_action(LangServerAction::Undo)
-        {
-            self.state.update(cx, |state, _cx| {
-                state.fatal_error = Some(format!("{e}").into());
-            });
-        }
+            .dispatch_action(LangServerAction::Undo);
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(e) = self
+        let _ = self
             .state
             .read(cx)
             .lang_server_client
-            .dispatch_action(LangServerAction::Redo)
-        {
-            self.state.update(cx, |state, _cx| {
-                state.fatal_error = Some(format!("{e}").into());
-            });
-        }
+            .dispatch_action(LangServerAction::Redo);
     }
 
     fn focus_invoking_app(
@@ -482,11 +475,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.state.read(cx).lang_server_client.open_command_bar() {
-            self.state.update(cx, |state, _cx| {
-                state.fatal_error = Some(format!("{error}").into());
-            });
-        }
+        let _ = self.state.read(cx).lang_server_client.open_command_bar();
         self.focus_invoker(cx);
     }
 
@@ -544,7 +533,15 @@ impl Render for Editor {
                             .overflow_hidden()
                             .child(self.canvas.clone());
 
-                        if let Some(fatal_error) = &self.state.read(cx).fatal_error {
+                        let displayed_error = {
+                            let state = self.state.read(cx);
+                            state
+                                .connection_error
+                                .clone()
+                                .map(|error| (error, true))
+                                .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                        };
+                        if let Some((error, is_connection_error)) = displayed_error {
                             d = d.child(
                                 div()
                                     .id("error_modal")
@@ -566,8 +563,14 @@ impl Render for Editor {
                                         )
                                         .child(div().child("Error"))
                                     )
-                                    .child(format!("Editing may be disabled due to error: {fatal_error}."))
-                                    .child(div().text_xs().text_color(theme.subtext).child("Fix the error and save in the editor to dismiss."))
+                                    .child(format!("Editing may be disabled due to error: {error}."))
+                                    .child(div().text_xs().text_color(theme.subtext).child(
+                                        if is_connection_error {
+                                            "This message will disappear when the connection recovers."
+                                        } else {
+                                            "Fix the error and save in the editor to dismiss."
+                                        }
+                                    ))
                                     .whitespace_normal()
                                     .top_2()
                                     .left_2()

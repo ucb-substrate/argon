@@ -1834,7 +1834,7 @@ impl LayoutCanvas {
                                                         "inconsistent editor and GUI state".into(),
                                                     ),
                                                     Ok(Some(_)) => None,
-                                                    Err(e) => Some(format!("{e}").into()),
+                                                    Err(_) => None,
                                                 }
                                             } else {
                                                 Some("no cell to edit".into())
@@ -1850,25 +1850,15 @@ impl LayoutCanvas {
                                 rect_tool.p0 = Some(p0);
                             }
                         } else {
-                            let res = state.lang_server_client.show_message(
+                            let _ = state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
-                            if let Err(e) = res {
-                                self.state.update(cx, |state, _cx| {
-                                    state.fatal_error = Some(format!("{e}").into());
-                                });
-                            }
                         }
                     } else {
-                        let res = state
+                        let _ = state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
-                        if let Err(e) = res {
-                            self.state.update(cx, |state, _cx| {
-                                state.fatal_error = Some(format!("{e}").into());
-                            });
-                        }
                     }
                 }
                 ToolState::DrawDim(dim_tool) => {
@@ -2301,18 +2291,11 @@ impl LayoutCanvas {
                                 self.sse_delta = Point::default();
                                 self.sse_targets = body.targets;
                             }
-                            if let Err(e) = self
+                            let _ = self
                                 .state
                                 .read(cx)
                                 .lang_server_client
-                                .select_rect(span.clone())
-                            {
-                                self.state.update(cx, |state, cx| {
-                                    state.fatal_error =
-                                        Some(format!("Editing disabled due to error {e}").into());
-                                    cx.notify();
-                                });
-                            }
+                                .select_rect(span.clone());
                         } else {
                             select_tool.selected_obj = None;
                         }
@@ -2616,14 +2599,10 @@ impl LayoutCanvas {
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
-                    Err(e) => {
+                    Err(_) => {
                         self.is_sse_dragging = false;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
-                        self.state.update(cx, |state, cx| {
-                            state.fatal_error = Some(format!("Failed to persist drag: {e}").into());
-                            cx.notify();
-                        });
                     }
                 }
             }

@@ -276,23 +276,22 @@ impl TextInput {
                 } else {
                     Ok(None)
                 };
-                let error = match result {
-                    Ok(None) => Some("inconsistent editor and GUI state".into()),
-                    Ok(Some(_)) => None,
-                    Err(e) => Some(format!("{e}").into()),
-                };
-                if let Some(error) = error {
-                    self.state.update(cx, |state, _cx| {
-                        state.fatal_error = Some(error);
-                    });
-                    false
-                } else {
-                    *tool = if *dim_mode {
-                        ToolState::DrawDim(DrawDimToolState::default())
-                    } else {
-                        ToolState::default()
-                    };
-                    true
+                match result {
+                    Ok(None) => {
+                        self.state.update(cx, |state, _cx| {
+                            state.fatal_error = Some("inconsistent editor and GUI state".into());
+                        });
+                        false
+                    }
+                    Ok(Some(_)) => {
+                        *tool = if *dim_mode {
+                            ToolState::DrawDim(DrawDimToolState::default())
+                        } else {
+                            ToolState::default()
+                        };
+                        true
+                    }
+                    Err(_) => false,
                 }
             } else {
                 false

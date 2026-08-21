@@ -1,5 +1,6 @@
 use std::{
     fmt::Display,
+    future::Future,
     net::{Ipv4Addr, SocketAddr, TcpListener},
     time::Duration,
 };
@@ -12,7 +13,7 @@ use argonc::{
 };
 use async_compat::CompatExt;
 use futures::{
-    channel::mpsc::{self, Receiver, Sender},
+    channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
     prelude::*,
 };
 use gpui::AsyncApp;
@@ -26,17 +27,17 @@ use tracing::error;
 
 use crate::{editor::Editor, editor_window_options, focus};
 
-pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
+pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct SyncLangServerClient {
     app: AsyncApp,
     client: LangServerClient,
-    to_exec: Sender<EditorFn>,
+    to_exec: UnboundedSender<EditorFn>,
 }
 
 impl SyncLangServerClient {
-    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, Receiver<EditorFn>) {
+    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, UnboundedReceiver<EditorFn>) {
         let client = app.background_executor().block(
             async move {
                 let mut transport =
@@ -48,7 +49,7 @@ impl SyncLangServerClient {
             }
             .compat(),
         );
-        let (to_exec, rx) = mpsc::channel(1);
+        let (to_exec, rx) = mpsc::unbounded();
         (
             Self {
                 app,
@@ -57,6 +58,40 @@ impl SyncLangServerClient {
             },
             rx,
         )
+    }
+
+    fn call<T, F>(&self, request: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = std::result::Result<T, tarpc::client::RpcError>> + Send + 'static,
+    {
+        let result = match self
+            .app
+            .background_executor()
+            .block_with_timeout(LANG_SERVER_CLIENT_TIMEOUT, request.compat())
+        {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(anyhow!(
+                "timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}"
+            )),
+        };
+        self.report_connection_result(&result);
+        result
+    }
+
+    fn report_connection_result<T>(&self, result: &Result<T>) {
+        let error = result.as_ref().err().map(ToString::to_string);
+        let _ = self.to_exec.unbounded_send(Box::new(move |editor, cx| {
+            let _ = editor.state.update(cx, |state, cx| {
+                if let Some(error) = error {
+                    state.connection_error = Some(error.into());
+                } else {
+                    state.connection_error = None;
+                }
+                cx.notify();
+            });
+        }));
     }
 
     pub fn register_server(
@@ -151,17 +186,7 @@ impl SyncLangServerClient {
 
     pub fn select_rect(&self, span: Span) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move { client_clone.select_rect(context::current(), span).await }.compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
+        self.call(async move { client_clone.select_rect(context::current(), span).await })
     }
 
     pub fn draw_rect(
@@ -171,21 +196,11 @@ impl SyncLangServerClient {
         rect: BasicRect<f64>,
     ) -> Result<Option<Span>> {
         let client_clone = self.client.clone();
-        Ok(self
-            .app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .draw_rect(context::current(), scope_span, var_name, rect)
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??)
+        self.call(async move {
+            client_clone
+                .draw_rect(context::current(), scope_span, var_name, rect)
+                .await
+        })
     }
 
     pub fn draw_dimension(
@@ -194,129 +209,58 @@ impl SyncLangServerClient {
         params: DimensionParams,
     ) -> Result<Option<Span>> {
         let client_clone = self.client.clone();
-        Ok(self
-            .app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .draw_dimension(context::current(), scope_span, params)
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??)
+        self.call(async move {
+            client_clone
+                .draw_dimension(context::current(), scope_span, params)
+                .await
+        })
     }
 
     pub fn edit_dimension(&self, span: Span, value: String) -> Result<Option<Span>> {
         let client_clone = self.client.clone();
-        Ok(self
-            .app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .edit_dimension(context::current(), span, value)
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??)
+        self.call(async move {
+            client_clone
+                .edit_dimension(context::current(), span, value)
+                .await
+        })
     }
 
     pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<bool> {
         let client_clone = self.client.clone();
-        Ok(self
-            .app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move { client_clone.update_values(context::current(), edits).await }.compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??)
+        self.call(async move { client_clone.update_values(context::current(), edits).await })
     }
 
     pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .add_eq_constraint(context::current(), scope_span, lhs, rhs)
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
+        self.call(async move {
+            client_clone
+                .add_eq_constraint(context::current(), scope_span, lhs, rhs)
+                .await
+        })
     }
 
     pub fn show_message<M: Display>(&self, typ: MessageType, message: M) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .show_message(context::current(), typ, format!("{}", message))
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
+        let message = message.to_string();
+        self.call(async move {
+            client_clone
+                .show_message(context::current(), typ, message)
+                .await
+        })
     }
 
     pub fn dispatch_action(&self, action: LangServerAction) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .dispatch_action(context::current(), action)
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
+        self.call(async move {
+            client_clone
+                .dispatch_action(context::current(), action)
+                .await
+        })
     }
 
     pub fn open_command_bar(&self) -> Result<()> {
         let client_clone = self.client.clone();
-        self.app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move { client_clone.focus_editor(context::current(), true).await }.compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
+        self.call(async move { client_clone.focus_editor(context::current(), true).await })
     }
 }
 
@@ -324,7 +268,7 @@ type EditorFn = Box<dyn FnOnce(&Editor, &mut AsyncApp) + Send>;
 
 #[derive(Clone)]
 pub struct GuiServer {
-    to_exec: Sender<EditorFn>,
+    to_exec: UnboundedSender<EditorFn>,
 }
 
 impl Gui for GuiServer {
