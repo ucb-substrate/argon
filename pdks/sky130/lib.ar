@@ -19,6 +19,7 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
     std::center_rects(li1_bbox, std::array2(licon, nf + 1, ny, 430., 340.));
+    let rect0 = rect("prBoundary.boundary", x0i = 2432.2, y0i = 788.7, x1i = -5405.5, y1i = 1228.6)!;
 }
 
 cell tap(ntap: Int, w: Float, h: Float) {

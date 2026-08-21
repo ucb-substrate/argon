@@ -43,3 +43,4 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 approx = { workspace = true }
+gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev", features = ["test-support"] }

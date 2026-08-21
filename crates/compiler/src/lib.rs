@@ -93,7 +93,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        compile::{ExecErrorKind, SolvedValue, StaticErrorKind},
+        compile::{ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind},
         gds::GdsMap,
         parse::{parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -875,6 +875,10 @@ mod tests {
         // fallback (the higher-priority `x1i`).
         assert_eq!(used.len(), 1);
         let fb = &used[0];
+        assert!(matches!(
+            fb.initial_condition,
+            Some(RectInitialCondition::X1(_))
+        ));
         // Constraint is `x1 - 100`: a single variable with coefficient 1 and a
         // pinned value of 100 (= -constant).
         assert_eq!(fb.constraint.coeffs.len(), 1);

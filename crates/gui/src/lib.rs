@@ -93,35 +93,7 @@ fn run_inner(
                 ])
                 .unwrap();
             // Bind keys must happen before menus to get the keybindings to show up next to menu items.
-            cx.bind_keys([
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("r", DrawRect, None),
-                KeyBinding::new("s", SelectMode, None),
-                KeyBinding::new("d", DrawDim, None),
-                KeyBinding::new("f", Fit, None),
-                KeyBinding::new("q", Edit, None),
-                KeyBinding::new("u", Undo, None),
-                KeyBinding::new("ctrl-r", Redo, None),
-                KeyBinding::new("0", Zero, None),
-                KeyBinding::new("1", One, None),
-                KeyBinding::new("*", All, None),
-                KeyBinding::new(":", Command, None),
-                KeyBinding::new("escape", Cancel, None),
-                KeyBinding::new("backspace", Backspace, None),
-                KeyBinding::new("delete", Delete, None),
-                KeyBinding::new("left", Left, None),
-                KeyBinding::new("right", Right, None),
-                KeyBinding::new("shift-left", SelectLeft, None),
-                KeyBinding::new("shift-right", SelectRight, None),
-                KeyBinding::new("cmd-a", SelectAll, None),
-                KeyBinding::new("cmd-v", Paste, None),
-                KeyBinding::new("cmd-c", Copy, None),
-                KeyBinding::new("cmd-x", Cut, None),
-                KeyBinding::new("home", Home, None),
-                KeyBinding::new("end", End, None),
-                KeyBinding::new("enter", Enter, None),
-                KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, None),
-            ]);
+            cx.bind_keys(key_bindings());
             // Register the `quit` function so it can be referenced by the `MenuItem::action` in the menu bar
             cx.on_action(quit);
             // Add menu items
@@ -177,6 +149,39 @@ fn run_inner(
         });
 }
 
+fn key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("r", DrawRect, Some("LayoutCanvas")),
+        KeyBinding::new("s", SelectMode, Some("LayoutCanvas")),
+        KeyBinding::new("d", DrawDim, Some("LayoutCanvas")),
+        KeyBinding::new("f", Fit, Some("LayoutCanvas")),
+        KeyBinding::new("q", Edit, Some("LayoutCanvas")),
+        KeyBinding::new("u", Undo, Some("LayoutCanvas")),
+        KeyBinding::new("ctrl-r", Redo, Some("LayoutCanvas")),
+        KeyBinding::new("0", Zero, Some("LayoutCanvas")),
+        KeyBinding::new("1", One, Some("LayoutCanvas")),
+        KeyBinding::new("*", All, Some("LayoutCanvas")),
+        KeyBinding::new(":", Command, Some("LayoutCanvas")),
+        KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
+        KeyBinding::new("escape", Cancel, Some("TextInput")),
+        KeyBinding::new("backspace", Backspace, Some("TextInput")),
+        KeyBinding::new("delete", Delete, Some("TextInput")),
+        KeyBinding::new("left", Left, Some("TextInput")),
+        KeyBinding::new("right", Right, Some("TextInput")),
+        KeyBinding::new("shift-left", SelectLeft, Some("TextInput")),
+        KeyBinding::new("shift-right", SelectRight, Some("TextInput")),
+        KeyBinding::new("cmd-a", SelectAll, Some("TextInput")),
+        KeyBinding::new("cmd-v", Paste, Some("TextInput")),
+        KeyBinding::new("cmd-c", Copy, Some("TextInput")),
+        KeyBinding::new("cmd-x", Cut, Some("TextInput")),
+        KeyBinding::new("home", Home, Some("TextInput")),
+        KeyBinding::new("end", End, Some("TextInput")),
+        KeyBinding::new("enter", Enter, Some("TextInput")),
+        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextInput")),
+    ]
+}
+
 fn editor_window_options() -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
@@ -193,4 +198,79 @@ fn editor_window_options() -> WindowOptions {
 fn quit(_: &Quit, cx: &mut App) {
     info!("Gracefully quitting the application . . .");
     cx.quit();
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Context, FocusHandle, Render, TestAppContext, Window, div, prelude::*};
+
+    use super::{actions::*, key_bindings};
+
+    struct ShortcutTestView {
+        canvas_focus: FocusHandle,
+        input_focus: FocusHandle,
+        undo_count: usize,
+        draw_rect_count: usize,
+        command_count: usize,
+    }
+
+    impl Render for ShortcutTestView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .on_action(cx.listener(|view, _: &Undo, _, _| view.undo_count += 1))
+                .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
+                .on_action(cx.listener(|view, _: &Command, _, _| view.command_count += 1))
+                .child(
+                    div()
+                        .key_context("LayoutCanvas")
+                        .track_focus(&self.canvas_focus),
+                )
+                .child(
+                    div()
+                        .key_context("TextInput")
+                        .track_focus(&self.input_focus),
+                )
+        }
+    }
+
+    #[gpui::test]
+    fn canvas_shortcuts_do_not_fire_while_text_input_is_focused(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.bind_keys(key_bindings());
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| ShortcutTestView {
+                    canvas_focus: cx.focus_handle(),
+                    input_focus: cx.focus_handle(),
+                    undo_count: 0,
+                    draw_rect_count: 0,
+                    command_count: 0,
+                })
+            })
+            .unwrap()
+        });
+
+        window
+            .update(cx, |view, window, _| window.focus(&view.input_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, "u r :");
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.undo_count, 0);
+                assert_eq!(view.draw_rect_count, 0);
+                assert_eq!(view.command_count, 0);
+            })
+            .unwrap();
+
+        window
+            .update(cx, |view, window, _| window.focus(&view.canvas_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, "u r :");
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.undo_count, 1);
+                assert_eq!(view.draw_rect_count, 1);
+                assert_eq!(view.command_count, 1);
+            })
+            .unwrap();
+    }
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt::Debug,
     ops::{Add, Sub},
 };
@@ -7,7 +7,7 @@ use std::{
 use analyzer::rpc::{DimensionParams, ValueEdit};
 use argonc::{
     ast::Span,
-    compile::{self, ObjectId, SolvedValue, ifmatvec},
+    compile::{self, ObjectId, RectInitialCondition, SolvedValue, ifmatvec},
     solver::{LinearExpr, Var},
 };
 use enumify::enumify;
@@ -55,6 +55,13 @@ struct SseHandle {
     bounds: Bounds<Pixels>,
     expr: LinearExpr,
     normal: Point<f32>,
+}
+
+struct InitialConditionUpdate {
+    span: Span,
+    value: f64,
+    changed: bool,
+    target: Option<RectInitialCondition>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -141,6 +148,29 @@ impl From<editor::Rect<(f64, Var)>> for Rect {
 }
 
 impl Rect {
+    /// Returns the same visual rectangle with ordered coordinates. Edge-specific
+    /// styling and constraint expressions move with their physical edge when a
+    /// dragged edge crosses its opposite edge.
+    fn normalized(mut self) -> Self {
+        if self.x0 > self.x1 {
+            std::mem::swap(&mut self.x0, &mut self.x1);
+            std::mem::swap(&mut self.border_widths.left, &mut self.border_widths.right);
+            std::mem::swap(&mut self.border_styles.left, &mut self.border_styles.right);
+            if let Some(cvars) = &mut self.cvars {
+                std::mem::swap(&mut cvars.left, &mut cvars.right);
+            }
+        }
+        if self.y0 > self.y1 {
+            std::mem::swap(&mut self.y0, &mut self.y1);
+            std::mem::swap(&mut self.border_widths.top, &mut self.border_widths.bottom);
+            std::mem::swap(&mut self.border_styles.top, &mut self.border_styles.bottom);
+            if let Some(cvars) = &mut self.cvars {
+                std::mem::swap(&mut cvars.top, &mut cvars.bottom);
+            }
+        }
+        self
+    }
+
     pub fn transform(&self, mat: TransformationMatrix, ofs: (f64, f64)) -> Self {
         let p0p = ifmatvec(mat, (self.x0 as f64, self.y0 as f64));
         let p1p = ifmatvec(mat, (self.x1 as f64, self.y1 as f64));
@@ -234,6 +264,9 @@ pub struct LayoutCanvas {
     pub state: Entity<EditorState>,
     // SSE state
     is_sse_dragging: bool,
+    // Keep displaying the final drag preview after mouse-up until the analyzer
+    // sends back the result compiled from the rewritten initial conditions.
+    is_sse_persisting: bool,
     sse_expr: LinearExpr,
     sse_delta: Point<Pixels>,
     // Unit normal (in layout space) of the edge being dragged: (1, 0) for the
@@ -297,10 +330,33 @@ fn get_rect_bounds(
     scale: f32,
     offset: Point<Pixels>,
 ) -> Bounds<Pixels> {
+    let x0 = r.x0.min(r.x1);
+    let x1 = r.x0.max(r.x1);
+    let y0 = r.y0.min(r.y1);
+    let y1 = r.y0.max(r.y1);
     Bounds::new(
-        Point::new(scale * px(r.x0), scale * px(-r.y1)) + offset + bounds.origin,
-        Size::new(scale * px(r.x1 - r.x0), scale * px(r.y1 - r.y0)),
+        Point::new(scale * px(x0), scale * px(-y1)) + offset + bounds.origin,
+        Size::new(scale * px(x1 - x0), scale * px(y1 - y0)),
     )
+}
+
+fn sort_initial_condition_pair(
+    updates: &mut [InitialConditionUpdate],
+    low_index: usize,
+    high_index: usize,
+) {
+    if let Some((low, high)) =
+        sorted_initial_condition_values(updates[low_index].value, updates[high_index].value)
+    {
+        updates[low_index].value = low;
+        updates[high_index].value = high;
+        updates[low_index].changed = true;
+        updates[high_index].changed = true;
+    }
+}
+
+fn sorted_initial_condition_values(low: f64, high: f64) -> Option<(f64, f64)> {
+    (low > high).then_some((high, low))
 }
 
 fn get_paint_quad(
@@ -403,7 +459,7 @@ impl Element for CanvasElement {
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(solved_cell) = solved_cell {
             let top = &solved_cell.output.cells[&solved_cell.output.top];
-            if inner.is_sse_dragging {
+            if inner.is_sse_dragging || inner.is_sse_persisting {
                 // Distance the dragged edge should travel along its normal, in
                 // layout units (the n̂ᵀd term of Algorithm 3).
                 let delta = crate::sse::edge_drag_distance(
@@ -564,7 +620,8 @@ impl Element for CanvasElement {
                                             bottom: rect.y0.1.clone(),
                                             top: rect.y1.1.clone(),
                                         }),
-                                    };
+                                    }
+                                    .normalized();
                                 if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                                     && rect.id.is_some()
                                     && &rect.id == selected_obj
@@ -744,8 +801,14 @@ impl Element for CanvasElement {
                     // handles is recorded for hit-testing in `on_left_mouse_down`.
                     // Only top-level rects expose `cvars`, and an edge is
                     // draggable iff it was rendered dashed.
-                    if matches!(tool, ToolState::Select(_)) {
+                    if let ToolState::Select(SelectToolState {
+                        selected_obj: Some(selected_obj),
+                    }) = &tool
+                    {
                         for (r, _) in &rects {
+                            if r.id.as_ref() != Some(selected_obj) {
+                                continue;
+                            }
                             let Some(cvars) = &r.cvars else { continue };
                             let pb = get_rect_bounds(r, bounds, scale, offset);
                             let center = pb.center();
@@ -1294,6 +1357,7 @@ impl Render for LayoutCanvas {
         div()
             .flex()
             .flex_1()
+            .key_context("LayoutCanvas")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
@@ -1348,6 +1412,7 @@ impl LayoutCanvas {
             },
             is_dragging: false,
             is_sse_dragging: false,
+            is_sse_persisting: false,
             sse_expr: LinearExpr::default(),
             sse_delta: Point::default(),
             sse_normal: Point::new(0., 0.),
@@ -1901,8 +1966,10 @@ impl LayoutCanvas {
                         .find(|h| h.bounds.contains(&event.position))
                         .cloned();
                     if let Some(handle) = handle {
+                        self.is_sse_persisting = false;
                         self.is_sse_dragging = true;
                         self.drag_start = event.position;
+                        self.sse_delta = Point::default();
                         self.sse_expr = handle.expr;
                         self.sse_normal = handle.normal;
                         cx.notify();
@@ -2181,13 +2248,52 @@ impl LayoutCanvas {
         else {
             return Vec::new();
         };
-        top.fallback_constraints_used
+        let mut updates = top
+            .fallback_constraints_used
             .iter()
-            .filter_map(|fb| {
-                crate::sse::updated_initial_condition(&fb.constraint, &dv).map(|value| ValueEdit {
+            .map(|fb| {
+                let (value, changed) =
+                    crate::sse::initial_condition_after_drag(&fb.constraint, &dv);
+                InitialConditionUpdate {
                     span: fb.span.clone(),
-                    value: crate::sse::format_value(value),
-                })
+                    value,
+                    changed,
+                    target: fb.initial_condition,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // A rectangle remains valid when an edge passes its opposite edge by
+        // exchanging the low/high initial-condition values in source. Include
+        // the unchanged partner in the rewrite when necessary.
+        let mut pairs: HashMap<ObjectId, [Option<usize>; 4]> = HashMap::new();
+        for (index, update) in updates.iter().enumerate() {
+            let Some(target) = update.target else {
+                continue;
+            };
+            let (id, edge) = match target {
+                RectInitialCondition::X0(id) => (id, 0),
+                RectInitialCondition::X1(id) => (id, 1),
+                RectInitialCondition::Y0(id) => (id, 2),
+                RectInitialCondition::Y1(id) => (id, 3),
+            };
+            pairs.entry(id).or_insert([None; 4])[edge] = Some(index);
+        }
+        for pair in pairs.values() {
+            if let (Some(x0), Some(x1)) = (pair[0], pair[1]) {
+                sort_initial_condition_pair(&mut updates, x0, x1);
+            }
+            if let (Some(y0), Some(y1)) = (pair[2], pair[3]) {
+                sort_initial_condition_pair(&mut updates, y0, y1);
+            }
+        }
+
+        updates
+            .into_iter()
+            .filter(|update| update.changed)
+            .map(|update| ValueEdit {
+                span: update.span,
+                value: crate::sse::format_value(update.value),
             })
             .collect()
     }
@@ -2200,21 +2306,45 @@ impl LayoutCanvas {
     ) {
         let was_sse_dragging = self.is_sse_dragging;
         self.is_dragging = false;
-        self.is_sse_dragging = false;
         // Persist the drag: rewrite the affected initial conditions in the source
         // and recompile, so the layout does not snap back on release.
         if was_sse_dragging {
             let edits = self.sse_value_edits(cx);
-            if !edits.is_empty()
-                && let Err(e) = self.state.read(cx).lang_server_client.update_values(edits)
-            {
-                self.state.update(cx, |state, cx| {
-                    state.fatal_error = Some(format!("Failed to persist drag: {e}").into());
-                    cx.notify();
-                });
+            if edits.is_empty() {
+                self.is_sse_dragging = false;
+                self.sse_delta = Point::default();
+            } else {
+                match self.state.read(cx).lang_server_client.update_values(edits) {
+                    Ok(true) => {
+                        self.is_sse_dragging = false;
+                        self.is_sse_persisting = true;
+                    }
+                    Ok(false) => {
+                        self.is_sse_dragging = false;
+                        self.sse_delta = Point::default();
+                    }
+                    Err(e) => {
+                        self.is_sse_dragging = false;
+                        self.sse_delta = Point::default();
+                        self.state.update(cx, |state, cx| {
+                            state.fatal_error = Some(format!("Failed to persist drag: {e}").into());
+                            cx.notify();
+                        });
+                    }
+                }
             }
         }
         cx.notify();
+    }
+
+    /// Ends the optimistic drag preview once a compile result based on the
+    /// rewritten source has reached the GUI.
+    pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
+        if self.is_sse_persisting {
+            self.is_sse_persisting = false;
+            self.sse_delta = Point::default();
+            cx.notify();
+        }
     }
 
     pub(crate) fn on_scroll_wheel(
@@ -2223,7 +2353,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_dragging || self.is_sse_dragging {
+        if self.is_dragging || self.is_sse_dragging || self.is_sse_persisting {
             // Do not allow zooming during a drag.
             return;
         }
@@ -2288,4 +2418,55 @@ pub(crate) fn find_obj_path(
         reachable = false;
     }
     (reachable, string_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalized_rect_keeps_edge_metadata_on_the_physical_edge() {
+        let rect = Rect {
+            x0: 20.,
+            x1: 10.,
+            y0: 40.,
+            y1: 30.,
+            id: None,
+            object_path: Vec::new(),
+            border_widths: Edges {
+                top: px(1.),
+                right: px(2.),
+                bottom: px(3.),
+                left: px(4.),
+            },
+            border_styles: Edges {
+                top: BorderStyle::Dashed,
+                right: BorderStyle::Solid,
+                bottom: BorderStyle::Solid,
+                left: BorderStyle::Dashed,
+            },
+            cvars: None,
+        }
+        .normalized();
+
+        assert_eq!((rect.x0, rect.x1, rect.y0, rect.y1), (10., 20., 30., 40.));
+        assert_eq!(rect.border_widths.left, px(2.));
+        assert_eq!(rect.border_widths.right, px(4.));
+        assert_eq!(rect.border_widths.top, px(3.));
+        assert_eq!(rect.border_widths.bottom, px(1.));
+        assert_eq!(rect.border_styles.left, BorderStyle::Solid);
+        assert_eq!(rect.border_styles.right, BorderStyle::Dashed);
+        assert_eq!(rect.border_styles.top, BorderStyle::Solid);
+        assert_eq!(rect.border_styles.bottom, BorderStyle::Dashed);
+    }
+
+    #[test]
+    fn crossed_initial_condition_values_are_sorted() {
+        assert_eq!(
+            sorted_initial_condition_values(150., 100.),
+            Some((100., 150.))
+        );
+        assert_eq!(sorted_initial_condition_values(100., 150.), None);
+        assert_eq!(sorted_initial_condition_values(100., 100.), None);
+    }
 }

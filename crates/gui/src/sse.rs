@@ -130,11 +130,17 @@ pub(crate) fn drag_delta(
 /// value, so recompilation reproduces the dragged layout instead of snapping
 /// back.
 pub(crate) fn updated_initial_condition(constraint: &LinearExpr, dv: &SparseVec) -> Option<f64> {
+    let (value, changed) = initial_condition_after_drag(constraint, dv);
+    changed.then_some(value)
+}
+
+/// Returns an initial condition's value after a drag and whether the drag
+/// actually moved it. Unlike [`updated_initial_condition`], this also exposes
+/// unchanged values so callers can compare both ends of a rectangle and swap
+/// their source values if one edge crossed the other.
+pub(crate) fn initial_condition_after_drag(constraint: &LinearExpr, dv: &SparseVec) -> (f64, bool) {
     let delta = dot(&SparseVec::from(constraint), dv);
-    if delta.abs() < EPSILON {
-        return None;
-    }
-    Some(-constraint.constant + delta)
+    (-constraint.constant + delta, delta.abs() >= EPSILON)
 }
 
 /// Formats a layout value as an Argon float literal (always containing a `.`),
@@ -300,6 +306,7 @@ mod tests {
         };
         let dv = SparseVec([(x1, 5.)].into_iter().collect());
         assert!(updated_initial_condition(&constraint, &dv).is_none());
+        assert_eq!(initial_condition_after_drag(&constraint, &dv), (0., false));
     }
 
     #[test]

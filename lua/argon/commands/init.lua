@@ -5,6 +5,7 @@ local M = {}
 
 local argon_cmd_name = 'Argon'
 local gui = require('argon.commands.gui')
+local diagnostics = require('argon.diagnostics')
 
 ---@class argon.command_tbl
 ---@field impl fun(args: string[], opts: vim.api.keyset.user_command) The command implementation
@@ -26,6 +27,11 @@ local argon_command_tbl = {
   set = {
     impl = function(args, opts)
       gui.set(table.concat(args, " "))
+    end,
+  },
+  diagnostics = {
+    impl = function()
+      diagnostics.open()
     end,
   },
   log = {
