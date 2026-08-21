@@ -1529,7 +1529,6 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::zero_hierarchy))
             .on_action(cx.listener(Self::one_hierarchy))
             .on_action(cx.listener(Self::all_hierarchy))
-            .on_action(cx.listener(Self::command_action))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
@@ -2348,17 +2347,6 @@ impl LayoutCanvas {
             window.prevent_default();
             cx.notify();
         }
-    }
-
-    pub(crate) fn command_action(
-        &mut self,
-        _: &Command,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        window.focus(&self.text_input_focus_handle);
-        window.prevent_default();
-        cx.notify();
     }
 
     pub(crate) fn zero_hierarchy(

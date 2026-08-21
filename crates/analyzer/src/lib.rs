@@ -363,6 +363,16 @@ impl Request for ForceSave {
     const METHOD: &'static str = "custom/forceSave";
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FocusEditor;
+
+impl Request for FocusEditor {
+    type Params = bool;
+    type Result = ();
+
+    const METHOD: &'static str = "custom/focusEditor";
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         #[allow(deprecated)]

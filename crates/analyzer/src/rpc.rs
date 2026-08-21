@@ -49,11 +49,13 @@ pub trait LangServer {
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
+    async fn delete_dimension(span: Span) -> bool;
     async fn update_values(edits: Vec<ValueEdit>) -> bool;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
+    async fn focus_editor(command_bar: bool);
 }
 
 #[tarpc::service]
@@ -369,6 +371,39 @@ impl LangServer for State {
             .then_some(updated_span)
     }
 
+    async fn delete_dimension(self, _: tarpc::context::Context, span: Span) -> bool {
+        let state_mut = self.state_mut.lock().await;
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
+            self.editor_client
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                .await;
+            return false;
+        }
+        let Some(url) = Uri::from_file_path(&span.path) else {
+            return false;
+        };
+        let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) else {
+            return false;
+        };
+        let Some(call) = ast.span2call.get(&span) else {
+            return false;
+        };
+        let document = Document::new(&ast.text, 0);
+        let start = call.span.start();
+        let mut end = call.span.end();
+        if ast.text.as_bytes().get(end) == Some(&b';') {
+            end += 1;
+        }
+        let edit = TextEdit {
+            range: Range::new(document.offset_to_pos(start), document.offset_to_pos(end)),
+            new_text: String::new(),
+        };
+        drop(state_mut);
+
+        self.apply_source_edit(url, span.path, edit).await
+    }
+
     /// Rewrites the value text at each given span in a single workspace edit,
     /// then saves (triggering recompilation). Used to persist SSE drags so the
     /// dragged layout survives recompilation instead of snapping back.
@@ -491,6 +526,21 @@ impl LangServer for State {
                 .show_message(
                     MessageType::ERROR,
                     format!("Could not dispatch editor action: {error}"),
+                )
+                .await;
+        }
+    }
+
+    async fn focus_editor(self, _: tarpc::context::Context, command_bar: bool) {
+        if let Err(error) = self
+            .editor_client
+            .send_request::<crate::FocusEditor>(command_bar)
+            .await
+        {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not focus the editor: {error}"),
                 )
                 .await;
         }

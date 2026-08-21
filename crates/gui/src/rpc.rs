@@ -230,6 +230,25 @@ impl SyncLangServerClient {
             })??)
     }
 
+    pub fn delete_dimension(&self, span: Span) -> Result<bool> {
+        let client_clone = self.client.clone();
+        Ok(self
+            .app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .delete_dimension(context::current(), span)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??)
+    }
+
     pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<bool> {
         let client_clone = self.client.clone();
         Ok(self
@@ -256,21 +275,6 @@ impl SyncLangServerClient {
                         .await
                 }
                 .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
-    }
-
-    pub fn open_cell(&self, cell: String) -> Result<()> {
-        let client_clone = self.client.clone();
-        self.app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move { client_clone.open_cell(context::current(), cell).await }.compat(),
             )
             .map_err(|_| {
                 anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
@@ -308,6 +312,26 @@ impl SyncLangServerClient {
                 async move {
                     client_clone
                         .dispatch_action(context::current(), action)
+                        .await
+                }
+                .compat(),
+            )
+            .map_err(|_| {
+                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
+            })??;
+
+        Ok(())
+    }
+
+    pub fn focus_editor(&self, command_bar: bool) -> Result<()> {
+        let client_clone = self.client.clone();
+        self.app
+            .background_executor()
+            .block_with_timeout(
+                LANG_SERVER_CLIENT_TIMEOUT,
+                async move {
+                    client_clone
+                        .focus_editor(context::current(), command_bar)
                         .await
                 }
                 .compat(),

@@ -18,7 +18,7 @@ use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
-    actions::{Redo, Undo},
+    actions::{FocusNvim, FocusNvimCommandBar, Redo, Undo},
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
     theme::{DARK_THEME, LIGHT_THEME, Theme},
@@ -364,7 +364,7 @@ impl Editor {
             )
         });
         let text_input = cx
-            .new(|cx| TextInput::new_command_prompt(cx, text_input_focus_handle, &state, &canvas));
+            .new(|cx| TextInput::new_dimension_input(cx, text_input_focus_handle, &state, &canvas));
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state, &canvas));
 
@@ -467,6 +467,34 @@ impl Editor {
         }
     }
 
+    fn focus_nvim(&mut self, _: &FocusNvim, _window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_editor(false, cx);
+    }
+
+    fn focus_nvim_command_bar(
+        &mut self,
+        _: &FocusNvimCommandBar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.focus_editor(true, cx);
+    }
+
+    fn focus_editor(&mut self, command_bar: bool, cx: &mut Context<Self>) {
+        if let Err(error) = self
+            .state
+            .read(cx)
+            .lang_server_client
+            .focus_editor(command_bar)
+        {
+            self.state.update(cx, |state, _cx| {
+                state.fatal_error = Some(format!("{error}").into());
+            });
+            return;
+        }
+        cx.hide();
+    }
+
     fn theme(&self, cx: &mut Context<Self>) -> &'static Theme {
         self.state.read(cx).theme()
     }
@@ -480,6 +508,8 @@ impl Render for Editor {
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
+            .on_action(cx.listener(Self::focus_nvim))
+            .on_action(cx.listener(Self::focus_nvim_command_bar))
             .font_family("Zed Plex Sans")
             .size_full()
             .flex()
