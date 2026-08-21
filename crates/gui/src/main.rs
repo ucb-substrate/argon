@@ -188,19 +188,19 @@ fn nvim_location(path: &Path) -> Result<(PathBuf, PathBuf)> {
 fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
     let control = SshControl::new(&args)?;
     validate_port_overrides(&args)?;
-    check_remote_analyzer(&args, &control)?;
-    let mut relay = start_remote_relay(&args, &control)?;
+    let analyzer = resolve_remote_analyzer(&args, &control)?;
+    let mut relay = start_remote_relay(&args, &control, &analyzer)?;
 
     let mut nvim_command = control.command(&args);
     nvim_command
         .arg("-t")
         .arg(&args.host)
-        .arg(remote_nvim_command(
+        .arg(interactive_shell_command(&remote_nvim_command(
             nvim,
             &args.path,
             args.remote_analyzer_port,
             &relay.socket_path,
-        ))
+        )))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -278,28 +278,44 @@ fn validate_port_overrides(args: &SshArgs) -> Result<()> {
     Ok(())
 }
 
-fn check_remote_analyzer(args: &SshArgs, control: &SshControl) -> Result<()> {
+fn resolve_remote_analyzer(args: &SshArgs, control: &SshControl) -> Result<String> {
+    let probe = interactive_shell_command(
+        "analyzer=$(command -v argon-analyzer) && [ -x \"$analyzer\" ] || exit 127; \
+         printf '\\nARGON_EXECUTABLE 1 %s\\n' \"$analyzer\"",
+    );
     let output = control
         .command(args)
-        .arg("-T")
+        .arg("-tt")
         .arg(&args.host)
-        .arg("if command -v argon-analyzer >/dev/null 2>&1; then exit 0; else exit 127; fi")
+        .arg(probe)
         .output()
         .with_context(|| format!("failed to start `{}`", args.ssh.to_string_lossy()))?;
     if output.status.success() {
-        return Ok(());
+        return parse_executable_announcement(&String::from_utf8_lossy(&output.stdout))
+            .map(str::to_owned)
+            .context("the remote shell did not report the `argon-analyzer` executable path");
     }
-    if output.status.code() == Some(127) || output.stderr.is_empty() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = format!("{stdout}\n{stderr}").trim().to_owned();
+    if output.status.code() == Some(127) || detail.is_empty() {
         bail!(
-            "`argon-analyzer` was not found on `{}`; install it on the remote machine and ensure it is available on PATH",
+            "`argon-analyzer` was not found on `{}` in the interactive shell environment; install it on the remote machine and ensure it is available on PATH",
             args.host
         );
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     bail!(
-        "could not check for `argon-analyzer` on `{}`: {stderr}",
+        "could not check for `argon-analyzer` on `{}`: {detail}",
         args.host
     )
+}
+
+fn parse_executable_announcement(output: &str) -> Option<&str> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("ARGON_EXECUTABLE 1 ")
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    })
 }
 
 struct Relay {
@@ -315,12 +331,12 @@ impl Drop for Relay {
     }
 }
 
-fn start_remote_relay(args: &SshArgs, control: &SshControl) -> Result<Relay> {
+fn start_remote_relay(args: &SshArgs, control: &SshControl, analyzer: &str) -> Result<Relay> {
     let mut child = control
         .command(args)
         .arg("-T")
         .arg(&args.host)
-        .arg("argon-analyzer relay")
+        .arg(format!("exec {} relay", shell_quote(analyzer)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -819,6 +835,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn interactive_shell_command(command: &str) -> String {
+    format!("exec \"${{SHELL:-/bin/sh}}\" -ic {}", shell_quote(command))
+}
+
 #[cfg(unix)]
 fn success_status() -> ExitStatus {
     use std::os::unix::process::ExitStatusExt;
@@ -923,10 +943,10 @@ mod tests {
     fn missing_remote_analyzer_has_an_actionable_error() {
         let args = ssh_args("/usr/bin/false");
         let control = SshControl::new(&args).unwrap();
-        let error = check_remote_analyzer(&args, &control).unwrap_err();
+        let error = resolve_remote_analyzer(&args, &control).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "`argon-analyzer` was not found on `server`; install it on the remote machine and ensure it is available on PATH"
+            "`argon-analyzer` was not found on `server` in the interactive shell environment; install it on the remote machine and ensure it is available on PATH"
         );
     }
 
@@ -934,6 +954,20 @@ mod tests {
     fn quotes_remote_shell_arguments() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a b's"), "'a b'\"'\"'s'");
+        assert_eq!(
+            interactive_shell_command("exec nvim 'some path'"),
+            "exec \"${SHELL:-/bin/sh}\" -ic 'exec nvim '\"'\"'some path'\"'\"''"
+        );
+    }
+
+    #[test]
+    fn finds_executable_announcements_among_shell_output() {
+        assert_eq!(
+            parse_executable_announcement(
+                "Welcome to the server\r\nARGON_EXECUTABLE 1 /home/me/.cargo/bin/argon-analyzer\r\n"
+            ),
+            Some("/home/me/.cargo/bin/argon-analyzer")
+        );
     }
 
     #[test]
