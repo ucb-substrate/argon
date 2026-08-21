@@ -79,62 +79,135 @@ pub(crate) fn edge_drag_distance(pixel_delta: (f32, f32), normal: (f32, f32), sc
     normal.0 * layout_dx + normal.1 * layout_dy
 }
 
-/// Computes the change in the constraint variable vector (Δ𝑥) produced by
-/// dragging an edge a signed distance `delta` along its normal while keeping
-/// every linear constraint satisfied. This implements Algorithm 3 (Solution
-/// Space Exploration) from the manuscript.
-///
-/// - `edge` is the coefficient vector `c` of the dragged edge's position (the
-///   linear combination of variables that determines where the edge sits).
-/// - `rowspace` is an orthonormal basis `V` of the rowspace of the constraint
-///   matrix `A`, as returned by [`argonc::solver::Solver::rowspace_vecs`].
-/// - `unsolved` is the set of variables that are still free to move. Locked
-///   variables have a fixed value and must never change, so the dragged edge's
-///   coefficient vector is restricted to `unsolved` before projecting.
-///
-/// Returns `None` when the edge is fully constrained — i.e. its coefficient
-/// vector lies entirely in the rowspace of `A` (or references only locked
-/// variables) — in which case dragging it cannot move anything.
-pub(crate) fn drag_delta(
-    edge: &SparseVec,
+/// Computes a null-space move that changes several edge expressions by the
+/// requested distances simultaneously. With one target this implements the
+/// edge-drag form of Algorithm 3; multiple targets support corner handles and
+/// whole-rectangle translation.
+pub(crate) fn drag_delta_multi(
+    edges: &[SparseVec],
     rowspace: &[SparseVec],
     unsolved: &IndexSet<Var>,
-    delta: f64,
+    deltas: &[f64],
 ) -> Option<SparseVec> {
-    // Restrict the coefficient vector to variables that can actually move.
-    let edge = SparseVec(
-        edge.iter()
-            .filter(|(var, _)| unsolved.contains(*var))
-            .map(|(var, coeff)| (*var, *coeff))
-            .collect(),
-    );
-    // r = c − proj_V(c): the component of the edge's coefficient vector lying in
-    // the null space of A. Moving the solution along r keeps every constraint
-    // satisfied while changing the dragged edge as directly as possible.
-    let r = remove_component(&edge, rowspace);
-    // cᵀr = ‖r‖², since c = proj_V(c) + r and proj_V(c) ⊥ r.
-    let denom = dot(&edge, &r);
-    if denom.abs() < EPSILON {
+    if edges.is_empty() || edges.len() != deltas.len() {
         return None;
     }
-    Some(r * (delta / denom))
+
+    let edges = edges
+        .iter()
+        .map(|edge| {
+            SparseVec(
+                edge.iter()
+                    .filter(|(var, _)| unsolved.contains(*var))
+                    .map(|(var, coeff)| (*var, *coeff))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    // Each residual is the target expression's component in the null space of
+    // the constraint matrix. Any linear combination remains constraint-safe.
+    let residuals = edges
+        .iter()
+        .map(|edge| remove_component(edge, rowspace))
+        .collect::<Vec<_>>();
+    let gram = edges
+        .iter()
+        .map(|edge| {
+            residuals
+                .iter()
+                .map(|residual| dot(edge, residual))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let weights = solve_linear_system(gram, deltas.to_vec())?;
+
+    let mut result = SparseVec(IndexMap::new());
+    for (residual, weight) in residuals.iter().zip(weights) {
+        for (var, coefficient) in residual.iter() {
+            *result.entry(*var).or_default() += coefficient * weight;
+        }
+    }
+
+    // Rank-deficient systems are allowed when their duplicate equations agree
+    // (for example, fixed width makes the x0 and x1 translation equations the
+    // same). Still reject a numerically inconsistent requested drag.
+    edges
+        .iter()
+        .zip(deltas)
+        .all(|(edge, delta)| (dot(edge, &result) - delta).abs() < EPSILON * (1. + delta.abs()))
+        .then_some(result)
 }
 
-/// Given a used fallback (initial-condition) constraint of the form
-/// `expr - value` — so the currently pinned value is `-constraint.constant`
-/// when `expr` has no constant term — and the solution-space move `dv` produced
-/// by a drag, returns the new value to write into the source, or `None` if the
-/// drag does not move this fallback's variables.
-///
-/// Persisting a drag means rewriting each affected initial condition to this new
-/// value, so recompilation reproduces the dragged layout instead of snapping
-/// back.
-pub(crate) fn updated_initial_condition(constraint: &LinearExpr, dv: &SparseVec) -> Option<f64> {
-    let delta = dot(&SparseVec::from(constraint), dv);
-    if delta.abs() < EPSILON {
+fn solve_linear_system(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f64>> {
+    let rows = matrix.len();
+    let columns = matrix.first()?.len();
+    if rhs.len() != rows || matrix.iter().any(|row| row.len() != columns) {
         return None;
     }
-    Some(-constraint.constant + delta)
+
+    let mut pivot_row = 0;
+    let mut pivots = Vec::new();
+    for column in 0..columns {
+        let Some(pivot) = (pivot_row..rows).max_by(|&left, &right| {
+            matrix[left][column]
+                .abs()
+                .total_cmp(&matrix[right][column].abs())
+        }) else {
+            break;
+        };
+        if matrix[pivot][column].abs() < EPSILON {
+            continue;
+        }
+        matrix.swap(pivot_row, pivot);
+        rhs.swap(pivot_row, pivot);
+
+        let scale = matrix[pivot_row][column];
+        for value in &mut matrix[pivot_row][column..] {
+            *value /= scale;
+        }
+        rhs[pivot_row] /= scale;
+        let pivot_values = matrix[pivot_row][column..].to_vec();
+
+        for row in 0..rows {
+            if row == pivot_row {
+                continue;
+            }
+            let factor = matrix[row][column];
+            for (entry, pivot_entry) in matrix[row][column..].iter_mut().zip(&pivot_values) {
+                *entry -= factor * pivot_entry;
+            }
+            rhs[row] -= factor * rhs[pivot_row];
+        }
+        pivots.push(column);
+        pivot_row += 1;
+        if pivot_row == rows {
+            break;
+        }
+    }
+
+    for row in pivot_row..rows {
+        if matrix[row].iter().all(|value| value.abs() < EPSILON) && rhs[row].abs() >= EPSILON {
+            return None;
+        }
+    }
+
+    // Free variables are set to zero. This is sufficient here because the
+    // result is a set of weights over null-space residuals; any solution to the
+    // Gram system yields the same minimum-norm drag vector.
+    let mut solution = vec![0.; columns];
+    for (row, column) in pivots.into_iter().enumerate() {
+        solution[column] = rhs[row];
+    }
+    Some(solution)
+}
+
+/// Returns an initial condition's value after a drag and whether the drag
+/// actually moved it. It exposes unchanged values too, so callers can compare
+/// both ends of a rectangle and swap their source values if one edge crossed
+/// the other.
+pub(crate) fn initial_condition_after_drag(constraint: &LinearExpr, dv: &SparseVec) -> (f64, bool) {
+    let delta = dot(&SparseVec::from(constraint), dv);
+    (-constraint.constant + delta, delta.abs() >= EPSILON)
 }
 
 /// Formats a layout value as an Argon float literal (always containing a `.`),
@@ -163,6 +236,15 @@ mod tests {
         SparseVec::from(&LinearExpr::from(var))
     }
 
+    fn drag_one(
+        edge: &SparseVec,
+        rowspace: &[SparseVec],
+        unsolved: &IndexSet<Var>,
+        delta: f64,
+    ) -> Option<SparseVec> {
+        drag_delta_multi(std::slice::from_ref(edge), rowspace, unsolved, &[delta])
+    }
+
     #[test]
     fn edge_drag_distance_picks_axis_and_flips_y() {
         // Right edge: normal +x. Only horizontal motion matters, no sign flip.
@@ -185,9 +267,91 @@ mod tests {
         let rs = rowspace(&mut solver);
         let unsolved = solver.unsolved_vars().clone();
 
-        let dx = drag_delta(&coeff(x1), &rs, &unsolved, 3.).unwrap();
+        let dx = drag_one(&coeff(x1), &rs, &unsolved, 3.).unwrap();
         assert_relative_eq!(dot(&coeff(x1), &dx), 3., epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(x0), &dx), 0., epsilon = 1e-9);
+    }
+
+    #[test]
+    fn corner_drag_moves_both_requested_edges() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+        solver.solve();
+        let rs = rowspace(&mut solver);
+        let unsolved = solver.unsolved_vars().clone();
+
+        let dv = drag_delta_multi(&[coeff(x), coeff(y)], &rs, &unsolved, &[3.5, -2.25]).unwrap();
+        assert_relative_eq!(dot(&coeff(x), &dv), 3.5, epsilon = 1e-9);
+        assert_relative_eq!(dot(&coeff(y), &dv), -2.25, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn body_drag_translates_all_four_free_edges() {
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        let y0 = solver.new_var();
+        let y1 = solver.new_var();
+        solver.solve();
+        let rs = rowspace(&mut solver);
+        let unsolved = solver.unsolved_vars().clone();
+        let edges = [coeff(x0), coeff(x1), coeff(y0), coeff(y1)];
+
+        let dv = drag_delta_multi(&edges, &rs, &unsolved, &[4., 4., -6., -6.]).unwrap();
+        for edge in &edges[..2] {
+            assert_relative_eq!(dot(edge, &dv), 4., epsilon = 1e-9);
+        }
+        for edge in &edges[2..] {
+            assert_relative_eq!(dot(edge, &dv), -6., epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn body_drag_translates_a_fixed_size_rectangle() {
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        let y0 = solver.new_var();
+        let y1 = solver.new_var();
+        solver.constrain_eq0(LinearExpr {
+            coeffs: vec![(1., x1), (-1., x0)],
+            constant: -4.,
+        });
+        solver.constrain_eq0(LinearExpr {
+            coeffs: vec![(1., y1), (-1., y0)],
+            constant: -7.,
+        });
+        solver.solve();
+        let rs = rowspace(&mut solver);
+        let unsolved = solver.unsolved_vars().clone();
+        let edges = [coeff(x0), coeff(x1), coeff(y0), coeff(y1)];
+
+        // The paired x and y equations are redundant because width and height
+        // are fixed, but they agree and therefore describe a valid translation.
+        let dv = drag_delta_multi(&edges, &rs, &unsolved, &[3., 3., -2., -2.]).unwrap();
+        for edge in &edges[..2] {
+            assert_relative_eq!(dot(edge, &dv), 3., epsilon = 1e-9);
+        }
+        for edge in &edges[2..] {
+            assert_relative_eq!(dot(edge, &dv), -2., epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn body_drag_rejects_conflicting_dependent_edge_requests() {
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        solver.constrain_eq0(LinearExpr {
+            coeffs: vec![(1., x1), (-1., x0)],
+            constant: -4.,
+        });
+        solver.solve();
+        let rs = rowspace(&mut solver);
+        let unsolved = solver.unsolved_vars().clone();
+
+        assert!(drag_delta_multi(&[coeff(x0), coeff(x1)], &rs, &unsolved, &[1., 2.]).is_none());
     }
 
     #[test]
@@ -206,7 +370,7 @@ mod tests {
 
         // Dragging the right edge by 2 slides the whole rect by 2 so the width
         // is preserved: both edges move together.
-        let dx = drag_delta(&coeff(x1), &rs, &unsolved, 2.).unwrap();
+        let dx = drag_one(&coeff(x1), &rs, &unsolved, 2.).unwrap();
         assert_relative_eq!(dot(&coeff(x1), &dx), 2., epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(x0), &dx), 2., epsilon = 1e-9);
         // Width (x1 - x0) is unchanged.
@@ -229,7 +393,7 @@ mod tests {
         let unsolved = solver.unsolved_vars().clone();
 
         // Dragging `a` drags `b` with it so the alignment constraint holds.
-        let dx = drag_delta(&coeff(a), &rs, &unsolved, 2.).unwrap();
+        let dx = drag_one(&coeff(a), &rs, &unsolved, 2.).unwrap();
         assert_relative_eq!(dot(&coeff(a), &dx), 2., epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(b), &dx), 2., epsilon = 1e-9);
     }
@@ -252,7 +416,7 @@ mod tests {
         let rs = rowspace(&mut solver);
         let unsolved = solver.unsolved_vars().clone();
 
-        assert!(drag_delta(&coeff(x1), &rs, &unsolved, 2.).is_none());
+        assert!(drag_one(&coeff(x1), &rs, &unsolved, 2.).is_none());
     }
 
     #[test]
@@ -271,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn updated_initial_condition_adds_drag_delta() {
+    fn initial_condition_after_drag_adds_delta() {
         let mut solver = Solver::new();
         let x1 = solver.new_var();
         // Fallback `x1 - 100` pins x1 = 100; a drag moved x1 by +2.5.
@@ -280,15 +444,13 @@ mod tests {
             constant: -100.,
         };
         let dv = SparseVec([(x1, 2.5)].into_iter().collect());
-        assert_relative_eq!(
-            updated_initial_condition(&constraint, &dv).unwrap(),
-            102.5,
-            epsilon = 1e-9
-        );
+        let (value, changed) = initial_condition_after_drag(&constraint, &dv);
+        assert!(changed);
+        assert_relative_eq!(value, 102.5, epsilon = 1e-9);
     }
 
     #[test]
-    fn updated_initial_condition_ignores_unaffected_fallback() {
+    fn initial_condition_after_drag_marks_unaffected_fallback_unchanged() {
         let mut solver = Solver::new();
         let x0 = solver.new_var();
         let x1 = solver.new_var();
@@ -299,7 +461,7 @@ mod tests {
             constant: 0.,
         };
         let dv = SparseVec([(x1, 5.)].into_iter().collect());
-        assert!(updated_initial_condition(&constraint, &dv).is_none());
+        assert_eq!(initial_condition_after_drag(&constraint, &dv), (0., false));
     }
 
     #[test]

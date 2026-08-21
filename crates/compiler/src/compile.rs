@@ -2127,6 +2127,7 @@ struct FallbackConstraint {
     priority: i32,
     constraint: LinearExpr,
     span: Span,
+    initial_condition: Option<RectInitialCondition>,
 }
 
 impl PartialEq for FallbackConstraint {
@@ -2539,7 +2540,10 @@ impl<'a> ExecPass<'a> {
                 let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);
                 while let Some(FallbackConstraint {
-                    constraint, span, ..
+                    constraint,
+                    span,
+                    initial_condition,
+                    ..
                 }) = state.fallback_constraints.pop()
                 {
                     if constraint
@@ -2550,6 +2554,7 @@ impl<'a> ExecPass<'a> {
                         state.fallback_constraints_used.push(UsedFallback {
                             constraint: constraint.clone(),
                             span: span.clone(),
+                            initial_condition,
                         });
                         let constraint_id = state.solver.constrain_eq0(constraint);
                         state.constraint_span_map.insert(constraint_id, span);
@@ -2656,24 +2661,42 @@ impl<'a> ExecPass<'a> {
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
-                    p: state.solver.eval_expr(&dim.p).expect("dim p not solved"),
-                    n: state.solver.eval_expr(&dim.n).expect("dim n not solved"),
-                    value: state
-                        .solver
-                        .eval_expr(&dim.value)
-                        .expect("dim value not solved"),
-                    coord: state
-                        .solver
-                        .eval_expr(&dim.coord)
-                        .expect("dim coord not solved"),
-                    pstop: state
-                        .solver
-                        .eval_expr(&dim.pstop)
-                        .expect("dim pstop not solved"),
-                    nstop: state
-                        .solver
-                        .eval_expr(&dim.nstop)
-                        .expect("dim nstop not solved"),
+                    p: (
+                        state.solver.eval_expr(&dim.p).expect("dim p not solved"),
+                        dim.p.clone(),
+                    ),
+                    n: (
+                        state.solver.eval_expr(&dim.n).expect("dim n not solved"),
+                        dim.n.clone(),
+                    ),
+                    value: (
+                        state
+                            .solver
+                            .eval_expr(&dim.value)
+                            .expect("dim value not solved"),
+                        dim.value.clone(),
+                    ),
+                    coord: (
+                        state
+                            .solver
+                            .eval_expr(&dim.coord)
+                            .expect("dim coord not solved"),
+                        dim.coord.clone(),
+                    ),
+                    pstop: (
+                        state
+                            .solver
+                            .eval_expr(&dim.pstop)
+                            .expect("dim pstop not solved"),
+                        dim.pstop.clone(),
+                    ),
+                    nstop: (
+                        state
+                            .solver
+                            .eval_expr(&dim.nstop)
+                            .expect("dim nstop not solved"),
+                        dim.nstop.clone(),
+                    ),
                     horiz: dim.horiz,
                     constraint: dim.constraint,
                     span: dim.span.clone(),
@@ -3320,26 +3343,46 @@ impl<'a> ExecPass<'a> {
                             .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            let priority = match kwarg.name.name.as_str() {
-                                "x0" | "x0i" => {
+                            let (priority, initial_condition) = match kwarg.name.name.as_str() {
+                                "x0" => {
                                     self.values
                                         .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
-                                    6
+                                    (6, None)
                                 }
-                                "x1" | "x1i" => {
+                                "x0i" => {
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
+                                    (6, Some(RectInitialCondition::X0(rect.id)))
+                                }
+                                "x1" => {
                                     self.values
                                         .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
-                                    5
+                                    (5, None)
                                 }
-                                "y0" | "y0i" => {
+                                "x1i" => {
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
+                                    (5, Some(RectInitialCondition::X1(rect.id)))
+                                }
+                                "y0" => {
                                     self.values
                                         .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
-                                    4
+                                    (4, None)
                                 }
-                                "y1" | "y1i" => {
+                                "y0i" => {
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
+                                    (4, Some(RectInitialCondition::Y0(rect.id)))
+                                }
+                                "y1" => {
                                     self.values
                                         .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
-                                    3
+                                    (3, None)
+                                }
+                                "y1i" => {
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
+                                    (3, Some(RectInitialCondition::Y1(rect.id)))
                                 }
                                 "w" => {
                                     self.values.insert(
@@ -3348,7 +3391,7 @@ impl<'a> ExecPass<'a> {
                                             rect.x1.clone() - rect.x0.clone(),
                                         )),
                                     );
-                                    2
+                                    (2, None)
                                 }
                                 "h" => {
                                     self.values.insert(
@@ -3357,7 +3400,7 @@ impl<'a> ExecPass<'a> {
                                             rect.y1.clone() - rect.y0.clone(),
                                         )),
                                     );
-                                    1
+                                    (1, None)
                                 }
                                 "layer" => {
                                     continue;
@@ -3376,6 +3419,7 @@ impl<'a> ExecPass<'a> {
                                     fallback: kwarg.name.name.ends_with('i'),
                                     priority,
                                     span,
+                                    initial_condition,
                                 })
                             });
                         }
@@ -3902,6 +3946,7 @@ impl<'a> ExecPass<'a> {
                                     fallback: kwarg.name.name.ends_with('i'),
                                     priority,
                                     span,
+                                    initial_condition: None,
                                 })
                             });
                         }
@@ -4510,6 +4555,7 @@ impl<'a> ExecPass<'a> {
                             priority: c.priority,
                             constraint: expr,
                             span: c.span.clone(),
+                            initial_condition: c.initial_condition,
                         });
                     } else {
                         let constraint = state.solver.constrain_eq0(expr);
@@ -4791,7 +4837,7 @@ pub struct SolvedInstance {
 pub enum SolvedValue {
     Rect(Rect<(f64, LinearExpr)>),
     Text(Text<f64>),
-    Dimension(Dimension<f64>),
+    Dimension(Dimension<(f64, LinearExpr)>),
     Instance(SolvedInstance),
 }
 
@@ -4852,6 +4898,18 @@ pub struct UsedFallback {
     /// Source span of the initial-condition value expression (e.g. the `100.`
     /// in `x1i=100.`), so the GUI can rewrite just that value.
     pub span: Span,
+    /// Rectangle edge initialized by this fallback. This lets the GUI keep
+    /// `x0 <= x1` and `y0 <= y1` when a drag crosses the opposite edge.
+    pub initial_condition: Option<RectInitialCondition>,
+}
+
+/// The rectangle edge associated with a user-written initial condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RectInitialCondition {
+    X0(ObjectId),
+    X1(ObjectId),
+    Y0(ObjectId),
+    Y1(ObjectId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4945,11 +5003,14 @@ pub fn bbox_text_union(b: Option<Rect<f64>>, t: &Text<f64>) -> Option<Rect<f64>>
     }
 }
 
-pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<Rect<f64>> {
-    let perp_max = dim.coord.max(dim.pstop).max(dim.nstop);
-    let perp_min = dim.coord.min(dim.pstop).min(dim.nstop);
-    let par_max = dim.n.max(dim.p);
-    let par_min = dim.n.min(dim.p);
+pub fn bbox_dim_union(
+    bbox: Option<Rect<f64>>,
+    dim: &Dimension<(f64, LinearExpr)>,
+) -> Option<Rect<f64>> {
+    let perp_max = dim.coord.0.max(dim.pstop.0).max(dim.nstop.0);
+    let perp_min = dim.coord.0.min(dim.pstop.0).min(dim.nstop.0);
+    let par_max = dim.n.0.max(dim.p.0);
+    let par_min = dim.n.0.min(dim.p.0);
     let (xmin, xmax, ymin, ymax) = if dim.horiz {
         (par_min, par_max, perp_min, perp_max)
     } else {
@@ -5031,6 +5092,7 @@ struct PartialConstraint {
     fallback: bool,
     priority: i32,
     span: Span,
+    initial_condition: Option<RectInitialCondition>,
 }
 
 #[derive(Debug, Clone)]

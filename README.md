@@ -43,6 +43,14 @@ cargo install --git https://github.com/ucb-substrate/argon --locked \
     argonc arc argon-analyzer argone
 ```
 
+To install from a local clone, you can run:
+
+```bash
+for crate in compiler gui arc analyzer; do
+    cargo install --locked --path crates/$crate;
+done
+```
+
 ## Command-line compilation
 
 Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
@@ -112,6 +120,13 @@ runs only on the local machine.
 
 Launching Neovim yourself remains supported. In that mode, start or activate
 the GUI by running `:Argon gui`.
+
+Run `:Argon diagnostics` to open a compiler-style view of every Argon
+diagnostic in the project, including diagnostics from files other than the
+current buffer. Press `<Enter>` on an entry to jump to its file and location,
+use `]d` and `[d` to move between entries, `r` to refresh, and `q` to close the
+panel. The same entries are also loaded into Neovim's quickfix list, so
+`:copen`, `:cnext`, and `:cprev` provide the standard cross-file navigation.
 
 From within the GUI, type `:openCell inv(1200., 2000., 4)` to open the `inv` cell. You should now be able to edit layouts 
 in both Neovim and the GUI.

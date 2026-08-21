@@ -230,9 +230,10 @@ impl SyncLangServerClient {
             })??)
     }
 
-    pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<()> {
+    pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<bool> {
         let client_clone = self.client.clone();
-        self.app
+        Ok(self
+            .app
             .background_executor()
             .block_with_timeout(
                 LANG_SERVER_CLIENT_TIMEOUT,
@@ -240,9 +241,7 @@ impl SyncLangServerClient {
             )
             .map_err(|_| {
                 anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??;
-
-        Ok(())
+            })??)
     }
 
     pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) -> Result<()> {

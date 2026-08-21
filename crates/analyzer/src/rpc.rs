@@ -49,7 +49,7 @@ pub trait LangServer {
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
-    async fn update_values(edits: Vec<ValueEdit>);
+    async fn update_values(edits: Vec<ValueEdit>) -> bool;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
@@ -372,9 +372,9 @@ impl LangServer for State {
     /// Rewrites the value text at each given span in a single workspace edit,
     /// then saves (triggering recompilation). Used to persist SSE drags so the
     /// dragged layout survives recompilation instead of snapping back.
-    async fn update_values(self, _: tarpc::context::Context, edits: Vec<ValueEdit>) -> () {
+    async fn update_values(self, _: tarpc::context::Context, edits: Vec<ValueEdit>) -> bool {
         if edits.is_empty() {
-            return;
+            return true;
         }
         let state_mut = self.state_mut.lock().await;
         if !editor_buffers_are_current(&state_mut) {
@@ -382,7 +382,7 @@ impl LangServer for State {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
-            return;
+            return false;
         }
 
         // Build one WorkspaceEdit grouping all rewrites per file. Edits within a
@@ -410,7 +410,7 @@ impl LangServer for State {
             }
         }
         if pending.is_empty() {
-            return;
+            return false;
         }
         let changes = pending
             .into_iter()
@@ -421,7 +421,7 @@ impl LangServer for State {
             .collect();
         drop(state_mut);
 
-        self.apply_source_changes(changes, paths, None).await;
+        self.apply_source_changes(changes, paths, None).await
     }
 
     async fn add_eq_constraint(

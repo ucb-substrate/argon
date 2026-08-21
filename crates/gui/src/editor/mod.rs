@@ -397,6 +397,8 @@ impl Editor {
             state.update(cx, output);
             cx.notify();
         });
+        self.canvas
+            .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
         if update {
             let state = self.state.clone();
             self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
