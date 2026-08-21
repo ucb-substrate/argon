@@ -49,7 +49,6 @@ pub trait LangServer {
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
-    async fn delete_dimension(span: Span) -> bool;
     async fn update_values(edits: Vec<ValueEdit>) -> bool;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
@@ -369,39 +368,6 @@ impl LangServer for State {
         self.apply_source_edit(url, span.path, edit)
             .await
             .then_some(updated_span)
-    }
-
-    async fn delete_dimension(self, _: tarpc::context::Context, span: Span) -> bool {
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
-                .await;
-            return false;
-        }
-        let Some(url) = Uri::from_file_path(&span.path) else {
-            return false;
-        };
-        let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) else {
-            return false;
-        };
-        let Some(call) = ast.span2call.get(&span) else {
-            return false;
-        };
-        let document = Document::new(&ast.text, 0);
-        let start = call.span.start();
-        let mut end = call.span.end();
-        if ast.text.as_bytes().get(end) == Some(&b';') {
-            end += 1;
-        }
-        let edit = TextEdit {
-            range: Range::new(document.offset_to_pos(start), document.offset_to_pos(end)),
-            new_text: String::new(),
-        };
-        drop(state_mut);
-
-        self.apply_source_edit(url, span.path, edit).await
     }
 
     /// Rewrites the value text at each given span in a single workspace edit,

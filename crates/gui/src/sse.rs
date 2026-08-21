@@ -44,7 +44,11 @@ pub(crate) fn dot(a: &SparseVec, b: &SparseVec) -> f64 {
 
 impl From<&Vec<(f64, Var)>> for SparseVec {
     fn from(value: &Vec<(f64, Var)>) -> Self {
-        SparseVec(value.iter().map(|(c, v)| (*v, *c)).collect())
+        let mut coefficients = IndexMap::new();
+        for (coefficient, variable) in value {
+            *coefficients.entry(*variable).or_default() += coefficient;
+        }
+        SparseVec(coefficients)
     }
 }
 
@@ -254,6 +258,25 @@ mod tests {
         assert_relative_eq!(edge_drag_distance((3., -10.), (0., 1.), 2.), 5.);
         // Dragging the mouse down moves a +y edge down.
         assert_relative_eq!(edge_drag_distance((3., 10.), (0., 1.), 2.), -5.);
+    }
+
+    #[test]
+    fn repeated_dimension_terms_follow_the_full_drag_distance() {
+        let mut solver = Solver::new();
+        let x0 = solver.new_var();
+        let x1 = solver.new_var();
+        // This is the coefficient form of
+        // `(rect.x0 + rect.x1 + rect.x0 + rect.x1) / 4.`.
+        let coordinate = LinearExpr {
+            coeffs: vec![(0.25, x0), (0.25, x1), (0.25, x0), (0.25, x1)],
+            constant: 0.,
+        };
+        let coordinate = SparseVec::from(&coordinate);
+        let translation = SparseVec([(x0, 12.), (x1, 12.)].into_iter().collect());
+
+        assert_relative_eq!(coordinate[&x0], 0.5, epsilon = 1e-9);
+        assert_relative_eq!(coordinate[&x1], 0.5, epsilon = 1e-9);
+        assert_relative_eq!(dot(&coordinate, &translation), 12., epsilon = 1e-9);
     }
 
     #[test]

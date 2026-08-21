@@ -492,7 +492,11 @@ impl Editor {
             });
             return;
         }
-        cx.hide();
+        if !crate::focus::activate_editor() {
+            self.state.update(cx, |state, _cx| {
+                state.fatal_error = Some("could not identify the application running Nvim".into());
+            });
+        }
     }
 
     fn theme(&self, cx: &mut Context<Self>) -> &'static Theme {

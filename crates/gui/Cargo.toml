@@ -41,6 +41,14 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "libc",
+    "NSRunningApplication",
+    "NSWorkspace",
+] }
+
 [dev-dependencies]
 approx = { workspace = true }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev", features = ["test-support"] }

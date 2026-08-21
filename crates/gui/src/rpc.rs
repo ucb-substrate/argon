@@ -24,7 +24,7 @@ use tarpc::{
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
-use crate::{editor::Editor, editor_window_options};
+use crate::{editor::Editor, editor_window_options, focus};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -230,25 +230,6 @@ impl SyncLangServerClient {
             })??)
     }
 
-    pub fn delete_dimension(&self, span: Span) -> Result<bool> {
-        let client_clone = self.client.clone();
-        Ok(self
-            .app
-            .background_executor()
-            .block_with_timeout(
-                LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .delete_dimension(context::current(), span)
-                        .await
-                }
-                .compat(),
-            )
-            .map_err(|_| {
-                anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")
-            })??)
-    }
-
     pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<bool> {
         let client_clone = self.client.clone();
         Ok(self
@@ -357,6 +338,9 @@ impl Gui for GuiServer {
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
                     editor.open_cell(cx, cell, update);
+                    if !update {
+                        focus::activate_gui(cx);
+                    }
                 });
             }))
             .await
@@ -412,7 +396,7 @@ impl Gui for GuiServer {
                             window.replace_root(cx, |_, _| editor)
                         });
                     }
-                    cx.activate(true);
+                    focus::activate_gui(cx);
                 });
             }))
             .await

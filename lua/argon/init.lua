@@ -8,10 +8,13 @@ local function focus_gui()
     client.any_buf_request('custom/startGui', nil, client.print_error)
 end
 
-vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, '<D-\\>', focus_gui, {
-    desc = 'Focus Argon GUI',
-    silent = true,
-})
+for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
+    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus_gui, {
+        desc = 'Focus Argon GUI',
+        silent = true,
+        nowait = true,
+    })
+end
 
 ---LSP restart internal implementations
 ---@param bufnr? number The buffer number, defaults to the current buffer

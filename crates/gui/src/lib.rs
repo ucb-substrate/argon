@@ -17,6 +17,7 @@ use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
 pub mod actions;
 pub mod assets;
 pub mod editor;
+mod focus;
 pub mod rpc;
 pub mod sse;
 pub mod theme;
@@ -144,7 +145,7 @@ fn run_inner(
             })
             .unwrap();
 
-            cx.activate(true);
+            focus::activate_gui(cx);
         });
 }
 
@@ -161,7 +162,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("0", Zero, Some("LayoutCanvas")),
         KeyBinding::new("1", One, Some("LayoutCanvas")),
         KeyBinding::new("*", All, Some("LayoutCanvas")),
-        KeyBinding::new("cmd-\\", FocusNvim, None),
+        KeyBinding::new("ctrl-\\", FocusNvim, None),
         KeyBinding::new(":", FocusNvimCommandBar, None),
         KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
@@ -257,7 +258,7 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r : cmd-\\");
+        cx.simulate_keystrokes(*window, "u r : ctrl-\\");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
@@ -270,7 +271,7 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r : cmd-\\");
+        cx.simulate_keystrokes(*window, "u r : ctrl-\\");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
