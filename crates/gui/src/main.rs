@@ -23,7 +23,7 @@ const ANALYZER_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 )]
 struct Cli {
     /// Neovim executable to launch.
-    #[arg(long, global = true, env = "NVIM", default_value = "nvim")]
+    #[arg(long, global = true, default_value = "nvim")]
     nvim: OsString,
 
     #[command(subcommand)]
@@ -54,7 +54,7 @@ struct SshArgs {
     path: PathBuf,
 
     /// SSH executable to launch.
-    #[arg(long, env = "SSH", default_value = "ssh")]
+    #[arg(long, default_value = "ssh")]
     ssh: OsString,
 
     /// Pass an option through to OpenSSH, as with `ssh -o OPTION`.
@@ -65,6 +65,12 @@ struct SshArgs {
 #[derive(Debug, Args)]
 struct GuiArgs {
     lang_server_addr: SocketAddr,
+
+    #[arg(long)]
+    listen_port: Option<u16>,
+
+    #[arg(long)]
+    register_addr: Option<SocketAddr>,
 }
 
 fn main() -> ExitCode {
@@ -83,7 +89,7 @@ fn run(cli: Cli) -> Result<ExitStatus> {
         None => run_nvim(&cli.nvim, &cli.path),
         Some(CommandKind::Ssh(args)) => run_ssh(&cli.nvim, args),
         Some(CommandKind::Gui(args)) => {
-            argone::run(args.lang_server_addr);
+            argone::run(args.lang_server_addr, args.listen_port, args.register_addr);
             Ok(success_status())
         }
     }
@@ -94,9 +100,9 @@ fn run_nvim(nvim: &OsStr, path: &Path) -> Result<ExitStatus> {
     let mut command = Command::new(nvim);
     command
         .current_dir(working_directory)
+        .arg("--cmd")
+        .arg("let g:argon_auto_gui = v:true")
         .arg(target)
-        .env("ARGON_AUTO_GUI", "1")
-        .env("ARGON_GUI_EXECUTABLE", env::current_exe()?)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -105,9 +111,8 @@ fn run_nvim(nvim: &OsStr, path: &Path) -> Result<ExitStatus> {
 }
 
 fn nvim_location(path: &Path) -> Result<(PathBuf, PathBuf)> {
-    let path = expand_tilde(path);
     let metadata =
-        fs::metadata(&path).with_context(|| format!("could not access `{}`", path.display()))?;
+        fs::metadata(path).with_context(|| format!("could not access `{}`", path.display()))?;
     if metadata.is_dir() {
         let source = path.join("lib.ar");
         if !source.is_file() {
@@ -116,7 +121,7 @@ fn nvim_location(path: &Path) -> Result<(PathBuf, PathBuf)> {
                 path.display()
             );
         }
-        return Ok((path, PathBuf::from("lib.ar")));
+        return Ok((path.to_path_buf(), PathBuf::from("lib.ar")));
     }
     if metadata.is_file() {
         let directory = path
@@ -130,18 +135,6 @@ fn nvim_location(path: &Path) -> Result<(PathBuf, PathBuf)> {
         return Ok((directory, target));
     }
     bail!("`{}` is not a file or directory", path.display())
-}
-
-fn expand_tilde(path: &Path) -> PathBuf {
-    let mut components = path.components();
-    if components
-        .next()
-        .is_some_and(|part| part.as_os_str() == "~")
-        && let Some(home) = env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(components.as_path());
-    }
-    path.to_path_buf()
 }
 
 fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
@@ -315,11 +308,9 @@ fn remote_nvim_command(nvim: &OsStr, path: &Path, analyzer_port: u16) -> String 
          else \
            printf '%s\\n' 'argone: remote path is not a file or directory' >&2; exit 1; \
          fi; \
-         exec env \
-           ARGON_LANG_SERVER_DEFAULT_PORT={analyzer_port} \
-           ARGON_LANG_SERVER_STRICT_PORT=1 \
-           ARGON_EXTERNAL_GUI=1 \
-           {nvim} \"$1\""
+         exec {nvim} \
+           --cmd 'let g:argon_analyzer_rpc_port = {analyzer_port}' \
+           \"$1\""
     )
 }
 
@@ -346,9 +337,10 @@ fn launch_forwarded_gui(
     Command::new(env::current_exe()?)
         .arg("__gui")
         .arg(analyzer_addr.to_string())
-        .env("ARGON_GUI_DEFAULT_PORT", gui_port.to_string())
-        .env("ARGON_GUI_STRICT_PORT", "1")
-        .env("ARGON_GUI_REGISTER_ADDR", register_addr.to_string())
+        .arg("--listen-port")
+        .arg(gui_port.to_string())
+        .arg("--register-addr")
+        .arg(register_addr.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -466,8 +458,9 @@ mod tests {
             12001,
         );
         assert!(command.starts_with("set -- '/work/a project'\"'\"'s files';"));
-        assert!(command.contains("ARGON_LANG_SERVER_DEFAULT_PORT=12001"));
-        assert!(command.ends_with("'custom nvim' \"$1\""));
+        assert!(command.contains("let g:argon_analyzer_rpc_port = 12001"));
+        assert!(command.contains("exec 'custom nvim'"));
+        assert!(command.ends_with("\"$1\""));
     }
 
     #[test]

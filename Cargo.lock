@@ -214,6 +214,7 @@ dependencies = [
  "argonc",
  "bytes",
  "cfgrammar",
+ "clap",
  "futures",
  "homedir",
  "indexmap",

@@ -387,9 +387,6 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "server initialized!")
             .await;
         self.compile().await;
-        if std::env::var_os("ARGON_AUTO_GUI").is_some() {
-            let _ = self.start_gui().await;
-        }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -471,17 +468,6 @@ impl Backend {
             let _ = gui.kill().await;
         }
 
-        if std::env::var_os("ARGON_EXTERNAL_GUI").is_some() {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::INFO,
-                    "The GUI is managed by the local `argone ssh` session.",
-                )
-                .await;
-            return Ok(());
-        }
-
         self.state
             .editor_client
             .show_message(MessageType::LOG, "Starting the GUI...")
@@ -489,9 +475,7 @@ impl Backend {
         let state = self.state.clone();
 
         tokio::spawn(async move {
-            let executable =
-                std::env::var_os("ARGON_GUI_EXECUTABLE").unwrap_or_else(|| "argone".into());
-            match Command::new(executable)
+            match Command::new("argone")
                 .arg("__gui")
                 .arg(format!("{}", state.server_addr))
                 .stdin(Stdio::null())
@@ -594,37 +578,18 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
-pub async fn main() {
+pub async fn main(rpc_port: Option<u16>) {
     // Start server for communication with GUI.
-    let port = std::env::var("ARGON_LANG_SERVER_DEFAULT_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(12345);
-    let strict_port = std::env::var_os("ARGON_LANG_SERVER_STRICT_PORT").is_some();
-    let mut listener = match tarpc::serde_transport::tcp::listen(
-        (Ipv4Addr::LOCALHOST, port),
-        Json::default,
-    )
-    .await
-    {
-        Ok(listener) => listener,
-        Err(port_error) if strict_port => {
-            eprintln!("failed to bind analyzer RPC server to port {port}: {port_error}");
-            return;
-        }
-        Err(port_error) => {
-            match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default).await
-            {
-                Ok(listener) => listener,
-                Err(fallback_error) => {
-                    eprintln!(
-                        "failed to bind analyzer RPC server to port {port} ({port_error}) or an available port ({fallback_error})"
-                    );
-                    return;
-                }
+    let port = rpc_port.unwrap_or(0);
+    let mut listener =
+        match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default).await
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("failed to bind analyzer RPC server to port {port}: {error}");
+                return;
             }
-        }
-    };
+        };
     let server_addr = listener.local_addr();
 
     // Construct actual LSP server.

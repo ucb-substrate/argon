@@ -33,10 +33,17 @@ pub struct SyncLangServerClient {
     app: AsyncApp,
     client: LangServerClient,
     to_exec: Sender<EditorFn>,
+    listen_port: Option<u16>,
+    register_addr: Option<SocketAddr>,
 }
 
 impl SyncLangServerClient {
-    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, Receiver<EditorFn>) {
+    pub fn new(
+        app: AsyncApp,
+        lang_server_addr: SocketAddr,
+        listen_port: Option<u16>,
+        register_addr: Option<SocketAddr>,
+    ) -> (Self, Receiver<EditorFn>) {
         let client = app.background_executor().block(
             async move {
                 let mut transport =
@@ -54,6 +61,8 @@ impl SyncLangServerClient {
                 app,
                 client,
                 to_exec,
+                listen_port,
+                register_addr,
             },
             rx,
         )
@@ -61,12 +70,10 @@ impl SyncLangServerClient {
 
     pub fn register_server(&self) {
         let background_executor = self.app.background_executor().clone();
+        let configured_port = self.listen_port;
         let mut listener = self.app.background_executor().block(
-            async {
-                let port = std::env::var("ARGON_GUI_DEFAULT_PORT")
-                    .ok()
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(12346);
+            async move {
+                let port = configured_port.unwrap_or(0);
                 match tarpc::serde_transport::tcp::listen(
                     (Ipv4Addr::LOCALHOST, port),
                     Json::default,
@@ -74,24 +81,16 @@ impl SyncLangServerClient {
                 .await
                 {
                     Ok(listener) => listener,
-                    Err(error) if std::env::var_os("ARGON_GUI_STRICT_PORT").is_some() => {
+                    Err(error) => {
                         error!("Failed to bind GUI RPC server to port {port}: {error}");
                         std::process::exit(1);
-                    }
-                    Err(_) => {
-                        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
-                            .await
-                            .unwrap()
                     }
                 }
             }
             .compat(),
         );
         let server_addr = listener.local_addr();
-        let register_addr = std::env::var("ARGON_GUI_REGISTER_ADDR")
-            .ok()
-            .and_then(|addr| addr.parse().ok())
-            .unwrap_or(server_addr);
+        let register_addr = self.register_addr.unwrap_or(server_addr);
         let to_exec = self.to_exec.clone();
         self.app
             .background_executor()

@@ -42,7 +42,11 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn run(lang_server_addr: SocketAddr) {
+pub fn run(
+    lang_server_addr: SocketAddr,
+    gui_listen_port: Option<u16>,
+    gui_register_addr: Option<SocketAddr>,
+) {
     // TODO: Allow configuration via ARGON_HOME environment variable.
     if let Some(log_dir) = default_argon_home() {
         tracing_subscriber::fmt()
@@ -140,7 +144,15 @@ pub fn run(lang_server_addr: SocketAddr) {
                     ..Default::default()
                 },
                 |window, cx| {
-                    window.replace_root(cx, |window, cx| Editor::new(cx, window, lang_server_addr))
+                    window.replace_root(cx, |window, cx| {
+                        Editor::new(
+                            cx,
+                            window,
+                            lang_server_addr,
+                            gui_listen_port,
+                            gui_register_addr,
+                        )
+                    })
                 },
             )
             .unwrap();
