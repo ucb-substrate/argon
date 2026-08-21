@@ -2,8 +2,7 @@ pub mod document;
 pub mod rpc;
 
 use std::{
-    fs,
-    io::Write,
+    io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -28,6 +27,7 @@ use tarpc::{
     server::{Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
+use tempfile::{NamedTempFile, TempPath};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
@@ -580,30 +580,15 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
-struct RpcInfoFile(PathBuf);
-
-impl Drop for RpcInfoFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-fn publish_rpc_port(path: PathBuf, port: u16) -> std::io::Result<RpcInfoFile> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    writeln!(file, "{port}")?;
-    file.sync_all()?;
-    fs::rename(&temporary, &path).inspect_err(|_| {
-        let _ = fs::remove_file(&temporary);
+fn publish_rpc_port(path: PathBuf, port: u16) -> io::Result<TempPath> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "RPC info path has no parent")
     })?;
-    Ok(RpcInfoFile(path))
+    let mut file = NamedTempFile::new_in(parent)?;
+    writeln!(file, "{port}")?;
+    file.as_file().sync_all()?;
+    file.persist(&path).map_err(|error| error.error)?;
+    TempPath::try_from_path(path)
 }
 
 pub async fn main(rpc_port: Option<u16>, rpc_info: Option<PathBuf>) {

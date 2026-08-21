@@ -32,3 +32,4 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 homedir = "0.3"
 clap = { workspace = true }
+tempfile = { workspace = true }

@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
+use tempfile::NamedTempFile;
 
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -714,22 +715,18 @@ fn local_forward_collision(stderr: &str, port: u16) -> bool {
 }
 
 fn publish_file(path: &Path, contents: String) -> Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&temporary)
-        .with_context(|| format!("could not create `{}`", temporary.display()))?;
-    writeln!(file, "{contents}")?;
-    file.sync_all()?;
-    fs::rename(&temporary, path).inspect_err(|_| {
-        let _ = fs::remove_file(&temporary);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("`{}` has no parent directory", path.display()))?;
+    let mut file = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "could not create a temporary file in `{}`",
+            parent.display()
+        )
     })?;
+    writeln!(file, "{contents}")?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
