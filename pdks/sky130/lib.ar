@@ -19,8 +19,6 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
     std::center_rects(li1_bbox, std::array2(licon, nf + 1, ny, 430., 340.));
-    let rect0 = rect("pwell.drawing", x0i = 65.6, y0i = 630.1, x1i = 691.8, y1i = 1069.9560546875)!;
-    dimension(rect0.y1, rect0.y0, 500., (rect0.x0 + rect0.x1 + rect0.x0 + rect0.x1)/4. - 968.3052, (rect0.x0 + rect0.x1) / 2., (rect0.x0 + rect0.x1) / 2., false);
 }
 
 cell tap(ntap: Int, w: Float, h: Float) {
