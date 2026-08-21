@@ -1,7 +1,6 @@
 use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
 
 use analyzer::default_argon_home;
-use clap::Parser;
 use editor::Editor;
 use gpui::*;
 use rust_embed::RustEmbed;
@@ -17,12 +16,6 @@ pub mod editor;
 pub mod rpc;
 pub mod sse;
 pub mod theme;
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    lang_server_addr: SocketAddr,
-}
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -49,9 +42,7 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn main() {
-    let args = Args::parse();
-
+pub fn run(lang_server_addr: SocketAddr) {
     // TODO: Allow configuration via ARGON_HOME environment variable.
     if let Some(log_dir) = default_argon_home() {
         tracing_subscriber::fmt()
@@ -149,9 +140,7 @@ pub fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    window.replace_root(cx, |window, cx| {
-                        Editor::new(cx, window, args.lang_server_addr)
-                    })
+                    window.replace_root(cx, |window, cx| Editor::new(cx, window, lang_server_addr))
                 },
             )
             .unwrap();

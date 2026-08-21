@@ -84,7 +84,34 @@ vim.pack.add({
 The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`; no repository path is needed in your Neovim configuration.
 
-Start the GUI by running `:Argon gui`.
+From an Argon project directory, start Neovim and the GUI together:
+
+```bash
+argone
+```
+
+You can also give `argone` a project directory or an Argon source file:
+
+```bash
+argone path/to/project
+argone path/to/project/lib.ar
+```
+
+`argone` runs Neovim in the current terminal and starts the GUI as soon as
+the Argon analyzer is ready. To edit a project on another machine, use an SSH
+host or alias from your OpenSSH configuration:
+
+```bash
+argone ssh build-server /path/to/project
+```
+
+Argone selects and forwards the RPC ports automatically. Neovim, the Argon
+Neovim plugin, and `argon-analyzer` must be installed on the remote machine,
+but `argone` itself is only needed locally; the graphical application also
+runs only on the local machine.
+
+Launching Neovim yourself remains supported. In that mode, start or activate
+the GUI by running `:Argon gui`.
 
 From within the GUI, type `:openCell inv(1200., 2000., 4)` to open the `inv` cell. You should now be able to edit layouts 
 in both Neovim and the GUI.

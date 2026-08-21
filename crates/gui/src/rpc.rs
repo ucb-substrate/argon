@@ -26,7 +26,7 @@ use tracing::error;
 
 use crate::editor::Editor;
 
-pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
+pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct SyncLangServerClient {
@@ -67,20 +67,31 @@ impl SyncLangServerClient {
                     .ok()
                     .and_then(|p| p.parse::<u16>().ok())
                     .unwrap_or(12346);
-                if let Ok(listener) =
-                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default)
-                        .await
+                match tarpc::serde_transport::tcp::listen(
+                    (Ipv4Addr::LOCALHOST, port),
+                    Json::default,
+                )
+                .await
                 {
-                    listener
-                } else {
-                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
-                        .await
-                        .unwrap()
+                    Ok(listener) => listener,
+                    Err(error) if std::env::var_os("ARGON_GUI_STRICT_PORT").is_some() => {
+                        error!("Failed to bind GUI RPC server to port {port}: {error}");
+                        std::process::exit(1);
+                    }
+                    Err(_) => {
+                        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
+                            .await
+                            .unwrap()
+                    }
                 }
             }
             .compat(),
         );
         let server_addr = listener.local_addr();
+        let register_addr = std::env::var("ARGON_GUI_REGISTER_ADDR")
+            .ok()
+            .and_then(|addr| addr.parse().ok())
+            .unwrap_or(server_addr);
         let to_exec = self.to_exec.clone();
         self.app
             .background_executor()
@@ -117,9 +128,13 @@ impl SyncLangServerClient {
             .background_executor()
             .block_with_timeout(
                 LANG_SERVER_CLIENT_TIMEOUT,
-                async move { client_clone.register(context::current(), server_addr).await }
-                    .compat()
-                    .map_err(|e| format!("{}", e)),
+                async move {
+                    client_clone
+                        .register(context::current(), register_addr)
+                        .await
+                }
+                .compat()
+                .map_err(|e| format!("{}", e)),
             )
             .map_err(|_| format!("timeout after {LANG_SERVER_CLIENT_TIMEOUT:?}"))
         {

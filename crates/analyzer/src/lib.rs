@@ -387,6 +387,9 @@ impl LanguageServer for Backend {
             .log_message(MessageType::INFO, "server initialized!")
             .await;
         self.compile().await;
+        if std::env::var_os("ARGON_AUTO_GUI").is_some() {
+            let _ = self.start_gui().await;
+        }
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -468,6 +471,17 @@ impl Backend {
             let _ = gui.kill().await;
         }
 
+        if std::env::var_os("ARGON_EXTERNAL_GUI").is_some() {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::INFO,
+                    "The GUI is managed by the local `argone ssh` session.",
+                )
+                .await;
+            return Ok(());
+        }
+
         self.state
             .editor_client
             .show_message(MessageType::LOG, "Starting the GUI...")
@@ -475,7 +489,10 @@ impl Backend {
         let state = self.state.clone();
 
         tokio::spawn(async move {
-            match Command::new("argone")
+            let executable =
+                std::env::var_os("ARGON_GUI_EXECUTABLE").unwrap_or_else(|| "argone".into());
+            match Command::new(executable)
+                .arg("__gui")
                 .arg(format!("{}", state.server_addr))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -583,6 +600,7 @@ pub async fn main() {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(12345);
+    let strict_port = std::env::var_os("ARGON_LANG_SERVER_STRICT_PORT").is_some();
     let mut listener = match tarpc::serde_transport::tcp::listen(
         (Ipv4Addr::LOCALHOST, port),
         Json::default,
@@ -590,6 +608,10 @@ pub async fn main() {
     .await
     {
         Ok(listener) => listener,
+        Err(port_error) if strict_port => {
+            eprintln!("failed to bind analyzer RPC server to port {port}: {port_error}");
+            return;
+        }
         Err(port_error) => {
             match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default).await
             {
