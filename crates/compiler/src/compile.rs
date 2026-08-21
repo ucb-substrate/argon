@@ -13,7 +13,13 @@ use geometry::transform::{Rotation, TransformationMatrix};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+
+mod result;
+
+pub use result::{
+    CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
+    StaticErrorCompileOutput, StaticErrorKind,
+};
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
@@ -22,7 +28,7 @@ use crate::ast::{
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
-use crate::parse::WorkspaceParseAst;
+use crate::parse::{ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
 use crate::{
     ast::{
@@ -59,6 +65,34 @@ pub fn static_compile(
     let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
     errors.extend(new_errors);
     Some((ast, StaticErrorCompileOutput { errors }))
+}
+
+/// Runs static analysis for a parsed workspace and folds parser diagnostics
+/// into the same error collection as import and type-checking errors.
+pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
+    let parse_errors = parse_output.static_errors();
+    let ast = parse_output.ast();
+    let (typed_ast, errors) = match static_compile(&ast) {
+        Some((typed_ast, mut output)) => {
+            output.errors.extend(parse_errors);
+            (Some(typed_ast), output.errors)
+        }
+        None => (None, parse_errors),
+    };
+    StaticAnalysis {
+        ast,
+        typed_ast,
+        errors,
+    }
+}
+
+pub struct StaticAnalysis {
+    /// Parsed source AST used for source-aware tooling.
+    pub ast: WorkspaceParseAst,
+    /// Type-annotated AST, absent only when the workspace has no root module.
+    pub typed_ast: Option<WorkspaceAst<VarIdTyMetadata>>,
+    /// Parser, import-resolution, and type-checking diagnostics.
+    pub errors: Vec<StaticError>,
 }
 
 pub fn dynamic_compile(
@@ -4943,232 +4977,6 @@ pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<R
             span: None,
         }),
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaticError {
-    pub span: Span,
-    pub kind: StaticErrorKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Error)]
-pub enum StaticErrorKind {
-    /// Multiple declarations with the same name.
-    ///
-    /// For example, two cells named `my_cell`.
-    #[error("duplicate name declaration")]
-    DuplicateNameDeclaration,
-    /// Attempted to declare an object with the same name as a built-in object.
-    ///
-    /// For example, users cannot declare cells or functions named `rect`.
-    #[error("redeclaration of built-in object")]
-    RedeclarationOfBuiltin,
-    /// Attempted to treat a non-enum object (e.g. a function or local variable) like an enum using the "::"
-    /// operator.
-    #[error("expected an enum")]
-    NotAnEnum,
-    /// Attempted to create a value using an enum variant that is not declared by the enum.
-    #[error("not a variant of the enum: {0}")]
-    InvalidVariant(String),
-    /// A cell had an expression in tail position, which is not permitted.
-    #[error("cells may not have an expression in tail position")]
-    CellWithTailExpr,
-    /// If conditions must have type bool.
-    #[error("if conditions must have type bool")]
-    IfCondNotBool,
-    /// Branches in expresssions must evaluate to the same type.
-    #[error("branches must evaluate to same type")]
-    BranchesDifferentTypes,
-    /// Multiple match arms with matching patterns.
-    #[error("match arms must be distinct")]
-    DuplicateMatchArm,
-    /// Match arms must be comprehensive.
-    #[error("match arms must be comprehensive")]
-    MatchArmsNotComprehensive,
-    /// The operands in a binary expression must have the same type.
-    #[error("operands of binary expression must have the same type")]
-    BinOpMismatchedTypes,
-    /// Cannot compare equality or inequality of floating point numbers.
-    #[error("cannot compare equality or inequality of floating point numbers")]
-    FloatEquality,
-    /// Cannot perform greater/less than comparisons on enum values.
-    #[error("cannot perform greater/less than comparisons on enum values")]
-    EnumsNotOrd,
-    /// Cannot perform greater/less than comparisons on nil values.
-    #[error("cannot perform greater/less than comparisons on nil")]
-    NilNotOrd,
-    /// Cannot perform greater/less than comparisons on seq nil values.
-    #[error("cannot perform greater/less than comparisons on seq nil")]
-    SeqNilNotOrd,
-    /// Must compare sequences for equality/inequality to nil.
-    #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
-    SeqMustCompareEqSeqNil,
-    /// A type cannot be used in a binary expression.
-    #[error("type cannot be used in a binary expression: {0:?}")]
-    BinOpInvalidType(Ty),
-    /// A type cannot be used in a unary operation.
-    #[error("type cannot be used in a unary operation")]
-    UnaryOpInvalidType,
-    /// A type cannot be used in a comparison expression.
-    #[error("type cannot be used in comparison expression")]
-    ComparisonInvalidType,
-    /// An unknown type, i.e. a type that has not been declared.
-    #[error("unknown type")]
-    UnknownType,
-    /// No field on object of the given type.
-    #[error("no field {field} on type {ty:?}")]
-    NoFieldOnTy { field: String, ty: Ty },
-    /// Tuple index out of range.
-    #[error("tuple index out of range")]
-    TupleIndexOutOfRange,
-    /// The fields of the given type cannot be accessed via index field access.
-    #[error("the fields of type {ty:?} cannot be accessed via index field access")]
-    CannotIndexFieldAccess { ty: Ty },
-    /// Cannot index the given type.
-    #[error("type {ty:?} cannot be indexed")]
-    CannotIndex { ty: Ty },
-    /// Cannot iterate over the given type.
-    #[error("cannot iterate over type {ty:?}")]
-    CannotIterate { ty: Ty },
-    /// Incorrect type.
-    #[error("expected type {expected:?}, found {found:?}")]
-    IncorrectTy { expected: Ty, found: Ty },
-    /// Incorrect type category.
-    #[error("expected type category {expected}, found {found:?}")]
-    IncorrectTyCategory { found: Ty, expected: String },
-    /// Empty list constructor.
-    #[error("list constructors cannot be empty (use `[]` for an empty list)")]
-    EmptyListConstructor,
-    /// Called a function or cell with the wrong number of positional arguments.
-    #[error("expected {expected} position arguments, found {found}")]
-    CallIncorrectPositionalArity { expected: usize, found: usize },
-    /// Invalid keyword argument.
-    #[error("invalid keyword argument")]
-    InvalidKwArg,
-    /// Duplicate keyword argument.
-    #[error("duplicate keyword argument")]
-    DuplicateKwArg,
-    /// Identifier used without being declared.
-    #[error("identifier used without being declared")]
-    UndeclaredVar,
-    /// Attempted to use an object of the given type as the function of a call expression.
-    #[error("cannot call type {0:?}")]
-    CannotCall(Ty),
-    /// Cannot perform the requested type cast.
-    #[error("invalid type cast")]
-    InvalidCast,
-    /// Module doesn't exist.
-    #[error("module doesn't exist")]
-    InvalidMod,
-    /// Error during lexing.
-    #[error("error during lexing: {0}")]
-    LexError(String),
-    /// Error during parsing.
-    #[error("error during parsing: {0}")]
-    ParseError(String),
-    /// Invalid LYP file.
-    #[error("{0}")]
-    InvalidLyp(String),
-    /// A source file could not be loaded or resolved.
-    #[error("could not load source: {0}")]
-    SourceError(String),
-    /// Unimplemented.
-    #[error("unimplemented")]
-    Unimplemented,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecError {
-    pub span: Option<Span>,
-    pub cell: CellId,
-    pub kind: ExecErrorKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Error)]
-pub enum ExecErrorKind {
-    /// A non-Manhattan rotation.
-    #[error("non-Manhattan rotation")]
-    InvalidRotation,
-    /// An invalid cell was specified for execution.
-    #[error("invalid cell `{0}`")]
-    InvalidCell(String),
-    /// A cell invocation supplied the wrong number of arguments.
-    #[error("invalid cell arguments: expected {expected} arguments, found {found}")]
-    InvalidCellArity { expected: usize, found: usize },
-    /// A cell invocation supplied an argument of the wrong type.
-    #[error("invalid cell argument {index}: expected {expected:?}, found {found}")]
-    InvalidCellArgumentType {
-        index: usize,
-        expected: Ty,
-        found: String,
-    },
-    /// A cell is underconstrained.
-    #[error("cell is underconstrained")]
-    Underconstrained,
-    /// Illegal layer (not defined in layer properties).
-    #[error("rectangle uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
-    IllegalLayer { layer: String, lyp: String },
-    /// Inconsistent constraint.
-    #[error("inconsistent constraint")]
-    InconsistentConstraint(ConstraintId),
-    /// Invalid rounding (e.g. solved value is not sufficiently close to a rounding step).
-    #[error("invalid rounding")]
-    InvalidRounding(Var),
-    /// A cell or instance had an empty bounding box.
-    #[error("empty bbox")]
-    EmptyBbox,
-    /// Field is empty (analogous to None).
-    #[error("empty field (field was not assigned a value)")]
-    EmptyField,
-    /// Edges of a rect are in the wrong order (e.g. x0 > x1 or y0 > y1).
-    #[error("rect edges are in the wrong order: {0}")]
-    FlippedRect(String),
-    /// Operation on an incompatible type, usually due to erroneous use of `Any`.
-    #[error("operation on an incompatible type (check usage of `Any`)")]
-    InvalidType,
-    /// Attempted to cast a type to an incompatible type.
-    #[error("cast to an incompatible type (check usage of `Any`)")]
-    InvalidCast,
-    /// Index out of bounds.
-    #[error("index out of bounds")]
-    IndexOutOfBounds,
-    /// Attempt to access the head of an empty list.
-    #[error("attempted to access the head of an empty list")]
-    HeadEmptyList,
-    /// Attempt to access the tail of an empty list.
-    #[error("attempted to access the tail of an empty list")]
-    TailEmptyList,
-}
-
-impl ExecErrorKind {
-    pub fn is_invalid_cell(&self) -> bool {
-        matches!(
-            self,
-            Self::InvalidCell(_)
-                | Self::InvalidCellArity { .. }
-                | Self::InvalidCellArgumentType { .. }
-        )
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[enumify]
-pub enum CompileOutput {
-    FatalParseErrors,
-    StaticErrors(StaticErrorCompileOutput),
-    ExecErrors(ExecErrorCompileOutput),
-    Valid(CompiledData),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StaticErrorCompileOutput {
-    pub errors: Vec<StaticError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecErrorCompileOutput {
-    pub errors: Vec<ExecError>,
-    pub output: Option<CompiledData>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -97,20 +97,20 @@ fn run(args: Args) -> Result<(), Failed> {
         }
     }
 
-    let parse_output = parse_workspace_with_std_and_deps(&root, args.dependencies);
-    let parse_errors = parse_output.static_errors();
-    let ast = parse_output.ast();
-    let Some((typed_ast, mut static_output)) = compile::static_compile(&ast) else {
+    let analysis =
+        compile::analyze_workspace(parse_workspace_with_std_and_deps(&root, args.dependencies));
+    let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(
             format,
             format!("could not parse library root `{}`", root.display()),
         ));
     };
-    static_output.errors.extend(parse_errors);
-    if !static_output.errors.is_empty() {
+    if !analysis.errors.is_empty() {
         return Err(compile_failed(
             format,
-            CompileOutput::StaticErrors(static_output),
+            CompileOutput::StaticErrors(compile::StaticErrorCompileOutput {
+                errors: analysis.errors,
+            }),
         ));
     }
     if args.check {

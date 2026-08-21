@@ -1,6 +1,6 @@
 //! RPC types shared by the analyzer and Argone.
 
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use argonc::{
     ast::Span,
@@ -14,7 +14,7 @@ use tower_lsp_server::ls_types::{
     Uri, WorkspaceEdit,
 };
 
-use crate::{ForceSave, Redo, State, Undo, document::Document};
+use crate::{ForceSave, Redo, State, StateMut, Undo, document::Document};
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
 /// persist solution-space-exploration drags by updating initial-condition
@@ -63,13 +63,142 @@ pub trait Gui {
     async fn activate();
 }
 
+const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
+
+fn editor_buffers_are_current(state: &StateMut) -> bool {
+    state.ast.values().all(|ast| {
+        Uri::from_file_path(&ast.path)
+            .and_then(|uri| state.editor_files.get(&uri))
+            .is_none_or(|document| document.contents() == ast.text)
+    })
+}
+
+struct SourceInsertion {
+    edit: TextEdit,
+    tracked_span: cfgrammar::Span,
+}
+
+fn insert_statement(
+    document: &Document,
+    scope_span: cfgrammar::Span,
+    tail_start: Option<usize>,
+    statement: &str,
+    tracked: std::ops::Range<usize>,
+) -> SourceInsertion {
+    let (offset, prefix, suffix) = if let Some(offset) = tail_start {
+        let position = document.offset_to_pos(offset);
+        (
+            offset,
+            String::new(),
+            format!("\n{}", " ".repeat(position.character as usize)),
+        )
+    } else {
+        let start = document.offset_to_pos(scope_span.start());
+        let stop = document.offset_to_pos(scope_span.end());
+        let line = document.substr(Position::new(stop.line, 0)..stop);
+        let indentation = &line[..line.len() - line.trim_start().len()];
+        (
+            scope_span.end() - 1,
+            if start.line == stop.line {
+                "\n".to_owned()
+            } else {
+                "    ".to_owned()
+            },
+            format!("\n{indentation}"),
+        )
+    };
+    let position = document.offset_to_pos(offset);
+    let tracked_start = offset + prefix.len() + tracked.start;
+
+    SourceInsertion {
+        edit: TextEdit {
+            range: Range::new(position, position),
+            new_text: format!("{prefix}{statement}{suffix}"),
+        },
+        tracked_span: cfgrammar::Span::new(tracked_start, offset + prefix.len() + tracked.end),
+    }
+}
+
+impl State {
+    async fn apply_source_changes(
+        &self,
+        changes: HashMap<Uri, Vec<TextEdit>>,
+        paths: impl IntoIterator<Item = PathBuf>,
+        focus: Option<Uri>,
+    ) -> bool {
+        let result: Result<(), String> = async {
+            if let Some(uri) = focus {
+                self.editor_client
+                    .show_document(ShowDocumentParams {
+                        uri,
+                        external: None,
+                        take_focus: None,
+                        selection: None,
+                    })
+                    .await
+                    .map_err(|error| format!("could not show source document: {error}"))?;
+            }
+
+            let response = self
+                .editor_client
+                .apply_edit(WorkspaceEdit {
+                    changes: Some(changes),
+                    document_changes: None,
+                    change_annotations: None,
+                })
+                .await
+                .map_err(|error| format!("could not apply source edit: {error}"))?;
+            if !response.applied {
+                return Err(response
+                    .failure_reason
+                    .unwrap_or_else(|| "editor rejected source edit".to_owned()));
+            }
+
+            for path in paths {
+                self.editor_client
+                    .send_request::<ForceSave>(path)
+                    .await
+                    .map_err(|error| format!("could not save edited source: {error}"))?;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = result {
+            self.editor_client
+                .show_message(MessageType::ERROR, error)
+                .await;
+            false
+        } else {
+            true
+        }
+    }
+
+    async fn apply_source_edit(&self, uri: Uri, path: PathBuf, edit: TextEdit) -> bool {
+        self.apply_source_changes(
+            HashMap::from([(uri.clone(), vec![edit])]),
+            [path],
+            Some(uri),
+        )
+        .await
+    }
+}
+
 impl LangServer for State {
     async fn register(self, _: tarpc::context::Context, addr: SocketAddr) -> () {
-        let gui_client = {
-            let mut transport = tarpc::serde_transport::tcp::connect(addr, Json::default);
-            transport.config_mut().max_frame_length(usize::MAX);
-
-            GuiClient::new(tarpc::client::Config::default(), transport.await.unwrap()).spawn()
+        let mut transport = tarpc::serde_transport::tcp::connect(addr, Json::default);
+        transport.config_mut().max_frame_length(usize::MAX);
+        let gui_client = match transport.await {
+            Ok(transport) => GuiClient::new(tarpc::client::Config::default(), transport).spawn(),
+            Err(error) => {
+                self.editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not connect to the GUI: {error}"),
+                    )
+                    .await;
+                return;
+            }
         };
         let mut state_mut = self.state_mut.lock().await;
         state_mut.gui_client = Some(gui_client);
@@ -81,7 +210,9 @@ impl LangServer for State {
         let state_mut = self.state_mut.lock().await;
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
             let doc = Document::new(&ast.text, 0);
-            let url = Uri::from_file_path(&span.path).unwrap();
+            let Some(url) = Uri::from_file_path(&span.path) else {
+                return;
+            };
             let diagnostics = vec![Diagnostic {
                 range: Range {
                     start: doc.offset_to_pos(span.span.start()),
@@ -105,125 +236,48 @@ impl LangServer for State {
         rect: BasicRect<f64>,
     ) -> Option<Span> {
         let state_mut = self.state_mut.lock().await;
-
-        if state_mut.ast.values().any(|ast| {
-            state_mut
-                .editor_files
-                .get(&Uri::from_file_path(&ast.path).unwrap())
-                .map(|file| file.contents() != ast.text)
-                .unwrap_or_default()
-        }) {
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
             self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Editor buffer state is inconsistent with GUI state.",
-                )
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         }
-
-        let url = Uri::from_file_path(&scope_span.path).unwrap();
-
-        if let Some(ast) = state_mut
+        let url = Uri::from_file_path(&scope_span.path)?;
+        let ast = state_mut
             .ast
             .values()
-            .find(|ast| ast.path == scope_span.path)
-            && let Some(scope) = ast.span2scope.get(&scope_span)
-        {
-            let doc = Document::new(&ast.text, 0);
-            let format_rect = |rect: &BasicRect<f64>| {
-                format!(
-                    "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
-                    rect.layer
-                        .as_ref()
-                        .map(|layer| format!("\"{layer}\", "))
-                        .unwrap_or_default(),
-                    rect.x0,
-                    rect.y0,
-                    rect.x1,
-                    rect.y1,
-                )
-            };
-            let (edit, span) = if let Some(tail) = &scope.tail {
-                let start = doc.offset_to_pos(tail.span().start());
-                let prefix = format!("let {var_name} = ");
-                let rect_str = format_rect(&rect);
-                (
-                    TextEdit {
-                        range: Range::new(start, start),
-                        new_text: format!(
-                            "{prefix}{rect_str}!;\n{}",
-                            // TODO: handle different types of indentation, or enforce that gui
-                            // reformats file before editing.
-                            std::iter::repeat_n(' ', start.character as usize).collect::<String>()
-                        ),
-                    },
-                    Span {
-                        path: scope_span.path.clone(),
-                        span: cfgrammar::Span::new(
-                            tail.span().start() + prefix.len(),
-                            tail.span().start() + prefix.len() + rect_str.len(),
-                        ),
-                    },
-                )
-            } else {
-                let start = doc.offset_to_pos(scope.span.start());
-                let stop = doc.offset_to_pos(scope.span.end());
-                let line = doc.substr(Position::new(stop.line, 0)..stop);
-                let trimmed = line.trim_start();
-                let whitespace = &line[..line.len() - trimmed.len()];
-                let insert_loc = doc.offset_to_pos(scope.span.end() - 1);
-                let prefix = format!(
-                    "{}let {var_name} = ",
-                    if start.line != stop.line {
-                        "    "
-                    } else {
-                        "\n"
-                    }
-                );
-                let rect_str = format_rect(&rect);
-                (
-                    TextEdit {
-                        range: Range::new(insert_loc, insert_loc),
-                        new_text: format!("{prefix}{rect_str}!;\n{whitespace}",),
-                    },
-                    Span {
-                        path: scope_span.path.clone(),
-                        span: cfgrammar::Span::new(
-                            scope.span.end() - 1 + prefix.len(),
-                            scope.span.end() - 1 + prefix.len() + rect_str.len(),
-                        ),
-                    },
-                )
-            };
+            .find(|ast| ast.path == scope_span.path)?;
+        let scope = ast.span2scope.get(&scope_span)?;
+        let document = Document::new(&ast.text, 0);
+        let expression = format!(
+            "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
+            rect.layer
+                .as_ref()
+                .map(|layer| format!("\"{layer}\", "))
+                .unwrap_or_default(),
+            rect.x0,
+            rect.y0,
+            rect.x1,
+            rect.y1,
+        );
+        let prefix = format!("let {var_name} = ");
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &format!("{prefix}{expression}!;"),
+            prefix.len()..prefix.len() + expression.len(),
+        );
+        let span = Span {
+            path: scope_span.path.clone(),
+            span: insertion.tracked_span,
+        };
+        drop(state_mut);
 
-            self.editor_client
-                .show_document(ShowDocumentParams {
-                    uri: url.clone(),
-                    external: None,
-                    take_focus: None,
-                    selection: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .apply_edit(WorkspaceEdit {
-                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
-                    document_changes: None,
-                    change_annotations: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .send_request::<ForceSave>(scope_span.path.clone())
-                .await
-                .unwrap();
-            Some(span)
-        } else {
-            None
-        }
+        self.apply_source_edit(url, scope_span.path, insertion.edit)
+            .await
+            .then_some(span)
     }
 
     async fn draw_dimension(
@@ -233,121 +287,46 @@ impl LangServer for State {
         params: DimensionParams,
     ) -> Option<Span> {
         let state_mut = self.state_mut.lock().await;
-
-        if state_mut.ast.values().any(|ast| {
-            state_mut
-                .editor_files
-                .get(&Uri::from_file_path(&ast.path).unwrap())
-                .map(|file| file.contents() != ast.text)
-                .unwrap_or_default()
-        }) {
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
             self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Editor buffer state is inconsistent with GUI state.",
-                )
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         }
-
-        let url = Uri::from_file_path(&scope_span.path).unwrap();
-
-        if let Some(ast) = state_mut
+        let url = Uri::from_file_path(&scope_span.path)?;
+        let ast = state_mut
             .ast
             .values()
-            .find(|ast| ast.path == scope_span.path)
-            && let Some(scope) = ast.span2scope.get(&scope_span)
-        {
-            let doc = Document::new(&ast.text, 0);
-            let format_dimension = |params: &DimensionParams| {
-                format!(
-                    "dimension({}, {}, {}, {}, {}, {}, {})",
-                    params.p,
-                    params.n,
-                    params.value,
-                    params.coord,
-                    params.pstop,
-                    params.nstop,
-                    params.horiz
-                )
-            };
-            let (edit, span) = if let Some(tail) = &scope.tail {
-                let start = doc.offset_to_pos(tail.span().start());
-                let dimension = format_dimension(&params);
-                (
-                    TextEdit {
-                        range: Range::new(start, start),
-                        new_text: format!(
-                            "{};\n{}",
-                            dimension,
-                            // TODO: handle different types of indentation, or enforce that gui
-                            // reformats file before editing.
-                            std::iter::repeat_n(' ', start.character as usize).collect::<String>()
-                        ),
-                    },
-                    Span {
-                        path: scope_span.path.clone(),
-                        span: cfgrammar::Span::new(
-                            tail.span().start(),
-                            tail.span().start() + dimension.len(),
-                        ),
-                    },
-                )
-            } else {
-                let start = doc.offset_to_pos(scope.span.start());
-                let stop = doc.offset_to_pos(scope.span.end());
-                let line = doc.substr(Position::new(stop.line, 0)..stop);
-                let trimmed = line.trim_start();
-                let whitespace = &line[..line.len() - trimmed.len()];
-                let insert_loc = doc.offset_to_pos(scope.span.end() - 1);
-                let prefix = if start.line != stop.line {
-                    "    "
-                } else {
-                    "\n"
-                };
-                let dimension = format_dimension(&params);
-                (
-                    TextEdit {
-                        range: Range::new(insert_loc, insert_loc),
-                        new_text: format!("{}{};\n{whitespace}", prefix, dimension,),
-                    },
-                    Span {
-                        path: scope_span.path.clone(),
-                        span: cfgrammar::Span::new(
-                            scope.span.end() - 1 + prefix.len(),
-                            scope.span.end() - 1 + prefix.len() + dimension.len(),
-                        ),
-                    },
-                )
-            };
+            .find(|ast| ast.path == scope_span.path)?;
+        let scope = ast.span2scope.get(&scope_span)?;
+        let document = Document::new(&ast.text, 0);
+        let expression = format!(
+            "dimension({}, {}, {}, {}, {}, {}, {})",
+            params.p,
+            params.n,
+            params.value,
+            params.coord,
+            params.pstop,
+            params.nstop,
+            params.horiz
+        );
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &format!("{expression};"),
+            0..expression.len(),
+        );
+        let span = Span {
+            path: scope_span.path.clone(),
+            span: insertion.tracked_span,
+        };
+        drop(state_mut);
 
-            self.editor_client
-                .show_document(ShowDocumentParams {
-                    uri: url.clone(),
-                    external: None,
-                    take_focus: None,
-                    selection: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .apply_edit(WorkspaceEdit {
-                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
-                    document_changes: None,
-                    change_annotations: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .send_request::<ForceSave>(scope_span.path.clone())
-                .await
-                .unwrap();
-            Some(span)
-        } else {
-            None
-        }
+        self.apply_source_edit(url, scope_span.path, insertion.edit)
+            .await
+            .then_some(span)
     }
 
     async fn edit_dimension(
@@ -357,71 +336,37 @@ impl LangServer for State {
         value: String,
     ) -> Option<Span> {
         let state_mut = self.state_mut.lock().await;
-
-        if state_mut.ast.values().any(|ast| {
-            state_mut
-                .editor_files
-                .get(&Uri::from_file_path(&ast.path).unwrap())
-                .map(|file| file.contents() != ast.text)
-                .unwrap_or_default()
-        }) {
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
             self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Editor buffer state is inconsistent with GUI state.",
-                )
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         }
+        let url = Uri::from_file_path(&span.path)?;
+        let ast = state_mut.ast.values().find(|ast| ast.path == span.path)?;
+        let call = ast.span2call.get(&span)?;
+        let old_value = call.args.posargs.get(2)?;
+        let document = Document::new(&ast.text, 0);
+        let edit = TextEdit {
+            range: Range::new(
+                document.offset_to_pos(old_value.span().start()),
+                document.offset_to_pos(old_value.span().end()),
+            ),
+            new_text: value.clone(),
+        };
+        let updated_span = Span {
+            path: span.path.clone(),
+            span: cfgrammar::Span::new(
+                old_value.span().start(),
+                old_value.span().start() + value.len(),
+            ),
+        };
+        drop(state_mut);
 
-        let url = Uri::from_file_path(&span.path).unwrap();
-
-        if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
-            && let Some(c) = ast.span2call.get(&span)
-        {
-            let doc = Document::new(&ast.text, 0);
-            let start = doc.offset_to_pos(c.args.posargs[2].span().start());
-            let stop = doc.offset_to_pos(c.args.posargs[2].span().end());
-            let value_len = value.len();
-            let edit = TextEdit {
-                range: Range::new(start, stop),
-                new_text: value,
-            };
-
-            self.editor_client
-                .show_document(ShowDocumentParams {
-                    uri: url.clone(),
-                    external: None,
-                    take_focus: None,
-                    selection: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .apply_edit(WorkspaceEdit {
-                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
-                    document_changes: None,
-                    change_annotations: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .send_request::<ForceSave>(span.path.clone())
-                .await
-                .unwrap();
-
-            Some(Span {
-                path: span.path.clone(),
-                span: cfgrammar::Span::new(
-                    c.args.posargs[2].span().start(),
-                    c.args.posargs[2].span().start() + value_len,
-                ),
-            })
-        } else {
-            None
-        }
+        self.apply_source_edit(url, span.path, edit)
+            .await
+            .then_some(updated_span)
     }
 
     /// Rewrites the value text at each given span in a single workspace edit,
@@ -432,19 +377,10 @@ impl LangServer for State {
             return;
         }
         let state_mut = self.state_mut.lock().await;
-
-        if state_mut.ast.values().any(|ast| {
-            state_mut
-                .editor_files
-                .get(&Uri::from_file_path(&ast.path).unwrap())
-                .map(|file| file.contents() != ast.text)
-                .unwrap_or_default()
-        }) {
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
             self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Editor buffer state is inconsistent with GUI state.",
-                )
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return;
         }
@@ -452,50 +388,40 @@ impl LangServer for State {
         // Build one WorkspaceEdit grouping all rewrites per file. Edits within a
         // file are sorted by descending start offset so they can be applied
         // back-to-front without invalidating each other's offsets.
-        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
-        let mut offsets: HashMap<Uri, Vec<usize>> = HashMap::new();
-        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        let mut pending: HashMap<Uri, Vec<(usize, TextEdit)>> = HashMap::new();
+        let mut paths = Vec::new();
         for ValueEdit { span, value } in edits {
-            let url = Uri::from_file_path(&span.path).unwrap();
-            if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
+            if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
+                && let Some(uri) = Uri::from_file_path(&span.path)
+            {
                 let doc = Document::new(&ast.text, 0);
                 let start = doc.offset_to_pos(span.span.start());
                 let stop = doc.offset_to_pos(span.span.end());
-                changes.entry(url.clone()).or_default().push(TextEdit {
-                    range: Range::new(start, stop),
-                    new_text: value,
-                });
-                offsets.entry(url).or_default().push(span.span.start());
+                pending.entry(uri).or_default().push((
+                    span.span.start(),
+                    TextEdit {
+                        range: Range::new(start, stop),
+                        new_text: value,
+                    },
+                ));
                 if !paths.contains(&span.path) {
                     paths.push(span.path.clone());
                 }
             }
         }
-        if changes.is_empty() {
+        if pending.is_empty() {
             return;
         }
-        for (url, edits) in changes.iter_mut() {
-            let starts = &offsets[url];
-            let mut idx: Vec<usize> = (0..edits.len()).collect();
-            idx.sort_by(|&a, &b| starts[b].cmp(&starts[a]));
-            *edits = idx.into_iter().map(|i| edits[i].clone()).collect();
-        }
-
-        self.editor_client
-            .apply_edit(WorkspaceEdit {
-                changes: Some(changes),
-                document_changes: None,
-                change_annotations: None,
+        let changes = pending
+            .into_iter()
+            .map(|(uri, mut edits)| {
+                edits.sort_by(|(left, _), (right, _)| right.cmp(left));
+                (uri, edits.into_iter().map(|(_, edit)| edit).collect())
             })
-            .await
-            .unwrap();
+            .collect();
+        drop(state_mut);
 
-        for path in paths {
-            self.editor_client
-                .send_request::<ForceSave>(path)
-                .await
-                .unwrap();
-        }
+        self.apply_source_changes(changes, paths, None).await;
     }
 
     async fn add_eq_constraint(
@@ -506,96 +432,38 @@ impl LangServer for State {
         rhs: String,
     ) {
         let state_mut = self.state_mut.lock().await;
-
-        if state_mut.ast.values().any(|ast| {
-            state_mut
-                .editor_files
-                .get(&Uri::from_file_path(&ast.path).unwrap())
-                .map(|file| file.contents() != ast.text)
-                .unwrap_or_default()
-        }) {
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
             self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Editor buffer state is inconsistent with GUI state.",
-                )
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return;
         }
-
-        let url = Uri::from_file_path(&scope_span.path).unwrap();
-
-        if let Some(ast) = state_mut
+        let Some(url) = Uri::from_file_path(&scope_span.path) else {
+            return;
+        };
+        let Some(ast) = state_mut
             .ast
             .values()
             .find(|ast| ast.path == scope_span.path)
-            && let Some(scope) = state_mut
-                .ast
-                .values()
-                .find(|ast| ast.path == scope_span.path)
-                .as_ref()
-                .and_then(|ast| ast.span2scope.get(&scope_span))
-        {
-            let doc = Document::new(&ast.text, 0);
-            let edit = if let Some(tail) = &scope.tail {
-                let start = doc.offset_to_pos(tail.span().start());
-                TextEdit {
-                    range: Range::new(start, start),
-                    new_text: format!(
-                        "eq({}, {});\n{}",
-                        lhs,
-                        rhs,
-                        // TODO: handle different types of indentation, or enforce that gui
-                        // reformats file before editing.
-                        std::iter::repeat_n(' ', start.character as usize).collect::<String>()
-                    ),
-                }
-            } else {
-                let start = doc.offset_to_pos(scope.span.start());
-                let stop = doc.offset_to_pos(scope.span.end());
-                let line = doc.substr(Position::new(stop.line, 0)..stop);
-                let trimmed = line.trim_start();
-                let whitespace = &line[..line.len() - trimmed.len()];
-                let insert_loc = doc.offset_to_pos(scope.span.end() - 1);
-                TextEdit {
-                    range: Range::new(insert_loc, insert_loc),
-                    new_text: format!(
-                        "{}eq({}, {});\n{whitespace}",
-                        if start.line != stop.line {
-                            "    "
-                        } else {
-                            "\n"
-                        },
-                        lhs,
-                        rhs
-                    ),
-                }
-            };
+        else {
+            return;
+        };
+        let Some(scope) = ast.span2scope.get(&scope_span) else {
+            return;
+        };
+        let document = Document::new(&ast.text, 0);
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &format!("eq({lhs}, {rhs});"),
+            0..0,
+        );
+        drop(state_mut);
 
-            self.editor_client
-                .show_document(ShowDocumentParams {
-                    uri: url.clone(),
-                    external: None,
-                    take_focus: None,
-                    selection: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .apply_edit(WorkspaceEdit {
-                    changes: Some(HashMap::from_iter([(url, vec![edit])])),
-                    document_changes: None,
-                    change_annotations: None,
-                })
-                .await
-                .unwrap();
-
-            self.editor_client
-                .send_request::<ForceSave>(scope_span.path.clone())
-                .await
-                .unwrap();
-        }
+        self.apply_source_edit(url, scope_span.path, insertion.edit)
+            .await;
     }
 
     async fn open_cell(self, _: tarpc::context::Context, cell: String) {
@@ -614,13 +482,70 @@ impl LangServer for State {
     }
 
     async fn dispatch_action(self, _: tarpc::context::Context, action: LangServerAction) {
-        match action {
-            LangServerAction::Undo => {
-                self.editor_client.send_request::<Undo>(()).await.unwrap();
-            }
-            LangServerAction::Redo => {
-                self.editor_client.send_request::<Redo>(()).await.unwrap();
-            }
+        let result = match action {
+            LangServerAction::Undo => self.editor_client.send_request::<Undo>(()).await,
+            LangServerAction::Redo => self.editor_client.send_request::<Redo>(()).await,
+        };
+        if let Err(error) = result {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not dispatch editor action: {error}"),
+                )
+                .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tower_lsp_server::ls_types::Position;
+
+    use super::{Document, insert_statement};
+
+    #[test]
+    fn inserts_a_statement_before_an_existing_tail() {
+        let source = "cell top() { x }\n";
+        let scope_start = source.find('{').expect("scope should start");
+        let scope_end = source.find('}').expect("scope should end") + 1;
+        let tail_start = source.find('x').expect("tail should exist");
+        let statement = "let r = rect()!;";
+        let expression_start = "let r = ".len();
+        let insertion = insert_statement(
+            &Document::new(source, 0),
+            cfgrammar::Span::new(scope_start, scope_end),
+            Some(tail_start),
+            statement,
+            expression_start..expression_start + "rect()".len(),
+        );
+
+        assert_eq!(
+            insertion.edit.new_text,
+            format!("{statement}\n{}", " ".repeat(tail_start))
+        );
+        assert_eq!(
+            insertion.tracked_span,
+            cfgrammar::Span::new(
+                tail_start + expression_start,
+                tail_start + expression_start + "rect()".len(),
+            )
+        );
+    }
+
+    #[test]
+    fn indents_a_statement_in_an_empty_multiline_scope() {
+        let source = "cell top() {\n}\n";
+        let scope_start = source.find('{').expect("scope should start");
+        let closing_brace = source.find('}').expect("scope should end");
+        let insertion = insert_statement(
+            &Document::new(source, 0),
+            cfgrammar::Span::new(scope_start, closing_brace + 1),
+            None,
+            "eq(x, y);",
+            0..0,
+        );
+
+        assert_eq!(insertion.edit.range.start, Position::new(1, 0));
+        assert_eq!(insertion.edit.new_text, "    eq(x, y);\n");
     }
 }
