@@ -12,7 +12,7 @@ struct Args {
 
     /// Unix socket through which to report the bound GUI RPC port.
     #[arg(long)]
-    rendezvous_socket: Option<PathBuf>,
+    relay_socket: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -21,30 +21,30 @@ struct Args {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Coordinate startup with a local Argone SSH session.
-    Rendezvous,
+    Relay,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    if matches!(args.command, Some(Command::Rendezvous)) {
-        if let Err(error) = run_rendezvous().await {
-            eprintln!("argon-analyzer rendezvous: {error}");
+    if matches!(args.command, Some(Command::Relay)) {
+        if let Err(error) = run_relay().await {
+            eprintln!("argon-analyzer relay: {error}");
             std::process::exit(1);
         }
     } else {
-        analyzer::main(args.rpc_port, args.rendezvous_socket).await;
+        analyzer::main(args.rpc_port, args.relay_socket).await;
     }
 }
 
 #[cfg(unix)]
-async fn run_rendezvous() -> io::Result<()> {
+async fn run_relay() -> io::Result<()> {
     let directory = tempfile::tempdir()?;
     let socket_path = directory.path().join("analyzer.sock");
     let listener = tokio::net::UnixListener::bind(&socket_path)?;
     let mut stdout = tokio::io::stdout();
     stdout
-        .write_all(format!("ARGON_RENDEZVOUS 1 {}\n", socket_path.display()).as_bytes())
+        .write_all(format!("ARGON_RELAY 1 {}\n", socket_path.display()).as_bytes())
         .await?;
     stdout.flush().await?;
 
@@ -64,9 +64,9 @@ async fn run_rendezvous() -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-async fn run_rendezvous() -> io::Result<()> {
+async fn run_relay() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "rendezvous requires a Unix-like remote host",
+        "relay requires a Unix-like remote host",
     ))
 }

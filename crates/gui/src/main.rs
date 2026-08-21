@@ -189,7 +189,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
     let control = SshControl::new(&args)?;
     validate_port_overrides(&args)?;
     check_remote_analyzer(&args, &control)?;
-    let mut rendezvous = start_remote_rendezvous(&args, &control)?;
+    let mut relay = start_remote_relay(&args, &control)?;
 
     let mut nvim_command = control.command(&args);
     nvim_command
@@ -199,7 +199,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
             nvim,
             &args.path,
             args.remote_analyzer_port,
-            &rendezvous.socket_path,
+            &relay.socket_path,
         ))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -209,7 +209,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
         .spawn()
         .with_context(|| format!("failed to start `{}`", args.ssh.to_string_lossy()))?;
 
-    let result = start_forwarded_session(&args, &control, &mut nvim_ssh, &mut rendezvous);
+    let result = start_forwarded_session(&args, &control, &mut nvim_ssh, &mut relay);
     let (mut tunnel, mut gui) = match result {
         Ok(processes) => processes,
         Err(error) => {
@@ -231,9 +231,9 @@ fn start_forwarded_session(
     args: &SshArgs,
     control: &SshControl,
     nvim_ssh: &mut Child,
-    rendezvous: &mut Rendezvous,
+    relay: &mut Relay,
 ) -> Result<(Child, Child)> {
-    let remote_analyzer_port = wait_for_remote_analyzer(nvim_ssh, rendezvous)?;
+    let remote_analyzer_port = wait_for_remote_analyzer(nvim_ssh, relay)?;
     let mut gui = launch_forwarded_gui(args.local_gui_port)?;
     let local_gui_port = gui.port;
 
@@ -302,31 +302,31 @@ fn check_remote_analyzer(args: &SshArgs, control: &SshControl) -> Result<()> {
     )
 }
 
-struct Rendezvous {
+struct Relay {
     child: Child,
     lines: mpsc::Receiver<io::Result<String>>,
     socket_path: String,
 }
 
-impl Drop for Rendezvous {
+impl Drop for Relay {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
-fn start_remote_rendezvous(args: &SshArgs, control: &SshControl) -> Result<Rendezvous> {
+fn start_remote_relay(args: &SshArgs, control: &SshControl) -> Result<Relay> {
     let mut child = control
         .command(args)
         .arg("-T")
         .arg(&args.host)
-        .arg("argon-analyzer rendezvous")
+        .arg("argon-analyzer relay")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to start the remote analyzer rendezvous")?;
-    let stdout = child.stdout.take().expect("rendezvous stdout was piped");
+        .context("failed to start the remote analyzer relay")?;
+    let stdout = child.stdout.take().expect("relay stdout was piped");
     let (line_tx, lines) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -336,35 +336,35 @@ fn start_remote_rendezvous(args: &SshArgs, control: &SshControl) -> Result<Rende
         }
     });
 
-    let mut rendezvous = Rendezvous {
+    let mut relay = Relay {
         child,
         lines,
         socket_path: String::new(),
     };
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        match rendezvous.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
+        match relay.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
             Ok(Ok(line)) => {
-                if let Some(socket_path) = parse_rendezvous_announcement(&line) {
-                    rendezvous.socket_path = socket_path.to_owned();
-                    return Ok(rendezvous);
+                if let Some(socket_path) = parse_relay_announcement(&line) {
+                    relay.socket_path = socket_path.to_owned();
+                    return Ok(relay);
                 }
             }
             Ok(Err(error)) => return Err(error.into()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        if let Some(status) = rendezvous.child.try_wait()? {
-            bail!("remote analyzer rendezvous failed to start ({status})");
+        if let Some(status) = relay.child.try_wait()? {
+            bail!("remote analyzer relay failed to start ({status})");
         }
         if Instant::now() >= deadline {
-            bail!("timed out starting the remote analyzer rendezvous");
+            bail!("timed out starting the remote analyzer relay");
         }
     }
 }
 
-fn parse_rendezvous_announcement(line: &str) -> Option<&str> {
-    line.strip_prefix("ARGON_RENDEZVOUS 1 ")
+fn parse_relay_announcement(line: &str) -> Option<&str> {
+    line.strip_prefix("ARGON_RELAY 1 ")
         .map(str::trim)
         .filter(|path| !path.is_empty())
 }
@@ -464,13 +464,13 @@ fn remote_nvim_command(
     nvim: &OsStr,
     path: &Path,
     analyzer_port: Option<u16>,
-    rendezvous_socket: &str,
+    relay_socket: &str,
 ) -> String {
     let path = shell_quote(&path.to_string_lossy());
     let nvim = shell_quote(&nvim.to_string_lossy());
-    let rendezvous_vim = shell_quote(&format!(
-        "let g:argon_analyzer_rendezvous = '{}'",
-        rendezvous_socket.replace('\'', "''")
+    let relay_vim = shell_quote(&format!(
+        "let g:argon_analyzer_relay = '{}'",
+        relay_socket.replace('\'', "''")
     ));
     let rpc_port = analyzer_port
         .map(|port| format!(" --cmd 'let g:argon_analyzer_rpc_port = {port}'"))
@@ -490,11 +490,11 @@ fn remote_nvim_command(
          else \
            printf '%s\\n' 'argone: remote path is not a file or directory' >&2; exit 1; \
          fi; \
-         exec {nvim}{rpc_port} --cmd {rendezvous_vim} \"$1\""
+         exec {nvim}{rpc_port} --cmd {relay_vim} \"$1\""
     )
 }
 
-fn wait_for_remote_analyzer(nvim_ssh: &mut Child, rendezvous: &mut Rendezvous) -> Result<u16> {
+fn wait_for_remote_analyzer(nvim_ssh: &mut Child, relay: &mut Relay) -> Result<u16> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if let Some(status) = nvim_ssh
@@ -503,10 +503,10 @@ fn wait_for_remote_analyzer(nvim_ssh: &mut Child, rendezvous: &mut Rendezvous) -
         {
             bail!("remote Neovim exited before the analyzer started ({status})");
         }
-        match rendezvous.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
+        match relay.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
             Ok(Ok(line)) => {
                 if let Some(port) = parse_analyzer_announcement(&line) {
-                    let _ = rendezvous.child.wait();
+                    let _ = relay.child.wait();
                     return Ok(port);
                 }
             }
@@ -514,12 +514,12 @@ fn wait_for_remote_analyzer(nvim_ssh: &mut Child, rendezvous: &mut Rendezvous) -
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        if let Some(status) = rendezvous
+        if let Some(status) = relay
             .child
             .try_wait()
-            .context("failed while waiting for the analyzer rendezvous")?
+            .context("failed while waiting for the analyzer relay")?
         {
-            bail!("analyzer rendezvous exited before reporting the RPC port ({status})");
+            bail!("analyzer relay exited before reporting the RPC port ({status})");
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for `argon-analyzer` to start");
@@ -881,7 +881,7 @@ mod tests {
     fn parses_startup_protocol_messages() {
         assert_eq!(parse_gui_announcement("ARGON_GUI 1 1234\n").unwrap(), 1234);
         assert_eq!(
-            parse_rendezvous_announcement("ARGON_RENDEZVOUS 1 /tmp/session/rpc.sock\n"),
+            parse_relay_announcement("ARGON_RELAY 1 /tmp/session/rpc.sock\n"),
             Some("/tmp/session/rpc.sock")
         );
         assert_eq!(
@@ -946,7 +946,7 @@ mod tests {
         );
         assert!(command.contains("set -- '/work/a project'\"'\"'s files';"));
         assert!(command.contains("let g:argon_analyzer_rpc_port = 12001"));
-        assert!(command.contains("let g:argon_analyzer_rendezvous"));
+        assert!(command.contains("let g:argon_analyzer_relay"));
         assert!(command.contains("'custom nvim'"));
     }
 

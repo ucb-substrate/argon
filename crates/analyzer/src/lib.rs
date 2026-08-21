@@ -593,11 +593,11 @@ fn announce_rpc_port(path: &Path, port: u16) -> io::Result<()> {
 fn announce_rpc_port(_: &Path, _: u16) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "rendezvous requires a Unix-like remote host",
+        "relay requires a Unix-like remote host",
     ))
 }
 
-pub async fn main(rpc_port: Option<u16>, rendezvous_socket: Option<PathBuf>) {
+pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
     // Start server for communication with GUI.
     let port = rpc_port.unwrap_or(0);
     let mut listener =
@@ -610,7 +610,7 @@ pub async fn main(rpc_port: Option<u16>, rendezvous_socket: Option<PathBuf>) {
             }
         };
     let server_addr = listener.local_addr();
-    if let Some(path) = rendezvous_socket
+    if let Some(path) = relay_socket
         && let Err(error) = announce_rpc_port(&path, server_addr.port())
     {
         eprintln!(
