@@ -89,10 +89,10 @@ M.start = function(bufnr)
             tostring(vim.g.argon_analyzer_rpc_port),
         })
     end
-    if vim.g.argon_analyzer_rpc_info then
+    if vim.g.argon_analyzer_rendezvous then
         vim.list_extend(analyzer_cmd, {
-            '--rpc-info',
-            tostring(vim.g.argon_analyzer_rpc_info),
+            '--rendezvous-socket',
+            tostring(vim.g.argon_analyzer_rendezvous),
         })
     end
     local lsp_start_config = { 

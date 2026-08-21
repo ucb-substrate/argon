@@ -2,7 +2,7 @@ pub mod document;
 pub mod rpc;
 
 use std::{
-    io::{self, Write},
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -27,7 +27,6 @@ use tarpc::{
     server::{Channel, incoming::Incoming},
     tokio_serde::formats::Json,
 };
-use tempfile::{NamedTempFile, TempPath};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
@@ -580,18 +579,25 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
-fn publish_rpc_port(path: PathBuf, port: u16) -> io::Result<TempPath> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "RPC info path has no parent")
-    })?;
-    let mut file = NamedTempFile::new_in(parent)?;
-    writeln!(file, "{port}")?;
-    file.as_file().sync_all()?;
-    file.persist(&path).map_err(|error| error.error)?;
-    TempPath::try_from_path(path)
+#[cfg(unix)]
+fn announce_rpc_port(path: &Path, port: u16) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(path)?;
+    writeln!(stream, "{port}")?;
+    stream.flush()
 }
 
-pub async fn main(rpc_port: Option<u16>, rpc_info: Option<PathBuf>) {
+#[cfg(not(unix))]
+fn announce_rpc_port(_: &Path, _: u16) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "rendezvous requires a Unix-like remote host",
+    ))
+}
+
+pub async fn main(rpc_port: Option<u16>, rendezvous_socket: Option<PathBuf>) {
     // Start server for communication with GUI.
     let port = rpc_port.unwrap_or(0);
     let mut listener =
@@ -604,20 +610,15 @@ pub async fn main(rpc_port: Option<u16>, rpc_info: Option<PathBuf>) {
             }
         };
     let server_addr = listener.local_addr();
-    let _rpc_info = if let Some(path) = rpc_info {
-        match publish_rpc_port(path.clone(), server_addr.port()) {
-            Ok(info) => Some(info),
-            Err(error) => {
-                eprintln!(
-                    "failed to publish analyzer RPC port to `{}`: {error}",
-                    path.display()
-                );
-                return;
-            }
-        }
-    } else {
-        None
-    };
+    if let Some(path) = rendezvous_socket
+        && let Err(error) = announce_rpc_port(&path, server_addr.port())
+    {
+        eprintln!(
+            "failed to announce analyzer RPC port through `{}`: {error}",
+            path.display()
+        );
+        return;
+    }
 
     // Construct actual LSP server.
     let stdin = tokio::io::stdin();
@@ -683,11 +684,12 @@ pub async fn main(rpc_port: Option<u16>, rpc_info: Option<PathBuf>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, time::SystemTime};
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
 
     use argonc::{compile::CellArg, parse};
 
-    use super::{parse_setting, publish_rpc_port};
+    use super::parse_setting;
 
     #[test]
     fn open_cell_accepts_boolean_literals() {
@@ -704,16 +706,21 @@ mod tests {
         assert_eq!(parse_setting("grid   "), None);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn rpc_info_is_published_and_removed_with_its_guard() {
-        let nonce = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("argon-analyzer-rpc-{nonce}"));
-        let guard = publish_rpc_port(path.clone(), 43210).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "43210\n");
-        drop(guard);
-        assert!(!path.exists());
+    fn rpc_port_is_announced_through_a_unix_socket() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rpc.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut port = String::new();
+            stream.read_to_string(&mut port).unwrap();
+            port
+        });
+        super::announce_rpc_port(&path, 43210).unwrap();
+        assert_eq!(receiver.join().unwrap(), "43210\n");
     }
 }

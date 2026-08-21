@@ -2,18 +2,17 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode, ExitStatus, Stdio},
+    process::{Child, ChildStdin, Command, ExitCode, ExitStatus, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use tempfile::NamedTempFile;
 
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,9 +92,9 @@ struct GuiArgs {
     #[arg(long)]
     register_addr: Option<SocketAddr>,
 
-    /// Private session directory used to coordinate an SSH launch.
+    /// Coordinate an SSH launch through stdin and stdout.
     #[arg(long)]
-    ssh_session_dir: Option<PathBuf>,
+    ssh_control: bool,
 }
 
 fn main() -> ExitCode {
@@ -118,25 +117,30 @@ fn run(cli: Cli) -> Result<ExitStatus> {
 }
 
 fn run_gui(args: GuiArgs) -> Result<ExitStatus> {
-    if let Some(session_dir) = args.ssh_session_dir {
+    if args.ssh_control {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, args.listen_port.unwrap_or(0)))
             .context("failed to bind the GUI callback listener")?;
         let listen_addr = listener.local_addr()?;
-        publish_file(
-            &session_dir.join("gui-port"),
-            listen_addr.port().to_string(),
-        )?;
-        let forwarding = wait_for_file(&session_dir.join("forwarding"), STARTUP_TIMEOUT)
-            .context("timed out waiting for the SSH forwards")?;
+        println!("ARGON_GUI 1 {}", listen_addr.port());
+        io_flush_stdout()?;
+        let mut forwarding = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut forwarding)
+            .context("failed to read SSH forwarding configuration")?;
         let (lang_server_addr, register_addr) = parse_address_pair(&forwarding)?;
         argone::run_with_listener(lang_server_addr, listener, register_addr);
     } else {
         let lang_server_addr = args.lang_server_addr.ok_or_else(|| {
-            anyhow!("an analyzer address is required unless --ssh-session-dir is used")
+            anyhow!("an analyzer address is required unless --ssh-control is used")
         })?;
         argone::run(lang_server_addr, args.listen_port, args.register_addr);
     }
     Ok(success_status())
+}
+
+fn io_flush_stdout() -> Result<()> {
+    std::io::stdout().flush().context("failed to flush stdout")
 }
 
 fn run_nvim(nvim: &OsStr, path: &Path) -> Result<ExitStatus> {
@@ -185,16 +189,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
     let control = SshControl::new(&args)?;
     validate_port_overrides(&args)?;
     check_remote_analyzer(&args, &control)?;
-
-    let remote_session = format!(
-        "/tmp/argone-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    let remote_rpc_info = format!("{remote_session}/analyzer-port");
+    let mut rendezvous = start_remote_rendezvous(&args, &control)?;
 
     let mut nvim_command = control.command(&args);
     nvim_command
@@ -204,8 +199,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
             nvim,
             &args.path,
             args.remote_analyzer_port,
-            &remote_session,
-            &remote_rpc_info,
+            &rendezvous.socket_path,
         ))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -215,7 +209,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
         .spawn()
         .with_context(|| format!("failed to start `{}`", args.ssh.to_string_lossy()))?;
 
-    let result = start_forwarded_session(&args, &control, &mut nvim_ssh, &remote_rpc_info);
+    let result = start_forwarded_session(&args, &control, &mut nvim_ssh, &mut rendezvous);
     let (mut tunnel, mut gui) = match result {
         Ok(processes) => processes,
         Err(error) => {
@@ -237,42 +231,31 @@ fn start_forwarded_session(
     args: &SshArgs,
     control: &SshControl,
     nvim_ssh: &mut Child,
-    remote_rpc_info: &str,
+    rendezvous: &mut Rendezvous,
 ) -> Result<(Child, Child)> {
-    let remote_analyzer_port = wait_for_remote_analyzer(args, control, nvim_ssh, remote_rpc_info)?;
-
-    let local_session = &control.directory;
-    let gui_port_file = local_session.join("gui-port");
-    let forwarding_file = local_session.join("forwarding");
-    let mut gui = launch_forwarded_gui(local_session, args.local_gui_port)?;
-    let local_gui_port = match wait_for_child_file(&mut gui, &gui_port_file, "GUI") {
-        Ok(value) => parse_port(&value).context("the GUI reported an invalid callback port")?,
-        Err(error) => {
-            let _ = gui.kill();
-            let _ = gui.wait();
-            return Err(error);
-        }
-    };
+    let remote_analyzer_port = wait_for_remote_analyzer(nvim_ssh, rendezvous)?;
+    let mut gui = launch_forwarded_gui(args.local_gui_port)?;
+    let local_gui_port = gui.port;
 
     let tunnel = match start_tunnel(args, control, remote_analyzer_port, local_gui_port) {
         Ok(tunnel) => tunnel,
         Err(error) => {
-            let _ = gui.kill();
-            let _ = gui.wait();
+            gui.stop();
             return Err(error);
         }
     };
     let analyzer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, tunnel.local_analyzer_port);
     let gui_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, tunnel.remote_gui_port);
-    if let Err(error) = publish_file(&forwarding_file, format!("{analyzer_addr} {gui_addr}")) {
+    if let Err(error) =
+        writeln!(gui.input, "{analyzer_addr} {gui_addr}").and_then(|_| gui.input.flush())
+    {
         let mut child = tunnel.child;
         let _ = child.kill();
         let _ = child.wait();
-        let _ = gui.kill();
-        let _ = gui.wait();
-        return Err(error);
+        gui.stop();
+        return Err(error).context("failed to send forwarding configuration to the GUI");
     }
-    Ok((tunnel.child, gui))
+    Ok((tunnel.child, gui.child))
 }
 
 fn validate_port_overrides(args: &SshArgs) -> Result<()> {
@@ -319,6 +302,79 @@ fn check_remote_analyzer(args: &SshArgs, control: &SshControl) -> Result<()> {
     )
 }
 
+struct Rendezvous {
+    child: Child,
+    lines: mpsc::Receiver<io::Result<String>>,
+    socket_path: String,
+}
+
+impl Drop for Rendezvous {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_remote_rendezvous(args: &SshArgs, control: &SshControl) -> Result<Rendezvous> {
+    let mut child = control
+        .command(args)
+        .arg("-T")
+        .arg(&args.host)
+        .arg("argon-analyzer rendezvous")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("failed to start the remote analyzer rendezvous")?;
+    let stdout = child.stdout.take().expect("rendezvous stdout was piped");
+    let (line_tx, lines) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut rendezvous = Rendezvous {
+        child,
+        lines,
+        socket_path: String::new(),
+    };
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match rendezvous.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
+            Ok(Ok(line)) => {
+                if let Some(socket_path) = parse_rendezvous_announcement(&line) {
+                    rendezvous.socket_path = socket_path.to_owned();
+                    return Ok(rendezvous);
+                }
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        if let Some(status) = rendezvous.child.try_wait()? {
+            bail!("remote analyzer rendezvous failed to start ({status})");
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out starting the remote analyzer rendezvous");
+        }
+    }
+}
+
+fn parse_rendezvous_announcement(line: &str) -> Option<&str> {
+    line.strip_prefix("ARGON_RENDEZVOUS 1 ")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn parse_analyzer_announcement(line: &str) -> Option<u16> {
+    line.strip_prefix("ARGON_ANALYZER 1 ")
+        .and_then(|port| port.trim().parse().ok())
+        .filter(|port| *port != 0)
+}
+
 fn ssh_command(args: &SshArgs) -> Command {
     let mut command = Command::new(&args.ssh);
     for option in &args.ssh_options {
@@ -328,7 +384,7 @@ fn ssh_command(args: &SshArgs) -> Command {
 }
 
 struct SshControl {
-    directory: PathBuf,
+    _directory: tempfile::TempDir,
     path: PathBuf,
     ssh: OsString,
     host: String,
@@ -337,32 +393,19 @@ struct SshControl {
 
 impl SshControl {
     fn new(args: &SshArgs) -> Result<Self> {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let directory = short_temp_root().join(format!("argone-{}-{nonce}", std::process::id()));
-        fs::create_dir(&directory).with_context(|| {
-            format!(
-                "could not create SSH session directory `{}`",
-                directory.display()
-            )
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        }
-        let path = directory.join("ssh");
+        let directory = tempfile::Builder::new()
+            .prefix("argone-")
+            .tempdir_in(short_temp_root())
+            .context("could not create a temporary SSH session directory")?;
+        let path = directory.path().join("ssh");
         if path.as_os_str().len() > 90 {
-            let _ = fs::remove_dir(&directory);
             bail!(
                 "temporary SSH control path is too long: `{}`",
                 path.display()
             );
         }
         Ok(Self {
-            directory,
+            _directory: directory,
             path,
             ssh: args.ssh.clone(),
             host: args.host.clone(),
@@ -403,10 +446,7 @@ impl Drop for SshControl {
                 .stderr(Stdio::null())
                 .status();
         }
-        let _ = fs::remove_file(self.directory.join("gui-port"));
-        let _ = fs::remove_file(self.directory.join("forwarding"));
         let _ = fs::remove_file(&self.path);
-        let _ = fs::remove_dir(&self.directory);
     }
 }
 
@@ -424,26 +464,19 @@ fn remote_nvim_command(
     nvim: &OsStr,
     path: &Path,
     analyzer_port: Option<u16>,
-    session_dir: &str,
-    rpc_info: &str,
+    rendezvous_socket: &str,
 ) -> String {
     let path = shell_quote(&path.to_string_lossy());
     let nvim = shell_quote(&nvim.to_string_lossy());
-    let session_dir = shell_quote(session_dir);
-    let rpc_info_shell = shell_quote(rpc_info);
-    let rpc_info_vim = shell_quote(&format!(
-        "let g:argon_analyzer_rpc_info = '{}'",
-        rpc_info.replace('\'', "''")
-    ));
-    let cleanup = shell_quote(&format!(
-        "rm -f -- {rpc_info_shell}; rmdir -- {session_dir} 2>/dev/null"
+    let rendezvous_vim = shell_quote(&format!(
+        "let g:argon_analyzer_rendezvous = '{}'",
+        rendezvous_socket.replace('\'', "''")
     ));
     let rpc_port = analyzer_port
         .map(|port| format!(" --cmd 'let g:argon_analyzer_rpc_port = {port}'"))
         .unwrap_or_default();
     format!(
-        "umask 077; mkdir -- {session_dir} || exit 1; trap {cleanup} EXIT; \
-         set -- {path}; \
+        "set -- {path}; \
          if [ -d \"$1\" ]; then \
            cd -- \"$1\" || exit 1; \
            if [ ! -f lib.ar ]; then \
@@ -457,78 +490,115 @@ fn remote_nvim_command(
          else \
            printf '%s\\n' 'argone: remote path is not a file or directory' >&2; exit 1; \
          fi; \
-         {nvim}{rpc_port} --cmd {rpc_info_vim} \"$1\"; \
-         exit $?"
+         exec {nvim}{rpc_port} --cmd {rendezvous_vim} \"$1\""
     )
 }
 
-fn wait_for_remote_analyzer(
-    args: &SshArgs,
-    control: &SshControl,
-    nvim_ssh: &mut Child,
-    rpc_info: &str,
-) -> Result<u16> {
-    let rpc_info = shell_quote(rpc_info);
-    let command = format!(
-        "i=0; while [ ! -s {rpc_info} ]; do \
-         i=$((i + 1)); [ \"$i\" -ge 300 ] && exit 124; sleep 0.1; done; \
-         cat -- {rpc_info}"
-    );
-    let mut watcher = control
-        .command(args)
-        .arg("-T")
-        .arg(&args.host)
-        .arg(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to start the remote analyzer watcher")?;
+fn wait_for_remote_analyzer(nvim_ssh: &mut Child, rendezvous: &mut Rendezvous) -> Result<u16> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         if let Some(status) = nvim_ssh
             .try_wait()
             .context("failed while waiting for Neovim")?
         {
-            let _ = watcher.kill();
-            let _ = watcher.wait();
             bail!("remote Neovim exited before the analyzer started ({status})");
         }
-        if let Some(status) = watcher
-            .try_wait()
-            .context("failed while waiting for the analyzer")?
-        {
-            let output = watcher.wait_with_output()?;
-            if status.success() {
-                return parse_port(&String::from_utf8_lossy(&output.stdout))
-                    .context("the remote analyzer reported an invalid RPC port");
+        match rendezvous.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
+            Ok(Ok(line)) => {
+                if let Some(port) = parse_analyzer_announcement(&line) {
+                    let _ = rendezvous.child.wait();
+                    return Ok(port);
+                }
             }
-            if status.code() == Some(124) {
-                bail!(
-                    "timed out waiting for `argon-analyzer` to start on `{}`",
-                    args.host
-                );
-            }
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            bail!(
-                "could not read the analyzer RPC port from `{}`: {stderr}",
-                args.host
-            );
+            Ok(Err(error)) => return Err(error.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        thread::sleep(STARTUP_POLL_INTERVAL);
+        if let Some(status) = rendezvous
+            .child
+            .try_wait()
+            .context("failed while waiting for the analyzer rendezvous")?
+        {
+            bail!("analyzer rendezvous exited before reporting the RPC port ({status})");
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for `argon-analyzer` to start");
+        }
     }
 }
 
-fn launch_forwarded_gui(session_dir: &Path, gui_port: Option<u16>) -> Result<Child> {
+struct GuiLaunch {
+    child: Child,
+    input: ChildStdin,
+    port: u16,
+}
+
+impl GuiLaunch {
+    fn stop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn launch_forwarded_gui(gui_port: Option<u16>) -> Result<GuiLaunch> {
     let mut command = Command::new(env::current_exe()?);
-    command.arg("gui").arg("--ssh-session-dir").arg(session_dir);
+    command.arg("gui").arg("--ssh-control");
     if let Some(port) = gui_port {
         command.arg("--listen-port").arg(port.to_string());
     }
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("failed to start the local Argon GUI")
+        .context("failed to start the local Argon GUI")?;
+    let input = child.stdin.take().expect("GUI stdin was piped");
+    let stdout = child.stdout.take().expect("GUI stdout was piped");
+    let (line_tx, line_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut line = String::new();
+        let result = stdout.read_line(&mut line).map(|_| line);
+        if line_tx.send(result).is_ok() {
+            let _ = io::copy(&mut stdout, &mut io::sink());
+        }
+    });
+
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        match line_rx.recv_timeout(STARTUP_POLL_INTERVAL) {
+            Ok(Ok(line)) => {
+                let port = match parse_gui_announcement(&line) {
+                    Ok(port) => port,
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error).context("the GUI reported an invalid callback port");
+                    }
+                };
+                return Ok(GuiLaunch { child, input, port });
+            }
+            Ok(Err(error)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("GUI closed stdout before reporting its callback port");
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!("GUI exited before startup completed ({status})");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out waiting for the GUI to start");
+        }
+    }
 }
 
 struct Tunnel {
@@ -714,63 +784,19 @@ fn local_forward_collision(stderr: &str, port: u16) -> bool {
             || stderr.contains("Could not request local forwarding"))
 }
 
-fn publish_file(path: &Path, contents: String) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("`{}` has no parent directory", path.display()))?;
-    let mut file = NamedTempFile::new_in(parent).with_context(|| {
-        format!(
-            "could not create a temporary file in `{}`",
-            parent.display()
-        )
-    })?;
-    writeln!(file, "{contents}")?;
-    file.as_file().sync_all()?;
-    file.persist(path).map_err(|error| error.error)?;
-    Ok(())
-}
-
-fn wait_for_file(path: &Path, timeout: Duration) -> Result<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match fs::read_to_string(path) {
-            Ok(contents) if !contents.trim().is_empty() => return Ok(contents),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for `{}`", path.display());
-        }
-        thread::sleep(STARTUP_POLL_INTERVAL);
-    }
-}
-
-fn wait_for_child_file(child: &mut Child, path: &Path, name: &str) -> Result<String> {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match fs::read_to_string(path) {
-            Ok(contents) if !contents.trim().is_empty() => return Ok(contents),
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        if let Some(status) = child.try_wait()? {
-            bail!("{name} exited before startup completed ({status})");
-        }
-        if Instant::now() >= deadline {
-            bail!("timed out waiting for {name} to start");
-        }
-        thread::sleep(STARTUP_POLL_INTERVAL);
-    }
-}
-
 fn parse_port(value: &str) -> Result<u16> {
     let port = value.trim().parse::<u16>()?;
     if port == 0 {
         bail!("port must be nonzero");
     }
     Ok(port)
+}
+
+fn parse_gui_announcement(value: &str) -> Result<u16> {
+    let port = value
+        .strip_prefix("ARGON_GUI 1 ")
+        .ok_or_else(|| anyhow!("unexpected GUI startup response"))?;
+    parse_port(port)
 }
 
 fn parse_address_pair(value: &str) -> Result<(SocketAddr, SocketAddr)> {
@@ -807,6 +833,8 @@ fn success_status() -> ExitStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
 
     fn ssh_args(ssh: impl Into<OsString>) -> SshArgs {
@@ -847,6 +875,21 @@ mod tests {
         );
         assert!(parse_address_pair("127.0.0.1:1234").is_err());
         assert!(parse_address_pair("127.0.0.1:1 127.0.0.1:2 extra").is_err());
+    }
+
+    #[test]
+    fn parses_startup_protocol_messages() {
+        assert_eq!(parse_gui_announcement("ARGON_GUI 1 1234\n").unwrap(), 1234);
+        assert_eq!(
+            parse_rendezvous_announcement("ARGON_RENDEZVOUS 1 /tmp/session/rpc.sock\n"),
+            Some("/tmp/session/rpc.sock")
+        );
+        assert_eq!(
+            parse_analyzer_announcement("ARGON_ANALYZER 1 5678\n"),
+            Some(5678)
+        );
+        assert!(parse_gui_announcement("1234").is_err());
+        assert_eq!(parse_analyzer_announcement("ARGON_ANALYZER 2 5678"), None);
     }
 
     #[test]
@@ -899,12 +942,11 @@ mod tests {
             OsStr::new("custom nvim"),
             Path::new("/work/a project's files"),
             Some(12001),
-            "/tmp/argon-session",
-            "/tmp/argon-session/analyzer-port",
+            "/tmp/argon-session/analyzer.sock",
         );
         assert!(command.contains("set -- '/work/a project'\"'\"'s files';"));
         assert!(command.contains("let g:argon_analyzer_rpc_port = 12001"));
-        assert!(command.contains("let g:argon_analyzer_rpc_info"));
+        assert!(command.contains("let g:argon_analyzer_rendezvous"));
         assert!(command.contains("'custom nvim'"));
     }
 
@@ -919,14 +961,11 @@ mod tests {
         fs::create_dir(&project).unwrap();
         fs::write(project.join("lib.ar"), "cell top() {}\n").unwrap();
 
-        let session = env::temp_dir().join(format!("argone-remote-session-{nonce}"));
-        let info = session.join("analyzer-port");
         let command = remote_nvim_command(
             OsStr::new("/usr/bin/true"),
             &project,
             Some(12001),
-            &session.to_string_lossy(),
-            &info.to_string_lossy(),
+            "/tmp/argon-session/analyzer.sock",
         );
         let status = Command::new("/bin/sh")
             .arg("-c")
@@ -937,7 +976,6 @@ mod tests {
 
         fs::remove_file(project.join("lib.ar")).unwrap();
         fs::remove_dir(project).unwrap();
-        assert!(!session.exists());
     }
 
     #[test]
