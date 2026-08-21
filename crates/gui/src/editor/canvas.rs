@@ -2545,7 +2545,7 @@ impl LayoutCanvas {
             } else {
                 let selected_after_edits = {
                     let tool = self.state.read(cx).tool.read(cx);
-                    match &*tool {
+                    match tool {
                         ToolState::Select(SelectToolState {
                             selected_obj: Some(selected),
                         }) => Some(remap_span_after_value_edits(selected, &edits)),

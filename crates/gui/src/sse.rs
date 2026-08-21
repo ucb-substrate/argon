@@ -166,14 +166,15 @@ fn solve_linear_system(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<V
             *value /= scale;
         }
         rhs[pivot_row] /= scale;
+        let pivot_values = matrix[pivot_row][column..].to_vec();
 
         for row in 0..rows {
             if row == pivot_row {
                 continue;
             }
             let factor = matrix[row][column];
-            for entry in column..columns {
-                matrix[row][entry] -= factor * matrix[pivot_row][entry];
+            for (entry, pivot_entry) in matrix[row][column..].iter_mut().zip(&pivot_values) {
+                *entry -= factor * pivot_entry;
             }
             rhs[row] -= factor * rhs[pivot_row];
         }
