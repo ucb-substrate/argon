@@ -1,6 +1,6 @@
 use std::{
     fmt::Display,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
     time::Duration,
 };
 
@@ -24,9 +24,9 @@ use tarpc::{
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
-use crate::editor::Editor;
+use crate::{editor::Editor, editor_window_options};
 
-pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_millis(500);
+pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct SyncLangServerClient {
@@ -59,28 +59,42 @@ impl SyncLangServerClient {
         )
     }
 
-    pub fn register_server(&self) {
+    pub fn register_server(
+        &self,
+        configured_port: Option<u16>,
+        prebound_listener: Option<TcpListener>,
+        register_addr: Option<SocketAddr>,
+    ) {
         let background_executor = self.app.background_executor().clone();
         let mut listener = self.app.background_executor().block(
-            async {
-                let port = std::env::var("ARGON_GUI_DEFAULT_PORT")
-                    .ok()
-                    .and_then(|p| p.parse::<u16>().ok())
-                    .unwrap_or(12346);
-                if let Ok(listener) =
+            async move {
+                let result = if let Some(listener) = prebound_listener {
+                    match listener
+                        .set_nonblocking(true)
+                        .and_then(|_| tokio::net::TcpListener::from_std(listener))
+                    {
+                        Ok(listener) => {
+                            tarpc::serde_transport::tcp::listen_on(listener, Json::default).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    let port = configured_port.unwrap_or(0);
                     tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default)
                         .await
-                {
-                    listener
-                } else {
-                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
-                        .await
-                        .unwrap()
+                };
+                match result {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        error!("Failed to start GUI RPC server: {error}");
+                        std::process::exit(1);
+                    }
                 }
             }
             .compat(),
         );
         let server_addr = listener.local_addr();
+        let register_addr = register_addr.unwrap_or(server_addr);
         let to_exec = self.to_exec.clone();
         self.app
             .background_executor()
@@ -117,9 +131,13 @@ impl SyncLangServerClient {
             .background_executor()
             .block_with_timeout(
                 LANG_SERVER_CLIENT_TIMEOUT,
-                async move { client_clone.register(context::current(), server_addr).await }
-                    .compat()
-                    .map_err(|e| format!("{}", e)),
+                async move {
+                    client_clone
+                        .register(context::current(), register_addr)
+                        .await
+                }
+                .compat()
+                .map_err(|e| format!("{}", e)),
             )
             .map_err(|_| format!("timeout after {LANG_SERVER_CLIENT_TIMEOUT:?}"))
         {
@@ -363,8 +381,14 @@ impl Gui for GuiServer {
 
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
         self.to_exec
-            .send(Box::new(|_, cx| {
+            .send(Box::new(|editor, cx| {
+                let editor = editor.clone();
                 let _ = cx.update(|cx| {
+                    if cx.windows().is_empty() {
+                        let _ = cx.open_window(editor_window_options(), |window, cx| {
+                            window.replace_root(cx, |_, _| editor)
+                        });
+                    }
                     cx.activate(true);
                 });
             }))

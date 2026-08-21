@@ -1,7 +1,10 @@
-use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
+use std::{
+    borrow::Cow,
+    collections::BTreeSet,
+    net::{SocketAddr, TcpListener},
+};
 
 use analyzer::default_argon_home;
-use clap::Parser;
 use editor::Editor;
 use gpui::*;
 use rust_embed::RustEmbed;
@@ -17,12 +20,6 @@ pub mod editor;
 pub mod rpc;
 pub mod sse;
 pub mod theme;
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-struct Args {
-    lang_server_addr: SocketAddr,
-}
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -49,9 +46,33 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn main() {
-    let args = Args::parse();
+pub fn run(
+    lang_server_addr: SocketAddr,
+    gui_listen_port: Option<u16>,
+    gui_register_addr: Option<SocketAddr>,
+) {
+    run_inner(lang_server_addr, gui_listen_port, None, gui_register_addr);
+}
 
+pub fn run_with_listener(
+    lang_server_addr: SocketAddr,
+    gui_listener: TcpListener,
+    gui_register_addr: SocketAddr,
+) {
+    run_inner(
+        lang_server_addr,
+        None,
+        Some(gui_listener),
+        Some(gui_register_addr),
+    );
+}
+
+fn run_inner(
+    lang_server_addr: SocketAddr,
+    gui_listen_port: Option<u16>,
+    gui_listener: Option<TcpListener>,
+    gui_register_addr: Option<SocketAddr>,
+) {
     // TODO: Allow configuration via ARGON_HOME environment variable.
     if let Some(log_dir) = default_argon_home() {
         tracing_subscriber::fmt()
@@ -138,26 +159,34 @@ pub fn main() {
                 },
             ]);
 
-            cx.open_window(
-                WindowOptions {
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: true,
-                        traffic_light_position: None,
-                    }),
-                    focus: false,
-                    ..Default::default()
-                },
-                |window, cx| {
-                    window.replace_root(cx, |window, cx| {
-                        Editor::new(cx, window, args.lang_server_addr)
-                    })
-                },
-            )
+            cx.open_window(editor_window_options(), |window, cx| {
+                window.replace_root(cx, |window, cx| {
+                    Editor::new(
+                        cx,
+                        window,
+                        lang_server_addr,
+                        gui_listen_port,
+                        gui_listener,
+                        gui_register_addr,
+                    )
+                })
+            })
             .unwrap();
 
             cx.activate(true);
         });
+}
+
+fn editor_window_options() -> WindowOptions {
+    WindowOptions {
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: None,
+        }),
+        focus: false,
+        ..Default::default()
+    }
 }
 
 // Define the quit function that is registered with the App

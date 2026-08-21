@@ -2,6 +2,7 @@ pub mod document;
 pub mod rpc;
 
 use std::{
+    io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -476,6 +477,7 @@ impl Backend {
 
         tokio::spawn(async move {
             match Command::new("argone")
+                .arg("gui")
                 .arg(format!("{}", state.server_addr))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -577,33 +579,46 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
-pub async fn main() {
+#[cfg(unix)]
+fn announce_rpc_port(path: &Path, port: u16) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(path)?;
+    writeln!(stream, "{port}")?;
+    stream.flush()
+}
+
+#[cfg(not(unix))]
+fn announce_rpc_port(_: &Path, _: u16) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "relay requires a Unix-like remote host",
+    ))
+}
+
+pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
     // Start server for communication with GUI.
-    let port = std::env::var("ARGON_LANG_SERVER_DEFAULT_PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(12345);
-    let mut listener = match tarpc::serde_transport::tcp::listen(
-        (Ipv4Addr::LOCALHOST, port),
-        Json::default,
-    )
-    .await
-    {
-        Ok(listener) => listener,
-        Err(port_error) => {
-            match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default).await
-            {
-                Ok(listener) => listener,
-                Err(fallback_error) => {
-                    eprintln!(
-                        "failed to bind analyzer RPC server to port {port} ({port_error}) or an available port ({fallback_error})"
-                    );
-                    return;
-                }
+    let port = rpc_port.unwrap_or(0);
+    let mut listener =
+        match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default).await
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("failed to bind analyzer RPC server to port {port}: {error}");
+                return;
             }
-        }
-    };
+        };
     let server_addr = listener.local_addr();
+    if let Some(path) = relay_socket
+        && let Err(error) = announce_rpc_port(&path, server_addr.port())
+    {
+        eprintln!(
+            "failed to announce analyzer RPC port through `{}`: {error}",
+            path.display()
+        );
+        return;
+    }
 
     // Construct actual LSP server.
     let stdin = tokio::io::stdin();
@@ -669,6 +684,9 @@ pub async fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+
     use argonc::{compile::CellArg, parse};
 
     use super::parse_setting;
@@ -686,5 +704,23 @@ mod tests {
         assert_eq!(parse_setting("grid   10 20"), Some(("grid", "10 20")));
         assert_eq!(parse_setting("grid"), None);
         assert_eq!(parse_setting("grid   "), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_port_is_announced_through_a_unix_socket() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rpc.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut port = String::new();
+            stream.read_to_string(&mut port).unwrap();
+            port
+        });
+        super::announce_rpc_port(&path, 43210).unwrap();
+        assert_eq!(receiver.join().unwrap(), "43210\n");
     }
 }

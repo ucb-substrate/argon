@@ -317,7 +317,14 @@ impl EditorState {
 }
 
 impl Editor {
-    pub fn new(cx: &mut Context<Self>, window: &mut Window, lang_server_addr: SocketAddr) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        window: &mut Window,
+        lang_server_addr: SocketAddr,
+        gui_listen_port: Option<u16>,
+        gui_listener: Option<std::net::TcpListener>,
+        gui_register_addr: Option<SocketAddr>,
+    ) -> Self {
         let (lang_server_client, mut rx) =
             SyncLangServerClient::new(cx.to_async(), lang_server_addr);
         let solved_cell = cx.new(|_cx| None);
@@ -380,7 +387,7 @@ impl Editor {
                 }
             })
             .detach();
-        lang_server_client.register_server();
+        lang_server_client.register_server(gui_listen_port, gui_listener, gui_register_addr);
 
         editor
     }

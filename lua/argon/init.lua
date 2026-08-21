@@ -62,6 +62,7 @@ end
 --- Start or attach the LSP client
 ---@param bufnr? number The buffer number (optional), defaults to the current buffer
 M.start = function(bufnr)
+    bufnr = bufnr or vim.api.nvim_get_current_buf()
     if vim.fn.executable(config.analyzer) ~= 1 then
         vim.notify(
           'argon: Could not find argon-analyzer. Install it with Cargo or configure vim.g.argon.analyzer.',
@@ -81,9 +82,22 @@ M.start = function(bufnr)
     if config.log.level then
         cmd_env.ARGON_LOG = config.log.level
     end
+    local analyzer_cmd = { config.analyzer }
+    if vim.g.argon_analyzer_rpc_port then
+        vim.list_extend(analyzer_cmd, {
+            '--rpc-port',
+            tostring(vim.g.argon_analyzer_rpc_port),
+        })
+    end
+    if vim.g.argon_analyzer_relay then
+        vim.list_extend(analyzer_cmd, {
+            '--relay-socket',
+            tostring(vim.g.argon_analyzer_relay),
+        })
+    end
     local lsp_start_config = { 
         name = 'argon',
-        cmd = { config.analyzer },
+        cmd = analyzer_cmd,
         cmd_env = cmd_env,
         handlers = {
             ['custom/forceSave'] = function(err, result, ctx)
@@ -126,10 +140,15 @@ M.start = function(bufnr)
     }
 
     local old_on_init = lsp_start_config.on_init
-    lsp_start_config.on_init = function(...)
+    lsp_start_config.on_init = function(lsp_client, ...)
         commands.create_argon_command()
         if type(old_on_init) == 'function' then
-            old_on_init(...)
+            old_on_init(lsp_client, ...)
+        end
+        if vim.g.argon_auto_gui then
+            vim.schedule(function()
+                lsp_client:request('custom/startGui', nil, client.print_error, bufnr)
+            end)
         end
     end
 
