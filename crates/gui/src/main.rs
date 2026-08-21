@@ -17,6 +17,7 @@ use clap::{Args, Parser, Subcommand};
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCAL_FORWARD_ATTEMPTS: usize = 8;
+const NVIM_FOCUS_MAPPING: &str = "lua local function focus_argon_gui() local client = require('argon.client'); client.any_buf_request('custom/startGui', nil, client.print_error) end; for _, lhs in ipairs({ '<C-Bslash>', string.char(28) }) do vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus_argon_gui, { desc = 'Focus Argon GUI', silent = true, nowait = true }) end";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -110,8 +111,14 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitStatus> {
     match cli.command {
-        None => run_nvim(&cli.nvim, &cli.path),
-        Some(CommandKind::Ssh(args)) => run_ssh(&cli.nvim, args),
+        None => {
+            let focus_target = argone::focus::capture_target();
+            run_nvim(&cli.nvim, &cli.path, focus_target.as_deref())
+        }
+        Some(CommandKind::Ssh(args)) => {
+            let focus_target = argone::focus::capture_target();
+            run_ssh(&cli.nvim, args, focus_target.as_deref())
+        }
         Some(CommandKind::Gui(args)) => run_gui(args),
     }
 }
@@ -143,17 +150,23 @@ fn io_flush_stdout() -> Result<()> {
     std::io::stdout().flush().context("failed to flush stdout")
 }
 
-fn run_nvim(nvim: &OsStr, path: &Path) -> Result<ExitStatus> {
+fn run_nvim(nvim: &OsStr, path: &Path, focus_target: Option<&str>) -> Result<ExitStatus> {
     let (working_directory, target) = nvim_location(path)?;
     let mut command = Command::new(nvim);
     command
         .current_dir(working_directory)
         .arg("--cmd")
         .arg("let g:argon_auto_gui = v:true")
+        .arg("--cmd")
+        .arg(NVIM_FOCUS_MAPPING)
         .arg(target)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(focus_target) = focus_target {
+        command.env(argone::focus::TARGET_ENV, focus_target);
+    }
+    command
         .status()
         .with_context(|| format!("failed to start `{}`", nvim.to_string_lossy()))
 }
@@ -185,7 +198,7 @@ fn nvim_location(path: &Path) -> Result<(PathBuf, PathBuf)> {
     bail!("`{}` is not a file or directory", path.display())
 }
 
-fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
+fn run_ssh(nvim: &OsStr, args: SshArgs, focus_target: Option<&str>) -> Result<ExitStatus> {
     let control = SshControl::new(&args)?;
     validate_port_overrides(&args)?;
     let analyzer = resolve_remote_analyzer(&args, &control)?;
@@ -209,7 +222,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
         .spawn()
         .with_context(|| format!("failed to start `{}`", args.ssh.to_string_lossy()))?;
 
-    let result = start_forwarded_session(&args, &control, &mut nvim_ssh, &mut relay);
+    let result = start_forwarded_session(&args, &control, &mut nvim_ssh, &mut relay, focus_target);
     let (mut tunnel, mut gui) = match result {
         Ok(processes) => processes,
         Err(error) => {
@@ -232,9 +245,10 @@ fn start_forwarded_session(
     control: &SshControl,
     nvim_ssh: &mut Child,
     relay: &mut Relay,
+    focus_target: Option<&str>,
 ) -> Result<(Child, Child)> {
     let remote_analyzer_port = wait_for_remote_analyzer(nvim_ssh, relay)?;
-    let mut gui = launch_forwarded_gui(args.local_gui_port)?;
+    let mut gui = launch_forwarded_gui(args.local_gui_port, focus_target)?;
     let local_gui_port = gui.port;
 
     let tunnel = match start_tunnel(args, control, remote_analyzer_port, local_gui_port) {
@@ -488,6 +502,7 @@ fn remote_nvim_command(
         "let g:argon_analyzer_relay = '{}'",
         relay_socket.replace('\'', "''")
     ));
+    let focus_mapping = shell_quote(NVIM_FOCUS_MAPPING);
     let rpc_port = analyzer_port
         .map(|port| format!(" --cmd 'let g:argon_analyzer_rpc_port = {port}'"))
         .unwrap_or_default();
@@ -506,7 +521,7 @@ fn remote_nvim_command(
          else \
            printf '%s\\n' 'argone: remote path is not a file or directory' >&2; exit 1; \
          fi; \
-         exec {nvim}{rpc_port} --cmd {relay_vim} \"$1\""
+         exec {nvim}{rpc_port} --cmd {relay_vim} --cmd {focus_mapping} \"$1\""
     )
 }
 
@@ -556,11 +571,14 @@ impl GuiLaunch {
     }
 }
 
-fn launch_forwarded_gui(gui_port: Option<u16>) -> Result<GuiLaunch> {
+fn launch_forwarded_gui(gui_port: Option<u16>, focus_target: Option<&str>) -> Result<GuiLaunch> {
     let mut command = Command::new(env::current_exe()?);
     command.arg("gui").arg("--ssh-control");
     if let Some(port) = gui_port {
         command.arg("--listen-port").arg(port.to_string());
+    }
+    if let Some(focus_target) = focus_target {
+        command.env(argone::focus::TARGET_ENV, focus_target);
     }
     let mut child = command
         .stdin(Stdio::piped())
@@ -998,6 +1016,7 @@ mod tests {
         assert!(command.contains("set -- '/work/a project'\"'\"'s files';"));
         assert!(command.contains("let g:argon_analyzer_rpc_port = 12001"));
         assert!(command.contains("let g:argon_analyzer_relay"));
+        assert!(command.contains("<C-Bslash>"));
         assert!(command.contains("'custom nvim'"));
     }
 
@@ -1031,7 +1050,9 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            "--cmd\nlet g:argon_analyzer_relay = '/tmp/relay socket.sock'\nlib.ar\n"
+            format!(
+                "--cmd\nlet g:argon_analyzer_relay = '/tmp/relay socket.sock'\n--cmd\n{NVIM_FOCUS_MAPPING}\nlib.ar\n"
+            )
         );
     }
 

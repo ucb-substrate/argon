@@ -304,18 +304,13 @@ impl SyncLangServerClient {
         Ok(())
     }
 
-    pub fn focus_editor(&self, command_bar: bool) -> Result<()> {
+    pub fn open_command_bar(&self) -> Result<()> {
         let client_clone = self.client.clone();
         self.app
             .background_executor()
             .block_with_timeout(
                 LANG_SERVER_CLIENT_TIMEOUT,
-                async move {
-                    client_clone
-                        .focus_editor(context::current(), command_bar)
-                        .await
-                }
-                .compat(),
+                async move { client_clone.focus_editor(context::current(), true).await }.compat(),
             )
             .map_err(|_| {
                 anyhow!("timeout reaching language server after {LANG_SERVER_CLIENT_TIMEOUT:?}")

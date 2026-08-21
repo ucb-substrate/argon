@@ -17,7 +17,7 @@ use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
 pub mod actions;
 pub mod assets;
 pub mod editor;
-mod focus;
+pub mod focus;
 pub mod rpc;
 pub mod sse;
 pub mod theme;
@@ -74,6 +74,8 @@ fn run_inner(
     gui_listener: Option<TcpListener>,
     gui_register_addr: Option<SocketAddr>,
 ) {
+    focus::initialize_target();
+
     // TODO: Allow configuration via ARGON_HOME environment variable.
     if let Some(log_dir) = default_argon_home() {
         tracing_subscriber::fmt()
@@ -162,8 +164,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("0", Zero, Some("LayoutCanvas")),
         KeyBinding::new("1", One, Some("LayoutCanvas")),
         KeyBinding::new("*", All, Some("LayoutCanvas")),
-        KeyBinding::new("ctrl-\\", FocusNvim, None),
-        KeyBinding::new(":", FocusNvimCommandBar, None),
+        KeyBinding::new("ctrl-\\", FocusInvoker, None),
+        KeyBinding::new(":", FocusInvokerCommandBar, None),
         KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
@@ -213,7 +215,7 @@ mod tests {
         undo_count: usize,
         draw_rect_count: usize,
         command_bar_count: usize,
-        focus_nvim_count: usize,
+        focus_invoker_count: usize,
     }
 
     impl Render for ShortcutTestView {
@@ -222,9 +224,13 @@ mod tests {
                 .on_action(cx.listener(|view, _: &Undo, _, _| view.undo_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
                 .on_action(
-                    cx.listener(|view, _: &FocusNvimCommandBar, _, _| view.command_bar_count += 1),
+                    cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
+                        view.command_bar_count += 1
+                    }),
                 )
-                .on_action(cx.listener(|view, _: &FocusNvim, _, _| view.focus_nvim_count += 1))
+                .on_action(
+                    cx.listener(|view, _: &FocusInvoker, _, _| view.focus_invoker_count += 1),
+                )
                 .child(
                     div()
                         .key_context("LayoutCanvas")
@@ -249,7 +255,7 @@ mod tests {
                     undo_count: 0,
                     draw_rect_count: 0,
                     command_bar_count: 0,
-                    focus_nvim_count: 0,
+                    focus_invoker_count: 0,
                 })
             })
             .unwrap()
@@ -264,7 +270,7 @@ mod tests {
                 assert_eq!(view.undo_count, 0);
                 assert_eq!(view.draw_rect_count, 0);
                 assert_eq!(view.command_bar_count, 1);
-                assert_eq!(view.focus_nvim_count, 1);
+                assert_eq!(view.focus_invoker_count, 1);
             })
             .unwrap();
 
@@ -277,7 +283,7 @@ mod tests {
                 assert_eq!(view.undo_count, 1);
                 assert_eq!(view.draw_rect_count, 1);
                 assert_eq!(view.command_bar_count, 2);
-                assert_eq!(view.focus_nvim_count, 2);
+                assert_eq!(view.focus_invoker_count, 2);
             })
             .unwrap();
     }

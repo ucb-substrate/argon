@@ -18,7 +18,7 @@ use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
-    actions::{FocusNvim, FocusNvimCommandBar, Redo, Undo},
+    actions::{FocusInvoker, FocusInvokerCommandBar, Redo, Undo},
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
     theme::{DARK_THEME, LIGHT_THEME, Theme},
@@ -467,34 +467,34 @@ impl Editor {
         }
     }
 
-    fn focus_nvim(&mut self, _: &FocusNvim, _window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_editor(false, cx);
-    }
-
-    fn focus_nvim_command_bar(
+    fn focus_invoking_app(
         &mut self,
-        _: &FocusNvimCommandBar,
+        _: &FocusInvoker,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_editor(true, cx);
+        self.focus_invoker(cx);
     }
 
-    fn focus_editor(&mut self, command_bar: bool, cx: &mut Context<Self>) {
-        if let Err(error) = self
-            .state
-            .read(cx)
-            .lang_server_client
-            .focus_editor(command_bar)
-        {
+    fn focus_invoking_app_command_bar(
+        &mut self,
+        _: &FocusInvokerCommandBar,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.state.read(cx).lang_server_client.open_command_bar() {
             self.state.update(cx, |state, _cx| {
                 state.fatal_error = Some(format!("{error}").into());
             });
-            return;
         }
-        if !crate::focus::activate_editor() {
+        self.focus_invoker(cx);
+    }
+
+    fn focus_invoker(&mut self, cx: &mut Context<Self>) {
+        if !crate::focus::activate_invoker() {
             self.state.update(cx, |state, _cx| {
-                state.fatal_error = Some("could not identify the application running Nvim".into());
+                state.fatal_error =
+                    Some("could not identify the application that invoked Argone".into());
             });
         }
     }
@@ -512,8 +512,8 @@ impl Render for Editor {
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_redo))
-            .on_action(cx.listener(Self::focus_nvim))
-            .on_action(cx.listener(Self::focus_nvim_command_bar))
+            .on_action(cx.listener(Self::focus_invoking_app))
+            .on_action(cx.listener(Self::focus_invoking_app_command_bar))
             .font_family("Zed Plex Sans")
             .size_full()
             .flex()
