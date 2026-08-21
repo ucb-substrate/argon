@@ -195,7 +195,7 @@ fn run_ssh(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
     nvim_command
         .arg("-t")
         .arg(&args.host)
-        .arg(interactive_shell_command(&remote_nvim_command(
+        .arg(interactive_terminal_command(&remote_nvim_command(
             nvim,
             &args.path,
             args.remote_analyzer_port,
@@ -285,7 +285,7 @@ fn resolve_remote_analyzer(args: &SshArgs, control: &SshControl) -> Result<Strin
     );
     let output = control
         .command(args)
-        .arg("-tt")
+        .arg("-T")
         .arg(&args.host)
         .arg(probe)
         .output()
@@ -513,12 +513,6 @@ fn remote_nvim_command(
 fn wait_for_remote_analyzer(nvim_ssh: &mut Child, relay: &mut Relay) -> Result<u16> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        if let Some(status) = nvim_ssh
-            .try_wait()
-            .context("failed while waiting for Neovim")?
-        {
-            bail!("remote Neovim exited before the analyzer started ({status})");
-        }
         match relay.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
             Ok(Ok(line)) => {
                 if let Some(port) = parse_analyzer_announcement(&line) {
@@ -536,6 +530,12 @@ fn wait_for_remote_analyzer(nvim_ssh: &mut Child, relay: &mut Relay) -> Result<u
             .context("failed while waiting for the analyzer relay")?
         {
             bail!("analyzer relay exited before reporting the RPC port ({status})");
+        }
+        if let Some(status) = nvim_ssh
+            .try_wait()
+            .context("failed while waiting for Neovim")?
+        {
+            bail!("remote Neovim exited before the analyzer started ({status})");
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for `argon-analyzer` to start");
@@ -677,6 +677,9 @@ fn start_tunnel_once(
     let local_analyzer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_analyzer_port);
     let mut command = control.command(args);
     command
+        // A multiplex control operation does not report the port allocated for `-R 0`.
+        .arg("-S")
+        .arg("none")
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
         .arg("-o")
@@ -728,9 +731,10 @@ fn start_tunnel_once(
             message: format!("failed while waiting for the SSH tunnel: {error}"),
             local_collision: false,
         })? {
-            while let Ok(line) = line_rx.try_recv() {
-                if let Ok(line) = line {
-                    lines.push(line);
+            for line in line_rx {
+                match line {
+                    Ok(line) => lines.push(line),
+                    Err(error) => lines.push(error.to_string()),
                 }
             }
             let detail = lines.join("\n");
@@ -837,6 +841,15 @@ fn shell_quote(value: &str) -> String {
 
 fn interactive_shell_command(command: &str) -> String {
     format!("exec \"${{SHELL:-/bin/sh}}\" -ic {}", shell_quote(command))
+}
+
+fn interactive_terminal_command(command: &str) -> String {
+    // Hide the terminal during shell startup, then restore it for Neovim.
+    let command = format!("exec <&3 >&4 2>&5; {command}");
+    format!(
+        "exec 3<&0 4>&1 5>&2; exec \"${{SHELL:-/bin/sh}}\" -ic {} </dev/null >/dev/null 2>/dev/null",
+        shell_quote(&command)
+    )
 }
 
 #[cfg(unix)]
@@ -958,6 +971,10 @@ mod tests {
             interactive_shell_command("exec nvim 'some path'"),
             "exec \"${SHELL:-/bin/sh}\" -ic 'exec nvim '\"'\"'some path'\"'\"''"
         );
+        assert_eq!(
+            interactive_terminal_command("exec nvim"),
+            "exec 3<&0 4>&1 5>&2; exec \"${SHELL:-/bin/sh}\" -ic 'exec <&3 >&4 2>&5; exec nvim' </dev/null >/dev/null 2>/dev/null"
+        );
     }
 
     #[test]
@@ -982,6 +999,40 @@ mod tests {
         assert!(command.contains("let g:argon_analyzer_rpc_port = 12001"));
         assert!(command.contains("let g:argon_analyzer_relay"));
         assert!(command.contains("'custom nvim'"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_shell_passes_relay_socket_to_nvim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("lib.ar"), "cell top() {}\n").unwrap();
+
+        let nvim = directory.path().join("fake-nvim");
+        fs::write(&nvim, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&nvim, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let command = interactive_terminal_command(&remote_nvim_command(
+            nvim.as_os_str(),
+            &project,
+            None,
+            "/tmp/relay socket.sock",
+        ));
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .env("SHELL", "/bin/sh")
+            .output()
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "--cmd\nlet g:argon_analyzer_relay = '/tmp/relay socket.sock'\nlib.ar\n"
+        );
     }
 
     #[cfg(unix)]
