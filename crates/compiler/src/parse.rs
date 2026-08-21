@@ -1,9 +1,6 @@
-use std::{
-    fmt::Write,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::{anyhow, bail};
 use arcstr::{ArcStr, Substr};
 use indexmap::IndexMap;
 
@@ -57,8 +54,10 @@ pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, an
     let Some(last) = path.last() else {
         return Ok(PathBuf::from(root_lib));
     };
-    let mut base_path = PathBuf::from(root_lib);
-    base_path.pop();
+    let mut base_path = root_lib
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
     for m in &path[0..path.len() - 1] {
         base_path.push(m);
     }
@@ -67,10 +66,10 @@ pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, an
     base_path.push(last);
     base_path.push("mod.ar");
     if direct_path.is_file() && base_path.is_file() {
-        bail!("both mod paths exists for mod {last}");
+        bail!("both module paths exist for module `{last}`");
     }
     if direct_path == root_lib {
-        bail!("circular mods: {last}");
+        bail!("circular module `{last}`");
     }
     if direct_path.is_file() {
         Ok(direct_path)
@@ -89,6 +88,7 @@ pub struct ParseDiagnostic {
     kind: StaticErrorKind,
 }
 
+#[derive(Default)]
 pub struct ParseOutput {
     pub asts: IndexMap<ModPath, ParseResult>,
     pub errs: IndexMap<PathBuf, (ParseDiagnostics, ModSpans)>,
@@ -143,6 +143,16 @@ impl ParseOutput {
             }))
             .collect()
     }
+
+    fn merge(&mut self, output: Self, prefix: Option<&str>) {
+        for (mut path, result) in output.asts {
+            if let Some(prefix) = prefix {
+                path.insert(0, prefix.to_owned());
+            }
+            self.asts.insert(path, result);
+        }
+        self.errs.extend(output.errs);
+    }
 }
 
 fn make_backup_ast(input: ArcStr, path: PathBuf) -> AnnotatedParseAst {
@@ -166,32 +176,21 @@ fn diagnostics_from_errors(errs: Vec<ParseError>) -> ParseDiagnostics {
         .collect()
 }
 
+fn diagnostics_message(diagnostics: &[ParseDiagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.kind.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn parse_result_from_errors(
     input: ArcStr,
     path: PathBuf,
     diagnostics: Vec<ParseDiagnostic>,
 ) -> (ParseResult, ParseDiagnostics) {
-    if !diagnostics.is_empty() {
-        let mut err = String::new();
-        for diagnostic in &diagnostics {
-            if let Err(write_err) = writeln!(&mut err, "{}", diagnostic.kind)
-                .with_context(|| "failed to write to string buffer")
-            {
-                return (
-                    (make_backup_ast(input, path), Some(anyhow!("{write_err}"))),
-                    diagnostics,
-                );
-            }
-        }
-        return (
-            (
-                make_backup_ast(input, path),
-                Some(anyhow!(err.trim_end().to_string())),
-            ),
-            diagnostics,
-        );
-    }
-    ((make_backup_ast(input, path), None), diagnostics)
+    let error = (!diagnostics.is_empty()).then(|| anyhow!(diagnostics_message(&diagnostics)));
+    ((make_backup_ast(input, path), error), diagnostics)
 }
 
 pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
@@ -207,33 +206,22 @@ pub fn parse_workspace_with_std_and_deps(
     dependencies: impl IntoIterator<Item = (String, PathBuf)>,
 ) -> ParseOutput {
     let root_lib = root_lib.as_ref();
-    let mut ast = IndexMap::new();
-    let mut err = IndexMap::new();
+    let mut output = ParseOutput::default();
     for (name, path) in dependencies {
         let dep_root = if path.is_dir() {
             path.join("lib.ar")
         } else {
             path
         };
-        let ParseOutput { asts, errs } = parse_workspace(dep_root);
-        ast.extend(asts.into_iter().map(|(mut k, v)| {
-            k.insert(0, name.clone());
-            (k, v)
-        }));
-        err.extend(errs);
+        output.merge(parse_workspace(dep_root), Some(&name));
     }
-    let ParseOutput { asts, errs } = parse_workspace(root_lib);
-    ast.extend(asts);
-    err.extend(errs);
+    output.merge(parse_workspace(root_lib), None);
     let std_path = PathBuf::from(STD_PATH);
     let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
     // TODO: fix std library overwriting user-defined std mods.
-    ast.insert(vec!["std".to_string()], std_ast);
-    err.insert(std_path, (std_diagnostics, Vec::new()));
-    ParseOutput {
-        asts: ast,
-        errs: err,
-    }
+    output.asts.insert(vec!["std".to_string()], std_ast);
+    output.errs.insert(std_path, (std_diagnostics, Vec::new()));
+    output
 }
 
 pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
@@ -324,22 +312,35 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, anyhow::
         Ok(ast) => Ok(ast),
         Err(errs) => {
             let diagnostics = diagnostics_from_errors(errs);
-            let mut err = String::new();
-            for diagnostic in diagnostics {
-                writeln!(&mut err, "{}", diagnostic.kind)
-                    .with_context(|| "failed to write to string buffer")?;
-            }
-            bail!("{}", err.trim_end());
+            bail!(diagnostics_message(&diagnostics));
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::parse_cell;
+    use std::path::PathBuf;
+
+    use crate::parse::{parse_cell, parse_workspace_with_std_and_deps};
 
     #[test]
     fn cell_invocation_parses() {
         parse_cell("test(1., 5)").expect("failed to parse cell");
+    }
+
+    #[test]
+    fn dependency_modules_are_namespaced() {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let output = parse_workspace_with_std_and_deps(
+            examples.join("path_dependencies/root_library/lib.ar"),
+            [(
+                "dependency".to_owned(),
+                examples.join("path_dependencies/dependency_library"),
+            )],
+        );
+
+        assert!(output.asts.contains_key(&Vec::new()));
+        assert!(output.asts.contains_key(&vec!["dependency".to_owned()]));
+        assert!(output.asts.contains_key(&vec!["std".to_owned()]));
     }
 }

@@ -2,24 +2,23 @@ pub mod document;
 pub mod rpc;
 
 use std::{
-    net::{Ipv4Addr, SocketAddr},
-    path::PathBuf,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
 
 use arc::Library;
 use argonc::{
-    ast::{Expr, Span},
+    ast::{Span, WorkspaceAst},
     compile::{
         self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
-        StaticErrorCompileOutput,
+        StaticErrorCompileOutput, VarIdTyMetadata,
     },
     parse::{self, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
-use itertools::Itertools;
 use rpc::{GuiClient, LangServer};
 use serde::{Deserialize, Serialize};
 use tarpc::{
@@ -42,7 +41,10 @@ use crate::document::{Document, DocumentChange};
 
 // TODO: Allow configuration via ARGON_HOME environment variable.
 pub fn default_argon_home() -> Option<PathBuf> {
-    Some(homedir::my_home().ok()??.join(".local/state/argon"))
+    homedir::my_home()
+        .ok()
+        .flatten()
+        .map(|home| home.join(".local/state/argon"))
 }
 
 // TODO: finer-grained synchronization?
@@ -58,20 +60,6 @@ pub struct StateMut {
     cell: Option<String>,
     gui_client: Option<GuiClient>,
     editor_files: IndexMap<Uri, Document>,
-}
-
-fn cell_arg_from_expr(
-    expr: &Expr<&str, parse::ParseMetadata>,
-) -> std::result::Result<CellArg, String> {
-    match expr {
-        Expr::FloatLiteral(value) => Ok(CellArg::Float(value.value)),
-        Expr::IntLiteral(value) => Ok(CellArg::Int(value.value)),
-        Expr::BoolLiteral(value) => Ok(CellArg::Bool(value.value)),
-        Expr::SeqNil(_) => Ok(CellArg::Seq(Vec::new())),
-        _ => Err(
-            "cell arguments must be integer, float, boolean, or empty-list literals".to_string(),
-        ),
-    }
 }
 
 fn compile_error_messages(output: &CompileOutput) -> Vec<String> {
@@ -93,15 +81,88 @@ fn compile_error_messages(output: &CompileOutput) -> Vec<String> {
     }
 }
 
+fn parse_setting(input: &str) -> Option<(&str, &str)> {
+    let separator = input.find(char::is_whitespace)?;
+    let (key, value) = input.split_at(separator);
+    let value = value.trim_start();
+    (!key.is_empty() && !value.is_empty()).then_some((key, value))
+}
+
+async fn compile_open_cell(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    cell: &str,
+    lyp: &Path,
+    client: &Client,
+) -> Option<CompileOutput> {
+    if let Err(error) = argonc::layer::read_lyp(lyp) {
+        client
+            .show_message(MessageType::ERROR, format!("Could not open cell: {error}"))
+            .await;
+        return None;
+    }
+
+    let cell_ast = match parse::parse_cell(cell) {
+        Ok(cell_ast) => cell_ast,
+        Err(error) => {
+            client
+                .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                .await;
+            return None;
+        }
+    };
+    if !cell_ast.args.kwargs.is_empty() {
+        client
+            .show_message(
+                MessageType::ERROR,
+                "Open cell does not support keyword arguments yet",
+            )
+            .await;
+        return None;
+    }
+    let Some(args) = cell_ast
+        .args
+        .posargs
+        .iter()
+        .map(CellArg::from_literal)
+        .collect::<Option<Vec<_>>>()
+    else {
+        client
+            .show_message(
+                MessageType::ERROR,
+                "Open cell arguments must be integer, float, boolean, or empty-list literals",
+            )
+            .await;
+        return None;
+    };
+    let cell_path = cell_ast
+        .func
+        .path
+        .iter()
+        .map(|ident| ident.name)
+        .collect::<Vec<_>>();
+
+    Some(compile::dynamic_compile(
+        ast,
+        CompileInput {
+            cell: &cell_path,
+            args,
+            lyp_file: lyp,
+        },
+    ))
+}
+
 impl StateMut {
     fn diagnostics(&self) -> IndexMap<Uri, Vec<Diagnostic>> {
         let mut diagnostics = IndexMap::new();
+        let Some(root_dir) = &self.root_dir else {
+            return diagnostics;
+        };
         if let Some(o) = &self.compile_output {
             let errs = match o {
                 CompileOutput::FatalParseErrors => {
                     vec![(
                         Span {
-                            path: self.root_dir.as_ref().unwrap().join("lib.ar"),
+                            path: root_dir.join("lib.ar"),
                             span: cfgrammar::Span::new(0, 0),
                         },
                         "fatal parse errors encountered, unable to compile".to_string(),
@@ -116,7 +177,7 @@ impl StateMut {
                     .map(|e| {
                         (
                             e.span.clone().unwrap_or_else(|| Span {
-                                path: self.root_dir.as_ref().unwrap().join("lib.ar"),
+                                path: root_dir.join("lib.ar"),
                                 span: cfgrammar::Span::new(0, 0),
                             }),
                             format!("{}", e.kind),
@@ -126,21 +187,19 @@ impl StateMut {
                 CompileOutput::Valid(_) => vec![],
             };
             for (span, message) in errs {
-                let url = Uri::from_file_path(&span.path).unwrap();
-                if let Some(ast) = self.ast.values().find(|ast| ast.path == span.path) {
+                if let Some(ast) = self.ast.values().find(|ast| ast.path == span.path)
+                    && let Some(url) = Uri::from_file_path(&span.path)
+                {
                     let doc = Document::new(&ast.text, 0);
-                    diagnostics
-                        .entry(url)
-                        .or_insert_with(Vec::new)
-                        .push(Diagnostic {
-                            range: Range {
-                                start: doc.offset_to_pos(span.span.start()),
-                                end: doc.offset_to_pos(span.span.end()),
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            message,
-                            ..Default::default()
-                        });
+                    diagnostics.entry(url).or_default().push(Diagnostic {
+                        range: Range {
+                            start: doc.offset_to_pos(span.span.start()),
+                            end: doc.offset_to_pos(span.span.end()),
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        message,
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -148,160 +207,100 @@ impl StateMut {
     }
 
     async fn compile(&mut self, client: &Client, update: bool) {
-        if let Some(root_dir) = &self.root_dir {
-            let manifest_path = root_dir.join("Argon.toml");
-            self.config = if manifest_path.is_file() {
-                match Library::load(&manifest_path) {
-                    Ok(config) => Some(config),
-                    Err(error) => {
-                        client
-                            .show_message(MessageType::ERROR, error.to_string())
-                            .await;
-                        self.compile_output = None;
-                        return;
-                    }
+        let Some(root_dir) = &self.root_dir else {
+            return;
+        };
+        let manifest_path = root_dir.join("Argon.toml");
+        self.config = if manifest_path.is_file() {
+            match Library::load(&manifest_path) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    client
+                        .show_message(MessageType::ERROR, error.to_string())
+                        .await;
+                    self.compile_output = None;
+                    return;
                 }
-            } else {
-                None
-            };
-            let lyp = self.config.as_ref().and_then(|config| config.lyp.clone());
-            let dependencies = self
-                .config
-                .as_ref()
-                .map(|config| config.dependencies.clone())
-                .unwrap_or_default();
-            let parse_output =
-                parse::parse_workspace_with_std_and_deps(root_dir.join("lib.ar"), dependencies);
-            let parse_errs = parse_output.static_errors();
-            let ast = parse_output.ast();
-            self.ast = ast;
-            let static_output = compile::static_compile(&self.ast);
+            }
+        } else {
+            None
+        };
+        let lyp = self.config.as_ref().and_then(|config| config.lyp.clone());
+        let dependencies = self
+            .config
+            .as_ref()
+            .map(|config| config.dependencies.clone())
+            .unwrap_or_default();
+        let analysis = compile::analyze_workspace(parse::parse_workspace_with_std_and_deps(
+            root_dir.join("lib.ar"),
+            dependencies,
+        ));
+        self.ast = analysis.ast;
 
-            let o = if let Some((ast, mut static_output)) = static_output {
-                if !static_output.errors.is_empty() || !parse_errs.is_empty() {
-                    static_output.errors.extend(parse_errs);
-                    Some(CompileOutput::StaticErrors(static_output))
-                } else if let Some(cell) = &self.cell {
-                    let Some(lyp) = lyp.as_deref() else {
-                        let message = if manifest_path.is_file() {
-                            format!(
-                                "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
-                                manifest_path.display()
-                            )
-                        } else {
-                            format!(
-                                "no library manifest found at `{}`; create it and set `lyp = \"path/to/layers.lyp\"`",
-                                manifest_path.display()
-                            )
-                        };
-                        client
-                            .show_message(
-                                MessageType::ERROR,
-                                format!("Could not open cell: {message}"),
-                            )
-                            .await;
-                        self.compile_output = None;
-                        return;
+        let o = if let Some(ast) = analysis.typed_ast {
+            if !analysis.errors.is_empty() {
+                Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                    errors: analysis.errors,
+                }))
+            } else if let Some(cell) = &self.cell {
+                let Some(lyp) = lyp.as_deref() else {
+                    let message = if manifest_path.is_file() {
+                        format!(
+                            "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
+                            manifest_path.display()
+                        )
+                    } else {
+                        format!(
+                            "no library manifest found at `{}`; create it and set `lyp = \"path/to/layers.lyp\"`",
+                            manifest_path.display()
+                        )
                     };
-                    if let Err(error) = argonc::layer::read_lyp(lyp) {
-                        client
-                            .show_message(
-                                MessageType::ERROR,
-                                format!("Could not open cell: {error}"),
-                            )
-                            .await;
-                        self.compile_output = None;
-                        return;
-                    }
-                    match parse::parse_cell(cell) {
-                        Ok(cell_ast) => {
-                            let cell_path = cell_ast
-                                .func
-                                .path
-                                .iter()
-                                .map(|ident| ident.name)
-                                .collect_vec();
-                            if !cell_ast.args.kwargs.is_empty() {
-                                client
-                                    .show_message(
-                                        MessageType::ERROR,
-                                        "Open cell does not support keyword arguments yet",
-                                    )
-                                    .await;
-                                None
-                            } else if let Ok(args) = cell_ast
-                                .args
-                                .posargs
-                                .iter()
-                                .map(cell_arg_from_expr)
-                                .collect::<std::result::Result<Vec<_>, _>>()
-                            {
-                                Some(compile::dynamic_compile(
-                                    &ast,
-                                    CompileInput {
-                                        cell: &cell_path,
-                                        args,
-                                        lyp_file: lyp,
-                                    },
-                                ))
-                            } else {
-                                client
-                                    .show_message(
-                                        MessageType::ERROR,
-                                        "Open cell arguments must be integer, float, boolean, or empty-list literals",
-                                    )
-                                    .await;
-                                None
-                            }
-                        }
-                        Err(e) => {
-                            client
-                                .show_message(
-                                    MessageType::ERROR,
-                                    format!("Open cell is invalid: {e}"),
-                                )
-                                .await;
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                Some(CompileOutput::FatalParseErrors)
-            };
-            self.compile_output = o;
-            if !update && let Some(output) = &self.compile_output {
-                for message in compile_error_messages(output) {
                     client
                         .show_message(
                             MessageType::ERROR,
                             format!("Could not open cell: {message}"),
                         )
                         .await;
-                }
+                    self.compile_output = None;
+                    return;
+                };
+                compile_open_cell(&ast, cell, lyp, client).await
+            } else {
+                None
             }
-            let mut tmp = self.diagnostics();
-            let mut diagnostics = tmp.clone();
-            std::mem::swap(&mut self.prev_diagnostics, &mut tmp);
-            for (path, _) in tmp {
-                diagnostics.entry(path).or_default();
-            }
-            for (uri, diags) in diagnostics {
-                // TODO: potentially add version number
-                client.publish_diagnostics(uri, diags, None).await;
-            }
-            if let Some(o) = &self.compile_output
-                && let Some(gui_client) = self.gui_client.as_mut()
-                && let Err(e) = gui_client
-                    .open_cell(context::current(), o.clone(), update)
-                    .await
-            {
+        } else {
+            Some(CompileOutput::FatalParseErrors)
+        };
+        self.compile_output = o;
+        if !update && let Some(output) = &self.compile_output {
+            for message in compile_error_messages(output) {
                 client
-                    .show_message(MessageType::ERROR, format!("{e}"))
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not open cell: {message}"),
+                    )
                     .await;
-                self.gui_client = None;
             }
+        }
+        let mut diagnostics = self.diagnostics();
+        let previous = std::mem::replace(&mut self.prev_diagnostics, diagnostics.clone());
+        for uri in previous.into_keys() {
+            diagnostics.entry(uri).or_default();
+        }
+        for (uri, diagnostics) in diagnostics {
+            // TODO: potentially add version number
+            client.publish_diagnostics(uri, diagnostics, None).await;
+        }
+        if let Some(o) = &self.compile_output
+            && let Some(gui_client) = self.gui_client.as_mut()
+            && let Err(e) = gui_client
+                .open_cell(context::current(), o.clone(), update)
+                .await
+        {
+            client
+                .show_message(MessageType::ERROR, format!("{e}"))
+                .await;
+            self.gui_client = None;
         }
     }
 }
@@ -364,7 +363,7 @@ impl LanguageServer for Backend {
         {
             self.state.state_mut.lock().await.root_dir = params
                 .root_uri
-                .map(|root| PathBuf::from(root.to_file_path().unwrap()));
+                .and_then(|root| root.to_file_path().map(|path| path.into_owned()));
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -549,14 +548,19 @@ impl Backend {
     }
 
     async fn set(&self, params: SetParams) -> Result<()> {
+        let Some((key, value)) = parse_setting(&params.kv) else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Expected a setting in KEY VALUE form")
+                .await;
+            return Ok(());
+        };
+        let (key, value) = (key.to_owned(), value.to_owned());
         let state = self.state.clone();
-        // TODO: Error handling.
-        let (k, v) = params.kv.split_once(" ").unwrap();
-        let (k, v) = (k.to_string(), v.to_string());
         tokio::spawn(async move {
             let mut state_mut = state.state_mut.lock().await;
             if let Some(client) = state_mut.gui_client.as_mut()
-                && let Err(e) = client.set(context::current(), k, v).await
+                && let Err(e) = client.set(context::current(), key, value).await
             {
                 state
                     .editor_client
@@ -579,14 +583,25 @@ pub async fn main() {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(12345);
-    let mut listener = if let Ok(listener) =
-        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default).await
+    let mut listener = match tarpc::serde_transport::tcp::listen(
+        (Ipv4Addr::LOCALHOST, port),
+        Json::default,
+    )
+    .await
     {
-        listener
-    } else {
-        tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
-            .await
-            .unwrap()
+        Ok(listener) => listener,
+        Err(port_error) => {
+            match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default).await
+            {
+                Ok(listener) => listener,
+                Err(fallback_error) => {
+                    eprintln!(
+                        "failed to bind analyzer RPC server to port {port} ({port_error}) or an available port ({fallback_error})"
+                    );
+                    return;
+                }
+            }
+        }
     };
     let server_addr = listener.local_addr();
 
@@ -604,7 +619,10 @@ pub async fn main() {
     .custom_method("custom/openCell", Backend::open_cell)
     .custom_method("custom/set", Backend::set)
     .finish();
-    let state = ext_state.unwrap();
+    let Some(state) = ext_state else {
+        eprintln!("failed to initialize analyzer state");
+        return;
+    };
     listener.config_mut().max_frame_length(usize::MAX);
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -613,7 +631,12 @@ pub async fn main() {
             .filter_map(|r| futures::future::ready(r.ok()))
             .map(tarpc::server::BaseChannel::with_defaults)
             // Limit channels to 1 per IP.
-            .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
+            .max_channels_per_key(1, |t| {
+                t.transport()
+                    .peer_addr()
+                    .map(|address| address.ip())
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            })
             // serve is generated by the service attribute. It takes as input any type implementing
             // the generated World trait.
             .map(|channel| channel.execute(state_clone.clone().serve()).for_each(spawn))
@@ -648,12 +671,20 @@ pub async fn main() {
 mod tests {
     use argonc::{compile::CellArg, parse};
 
-    use super::cell_arg_from_expr;
+    use super::parse_setting;
 
     #[test]
     fn open_cell_accepts_boolean_literals() {
         let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
-        let arg = cell_arg_from_expr(&call.args.posargs[0]).expect("boolean should convert");
+        let arg = CellArg::from_literal(&call.args.posargs[0]).expect("boolean should convert");
         assert!(matches!(arg, CellArg::Bool(true)));
+    }
+
+    #[test]
+    fn setting_requires_a_key_and_value() {
+        assert_eq!(parse_setting("grid 10"), Some(("grid", "10")));
+        assert_eq!(parse_setting("grid   10 20"), Some(("grid", "10 20")));
+        assert_eq!(parse_setting("grid"), None);
+        assert_eq!(parse_setting("grid   "), None);
     }
 }

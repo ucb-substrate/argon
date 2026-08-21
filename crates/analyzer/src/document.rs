@@ -64,9 +64,4 @@ impl Document {
     pub(crate) fn contents(&self) -> &str {
         self.contents.text()
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn version(&self) -> i32 {
-        self.version
-    }
 }

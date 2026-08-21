@@ -83,13 +83,9 @@ fn run(args: RunArgs) -> Result<()> {
         )
     })?;
     status("Running", &format!("{} in {}", args.cell, library.name));
-    let output = args.output.unwrap_or_else(|| {
-        library
-            .manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("target/argon.bin")
-    });
+    let output = args
+        .output
+        .unwrap_or_else(|| library.target_path("argon.bin"));
     let mut command = compiler_command(&args.library.argonc, &library);
     command
         .arg("--cell")
@@ -99,11 +95,7 @@ fn run(args: RunArgs) -> Result<()> {
         .arg("--output")
         .arg(&output);
     if args.gds {
-        let gds = library
-            .manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("target/argon.gds");
+        let gds = library.target_path("argon.gds");
         command.arg("--gds").arg(gds);
     }
     run_compiler(command)?;
