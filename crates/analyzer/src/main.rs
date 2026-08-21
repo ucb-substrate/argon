@@ -1,14 +1,21 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Args {
-    /// Analyzer RPC port reserved by an Argone SSH session.
-    #[arg(long, hide = true)]
+    /// RPC port for GUI connections. Omit or pass 0 to allocate one automatically.
+    #[arg(long)]
     rpc_port: Option<u16>,
+
+    /// File in which to publish the bound GUI RPC port.
+    #[arg(long)]
+    rpc_info: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() {
-    analyzer::main(Args::parse().rpc_port).await;
+    let args = Args::parse();
+    analyzer::main(args.rpc_port, args.rpc_info).await;
 }

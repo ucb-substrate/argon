@@ -1,6 +1,6 @@
 use std::{
     fmt::Display,
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddr, TcpListener},
     time::Duration,
 };
 
@@ -24,7 +24,7 @@ use tarpc::{
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
-use crate::editor::Editor;
+use crate::{editor::Editor, editor_window_options};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -33,17 +33,10 @@ pub struct SyncLangServerClient {
     app: AsyncApp,
     client: LangServerClient,
     to_exec: Sender<EditorFn>,
-    listen_port: Option<u16>,
-    register_addr: Option<SocketAddr>,
 }
 
 impl SyncLangServerClient {
-    pub fn new(
-        app: AsyncApp,
-        lang_server_addr: SocketAddr,
-        listen_port: Option<u16>,
-        register_addr: Option<SocketAddr>,
-    ) -> (Self, Receiver<EditorFn>) {
+    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, Receiver<EditorFn>) {
         let client = app.background_executor().block(
             async move {
                 let mut transport =
@@ -61,28 +54,39 @@ impl SyncLangServerClient {
                 app,
                 client,
                 to_exec,
-                listen_port,
-                register_addr,
             },
             rx,
         )
     }
 
-    pub fn register_server(&self) {
+    pub fn register_server(
+        &self,
+        configured_port: Option<u16>,
+        prebound_listener: Option<TcpListener>,
+        register_addr: Option<SocketAddr>,
+    ) {
         let background_executor = self.app.background_executor().clone();
-        let configured_port = self.listen_port;
         let mut listener = self.app.background_executor().block(
             async move {
-                let port = configured_port.unwrap_or(0);
-                match tarpc::serde_transport::tcp::listen(
-                    (Ipv4Addr::LOCALHOST, port),
-                    Json::default,
-                )
-                .await
-                {
+                let result = if let Some(listener) = prebound_listener {
+                    match listener
+                        .set_nonblocking(true)
+                        .and_then(|_| tokio::net::TcpListener::from_std(listener))
+                    {
+                        Ok(listener) => {
+                            tarpc::serde_transport::tcp::listen_on(listener, Json::default).await
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    let port = configured_port.unwrap_or(0);
+                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default)
+                        .await
+                };
+                match result {
                     Ok(listener) => listener,
                     Err(error) => {
-                        error!("Failed to bind GUI RPC server to port {port}: {error}");
+                        error!("Failed to start GUI RPC server: {error}");
                         std::process::exit(1);
                     }
                 }
@@ -90,7 +94,7 @@ impl SyncLangServerClient {
             .compat(),
         );
         let server_addr = listener.local_addr();
-        let register_addr = self.register_addr.unwrap_or(server_addr);
+        let register_addr = register_addr.unwrap_or(server_addr);
         let to_exec = self.to_exec.clone();
         self.app
             .background_executor()
@@ -377,8 +381,14 @@ impl Gui for GuiServer {
 
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
         self.to_exec
-            .send(Box::new(|_, cx| {
+            .send(Box::new(|editor, cx| {
+                let editor = editor.clone();
                 let _ = cx.update(|cx| {
+                    if cx.windows().is_empty() {
+                        let _ = cx.open_window(editor_window_options(), |window, cx| {
+                            window.replace_root(cx, |_, _| editor)
+                        });
+                    }
                     cx.activate(true);
                 });
             }))

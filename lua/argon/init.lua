@@ -89,6 +89,12 @@ M.start = function(bufnr)
             tostring(vim.g.argon_analyzer_rpc_port),
         })
     end
+    if vim.g.argon_analyzer_rpc_info then
+        vim.list_extend(analyzer_cmd, {
+            '--rpc-info',
+            tostring(vim.g.argon_analyzer_rpc_info),
+        })
+    end
     local lsp_start_config = { 
         name = 'argon',
         cmd = analyzer_cmd,

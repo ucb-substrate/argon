@@ -322,14 +322,11 @@ impl Editor {
         window: &mut Window,
         lang_server_addr: SocketAddr,
         gui_listen_port: Option<u16>,
+        gui_listener: Option<std::net::TcpListener>,
         gui_register_addr: Option<SocketAddr>,
     ) -> Self {
-        let (lang_server_client, mut rx) = SyncLangServerClient::new(
-            cx.to_async(),
-            lang_server_addr,
-            gui_listen_port,
-            gui_register_addr,
-        );
+        let (lang_server_client, mut rx) =
+            SyncLangServerClient::new(cx.to_async(), lang_server_addr);
         let solved_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
@@ -390,7 +387,7 @@ impl Editor {
                 }
             })
             .detach();
-        lang_server_client.register_server();
+        lang_server_client.register_server(gui_listen_port, gui_listener, gui_register_addr);
 
         editor
     }

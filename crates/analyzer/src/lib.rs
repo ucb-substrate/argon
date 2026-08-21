@@ -2,6 +2,8 @@ pub mod document;
 pub mod rpc;
 
 use std::{
+    fs,
+    io::Write,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -476,7 +478,7 @@ impl Backend {
 
         tokio::spawn(async move {
             match Command::new("argone")
-                .arg("__gui")
+                .arg("gui")
                 .arg(format!("{}", state.server_addr))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -578,7 +580,33 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
-pub async fn main(rpc_port: Option<u16>) {
+struct RpcInfoFile(PathBuf);
+
+impl Drop for RpcInfoFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn publish_rpc_port(path: PathBuf, port: u16) -> std::io::Result<RpcInfoFile> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    writeln!(file, "{port}")?;
+    file.sync_all()?;
+    fs::rename(&temporary, &path).inspect_err(|_| {
+        let _ = fs::remove_file(&temporary);
+    })?;
+    Ok(RpcInfoFile(path))
+}
+
+pub async fn main(rpc_port: Option<u16>, rpc_info: Option<PathBuf>) {
     // Start server for communication with GUI.
     let port = rpc_port.unwrap_or(0);
     let mut listener =
@@ -591,6 +619,20 @@ pub async fn main(rpc_port: Option<u16>) {
             }
         };
     let server_addr = listener.local_addr();
+    let _rpc_info = if let Some(path) = rpc_info {
+        match publish_rpc_port(path.clone(), server_addr.port()) {
+            Ok(info) => Some(info),
+            Err(error) => {
+                eprintln!(
+                    "failed to publish analyzer RPC port to `{}`: {error}",
+                    path.display()
+                );
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     // Construct actual LSP server.
     let stdin = tokio::io::stdin();
@@ -656,9 +698,11 @@ pub async fn main(rpc_port: Option<u16>) {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::SystemTime};
+
     use argonc::{compile::CellArg, parse};
 
-    use super::parse_setting;
+    use super::{parse_setting, publish_rpc_port};
 
     #[test]
     fn open_cell_accepts_boolean_literals() {
@@ -673,5 +717,18 @@ mod tests {
         assert_eq!(parse_setting("grid   10 20"), Some(("grid", "10 20")));
         assert_eq!(parse_setting("grid"), None);
         assert_eq!(parse_setting("grid   "), None);
+    }
+
+    #[test]
+    fn rpc_info_is_published_and_removed_with_its_guard() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("argon-analyzer-rpc-{nonce}"));
+        let guard = publish_rpc_port(path.clone(), 43210).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "43210\n");
+        drop(guard);
+        assert!(!path.exists());
     }
 }
