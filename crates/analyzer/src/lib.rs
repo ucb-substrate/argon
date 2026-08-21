@@ -63,7 +63,11 @@ pub struct StateMut {
     editor_files: IndexMap<Uri, Document>,
 }
 
-fn compile_error_messages(output: &CompileOutput) -> Vec<String> {
+/// Errors that actually prevent the GUI from displaying a compiled cell.
+/// Execution diagnostics may still contain usable output (most notably an
+/// underconstrained cell with initial-condition fallbacks), so those are
+/// published as diagnostics without also claiming that the cell did not open.
+fn blocking_compile_error_messages(output: &CompileOutput) -> Vec<String> {
     match output {
         CompileOutput::FatalParseErrors => {
             vec!["fatal parse errors encountered, unable to compile".to_string()]
@@ -73,6 +77,7 @@ fn compile_error_messages(output: &CompileOutput) -> Vec<String> {
             .iter()
             .map(|error| error.kind.to_string())
             .collect(),
+        CompileOutput::ExecErrors(output) if output.output.is_some() => Vec::new(),
         CompileOutput::ExecErrors(output) => output
             .errors
             .iter()
@@ -274,7 +279,7 @@ impl StateMut {
         };
         self.compile_output = o;
         if !update && let Some(output) = &self.compile_output {
-            for message in compile_error_messages(output) {
+            for message in blocking_compile_error_messages(output) {
                 client
                     .show_message(
                         MessageType::ERROR,

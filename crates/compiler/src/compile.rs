@@ -2661,24 +2661,42 @@ impl<'a> ExecPass<'a> {
                 }),
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
-                    p: state.solver.eval_expr(&dim.p).expect("dim p not solved"),
-                    n: state.solver.eval_expr(&dim.n).expect("dim n not solved"),
-                    value: state
-                        .solver
-                        .eval_expr(&dim.value)
-                        .expect("dim value not solved"),
-                    coord: state
-                        .solver
-                        .eval_expr(&dim.coord)
-                        .expect("dim coord not solved"),
-                    pstop: state
-                        .solver
-                        .eval_expr(&dim.pstop)
-                        .expect("dim pstop not solved"),
-                    nstop: state
-                        .solver
-                        .eval_expr(&dim.nstop)
-                        .expect("dim nstop not solved"),
+                    p: (
+                        state.solver.eval_expr(&dim.p).expect("dim p not solved"),
+                        dim.p.clone(),
+                    ),
+                    n: (
+                        state.solver.eval_expr(&dim.n).expect("dim n not solved"),
+                        dim.n.clone(),
+                    ),
+                    value: (
+                        state
+                            .solver
+                            .eval_expr(&dim.value)
+                            .expect("dim value not solved"),
+                        dim.value.clone(),
+                    ),
+                    coord: (
+                        state
+                            .solver
+                            .eval_expr(&dim.coord)
+                            .expect("dim coord not solved"),
+                        dim.coord.clone(),
+                    ),
+                    pstop: (
+                        state
+                            .solver
+                            .eval_expr(&dim.pstop)
+                            .expect("dim pstop not solved"),
+                        dim.pstop.clone(),
+                    ),
+                    nstop: (
+                        state
+                            .solver
+                            .eval_expr(&dim.nstop)
+                            .expect("dim nstop not solved"),
+                        dim.nstop.clone(),
+                    ),
                     horiz: dim.horiz,
                     constraint: dim.constraint,
                     span: dim.span.clone(),
@@ -4819,7 +4837,7 @@ pub struct SolvedInstance {
 pub enum SolvedValue {
     Rect(Rect<(f64, LinearExpr)>),
     Text(Text<f64>),
-    Dimension(Dimension<f64>),
+    Dimension(Dimension<(f64, LinearExpr)>),
     Instance(SolvedInstance),
 }
 
@@ -4985,11 +5003,14 @@ pub fn bbox_text_union(b: Option<Rect<f64>>, t: &Text<f64>) -> Option<Rect<f64>>
     }
 }
 
-pub fn bbox_dim_union(bbox: Option<Rect<f64>>, dim: &Dimension<f64>) -> Option<Rect<f64>> {
-    let perp_max = dim.coord.max(dim.pstop).max(dim.nstop);
-    let perp_min = dim.coord.min(dim.pstop).min(dim.nstop);
-    let par_max = dim.n.max(dim.p);
-    let par_min = dim.n.min(dim.p);
+pub fn bbox_dim_union(
+    bbox: Option<Rect<f64>>,
+    dim: &Dimension<(f64, LinearExpr)>,
+) -> Option<Rect<f64>> {
+    let perp_max = dim.coord.0.max(dim.pstop.0).max(dim.nstop.0);
+    let perp_min = dim.coord.0.min(dim.pstop.0).min(dim.nstop.0);
+    let par_max = dim.n.0.max(dim.p.0);
+    let par_min = dim.n.0.min(dim.p.0);
     let (xmin, xmax, ymin, ymax) = if dim.horiz {
         (par_min, par_max, perp_min, perp_max)
     } else {

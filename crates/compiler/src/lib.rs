@@ -946,6 +946,15 @@ mod tests {
         assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 200., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 100., epsilon = EPSILON);
+        let dimensions = cell
+            .objects
+            .values()
+            .filter_map(|value| value.get_dimension())
+            .collect::<Vec<_>>();
+        assert_eq!(dimensions.len(), 2);
+        assert!(dimensions.iter().all(|dimension| {
+            !dimension.p.1.coeffs.is_empty() && !dimension.n.1.coeffs.is_empty()
+        }));
     }
 
     #[test]

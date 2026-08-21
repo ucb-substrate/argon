@@ -43,6 +43,14 @@ cargo install --git https://github.com/ucb-substrate/argon --locked \
     argonc arc argon-analyzer argone
 ```
 
+To install from a local clone, you can run:
+
+```bash
+for crate in compiler gui arc analyzer; do
+    cargo install --locked --path crates/$crate;
+done
+```
+
 ## Command-line compilation
 
 Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
