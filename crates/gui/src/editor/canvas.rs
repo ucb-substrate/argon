@@ -296,10 +296,29 @@ pub(crate) struct DrawDimToolState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EditDimToolState {
-    pub(crate) dim: Span,
+    pub(crate) dim: Option<Span>,
+    pub(crate) pending: Option<Box<PendingDimension>>,
     pub(crate) original_value: SharedString,
     /// `true` if entered from dimension tool
     pub(crate) dim_mode: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingDimension {
+    pub(crate) scope_span: Span,
+    pub(crate) params: DimensionParams,
+    preview: PendingDimensionPreview,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDimensionPreview {
+    p: f32,
+    n: f32,
+    coord: f32,
+    pstop: f32,
+    nstop: f32,
+    horiz: bool,
+    value: String,
 }
 
 // TODO: potentially re-use compiler provided object IDs
@@ -1179,7 +1198,10 @@ impl Element for CanvasElement {
                                 ToolState::Select(SelectToolState {
                                     selected_obj: Some(selected),
                                 })
-                                | ToolState::EditDim(EditDimToolState { dim: selected, .. })
+                                | ToolState::EditDim(EditDimToolState {
+                                    dim: Some(selected),
+                                    ..
+                                })
                                     if Some(selected) == dim.span.as_ref() =>
                                 {
                                     rgb(0xffff00)
@@ -1187,6 +1209,25 @@ impl Element for CanvasElement {
                                 _ => theme.text,
                             },
                             dim.span.as_ref(),
+                        );
+                    }
+
+                    if let ToolState::EditDim(EditDimToolState {
+                        pending: Some(pending),
+                        ..
+                    }) = &tool
+                    {
+                        let preview = &pending.preview;
+                        draw_dim(
+                            preview.p,
+                            preview.n,
+                            preview.coord,
+                            preview.pstop,
+                            preview.nstop,
+                            preview.horiz,
+                            preview.value.clone(),
+                            rgb(0xffff00),
+                            None,
                         );
                     }
 
@@ -1529,7 +1570,6 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::zero_hierarchy))
             .on_action(cx.listener(Self::one_hierarchy))
             .on_action(cx.listener(Self::all_hierarchy))
-            .on_action(cx.listener(Self::command_action))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
@@ -1794,7 +1834,7 @@ impl LayoutCanvas {
                                                         "inconsistent editor and GUI state".into(),
                                                     ),
                                                     Ok(Some(_)) => None,
-                                                    Err(e) => Some(format!("{e}").into()),
+                                                    Err(_) => None,
                                                 }
                                             } else {
                                                 Some("no cell to edit".into())
@@ -1810,25 +1850,15 @@ impl LayoutCanvas {
                                 rect_tool.p0 = Some(p0);
                             }
                         } else {
-                            let res = state.lang_server_client.show_message(
+                            let _ = state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
-                            if let Err(e) = res {
-                                self.state.update(cx, |state, _cx| {
-                                    state.fatal_error = Some(format!("{e}").into());
-                                });
-                            }
                         }
                     } else {
-                        let res = state
+                        let _ = state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
-                        if let Err(e) = res {
-                            self.state.update(cx, |state, _cx| {
-                                state.fatal_error = Some(format!("{e}").into());
-                            });
-                        }
                     }
                 }
                 ToolState::DrawDim(dim_tool) => {
@@ -2015,7 +2045,7 @@ impl LayoutCanvas {
                     if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
                         let selected_scope_addr = cell.state[&cell.selected_scope].address;
 
-                        let span_value = if dim_tool.edges.len() == 1
+                        let pending = if dim_tool.edges.len() == 1
                             && let DimEdge::Edge(edge) = &dim_tool.edges[0]
                         {
                             let (left, right, coord, horiz) = match edge.2.dir {
@@ -2023,12 +2053,9 @@ impl LayoutCanvas {
                                 Dir::Vert => ("y0", "y1", layout_mouse_position.x, "false"),
                             };
 
-                            let value = format!("{:?}", edge.2.stop - edge.2.start);
-                            let res = state.lang_server_client.draw_dimension(
-                                cell.output.cells[&selected_scope_addr.cell].scopes
-                                    [&selected_scope_addr.scope]
-                                    .span
-                                    .clone(),
+                            let distance = edge.2.stop - edge.2.start;
+                            let value = format!("{distance:?}");
+                            Some((
                                 DimensionParams {
                                     p: format!("{}.{}", edge.0, right),
                                     n: format!("{}.{}", edge.0, left),
@@ -2042,18 +2069,17 @@ impl LayoutCanvas {
                                     nstop: format!("{}.{}", edge.0, edge.1),
                                     horiz: horiz.to_string(),
                                 },
-                            );
-                            if let Some(error) = match &res {
-                                Ok(None) => Some("inconsistent editor and GUI state".into()),
-                                Ok(Some(_)) => None,
-                                Err(e) => Some(format!("{e}").into()),
-                            } {
-                                self.state.update(cx, |state, _cx| {
-                                    state.fatal_error = Some(error);
-                                });
-                            }
-
-                            res.unwrap_or_default().map(|span| (span, value))
+                                value,
+                                PendingDimensionPreview {
+                                    p: edge.2.stop,
+                                    n: edge.2.start,
+                                    coord,
+                                    pstop: edge.2.coord,
+                                    nstop: edge.2.coord,
+                                    horiz: edge.2.dir == Dir::Horiz,
+                                    value: format!("{distance:.3}"),
+                                },
+                            ))
                         } else if dim_tool.edges.len() == 2 {
                             match (&dim_tool.edges[0], &dim_tool.edges[1]) {
                                 (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
@@ -2077,12 +2103,9 @@ impl LayoutCanvas {
                                     } else {
                                         format!("- {}", intended_coord - coord)
                                     };
-                                    let value = format!("{:?}", right.2.coord - left.2.coord);
-                                    let res = state.lang_server_client.draw_dimension(
-                                        cell.output.cells[&selected_scope_addr.cell].scopes
-                                            [&selected_scope_addr.scope]
-                                            .span
-                                            .clone(),
+                                    let distance = right.2.coord - left.2.coord;
+                                    let value = format!("{distance:?}");
+                                    Some((
                                         DimensionParams {
                                             p: format!("{}.{}", right.0, right.1,),
                                             n: format!("{}.{}", left.0, left.1),
@@ -2108,20 +2131,17 @@ impl LayoutCanvas {
                                             ),
                                             horiz: horiz.to_string(),
                                         },
-                                    );
-                                    if let Some(error) = match &res {
-                                        Ok(None) => {
-                                            Some("inconsistent editor and GUI state".into())
-                                        }
-                                        Ok(Some(_)) => None,
-                                        Err(e) => Some(format!("{e}").into()),
-                                    } {
-                                        self.state.update(cx, |state, _cx| {
-                                            state.fatal_error = Some(error);
-                                        });
-                                    }
-
-                                    res.unwrap_or_default().map(|span| (span, value))
+                                        value,
+                                        PendingDimensionPreview {
+                                            p: right.2.coord,
+                                            n: left.2.coord,
+                                            coord,
+                                            pstop: (right.2.start + right.2.stop) / 2.,
+                                            nstop: (left.2.start + left.2.stop) / 2.,
+                                            horiz: left.2.dir == Dir::Vert,
+                                            value: format!("{distance:.3}"),
+                                        },
+                                    ))
                                 }
                                 (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                 | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
@@ -2144,13 +2164,29 @@ impl LayoutCanvas {
                                         edge.0, start, edge.0, stop,
                                     );
                                     let coord = format!("{pnstop} {coord_offset}");
-                                    let (p, n, value, pstop, nstop) = if edge.2.coord < 0. {
+                                    let (p, n, value, pstop, nstop, preview) = if edge.2.coord < 0.
+                                    {
                                         (
                                             "0.".to_string(),
                                             format!("{}.{}", edge.0, edge.1),
                                             format!("{:?}", -edge.2.coord),
                                             coord.clone(),
                                             pnstop,
+                                            PendingDimensionPreview {
+                                                p: 0.,
+                                                n: edge.2.coord,
+                                                coord: match edge.2.dir {
+                                                    Dir::Vert => layout_mouse_position.y,
+                                                    Dir::Horiz => layout_mouse_position.x,
+                                                },
+                                                pstop: match edge.2.dir {
+                                                    Dir::Vert => layout_mouse_position.y,
+                                                    Dir::Horiz => layout_mouse_position.x,
+                                                },
+                                                nstop: intended_coord,
+                                                horiz: edge.2.dir == Dir::Vert,
+                                                value: format!("{:.3}", -edge.2.coord),
+                                            },
                                         )
                                     } else {
                                         (
@@ -2159,13 +2195,24 @@ impl LayoutCanvas {
                                             format!("{:?}", edge.2.coord),
                                             pnstop,
                                             coord.clone(),
+                                            PendingDimensionPreview {
+                                                p: edge.2.coord,
+                                                n: 0.,
+                                                coord: match edge.2.dir {
+                                                    Dir::Vert => layout_mouse_position.y,
+                                                    Dir::Horiz => layout_mouse_position.x,
+                                                },
+                                                pstop: intended_coord,
+                                                nstop: match edge.2.dir {
+                                                    Dir::Vert => layout_mouse_position.y,
+                                                    Dir::Horiz => layout_mouse_position.x,
+                                                },
+                                                horiz: edge.2.dir == Dir::Vert,
+                                                value: format!("{:.3}", edge.2.coord),
+                                            },
                                         )
                                     };
-                                    let res = state.lang_server_client.draw_dimension(
-                                        cell.output.cells[&selected_scope_addr.cell].scopes
-                                            [&selected_scope_addr.scope]
-                                            .span
-                                            .clone(),
+                                    Some((
                                         DimensionParams {
                                             p,
                                             n,
@@ -2175,29 +2222,27 @@ impl LayoutCanvas {
                                             nstop,
                                             horiz: horiz.to_string(),
                                         },
-                                    );
-                                    if let Some(error) = match &res {
-                                        Ok(None) => {
-                                            Some("inconsistent editor and GUI state".into())
-                                        }
-                                        Ok(Some(_)) => None,
-                                        Err(e) => Some(format!("{e}").into()),
-                                    } {
-                                        self.state.update(cx, |state, _cx| {
-                                            state.fatal_error = Some(error);
-                                        });
-                                    }
-
-                                    res.unwrap_or_default().map(|span| (span, value))
+                                        value,
+                                        preview,
+                                    ))
                                 }
                                 _ => unreachable!(),
                             }
                         } else {
                             None
                         };
-                        if let Some((span, value)) = span_value {
+                        if let Some((params, value, preview)) = pending {
+                            let scope_span = cell.output.cells[&selected_scope_addr.cell].scopes
+                                [&selected_scope_addr.scope]
+                                .span
+                                .clone();
                             *tool = ToolState::EditDim(EditDimToolState {
-                                dim: span,
+                                dim: None,
+                                pending: Some(Box::new(PendingDimension {
+                                    scope_span,
+                                    params,
+                                    preview,
+                                })),
                                 original_value: SharedString::from(value),
                                 dim_mode: true,
                             });
@@ -2246,18 +2291,11 @@ impl LayoutCanvas {
                                 self.sse_delta = Point::default();
                                 self.sse_targets = body.targets;
                             }
-                            if let Err(e) = self
+                            let _ = self
                                 .state
                                 .read(cx)
                                 .lang_server_client
-                                .select_rect(span.clone())
-                            {
-                                self.state.update(cx, |state, cx| {
-                                    state.fatal_error =
-                                        Some(format!("Editing disabled due to error {e}").into());
-                                    cx.notify();
-                                });
-                            }
+                                .select_rect(span.clone());
                         } else {
                             select_tool.selected_obj = None;
                         }
@@ -2337,7 +2375,8 @@ impl LayoutCanvas {
             let obj = obj.clone();
             self.state.read(cx).tool.clone().update(cx, |tool, _cx| {
                 *tool = ToolState::EditDim(EditDimToolState {
-                    dim: obj.clone(),
+                    dim: Some(obj.clone()),
+                    pending: None,
                     dim_mode: false,
                     original_value: value.clone(),
                 })
@@ -2348,17 +2387,6 @@ impl LayoutCanvas {
             window.prevent_default();
             cx.notify();
         }
-    }
-
-    pub(crate) fn command_action(
-        &mut self,
-        _: &Command,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        window.focus(&self.text_input_focus_handle);
-        window.prevent_default();
-        cx.notify();
     }
 
     pub(crate) fn zero_hierarchy(
@@ -2571,14 +2599,10 @@ impl LayoutCanvas {
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
-                    Err(e) => {
+                    Err(_) => {
                         self.is_sse_dragging = false;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
-                        self.state.update(cx, |state, cx| {
-                            state.fatal_error = Some(format!("Failed to persist drag: {e}").into());
-                            cx.notify();
-                        });
                     }
                 }
             }

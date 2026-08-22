@@ -54,6 +54,7 @@ pub trait LangServer {
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
+    async fn focus_editor(command_bar: bool);
 }
 
 #[tarpc::service]
@@ -491,6 +492,21 @@ impl LangServer for State {
                 .show_message(
                     MessageType::ERROR,
                     format!("Could not dispatch editor action: {error}"),
+                )
+                .await;
+        }
+    }
+
+    async fn focus_editor(self, _: tarpc::context::Context, command_bar: bool) {
+        if let Err(error) = self
+            .editor_client
+            .send_request::<crate::FocusEditor>(command_bar)
+            .await
+        {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not focus the editor: {error}"),
                 )
                 .await;
         }

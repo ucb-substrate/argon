@@ -81,15 +81,10 @@ impl Render for ToolBar {
                         "icons/arrow-rotate-left-solid-full.svg",
                         Box::new(|_| false),
                         Arc::new(|state, cx| {
-                            if let Err(e) = state
+                            let _ = state
                                 .read(cx)
                                 .lang_server_client
-                                .dispatch_action(LangServerAction::Undo)
-                            {
-                                state.update(cx, |state, _cx| {
-                                    state.fatal_error = Some(format!("{e}").into());
-                                });
-                            }
+                                .dispatch_action(LangServerAction::Undo);
                         }),
                     )),
                     Some((
@@ -97,15 +92,10 @@ impl Render for ToolBar {
                         "icons/arrow-rotate-right-solid-full.svg",
                         Box::new(|_| false),
                         Arc::new(|state, cx| {
-                            if let Err(e) = state
+                            let _ = state
                                 .read(cx)
                                 .lang_server_client
-                                .dispatch_action(LangServerAction::Redo)
-                            {
-                                state.update(cx, |state, _cx| {
-                                    state.fatal_error = Some(format!("{e}").into());
-                                });
-                            }
+                                .dispatch_action(LangServerAction::Redo);
                         }),
                     )),
                     None,

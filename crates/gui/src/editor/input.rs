@@ -35,7 +35,7 @@ pub(crate) struct TextInput {
 }
 
 impl TextInput {
-    pub(crate) fn new_command_prompt(
+    pub(crate) fn new_dimension_input(
         cx: &mut Context<Self>,
         focus_handle: FocusHandle,
         state: &Entity<EditorState>,
@@ -45,7 +45,7 @@ impl TextInput {
             focus_handle,
             canvas_focus_handle: canvas.focus_handle(cx),
             content: "".into(),
-            placeholder: "Enter command...".into(),
+            placeholder: "Dimension value...".into(),
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -53,8 +53,8 @@ impl TextInput {
             last_bounds: None,
             is_selecting: false,
             state: state.clone(),
-            enter_handler: Self::command_prompt_enter,
-            cancel_handler: Self::command_prompt_cancel,
+            enter_handler: Self::dimension_enter,
+            cancel_handler: Self::dimension_cancel,
             px: 8.,
         }
     }
@@ -241,61 +241,59 @@ impl TextInput {
         window.focus(&self.canvas_focus_handle);
     }
 
-    fn command_prompt_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+    fn dimension_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
-        self.state.read(cx).tool.clone().update(cx, |tool, _cx| {
-            if let ToolState::EditDim(_) = tool {
-                *tool = ToolState::default();
-            }
+        let tool = self.state.read(cx).tool.clone();
+        tool.update(cx, |tool, _cx| {
+            *tool = match tool {
+                ToolState::EditDim(EditDimToolState { dim_mode: true, .. }) => {
+                    ToolState::DrawDim(DrawDimToolState::default())
+                }
+                ToolState::EditDim(_) => ToolState::default(),
+                _ => tool.clone(),
+            };
         });
+        self.reset();
+        cx.notify();
     }
 
-    fn command_prompt_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    fn dimension_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         let reset = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
-            if let ToolState::EditDim(EditDimToolState { dim, dim_mode, .. }) = tool {
-                let error = match self
-                    .state
-                    .read(cx)
-                    .lang_server_client
-                    .edit_dimension(dim.clone(), self.content.to_string())
-                {
-                    Ok(None) => Some("inconsistent editor and GUI state".into()),
-                    Ok(Some(_)) => None,
-                    Err(e) => Some(format!("{e}").into()),
-                };
-                if let Some(error) = error {
-                    self.state.update(cx, |state, _cx| {
-                        state.fatal_error = Some(error);
-                    });
-                    false
+            if let ToolState::EditDim(EditDimToolState {
+                dim,
+                pending,
+                dim_mode,
+                ..
+            }) = tool
+            {
+                let client = &self.state.read(cx).lang_server_client;
+                let result = if let Some(pending) = pending {
+                    let mut params = pending.params.clone();
+                    params.value = self.content.to_string();
+                    client.draw_dimension(pending.scope_span.clone(), params)
+                } else if let Some(dim) = dim {
+                    client.edit_dimension(dim.clone(), self.content.to_string())
                 } else {
-                    *tool = if *dim_mode {
-                        ToolState::DrawDim(DrawDimToolState::default())
-                    } else {
-                        ToolState::default()
-                    };
-                    true
+                    Ok(None)
+                };
+                match result {
+                    Ok(None) => {
+                        self.state.update(cx, |state, _cx| {
+                            state.fatal_error = Some("inconsistent editor and GUI state".into());
+                        });
+                        false
+                    }
+                    Ok(Some(_)) => {
+                        *tool = if *dim_mode {
+                            ToolState::DrawDim(DrawDimToolState::default())
+                        } else {
+                            ToolState::default()
+                        };
+                        true
+                    }
+                    Err(_) => false,
                 }
             } else {
-                if let Some((command, rest)) = self.content.split_once(" ") {
-                    #[allow(clippy::single_match)]
-                    match command.trim_start_matches(":") {
-                        "openCell" => {
-                            let res = self
-                                .state
-                                .read(cx)
-                                .lang_server_client
-                                .open_cell(rest.to_string());
-                            if let Err(e) = &res {
-                                self.state.update(cx, |state, _cx| {
-                                    state.fatal_error = Some(format!("{e}").into());
-                                });
-                            }
-                            return res.is_ok();
-                        }
-                        _ => {} // TODO: support other commands, reduce redundancy with rpc.rs
-                    }
-                }
                 false
             }
         });

@@ -4,6 +4,18 @@ local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
 
+local function focus_gui()
+    client.any_buf_request('custom/startGui', nil, client.print_error)
+end
+
+for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
+    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus_gui, {
+        desc = 'Focus Argon GUI',
+        silent = true,
+        nowait = true,
+    })
+end
+
 ---LSP restart internal implementations
 ---@param bufnr? number The buffer number, defaults to the current buffer
 ---@param filter? vim.lsp.get_clients.Filter
@@ -133,6 +145,20 @@ M.start = function(bufnr)
                     end)
                 end
 
+                return vim.NIL
+            end,
+            ['custom/focusEditor'] = function(err, command_bar, ctx)
+                if err then
+                    client.print_error(err)
+                    return vim.NIL
+                end
+                if command_bar then
+                    vim.schedule(function()
+                        local mode = vim.api.nvim_get_mode().mode
+                        local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
+                        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
+                    end)
+                end
                 return vim.NIL
             end,
         },
