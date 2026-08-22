@@ -24,6 +24,11 @@ local argon_command_tbl = {
       gui.open_cell(table.concat(args, " "))
     end,
   },
+  inst = {
+    impl = function(args, opts)
+      gui.instantiate(table.concat(args, " "))
+    end,
+  },
   set = {
     impl = function(args, opts)
       gui.set(table.concat(args, " "))

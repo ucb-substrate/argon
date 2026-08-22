@@ -13,14 +13,14 @@ use arc::Library;
 use argonc::{
     ast::{Span, WorkspaceAst},
     compile::{
-        self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
+        self, Arrayed, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
         StaticErrorCompileOutput, VarIdTyMetadata,
     },
     parse::{self, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
-use rpc::{GuiClient, LangServer};
+use rpc::{GuiClient, InstancePreview, LangServer, insert_statement};
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Json};
 use tokio::{
@@ -456,6 +456,45 @@ struct SetParams {
     kv: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstantiateParams {
+    cell: String,
+    text_document: TextDocumentIdentifier,
+    position: Position,
+}
+
+const PREVIEW_BINDING_PREFIX: &str = "__argon_preview_instance";
+
+fn innermost_scope_at(ast: &parse::AnnotatedParseAst, offset: usize) -> Option<Span> {
+    ast.span2scope
+        .keys()
+        .filter(|span| span.span.start() <= offset && offset <= span.span.end())
+        .min_by_key(|span| span.span.end() - span.span.start())
+        .cloned()
+}
+
+fn preview_instance_cell(
+    output: &compile::CompiledData,
+    preview_binding: &str,
+) -> Option<compile::CellId> {
+    output.cells.values().find_map(|cell| {
+        cell.scopes.values().find_map(|scope| {
+            scope.bindings.values().find_map(|(name, objects)| {
+                if name != preview_binding {
+                    return None;
+                }
+                let Arrayed::Elem(object) = objects else {
+                    return None;
+                };
+                cell.objects[object]
+                    .get_instance()
+                    .map(|instance| instance.cell)
+            })
+        })
+    })
+}
+
 impl Backend {
     async fn start_gui(&self) -> Result<()> {
         let mut state_mut = self.state.state_mut.lock().await;
@@ -560,6 +599,201 @@ impl Backend {
         Ok(())
     }
 
+    async fn instantiate(&self, params: InstantiateParams) -> Result<()> {
+        let state_mut = self.state.state_mut.lock().await;
+        if !rpc::editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return Ok(());
+        }
+        let Some(path) = params.text_document.uri.to_file_path() else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The current buffer is not a local Argon file",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some((module_path, ast)) = state_mut
+            .ast
+            .iter()
+            .find(|(_, ast)| ast.path == path)
+            .map(|(module_path, ast)| (module_path.clone(), ast.clone()))
+        else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The current file is not part of this Argon workspace",
+                )
+                .await;
+            return Ok(());
+        };
+        let document = Document::new(&ast.text, 0);
+        let Some(offset) = document.pos_to_offset(params.position) else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "The editor cursor position is invalid")
+                .await;
+            return Ok(());
+        };
+        let Some(scope_span) = innermost_scope_at(&ast, offset) else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Run `:Argon inst` from inside a cell scope",
+                )
+                .await;
+            return Ok(());
+        };
+        let scope = &ast.span2scope[&scope_span];
+        let preview_binding = (0..)
+            .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
+            .find(|name| {
+                state_mut
+                    .ast
+                    .values()
+                    .all(|ast| !ast.text.contains(name.as_str()))
+            })
+            .expect("an unused preview binding always exists");
+        let statement = format!("let {preview_binding} = inst({});", params.cell);
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &statement,
+            0..statement.len(),
+        );
+        let mut preview_source = ast.text.to_string();
+        preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
+        let preview_module =
+            match parse::parse_source_text(preview_source, path.clone().into_owned()) {
+                Ok(ast) => ast,
+                Err(error) => {
+                    self.state
+                        .editor_client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("Could not instantiate `{}`: {error}", params.cell),
+                        )
+                        .await;
+                    return Ok(());
+                }
+            };
+        let mut preview_ast = state_mut.ast.clone();
+        preview_ast.insert(module_path, preview_module);
+        let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Could not analyze the preview instance")
+                .await;
+            return Ok(());
+        };
+        if !static_output.errors.is_empty() {
+            let message = static_output
+                .errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not instantiate `{}`: {message}", params.cell),
+                )
+                .await;
+            return Ok(());
+        }
+        let Some(open_cell) = state_mut.cell.clone() else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
+                .await;
+            return Ok(());
+        };
+        let Some(lyp) = state_mut
+            .config
+            .as_ref()
+            .and_then(|config| config.lyp.clone())
+        else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The Argon library does not configure an LYP file",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(compiled) =
+            compile_open_cell(&typed_ast, &open_cell, &lyp, &self.state.editor_client).await
+        else {
+            return Ok(());
+        };
+        let output = match compiled {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(output),
+                errors,
+            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
+            output => {
+                let messages = blocking_compile_error_messages(&output).join("\n");
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not instantiate `{}`: {messages}", params.cell),
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        let Some(cell) = preview_instance_cell(&output, &preview_binding) else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The preview scope did not execute while compiling the open cell",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(gui_client) = state_mut.gui_client.clone() else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Start the Argon GUI before placing an instance",
+                )
+                .await;
+            return Ok(());
+        };
+        let preview = InstancePreview {
+            output,
+            cell,
+            invocation: params.cell,
+            scope_span,
+        };
+        drop(state_mut);
+        if let Err(error) = gui_client.place_instance(context::current(), preview).await {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not contact the GUI: {error}"),
+                )
+                .await;
+        }
+        Ok(())
+    }
+
     async fn set(&self, params: SetParams) -> Result<()> {
         let Some((key, value)) = parse_setting(&params.kv) else {
             self.state
@@ -643,6 +877,7 @@ pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
     })
     .custom_method("custom/startGui", Backend::start_gui)
     .custom_method("custom/openCell", Backend::open_cell)
+    .custom_method("custom/inst", Backend::instantiate)
     .custom_method("custom/set", Backend::set)
     .finish();
     let Some(state) = ext_state else {
@@ -691,9 +926,12 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
 
-    use argonc::{compile::CellArg, parse};
+    use argonc::{
+        compile::{self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput},
+        parse,
+    };
 
-    use super::parse_setting;
+    use super::{parse_setting, preview_instance_cell};
 
     #[test]
     fn open_cell_accepts_boolean_literals() {
@@ -708,6 +946,43 @@ mod tests {
         assert_eq!(parse_setting("grid   10 20"), Some(("grid", "10 20")));
         assert_eq!(parse_setting("grid"), None);
         assert_eq!(parse_setting("grid   "), None);
+    }
+
+    #[test]
+    fn preview_instance_can_use_a_value_from_its_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            "cell child(width: Float) {}\n\
+             cell top(width: Float) {\n\
+                 let preview_binding = inst(child(width));\n\
+             }\n",
+        )
+        .unwrap();
+        let ast = parse::parse_workspace_with_std(&source_path).ast();
+        let (typed, errors) = compile::static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = compile::dynamic_compile(
+            &typed,
+            CompileInput {
+                cell: &["top"],
+                args: vec![CellArg::Float(42.)],
+                lyp_file: &lyp,
+            },
+        );
+        let output = match output {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(output),
+                ..
+            }) => output,
+            output => panic!("preview should compile: {output:?}"),
+        };
+
+        assert!(preview_instance_cell(&output, "preview_binding").is_some());
     }
 
     #[cfg(unix)]

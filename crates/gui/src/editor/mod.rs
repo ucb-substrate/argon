@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
 };
 
+use analyzer::rpc::InstancePreview;
 use analyzer::rpc::LangServerAction;
 use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
@@ -431,6 +432,11 @@ impl Editor {
                 });
             });
         }
+    }
+
+    pub fn place_instance(&self, cx: &mut App, preview: InstancePreview) {
+        self.canvas
+            .update(cx, |canvas, cx| canvas.place_instance(preview, cx));
     }
 
     fn on_mouse_move(

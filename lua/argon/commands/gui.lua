@@ -15,6 +15,20 @@ function M.open_cell(cell)
     end
 end
 
+function M.instantiate(cell)
+    local bufnr = vim.api.nvim_get_current_buf()
+    local client_found = false
+    for _, lsp_client in ipairs(client.get_active_argon_lsp_clients(bufnr)) do
+        local params = vim.lsp.util.make_position_params(0, lsp_client.offset_encoding)
+        params.cell = cell
+        lsp_client:request('custom/inst', params, client.print_error, bufnr)
+        client_found = true
+    end
+    if not client_found then
+        vim.notify('No Argon language server is attached to this buffer', vim.log.levels.ERROR)
+    end
+end
+
 function M.set(kv)
     client.buf_request(0, "custom/set", {
         kv = kv

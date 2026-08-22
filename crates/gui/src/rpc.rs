@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use analyzer::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient, ValueEdit};
+use analyzer::rpc::{
+    DimensionParams, Gui, InstancePreview, LangServerAction, LangServerClient, ValueEdit,
+};
 use anyhow::{Result, anyhow};
 use argonc::{
     ast::Span,
@@ -265,6 +267,24 @@ impl SyncLangServerClient {
         })
     }
 
+    pub fn place_instance(
+        &self,
+        scope_span: Span,
+        invocation: String,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<Span>> {
+        self.call(move |client| {
+            let scope_span = scope_span.clone();
+            let invocation = invocation.clone();
+            async move {
+                client
+                    .place_instance(context::current(), scope_span, invocation, x, y)
+                    .await
+            }
+        })
+    }
+
     pub fn draw_dimension(
         &self,
         scope_span: Span,
@@ -345,6 +365,18 @@ impl Gui for GuiServer {
                     if !update {
                         focus::activate_gui(cx);
                     }
+                });
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn place_instance(mut self, _: context::Context, preview: InstancePreview) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.place_instance(cx, preview);
+                    focus::activate_gui(cx);
                 });
             }))
             .await
