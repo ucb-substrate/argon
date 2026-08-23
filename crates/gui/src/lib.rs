@@ -157,6 +157,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("r", DrawRect, Some("LayoutCanvas")),
         KeyBinding::new("s", SelectMode, Some("LayoutCanvas")),
         KeyBinding::new("d", DrawDim, Some("LayoutCanvas")),
+        KeyBinding::new("i", InstantiateCommand, Some("LayoutCanvas")),
+        KeyBinding::new("o", OpenCellCommand, Some("LayoutCanvas")),
         KeyBinding::new("f", Fit, Some("LayoutCanvas")),
         KeyBinding::new("q", Edit, Some("LayoutCanvas")),
         KeyBinding::new("u", Undo, Some("LayoutCanvas")),
@@ -215,6 +217,8 @@ mod tests {
         undo_count: usize,
         draw_rect_count: usize,
         command_bar_count: usize,
+        instantiate_count: usize,
+        open_cell_count: usize,
         focus_invoker_count: usize,
     }
 
@@ -228,6 +232,10 @@ mod tests {
                         view.command_bar_count += 1
                     }),
                 )
+                .on_action(
+                    cx.listener(|view, _: &InstantiateCommand, _, _| view.instantiate_count += 1),
+                )
+                .on_action(cx.listener(|view, _: &OpenCellCommand, _, _| view.open_cell_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvoker, _, _| view.focus_invoker_count += 1),
                 )
@@ -255,6 +263,8 @@ mod tests {
                     undo_count: 0,
                     draw_rect_count: 0,
                     command_bar_count: 0,
+                    instantiate_count: 0,
+                    open_cell_count: 0,
                     focus_invoker_count: 0,
                 })
             })
@@ -264,12 +274,14 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r : ctrl-\\");
+        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
                 assert_eq!(view.draw_rect_count, 0);
                 assert_eq!(view.command_bar_count, 1);
+                assert_eq!(view.instantiate_count, 0);
+                assert_eq!(view.open_cell_count, 0);
                 assert_eq!(view.focus_invoker_count, 1);
             })
             .unwrap();
@@ -277,12 +289,14 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r : ctrl-\\");
+        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
                 assert_eq!(view.draw_rect_count, 1);
                 assert_eq!(view.command_bar_count, 2);
+                assert_eq!(view.instantiate_count, 1);
+                assert_eq!(view.open_cell_count, 1);
                 assert_eq!(view.focus_invoker_count, 2);
             })
             .unwrap();

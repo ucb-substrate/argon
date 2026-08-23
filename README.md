@@ -121,11 +121,16 @@ runs only on the local machine.
 Launching Neovim yourself remains supported. In that mode, start or activate
 the GUI by running `:Argon gui`.
 
-To place a cell instance, put the Neovim cursor inside the destination scope
-and run `:Argon inst child(100.)`. Argone solves the cell, attaches a dashed
-outline of its hierarchy to the pointer, and inserts the instance at the layout
-coordinates you click. Arguments may refer to values available in the cursor's
-scope, for example `:Argon inst child(width)`. Press `Esc` to cancel placement.
+To place a cell instance, select the destination scope in Argone and run
+`:Argon inst child(100.)`. Argone solves the cell, attaches a dashed outline of
+its hierarchy to the pointer, and inserts the instance at the layout coordinates
+you click. Arguments may refer to values available in the selected scope, for
+example `:Argon inst child(width)`. If no GUI scope is selected, the scope under
+the Neovim cursor is used as a fallback. Placement remains active after each
+click so multiple instances can be inserted; press `Esc` when finished.
+From the layout canvas, press `i` or click the Instance toolbar button to focus
+Neovim with `:Argon inst ` prefilled. Press `o` or click Open Cell (after the
+Undo/Redo buttons) to prefill `:Argon openCell `.
 
 Run `:Argon diagnostics` to open a compiler-style view of every Argon
 diagnostic in the project, including diagnostics from files other than the

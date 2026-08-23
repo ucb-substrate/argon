@@ -18,6 +18,8 @@ actions!(
         Redo,
         FocusInvoker,
         FocusInvokerCommandBar,
+        InstantiateCommand,
+        OpenCellCommand,
         Cancel,
         Backspace,
         Delete,

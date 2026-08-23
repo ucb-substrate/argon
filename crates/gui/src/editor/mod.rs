@@ -19,7 +19,9 @@ use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
-    actions::{FocusInvoker, FocusInvokerCommandBar, Redo, Undo},
+    actions::{
+        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Undo,
+    },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
     theme::{DARK_THEME, LIGHT_THEME, Theme},
@@ -439,6 +441,23 @@ impl Editor {
             .update(cx, |canvas, cx| canvas.place_instance(preview, cx));
     }
 
+    pub fn selected_scope_span(&self, cx: &App) -> Option<argonc::ast::Span> {
+        let state = self.state.read(cx);
+        let solved = state.solved_cell.read(cx);
+        let solved = solved.as_ref()?;
+        let scope = solved.state.get(&solved.selected_scope)?.address;
+        Some(
+            solved
+                .output
+                .cells
+                .get(&scope.cell)?
+                .scopes
+                .get(&scope.scope)?
+                .span
+                .clone(),
+        )
+    }
+
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -481,7 +500,33 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let _ = self.state.read(cx).lang_server_client.open_command_bar();
+        self.open_invoking_command(None, cx);
+    }
+
+    fn instantiate_command(
+        &mut self,
+        _: &InstantiateCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon inst "), cx);
+    }
+
+    fn open_cell_command(
+        &mut self,
+        _: &OpenCellCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon openCell "), cx);
+    }
+
+    fn open_invoking_command(&mut self, command: Option<&str>, cx: &mut Context<Self>) {
+        let _ = self
+            .state
+            .read(cx)
+            .lang_server_client
+            .open_command_bar(command.map(str::to_owned));
         self.focus_invoker(cx);
     }
 
@@ -509,6 +554,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))
+            .on_action(cx.listener(Self::instantiate_command))
+            .on_action(cx.listener(Self::open_cell_command))
             .font_family("Zed Plex Sans")
             .size_full()
             .flex()

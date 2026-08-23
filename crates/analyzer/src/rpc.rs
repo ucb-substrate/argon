@@ -66,12 +66,13 @@ pub trait LangServer {
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
-    async fn focus_editor(command_bar: bool);
+    async fn focus_editor(command: Option<String>);
 }
 
 #[tarpc::service]
 pub trait Gui {
     async fn open_cell(cell: CompileOutput, update: bool);
+    async fn selected_scope() -> Option<Span>;
     async fn place_instance(preview: InstancePreview);
     async fn set(key: String, value: String);
     async fn activate();
@@ -339,15 +340,20 @@ impl LangServer for State {
             &format!("{prefix}{expression};"),
             prefix.len()..prefix.len() + expression.len(),
         );
-        let span = Span {
+        // Keep the placement tool anchored to this scope after the edit. Its
+        // start is unchanged, while its end moves by the inserted source text.
+        let updated_scope_span = Span {
             path: scope_span.path.clone(),
-            span: insertion.tracked_span,
+            span: cfgrammar::Span::new(
+                scope.span.start(),
+                scope.span.end() + insertion.edit.new_text.len(),
+            ),
         };
         drop(state_mut);
 
         self.apply_source_edit(url, scope_span.path, insertion.edit)
             .await
-            .then_some(span)
+            .then_some(updated_scope_span)
     }
 
     async fn draw_dimension(
@@ -566,10 +572,10 @@ impl LangServer for State {
         }
     }
 
-    async fn focus_editor(self, _: tarpc::context::Context, command_bar: bool) {
+    async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
         if let Err(error) = self
             .editor_client
-            .send_request::<crate::FocusEditor>(command_bar)
+            .send_request::<crate::FocusEditor>(command)
             .await
         {
             self.editor_client

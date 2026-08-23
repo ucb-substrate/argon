@@ -111,9 +111,14 @@ pub enum StaticErrorKind {
     /// A call supplies the same keyword argument more than once.
     #[error("duplicate keyword argument")]
     DuplicateKwArg,
-    /// An identifier was used without being declared.
-    #[error("identifier used without being declared")]
-    UndeclaredVar,
+    /// An identifier was used without being declared in the current scope.
+    #[error("`{name}` is not declared in this scope")]
+    UndeclaredVar { name: String },
+    /// A cell was referenced before its declaration was processed.
+    #[error(
+        "cannot use `{name}` before its declaration; move the `cell {name} ...` declaration above this use"
+    )]
+    UseBeforeDeclaration { name: String },
     /// A value of the given type cannot be called.
     #[error("cannot call type {0:?}")]
     CannotCall(Ty),

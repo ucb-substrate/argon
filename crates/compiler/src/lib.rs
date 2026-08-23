@@ -795,8 +795,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "not supported"]
-    fn argon_cell_out_of_order() {
+    fn argon_cell_out_of_order_reports_use_before_declaration() {
         let o = parse_workspace_with_std(ARGON_CELL_OUT_OF_ORDER);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
@@ -808,7 +807,21 @@ mod tests {
                 lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
-        println!("{cells:#?}");
+        let errors = cells.unwrap_static_errors();
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| {
+                matches!(
+                    &error.kind,
+                    StaticErrorKind::UseBeforeDeclaration { name } if name == "bot"
+                )
+            })
+            .expect("expected an explicit use-before-declaration error for `bot`");
+        assert_eq!(
+            error.kind.to_string(),
+            "cannot use `bot` before its declaration; move the `cell bot ...` declaration above this use"
+        );
     }
 
     #[test]
@@ -1451,12 +1464,9 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_static_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
-        );
+        assert!(errors.errors.iter().any(
+            |e| matches!(&e.kind, StaticErrorKind::UndeclaredVar { name } if name == "argument")
+        ));
     }
 
     #[test]
@@ -1476,10 +1486,9 @@ mod tests {
 
         let errors = cells.unwrap_static_errors();
         assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, StaticErrorKind::UndeclaredVar))
+            errors.errors.iter().any(
+                |e| matches!(&e.kind, StaticErrorKind::UndeclaredVar { name } if name == "size")
+            )
         );
     }
 

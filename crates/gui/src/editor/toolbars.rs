@@ -8,7 +8,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 
 use crate::{
-    actions::{DrawDim, DrawRect, SelectMode},
+    actions::{DrawDim, DrawRect, InstantiateCommand, OpenCellCommand, SelectMode},
     editor::{
         CompileOutputState, Layers, ScopeAddress, ScopePath,
         canvas::{EditDimToolState, LayoutCanvas, ToolState},
@@ -98,6 +98,16 @@ impl Render for ToolBar {
                                 .dispatch_action(LangServerAction::Redo);
                         }),
                     )),
+                    Some((
+                        "btn_open_cell",
+                        "icons/folder-open.svg",
+                        Box::new(|_| false),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&OpenCellCommand);
+                            });
+                        }),
+                    )),
                     None,
                     Some((
                         "btn_select",
@@ -141,6 +151,16 @@ impl Render for ToolBar {
                         Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&DrawDim);
+                            });
+                        }),
+                    )),
+                    Some((
+                        "btn_instance",
+                        "icons/instance.svg",
+                        Box::new(|tool| matches!(tool, ToolState::PlaceInstance(_))),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&InstantiateCommand);
                             });
                         }),
                     )),

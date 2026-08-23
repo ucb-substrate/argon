@@ -684,6 +684,28 @@ impl<'a> VarIdTyPass<'a> {
         None
     }
 
+    fn unresolved_local_name_error(
+        &self,
+        name: &str,
+        use_span: cfgrammar::Span,
+    ) -> StaticErrorKind {
+        let is_cell_declared_later = self.ast.ast.decls.iter().any(|decl| {
+            matches!(decl, Decl::Cell(cell)
+                if cell.name.name.as_str() == name
+                    && cell.name.span.start() > use_span.start())
+        });
+
+        if is_cell_declared_later {
+            StaticErrorKind::UseBeforeDeclaration {
+                name: name.to_owned(),
+            }
+        } else {
+            StaticErrorKind::UndeclaredVar {
+                name: name.to_owned(),
+            }
+        }
+    }
+
     fn alloc_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -962,9 +984,11 @@ impl<'a> VarIdTyPass<'a> {
 
     fn typecheck_call(
         &mut self,
+        name: &str,
         lookup: Option<(VarId, Ty)>,
         call_span: cfgrammar::Span,
         args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+        is_local: bool,
     ) -> (Option<VarId>, Ty) {
         if let Some((varid, ty)) = lookup {
             match ty {
@@ -987,7 +1011,13 @@ impl<'a> VarIdTyPass<'a> {
         } else {
             self.errors.push(StaticError {
                 span: self.span(call_span),
-                kind: StaticErrorKind::UndeclaredVar,
+                kind: if is_local {
+                    self.unresolved_local_name_error(name, call_span)
+                } else {
+                    StaticErrorKind::UndeclaredVar {
+                        name: name.to_owned(),
+                    }
+                },
             });
             (None, Ty::Unknown)
         }
@@ -1048,7 +1078,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             } else {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
-                    kind: StaticErrorKind::UndeclaredVar,
+                    kind: self.unresolved_local_name_error(&input.path[0].name, input.span),
                 });
                 (None, Ty::Unknown)
             }
@@ -1737,7 +1767,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         (None, Ty::Unknown)
                     }
                 }
-                name => self.typecheck_call(self.lookup(name), input.span, args),
+                name => self.typecheck_call(name, self.lookup(name), input.span, args, true),
             }
         } else {
             let path = match func.path[0].name.as_str() {
@@ -1769,7 +1799,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 .get(&path)
                 .as_ref()
                 .and_then(|mod_binding| mod_binding.var_bindings.get(name).cloned());
-            self.typecheck_call(lookup, input.span, args)
+            self.typecheck_call(name, lookup, input.span, args, false)
         }
     }
 

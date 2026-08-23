@@ -16,7 +16,10 @@ use argonc::{
 };
 use async_compat::CompatExt;
 use futures::{
-    channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    channel::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     prelude::*,
 };
 use gpui::AsyncApp;
@@ -344,8 +347,11 @@ impl SyncLangServerClient {
         })
     }
 
-    pub fn open_command_bar(&self) -> Result<()> {
-        self.call(move |client| async move { client.focus_editor(context::current(), true).await })
+    pub fn open_command_bar(&self, command: Option<String>) -> Result<()> {
+        self.call(move |client| {
+            let command = command.clone();
+            async move { client.focus_editor(context::current(), command).await }
+        })
     }
 }
 
@@ -369,6 +375,21 @@ impl Gui for GuiServer {
             }))
             .await
             .unwrap();
+    }
+
+    async fn selected_scope(mut self, _: context::Context) -> Option<Span> {
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let selected = cx
+                    .update(|cx| editor.selected_scope_span(cx))
+                    .ok()
+                    .flatten();
+                let _ = sender.send(selected);
+            }))
+            .await
+            .ok()?;
+        receiver.await.ok().flatten()
     }
 
     async fn place_instance(mut self, _: context::Context, preview: InstancePreview) {

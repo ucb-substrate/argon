@@ -363,7 +363,7 @@ impl Request for ForceSave {
 struct FocusEditor;
 
 impl Request for FocusEditor {
-    type Params = bool;
+    type Params = Option<String>;
     type Result = ();
 
     const METHOD: &'static str = "custom/focusEditor";
@@ -600,6 +600,16 @@ impl Backend {
     }
 
     async fn instantiate(&self, params: InstantiateParams) -> Result<()> {
+        let gui_client = self.state.state_mut.lock().await.gui_client.clone();
+        let selected_scope = if let Some(gui_client) = &gui_client {
+            gui_client
+                .selected_scope(context::current())
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let state_mut = self.state.state_mut.lock().await;
         if !rpc::editor_buffers_are_current(&state_mut) {
             drop(state_mut);
@@ -609,12 +619,25 @@ impl Backend {
                 .await;
             return Ok(());
         }
-        let Some(path) = params.text_document.uri.to_file_path() else {
+        let cursor_scope = params.text_document.uri.to_file_path().and_then(|path| {
+            let ast = state_mut.ast.values().find(|ast| ast.path == path)?;
+            let document = Document::new(&ast.text, 0);
+            let offset = document.pos_to_offset(params.position)?;
+            innermost_scope_at(ast, offset)
+        });
+        let selected_scope = selected_scope.filter(|span| {
+            state_mut
+                .ast
+                .values()
+                .find(|ast| ast.path == span.path)
+                .is_some_and(|ast| ast.span2scope.contains_key(span))
+        });
+        let Some(scope_span) = selected_scope.or(cursor_scope) else {
             self.state
                 .editor_client
                 .show_message(
                     MessageType::ERROR,
-                    "The current buffer is not a local Argon file",
+                    "Select a destination scope in Argone or run `:Argon inst` with the Neovim cursor inside a cell scope",
                 )
                 .await;
             return Ok(());
@@ -622,36 +645,19 @@ impl Backend {
         let Some((module_path, ast)) = state_mut
             .ast
             .iter()
-            .find(|(_, ast)| ast.path == path)
+            .find(|(_, ast)| ast.path == scope_span.path)
             .map(|(module_path, ast)| (module_path.clone(), ast.clone()))
         else {
             self.state
                 .editor_client
                 .show_message(
                     MessageType::ERROR,
-                    "The current file is not part of this Argon workspace",
+                    "The selected scope is not part of this Argon workspace",
                 )
                 .await;
             return Ok(());
         };
         let document = Document::new(&ast.text, 0);
-        let Some(offset) = document.pos_to_offset(params.position) else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "The editor cursor position is invalid")
-                .await;
-            return Ok(());
-        };
-        let Some(scope_span) = innermost_scope_at(&ast, offset) else {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Run `:Argon inst` from inside a cell scope",
-                )
-                .await;
-            return Ok(());
-        };
         let scope = &ast.span2scope[&scope_span];
         let preview_binding = (0..)
             .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
@@ -672,20 +678,20 @@ impl Backend {
         );
         let mut preview_source = ast.text.to_string();
         preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
-        let preview_module =
-            match parse::parse_source_text(preview_source, path.clone().into_owned()) {
-                Ok(ast) => ast,
-                Err(error) => {
-                    self.state
-                        .editor_client
-                        .show_message(
-                            MessageType::ERROR,
-                            format!("Could not instantiate `{}`: {error}", params.cell),
-                        )
-                        .await;
-                    return Ok(());
-                }
-            };
+        let preview_module = match parse::parse_source_text(preview_source, scope_span.path.clone())
+        {
+            Ok(ast) => ast,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not instantiate `{}`: {error}", params.cell),
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
         let mut preview_ast = state_mut.ast.clone();
         preview_ast.insert(module_path, preview_module);
         let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
@@ -765,7 +771,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let Some(gui_client) = state_mut.gui_client.clone() else {
+        let Some(gui_client) = gui_client else {
             self.state
                 .editor_client
                 .show_message(

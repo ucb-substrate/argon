@@ -1972,10 +1972,8 @@ impl LayoutCanvas {
                         y,
                     );
                     match result {
-                        Ok(Some(span)) => {
-                            *tool = ToolState::Select(SelectToolState {
-                                selected_obj: Some(span),
-                            });
+                        Ok(Some(scope_span)) => {
+                            placement.scope_span = scope_span;
                             cx.notify();
                         }
                         Ok(None) => {
