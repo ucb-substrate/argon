@@ -125,9 +125,10 @@ To place a cell instance, select the destination scope in Argone and run
 `:Argon inst child(100.)`. Argone solves the cell, attaches a dashed outline of
 its hierarchy to the pointer, and inserts the instance at the layout coordinates
 you click. Arguments may refer to values available in the selected scope, for
-example `:Argon inst child(width)`. If no GUI scope is selected, the scope under
-the Neovim cursor is used as a fallback. Placement remains active after each
-click so multiple instances can be inserted; press `Esc` when finished.
+example `:Argon inst child(width)`. This command requires the GUI to be open and
+uses only the scope selected in the GUI; source-editor cursor placement is not
+supported. Placement remains active after each click so multiple instances can
+be inserted; press `Esc` when finished.
 From the layout canvas, press `i` or click the Instance toolbar button to focus
 Neovim with `:Argon inst ` prefilled. Press `o` or click Open Cell (after the
 Undo/Redo buttons) to prefill `:Argon openCell `.

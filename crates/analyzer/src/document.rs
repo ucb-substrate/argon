@@ -38,27 +38,6 @@ impl Document {
         pos2position(self.contents.offset_to_pos(offset).unwrap())
     }
 
-    pub(crate) fn pos_to_offset(&self, position: Position) -> Option<usize> {
-        let text = self.contents.text();
-        let line_start = text
-            .split_inclusive('\n')
-            .take(position.line as usize)
-            .map(str::len)
-            .sum::<usize>();
-        let line = text.get(line_start..)?.split('\n').next()?;
-        let mut utf16_col = 0u32;
-        for (byte_col, ch) in line.char_indices() {
-            if utf16_col == position.character {
-                return Some(line_start + byte_col);
-            }
-            utf16_col += ch.len_utf16() as u32;
-            if utf16_col > position.character {
-                return None;
-            }
-        }
-        (utf16_col == position.character).then_some(line_start + line.len())
-    }
-
     pub(crate) fn substr(&self, range: std::ops::Range<Position>) -> &str {
         self.contents
             .substr(position2pos(range.start)..position2pos(range.end))
@@ -84,21 +63,5 @@ impl Document {
 
     pub(crate) fn contents(&self) -> &str {
         self.contents.text()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tower_lsp_server::ls_types::Position;
-
-    use super::Document;
-
-    #[test]
-    fn converts_utf16_cursor_positions_to_byte_offsets() {
-        let document = Document::new("a😀b\nxy", 0);
-
-        assert_eq!(document.pos_to_offset(Position::new(0, 3)), Some(5));
-        assert_eq!(document.pos_to_offset(Position::new(1, 1)), Some(8));
-        assert_eq!(document.pos_to_offset(Position::new(0, 2)), None);
     }
 }

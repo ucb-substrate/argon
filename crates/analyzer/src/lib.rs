@@ -457,22 +457,11 @@ struct SetParams {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct InstantiateParams {
     cell: String,
-    text_document: TextDocumentIdentifier,
-    position: Position,
 }
 
 const PREVIEW_BINDING_PREFIX: &str = "__argon_preview_instance";
-
-fn innermost_scope_at(ast: &parse::AnnotatedParseAst, offset: usize) -> Option<Span> {
-    ast.span2scope
-        .keys()
-        .filter(|span| span.span.start() <= offset && offset <= span.span.end())
-        .min_by_key(|span| span.span.end() - span.span.start())
-        .cloned()
-}
 
 fn preview_instance_cell(
     output: &compile::CompiledData,
@@ -600,15 +589,41 @@ impl Backend {
     }
 
     async fn instantiate(&self, params: InstantiateParams) -> Result<()> {
-        let gui_client = self.state.state_mut.lock().await.gui_client.clone();
-        let selected_scope = if let Some(gui_client) = &gui_client {
-            gui_client
-                .selected_scope(context::current())
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
+        let Some(gui_client) = self.state.state_mut.lock().await.gui_client.clone() else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Start the Argon GUI before placing an instance",
+                )
+                .await;
+            return Ok(());
+        };
+        let selected_scope = match gui_client.selected_scope(context::current()).await {
+            Ok(Some(scope)) => scope,
+            Ok(None) => {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        "Select a destination scope in the Argon GUI before placing an instance",
+                    )
+                    .await;
+                return Ok(());
+            }
+            Err(error) => {
+                self.state.state_mut.lock().await.gui_client = None;
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!(
+                            "The Argon GUI is not connected; start it before placing an instance ({error})"
+                        ),
+                    )
+                    .await;
+                return Ok(());
+            }
         };
         let state_mut = self.state.state_mut.lock().await;
         if !rpc::editor_buffers_are_current(&state_mut) {
@@ -619,25 +634,19 @@ impl Backend {
                 .await;
             return Ok(());
         }
-        let cursor_scope = params.text_document.uri.to_file_path().and_then(|path| {
-            let ast = state_mut.ast.values().find(|ast| ast.path == path)?;
-            let document = Document::new(&ast.text, 0);
-            let offset = document.pos_to_offset(params.position)?;
-            innermost_scope_at(ast, offset)
-        });
-        let selected_scope = selected_scope.filter(|span| {
+        let selected_scope = Some(selected_scope).filter(|span| {
             state_mut
                 .ast
                 .values()
                 .find(|ast| ast.path == span.path)
                 .is_some_and(|ast| ast.span2scope.contains_key(span))
         });
-        let Some(scope_span) = selected_scope.or(cursor_scope) else {
+        let Some(scope_span) = selected_scope else {
             self.state
                 .editor_client
                 .show_message(
                     MessageType::ERROR,
-                    "Select a destination scope in Argone or run `:Argon inst` with the Neovim cursor inside a cell scope",
+                    "The scope selected in the Argon GUI is not part of the current workspace",
                 )
                 .await;
             return Ok(());
@@ -767,16 +776,6 @@ impl Backend {
                 .show_message(
                     MessageType::ERROR,
                     "The preview scope did not execute while compiling the open cell",
-                )
-                .await;
-            return Ok(());
-        };
-        let Some(gui_client) = gui_client else {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "Start the Argon GUI before placing an instance",
                 )
                 .await;
             return Ok(());
