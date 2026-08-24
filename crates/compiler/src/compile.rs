@@ -25,7 +25,7 @@ use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
-    Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, WorkspaceAst,
+    Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::layer::LayerProperties;
 use crate::parse::{ParseOutput, WorkspaceParseAst};
@@ -270,6 +270,31 @@ impl<'a> ImportPass<'a> {
         }
     }
 
+    fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
+        match use_decl.path[0].name.as_str() {
+            "std" => vec!["std".to_string()],
+            "lib" => use_decl
+                .path
+                .iter()
+                .skip(1)
+                .dropping_back(1)
+                .map(|ident| ident.name.to_string())
+                .collect(),
+            _ => self
+                .current_path
+                .iter()
+                .cloned()
+                .chain(
+                    use_decl
+                        .path
+                        .iter()
+                        .dropping_back(1)
+                        .map(|ident| ident.name.to_string()),
+                )
+                .collect(),
+        }
+    }
+
     pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
@@ -280,6 +305,9 @@ impl<'a> ImportPass<'a> {
                     self.transform_cell_decl(c);
                 }
                 Decl::Mod(_) => {}
+                Decl::Use(u) => {
+                    self.record_dependency(self.use_module_path(u), u.span);
+                }
                 Decl::Enum(_) => {}
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
@@ -837,11 +865,23 @@ impl<'a> VarIdTyPass<'a> {
 
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
+        // Enum types must exist before imports and function signatures are
+        // resolved. Imports are then installed before functions are declared,
+        // allowing imported enum types in signatures and imported functions in
+        // any declaration body regardless of source order.
         for decl in &self.ast.ast.decls {
-            match decl {
-                Decl::Fn(f) => self.declare_fn_decl(f),
-                Decl::Enum(e) => self.declare_enum_decl(e),
-                _ => (),
+            if let Decl::Enum(e) = decl {
+                self.declare_enum_decl(e);
+            }
+        }
+        for decl in &self.ast.ast.decls {
+            if let Decl::Use(u) = decl {
+                self.declare_use_decl(u);
+            }
+        }
+        for decl in &self.ast.ast.decls {
+            if let Decl::Fn(f) = decl {
+                self.declare_fn_decl(f);
             }
         }
 
@@ -855,6 +895,9 @@ impl<'a> VarIdTyPass<'a> {
                 }
                 Decl::Mod(m) => {
                     decls.push(Decl::Mod(self.transform_mod_decl(m)));
+                }
+                Decl::Use(u) => {
+                    decls.push(Decl::Use(self.transform_use_decl(u)));
                 }
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
@@ -873,6 +916,63 @@ impl<'a> VarIdTyPass<'a> {
             },
             self.ast.path.clone(),
         )
+    }
+
+    fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
+        match use_decl.path[0].name.as_str() {
+            "std" => vec!["std".to_string()],
+            "lib" => use_decl
+                .path
+                .iter()
+                .skip(1)
+                .dropping_back(1)
+                .map(|ident| ident.name.to_string())
+                .collect(),
+            _ => self
+                .current_path
+                .iter()
+                .cloned()
+                .chain(
+                    use_decl
+                        .path
+                        .iter()
+                        .dropping_back(1)
+                        .map(|ident| ident.name.to_string()),
+                )
+                .collect(),
+        }
+    }
+
+    fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
+        let module = self.use_module_path(use_decl);
+        let item = use_decl.path.last().expect("use paths are non-empty");
+        let local_name = use_decl.alias.as_ref().unwrap_or(item);
+        let imported = if &module == self.current_path {
+            self.lookup(&item.name)
+        } else {
+            self.mod_bindings
+                .get(&module)
+                .and_then(|frame| frame.var_bindings.get(item.name.as_str()).cloned())
+        };
+
+        if let Some(binding) = imported {
+            self.bindings
+                .last_mut()
+                .unwrap()
+                .var_bindings
+                .insert(local_name.name.clone(), binding);
+        } else {
+            self.errors.push(StaticError {
+                span: self.span(use_decl.span),
+                kind: StaticErrorKind::UnresolvedImport {
+                    path: use_decl
+                        .path
+                        .iter()
+                        .map(|ident| ident.name.as_str())
+                        .join("::"),
+                },
+            });
+        }
     }
 
     fn declare_fn_decl(&mut self, input: &'a FnDecl<Substr, ParseMetadata>) {

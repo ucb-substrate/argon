@@ -30,6 +30,18 @@ pub struct ModDecl<S, T: AstMetadata> {
     pub span: cfgrammar::Span,
 }
 
+/// Imports the final item in `path` into the declaring module's namespace.
+///
+/// For example, `use lib::geometry::width;` makes `width` available as an
+/// unqualified name while retaining the full path here for module resolution.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct UseDecl<S, T: AstMetadata> {
+    pub path: Vec<Ident<S, T>>,
+    /// Optional local name from `use path::item as local;`.
+    pub alias: Option<Ident<S, T>>,
+    pub span: cfgrammar::Span,
+}
+
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub enum Decl<S, T: AstMetadata> {
     Enum(EnumDecl<S, T>),
@@ -37,6 +49,7 @@ pub enum Decl<S, T: AstMetadata> {
     Constant(ConstantDecl<S, T>),
     Cell(CellDecl<S, T>),
     Mod(ModDecl<S, T>),
+    Use(UseDecl<S, T>),
     Fn(FnDecl<S, T>),
 }
 
@@ -698,6 +711,23 @@ pub trait AstTransformer {
         let ident = self.transform_ident(&input.ident);
         ModDecl {
             ident,
+            span: input.span,
+        }
+    }
+    fn transform_use_decl(
+        &mut self,
+        input: &UseDecl<Self::InputS, Self::InputMetadata>,
+    ) -> UseDecl<Self::OutputS, Self::OutputMetadata> {
+        UseDecl {
+            path: input
+                .path
+                .iter()
+                .map(|ident| self.transform_ident(ident))
+                .collect(),
+            alias: input
+                .alias
+                .as_ref()
+                .map(|ident| self.transform_ident(ident)),
             span: input.span,
         }
     }

@@ -16,6 +16,7 @@ pub enum TokenKind {
     KwConst,
     KwCell,
     KwMod,
+    KwUse,
     KwIf,
     KwFn,
     KwElse,
@@ -81,6 +82,7 @@ impl TokenKind {
             KwConst => "'const'",
             KwCell => "'cell'",
             KwMod => "'mod'",
+            KwUse => "'use'",
             KwIf => "'if'",
             KwFn => "'fn'",
             KwElse => "'else'",
@@ -163,6 +165,7 @@ pub fn keyword_or_ident(s: &[u8]) -> TokenKind {
             b"let" => KwLet,
             b"for" => KwFor,
             b"mod" => KwMod,
+            b"use" => KwUse,
             _ => Ident,
         },
         4 => match s {
