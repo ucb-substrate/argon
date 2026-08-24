@@ -913,7 +913,17 @@ mod tests {
         .unwrap_exec_errors()
         .output
         .unwrap();
-        assert!(!cells.cells[&cells.top].fallback_constraints_used.is_empty());
+        let cell = &cells.cells[&cells.top];
+        assert!(!cell.fallback_constraints_used.is_empty());
+        let inst = cell
+            .objects
+            .values()
+            .find_map(SolvedValue::get_instance)
+            .expect("top should contain an instance");
+        assert_eq!(inst.x_expr.coeffs.len(), 1);
+        assert_eq!(inst.y_expr.coeffs.len(), 1);
+        assert!(cell.unsolved_vars.contains(&inst.x_expr.coeffs[0].1));
+        assert!(!cell.unsolved_vars.contains(&inst.y_expr.coeffs[0].1));
         println!("{cells:#?}");
     }
 
