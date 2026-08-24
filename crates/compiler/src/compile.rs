@@ -2848,6 +2848,8 @@ impl<'a> ExecPass<'a> {
                     id: inst.id,
                     x: state.solver.eval_expr(&inst.x).expect("inst x not solved"),
                     y: state.solver.eval_expr(&inst.y).expect("inst y not solved"),
+                    x_expr: inst.x.clone(),
+                    y_expr: inst.y.clone(),
                     angle: inst.angle,
                     reflect: inst.reflect,
                     construction: inst.construction,
@@ -4964,6 +4966,9 @@ pub struct SolvedInstance {
     pub id: ObjectId,
     pub x: f64,
     pub y: f64,
+    /// Solver expressions retained for solution-space movement in the GUI.
+    pub x_expr: LinearExpr,
+    pub y_expr: LinearExpr,
     pub angle: Rotation,
     pub reflect: bool,
     pub construction: bool,

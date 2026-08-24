@@ -136,6 +136,10 @@ pub(crate) fn insert_statement(
     }
 }
 
+fn instance_placement_expression(invocation: &str, x: f64, y: f64) -> String {
+    format!("inst({invocation}, xi={x:?}, yi={y:?})")
+}
+
 impl State {
     async fn apply_source_changes(
         &self,
@@ -331,7 +335,7 @@ impl LangServer for State {
         let var_name = (0..)
             .map(|index| format!("inst{index}"))
             .find(|name| !names.contains(name.as_str()))?;
-        let expression = format!("inst({invocation}, x={x:?}, y={y:?})");
+        let expression = instance_placement_expression(&invocation, x, y);
         let prefix = format!("let {var_name} = ");
         let insertion = insert_statement(
             &document,
@@ -592,7 +596,15 @@ impl LangServer for State {
 mod tests {
     use tower_lsp_server::ls_types::Position;
 
-    use super::{Document, insert_statement};
+    use super::{Document, insert_statement, instance_placement_expression};
+
+    #[test]
+    fn placed_instances_use_initial_conditions() {
+        assert_eq!(
+            instance_placement_expression("child(10.)", 12.5, -4.0),
+            "inst(child(10.), xi=12.5, yi=-4.0)"
+        );
+    }
 
     #[test]
     fn inserts_a_statement_before_an_existing_tail() {

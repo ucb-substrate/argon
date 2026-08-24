@@ -16,8 +16,8 @@ use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
     Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
-    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Window, div, pattern_slash,
-    px, rgb, size, solid_background,
+    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
+    pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -65,6 +65,12 @@ struct SseBody {
     bounds: Bounds<Pixels>,
     span: Span,
     targets: Vec<SseDragTarget>,
+}
+
+#[derive(Clone)]
+struct LabeledBbox {
+    rect: Rect,
+    label: SharedString,
 }
 
 fn corner_sse_targets(x: &LinearExpr, y: &LinearExpr) -> Vec<SseDragTarget> {
@@ -369,7 +375,7 @@ pub struct LayoutCanvas {
     is_sse_persisting: bool,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
-    // Drag handles and fully-free rectangle bodies, recomputed each paint.
+    // Drag handles and movable rectangle/instance bodies, recomputed each paint.
     sse_handles: Vec<SseHandle>,
     sse_bodies: Vec<SseBody>,
     // drag state
@@ -384,7 +390,7 @@ pub struct LayoutCanvas {
     #[allow(unused)]
     subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
-    scope_rects: Vec<Rect>,
+    scope_rects: Vec<LabeledBbox>,
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
     // True if waiting on render step to finish some initialization.
     //
@@ -648,14 +654,15 @@ impl Element for CanvasElement {
         let mut rects = Vec::new();
         let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
+        let mut instance_sse_candidates = Vec::new();
         let mut select_rects = Vec::new();
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(solved_cell) = solved_cell {
-            let top = &solved_cell.output.cells[&solved_cell.output.top];
-            if inner.is_sse_dragging || inner.is_sse_persisting {
-                sse_dv = inner.sse_drag_delta(top);
-            }
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
+            let editable_cell = &solved_cell.output.cells[&scope_address.cell];
+            if inner.is_sse_dragging || inner.is_sse_persisting {
+                sse_dv = inner.sse_drag_delta(editable_cell);
+            }
             let mut queue = VecDeque::from_iter([(
                 ScopeAddress {
                     cell: scope_address.cell,
@@ -713,7 +720,10 @@ impl Element for CanvasElement {
                             });
                         }
                         if show {
-                            scope_rects.push(rect);
+                            scope_rects.push(LabeledBbox {
+                                rect,
+                                label: scope_info.name.clone().into(),
+                            });
                         }
                     }
                     show = false;
@@ -821,7 +831,17 @@ impl Element for CanvasElement {
                                 inst_mat = inst_mat.reflect_vert()
                             }
                             inst_mat = inst_mat.rotate(inst.angle);
-                            let inst_ofs = ifmatvec(mat, (inst.x, inst.y));
+                            let (sse_dx, sse_dy) = if depth == 0 {
+                                sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
+                                    (
+                                        crate::sse::dot(&SparseVec::from(&inst.x_expr), sse_dv),
+                                        crate::sse::dot(&SparseVec::from(&inst.y_expr), sse_dv),
+                                    )
+                                })
+                            } else {
+                                (0., 0.)
+                            };
+                            let inst_ofs = ifmatvec(mat, (inst.x + sse_dx, inst.y + sse_dy));
 
                             let inst_address = ScopeAddress {
                                 scope: solved_cell.output.cells[&inst.cell].root,
@@ -836,6 +856,16 @@ impl Element for CanvasElement {
                                 if let Some(bbox) = &scope_state.bbox {
                                     let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
                                     let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
+                                    let x_unconstrained =
+                                        depth == 0
+                                            && inst.x_expr.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            });
+                                    let y_unconstrained =
+                                        depth == 0
+                                            && inst.y_expr.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            });
                                     let rect = Rect {
                                         x0: (p0p.0.min(p1p.0) + new_ofs.0) as f32,
                                         y0: (p0p.1.min(p1p.1) + new_ofs.1) as f32,
@@ -844,7 +874,28 @@ impl Element for CanvasElement {
                                         id: Some(inst.span.clone()),
                                         object_path: object_path.clone(),
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                        border_styles: Edges::all(BorderStyle::Solid),
+                                        border_styles: Edges {
+                                            top: if y_unconstrained {
+                                                BorderStyle::Dashed
+                                            } else {
+                                                BorderStyle::Solid
+                                            },
+                                            right: if x_unconstrained {
+                                                BorderStyle::Dashed
+                                            } else {
+                                                BorderStyle::Solid
+                                            },
+                                            bottom: if y_unconstrained {
+                                                BorderStyle::Dashed
+                                            } else {
+                                                BorderStyle::Solid
+                                            },
+                                            left: if x_unconstrained {
+                                                BorderStyle::Dashed
+                                            } else {
+                                                BorderStyle::Solid
+                                            },
+                                        },
                                         cvars: None,
                                     };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
@@ -858,7 +909,26 @@ impl Element for CanvasElement {
                                         });
                                     }
                                     if show {
-                                        scope_rects.push(rect);
+                                        if depth == 0 {
+                                            instance_sse_candidates.push((
+                                                rect.clone(),
+                                                inst.span.clone(),
+                                                [
+                                                    SseDragTarget {
+                                                        expr: inst.x_expr.clone(),
+                                                        normal: Point::new(1., 0.),
+                                                    },
+                                                    SseDragTarget {
+                                                        expr: inst.y_expr.clone(),
+                                                        normal: Point::new(0., 1.),
+                                                    },
+                                                ],
+                                            ));
+                                        }
+                                        scope_rects.push(LabeledBbox {
+                                            rect,
+                                            label: scope_state.name.clone().into(),
+                                        });
                                     }
                                 }
                                 show = false;
@@ -912,9 +982,10 @@ impl Element for CanvasElement {
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
         let mut sse_bodies: Vec<SseBody> = Vec::new();
-        let sse_cell = solved_cell
-            .as_ref()
-            .map(|solved| &solved.output.cells[&solved.output.top]);
+        let sse_cell = solved_cell.as_ref().map(|solved| {
+            let selected = &solved.state[&solved.selected_scope].address;
+            &solved.output.cells[&selected.cell]
+        });
         let mut movable_corners = HashMap::new();
         for (rect, _) in &rects {
             let (Some(span), Some(cvars), Some(sse_cell)) = (&rect.id, &rect.cvars, sse_cell)
@@ -959,6 +1030,28 @@ impl Element for CanvasElement {
                 });
             }
         }
+        if let Some(sse_cell) = sse_cell {
+            for (rect, span, targets) in instance_sse_candidates {
+                let targets: Vec<_> = if LayoutCanvas::sse_targets_support_2d(&targets, sse_cell) {
+                    targets.into_iter().collect()
+                } else {
+                    // A one-degree-of-freedom instance remains draggable along
+                    // whichever coordinate can control that degree of freedom.
+                    targets
+                        .into_iter()
+                        .find(|target| LayoutCanvas::sse_target_supported(target, sse_cell))
+                        .into_iter()
+                        .collect()
+                };
+                if !targets.is_empty() {
+                    sse_bodies.push(SseBody {
+                        bounds: get_rect_bounds(&rect, bounds, scale, offset),
+                        span,
+                        targets,
+                    });
+                }
+            }
+        }
         let theme = inner.state.read(cx).theme();
         inner
             .bg_style
@@ -999,15 +1092,31 @@ impl Element for CanvasElement {
                             r.border_styles,
                         ));
                     }
-                    for r in &scope_rects {
+                    for bbox in &scope_rects {
                         window.paint_quad(get_paint_quad(
-                            get_rect_bounds(r, bounds, scale, offset),
+                            get_rect_bounds(&bbox.rect, bounds, scale, offset),
                             ShapeFill::Solid,
                             Rgba { a: 0., ..theme.text },
                             theme.text,
-                            r.border_widths,
-                            r.border_styles,
+                            bbox.rect.border_widths,
+                            bbox.rect.border_styles,
                         ));
+                        let font_size = px(12.);
+                        let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
+                            + Point::new(px(4.), px(2.));
+                        let runs = &[TextRun {
+                            len: bbox.label.len(),
+                            font: window.text_style().font(),
+                            color: theme.text.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }];
+                        window
+                            .text_system()
+                            .shape_line(bbox.label.clone(), font_size, runs, None)
+                            .paint(text_origin, px(14.), window, cx)
+                            .unwrap();
                     }
                     if let ToolState::PlaceInstance(placement) = &tool {
                         for rect in &placement.rects {
@@ -1774,6 +1883,11 @@ impl LayoutCanvas {
             .all(|delta| Self::sse_drag_delta_for_targets(targets, cell, delta).is_some())
     }
 
+    fn sse_target_supported(target: &SseDragTarget, cell: &compile::CompiledCell) -> bool {
+        Self::sse_drag_delta_for_targets(std::slice::from_ref(target), cell, target.normal)
+            .is_some()
+    }
+
     fn selection_hits_at(&self, position: Point<Pixels>) -> Vec<SelectionHit> {
         let mut hits = Vec::new();
 
@@ -1792,11 +1906,11 @@ impl LayoutCanvas {
             }
         }
 
-        for (paint_order, rect) in self.scope_rects.iter().enumerate() {
-            let Some(span) = &rect.id else {
+        for (paint_order, bbox) in self.scope_rects.iter().enumerate() {
+            let Some(span) = &bbox.rect.id else {
                 continue;
             };
-            let bounds = get_rect_bounds(rect, self.screen_bounds, self.scale, self.offset);
+            let bounds = get_rect_bounds(&bbox.rect, self.screen_bounds, self.scale, self.offset);
             if bounds.contains(&position) {
                 hits.push(SelectionHit {
                     span: span.clone(),
@@ -2376,8 +2490,8 @@ impl LayoutCanvas {
                     }
                 }
                 ToolState::Select(select_tool) => {
-                    // Handles control individual edges/corners. Clicking the
-                    // body of a fully free rectangle controls all four edges.
+                    // Handles control individual edges/corners. Movable object
+                    // bodies control a rectangle translation or instance origin.
                     let handle = self
                         .sse_handles
                         .iter()
@@ -2624,11 +2738,12 @@ impl LayoutCanvas {
         let Some(solved) = solved.as_ref() else {
             return Vec::new();
         };
-        let top = &solved.output.cells[&solved.output.top];
-        let Some(dv) = self.sse_drag_delta(top) else {
+        let selected = &solved.state[&solved.selected_scope].address;
+        let editable_cell = &solved.output.cells[&selected.cell];
+        let Some(dv) = self.sse_drag_delta(editable_cell) else {
             return Vec::new();
         };
-        let mut updates = top
+        let mut updates = editable_cell
             .fallback_constraints_used
             .iter()
             .map(|fb| {
