@@ -71,6 +71,8 @@ struct SseBody {
 struct LabeledBbox {
     rect: Rect,
     label: SharedString,
+    /// Layout-space cell origin. Present for instance bboxes, absent for scopes.
+    origin: Option<Point<f32>>,
 }
 
 fn corner_sse_targets(x: &LinearExpr, y: &LinearExpr) -> Vec<SseDragTarget> {
@@ -723,6 +725,7 @@ impl Element for CanvasElement {
                             scope_rects.push(LabeledBbox {
                                 rect,
                                 label: scope_info.name.clone().into(),
+                                origin: None,
                             });
                         }
                     }
@@ -913,6 +916,7 @@ impl Element for CanvasElement {
                                             instance_sse_candidates.push((
                                                 rect.clone(),
                                                 inst.span.clone(),
+                                                Point::new(new_ofs.0 as f32, new_ofs.1 as f32),
                                                 [
                                                     SseDragTarget {
                                                         expr: inst.x_expr.clone(),
@@ -928,6 +932,10 @@ impl Element for CanvasElement {
                                         scope_rects.push(LabeledBbox {
                                             rect,
                                             label: scope_state.name.clone().into(),
+                                            origin: Some(Point::new(
+                                                new_ofs.0 as f32,
+                                                new_ofs.1 as f32,
+                                            )),
                                         });
                                     }
                                 }
@@ -1031,7 +1039,7 @@ impl Element for CanvasElement {
             }
         }
         if let Some(sse_cell) = sse_cell {
-            for (rect, span, targets) in instance_sse_candidates {
+            for (rect, span, origin, targets) in instance_sse_candidates {
                 let targets: Vec<_> = if LayoutCanvas::sse_targets_support_2d(&targets, sse_cell) {
                     targets.into_iter().collect()
                 } else {
@@ -1046,9 +1054,25 @@ impl Element for CanvasElement {
                 if !targets.is_empty() {
                     sse_bodies.push(SseBody {
                         bounds: get_rect_bounds(&rect, bounds, scale, offset),
-                        span,
-                        targets,
+                        span: span.clone(),
+                        targets: targets.clone(),
                     });
+                    if matches!(
+                        &tool,
+                        ToolState::Select(SelectToolState {
+                            selected_obj: Some(selected),
+                        }) if selected == &span
+                    ) {
+                        let mid = inner.layout_to_px(origin);
+                        let hit_half = HANDLE_HIT.half();
+                        sse_handles.push(SseHandle {
+                            bounds: Bounds::new(
+                                Point::new(mid.x - hit_half, mid.y - hit_half),
+                                Size::new(HANDLE_HIT, HANDLE_HIT),
+                            ),
+                            targets,
+                        });
+                    }
                 }
             }
         }
@@ -1117,6 +1141,28 @@ impl Element for CanvasElement {
                             .shape_line(bbox.label.clone(), font_size, runs, None)
                             .paint(text_origin, px(14.), window, cx)
                             .unwrap();
+                        if let Some(origin) = bbox.origin
+                            && matches!(
+                                &tool,
+                                ToolState::Select(SelectToolState {
+                                    selected_obj: Some(selected),
+                                }) if bbox.rect.id.as_ref() == Some(selected)
+                            )
+                        {
+                            let mid = self.inner.read(cx).layout_to_px(origin);
+                            let draw_half = HANDLE_SIZE.half();
+                            window.paint_quad(get_paint_quad(
+                                Bounds::new(
+                                    Point::new(mid.x - draw_half, mid.y - draw_half),
+                                    Size::new(HANDLE_SIZE, HANDLE_SIZE),
+                                ),
+                                ShapeFill::Solid,
+                                rgb(HANDLE_FILL),
+                                rgb(HANDLE_BORDER),
+                                Edges::all(px(1.5)),
+                                Edges::all(BorderStyle::Solid),
+                            ));
+                        }
                     }
                     if let ToolState::PlaceInstance(placement) = &tool {
                         for rect in &placement.rects {
