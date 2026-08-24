@@ -85,8 +85,6 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     let licon_bbox = std::array(licon, nf, 430., 0.);
     eq(licon_bbox.x0, a_li_mid.x0 + 80.);
     eq(licon_bbox.y0, a_li_mid.y0);
-    let inst0 = inst(fet1v8(true, 1000., 5), xi=-1755.8, yi=-2684.9);
-    dimension(ptap.sdm.y0, inst0.sdm.y1, 300., (ptap.sdm.x0 + ptap.sdm.x1 + inst0.sdm.x0 + inst0.sdm.x1)/4. + 2976.5122, (ptap.sdm.x0 + ptap.sdm.x1) / 2., (inst0.sdm.x0 + inst0.sdm.x1) / 2., false);
 }
 
 cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
