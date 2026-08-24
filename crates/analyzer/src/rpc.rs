@@ -4,7 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use argonc::{
     ast::Span,
-    compile::{BasicRect, CompileOutput},
+    compile::{BasicRect, CellId, CompileOutput, CompiledData},
 };
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,17 @@ pub struct DimensionParams {
     pub horiz: String,
 }
 
+/// A solved cell and the source location where placing it will insert an
+/// instance. The GUI keeps this separate from the currently open layout and
+/// uses it only for the cursor-following placement outline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstancePreview {
+    pub output: CompiledData,
+    pub cell: CellId,
+    pub invocation: String,
+    pub scope_span: Span,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LangServerAction {
     Undo,
@@ -47,6 +58,7 @@ pub trait LangServer {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Span);
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
+    async fn place_instance(scope_span: Span, invocation: String, x: f64, y: f64) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
     async fn update_values(edits: Vec<ValueEdit>) -> bool;
@@ -54,19 +66,21 @@ pub trait LangServer {
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
-    async fn focus_editor(command_bar: bool);
+    async fn focus_editor(command: Option<String>);
 }
 
 #[tarpc::service]
 pub trait Gui {
     async fn open_cell(cell: CompileOutput, update: bool);
+    async fn selected_scope() -> Option<Span>;
+    async fn place_instance(preview: InstancePreview);
     async fn set(key: String, value: String);
     async fn activate();
 }
 
-const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
+pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
 
-fn editor_buffers_are_current(state: &StateMut) -> bool {
+pub(crate) fn editor_buffers_are_current(state: &StateMut) -> bool {
     state.ast.values().all(|ast| {
         Uri::from_file_path(&ast.path)
             .and_then(|uri| state.editor_files.get(&uri))
@@ -74,12 +88,13 @@ fn editor_buffers_are_current(state: &StateMut) -> bool {
     })
 }
 
-struct SourceInsertion {
-    edit: TextEdit,
-    tracked_span: cfgrammar::Span,
+pub(crate) struct SourceInsertion {
+    pub(crate) offset: usize,
+    pub(crate) edit: TextEdit,
+    pub(crate) tracked_span: cfgrammar::Span,
 }
 
-fn insert_statement(
+pub(crate) fn insert_statement(
     document: &Document,
     scope_span: cfgrammar::Span,
     tail_start: Option<usize>,
@@ -112,6 +127,7 @@ fn insert_statement(
     let tracked_start = offset + prefix.len() + tracked.start;
 
     SourceInsertion {
+        offset,
         edit: TextEdit {
             range: Range::new(position, position),
             new_text: format!("{prefix}{statement}{suffix}"),
@@ -279,6 +295,65 @@ impl LangServer for State {
         self.apply_source_edit(url, scope_span.path, insertion.edit)
             .await
             .then_some(span)
+    }
+
+    async fn place_instance(
+        self,
+        _: tarpc::context::Context,
+        scope_span: Span,
+        invocation: String,
+        x: f64,
+        y: f64,
+    ) -> Option<Span> {
+        let state_mut = self.state_mut.lock().await;
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
+            self.editor_client
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                .await;
+            return None;
+        }
+        let url = Uri::from_file_path(&scope_span.path)?;
+        let ast = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)?;
+        let scope = ast.span2scope.get(&scope_span)?;
+        let document = Document::new(&ast.text, 0);
+        let names = scope
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                argonc::ast::Statement::LetBinding(binding) => Some(binding.name.name.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let var_name = (0..)
+            .map(|index| format!("inst{index}"))
+            .find(|name| !names.contains(name.as_str()))?;
+        let expression = format!("inst({invocation}, x={x:?}, y={y:?})");
+        let prefix = format!("let {var_name} = ");
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &format!("{prefix}{expression};"),
+            prefix.len()..prefix.len() + expression.len(),
+        );
+        // Keep the placement tool anchored to this scope after the edit. Its
+        // start is unchanged, while its end moves by the inserted source text.
+        let updated_scope_span = Span {
+            path: scope_span.path.clone(),
+            span: cfgrammar::Span::new(
+                scope.span.start(),
+                scope.span.end() + insertion.edit.new_text.len(),
+            ),
+        };
+        drop(state_mut);
+
+        self.apply_source_edit(url, scope_span.path, insertion.edit)
+            .await
+            .then_some(updated_scope_span)
     }
 
     async fn draw_dimension(
@@ -497,10 +572,10 @@ impl LangServer for State {
         }
     }
 
-    async fn focus_editor(self, _: tarpc::context::Context, command_bar: bool) {
+    async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
         if let Err(error) = self
             .editor_client
-            .send_request::<crate::FocusEditor>(command_bar)
+            .send_request::<crate::FocusEditor>(command)
             .await
         {
             self.editor_client

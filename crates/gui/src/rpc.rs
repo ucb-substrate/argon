@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use analyzer::rpc::{DimensionParams, Gui, LangServerAction, LangServerClient, ValueEdit};
+use analyzer::rpc::{
+    DimensionParams, Gui, InstancePreview, LangServerAction, LangServerClient, ValueEdit,
+};
 use anyhow::{Result, anyhow};
 use argonc::{
     ast::Span,
@@ -14,7 +16,10 @@ use argonc::{
 };
 use async_compat::CompatExt;
 use futures::{
-    channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    channel::{
+        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
     prelude::*,
 };
 use gpui::AsyncApp;
@@ -265,6 +270,24 @@ impl SyncLangServerClient {
         })
     }
 
+    pub fn place_instance(
+        &self,
+        scope_span: Span,
+        invocation: String,
+        x: f64,
+        y: f64,
+    ) -> Result<Option<Span>> {
+        self.call(move |client| {
+            let scope_span = scope_span.clone();
+            let invocation = invocation.clone();
+            async move {
+                client
+                    .place_instance(context::current(), scope_span, invocation, x, y)
+                    .await
+            }
+        })
+    }
+
     pub fn draw_dimension(
         &self,
         scope_span: Span,
@@ -324,8 +347,11 @@ impl SyncLangServerClient {
         })
     }
 
-    pub fn open_command_bar(&self) -> Result<()> {
-        self.call(move |client| async move { client.focus_editor(context::current(), true).await })
+    pub fn open_command_bar(&self, command: Option<String>) -> Result<()> {
+        self.call(move |client| {
+            let command = command.clone();
+            async move { client.focus_editor(context::current(), command).await }
+        })
     }
 }
 
@@ -345,6 +371,33 @@ impl Gui for GuiServer {
                     if !update {
                         focus::activate_gui(cx);
                     }
+                });
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn selected_scope(mut self, _: context::Context) -> Option<Span> {
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let selected = cx
+                    .update(|cx| editor.selected_scope_span(cx))
+                    .ok()
+                    .flatten();
+                let _ = sender.send(selected);
+            }))
+            .await
+            .ok()?;
+        receiver.await.ok().flatten()
+    }
+
+    async fn place_instance(mut self, _: context::Context, preview: InstancePreview) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.place_instance(cx, preview);
+                    focus::activate_gui(cx);
                 });
             }))
             .await

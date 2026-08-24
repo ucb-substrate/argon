@@ -147,18 +147,19 @@ M.start = function(bufnr)
 
                 return vim.NIL
             end,
-            ['custom/focusEditor'] = function(err, command_bar, ctx)
+            ['custom/focusEditor'] = function(err, command, ctx)
                 if err then
                     client.print_error(err)
                     return vim.NIL
                 end
-                if command_bar then
-                    vim.schedule(function()
-                        local mode = vim.api.nvim_get_mode().mode
-                        local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
-                        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
-                    end)
-                end
+                vim.schedule(function()
+                    local mode = vim.api.nvim_get_mode().mode
+                    local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
+                    if type(command) == 'string' then
+                        keys = keys .. command
+                    end
+                    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
+                end)
                 return vim.NIL
             end,
         },

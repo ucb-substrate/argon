@@ -4,10 +4,10 @@ use std::{
     ops::{Add, Sub},
 };
 
-use analyzer::rpc::{DimensionParams, ValueEdit};
+use analyzer::rpc::{DimensionParams, InstancePreview, ValueEdit};
 use argonc::{
     ast::Span,
-    compile::{self, ObjectId, RectInitialCondition, SolvedValue, ifmatvec},
+    compile::{self, CellId, CompiledData, ObjectId, RectInitialCondition, SolvedValue, ifmatvec},
     solver::{LinearExpr, Var},
 };
 use enumify::enumify;
@@ -333,12 +333,20 @@ pub(crate) struct SelectToolState {
     pub(crate) selected_obj: Option<Span>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PlaceInstanceToolState {
+    invocation: String,
+    scope_span: Span,
+    rects: Vec<Rect>,
+}
+
 #[enumify]
 #[derive(Debug, Clone)]
 pub(crate) enum ToolState {
     DrawRect(DrawRectToolState),
     DrawDim(DrawDimToolState),
     EditDim(EditDimToolState),
+    PlaceInstance(PlaceInstanceToolState),
     Select(SelectToolState),
 }
 
@@ -481,6 +489,67 @@ fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>)
         + drag
             .map(|dv| crate::sse::dot(&SparseVec::from(&field.1), dv))
             .unwrap_or_default()
+}
+
+/// Flatten the solved geometry of one compiled cell into rectangles relative
+/// to that cell's origin. Placement paints these as a single pointer-following
+/// outline without disturbing the layout currently open in the editor.
+fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
+    let mut rects = Vec::new();
+    let mut queue = VecDeque::from_iter([(
+        cell,
+        output.cells[&cell].root,
+        TransformationMatrix::identity(),
+        (0., 0.),
+    )]);
+
+    while let Some((cell, scope, mat, ofs)) = queue.pop_front() {
+        let compiled_cell = &output.cells[&cell];
+        let compiled_scope = &compiled_cell.scopes[&scope];
+        let mut emitted = HashSet::new();
+        for (object, _) in &compiled_scope.emit {
+            if !emitted.insert(*object) {
+                continue;
+            }
+            match &compiled_cell.objects[object] {
+                SolvedValue::Rect(rect) if !rect.construction => {
+                    let p0 = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                    let p1 = ifmatvec(mat, (rect.x1.0, rect.y1.0));
+                    rects.push(Rect {
+                        x0: (p0.0.min(p1.0) + ofs.0) as f32,
+                        y0: (p0.1.min(p1.1) + ofs.1) as f32,
+                        x1: (p0.0.max(p1.0) + ofs.0) as f32,
+                        y1: (p0.1.max(p1.1) + ofs.1) as f32,
+                        id: None,
+                        object_path: Vec::new(),
+                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                        border_styles: Edges::all(BorderStyle::Dashed),
+                        cvars: None,
+                    });
+                }
+                SolvedValue::Instance(instance) if !instance.construction => {
+                    let mut instance_mat = TransformationMatrix::identity();
+                    if instance.reflect {
+                        instance_mat = instance_mat.reflect_vert();
+                    }
+                    instance_mat = instance_mat.rotate(instance.angle);
+                    let instance_ofs = ifmatvec(mat, (instance.x, instance.y));
+                    let child = instance.cell;
+                    queue.push_back((
+                        child,
+                        output.cells[&child].root,
+                        mat * instance_mat,
+                        (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for child in &compiled_scope.children {
+            queue.push_back((cell, *child, mat, ofs));
+        }
+    }
+    rects
 }
 
 fn get_paint_quad(
@@ -939,6 +1008,25 @@ impl Element for CanvasElement {
                             r.border_widths,
                             r.border_styles,
                         ));
+                    }
+                    if let ToolState::PlaceInstance(placement) = &tool {
+                        for rect in &placement.rects {
+                            let rect = rect.transform(
+                                TransformationMatrix::identity(),
+                                (
+                                    layout_mouse_position.x as f64,
+                                    layout_mouse_position.y as f64,
+                                ),
+                            );
+                            window.paint_quad(get_paint_quad(
+                                get_rect_bounds(&rect, bounds, scale, offset),
+                                ShapeFill::Solid,
+                                Rgba { a: 0., ..rgb(0xffff00) },
+                                rgb(0xffff00),
+                                rect.border_widths,
+                                rect.border_styles,
+                            ));
+                        }
                     }
                     for r in &select_rects {
                         window.paint_quad(get_paint_quad(
@@ -1629,6 +1717,19 @@ impl LayoutCanvas {
         }
     }
 
+    pub(crate) fn place_instance(&mut self, preview: InstancePreview, cx: &mut Context<Self>) {
+        let rects = instance_preview_rects(&preview.output, preview.cell);
+        let tool = self.state.read(cx).tool.clone();
+        tool.update(cx, |tool, cx| {
+            *tool = ToolState::PlaceInstance(PlaceInstanceToolState {
+                invocation: preview.invocation,
+                scope_span: preview.scope_span,
+                rects,
+            });
+            cx.notify();
+        });
+    }
+
     fn sse_drag_delta_for_targets(
         targets: &[SseDragTarget],
         cell: &compile::CompiledCell,
@@ -1859,6 +1960,29 @@ impl LayoutCanvas {
                         let _ = state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
+                    }
+                }
+                ToolState::PlaceInstance(placement) => {
+                    let x = ((layout_mouse_position.x as f64 * 10.).round() / 10.) + 0.;
+                    let y = ((layout_mouse_position.y as f64 * 10.).round() / 10.) + 0.;
+                    let result = self.state.read(cx).lang_server_client.place_instance(
+                        placement.scope_span.clone(),
+                        placement.invocation.clone(),
+                        x,
+                        y,
+                    );
+                    match result {
+                        Ok(Some(scope_span)) => {
+                            placement.scope_span = scope_span;
+                            cx.notify();
+                        }
+                        Ok(None) => {
+                            let _ = self.state.read(cx).lang_server_client.show_message(
+                                MessageType::ERROR,
+                                "Could not insert the instance into the source scope.",
+                            );
+                        }
+                        Err(_) => {}
                     }
                 }
                 ToolState::DrawDim(dim_tool) => {
@@ -2830,5 +2954,54 @@ mod tests {
         assert_eq!(next.span, large.span);
         let wrapped = choose_selection_hit(hits, Some(&large.span), true).unwrap();
         assert_eq!(wrapped.span, small.span);
+    }
+
+    #[test]
+    fn instance_preview_flattens_nested_translated_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            r#"
+cell leaf(width: Float) {
+    let shape = rect("met1", x0=0., y0=0., x1=width, y1=5.)!;
+}
+cell child(width: Float) {
+    let leaf_instance = inst(leaf(width), x=3., y=4.);
+}
+cell top() {
+    let child_instance = inst(child(10.));
+}
+"#,
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        );
+        let output = match output {
+            argonc::compile::CompileOutput::Valid(output) => output,
+            argonc::compile::CompileOutput::ExecErrors(
+                argonc::compile::ExecErrorCompileOutput {
+                    output: Some(output),
+                    ..
+                },
+            ) => output,
+            output => panic!("preview fixture should compile: {output:?}"),
+        };
+
+        let rects = instance_preview_rects(&output, output.top);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(
+            (rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1),
+            (3., 4., 13., 9.)
+        );
     }
 }

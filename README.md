@@ -78,7 +78,7 @@ result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
 Dependency cells use their dependency name, for example
 `arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
 
-### Neovim
+### IDE
 
 Install the Neovim plugin with the built-in `vim.pack` package manager by
 adding this to your `init.lua`:
@@ -90,46 +90,16 @@ vim.pack.add({
 ```
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your
-`PATH`; no repository path is needed in your Neovim configuration.
+`PATH`.
 
 From an Argon project directory, start Neovim and the GUI together:
 
 ```bash
-argone
+argone pdks/sky130
 ```
 
-You can also give `argone` a project directory or an Argon source file:
-
-```bash
-argone path/to/project
-argone path/to/project/lib.ar
-```
-
-`argone` runs Neovim in the current terminal and starts the GUI as soon as
-the Argon analyzer is ready. To edit a project on another machine, use an SSH
-host or alias from your OpenSSH configuration:
-
-```bash
-argone ssh build-server /path/to/project
-```
-
-Argone selects and forwards the RPC ports automatically. Neovim, the Argon
-Neovim plugin, and `argon-analyzer` must be installed on the remote machine,
-but `argone` itself is only needed locally; the graphical application also
-runs only on the local machine.
-
-Launching Neovim yourself remains supported. In that mode, start or activate
-the GUI by running `:Argon gui`.
-
-Run `:Argon diagnostics` to open a compiler-style view of every Argon
-diagnostic in the project, including diagnostics from files other than the
-current buffer. Press `<Enter>` on an entry to jump to its file and location,
-use `]d` and `[d` to move between entries, `r` to refresh, and `q` to close the
-panel. The same entries are also loaded into Neovim's quickfix list, so
-`:copen`, `:cnext`, and `:cprev` provide the standard cross-file navigation.
-
-From within the GUI, type `:openCell inv(1200., 2000., 4)` to open the `inv` cell. You should now be able to edit layouts 
-in both Neovim and the GUI.
+From within the GUI, hit the `o` hotkey, type `inv(1200., 2000., 4)` after the prefilled `:Argon openCell` command, and press Enter to 
+open the `inv` cell. You should now be able to edit layouts in both Neovim and the GUI.
 
 ## Parametric Cell Tutorial
 
@@ -153,20 +123,27 @@ cell inset_rect() {
 }
 ```
 
-Start the GUI and run `:openCell inset_rect()`. Click on the `met2` layer from the layer sidebar on the right to select it.
-Hit `r` to use the Rect tool and click on two points on the screen to draw your first rectangle.
+Start Argone for the tutorial library with `argone tutorial`. With the layout
+canvas focused, press `o`, type `inset_rect()` after the prefilled
+`:Argon openCell ` command, and press `Enter`. Click the `met2` layer in the
+right sidebar to select it. Press `r` to activate the Rectangle tool, then click
+two points on the canvas to draw your first rectangle.
 You should see a rectangle appear in the GUI and code editor.
 
-Select the `met1` layer and draw another rectangle that surrounds the first. You can use the `ESC` key to exit the Rect tool.
+Select the `met1` layer and draw another rectangle that surrounds the first.
+Press `Esc` to leave the Rectangle tool.
 
 Let us now dimension the rectangles such that the `met2`
 rectangle is inset by `50.` relative to the `met1` rectangle.
-Hit `d` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
-The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
-of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
+Press `d` to activate the Dimension tool and click the top edge of each
+rectangle. Click elsewhere to place the dimension label. The dimension should
+be highlighted yellow while it is being edited. Type `50.` and press `Enter`
+to set its value. The decimal point is important because `50` is an integer
+literal, while the dimension requires a float. To edit an existing dimension
+later, press `s`, select its label, and press `q`.
 
 > [!TIP]
-> If you make a mistake, you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
+> If you make a mistake, you can undo and redo changes from the GUI using `u` and `Ctrl-R`,
 > respectively, or manually modify the code in the text editor if needed.
 
 Repeat for the other 3 sides of the rectangle.
@@ -181,12 +158,13 @@ cell inset_rect(w: Float, h: Float) {
 
 Once you save, you may notice that an error popped up saying that the open cell is invalid.
 This is because we opened the cell with no arguments, but the cell now requires us to specify `w`
-and `h`. To resolve this, go back to the GUI and run `:openCell inset_rect(200., 200.)`. 
+and `h`. To resolve this, focus the canvas, press `o`, enter
+`inset_rect(200., 200.)`, and press `Enter`.
 
-You can now dimension the width of the `met1` rectangle by selecting the top edge then 
-clicking above the rectangle to place the dimension label.
+You can now press `d` and dimension the width of the `met1` rectangle by
+selecting the top edge, then clicking above the rectangle to place the label.
 Enter the dimension as `w`. Dimension the right edge to `h`. You
-can use the `f` keybind to fit the layout to your screen.
+can press `f` to fit the layout to your screen.
 
 You may notice that none of the rectangles have a solid boundary, indicating that they are not fully constrained. In order to
 constrain the edges to absolute coordinates, you can dimension the left and bottom edges of the `met1` rectangle relative to the origin.
@@ -212,9 +190,15 @@ cell triple_rect() {
 }
 ```
 
-After saving, try opening this cell from the GUI by running `:openCell triple_rect()`. You
-should be able to constrain the instances relative to one another based on their
-constituent rectangles.
+After saving, focus the canvas, press `o`, enter `triple_rect()`, and press
+`Enter`. You should be able to constrain the instances relative to one another
+based on their constituent rectangles.
+
+You can also add an instance from the GUI. Select the destination scope in the
+hierarchy sidebar, press `i`, enter a cell invocation such as
+`inset_rect(150., 150.)`, and press `Enter`. Move the instance outline to the
+desired location and click to insert it. The placement tool remains active so
+you can click again to insert more copies; press `Esc` when finished.
 
 ## Logs
 

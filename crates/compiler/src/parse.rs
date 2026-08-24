@@ -118,7 +118,9 @@ impl ParseOutput {
                                     path: path.clone(),
                                     span: *span,
                                 },
-                                kind: StaticErrorKind::InvalidMod,
+                                kind: StaticErrorKind::InvalidMod {
+                                    module: mod_path.join("::"),
+                                },
                             })
                         } else {
                             None
@@ -289,6 +291,21 @@ fn parse_source(input: ArcStr, path: PathBuf) -> (ParseResult, ParseDiagnostics)
         Ok(ast) => ((ast, None), Vec::new()),
         Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
     }
+}
+
+/// Parse one source file from memory.
+///
+/// This is used by editor tooling that needs to type-check a temporary source
+/// transformation without writing it to disk. The returned AST owns the source
+/// text through its annotated substrings, just like a workspace parsed from
+/// disk.
+pub fn parse_source_text(
+    input: impl Into<ArcStr>,
+    path: PathBuf,
+) -> Result<AnnotatedParseAst, anyhow::Error> {
+    let input = input.into();
+    crate::parser::parse_ast(input, path)
+        .map_err(|errors| anyhow!(diagnostics_message(&diagnostics_from_errors(errors))))
 }
 
 /// Wrap a cell-body snippet (a single statement, written without its trailing
