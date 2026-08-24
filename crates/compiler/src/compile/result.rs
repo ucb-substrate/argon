@@ -125,9 +125,12 @@ pub enum StaticErrorKind {
     /// The requested type cast is invalid.
     #[error("invalid type cast")]
     InvalidCast,
-    /// A referenced module does not exist.
-    #[error("module doesn't exist")]
-    InvalidMod,
+    /// A referenced module does not exist in the loaded workspace.
+    #[error("module `{module}` does not exist or could not be loaded")]
+    InvalidMod { module: String },
+    /// Module references form a dependency cycle.
+    #[error("cyclic module dependency: {cycle}")]
+    CyclicModuleDependency { cycle: String },
     /// Source text could not be lexed.
     #[error("error during lexing: {0}")]
     LexError(String),

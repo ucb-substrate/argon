@@ -118,7 +118,9 @@ impl ParseOutput {
                                     path: path.clone(),
                                     span: *span,
                                 },
-                                kind: StaticErrorKind::InvalidMod,
+                                kind: StaticErrorKind::InvalidMod {
+                                    module: mod_path.join("::"),
+                                },
                             })
                         } else {
                             None

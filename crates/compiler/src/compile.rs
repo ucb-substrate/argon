@@ -62,6 +62,12 @@ pub fn static_compile(
         return None;
     }
     let (dag, mut errors) = construct_dag(ast);
+    // Type checking depends on a complete topological module order. Continuing
+    // with a missing module or a dependency cycle only produces misleading
+    // follow-on errors from half-populated module binding frames.
+    if !errors.is_empty() {
+        return Some((IndexMap::new(), StaticErrorCompileOutput { errors }));
+    }
     let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
     errors.extend(new_errors);
     Some((ast, StaticErrorCompileOutput { errors }))
@@ -136,28 +142,97 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
     dynamic_compile(&ast, input)
 }
 
-type ModDag<'a> = IndexMap<&'a ModPath, IndexSet<&'a ModPath>>;
+type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
 
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
-    deps: IndexSet<&'a ModPath>,
+    deps: IndexMap<&'a ModPath, cfgrammar::Span>,
     errors: Vec<StaticError>,
 }
 
 pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> (ModDag<'_>, Vec<StaticError>) {
     let mut errors = Vec::new();
-    (
-        ast.keys()
-            .map(|path| {
-                let (children, new_errors) = ImportPass::new(ast, path).execute();
-                errors.extend(new_errors);
+    let dag = ast
+        .keys()
+        .map(|path| {
+            let (children, new_errors) = ImportPass::new(ast, path).execute();
+            errors.extend(new_errors);
 
-                (path, children)
-            })
-            .collect(),
-        errors,
-    )
+            (path, children)
+        })
+        .collect();
+    errors.extend(dependency_cycle_errors(ast, &dag));
+    (dag, errors)
+}
+
+fn module_name(path: &ModPath) -> String {
+    if path.is_empty() {
+        "lib".to_owned()
+    } else {
+        path.join("::")
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModuleVisitState {
+    Visiting,
+    Visited,
+}
+
+fn dependency_cycle_errors(ast: &WorkspaceParseAst, dag: &ModDag<'_>) -> Vec<StaticError> {
+    fn visit<'a>(
+        module: &'a ModPath,
+        ast: &'a WorkspaceParseAst,
+        dag: &ModDag<'a>,
+        states: &mut IndexMap<&'a ModPath, ModuleVisitState>,
+        stack: &mut Vec<&'a ModPath>,
+        errors: &mut Vec<StaticError>,
+    ) {
+        states.insert(module, ModuleVisitState::Visiting);
+        stack.push(module);
+
+        for (dependency, reference_span) in &dag[module] {
+            let dependency = *dependency;
+            match states.get(dependency).copied() {
+                Some(ModuleVisitState::Visiting) => {
+                    let cycle_start = stack
+                        .iter()
+                        .position(|candidate| *candidate == dependency)
+                        .expect("a visiting module is on the dependency stack");
+                    let mut cycle = stack[cycle_start..]
+                        .iter()
+                        .map(|path| module_name(path))
+                        .collect_vec();
+                    cycle.push(module_name(dependency));
+                    errors.push(StaticError {
+                        span: Span {
+                            path: ast[module].path.clone(),
+                            span: *reference_span,
+                        },
+                        kind: StaticErrorKind::CyclicModuleDependency {
+                            cycle: cycle.join(" -> "),
+                        },
+                    });
+                }
+                Some(ModuleVisitState::Visited) => {}
+                None => visit(dependency, ast, dag, states, stack, errors),
+            }
+        }
+
+        stack.pop();
+        states.insert(module, ModuleVisitState::Visited);
+    }
+
+    let mut states = IndexMap::new();
+    let mut stack = Vec::new();
+    let mut errors = Vec::new();
+    for module in dag.keys().copied() {
+        if !states.contains_key(module) {
+            visit(module, ast, dag, &mut states, &mut stack, &mut errors);
+        }
+    }
+    errors
 }
 
 impl<'a> ImportPass<'a> {
@@ -177,7 +252,25 @@ impl<'a> ImportPass<'a> {
         }
     }
 
-    pub(crate) fn execute(mut self) -> (IndexSet<&'a ModPath>, Vec<StaticError>) {
+    fn record_dependency(&mut self, path: ModPath, span: cfgrammar::Span) {
+        // An unqualified name, or an explicitly qualified name that resolves
+        // back to this module, does not create an edge between modules.
+        if path == *self.current_path {
+            return;
+        }
+        if let Some((path_ref, _)) = self.ast.get_key_value(&path) {
+            self.deps.entry(path_ref).or_insert(span);
+        } else {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::InvalidMod {
+                    module: module_name(&path),
+                },
+            });
+        }
+    }
+
+    pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -212,8 +305,35 @@ impl<'a> AstTransformer for ImportPass<'a> {
 
     fn dispatch_ident_path(
         &mut self,
-        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
+        input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
+        // Multi-component identifier paths are enum values. The final two
+        // components are the enum and variant, leaving the module path.
+        if input.path.len() <= 2 || input.path[0].name == "std" {
+            return;
+        }
+        let path = if input.path[0].name == "lib" {
+            input
+                .path
+                .iter()
+                .skip(1)
+                .dropping_back(2)
+                .map(|ident| ident.name.to_string())
+                .collect_vec()
+        } else {
+            self.current_path
+                .iter()
+                .cloned()
+                .chain(
+                    input
+                        .path
+                        .iter()
+                        .dropping_back(2)
+                        .map(|ident| ident.name.to_string()),
+                )
+                .collect_vec()
+        };
+        self.record_dependency(path, input.span);
     }
 
     fn dispatch_enum_decl(
@@ -354,7 +474,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if func.path[0].name != "std" {
+        if func.path.len() > 1 && func.path[0].name != "std" {
             let path = if func.path[0].name == "lib" {
                 func.path
                     .iter()
@@ -374,14 +494,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
                     )
                     .collect_vec()
             };
-            if let Some((path_ref, _)) = self.ast.get_key_value(&path) {
-                self.deps.insert(path_ref);
-            } else {
-                self.errors.push(StaticError {
-                    span: self.span(func.span),
-                    kind: StaticErrorKind::InvalidMod,
-                });
-            }
+            self.record_dependency(path, func.span);
         }
     }
 
@@ -511,7 +624,7 @@ pub(crate) fn execute_var_id_ty_pass_inner<'a>(
     }
     mod_bindings.insert(current_path, VarIdTyFrame::default());
 
-    for children in &dag[&current_path] {
+    for children in dag[&current_path].keys() {
         execute_var_id_ty_pass_inner(
             ast,
             dag,

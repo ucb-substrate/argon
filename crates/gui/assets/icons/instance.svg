@@ -1,5 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-  <path d="M8 8h32v8H16v24H8V8Z"/>
-  <path fill-rule="evenodd" d="M24 24h32v32H24V24Zm8 8v16h16V32H32Z"/>
-  <path d="M44 4v8h8v8h-8v8h-8v-8h-8v-8h8V4h8Z"/>
+  <!-- A reusable layout cell, drawn like a component with connection pins. -->
+  <path fill-rule="evenodd" d="M8 10h34v4h6v8h-6v6h6v8h-6v14H8V36H2v-8h6v-6H2v-8h6V10Zm8 8v24h18V18H16Z"/>
+  <!-- The plus is cut out of a solid badge so it remains legible at 20 px. -->
+  <path fill-rule="evenodd" d="M49 34a15 15 0 1 1 0 30 15 15 0 0 1 0-30Zm-3 5h6v7h7v6h-7v7h-6v-7h-7v-6h7v-7Z"/>
 </svg>

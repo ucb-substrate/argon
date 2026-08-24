@@ -93,14 +93,17 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{
-        compile::{ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind},
+        compile::{
+            ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
+        },
         gds::GdsMap,
-        parse::{parse_workspace_with_std, parse_workspace_with_std_and_deps},
+        parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
     use ::gds::GdsUnits;
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
+    use indexmap::IndexMap;
     use pegasus::drc::{DrcParams, run_drc};
 
     use crate::compile::{CellArg, CompileInput, compile};
@@ -821,6 +824,56 @@ mod tests {
         assert_eq!(
             error.kind.to_string(),
             "cannot use `bot` before its declaration; move the `cell bot ...` declaration above this use"
+        );
+    }
+
+    #[test]
+    fn cyclic_module_dependencies_report_the_full_cycle() {
+        let root_path = PathBuf::from("/virtual/lib.ar");
+        let devices_path = PathBuf::from("/virtual/devices.ar");
+        let root = parse_source_text(
+            "fn root_value() -> Float { devices::device_value() }",
+            root_path,
+        )
+        .unwrap();
+        let devices = parse_source_text(
+            "fn device_value() -> Float { lib::root_value() }",
+            devices_path.clone(),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["devices".to_owned()], devices)]);
+
+        let (typed, output) = static_compile(&ast).unwrap();
+        assert!(
+            typed.is_empty(),
+            "an invalid module graph must not be typed"
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(output.errors[0].span.path, devices_path);
+        assert_eq!(
+            output.errors[0].kind.to_string(),
+            "cyclic module dependency: lib -> devices -> lib"
+        );
+    }
+
+    #[test]
+    fn missing_module_errors_include_the_module_name() {
+        let root = parse_source_text(
+            "fn root_value() -> Float { missing::value() }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+
+        let (typed, output) = static_compile(&ast).unwrap();
+        assert!(
+            typed.is_empty(),
+            "an invalid module graph must not be typed"
+        );
+        assert_eq!(output.errors.len(), 1);
+        assert_eq!(
+            output.errors[0].kind.to_string(),
+            "module `missing` does not exist or could not be loaded"
         );
     }
 
