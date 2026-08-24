@@ -40,6 +40,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Mod(m) => {
                     decls.push(Decl::Mod(pass.transform_mod_decl(m)));
                 }
+                Decl::Use(u) => {
+                    decls.push(Decl::Use(pass.transform_use_decl(u)));
+                }
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(pass.transform_enum_decl(e)));
                 }

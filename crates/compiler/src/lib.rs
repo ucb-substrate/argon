@@ -857,6 +857,57 @@ mod tests {
     }
 
     #[test]
+    fn use_imports_functions_and_supports_aliases() {
+        use crate::ast::{Decl, Expr};
+
+        let root = parse_source_text(
+            "use math::double as twice; fn root(x: Float) -> Float { twice(x) }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let math = parse_source_text(
+            "fn double(x: Float) -> Float { x + x }",
+            PathBuf::from("/virtual/math.ar"),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["math".to_owned()], math)]);
+
+        let (typed, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.is_empty(), "{:#?}", output.errors);
+
+        let Decl::Fn(root) = &typed[&Vec::new()].ast.decls[1] else {
+            panic!("expected root function");
+        };
+        let Expr::Call(call) = root.scope.tail.as_ref().unwrap() else {
+            panic!("expected imported function call");
+        };
+        let Decl::Fn(double) = &typed[&vec!["math".to_owned()]].ast.decls[0] else {
+            panic!("expected double function");
+        };
+        assert_eq!(call.func.path[0].name.as_str(), "twice");
+        assert_eq!(call.metadata.0, Some(double.metadata.1));
+    }
+
+    #[test]
+    fn unresolved_use_item_has_a_targeted_error() {
+        let root = parse_source_text(
+            "use math::missing; fn root() {}",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let math = parse_source_text("fn present() {}", PathBuf::from("/virtual/math.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["math".to_owned()], math)]);
+
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.iter().any(|error| {
+            matches!(
+                &error.kind,
+                StaticErrorKind::UnresolvedImport { path } if path == "math::missing"
+            )
+        }));
+    }
+
+    #[test]
     fn missing_module_errors_include_the_module_name() {
         let root = parse_source_text(
             "fn root_value() -> Float { missing::value() }",

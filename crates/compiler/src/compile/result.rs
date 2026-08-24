@@ -128,6 +128,9 @@ pub enum StaticErrorKind {
     /// A referenced module does not exist in the loaded workspace.
     #[error("module `{module}` does not exist or could not be loaded")]
     InvalidMod { module: String },
+    /// A `use` path names an item that does not exist in the target module.
+    #[error("unresolved import `{path}`")]
+    UnresolvedImport { path: String },
     /// Module references form a dependency cycle.
     #[error("cyclic module dependency: {cycle}")]
     CyclicModuleDependency { cycle: String },

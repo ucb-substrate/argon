@@ -20,7 +20,7 @@ use crate::ast::{
     FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
     IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
     SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
-    TySpecKind, UnaryOp, UnaryOpExpr,
+    TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -360,7 +360,7 @@ impl<'a> Parser<'a> {
         use TokenKind::*;
         while !self.at(Eof) {
             match self.cur.kind {
-                KwEnum | KwStruct | KwCell | KwFn | KwConst | KwMod => break,
+                KwEnum | KwStruct | KwCell | KwFn | KwConst | KwMod | KwUse => break,
                 _ => {
                     self.bump();
                 }
@@ -381,6 +381,7 @@ impl<'a> Parser<'a> {
             KwFn => Decl::Fn(self.parse_fn_decl()),
             KwConst => Decl::Constant(self.parse_const_decl()),
             KwMod => Decl::Mod(self.parse_mod_decl()),
+            KwUse => Decl::Use(self.parse_use_decl()),
             _ => return None,
         })
     }
@@ -454,6 +455,30 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Semi);
         ModDecl {
             ident,
+            span: self.finish_span(lo),
+        }
+    }
+
+    /// `useDecl : USE identPath (AS ident)? SEMI`
+    fn parse_use_decl(&mut self) -> UseDecl<&'a str, Md> {
+        let lo = self.cur.start;
+        self.expect(TokenKind::KwUse);
+        let path = self.parse_ident_path();
+        if path.path.len() < 2 {
+            self.error_at(
+                path.span,
+                "a use path must name an item in a module".to_string(),
+            );
+        }
+        let alias = if self.eat(TokenKind::KwAs) {
+            Some(self.ident())
+        } else {
+            None
+        };
+        self.expect(TokenKind::Semi);
+        UseDecl {
+            path: path.path,
+            alias,
             span: self.finish_span(lo),
         }
     }

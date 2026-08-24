@@ -159,6 +159,46 @@ mod tests {
     }
 
     #[test]
+    fn use_declarations_parse_paths_and_aliases() {
+        use crate::ast::Decl;
+
+        let src = "use geometry::width;\nuse lib::math::double as twice;\nfn f() {}";
+        let ast = parse(src).expect("use declarations should parse");
+        let Decl::Use(width) = &ast.ast.decls[0] else {
+            panic!("expected a use declaration");
+        };
+        assert_eq!(
+            width
+                .path
+                .iter()
+                .map(|part| part.name.as_str())
+                .collect::<Vec<_>>(),
+            ["geometry", "width"]
+        );
+        assert!(width.alias.is_none());
+        assert_eq!(
+            &src[width.span.start()..width.span.end()],
+            "use geometry::width;"
+        );
+
+        let Decl::Use(double) = &ast.ast.decls[1] else {
+            panic!("expected an aliased use declaration");
+        };
+        assert_eq!(double.alias.as_ref().unwrap().name.as_str(), "twice");
+        assert_eq!(
+            &src[double.span.start()..double.span.end()],
+            "use lib::math::double as twice;"
+        );
+
+        let error = parse("use width;").expect_err("a use must include a module path");
+        assert!(
+            error
+                .iter()
+                .any(|error| error.message.contains("must name an item in a module"))
+        );
+    }
+
+    #[test]
     fn literal_values_and_spans() {
         use crate::ast::{Decl, Expr, Statement};
 
