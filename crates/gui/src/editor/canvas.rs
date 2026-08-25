@@ -138,6 +138,47 @@ fn choose_selection_hit(
     hits.get(index).cloned()
 }
 
+/// Rectangle order for dimension-edge hit testing, matching
+/// [`ordered_selection_hits`]. Scope bboxes sit below layout layers; within
+/// layout, higher-z layers win, then smaller shapes, then later paint order.
+fn ordered_dimension_rects<'a>(
+    rects: &'a [(Rect, LayerState)],
+    scope_rects: &'a [LabeledBbox],
+) -> Vec<&'a Rect> {
+    let mut candidates = rects
+        .iter()
+        .enumerate()
+        .map(|(paint_order, (rect, layer))| {
+            (
+                rect,
+                SelectionLayer::Layout(layer.z),
+                (rect.x1 - rect.x0).abs() * (rect.y1 - rect.y0).abs(),
+                paint_order,
+            )
+        })
+        .chain(
+            scope_rects
+                .iter()
+                .enumerate()
+                .filter(|(_, bbox)| !bbox.rect.object_path.is_empty())
+                .map(|(paint_order, bbox)| {
+                    (
+                        &bbox.rect,
+                        SelectionLayer::Scope,
+                        (bbox.rect.x1 - bbox.rect.x0).abs() * (bbox.rect.y1 - bbox.rect.y0).abs(),
+                        paint_order,
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    candidates.into_iter().map(|(rect, _, _, _)| rect).collect()
+}
+
 struct InitialConditionUpdate {
     span: Span,
     value: f64,
@@ -1585,18 +1626,7 @@ impl Element for CanvasElement {
                     match tool {
                         ToolState::DrawDim(dim_tool)
                             if dim_tool.edges.len() < 2 => {
-                                let rects = rects
-                                    .iter()
-                                    .rev()
-                                    .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                                    .map(|(r, _)| r)
-                                    .chain(
-                                        scope_rects
-                                            .iter()
-                                            .rev()
-                                            .map(|bbox| &bbox.rect)
-                                            .filter(|rect| !rect.object_path.is_empty()),
-                                    );
+                                let rects = ordered_dimension_rects(&rects, &scope_rects);
                                 let scale = inner.scale;
                                 let offset = inner.offset;
                                 let mut selected = None;
@@ -1612,7 +1642,7 @@ impl Element for CanvasElement {
                                 {
                                     selected = Some(DimEdge::X0);
                                 }
-                                for (rect, r) in rects.map(|r| {
+                                'rects: for (rect, r) in rects.into_iter().map(|r| {
                                     (
                                         r,
                                         Bounds::new(
@@ -1694,7 +1724,7 @@ impl Element for CanvasElement {
                                         {
                                             selected =
                                                 Some(DimEdge::Edge((rect, name, edge_layout)));
-                                            break;
+                                            break 'rects;
                                         }
                                     }
                                 }
@@ -2163,19 +2193,7 @@ impl LayoutCanvas {
                 }
                 ToolState::DrawDim(dim_tool) => {
                     let enter_entry_mode = if dim_tool.edges.len() < 2 {
-                        let rects = self
-                            .rects
-                            .iter()
-                            .rev()
-                            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                            .map(|(r, _)| r)
-                            .chain(
-                                self.scope_rects
-                                    .iter()
-                                    .rev()
-                                    .map(|bbox| &bbox.rect)
-                                    .filter(|rect| !rect.object_path.is_empty()),
-                            );
+                        let rects = ordered_dimension_rects(&self.rects, &self.scope_rects);
                         let scale = self.scale;
                         let offset = self.offset;
                         let mut selected = None;
@@ -2185,7 +2203,7 @@ impl LayoutCanvas {
                         if y_axis.select_bounds(SELECT_WIDTH).contains(&event.position) {
                             selected = Some(DimEdge::X0);
                         }
-                        for (rect, r) in rects.map(|r| {
+                        'rects: for (rect, r) in rects.into_iter().map(|r| {
                             (
                                 r,
                                 Bounds::new(
@@ -2262,7 +2280,7 @@ impl LayoutCanvas {
                                 if bounds.contains(&event.position) && !rect.object_path.is_empty()
                                 {
                                     selected = Some(DimEdge::Edge((rect, name, edge_layout)));
-                                    break;
+                                    break 'rects;
                                 }
                             }
                         }
@@ -3011,6 +3029,31 @@ pub(crate) fn find_obj_path(
 mod tests {
     use super::*;
 
+    fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
+        (
+            Rect {
+                x0,
+                x1: x0 + size,
+                y0: 0.,
+                y1: size,
+                id: None,
+                object_path: Vec::new(),
+                border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                border_styles: Edges::all(BorderStyle::Solid),
+                cvars: None,
+            },
+            LayerState {
+                name: format!("layer-{z}").into(),
+                color: rgb(0),
+                fill: ShapeFill::Solid,
+                used: true,
+                border_color: rgb(0),
+                visible: true,
+                z,
+            },
+        )
+    }
+
     fn selection_hit(name: &str, layer: SelectionLayer, size: f32) -> SelectionHit {
         SelectionHit {
             span: Span {
@@ -3137,6 +3180,23 @@ mod tests {
         assert_eq!(
             selected.span.path,
             std::path::PathBuf::from("large-high.ar")
+        );
+    }
+
+    #[test]
+    fn dimension_edges_use_normal_selection_priority() {
+        let rects = vec![
+            dimension_rect(10., 10., 2),
+            dimension_rect(20., 100., 3),
+            dimension_rect(30., 5., 3),
+        ];
+
+        let ordered = ordered_dimension_rects(&rects, &[]);
+
+        // Higher z wins even when larger; among equal-z shapes, smaller wins.
+        assert_eq!(
+            ordered.iter().map(|rect| rect.x0).collect::<Vec<_>>(),
+            [30., 20., 10.]
         );
     }
 
