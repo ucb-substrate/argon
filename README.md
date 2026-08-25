@@ -88,6 +88,12 @@ and a leading `~/` is expanded to the user's home directory.
 When invoking `argonc` directly, pass the same mapping as
 `--gds-import 'macros::sram=layout/sram.gds'`.
 
+Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
+receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
+text from a contained `<layer>.label` as its field name. Repeated pin names are
+arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance is collapsed in the
+GUI, its displayed bounding-box edges are available through `bbox(inst)`.
+
 ### IDE
 
 Install the Neovim plugin with the built-in `vim.pack` package manager by

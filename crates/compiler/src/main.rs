@@ -301,6 +301,35 @@ mod tests {
         path
     }
 
+    fn temp_nested_gds(name: &str) -> PathBuf {
+        let source = temp_source(name, "");
+        let path = source.with_extension("gds");
+        let mut library = GdsLibrary::new("fixture");
+        let mut child = GdsStruct::new("layout_child");
+        child.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+            layer: 235,
+            datatype: 4,
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(0, 20),
+                GdsPoint::new(10, 20),
+                GdsPoint::new(10, 0),
+            ],
+            ..Default::default()
+        }));
+        let mut top = GdsStruct::new("layout_top");
+        top.elems.push(GdsElement::GdsStructRef(gds::GdsStructRef {
+            name: "layout_child".into(),
+            xy: GdsPoint::new(0, 0),
+            ..Default::default()
+        }));
+        library.structs.extend([child, top]);
+        library
+            .save(&path)
+            .expect("temporary nested GDS should be written");
+        path
+    }
+
     fn check_args(root: PathBuf) -> Args {
         Args {
             root,
@@ -437,7 +466,11 @@ mod tests {
     fn imports_a_gds_cell_at_a_module_path() {
         let source = temp_source(
             "gds-root",
-            "use lib::macros::sram;\ncell top() { let imported = inst(sram(), x=0., y=0.); }\n",
+            "use lib::macros::sram;\n\
+             cell top() {\n\
+             let imported = inst(sram(), x=0., y=0.);\n\
+             eq(imported.gds_rect_0.x0, 0.);\n\
+             }\n",
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
@@ -456,13 +489,89 @@ mod tests {
         };
         let top = &output.cells[&output.top];
         assert_eq!(top.scopes[&top.root].name, "cell top");
-        assert_eq!(top.objects.len(), 1);
+        assert_eq!(top.objects.len(), 2);
         let imported = top
             .objects
             .values()
             .find_map(|object| object.get_instance())
             .expect("top should instantiate the imported cell");
-        assert_eq!(output.cells[&imported.cell].objects.len(), 1);
+        let imported_cell = &output.cells[&imported.cell];
+        assert_eq!(imported_cell.objects.len(), 1);
+        assert!(imported_cell.fields.contains_key("gds_rect_0"));
+    }
+
+    #[test]
+    fn constrains_an_imported_gds_shape_field() {
+        let source = temp_source(
+            "gds-shape-constraint",
+            "cell top() {\n\
+             let imported = inst(sram());\n\
+             eq(imported.gds_rect_0.x0, 100.);\n\
+             eq(imported.y, 0.);\n\
+             }\n",
+        );
+        let directory = source.parent().expect("source should have a parent");
+        let artifact_path = directory.join("imported.bin");
+        let mut args = execution_args(source, "top()", basic_lyp());
+        args.gds_imports
+            .push(("sram".to_owned(), temp_gds("gds-shape-field")));
+        args.output = Some(artifact_path.clone());
+
+        if let Err(error) = run(args) {
+            panic!(
+                "GDS shape constraint should compile: {}",
+                render_failed(error)
+            );
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("GDS shape constraint should compile successfully");
+        };
+        let top = &output.cells[&output.top];
+        let imported = top
+            .objects
+            .values()
+            .find_map(|object| object.get_instance())
+            .expect("top should instantiate the imported cell");
+        assert_eq!(imported.x, 100.);
+    }
+
+    #[test]
+    fn constrains_a_shape_through_imported_gds_hierarchy() {
+        let source = temp_source(
+            "nested-gds-shape-constraint",
+            "cell top() {\n\
+             let imported = inst(sram());\n\
+             eq(imported.gds_inst_0.gds_rect_0.x0, 100.);\n\
+             eq(imported.y, 0.);\n\
+             }\n",
+        );
+        let directory = source.parent().expect("source should have a parent");
+        let artifact_path = directory.join("imported.bin");
+        let mut args = execution_args(source, "top()", basic_lyp());
+        args.gds_imports
+            .push(("sram".to_owned(), temp_nested_gds("nested-gds-shape-field")));
+        args.output = Some(artifact_path.clone());
+
+        if let Err(error) = run(args) {
+            panic!(
+                "nested GDS shape constraint should compile: {}",
+                render_failed(error)
+            );
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("nested GDS shape constraint should compile successfully");
+        };
+        let top = &output.cells[&output.top];
+        let imported = top
+            .objects
+            .values()
+            .find_map(|object| object.get_instance())
+            .expect("top should instantiate the imported cell");
+        assert_eq!(imported.x, 100.);
     }
 
     #[test]

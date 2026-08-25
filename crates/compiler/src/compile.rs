@@ -787,6 +787,10 @@ pub struct CellFnTy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellTy {
     data: IndexMap<String, Ty>,
+    /// GDS-backed cells publish geometry fields at execution time. Their
+    /// generated source declaration is intentionally only a signature, so
+    /// field names cannot be enumerated by the source type pass.
+    dynamic_fields: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1475,9 +1479,21 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
             })
             .collect();
+        let dynamic_fields = self
+            .ast
+            .ast
+            .decls
+            .iter()
+            .take(self.ast.generated_declarations)
+            .any(|decl| {
+                matches!(decl, Decl::Cell(cell) if cell.span == input.span && cell.name.name == input.name.name)
+            });
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            cell: Arc::new(CellTy { data }),
+            cell: Arc::new(CellTy {
+                data,
+                dynamic_fields,
+            }),
         }));
         self.alloc(&input.name.name, ty);
         let name = self.transform_ident(&input.name);
@@ -1721,11 +1737,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             },
             Ty::Inst(ref c) => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
-                name => c
-                    .data
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| self.no_field_on_ty(field, base_ty.clone())),
+                name => c.data.get(name).cloned().unwrap_or_else(|| {
+                    if c.dynamic_fields {
+                        Ty::Any
+                    } else {
+                        self.no_field_on_ty(field, base_ty.clone())
+                    }
+                }),
             },
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
@@ -2930,6 +2948,17 @@ impl<'a> ExecPass<'a> {
         let cell_ids = (0..imported.structs.len())
             .map(|_| self.alloc_id())
             .collect::<Vec<_>>();
+        // Imported hierarchy has no source-level cell calls, but field access
+        // through a child instance still needs a ready cell value.
+        let cell_vids = cell_ids
+            .iter()
+            .map(|cell_id| {
+                let vid = self.value_id();
+                self.values
+                    .insert(vid, DeferValue::Ready(Value::Cell(*cell_id)));
+                vid
+            })
+            .collect::<Vec<_>>();
         let top_id = cell_ids[imported.top];
         for (structure_index, structure) in imported.structs.into_iter().enumerate() {
             let cell_id = cell_ids[structure_index];
@@ -2947,61 +2976,91 @@ impl<'a> ExecPass<'a> {
             };
             let mut objects = IndexMap::new();
             let mut emit = Vec::new();
-            for element in structure.elements {
+            let mut named_objects: IndexMap<String, Vec<ObjectId>> = IndexMap::new();
+            for (element_index, element) in structure.elements.into_iter().enumerate() {
                 let id = self.object_id();
-                let value = match element {
+                let (value, field_name) = match element {
                     ImportedGdsElement::Rect {
                         layer,
+                        name,
                         x0,
                         y0,
                         x1,
                         y1,
-                    } => SolvedValue::Rect(Rect {
-                        id,
-                        layer: Some(layer),
-                        x0: (x0, LinearExpr::from(x0)),
-                        y0: (y0, LinearExpr::from(y0)),
-                        x1: (x1, LinearExpr::from(x1)),
-                        y1: (y1, LinearExpr::from(y1)),
-                        construction: false,
-                        span: None,
-                    }),
-                    ImportedGdsElement::Text { layer, text, x, y } => SolvedValue::Text(Text {
-                        id,
-                        layer,
-                        text,
-                        x,
-                        y,
-                        span: None,
-                    }),
+                    } => (
+                        SolvedValue::Rect(Rect {
+                            id,
+                            layer: Some(layer),
+                            x0: (x0, LinearExpr::from(x0)),
+                            y0: (y0, LinearExpr::from(y0)),
+                            x1: (x1, LinearExpr::from(x1)),
+                            y1: (y1, LinearExpr::from(y1)),
+                            construction: false,
+                            span: None,
+                        }),
+                        Some(name.unwrap_or_else(|| format!("gds_rect_{element_index}"))),
+                    ),
+                    ImportedGdsElement::Text { layer, text, x, y } => (
+                        SolvedValue::Text(Text {
+                            id,
+                            layer,
+                            text,
+                            x,
+                            y,
+                            span: None,
+                        }),
+                        None,
+                    ),
                     ImportedGdsElement::Instance {
                         cell,
                         x,
                         y,
                         angle,
                         reflect,
-                    } => SolvedValue::Instance(SolvedInstance {
-                        id,
-                        x,
-                        y,
-                        x_expr: LinearExpr::from(x),
-                        y_expr: LinearExpr::from(y),
-                        angle: Rotation::try_from(angle).unwrap_or(Rotation::R0),
-                        reflect,
-                        construction: false,
-                        cell: cell_ids[cell],
-                        span: span.clone(),
-                        cell_vid: 0,
-                    }),
+                    } => (
+                        SolvedValue::Instance(SolvedInstance {
+                            id,
+                            x,
+                            y,
+                            x_expr: LinearExpr::from(x),
+                            y_expr: LinearExpr::from(y),
+                            angle: Rotation::try_from(angle).unwrap_or(Rotation::R0),
+                            reflect,
+                            construction: false,
+                            cell: cell_ids[cell],
+                            span: span.clone(),
+                            cell_vid: cell_vids[cell],
+                        }),
+                        Some(format!("gds_inst_{element_index}")),
+                    ),
                 };
                 objects.insert(id, value);
                 emit.push((id, CompiledEmit { span: span.clone() }));
+                if let Some(field_name) = field_name {
+                    named_objects.entry(field_name).or_default().push(id);
+                }
             }
+            let fields = named_objects
+                .into_iter()
+                .map(|(name, ids)| {
+                    let value = if ids.len() == 1 {
+                        Arrayed::Elem(ids[0])
+                    } else {
+                        Arrayed::Array(ids.into_iter().map(Arrayed::Elem).collect())
+                    };
+                    (name, value)
+                })
+                .collect::<IndexMap<_, _>>();
+            let bindings = fields
+                .iter()
+                .enumerate()
+                .map(|(index, (name, value))| (SeqNum(index as u64), (name.clone(), value.clone())))
+                .collect();
             let scopes = IndexMap::from_iter([(
                 root,
                 CompiledScope {
                     static_parent: None,
-                    bindings: IndexMap::new(),
+                    bindings,
                     children: IndexSet::new(),
                     name: root_name,
                     span: span.clone(),
@@ -3013,7 +3072,7 @@ impl<'a> ExecPass<'a> {
                 CompiledCell {
                     scopes,
                     root,
-                    fields: IndexMap::new(),
+                    fields,
                     rowspace_vecs: Vec::new(),
                     objects,
                     fallback_constraints_used: Vec::new(),
@@ -3899,16 +3958,34 @@ impl<'a> ExecPass<'a> {
                             Value::Inst(i) => {
                                 if let Defer::Ready(cell) = &self.values[&i.cell] {
                                     let cell_id = cell.as_ref().unwrap_cell();
-                                    Some(
-                                        self.bbox(*cell_id)
-                                            .map(|r| r.transform(i.reflect, i.angle)),
-                                    )
+                                    Some(self.bbox(*cell_id).map(|r| {
+                                        let r = r.transform(i.reflect, i.angle);
+                                        Rect {
+                                            id: r.id,
+                                            layer: r.layer,
+                                            x0: LinearExpr::from(r.x0) + i.x.clone(),
+                                            y0: LinearExpr::from(r.y0) + i.y.clone(),
+                                            x1: LinearExpr::from(r.x1) + i.x.clone(),
+                                            y1: LinearExpr::from(r.y1) + i.y.clone(),
+                                            construction: true,
+                                            span: None,
+                                        }
+                                    }))
                                 } else {
                                     self.add_value_dependent(i.cell, vid);
                                     None
                                 }
                             }
-                            Value::Cell(c) => Some(self.bbox(*c)),
+                            Value::Cell(c) => Some(self.bbox(*c).map(|r| Rect {
+                                id: r.id,
+                                layer: r.layer,
+                                x0: r.x0.into(),
+                                y0: r.y0.into(),
+                                x1: r.x1.into(),
+                                y1: r.y1.into(),
+                                construction: true,
+                                span: None,
+                            })),
                             _ => {
                                 self.errors.push(ExecError {
                                     span: Some(span.clone()),
@@ -3925,10 +4002,10 @@ impl<'a> ExecPass<'a> {
                                 let orect = Rect {
                                     id,
                                     layer: None,
-                                    x0: r.x0.into(),
-                                    y0: r.y0.into(),
-                                    x1: r.x1.into(),
-                                    y1: r.y1.into(),
+                                    x0: r.x0,
+                                    y0: r.y0,
+                                    x1: r.x1,
+                                    y1: r.y1,
                                     construction: true,
                                     span: Some(span.clone()),
                                 };
@@ -5761,15 +5838,31 @@ impl CompiledData {
         }
         for (item_num, (name, obj)) in scope.bindings.iter() {
             if *item_num < seq_num {
-                obj.for_each(&mut |obj| match &cell.objects[obj] {
-                    SolvedValue::Rect(r) => {
-                        set.insert(r.id, format!("{}{}", name_prefix, name));
-                    }
-                    SolvedValue::Instance(inst) => {
-                        set.insert(inst.id, format!("{}{}", name_prefix, name));
-                    }
-                    _ => (),
-                });
+                Self::insert_reachable_obj(obj, cell, &format!("{}{}", name_prefix, name), set);
+            }
+        }
+    }
+
+    fn insert_reachable_obj(
+        value: &Arrayed<ObjectId>,
+        cell: &CompiledCell,
+        name: &str,
+        set: &mut IndexMap<ObjectId, String>,
+    ) {
+        match value {
+            Arrayed::Elem(obj) => match &cell.objects[obj] {
+                SolvedValue::Rect(r) => {
+                    set.insert(r.id, name.to_owned());
+                }
+                SolvedValue::Instance(inst) => {
+                    set.insert(inst.id, name.to_owned());
+                }
+                _ => (),
+            },
+            Arrayed::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    Self::insert_reachable_obj(value, cell, &format!("{name}[{index}]"), set);
+                }
             }
         }
     }

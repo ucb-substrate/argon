@@ -272,7 +272,12 @@ fn add_gds_imports(output: &mut ParseOutput, imports: impl IntoIterator<Item = (
                 .unwrap_or_default();
             output.errs.insert(source_path, (diagnostics, mod_spans));
         } else {
-            let (result, diagnostics) = parse_source(ArcStr::from(imports), import_path.clone());
+            let (mut result, diagnostics) =
+                parse_source(ArcStr::from(imports), import_path.clone());
+            if result.1.is_none() {
+                result.0.promote_last_declarations(import_count);
+            }
+            result.0.source_text = ArcStr::from("");
             output.asts.insert(module, result);
             output.errs.insert(import_path, (diagnostics, Vec::new()));
         }

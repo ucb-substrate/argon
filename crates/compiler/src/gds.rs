@@ -97,6 +97,7 @@ pub(crate) struct ImportedGdsStruct {
 pub(crate) enum ImportedGdsElement {
     Rect {
         layer: String,
+        name: Option<String>,
         x0: f64,
         y0: f64,
         x1: f64,
@@ -228,6 +229,7 @@ pub(crate) fn import_gds(
                 ),
             }
         }
+        name_pin_rects(&mut elements);
         structs.push(ImportedGdsStruct {
             name: structure.name.to_string(),
             elements,
@@ -277,11 +279,85 @@ fn import_rect(
     }
     Ok(ImportedGdsElement::Rect {
         layer: import_layer(map, path, layer, datatype)?,
+        name: None,
         x0: f64::from(x0) * scale,
         y0: f64::from(y0) * scale,
         x1: f64::from(x1) * scale,
         y1: f64::from(y1) * scale,
     })
+}
+
+/// Associate conventional `<material>.label` text with the `<material>.pin`
+/// rectangle containing its origin. The LYP names already carry the layer
+/// purpose, so this does not require a PDK-specific technology file.
+fn name_pin_rects(elements: &mut [ImportedGdsElement]) {
+    let labels = elements
+        .iter()
+        .filter_map(|element| match element {
+            ImportedGdsElement::Text { layer, text, x, y } => layer
+                .strip_suffix(".label")
+                .map(|material| (material.to_owned(), text.clone(), *x, *y)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for element in elements {
+        let ImportedGdsElement::Rect {
+            layer,
+            name,
+            x0,
+            y0,
+            x1,
+            y1,
+        } = element
+        else {
+            continue;
+        };
+        let Some(material) = layer.strip_suffix(".pin") else {
+            continue;
+        };
+        *name = labels.iter().find_map(|(label_material, text, x, y)| {
+            (label_material == material && *x >= *x0 && *x <= *x1 && *y >= *y0 && *y <= *y1)
+                .then(|| argon_ident(text))
+        });
+    }
+}
+
+fn argon_ident(label: &str) -> String {
+    let mut ident = String::with_capacity(label.len() + 1);
+    for ch in label.chars() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            ident.push(ch);
+        } else {
+            ident.push('_');
+        }
+    }
+    if ident.is_empty() || ident.as_bytes()[0].is_ascii_digit() {
+        ident.insert(0, '_');
+    }
+    if matches!(
+        ident.as_str(),
+        "x" | "y"
+            | "fn"
+            | "if"
+            | "as"
+            | "in"
+            | "let"
+            | "for"
+            | "mod"
+            | "use"
+            | "enum"
+            | "cell"
+            | "true"
+            | "else"
+            | "match"
+            | "const"
+            | "false"
+            | "struct"
+    ) {
+        ident.push('_');
+    }
+    ident
 }
 
 fn import_reference(
@@ -484,4 +560,50 @@ fn parse_cell_name(name: &str) -> Result<&str> {
         .next()
         .and_then(|suffix| suffix.split_whitespace().next())
         .ok_or_else(|| anyhow!("parse error"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_shape_uses_contained_matching_layer_label() {
+        let mut elements = vec![
+            ImportedGdsElement::Rect {
+                layer: "met1.pin".to_owned(),
+                name: None,
+                x0: 0.,
+                y0: 0.,
+                x1: 100.,
+                y1: 100.,
+            },
+            ImportedGdsElement::Text {
+                layer: "met1.label".to_owned(),
+                text: "VDD".to_owned(),
+                x: 50.,
+                y: 50.,
+            },
+            ImportedGdsElement::Text {
+                layer: "met2.label".to_owned(),
+                text: "wrong_layer".to_owned(),
+                x: 50.,
+                y: 50.,
+            },
+        ];
+
+        name_pin_rects(&mut elements);
+
+        let ImportedGdsElement::Rect { name, .. } = &elements[0] else {
+            unreachable!();
+        };
+        assert_eq!(name.as_deref(), Some("VDD"));
+    }
+
+    #[test]
+    fn pin_label_is_made_into_an_argon_identifier() {
+        assert_eq!(argon_ident("data out[0]"), "data_out_0_");
+        assert_eq!(argon_ident("1V8"), "_1V8");
+        assert_eq!(argon_ident("in"), "in_");
+        assert_eq!(argon_ident("x"), "x_");
+    }
 }

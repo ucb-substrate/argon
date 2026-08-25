@@ -1246,6 +1246,16 @@ mod tests {
         let cells = cells.unwrap_valid();
         let cell = &cells.cells[&cells.top];
         assert_eq!(cell.objects.len(), 5);
+        let translated_bbox_rect = cell
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .find(|rect| rect.layer.as_deref() == Some("met3"))
+            .expect("met3 should copy the placed instance bbox");
+        assert_eq!(translated_bbox_rect.x0.0, 100.);
+        assert_eq!(translated_bbox_rect.y0.0, 100.);
+        assert_eq!(translated_bbox_rect.x1.0, 200.);
+        assert_eq!(translated_bbox_rect.y1.0, 200.);
     }
 
     #[test]

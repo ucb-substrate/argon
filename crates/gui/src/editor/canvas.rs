@@ -1589,7 +1589,14 @@ impl Element for CanvasElement {
                                     .iter()
                                     .rev()
                                     .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                                    .map(|(r, _)| r);
+                                    .map(|(r, _)| r)
+                                    .chain(
+                                        scope_rects
+                                            .iter()
+                                            .rev()
+                                            .map(|bbox| &bbox.rect)
+                                            .filter(|rect| !rect.object_path.is_empty()),
+                                    );
                                 let scale = inner.scale;
                                 let offset = inner.offset;
                                 let mut selected = None;
@@ -1683,7 +1690,7 @@ impl Element for CanvasElement {
                                     ] {
                                         let bounds = edge_px.select_bounds(SELECT_WIDTH);
                                         if bounds.contains(&inner.mouse_position)
-                                            && rect.id.is_some()
+                                            && !rect.object_path.is_empty()
                                         {
                                             selected =
                                                 Some(DimEdge::Edge((rect, name, edge_layout)));
@@ -2161,7 +2168,14 @@ impl LayoutCanvas {
                             .iter()
                             .rev()
                             .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                            .map(|(r, _)| r);
+                            .map(|(r, _)| r)
+                            .chain(
+                                self.scope_rects
+                                    .iter()
+                                    .rev()
+                                    .map(|bbox| &bbox.rect)
+                                    .filter(|rect| !rect.object_path.is_empty()),
+                            );
                         let scale = self.scale;
                         let offset = self.offset;
                         let mut selected = None;
@@ -2245,7 +2259,8 @@ impl LayoutCanvas {
                                 ),
                             ] {
                                 let bounds = edge_px.select_bounds(SELECT_WIDTH);
-                                if bounds.contains(&event.position) && rect.id.is_some() {
+                                if bounds.contains(&event.position) && !rect.object_path.is_empty()
+                                {
                                     selected = Some(DimEdge::Edge((rect, name, edge_layout)));
                                     break;
                                 }
@@ -2977,10 +2992,15 @@ pub(crate) fn find_obj_path(
     let mut reachable_objs = cell
         .output
         .reachable_objs(current_scope.cell, current_scope.scope);
-    if let Some(name) = reachable_objs.swap_remove(obj)
-        && cell.output.cells[&current_scope.cell].objects[obj].is_rect()
-    {
-        string_path.push(name);
+    if let Some(name) = reachable_objs.swap_remove(obj) {
+        match &cell.output.cells[&current_scope.cell].objects[obj] {
+            SolvedValue::Rect(_) => string_path.push(name),
+            SolvedValue::Instance(_) => {
+                string_path.push(name);
+                string_path = vec![format!("bbox({})", string_path.join("."))];
+            }
+            _ => reachable = false,
+        }
     } else {
         reachable = false;
     }
@@ -3178,6 +3198,70 @@ cell top() {
         assert_eq!(
             (rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1),
             (3., 4., 13., 9.)
+        );
+    }
+
+    #[test]
+    fn dimension_path_uses_bbox_for_a_collapsed_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            r#"
+cell child() {
+    let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+}
+cell top() {
+    let child_instance = inst(child(), x=3., y=4.);
+}
+"#,
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        )
+        .unwrap_valid();
+        let top = output.top;
+        let top_cell = &output.cells[&top];
+        let top_root = top_cell.root;
+        let instance = top_cell
+            .objects
+            .values()
+            .find_map(|object| object.get_instance())
+            .unwrap();
+        let instance_id = instance.id;
+        let child_cell = &output.cells[&instance.cell];
+        let child_rect_id = child_cell
+            .objects
+            .values()
+            .find_map(|object| object.get_rect().map(|rect| rect.id))
+            .unwrap();
+        let state = CompileOutputState {
+            output,
+            selected_scope: Vec::new(),
+            state: Default::default(),
+            scope_paths: Default::default(),
+        };
+        let scope = ScopeAddress {
+            cell: top,
+            scope: top_root,
+        };
+
+        assert_eq!(
+            find_obj_path(&[instance_id], &state, scope),
+            (true, vec!["bbox(child_instance)".to_owned()])
+        );
+        assert_eq!(
+            find_obj_path(&[instance_id, child_rect_id], &state, scope),
+            (true, vec!["child_instance".to_owned(), "shape".to_owned()])
         );
     }
 }
