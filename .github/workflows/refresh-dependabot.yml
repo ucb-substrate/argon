@@ -25,10 +25,11 @@ jobs:
     env:
       DEPENDABOT_REBASE_TOKEN: ${{ secrets.DEPENDABOT_REBASE_TOKEN }}
     steps:
-      - name: Report missing maintainer token
+      - name: Require maintainer token
         if: env.DEPENDABOT_REBASE_TOKEN == ''
         run: |
-          echo "::warning::DEPENDABOT_REBASE_TOKEN is not configured; skipping Dependabot refresh"
+          echo "::error::DEPENDABOT_REBASE_TOKEN is not configured; cannot refresh Dependabot pull requests"
+          exit 1
 
       - name: Re-evaluate open Dependabot pull requests
         if: env.DEPENDABOT_REBASE_TOKEN != ''
