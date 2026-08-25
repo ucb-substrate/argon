@@ -1,4 +1,4 @@
-local project_root = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':p:h:h:h')
+local project_root = assert(vim.env.ARGON_REPOSITORY_ROOT)
 vim.opt.runtimepath:append(project_root)
 
 local diagnostics = require('argon.diagnostics')

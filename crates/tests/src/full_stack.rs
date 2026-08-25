@@ -1,14 +1,6 @@
-//! Cross-process tests for the Neovim plugin, analyzer, and GUI RPC contract.
-//!
-//! The GUI side is deliberately headless: it implements the same generated
-//! `Gui` service as Argone, which lets these tests run on CI without a window
-//! server while still exercising the real serialization and callback paths.
+//! Reusable Neovim, analyzer, and headless-GUI test scenarios.
 
-use std::{
-    net::Ipv4Addr,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
+use std::{net::Ipv4Addr, path::Path, path::PathBuf, time::Instant};
 
 use analyzer::rpc::{Gui, InstancePreview, LangServerClient};
 use argonc::{
@@ -18,11 +10,12 @@ use argonc::{
 use futures::prelude::*;
 use tarpc::{context, server::Channel, tokio_serde::formats::Json};
 use tempfile::TempDir;
-use tokio::{process::Command, sync::mpsc, time};
+use tokio::{sync::mpsc, time};
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(30);
-// Cargo's test runner is parallel by default. These tests launch editors and
-// servers, so serialize them to keep process startup and RPC deadlines stable.
+use crate::{TEST_TIMEOUT, finish_nvim, nvim_command, repository_root};
+
+// Process-heavy scenarios share ports and startup deadlines, so keep them
+// serial even though Cargo runs Rust tests in parallel by default.
 static FULL_STACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,20 +153,16 @@ impl Session {
         }
     }
 
-    fn spawn_nvim(&self, mode: &str) -> tokio::process::Child {
-        let mut command = Command::new("nvim");
+    fn spawn_nvim(&self, mode: &str, analyzer_executable: &Path) -> tokio::process::Child {
+        let mut command = nvim_command();
         command
-            .kill_on_drop(true)
             .current_dir(&self.project)
-            .env("ARGON_TEST_ANALYZER", env!("CARGO_BIN_EXE_argon-analyzer"))
+            .env("ARGON_TEST_ANALYZER", analyzer_executable)
             .env("ARGON_TEST_ANALYZER_PORT", self.analyzer_port.to_string())
             .env("ARGON_TEST_ACK", &self.ack)
             .env("ARGON_TEST_GUI_EDIT_ACK", &self.gui_edit_ack)
             .env("ARGON_TEST_DIAGNOSTIC_ACK", &self.diagnostic_ack)
             .env("ARGON_TEST_MODE", mode)
-            .arg("--headless")
-            .arg("-u")
-            .arg("NONE")
             .arg("--cmd")
             .arg(format!(
                 "set runtimepath+={}",
@@ -185,7 +174,7 @@ impl Session {
             .arg("filetype plugin on")
             .arg("lib.ar")
             .arg("-l")
-            .arg(repository_root().join("tests/full-stack/session.lua"));
+            .arg(repository_root().join("crates/tests/fixtures/nvim/full_stack.lua"));
         command.spawn().expect("start headless Neovim")
     }
 
@@ -204,7 +193,7 @@ impl Session {
                 Instant::now() < deadline,
                 "analyzer RPC server did not start"
             );
-            time::sleep(Duration::from_millis(25)).await;
+            time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 
@@ -216,10 +205,6 @@ impl Session {
     }
 }
 
-fn repository_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 fn unused_port() -> u16 {
     std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("reserve analyzer port")
@@ -228,24 +213,10 @@ fn unused_port() -> u16 {
         .port()
 }
 
-async fn finish_nvim(child: tokio::process::Child) {
-    let output = time::timeout(TEST_TIMEOUT, child.wait_with_output())
-        .await
-        .expect("headless Neovim timed out")
-        .expect("wait for headless Neovim");
-    assert!(
-        output.status.success(),
-        "headless Neovim failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn gui_edit_round_trips_through_nvim_and_back_to_gui() {
+pub async fn gui_edit_roundtrip(analyzer_executable: &Path) {
     let _guard = FULL_STACK_LOCK.lock().await;
     let mut session = Session::new("cell top() {\n}\n").await;
-    let child = session.spawn_nvim("roundtrip");
+    let child = session.spawn_nvim("roundtrip", analyzer_executable);
     let analyzer = session.connect_analyzer().await;
     analyzer
         .register(context::current(), session.gui_addr)
@@ -255,8 +226,7 @@ async fn gui_edit_round_trips_through_nvim_and_back_to_gui() {
     let mut drew_rect = false;
     let mut saw_editor_update = false;
     while !saw_editor_update {
-        let event = session.next_event().await;
-        match event {
+        match session.next_event().await {
             GuiEvent::OpenCell {
                 kind: OutputKind::Data,
                 update,
@@ -312,11 +282,10 @@ async fn gui_edit_round_trips_through_nvim_and_back_to_gui() {
     assert!(source.contains("let editor_rect = rect("));
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn analyzer_diagnostics_recover_in_nvim_and_gui() {
+pub async fn diagnostic_recovery(analyzer_executable: &Path) {
     let _guard = FULL_STACK_LOCK.lock().await;
     let mut session = Session::new("cell top() {\n    missing;\n}\n").await;
-    let child = session.spawn_nvim("diagnostics");
+    let child = session.spawn_nvim("diagnostics", analyzer_executable);
     let analyzer = session.connect_analyzer().await;
     analyzer
         .register(context::current(), session.gui_addr)
@@ -326,8 +295,7 @@ async fn analyzer_diagnostics_recover_in_nvim_and_gui() {
     let mut saw_errors = false;
     let mut saw_recovery = false;
     while !saw_recovery {
-        let event = session.next_event().await;
-        match event {
+        match session.next_event().await {
             GuiEvent::OpenCell {
                 kind: OutputKind::StaticErrors,
                 ..
