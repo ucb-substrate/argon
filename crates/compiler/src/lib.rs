@@ -476,9 +476,12 @@ mod tests {
         let lib = dir.join("lib.ar");
 
         let mut rows = Vec::new();
-        for depth in bench_sizes("ARGON_BENCH_HIER_SINGLE", &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
-            .into_iter()
-            .map(|d| d as usize)
+        for depth in bench_sizes(
+            "ARGON_BENCH_HIER_SINGLE",
+            &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+        )
+        .into_iter()
+        .map(|d| d as usize)
         {
             std::fs::write(&lib, gen_hier(depth, false)).unwrap();
             let o = parse_workspace_with_std(&lib);
@@ -512,9 +515,12 @@ mod tests {
         // exponentially and had to be capped near depth 18.) Override
         // `ARGON_BENCH_HIER_DOUBLE` to push deeper.
         let mut rows = Vec::new();
-        for depth in bench_sizes("ARGON_BENCH_HIER_DOUBLE", &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048])
-            .into_iter()
-            .map(|d| d as usize)
+        for depth in bench_sizes(
+            "ARGON_BENCH_HIER_DOUBLE",
+            &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+        )
+        .into_iter()
+        .map(|d| d as usize)
         {
             std::fs::write(&lib, gen_hier(depth, true)).unwrap();
             let o = parse_workspace_with_std(&lib);
