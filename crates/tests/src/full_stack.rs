@@ -1,6 +1,6 @@
-//! Reusable Neovim, analyzer, and headless-GUI test scenarios.
+//! Neovim, analyzer, and headless-GUI test scenarios.
 
-use std::{net::Ipv4Addr, path::Path, path::PathBuf, time::Instant};
+use std::{net::Ipv4Addr, path::PathBuf, time::Instant};
 
 use analyzer::rpc::{Gui, InstancePreview, LangServerClient};
 use argonc::{
@@ -90,6 +90,8 @@ struct Session {
     gui_edit_ack: PathBuf,
     diagnostic_ack: PathBuf,
     analyzer_port: u16,
+    lsp_port: u16,
+    lsp_listener: Option<tokio::net::TcpListener>,
     gui_addr: std::net::SocketAddr,
     events: mpsc::UnboundedReceiver<GuiEvent>,
 }
@@ -112,6 +114,13 @@ impl Session {
         .expect("copy test layer properties");
 
         let analyzer_port = unused_port();
+        let lsp_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind analyzer LSP listener");
+        let lsp_port = lsp_listener
+            .local_addr()
+            .expect("read analyzer LSP address")
+            .port();
         let (events_tx, events) = mpsc::unbounded_channel();
         let mut listener =
             tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
@@ -148,17 +157,31 @@ impl Session {
             gui_edit_ack,
             diagnostic_ack,
             analyzer_port,
+            lsp_port,
+            lsp_listener: Some(lsp_listener),
             gui_addr,
             events,
         }
     }
 
-    fn spawn_nvim(&self, mode: &str, analyzer_executable: &Path) -> tokio::process::Child {
+    fn start_analyzer(&mut self) {
+        let listener = self
+            .lsp_listener
+            .take()
+            .expect("analyzer should only be started once");
+        let rpc_port = self.analyzer_port;
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept Neovim LSP stream");
+            let (reader, writer) = tokio::io::split(stream);
+            analyzer::main_with_io(Some(rpc_port), None, reader, writer).await;
+        });
+    }
+
+    fn spawn_nvim(&self, mode: &str) -> tokio::process::Child {
         let mut command = nvim_command();
         command
             .current_dir(&self.project)
-            .env("ARGON_TEST_ANALYZER", analyzer_executable)
-            .env("ARGON_TEST_ANALYZER_PORT", self.analyzer_port.to_string())
+            .env("ARGON_TEST_LSP_PORT", self.lsp_port.to_string())
             .env("ARGON_TEST_ACK", &self.ack)
             .env("ARGON_TEST_GUI_EDIT_ACK", &self.gui_edit_ack)
             .env("ARGON_TEST_DIAGNOSTIC_ACK", &self.diagnostic_ack)
@@ -169,7 +192,7 @@ impl Session {
                 repository_root().display()
             ))
             .arg("--cmd")
-            .arg("lua vim.g.argon={analyzer=vim.env.ARGON_TEST_ANALYZER}; vim.g.argon_analyzer_rpc_port=tonumber(vim.env.ARGON_TEST_ANALYZER_PORT)")
+            .arg("lua vim.g.argon={cmd=vim.lsp.rpc.connect('127.0.0.1', tonumber(vim.env.ARGON_TEST_LSP_PORT))}")
             .arg("--cmd")
             .arg("filetype plugin on")
             .arg("lib.ar")
@@ -213,10 +236,12 @@ fn unused_port() -> u16 {
         .port()
 }
 
-pub async fn gui_edit_roundtrip(analyzer_executable: &Path) {
+#[tokio::test(flavor = "multi_thread")]
+async fn gui_edit_roundtrip() {
     let _guard = FULL_STACK_LOCK.lock().await;
     let mut session = Session::new("cell top() {\n}\n").await;
-    let child = session.spawn_nvim("roundtrip", analyzer_executable);
+    session.start_analyzer();
+    let child = session.spawn_nvim("roundtrip");
     let analyzer = session.connect_analyzer().await;
     analyzer
         .register(context::current(), session.gui_addr)
@@ -282,10 +307,12 @@ pub async fn gui_edit_roundtrip(analyzer_executable: &Path) {
     assert!(source.contains("let editor_rect = rect("));
 }
 
-pub async fn diagnostic_recovery(analyzer_executable: &Path) {
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostic_recovery() {
     let _guard = FULL_STACK_LOCK.lock().await;
     let mut session = Session::new("cell top() {\n    missing;\n}\n").await;
-    let child = session.spawn_nvim("diagnostics", analyzer_executable);
+    session.start_analyzer();
+    let child = session.spawn_nvim("diagnostics");
     let analyzer = session.connect_analyzer().await;
     analyzer
         .register(context::current(), session.gui_addr)

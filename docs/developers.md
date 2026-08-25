@@ -9,11 +9,11 @@ language server, and a GUI RPC harness together. They cover editor-to-GUI
 recompilation, GUI-to-editor source edits, and diagnostic recovery. Neovim 0.12
 or newer must be available on `PATH` to run them locally.
 
-As in normal use, Neovim launches the analyzer as an LSP child and communicates
-with it over standard input and output. The tests substitute the
-`argon-test-analyzer` wrapper around the real analyzer library and assign its
-GUI-facing RPC port explicitly, allowing the headless GUI harness to connect
-over TCP. The analyzer itself is not started independently of Neovim.
+In normal use, Neovim launches the analyzer as an LSP child and communicates
+with it over standard input and output. The unit tests instead run the real
+analyzer library in-process and connect Neovim to its LSP stream over TCP using
+`vim.lsp.rpc.connect()`. The analyzer's separate GUI-facing RPC port connects
+to the headless GUI harness.
 
 ## Debugging
 

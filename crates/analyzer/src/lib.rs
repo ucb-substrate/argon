@@ -24,7 +24,7 @@ use rpc::{GuiClient, InstancePreview, LangServer, insert_statement};
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Json};
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader},
     process::{Child, Command},
     sync::Mutex,
 };
@@ -880,6 +880,28 @@ fn announce_rpc_port(_: &Path, _: u16) -> io::Result<()> {
 }
 
 pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
+    main_with_io(
+        rpc_port,
+        relay_socket,
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+    )
+    .await;
+}
+
+/// Runs the analyzer over an arbitrary LSP transport.
+///
+/// The production binary supplies stdin and stdout. Tests can supply a TCP
+/// stream without launching a second Cargo target.
+pub async fn main_with_io<I, O>(
+    rpc_port: Option<u16>,
+    relay_socket: Option<PathBuf>,
+    stdin: I,
+    stdout: O,
+) where
+    I: AsyncRead + Unpin,
+    O: AsyncWrite,
+{
     // Start server for communication with GUI.
     let port = rpc_port.unwrap_or(0);
     let mut listener =
@@ -901,10 +923,6 @@ pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
         );
         return;
     }
-
-    // Construct actual LSP server.
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
 
     let mut ext_state = None;
     let (service, socket) = LspService::build(|client| {
@@ -947,11 +965,11 @@ pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
 
     // TODO: Allow configuration via ARGON_HOME environment variable.
     if let Some(log_dir) = default_argon_home() {
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
             .with_writer(tracing_appender::rolling::never(log_dir, "analyzer.log"))
             .with_ansi(false)
-            .init();
+            .try_init();
     }
 
     // Start actual LSP server.
