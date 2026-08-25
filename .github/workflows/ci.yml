@@ -71,6 +71,12 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
 
+      - name: Install Neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: v0.12.0
+
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |

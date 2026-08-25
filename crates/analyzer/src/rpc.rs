@@ -272,7 +272,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = Document::new(&ast.source_text, 0);
         let expression = format!(
-            "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
+            "rect({}x0i = {:?}, y0i = {:?}, x1i = {:?}, y1i = {:?})",
             rect.layer
                 .as_ref()
                 .map(|layer| format!("\"{layer}\", "))
