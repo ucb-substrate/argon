@@ -9,7 +9,7 @@ fn make_list(base: Float) -> [Rect] {
 }
 
 fn make_array() -> [[Rect]] {
-    cons(#scope0 make_list(0.), cons(#scope1 make_list(1000.), cons(#scope2 make_list(2000.), [])))
+    cons(make_list(0.), cons(make_list(1000.), cons(make_list(2000.), [])))
 }
 
 fn elem12(arr: [[Rect]]) -> Rect {
@@ -20,14 +20,14 @@ fn elem11(arr: [[Rect]]) -> Rect {
 }
 
 cell bot(input: [Float]) {
-    let arr = #scope0 make_array();
-    let v = #scope1 elem12(arr)!;
+    let arr = make_array();
+    let v = elem12(arr)!;
     let r = rect("met2", x0=0., y0=200., x1=100., y1=head(tail(input)))!;
 }
 
 cell top() {
     let lst = cons(250., cons(350., cons(450., [])));
-    let bot_inst = inst(#scope0 bot(lst), x=2000., y=3000.);
+    let bot_inst = inst(bot(lst), x=2000., y=3000.);
     let r1 = bot_inst.v!;
-    let r2 = #scope1 elem11(bot_inst.arr)!;
+    let r2 = elem11(bot_inst.arr)!;
 }

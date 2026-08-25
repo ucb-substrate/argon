@@ -8,7 +8,7 @@ fn coupled_ring(prev: Rect, first: Rect, n: Int) {
     // component). The base case closes the ring with a single *sum*
     // constraint, which makes the otherwise-underconstrained chain fully
     // determined regardless of `n`.
-    #scope0 if n <= 0 {
+    if n <= 0 {
         eq(prev.x0 + first.x0, 100.);
     } else {
         let cur = crect();
@@ -16,7 +16,7 @@ fn coupled_ring(prev: Rect, first: Rect, n: Int) {
         eq(cur.y1, 10.);
         eq(cur.x1, cur.x0 + 10.);
         eq(prev.x0 - cur.x0, 5.);
-        #scope1 coupled_ring(cur, first, n - 1);
+        coupled_ring(cur, first, n - 1);
     }
 }
 
@@ -28,5 +28,5 @@ cell constraints(n: Int) {
     eq(first.y0, 0.);
     eq(first.y1, 10.);
     eq(first.x1, first.x0 + 10.);
-    #scope0 coupled_ring(first, first, n);
+    coupled_ring(first, first, n);
 }

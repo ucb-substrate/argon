@@ -1,1 +1,5 @@
+name = "sky130"
 lyp = "sky130.lyp"
+
+[gds]
+ring_osc = "~/Downloads/ring_osc.gds"

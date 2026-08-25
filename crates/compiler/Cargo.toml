@@ -1,0 +1,38 @@
+[package]
+name = "argonc"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+derive-where = { version = "1", features = ["serde"] }
+nalgebra = { version = "0.35", features = ["sparse"] }
+klayout-lyp = "0.1"
+gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
+anyhow = { workspace = true }
+cfgrammar = { workspace = true }
+itertools = { workspace = true }
+enumify = { workspace = true }
+arcstr = { workspace = true }
+serde = { workspace = true }
+approx = { workspace = true }
+indexmap = { workspace = true }
+im = { workspace = true }
+geometry = { workspace = true }
+uniquify = { workspace = true }
+rgb = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+bincode = "1"
+
+[dev-dependencies]
+const_format = "0.2"
+pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
+sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
+
+[[bin]]
+name = "argonc"
+path = "src/main.rs"

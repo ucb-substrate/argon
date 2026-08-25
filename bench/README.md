@@ -19,7 +19,7 @@ The Argon sources that are swept live in [`../examples/`](../examples):
 | `examples/stress_hierarchy`      | `h0 .. h8`              | a chain of cells `h{k}` each instantiating `h{k-1}`; compiling `h{k}` exercises `k` levels of hierarchy |
 
 The benchmark *drivers* are the `bench_*` tests in
-[`../core/compiler/src/lib.rs`](../core/compiler/src/lib.rs). For the
+[`../crates/compiler/src/lib.rs`](../crates/compiler/src/lib.rs). For the
 hierarchy axis the driver generates `h0..h{depth}` workspaces on the fly (a
 single `.ar` file cannot express a runtime-variable depth because Argon cells
 cannot be recursive or forward-referenced).
@@ -45,6 +45,19 @@ straight through as environment variables (see
 ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 ```
 
+### BWRC setup
+
+On BWRC servers, installing the full Argon analyzer and Argone application may
+require the following linker flags:
+
+```bash
+RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" \
+  cargo install --git https://github.com/ucb-substrate/argon --locked \
+  argon-analyzer argone
+```
+
+The compiler-only benchmark commands below do not require these flags.
+
 > **Note for AI agents.** Prefer this script over invoking `cargo test`
 > directly — it encodes the flags that are easy to get wrong (release,
 > `--test-threads=1`, the `bench_` name filter) and the figure regeneration.
@@ -58,7 +71,7 @@ ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 >    a difference there is a real discrepancy to fix, not noise. Wall-clock
 >    **times** drift a few percent run-to-run, so small changes there are
 >    expected.
-> 2. Do **not** set `RUSTFLAGS` for these runs — building `-p compiler` does not
+> 2. Do **not** set `RUSTFLAGS` for these runs — building `-p argonc` does not
 >    need the GUI's linker flags. Any you already export are harmless but
 >    unnecessary.
 
@@ -68,7 +81,7 @@ ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 (e.g. to debug a single axis):
 
 ```bash
-cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_
+cargo test -p argonc --release -- --ignored --test-threads=1 --nocapture bench_
 python3 bench/plot_scaling.py     # writes bench/argon_scaling.{png,pdf}
 ```
 
@@ -107,7 +120,7 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 ```bash
 # e.g. sweep the for-loop variant out to the same sizes as bench_shapes
 ARGON_BENCH_SHAPES_LOOP=500,1000,2000,4000,8000,16000,32000 \
-  cargo test -p compiler --release -- --ignored --test-threads=1 --nocapture bench_shapes_loop
+  cargo test -p argonc --release -- --ignored --test-threads=1 --nocapture bench_shapes_loop
 ```
 
 The defaults are sized so the full suite runs in about a minute within ~1.3 GiB

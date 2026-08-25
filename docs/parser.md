@@ -4,7 +4,7 @@ This document describes the hand-written parser that turns Argon source text
 into an abstract syntax tree (AST). It is a reference for anyone modifying the
 parser, the lexer, or the grammar.
 
-The parser lives in `core/compiler/src/parser/`:
+The parser lives in `crates/compiler/src/parser/`:
 
 | File         | Responsibility |
 |--------------|----------------|
@@ -13,9 +13,9 @@ The parser lives in `core/compiler/src/parser/`:
 | `grammar.rs` | `Parser` — a recursive-descent + Pratt parser that builds the AST. Most of the logic lives here. |
 | `mod.rs`     | The public entry points (`parse_ast`, `parse_cell`), the `ParseError` type, and the `#[cfg(test)]` test suite. |
 
-The AST node definitions are in `core/compiler/src/ast/mod.rs`. A descriptive
+The AST node definitions are in `crates/compiler/src/ast/mod.rs`. A descriptive
 (non-executable) reference grammar is kept in sync at
-`core/compiler/grammar/Argon.g4`.
+`crates/compiler/grammar/Argon.g4`.
 
 ---
 
@@ -138,7 +138,7 @@ is irrelevant for Argon.)
 
 - **Keywords** — `enum struct match const cell mod if fn else let for in as
   true false` (15 of them).
-- **Names & literals** — `Ident`, `Annotation` (`#name`), `IntLit`, `StrLit`.
+- **Names & literals** — `Ident`, `IntLit`, `StrLit`.
 - **Multi-character operators** — `:: => == != >= <= ->`.
 - **Single-character operators / punctuation** — `< > = ! + - * / % ( ) { } [ ]
   . : ; ,`.
@@ -197,7 +197,6 @@ After skipping trivia, `next_token` dispatches on the first byte:
 | First byte            | Rule                       | Token kind(s) |
 |-----------------------|----------------------------|---------------|
 | `_` or ASCII letter   | `lex_ident_or_keyword`     | `Ident` or a keyword |
-| `#`                   | `lex_annotation`           | `Annotation` (or `Error` for a lone `#`) |
 | `0`–`9`               | `lex_int`                  | `IntLit` |
 | `"`                   | `lex_string`               | `StrLit` (or `Error` if unterminated) |
 | anything else         | `lex_operator`             | an operator, or `Error` |
@@ -205,9 +204,6 @@ After skipping trivia, `next_token` dispatches on the first byte:
 
 Notes on individual rules:
 
-- **`lex_annotation`** requires the `#` to be followed by an identifier start;
-  otherwise it emits a one-byte `Error`. The `#` is part of the token span; the
-  parser strips it later.
 - **`lex_int`** scans digits only. The fractional part of a float (`.5`) is *not*
   lexed here — the parser assembles floats from `IntLit DOT IntLit?` tokens (see
   [§9.3](#93-integers-vs-floats)).
@@ -489,8 +485,6 @@ level).
   - `if` / `match` / `{` → the block-form primaries `IfExpr`, `MatchExpr`,
     `Scope`. These are full expressions, so the Pratt loop can still attach
     trailing operators to them.
-  - `#name` → `parse_annotated_primary` (an annotation, which may precede a
-    call, an `if`, or a `{` block — nothing else).
   - identifier → an `identPath` (`a::b::c`); becomes a `Call` if followed by
     `(`, otherwise an `IdentPath`.
   - integer / string / `true` / `false` → the corresponding literal.
@@ -545,9 +539,14 @@ immediate primary and the suffix then applies to the whole unary expression.
 
 ## 10. Scopes, statements, and tails
 
-`parse_scope` = optional `#annotation` then `parse_unannotated_scope`. An
-`unannotatedScope` is `LBRACE statements expr? RBRACE` — a brace-delimited list
+`parse_scope` parses `LBRACE statements expr? RBRACE`: a brace-delimited list
 of statements optionally ending in a *tail expression* (the scope's value).
+
+While parsing, each scope-producing expression receives its lexical ordinal in
+the enclosing scope. The counter resets inside every brace scope and ignores
+builtin calls, which do not create execution scopes. The compiler combines this
+ordinal with semantic context (such as the called function or cell name) to
+produce stable GUI hierarchy IDs without adding annotations to source text.
 
 The statement loop dispatches on `cur`:
 
@@ -571,7 +570,7 @@ an annotation, if present, has its own span and is excluded.)
 
 ## 11. The `parse_cell` contract
 
-`parse_cell_entry` parses a single cell invocation for the language server,
+`parse_cell_entry` parses a single cell invocation for the analyzer,
 which reads the target cell's name and literal arguments from it. The contract
 is *exactly one call expression followed by EOF*:
 
@@ -643,7 +642,7 @@ declaration doesn't poison the rest of the file.
 
 ## 13. Relationship to `Argon.g4`
 
-`core/compiler/grammar/Argon.g4` is a **descriptive reference grammar**, not an
+`crates/compiler/grammar/Argon.g4` is a **descriptive reference grammar**, not an
 input to any build step (nothing generates code from it any more). It documents
 the intended language and should be kept in sync when the parser's accepted
 language changes. Expression precedence and associativity in the Pratt table
@@ -666,7 +665,7 @@ The parser is designed to be fast and allocation-light:
 throughput on a synthetic program:
 
 ```bash
-cargo test -p compiler --release -- --ignored --nocapture parser_throughput
+cargo test -p argonc --release -- --ignored --nocapture parser_throughput
 ```
 
 ---
@@ -688,7 +687,7 @@ Parser tests live in `mod.rs` under `#[cfg(test)] mod tests`:
 - **`corpus_parses`** — every grammar-valid `.ar` file under `examples/`,
   `pdks/`, and the compiler's `src/std/` must parse without error.
 
-End-to-end coverage (parse → compile → solve) lives in `core/compiler/src/lib.rs`
+End-to-end coverage (parse → compile → solve) lives in `crates/compiler/src/lib.rs`
 as the `argon_*` and `stress_*_smoke` tests. There is no longer a differential
 test against ANTLR (it has been removed), so behavioral changes should be locked
 in with a focused `parser::tests` case.
@@ -696,9 +695,9 @@ in with a focused `parser::tests` case.
 Verify any change with:
 
 ```bash
-cargo test -p compiler --lib
-cargo clippy -p compiler --all-targets
-cargo fmt -p compiler -- --check
+cargo test -p argonc --lib
+cargo clippy -p argonc --all-targets
+cargo fmt -p argonc -- --check
 ```
 
 ---

@@ -1,0 +1,4 @@
+name = "path-dependency-example"
+
+[dependencies]
+dependency = "../dependency_library"

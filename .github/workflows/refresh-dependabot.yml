@@ -1,0 +1,50 @@
+name: Refresh Dependabot pull requests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - "crates/**/Cargo.toml"
+      - ".github/dependabot.yml"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-dependabot
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    name: Request Dependabot rebases
+    runs-on: ubuntu-latest
+    env:
+      DEPENDABOT_REBASE_TOKEN: ${{ secrets.DEPENDABOT_REBASE_TOKEN }}
+    steps:
+      - name: Require maintainer token
+        if: env.DEPENDABOT_REBASE_TOKEN == ''
+        run: |
+          echo "::error::DEPENDABOT_REBASE_TOKEN is not configured; cannot refresh Dependabot pull requests"
+          exit 1
+
+      - name: Re-evaluate open Dependabot pull requests
+        if: env.DEPENDABOT_REBASE_TOKEN != ''
+        env:
+          # Dependabot rejects commands from github-actions[bot]. This token
+          # must identify a maintainer or GitHub App with push access.
+          GH_TOKEN: ${{ env.DEPENDABOT_REBASE_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr list \
+            --state open \
+            --author app/dependabot \
+            --json number \
+            --jq '.[].number' |
+          while read -r pr_number; do
+            echo "Requesting rebase of Dependabot PR #${pr_number}"
+            gh pr comment "${pr_number}" --body '@dependabot rebase'
+          done

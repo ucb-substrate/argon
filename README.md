@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
 Argon is a programming language for writing constraint-based integrated circuit layout generators.
-Argon's primary feature is bidirectional editing between a code editor (Neovim or VS Code) and a custom GUI.
+Argon's primary feature is bidirectional editing between Neovim and a custom GUI.
 Simpler geometric constraints can be entered visually in the GUI, while more complex logic can be
 implemented in code.
 
@@ -33,104 +33,99 @@ Future versions of Argon will hopefully support:
 
 To use Argon, you will need:
 - [Rust (tested on 1.90.0)](https://www.rust-lang.org/tools/install)
-- One of [Neovim (version 0.11.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md) or [VS Code (version 1.100.0 or above)](https://code.visualstudio.com/download)
+- [Neovim (version 0.12.0 or above)](https://github.com/neovim/neovim/blob/master/INSTALL.md)
 - Git
 
-Begin by cloning and compiling the Argon source code:
+Install Argon from source:
 
 ```bash
-git clone https://github.com/ucb-substrate/argon.git
-cd argon
-cargo build --release
+cargo install --git https://github.com/ucb-substrate/argon --locked \
+    argonc arc argon-analyzer argone
 ```
 
-On BWRC servers, you may need to supply `RUSTFLAGS` as follows:
+To install from a local clone, you can run:
 
 ```bash
-RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon" cargo b --release
+for crate in compiler gui arc analyzer; do
+    cargo install --locked --path crates/$crate;
+done
 ```
 
-### Neovim
+## Command-line compilation
 
-Add the following to your Neovim Lua configuration:
+Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
+manifest names the library and can set its layer-properties file and path
+dependencies and GDS cell imports:
+
+```toml
+name = "my-library"
+lyp = "layers.lyp"
+
+[dependencies]
+pdk = "../pdk"
+
+[gds]
+ring_osc = "~/Downloads/ring_osc.gds"
+"macros::sram" = "layout/sram.gds"
+```
+
+From the library directory, check the source or run a cell:
+
+```bash
+arc check
+arc run --cell 'top(10., 20.)'
+arc run --cell 'top()' --gds
+```
+
+`arc check` checks the library without executing a cell. `arc run` writes the
+result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
+Dependency cells use their dependency name, for example
+`arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
+GDS imports are zero-argument cells. A module-qualified entry such as
+`"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
+`use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,
+and a leading `~/` is expanded to the user's home directory.
+When invoking `argonc` directly, pass the same mapping as
+`--gds-import 'macros::sram=layout/sram.gds'`.
+
+Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
+receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
+text from a contained `<layer>.label` as its field name. Repeated pin names are
+arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance is collapsed in the
+GUI, its displayed bounding-box edges are available through `bbox(inst)`.
+
+### IDE
+
+Install the Neovim plugin with the built-in `vim.pack` package manager by
+adding this to your `init.lua`:
 
 ```lua
-vim.g.argon = {
-    argon_repo_path = '<absolute_path_to_argon_repo>'
-}
-vim.opt.runtimepath:append(vim.g.argon.argon_repo_path .. '/plugins/nvim')
-vim.cmd([[autocmd BufRead,BufNewFile *.ar setfiletype argon]])
+vim.pack.add({
+    'https://github.com/ucb-substrate/argon',
+})
 ```
 
-To open an example Argon workspace, run the following from the root directory of your Argon clone:
+The plugin detects `.ar` files and starts `argon-analyzer` from your
+`PATH`.
 
-```
-nvim pdks/sky130/lib.ar
-```
-
-Start the GUI by running `:Argon gui`.
-
-From within the GUI, type `:openCell inv(1200., 2000., 4)` to open the `inv` cell. You should now be able to edit layouts 
-in both Neovim and the GUI.
-
-### VS Code
-
-To use VS Code as your code editor, you will additionally need:
-- [Node JS (tested on 25.0.0)](https://nodejs.org/en/download)
-
-First, open your VS Code user settings using `Command Palette > Preferences: Open User Settings (JSON)`.
-Add the following key:
-
-```json
-{
-    "argon.argonRepoDir": "<absolute_path_to_argon_repo>"
-}
-```
-
-Compile the VS Code extension by running the following from the root directory of your Argon clone:
+From an Argon project directory, start Neovim and the GUI together:
 
 ```bash
-cd plugins/vscode
-npm install
-npm run compile
-cd ../..
+argone pdks/sky130
 ```
 
-To open an example Argon workspace, run the following from the root directory of your Argon clone:
-
-```bash
-code --extensionDevelopmentPath=$(pwd)/plugins/vscode pdks/sky130/lib.ar
-```
-
-We recommend defining an alias in your shell configuration to simplify future commands:
-
-```bash
-alias codear="code --extensionDevelopmentPath=<absolute_path_to_argon_repo>/plugins/vscode"
-```
-
-With this alias defined, you can now run:
-
-```bash
-codear pdks/sky130
-```
-
-Open the `lib.ar` file within the workspace. You can then start the GUI by running `Command Palette > Argon: Start GUI`.
-
-> [!WARNING]
-> If you cannot find the command for starting the GUI but did not notice any obvious errors, you may be on an old version of VS Code.
-
-From within the GUI, type `:openCell test()` to open the `test` cell. You should now be able to edit layouts 
-in both VS Code and the GUI.
+From within the GUI, hit the `o` hotkey, type `inv(1200., 2000., 4)` after the prefilled `:Argon openCell` command, and press Enter to 
+open the `inv` cell. You should now be able to edit layouts in both Neovim and the GUI.
 
 ## Parametric Cell Tutorial
 
-Create a new Argon workspace with the following command:
+Create a new Argon library with the following command:
 
 ```bash
 mkdir tutorial && touch tutorial/lib.ar
 ```
 
-Your workspace directory should look like this:
+Your library directory should look like this:
 
 ```
 tutorial
@@ -144,20 +139,27 @@ cell inset_rect() {
 }
 ```
 
-Start the GUI and run `:openCell inset_rect()`. Click on the `met2` layer from the layer sidebar on the right to select it.
-Hit `r` to use the Rect tool and click on two points on the screen to draw your first rectangle.
+Start Argone for the tutorial library with `argone tutorial`. With the layout
+canvas focused, press `o`, type `inset_rect()` after the prefilled
+`:Argon openCell ` command, and press `Enter`. Click the `met2` layer in the
+right sidebar to select it. Press `r` to activate the Rectangle tool, then click
+two points on the canvas to draw your first rectangle.
 You should see a rectangle appear in the GUI and code editor.
 
-Select the `met1` layer and draw another rectangle that surrounds the first. You can use the `ESC` key to exit the Rect tool.
+Select the `met1` layer and draw another rectangle that surrounds the first.
+Press `Esc` to leave the Rectangle tool.
 
 Let us now dimension the rectangles such that the `met2`
 rectangle is inset by `50.` relative to the `met1` rectangle.
-Hit `d` to use the Dimension tool and click on the top edge of each rectangle. Click somewhere else to place the dimension label.
-The dimension should now be highlighted yellow, indicating that you are editing that dimension. Type `5.` and hit enter to set the value
-of the dimension (the decimal point is important, since just `5` is considered an integer literal rather than a float).
+Press `d` to activate the Dimension tool and click the top edge of each
+rectangle. Click elsewhere to place the dimension label. The dimension should
+be highlighted yellow while it is being edited. Type `50.` and press `Enter`
+to set its value. The decimal point is important because `50` is an integer
+literal, while the dimension requires a float. To edit an existing dimension
+later, press `s`, select its label, and press `q`.
 
 > [!TIP]
-> If you make a mistake, you can undo and redo changes from the GUI using `u` and `Ctrl + r`,
+> If you make a mistake, you can undo and redo changes from the GUI using `u` and `Ctrl-R`,
 > respectively, or manually modify the code in the text editor if needed.
 
 Repeat for the other 3 sides of the rectangle.
@@ -172,12 +174,13 @@ cell inset_rect(w: Float, h: Float) {
 
 Once you save, you may notice that an error popped up saying that the open cell is invalid.
 This is because we opened the cell with no arguments, but the cell now requires us to specify `w`
-and `h`. To resolve this, go back to the GUI and run `:openCell inset_rect(200., 200.)`. 
+and `h`. To resolve this, focus the canvas, press `o`, enter
+`inset_rect(200., 200.)`, and press `Enter`.
 
-You can now dimension the width of the `met1` rectangle by selecting the top edge then 
-clicking above the rectangle to place the dimension label.
+You can now press `d` and dimension the width of the `met1` rectangle by
+selecting the top edge, then clicking above the rectangle to place the label.
 Enter the dimension as `w`. Dimension the right edge to `h`. You
-can use the `f` keybind to fit the layout to your screen.
+can press `f` to fit the layout to your screen.
 
 You may notice that none of the rectangles have a solid boundary, indicating that they are not fully constrained. In order to
 constrain the edges to absolute coordinates, you can dimension the left and bottom edges of the `met1` rectangle relative to the origin.
@@ -203,23 +206,29 @@ cell triple_rect() {
 }
 ```
 
-After saving, try opening this cell from the GUI by running `:openCell triple_rect()`. You
-should be able to constrain the instances relative to one another based on their
-constituent rectangles.
+After saving, focus the canvas, press `o`, enter `triple_rect()`, and press
+`Enter`. You should be able to constrain the instances relative to one another
+based on their constituent rectangles.
+
+You can also add an instance from the GUI. Select the destination scope in the
+hierarchy sidebar, press `i`, enter a cell invocation such as
+`inset_rect(150., 150.)`, and press `Enter`. Move the instance outline to the
+desired location and click to insert it. The placement tool remains active so
+you can click again to insert more copies; press `Esc` when finished.
 
 ## Logs
 
 <!-- TODO: Implement commands to open GUI log -->
-Argon writes log messages to `~/.local/state/argon/lang-server.log` (language server) and `~/local/state/argon/gui.log` (GUI).
+Argon writes log messages to `~/.local/state/argon/analyzer.log` (analyzer) and `~/.local/state/argon/argone.log` (Argone).
 Log level can be set using the `ARGON_LOG` environment variable
-or in editor-specific configuration. If no configuration is specified, only errors will be logged.
+or in the Neovim configuration. If no configuration is specified, only errors will be logged.
 Log level configuration follows [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
 
 For performance, it is recommended to use `ARGON_LOG=warn` or `ARGON_LOG=error` unless you are troubleshooting an issue.
 
-### Neovim
+### Analyzer logs
 
-While the language server is running, you can open the language server logs using the `:Argon log` command 
+While the analyzer is running, you can open its logs using the `:Argon log` command.
 
 To configure the log level, you can use the `vim.g.argon.log.level` key:
 
@@ -232,21 +241,7 @@ vim.g.argon = {
 }
 ```
 
-The Neovim plugin will then supply `ARGON_LOG=debug` when starting the language server and GUI.
-
-### VS Code
-
-While the language is running, you can open the language logs using the `Command Palette > Argon: Open Log` command.
-
-To configure the log level, you can use the `argon.log.level` key:
-
-```json
-{
-    "argon.log.level": "debug"
-}
-```
-
-The VS Code plugin will then supply `ARGON_LOG=debug` when starting the language server and GUI.
+The Neovim plugin will then supply `ARGON_LOG=debug` when starting the analyzer and Argone.
 
 ## Contributing
 

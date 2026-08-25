@@ -15,7 +15,7 @@ jobs:
     name: Format Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,7 +30,7 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -59,7 +59,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
         rust: [stable]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -89,16 +89,18 @@ jobs:
       - name: Run tests
         run: cargo test --release --workspace
 
-  # Checks if dependencies have vulnerabilties
-  security-audit:
-    name: Security Audit
+  # Checks if dependencies have incompatible licenses or known vulnerabilties
+  audit:
+    name: Audit
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
+      - name: Install security tools
+        run: cargo install cargo-audit cargo-deny --locked
       
       - name: Run security audit
         run: cargo audit
+
+      - name: Check dependency licenses and sources
+        run: cargo deny check licenses sources
