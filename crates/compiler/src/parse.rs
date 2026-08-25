@@ -207,6 +207,21 @@ pub fn parse_workspace_with_std_and_deps(
     root_lib: impl AsRef<Path>,
     dependencies: impl IntoIterator<Item = (String, PathBuf)>,
 ) -> ParseOutput {
+    parse_workspace_with_std_deps_and_gds(
+        root_lib,
+        dependencies,
+        std::iter::empty::<(String, PathBuf)>(),
+    )
+}
+
+/// Parses a workspace and adds zero-argument cell declarations backed by GDS
+/// files. A name such as `macros::sram` creates `sram` in module `macros`, so
+/// source can refer to it as `lib::macros::sram`.
+pub fn parse_workspace_with_std_deps_and_gds(
+    root_lib: impl AsRef<Path>,
+    dependencies: impl IntoIterator<Item = (String, PathBuf)>,
+    gds_imports: impl IntoIterator<Item = (String, PathBuf)>,
+) -> ParseOutput {
     let root_lib = root_lib.as_ref();
     let mut output = ParseOutput::default();
     for (name, path) in dependencies {
@@ -218,12 +233,50 @@ pub fn parse_workspace_with_std_and_deps(
         output.merge(parse_workspace(dep_root), Some(&name));
     }
     output.merge(parse_workspace(root_lib), None);
+    add_gds_imports(&mut output, gds_imports);
     let std_path = PathBuf::from(STD_PATH);
     let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
     // TODO: fix std library overwriting user-defined std mods.
     output.asts.insert(vec!["std".to_string()], std_ast);
     output.errs.insert(std_path, (std_diagnostics, Vec::new()));
     output
+}
+
+fn add_gds_imports(output: &mut ParseOutput, imports: impl IntoIterator<Item = (String, PathBuf)>) {
+    let mut modules: IndexMap<ModPath, (String, PathBuf, usize)> = IndexMap::new();
+    for (name, path) in imports {
+        let mut components = name.split("::").map(str::to_owned).collect::<Vec<_>>();
+        let Some(cell_name) = components.pop() else {
+            continue;
+        };
+        let (source, _, count) = modules
+            .entry(components)
+            .or_insert_with(|| (String::new(), path, 0));
+        source.push_str(&format!("cell {cell_name}() {{}}\n"));
+        *count += 1;
+    }
+    for (module, (imports, import_path, import_count)) in modules {
+        if let Some((existing, _)) = output.asts.get(&module) {
+            let source_path = existing.path.clone();
+            let source = ArcStr::from(format!("{}\n{imports}", existing.text));
+            let (mut result, diagnostics) = parse_source(source, source_path.clone());
+            if result.1.is_none() {
+                result.0.promote_last_declarations(import_count);
+            }
+            result.0.source_text = existing.source_text.clone();
+            output.asts.insert(module, result);
+            let mod_spans = output
+                .errs
+                .get(&source_path)
+                .map(|(_, spans)| spans.clone())
+                .unwrap_or_default();
+            output.errs.insert(source_path, (diagnostics, mod_spans));
+        } else {
+            let (result, diagnostics) = parse_source(ArcStr::from(imports), import_path.clone());
+            output.asts.insert(module, result);
+            output.errs.insert(import_path, (diagnostics, Vec::new()));
+        }
+    }
 }
 
 pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {

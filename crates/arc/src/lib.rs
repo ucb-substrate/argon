@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
 };
 
@@ -18,6 +18,9 @@ pub struct Manifest {
     /// Path library dependencies.
     #[serde(default)]
     pub dependencies: IndexMap<String, PathBuf>,
+    /// GDS files imported as zero-argument cells.
+    #[serde(default)]
+    pub gds: IndexMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,7 @@ pub struct Library {
     pub root: PathBuf,
     pub lyp: Option<PathBuf>,
     pub dependencies: IndexMap<String, PathBuf>,
+    pub gds: IndexMap<String, PathBuf>,
 }
 
 impl Library {
@@ -35,12 +39,18 @@ impl Library {
         let manifest = read_manifest(manifest_path)?;
         let directory = manifest_path.parent().unwrap_or_else(|| Path::new("."));
         let dependencies = DependencyResolver::new(manifest_path).resolve(&manifest, directory)?;
+        let gds = manifest
+            .gds
+            .into_iter()
+            .map(|(name, path)| Ok((validate_cell_path(name)?, resolve_path(directory, path))))
+            .collect::<Result<_>>()?;
         Ok(Self {
             name: manifest.name,
             manifest_path: manifest_path.to_path_buf(),
             root: directory.join("lib.ar"),
             lyp: manifest.lyp.map(|path| resolve_path(directory, path)),
             dependencies,
+            gds,
         })
     }
 
@@ -134,12 +144,42 @@ fn manifest_key(path: &Path) -> PathBuf {
 }
 
 fn resolve_path(base: &Path, path: PathBuf) -> PathBuf {
+    let path = expand_home(path);
     let path = if path.is_relative() {
         base.join(path)
     } else {
         path
     };
     fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn expand_home(path: PathBuf) -> PathBuf {
+    let Some(path_text) = path.to_str() else {
+        return path;
+    };
+    let Some(suffix) = path_text.strip_prefix("~/") else {
+        return path;
+    };
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(suffix))
+        .unwrap_or(path)
+}
+
+fn validate_cell_path(name: String) -> Result<String> {
+    if name.split("::").all(is_identifier) {
+        Ok(name)
+    } else {
+        bail!("invalid GDS cell path `{name}`")
+    }
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 #[cfg(test)]
@@ -160,6 +200,8 @@ mod tests {
                 lyp = "layers.lyp"
                 [dependencies]
                 dependency = "../dependency"
+                [gds]
+                "macros::sram" = "~/layout/sram.gds"
             "#,
         )
         .expect("manifest should parse");
@@ -167,6 +209,10 @@ mod tests {
         assert_eq!(
             manifest.dependencies["dependency"],
             PathBuf::from("../dependency")
+        );
+        assert_eq!(
+            manifest.gds["macros::sram"],
+            PathBuf::from("~/layout/sram.gds")
         );
     }
 

@@ -9,7 +9,7 @@ use argonc::{
     compile::{self, CellArg, CompileInput, CompileOutput},
     diagnostics::{self, Diagnostic},
     gds::GdsMap,
-    parse::{self, parse_workspace_with_std_and_deps},
+    parse::{self, parse_workspace_with_std_deps_and_gds},
 };
 use clap::{Parser, ValueEnum};
 use gds::GdsUnits;
@@ -38,6 +38,10 @@ struct Args {
     /// Path dependency in NAME=PATH form. PATH may be a directory or lib.ar.
     #[arg(long = "dependency", value_parser = parse_dependency)]
     dependencies: Vec<(String, PathBuf)>,
+
+    /// GDS cell import in NAME=PATH form. NAME may be a module path.
+    #[arg(long = "gds-import", value_parser = parse_gds_import)]
+    gds_imports: Vec<(String, PathBuf)>,
 
     /// Binary compiler-output path. Defaults to lib.bin beside the root lib.ar.
     #[arg(short, long, requires = "cell")]
@@ -96,9 +100,18 @@ fn run(args: Args) -> Result<(), Failed> {
             return Err(fail(format, format!("duplicate path dependency `{name}`")));
         }
     }
+    names.clear();
+    for (name, _) in &args.gds_imports {
+        if !names.insert(name) {
+            return Err(fail(format, format!("duplicate GDS import `{name}`")));
+        }
+    }
 
-    let analysis =
-        compile::analyze_workspace(parse_workspace_with_std_and_deps(&root, args.dependencies));
+    let analysis = compile::analyze_workspace(parse_workspace_with_std_deps_and_gds(
+        &root,
+        args.dependencies,
+        args.gds_imports.clone(),
+    ));
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(
             format,
@@ -153,13 +166,14 @@ fn run(args: Args) -> Result<(), Failed> {
                 "--cell arguments must be integer, float, boolean, or empty-list literals",
             )
         })?;
-    let output = compile::dynamic_compile(
+    let output = compile::dynamic_compile_with_gds(
         &typed_ast,
         CompileInput {
             cell: &cell_path,
             args: cell_args,
             lyp_file: lyp,
         },
+        &args.gds_imports,
     );
     if !matches!(output, CompileOutput::Valid(_)) {
         return Err(compile_failed(format, output));
@@ -209,6 +223,23 @@ fn parse_dependency(value: &str) -> Result<(String, PathBuf), String> {
     Ok((name.to_string(), PathBuf::from(path)))
 }
 
+fn parse_gds_import(value: &str) -> Result<(String, PathBuf), String> {
+    let (name, path) = parse_dependency(value)?;
+    if name.split("::").all(is_identifier) {
+        Ok((name, path))
+    } else {
+        Err("NAME must be an Argon identifier or module path".to_string())
+    }
+}
+
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn fail(format: ErrorFormat, message: impl Into<String>) -> Failed {
     Failed(format, vec![Diagnostic::error(message)])
 }
@@ -227,6 +258,7 @@ mod tests {
 
     use argonc::{artifact, compile::CompileOutput};
     use clap::{CommandFactory, Parser};
+    use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
     use super::{Args, ErrorFormat, Failed, run};
 
@@ -246,12 +278,36 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp")
     }
 
+    fn temp_gds(name: &str) -> PathBuf {
+        let source = temp_source(name, "");
+        let path = source.with_extension("gds");
+        let mut library = GdsLibrary::new("fixture");
+        let mut structure = GdsStruct::new("layout_top");
+        structure.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+            layer: 235,
+            datatype: 4,
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(0, 20),
+                GdsPoint::new(10, 20),
+                GdsPoint::new(10, 0),
+            ],
+            ..Default::default()
+        }));
+        library.structs.push(structure);
+        library
+            .save(&path)
+            .expect("temporary GDS should be written");
+        path
+    }
+
     fn check_args(root: PathBuf) -> Args {
         Args {
             root,
             cell: None,
             lyp: None,
             dependencies: Vec::new(),
+            gds_imports: Vec::new(),
             output: None,
             gds: None,
             check: true,
@@ -265,6 +321,7 @@ mod tests {
             cell: Some(cell.to_owned()),
             lyp: Some(lyp),
             dependencies: Vec::new(),
+            gds_imports: Vec::new(),
             output: None,
             gds: None,
             check: false,
@@ -377,6 +434,60 @@ mod tests {
     }
 
     #[test]
+    fn imports_a_gds_cell_at_a_module_path() {
+        let source = temp_source(
+            "gds-root",
+            "use lib::macros::sram;\ncell top() { let imported = inst(sram(), x=0., y=0.); }\n",
+        );
+        let directory = source.parent().expect("source should have a parent");
+        let artifact_path = directory.join("imported.bin");
+        let mut args = execution_args(source, "top()", basic_lyp());
+        args.gds_imports
+            .push(("macros::sram".to_owned(), temp_gds("gds-import")));
+        args.output = Some(artifact_path.clone());
+
+        if let Err(error) = run(args) {
+            panic!("GDS import should compile: {}", render_failed(error));
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("GDS import should compile successfully");
+        };
+        let top = &output.cells[&output.top];
+        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.objects.len(), 1);
+        let imported = top
+            .objects
+            .values()
+            .find_map(|object| object.get_instance())
+            .expect("top should instantiate the imported cell");
+        assert_eq!(output.cells[&imported.cell].objects.len(), 1);
+    }
+
+    #[test]
+    fn gds_cells_are_declared_before_source_cells() {
+        let source = temp_source(
+            "gds-declaration-order",
+            "cell top() { let imported = inst(sram(), x=0., y=0.); }\n",
+        );
+        let directory = source.parent().expect("source should have a parent");
+        let artifact_path = directory.join("imported.bin");
+        let mut args = execution_args(source, "top()", basic_lyp());
+        args.gds_imports
+            .push(("sram".to_owned(), temp_gds("gds-declaration-order-import")));
+        args.output = Some(artifact_path.clone());
+
+        if let Err(error) = run(args) {
+            panic!("GDS import should compile: {}", render_failed(error));
+        }
+        assert!(matches!(
+            artifact::read(artifact_path).expect("artifact should decode"),
+            CompileOutput::Valid(_)
+        ));
+    }
+
+    #[test]
     fn invalid_cell_argument_type_is_reported_cleanly() {
         let source = temp_source("invalid-argument-root", "");
         let dependency = temp_source(
@@ -467,6 +578,7 @@ mod tests {
         assert!(!help.contains("<INPUTS>..."), "{help}");
         assert!(!help.contains("path modules"), "{help}");
         assert!(help.contains("--dependency"), "{help}");
+        assert!(help.contains("--gds-import"), "{help}");
         assert!(!help.contains("--extern"), "{help}");
     }
 }

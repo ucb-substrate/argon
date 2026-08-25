@@ -94,6 +94,7 @@ async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     cell: &str,
     lyp: &Path,
+    gds_imports: &[(String, PathBuf)],
     client: &Client,
 ) -> Option<CompileOutput> {
     if let Err(error) = argonc::layer::read_lyp(lyp) {
@@ -143,13 +144,14 @@ async fn compile_open_cell(
         .map(|ident| ident.name)
         .collect::<Vec<_>>();
 
-    Some(compile::dynamic_compile(
+    Some(compile::dynamic_compile_with_gds(
         ast,
         CompileInput {
             cell: &cell_path,
             args,
             lyp_file: lyp,
         },
+        gds_imports,
     ))
 }
 
@@ -192,7 +194,7 @@ impl StateMut {
                 if let Some(ast) = self.ast.values().find(|ast| ast.path == span.path)
                     && let Some(url) = Uri::from_file_path(&span.path)
                 {
-                    let doc = Document::new(&ast.text, 0);
+                    let doc = Document::new(&ast.source_text, 0);
                     diagnostics.entry(url).or_default().push(Diagnostic {
                         range: Range {
                             start: doc.offset_to_pos(span.span.start()),
@@ -233,9 +235,21 @@ impl StateMut {
             .as_ref()
             .map(|config| config.dependencies.clone())
             .unwrap_or_default();
-        let analysis = compile::analyze_workspace(parse::parse_workspace_with_std_and_deps(
+        let gds_imports = self
+            .config
+            .as_ref()
+            .map(|config| {
+                config
+                    .gds
+                    .iter()
+                    .map(|(name, path)| (name.clone(), path.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let analysis = compile::analyze_workspace(parse::parse_workspace_with_std_deps_and_gds(
             root_dir.join("lib.ar"),
             dependencies,
+            gds_imports.clone(),
         ));
         self.ast = analysis.ast;
 
@@ -266,7 +280,7 @@ impl StateMut {
                     self.compile_output = None;
                     return;
                 };
-                compile_open_cell(&ast, cell, lyp, client).await
+                compile_open_cell(&ast, cell, lyp, &gds_imports, client).await
             } else {
                 None
             }
@@ -666,7 +680,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let document = Document::new(&ast.text, 0);
+        let document = Document::new(&ast.source_text, 0);
         let scope = &ast.span2scope[&scope_span];
         let preview_binding = (0..)
             .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
@@ -687,20 +701,21 @@ impl Backend {
         );
         let mut preview_source = ast.text.to_string();
         preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
-        let preview_module = match parse::parse_source_text(preview_source, scope_span.path.clone())
-        {
-            Ok(ast) => ast,
-            Err(error) => {
-                self.state
-                    .editor_client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not instantiate `{}`: {error}", params.cell),
-                    )
-                    .await;
-                return Ok(());
-            }
-        };
+        let mut preview_module =
+            match parse::parse_source_text(preview_source, scope_span.path.clone()) {
+                Ok(ast) => ast,
+                Err(error) => {
+                    self.state
+                        .editor_client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("Could not instantiate `{}`: {error}", params.cell),
+                        )
+                        .await;
+                    return Ok(());
+                }
+            };
+        preview_module.promote_last_declarations(ast.generated_declarations);
         let mut preview_ast = state_mut.ast.clone();
         preview_ast.insert(module_path, preview_module);
         let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
@@ -747,8 +762,25 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let Some(compiled) =
-            compile_open_cell(&typed_ast, &open_cell, &lyp, &self.state.editor_client).await
+        let gds_imports = state_mut
+            .config
+            .as_ref()
+            .map(|config| {
+                config
+                    .gds
+                    .iter()
+                    .map(|(name, path)| (name.clone(), path.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(compiled) = compile_open_cell(
+            &typed_ast,
+            &open_cell,
+            &lyp,
+            &gds_imports,
+            &self.state.editor_client,
+        )
+        .await
         else {
             return Ok(());
         };

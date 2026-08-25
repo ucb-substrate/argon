@@ -117,6 +117,11 @@ fn compiler_command(argonc: &Path, library: &Library) -> Command {
             .arg("--dependency")
             .arg(format!("{name}={}", path.display()));
     }
+    for (name, path) in &library.gds {
+        command
+            .arg("--gds-import")
+            .arg(format!("{name}={}", path.display()));
+    }
     command
 }
 

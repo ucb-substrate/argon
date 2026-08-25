@@ -499,6 +499,15 @@ fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>)
             .unwrap_or_default()
 }
 
+fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
+    let scale = scale * (wheel_delta / 400.).exp();
+    if scale.is_finite() {
+        scale.clamp(f32::MIN_POSITIVE, 100.)
+    } else {
+        100.
+    }
+}
+
 /// Flatten the solved geometry of one compiled cell into rectangles relative
 /// to that cell's origin. Placement paints these as a single pointer-following
 /// outline without disturbing the layout currently open in the editor.
@@ -2918,8 +2927,7 @@ impl LayoutCanvas {
         }
         let new_scale = {
             let delta = event.delta.pixel_delta(px(20.));
-            let ns = self.scale + f32::from(delta.y) / 400.;
-            f32::clamp(ns, 0.01, 100.)
+            zoomed_scale(self.scale, f32::from(delta.y))
         };
 
         // screen = scale*world + b
@@ -3039,6 +3047,13 @@ mod tests {
         );
         assert_eq!(sorted_initial_condition_values(100., 150.), None);
         assert_eq!(sorted_initial_condition_values(100., 100.), None);
+    }
+
+    #[test]
+    fn zoom_out_has_no_ui_scale_floor() {
+        let below_old_floor = zoomed_scale(0.01, -20.);
+        assert!(below_old_floor < 0.01);
+        assert!(zoomed_scale(below_old_floor, -20.) < below_old_floor);
     }
 
     #[test]

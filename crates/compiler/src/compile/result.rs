@@ -163,6 +163,9 @@ pub enum ExecErrorKind {
     /// A transformation contains a non-Manhattan rotation.
     #[error("non-Manhattan rotation")]
     InvalidRotation,
+    /// An imported GDS file could not be loaded or converted.
+    #[error("invalid GDS import: {0}")]
+    InvalidGds(String),
     /// The requested cell does not exist.
     #[error("invalid cell `{0}`")]
     InvalidCell(String),
