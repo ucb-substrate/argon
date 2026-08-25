@@ -85,8 +85,6 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     let licon_bbox = std::array(licon, nf, 430., 0.);
     eq(licon_bbox.x0, a_li_mid.x0 + 80.);
     eq(licon_bbox.y0, a_li_mid.y0);
-    let inst0 = inst(ring_osc(), xi=487.8, yi=20027.7);
-    let inst1 = inst(ring_osc(), xi=-16736., yi=4903.9);
 }
 
 cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
