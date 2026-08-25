@@ -55,7 +55,7 @@ done
 
 Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
 manifest names the library and can set its layer-properties file and path
-dependencies:
+dependencies and GDS cell imports:
 
 ```toml
 name = "my-library"
@@ -63,6 +63,10 @@ lyp = "layers.lyp"
 
 [dependencies]
 pdk = "../pdk"
+
+[gds]
+ring_osc = "~/Downloads/ring_osc.gds"
+"macros::sram" = "layout/sram.gds"
 ```
 
 From the library directory, check the source or run a cell:
@@ -77,6 +81,18 @@ arc run --cell 'top()' --gds
 result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
 Dependency cells use their dependency name, for example
 `arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
+GDS imports are zero-argument cells. A module-qualified entry such as
+`"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
+`use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,
+and a leading `~/` is expanded to the user's home directory.
+When invoking `argonc` directly, pass the same mapping as
+`--gds-import 'macros::sram=layout/sram.gds'`.
+
+Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
+receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
+text from a contained `<layer>.label` as its field name. Repeated pin names are
+arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance is collapsed in the
+GUI, its displayed bounding-box edges are available through `bbox(inst)`.
 
 ### IDE
 

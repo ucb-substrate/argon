@@ -27,6 +27,7 @@ use crate::ast::{
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
+use crate::gds::{ImportedGdsElement, import_gds};
 use crate::layer::LayerProperties;
 use crate::parse::{ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
@@ -105,8 +106,16 @@ pub fn dynamic_compile(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
 ) -> CompileOutput {
+    dynamic_compile_with_gds(ast, input, &[])
+}
+
+pub fn dynamic_compile_with_gds(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+    gds_imports: &[(String, PathBuf)],
+) -> CompileOutput {
     let lyp_file = input.lyp_file;
-    let res = ExecPass::new(ast).execute(input);
+    let res = ExecPass::new(ast, lyp_file, gds_imports).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -130,6 +139,14 @@ pub fn dynamic_compile(
 }
 
 pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+    compile_with_gds(ast, input, &[])
+}
+
+pub fn compile_with_gds(
+    ast: &WorkspaceParseAst,
+    input: CompileInput<'_>,
+    gds_imports: &[(String, PathBuf)],
+) -> CompileOutput {
     let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
         static_output
     } else {
@@ -139,7 +156,7 @@ pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutpu
         return CompileOutput::StaticErrors(static_output);
     };
 
-    dynamic_compile(&ast, input)
+    dynamic_compile_with_gds(&ast, input, gds_imports)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -770,6 +787,10 @@ pub struct CellFnTy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellTy {
     data: IndexMap<String, Ty>,
+    /// GDS-backed cells publish geometry fields at execution time. Their
+    /// generated source declaration is intentionally only a signature, so
+    /// field names cannot be enumerated by the source type pass.
+    dynamic_fields: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1458,9 +1479,21 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
             })
             .collect();
+        let dynamic_fields = self
+            .ast
+            .ast
+            .decls
+            .iter()
+            .take(self.ast.generated_declarations)
+            .any(|decl| {
+                matches!(decl, Decl::Cell(cell) if cell.span == input.span && cell.name.name == input.name.name)
+            });
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
-            cell: Arc::new(CellTy { data }),
+            cell: Arc::new(CellTy {
+                data,
+                dynamic_fields,
+            }),
         }));
         self.alloc(&input.name.name, ty);
         let name = self.transform_ident(&input.name);
@@ -1704,11 +1737,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             },
             Ty::Inst(ref c) => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
-                name => c
-                    .data
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| self.no_field_on_ty(field, base_ty.clone())),
+                name => c.data.get(name).cloned().unwrap_or_else(|| {
+                    if c.dynamic_fields {
+                        Ty::Any
+                    } else {
+                        self.no_field_on_ty(field, base_ty.clone())
+                    }
+                }),
             },
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
@@ -2413,6 +2448,8 @@ struct CellState {
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
+    lyp_file: &'a Path,
+    gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
     value_dependents: IndexMap<ValueId, IndexSet<ValueId>>,
@@ -2458,9 +2495,36 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 }
 
 impl<'a> ExecPass<'a> {
-    pub(crate) fn new(ast: &'a WorkspaceAst<VarIdTyMetadata>) -> Self {
+    pub(crate) fn new(
+        ast: &'a WorkspaceAst<VarIdTyMetadata>,
+        lyp_file: &'a Path,
+        gds_imports: &[(String, PathBuf)],
+    ) -> Self {
+        let gds_imports = gds_imports
+            .iter()
+            .filter_map(|(name, path)| {
+                let mut components = name.split("::").collect::<Vec<_>>();
+                let cell_name = components.pop()?;
+                let module = components
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let cell = ast
+                    .get(&module)?
+                    .ast
+                    .decls
+                    .iter()
+                    .find_map(|decl| match decl {
+                        Decl::Cell(cell) if cell.name.name == cell_name => Some(cell.metadata.1),
+                        _ => None,
+                    })?;
+                Some((cell, (cell_name.to_owned(), path.clone())))
+            })
+            .collect();
         Self {
             ast,
+            lyp_file,
+            gds_imports,
             cell_states: IndexMap::new(),
             values: IndexMap::from_iter([
                 (1, DeferValue::Ready(Value::Nil)),
@@ -2616,6 +2680,22 @@ impl<'a> ExecPass<'a> {
         };
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
+        }
+        if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
+            if !args.is_empty() {
+                self.errors.push(ExecError {
+                    span: None,
+                    cell: 0,
+                    kind: ExecErrorKind::InvalidCellArity {
+                        expected: 0,
+                        found: args.len(),
+                    },
+                });
+                return Err(());
+            }
+            let cell_id = self.execute_gds_cell(&declared_name, &path, scope_name)?;
+            self.compiled_cell_cache.insert(cache_key, cell_id);
+            return Ok(cell_id);
         }
         let mut frame = Frame {
             bindings: Default::default(),
@@ -2846,6 +2926,162 @@ impl<'a> ExecPass<'a> {
         assert!(self.compiled_cells.insert(cell_id, cell).is_none());
         self.compiled_cell_cache.insert(cache_key, cell_id);
         Ok(cell_id)
+    }
+
+    fn execute_gds_cell(
+        &mut self,
+        declared_name: &str,
+        path: &Path,
+        scope_name: Option<String>,
+    ) -> Result<CellId, ()> {
+        let imported = match import_gds(path, declared_name, self.lyp_file) {
+            Ok(imported) => imported,
+            Err(error) => {
+                self.errors.push(ExecError {
+                    span: None,
+                    cell: 0,
+                    kind: ExecErrorKind::InvalidGds(error.to_string()),
+                });
+                return Err(());
+            }
+        };
+        let cell_ids = (0..imported.structs.len())
+            .map(|_| self.alloc_id())
+            .collect::<Vec<_>>();
+        // Imported hierarchy has no source-level cell calls, but field access
+        // through a child instance still needs a ready cell value.
+        let cell_vids = cell_ids
+            .iter()
+            .map(|cell_id| {
+                let vid = self.value_id();
+                self.values
+                    .insert(vid, DeferValue::Ready(Value::Cell(*cell_id)));
+                vid
+            })
+            .collect::<Vec<_>>();
+        let top_id = cell_ids[imported.top];
+        for (structure_index, structure) in imported.structs.into_iter().enumerate() {
+            let cell_id = cell_ids[structure_index];
+            let root_name = if structure_index == imported.top {
+                scope_name
+                    .clone()
+                    .unwrap_or_else(|| format!("cell {declared_name}"))
+            } else {
+                format!("cell {}", structure.name)
+            };
+            let root = ScopeId::semantic(None, &root_name);
+            let span = Span {
+                path: path.to_path_buf(),
+                span: cfgrammar::Span::new(0, 0),
+            };
+            let mut objects = IndexMap::new();
+            let mut emit = Vec::new();
+            let mut named_objects: IndexMap<String, Vec<ObjectId>> = IndexMap::new();
+            for (element_index, element) in structure.elements.into_iter().enumerate() {
+                let id = self.object_id();
+                let (value, field_name) = match element {
+                    ImportedGdsElement::Rect {
+                        layer,
+                        name,
+                        x0,
+                        y0,
+                        x1,
+                        y1,
+                    } => (
+                        SolvedValue::Rect(Rect {
+                            id,
+                            layer: Some(layer),
+                            x0: (x0, LinearExpr::from(x0)),
+                            y0: (y0, LinearExpr::from(y0)),
+                            x1: (x1, LinearExpr::from(x1)),
+                            y1: (y1, LinearExpr::from(y1)),
+                            construction: false,
+                            span: None,
+                        }),
+                        Some(name.unwrap_or_else(|| format!("gds_rect_{element_index}"))),
+                    ),
+                    ImportedGdsElement::Text { layer, text, x, y } => (
+                        SolvedValue::Text(Text {
+                            id,
+                            layer,
+                            text,
+                            x,
+                            y,
+                            span: None,
+                        }),
+                        None,
+                    ),
+                    ImportedGdsElement::Instance {
+                        cell,
+                        x,
+                        y,
+                        angle,
+                        reflect,
+                    } => (
+                        SolvedValue::Instance(SolvedInstance {
+                            id,
+                            x,
+                            y,
+                            x_expr: LinearExpr::from(x),
+                            y_expr: LinearExpr::from(y),
+                            angle: Rotation::try_from(angle).unwrap_or(Rotation::R0),
+                            reflect,
+                            construction: false,
+                            cell: cell_ids[cell],
+                            span: span.clone(),
+                            cell_vid: cell_vids[cell],
+                        }),
+                        Some(format!("gds_inst_{element_index}")),
+                    ),
+                };
+                objects.insert(id, value);
+                emit.push((id, CompiledEmit { span: span.clone() }));
+                if let Some(field_name) = field_name {
+                    named_objects.entry(field_name).or_default().push(id);
+                }
+            }
+            let fields = named_objects
+                .into_iter()
+                .map(|(name, ids)| {
+                    let value = if ids.len() == 1 {
+                        Arrayed::Elem(ids[0])
+                    } else {
+                        Arrayed::Array(ids.into_iter().map(Arrayed::Elem).collect())
+                    };
+                    (name, value)
+                })
+                .collect::<IndexMap<_, _>>();
+            let bindings = fields
+                .iter()
+                .enumerate()
+                .map(|(index, (name, value))| (SeqNum(index as u64), (name.clone(), value.clone())))
+                .collect();
+            let scopes = IndexMap::from_iter([(
+                root,
+                CompiledScope {
+                    static_parent: None,
+                    bindings,
+                    children: IndexSet::new(),
+                    name: root_name,
+                    span: span.clone(),
+                    emit,
+                },
+            )]);
+            self.compiled_cells.insert(
+                cell_id,
+                CompiledCell {
+                    scopes,
+                    root,
+                    fields,
+                    rowspace_vecs: Vec::new(),
+                    objects,
+                    fallback_constraints_used: Vec::new(),
+                    unsolved_vars: IndexSet::new(),
+                    inconsistent_constraints: IndexSet::new(),
+                },
+            );
+        }
+        Ok(top_id)
     }
 
     fn emit(&mut self, cell: CellId) -> CompiledCell {
@@ -3722,16 +3958,34 @@ impl<'a> ExecPass<'a> {
                             Value::Inst(i) => {
                                 if let Defer::Ready(cell) = &self.values[&i.cell] {
                                     let cell_id = cell.as_ref().unwrap_cell();
-                                    Some(
-                                        self.bbox(*cell_id)
-                                            .map(|r| r.transform(i.reflect, i.angle)),
-                                    )
+                                    Some(self.bbox(*cell_id).map(|r| {
+                                        let r = r.transform(i.reflect, i.angle);
+                                        Rect {
+                                            id: r.id,
+                                            layer: r.layer,
+                                            x0: LinearExpr::from(r.x0) + i.x.clone(),
+                                            y0: LinearExpr::from(r.y0) + i.y.clone(),
+                                            x1: LinearExpr::from(r.x1) + i.x.clone(),
+                                            y1: LinearExpr::from(r.y1) + i.y.clone(),
+                                            construction: true,
+                                            span: None,
+                                        }
+                                    }))
                                 } else {
                                     self.add_value_dependent(i.cell, vid);
                                     None
                                 }
                             }
-                            Value::Cell(c) => Some(self.bbox(*c)),
+                            Value::Cell(c) => Some(self.bbox(*c).map(|r| Rect {
+                                id: r.id,
+                                layer: r.layer,
+                                x0: r.x0.into(),
+                                y0: r.y0.into(),
+                                x1: r.x1.into(),
+                                y1: r.y1.into(),
+                                construction: true,
+                                span: None,
+                            })),
                             _ => {
                                 self.errors.push(ExecError {
                                     span: Some(span.clone()),
@@ -3748,10 +4002,10 @@ impl<'a> ExecPass<'a> {
                                 let orect = Rect {
                                     id,
                                     layer: None,
-                                    x0: r.x0.into(),
-                                    y0: r.y0.into(),
-                                    x1: r.x1.into(),
-                                    y1: r.y1.into(),
+                                    x0: r.x0,
+                                    y0: r.y0,
+                                    x1: r.x1,
+                                    y1: r.y1,
                                     construction: true,
                                     span: Some(span.clone()),
                                 };
@@ -5584,15 +5838,31 @@ impl CompiledData {
         }
         for (item_num, (name, obj)) in scope.bindings.iter() {
             if *item_num < seq_num {
-                obj.for_each(&mut |obj| match &cell.objects[obj] {
-                    SolvedValue::Rect(r) => {
-                        set.insert(r.id, format!("{}{}", name_prefix, name));
-                    }
-                    SolvedValue::Instance(inst) => {
-                        set.insert(inst.id, format!("{}{}", name_prefix, name));
-                    }
-                    _ => (),
-                });
+                Self::insert_reachable_obj(obj, cell, &format!("{}{}", name_prefix, name), set);
+            }
+        }
+    }
+
+    fn insert_reachable_obj(
+        value: &Arrayed<ObjectId>,
+        cell: &CompiledCell,
+        name: &str,
+        set: &mut IndexMap<ObjectId, String>,
+    ) {
+        match value {
+            Arrayed::Elem(obj) => match &cell.objects[obj] {
+                SolvedValue::Rect(r) => {
+                    set.insert(r.id, name.to_owned());
+                }
+                SolvedValue::Instance(inst) => {
+                    set.insert(inst.id, name.to_owned());
+                }
+                _ => (),
+            },
+            Arrayed::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    Self::insert_reachable_obj(value, cell, &format!("{name}[{index}]"), set);
+                }
             }
         }
     }

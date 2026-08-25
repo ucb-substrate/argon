@@ -10,7 +10,14 @@ use crate::ast::{
 
 #[derive_where(Debug, Clone)]
 pub struct AnnotatedAst<T: AstMetadata> {
+    /// Text backing all annotated substrings. This may include generated
+    /// declarations appended after the editor-visible source.
     pub text: ArcStr,
+    /// Source text as it exists on disk or in the editor.
+    pub source_text: ArcStr,
+    /// Number of generated declarations stored at the front of `ast.decls`
+    /// while their backing text remains appended to `text`.
+    pub generated_declarations: usize,
     pub ast: Ast<Substr, T>,
     pub path: PathBuf,
     pub span2scope: IndexMap<Span, Scope<Substr, T>>,
@@ -53,7 +60,9 @@ impl<T: AstMetadata> AnnotatedAst<T> {
         }
 
         Self {
+            source_text: pass.text.clone(),
             text: pass.text,
+            generated_declarations: 0,
             ast: Ast {
                 decls,
                 span: ast.span,
@@ -62,6 +71,20 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             span2scope: pass.span2scope,
             span2call: pass.span2call,
         }
+    }
+
+    /// Moves declarations parsed from the end of the backing text to the
+    /// beginning of semantic declaration order.
+    pub fn promote_last_declarations(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        assert!(self.ast.decls.len() >= count);
+        let split = self.ast.decls.len() - count;
+        let mut source_decls = self.ast.decls.split_off(split);
+        std::mem::swap(&mut source_decls, &mut self.ast.decls);
+        self.ast.decls.extend(source_decls);
+        self.generated_declarations = count;
     }
 }
 

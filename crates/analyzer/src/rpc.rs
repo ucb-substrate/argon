@@ -84,7 +84,7 @@ pub(crate) fn editor_buffers_are_current(state: &StateMut) -> bool {
     state.ast.values().all(|ast| {
         Uri::from_file_path(&ast.path)
             .and_then(|uri| state.editor_files.get(&uri))
-            .is_none_or(|document| document.contents() == ast.text)
+            .is_none_or(|document| document.contents() == ast.source_text)
     })
 }
 
@@ -230,7 +230,7 @@ impl LangServer for State {
         // TODO: check that vim file is in sync with GUI file.
         let state_mut = self.state_mut.lock().await;
         if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
-            let doc = Document::new(&ast.text, 0);
+            let doc = Document::new(&ast.source_text, 0);
             let Some(url) = Uri::from_file_path(&span.path) else {
                 return;
             };
@@ -270,7 +270,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.text, 0);
+        let document = Document::new(&ast.source_text, 0);
         let expression = format!(
             "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
             rect.layer
@@ -323,7 +323,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.text, 0);
+        let document = Document::new(&ast.source_text, 0);
         let names = scope
             .stmts
             .iter()
@@ -380,7 +380,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.text, 0);
+        let document = Document::new(&ast.source_text, 0);
         let expression = format!(
             "dimension({}, {}, {}, {}, {}, {}, {})",
             params.p,
@@ -427,7 +427,7 @@ impl LangServer for State {
         let ast = state_mut.ast.values().find(|ast| ast.path == span.path)?;
         let call = ast.span2call.get(&span)?;
         let old_value = call.args.posargs.get(2)?;
-        let document = Document::new(&ast.text, 0);
+        let document = Document::new(&ast.source_text, 0);
         let edit = TextEdit {
             range: Range::new(
                 document.offset_to_pos(old_value.span().start()),
@@ -474,7 +474,7 @@ impl LangServer for State {
             if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
             {
-                let doc = Document::new(&ast.text, 0);
+                let doc = Document::new(&ast.source_text, 0);
                 let start = doc.offset_to_pos(span.span.start());
                 let stop = doc.offset_to_pos(span.span.end());
                 pending.entry(uri).or_default().push((
@@ -532,7 +532,7 @@ impl LangServer for State {
         let Some(scope) = ast.span2scope.get(&scope_span) else {
             return;
         };
-        let document = Document::new(&ast.text, 0);
+        let document = Document::new(&ast.source_text, 0);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -594,9 +594,35 @@ impl LangServer for State {
 
 #[cfg(test)]
 mod tests {
-    use tower_lsp_server::ls_types::Position;
+    use argonc::parse;
+    use tower_lsp_server::ls_types::{Position, Uri};
 
-    use super::{Document, insert_statement, instance_placement_expression};
+    use super::{
+        Document, editor_buffers_are_current, insert_statement, instance_placement_expression,
+    };
+    use crate::StateMut;
+
+    #[test]
+    fn generated_gds_declarations_do_not_make_editor_buffers_stale() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        let source = "cell top() {}\n";
+        std::fs::write(&source_path, source).unwrap();
+        let ast = parse::parse_workspace_with_std_deps_and_gds(
+            &source_path,
+            std::iter::empty(),
+            [("ring_osc".to_owned(), directory.path().join("ring_osc.gds"))],
+        )
+        .ast();
+        let uri = Uri::from_file_path(&source_path).unwrap();
+        let mut state = StateMut {
+            ast,
+            ..Default::default()
+        };
+        state.editor_files.insert(uri, Document::new(source, 1));
+
+        assert!(editor_buffers_are_current(&state));
+    }
 
     #[test]
     fn placed_instances_use_initial_conditions() {

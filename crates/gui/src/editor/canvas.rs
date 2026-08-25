@@ -138,6 +138,47 @@ fn choose_selection_hit(
     hits.get(index).cloned()
 }
 
+/// Rectangle order for dimension-edge hit testing, matching
+/// [`ordered_selection_hits`]. Scope bboxes sit below layout layers; within
+/// layout, higher-z layers win, then smaller shapes, then later paint order.
+fn ordered_dimension_rects<'a>(
+    rects: &'a [(Rect, LayerState)],
+    scope_rects: &'a [LabeledBbox],
+) -> Vec<&'a Rect> {
+    let mut candidates = rects
+        .iter()
+        .enumerate()
+        .map(|(paint_order, (rect, layer))| {
+            (
+                rect,
+                SelectionLayer::Layout(layer.z),
+                (rect.x1 - rect.x0).abs() * (rect.y1 - rect.y0).abs(),
+                paint_order,
+            )
+        })
+        .chain(
+            scope_rects
+                .iter()
+                .enumerate()
+                .filter(|(_, bbox)| !bbox.rect.object_path.is_empty())
+                .map(|(paint_order, bbox)| {
+                    (
+                        &bbox.rect,
+                        SelectionLayer::Scope,
+                        (bbox.rect.x1 - bbox.rect.x0).abs() * (bbox.rect.y1 - bbox.rect.y0).abs(),
+                        paint_order,
+                    )
+                }),
+        )
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| b.3.cmp(&a.3))
+    });
+    candidates.into_iter().map(|(rect, _, _, _)| rect).collect()
+}
+
 struct InitialConditionUpdate {
     span: Span,
     value: f64,
@@ -497,6 +538,15 @@ fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>)
         + drag
             .map(|dv| crate::sse::dot(&SparseVec::from(&field.1), dv))
             .unwrap_or_default()
+}
+
+fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
+    let scale = scale * (wheel_delta / 400.).exp();
+    if scale.is_finite() {
+        scale.clamp(f32::MIN_POSITIVE, 100.)
+    } else {
+        100.
+    }
 }
 
 /// Flatten the solved geometry of one compiled cell into rectangles relative
@@ -1576,11 +1626,7 @@ impl Element for CanvasElement {
                     match tool {
                         ToolState::DrawDim(dim_tool)
                             if dim_tool.edges.len() < 2 => {
-                                let rects = rects
-                                    .iter()
-                                    .rev()
-                                    .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                                    .map(|(r, _)| r);
+                                let rects = ordered_dimension_rects(&rects, &scope_rects);
                                 let scale = inner.scale;
                                 let offset = inner.offset;
                                 let mut selected = None;
@@ -1596,7 +1642,7 @@ impl Element for CanvasElement {
                                 {
                                     selected = Some(DimEdge::X0);
                                 }
-                                for (rect, r) in rects.map(|r| {
+                                'rects: for (rect, r) in rects.into_iter().map(|r| {
                                     (
                                         r,
                                         Bounds::new(
@@ -1674,11 +1720,11 @@ impl Element for CanvasElement {
                                     ] {
                                         let bounds = edge_px.select_bounds(SELECT_WIDTH);
                                         if bounds.contains(&inner.mouse_position)
-                                            && rect.id.is_some()
+                                            && !rect.object_path.is_empty()
                                         {
                                             selected =
                                                 Some(DimEdge::Edge((rect, name, edge_layout)));
-                                            break;
+                                            break 'rects;
                                         }
                                     }
                                 }
@@ -2147,12 +2193,7 @@ impl LayoutCanvas {
                 }
                 ToolState::DrawDim(dim_tool) => {
                     let enter_entry_mode = if dim_tool.edges.len() < 2 {
-                        let rects = self
-                            .rects
-                            .iter()
-                            .rev()
-                            .sorted_by_key(|(_, layer)| usize::MAX - layer.z)
-                            .map(|(r, _)| r);
+                        let rects = ordered_dimension_rects(&self.rects, &self.scope_rects);
                         let scale = self.scale;
                         let offset = self.offset;
                         let mut selected = None;
@@ -2162,7 +2203,7 @@ impl LayoutCanvas {
                         if y_axis.select_bounds(SELECT_WIDTH).contains(&event.position) {
                             selected = Some(DimEdge::X0);
                         }
-                        for (rect, r) in rects.map(|r| {
+                        'rects: for (rect, r) in rects.into_iter().map(|r| {
                             (
                                 r,
                                 Bounds::new(
@@ -2236,9 +2277,10 @@ impl LayoutCanvas {
                                 ),
                             ] {
                                 let bounds = edge_px.select_bounds(SELECT_WIDTH);
-                                if bounds.contains(&event.position) && rect.id.is_some() {
+                                if bounds.contains(&event.position) && !rect.object_path.is_empty()
+                                {
                                     selected = Some(DimEdge::Edge((rect, name, edge_layout)));
-                                    break;
+                                    break 'rects;
                                 }
                             }
                         }
@@ -2918,8 +2960,7 @@ impl LayoutCanvas {
         }
         let new_scale = {
             let delta = event.delta.pixel_delta(px(20.));
-            let ns = self.scale + f32::from(delta.y) / 400.;
-            f32::clamp(ns, 0.01, 100.)
+            zoomed_scale(self.scale, f32::from(delta.y))
         };
 
         // screen = scale*world + b
@@ -2969,10 +3010,15 @@ pub(crate) fn find_obj_path(
     let mut reachable_objs = cell
         .output
         .reachable_objs(current_scope.cell, current_scope.scope);
-    if let Some(name) = reachable_objs.swap_remove(obj)
-        && cell.output.cells[&current_scope.cell].objects[obj].is_rect()
-    {
-        string_path.push(name);
+    if let Some(name) = reachable_objs.swap_remove(obj) {
+        match &cell.output.cells[&current_scope.cell].objects[obj] {
+            SolvedValue::Rect(_) => string_path.push(name),
+            SolvedValue::Instance(_) => {
+                string_path.push(name);
+                string_path = vec![format!("bbox({})", string_path.join("."))];
+            }
+            _ => reachable = false,
+        }
     } else {
         reachable = false;
     }
@@ -2982,6 +3028,31 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
+        (
+            Rect {
+                x0,
+                x1: x0 + size,
+                y0: 0.,
+                y1: size,
+                id: None,
+                object_path: Vec::new(),
+                border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                border_styles: Edges::all(BorderStyle::Solid),
+                cvars: None,
+            },
+            LayerState {
+                name: format!("layer-{z}").into(),
+                color: rgb(0),
+                fill: ShapeFill::Solid,
+                used: true,
+                border_color: rgb(0),
+                visible: true,
+                z,
+            },
+        )
+    }
 
     fn selection_hit(name: &str, layer: SelectionLayer, size: f32) -> SelectionHit {
         SelectionHit {
@@ -3039,6 +3110,13 @@ mod tests {
         );
         assert_eq!(sorted_initial_condition_values(100., 150.), None);
         assert_eq!(sorted_initial_condition_values(100., 100.), None);
+    }
+
+    #[test]
+    fn zoom_out_has_no_ui_scale_floor() {
+        let below_old_floor = zoomed_scale(0.01, -20.);
+        assert!(below_old_floor < 0.01);
+        assert!(zoomed_scale(below_old_floor, -20.) < below_old_floor);
     }
 
     #[test]
@@ -3106,6 +3184,23 @@ mod tests {
     }
 
     #[test]
+    fn dimension_edges_use_normal_selection_priority() {
+        let rects = vec![
+            dimension_rect(10., 10., 2),
+            dimension_rect(20., 100., 3),
+            dimension_rect(30., 5., 3),
+        ];
+
+        let ordered = ordered_dimension_rects(&rects, &[]);
+
+        // Higher z wins even when larger; among equal-z shapes, smaller wins.
+        assert_eq!(
+            ordered.iter().map(|rect| rect.x0).collect::<Vec<_>>(),
+            [30., 20., 10.]
+        );
+    }
+
+    #[test]
     fn command_click_cycles_through_hits_and_wraps() {
         let small = selection_hit("small", SelectionLayer::Layout(3), 10.);
         let large = selection_hit("large", SelectionLayer::Layout(3), 100.);
@@ -3163,6 +3258,70 @@ cell top() {
         assert_eq!(
             (rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1),
             (3., 4., 13., 9.)
+        );
+    }
+
+    #[test]
+    fn dimension_path_uses_bbox_for_a_collapsed_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            r#"
+cell child() {
+    let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+}
+cell top() {
+    let child_instance = inst(child(), x=3., y=4.);
+}
+"#,
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        )
+        .unwrap_valid();
+        let top = output.top;
+        let top_cell = &output.cells[&top];
+        let top_root = top_cell.root;
+        let instance = top_cell
+            .objects
+            .values()
+            .find_map(|object| object.get_instance())
+            .unwrap();
+        let instance_id = instance.id;
+        let child_cell = &output.cells[&instance.cell];
+        let child_rect_id = child_cell
+            .objects
+            .values()
+            .find_map(|object| object.get_rect().map(|rect| rect.id))
+            .unwrap();
+        let state = CompileOutputState {
+            output,
+            selected_scope: Vec::new(),
+            state: Default::default(),
+            scope_paths: Default::default(),
+        };
+        let scope = ScopeAddress {
+            cell: top,
+            scope: top_root,
+        };
+
+        assert_eq!(
+            find_obj_path(&[instance_id], &state, scope),
+            (true, vec!["bbox(child_instance)".to_owned()])
+        );
+        assert_eq!(
+            find_obj_path(&[instance_id, child_rect_id], &state, scope),
+            (true, vec!["child_instance".to_owned(), "shape".to_owned()])
         );
     }
 }
