@@ -409,10 +409,8 @@ fn update_delimiters(line: &str, delimiters: &mut Vec<char>, in_string: &mut boo
         match ch {
             '"' => *in_string = true,
             '{' | '(' | '[' => delimiters.push(ch),
-            '}' | ')' | ']' => {
-                if delimiters.last().is_some_and(|open| closes(*open, ch)) {
-                    delimiters.pop();
-                }
+            '}' | ')' | ']' if delimiters.last().is_some_and(|open| closes(*open, ch)) => {
+                delimiters.pop();
             }
             _ => {}
         }

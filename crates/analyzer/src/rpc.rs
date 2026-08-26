@@ -50,6 +50,23 @@ pub struct DimensionParams {
 pub struct PolygonParams {
     pub layer: String,
     pub points: Vec<(f64, f64)>,
+    pub constraints: Vec<DrawSegmentConstraint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathParams {
+    pub layer: String,
+    pub width: f64,
+    pub points: Vec<(f64, f64)>,
+    pub constraints: Vec<DrawSegmentConstraint>,
+}
+
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DrawSegmentConstraint {
+    Horizontal(usize),
+    Vertical(usize),
+    DiagonalPositive(usize),
+    DiagonalNegative(usize),
 }
 
 /// A solved cell and the source location where placing it will insert an
@@ -79,6 +96,7 @@ pub trait LangServer {
         var_name: String,
         polygon: PolygonParams,
     ) -> Option<Span>;
+    async fn draw_path(scope_span: Span, var_name: String, path: PathParams) -> Option<Span>;
     async fn place_instance(scope_span: Span, invocation: String, x: f64, y: f64) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
@@ -174,6 +192,53 @@ fn polygon_expression(polygon: &PolygonParams) -> String {
         polygon.points.len(),
         coordinates
     )
+}
+
+fn path_expression(path: &PathParams) -> String {
+    let coordinates = path
+        .points
+        .iter()
+        .enumerate()
+        .map(|(index, (x, y))| format!("x{index}i = {x:?}, y{index}i = {y:?},"))
+        .collect::<Vec<_>>()
+        .join("\n        ");
+    format!(
+        "path({:?}, {},\n        widthi = {:?},\n        {}\n    )",
+        path.layer,
+        path.points.len(),
+        path.width,
+        coordinates
+    )
+}
+
+fn segment_constraint_statements(variable: &str, constraints: &[DrawSegmentConstraint]) -> String {
+    constraints
+        .iter()
+        .filter_map(|constraint| {
+            let end = match *constraint {
+                DrawSegmentConstraint::Horizontal(end)
+                | DrawSegmentConstraint::Vertical(end)
+                | DrawSegmentConstraint::DiagonalPositive(end)
+                | DrawSegmentConstraint::DiagonalNegative(end) => end,
+            };
+            let start = end.checked_sub(1)?;
+            let expression = match *constraint {
+                DrawSegmentConstraint::Horizontal(end) => {
+                    format!("{variable}.y{end}, {variable}.y{start}")
+                }
+                DrawSegmentConstraint::Vertical(end) => {
+                    format!("{variable}.x{end}, {variable}.x{start}")
+                }
+                DrawSegmentConstraint::DiagonalPositive(end) => format!(
+                    "{variable}.x{end} - {variable}.x{start}, {variable}.y{end} - {variable}.y{start}"
+                ),
+                DrawSegmentConstraint::DiagonalNegative(end) => format!(
+                    "{variable}.x{end} - {variable}.x{start}, {variable}.y{start} - {variable}.y{end}"
+                ),
+            };
+            Some(format!("\n    eq({expression});"))
+        })
+        .collect()
 }
 
 fn missing_initial_condition_edit(
@@ -410,11 +475,58 @@ impl LangServer for State {
         let document = Document::new(&ast.source_text, 0);
         let expression = polygon_expression(&polygon);
         let prefix = format!("let {var_name} = ");
+        let constraints = segment_constraint_statements(&var_name, &polygon.constraints);
         let insertion = insert_statement(
             &document,
             scope.span,
             scope.tail.as_ref().map(|tail| tail.span().start()),
-            &format!("{prefix}{expression}!;"),
+            &format!("{prefix}{expression}!;{constraints}"),
+            prefix.len()..prefix.len() + expression.len(),
+        );
+        let span = Span {
+            path: scope_span.path.clone(),
+            span: insertion.tracked_span,
+        };
+        drop(state_mut);
+
+        self.apply_source_edit(url, scope_span.path, insertion.edit)
+            .await
+            .then_some(span)
+    }
+
+    async fn draw_path(
+        self,
+        _: tarpc::context::Context,
+        scope_span: Span,
+        var_name: String,
+        path: PathParams,
+    ) -> Option<Span> {
+        if path.points.len() < 2 || !path.width.is_finite() || path.width <= 0. {
+            return None;
+        }
+        let state_mut = self.state_mut.lock().await;
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
+            self.editor_client
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                .await;
+            return None;
+        }
+        let url = Uri::from_file_path(&scope_span.path)?;
+        let ast = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)?;
+        let scope = ast.span2scope.get(&scope_span)?;
+        let document = Document::new(&ast.source_text, 0);
+        let expression = path_expression(&path);
+        let prefix = format!("let {var_name} = ");
+        let constraints = segment_constraint_statements(&var_name, &path.constraints);
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &format!("{prefix}{expression}!;{constraints}"),
             prefix.len()..prefix.len() + expression.len(),
         );
         let span = Span {
@@ -806,8 +918,9 @@ mod tests {
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
-        Document, PolygonParams, editor_buffers_are_current, insert_statement,
-        instance_placement_expression, missing_initial_condition_edit, polygon_expression,
+        Document, DrawSegmentConstraint, PathParams, PolygonParams, editor_buffers_are_current,
+        insert_statement, instance_placement_expression, missing_initial_condition_edit,
+        path_expression, polygon_expression, segment_constraint_statements,
     };
     use crate::StateMut;
 
@@ -847,8 +960,38 @@ mod tests {
             polygon_expression(&PolygonParams {
                 layer: "met1".to_owned(),
                 points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+                constraints: vec![],
             }),
             "polygon(\"met1\", 3,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+        );
+    }
+
+    #[test]
+    fn drawn_paths_use_numbered_initial_conditions() {
+        assert_eq!(
+            path_expression(&PathParams {
+                layer: "met1".to_owned(),
+                width: 20.,
+                points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+                constraints: vec![],
+            }),
+            "path(\"met1\", 3,\n        widthi = 20.0,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+        );
+    }
+
+    #[test]
+    fn drawn_segment_constraints_reference_adjacent_fields() {
+        assert_eq!(
+            segment_constraint_statements(
+                "path0",
+                &[
+                    DrawSegmentConstraint::Horizontal(1),
+                    DrawSegmentConstraint::Vertical(2),
+                    DrawSegmentConstraint::DiagonalPositive(3),
+                    DrawSegmentConstraint::DiagonalNegative(4),
+                ],
+            ),
+            "\n    eq(path0.y1, path0.y0);\n    eq(path0.x2, path0.x1);\n    eq(path0.x3 - path0.x2, path0.y3 - path0.y2);\n    eq(path0.x4 - path0.x3, path0.y3 - path0.y4);"
         );
     }
 
