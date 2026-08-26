@@ -23,8 +23,8 @@
 #   ARGON_BENCH_CONSTRAINTS=64,128,256 bench/run_benchmarks.sh bench_constraints
 #
 # Recognised vars: ARGON_BENCH_SHAPES, ARGON_BENCH_SHAPES_LOOP,
-#   ARGON_BENCH_INSTANCES, ARGON_BENCH_CONSTRAINTS, ARGON_BENCH_HIER_SINGLE,
-#   ARGON_BENCH_HIER_DOUBLE.
+#   ARGON_BENCH_INSTANCES, ARGON_BENCH_CONSTRAINTS,
+#   ARGON_BENCH_SPARSE_SOLVER, ARGON_BENCH_HIER_SINGLE, ARGON_BENCH_HIER_DOUBLE.
 #
 # Note: building `-p argonc` does not need the GUI's linker flags, so this
 # script sets no RUSTFLAGS (any you already export are passed through, and are

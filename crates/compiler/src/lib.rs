@@ -298,6 +298,70 @@ mod tests {
         s
     }
 
+    /// Builds a cyclic tridiagonal system in which every constraint has three
+    /// unknowns. Neither unary back-substitution nor the size-2 elimination
+    /// pass can reduce it, so it exercises the sparse component solver.
+    fn sparse_solver_fixture(
+        n: usize,
+    ) -> (crate::solver::Solver, Vec<crate::solver::Var>, Vec<f64>) {
+        use crate::solver::{LinearExpr, Solver};
+
+        let mut solver = Solver::new();
+        let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
+        let expected: Vec<_> = (0..n).map(|i| ((i % 11) as f64 - 5.) * 0.1).collect();
+        for i in 0..n {
+            let previous = (i + n - 1) % n;
+            let next = (i + 1) % n;
+            let rhs = -expected[previous] + 4. * expected[i] - expected[next];
+            solver.constrain_eq0(LinearExpr {
+                coeffs: vec![(-1., vars[previous]), (4., vars[i]), (-1., vars[next])],
+                constant: -rhs,
+            });
+        }
+        assert!(vars.iter().all(|&var| !solver.is_solved(var)));
+        (solver, vars, expected)
+    }
+
+    /// Sparse solver kernel: a connected component with three unknowns per row,
+    /// timed after fixture construction so only `Solver::solve()` is measured.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_sparse_solver() {
+        let _g = bench_guard();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes(
+            "ARGON_BENCH_SPARSE_SOLVER",
+            &[256, 512, 1024, 2048, 4096, 8192, 16384],
+        ) {
+            let n = usize::try_from(n).expect("sparse solver benchmark sizes must be positive");
+            let (template, vars, expected) = sparse_solver_fixture(n);
+            let mut best = std::time::Duration::MAX;
+            let mut peak = 0usize;
+
+            for _ in 0..5 {
+                let mut solver = template.clone();
+                crate::bench_alloc::reset_peak();
+                let base = crate::bench_alloc::live();
+                let start = std::time::Instant::now();
+                solver.solve();
+                best = best.min(start.elapsed());
+                peak = peak.max(crate::bench_alloc::peak().saturating_sub(base));
+
+                assert!(solver.fully_solved());
+                for (&var, &value) in vars.iter().zip(&expected) {
+                    assert!((solver.value_of(var).unwrap() - value).abs() < 1e-8);
+                }
+            }
+
+            eprintln!(
+                "sparse_solver n={n:>6} time={best:>11.3?} peak={:>8.2} MiB",
+                peak as f64 / (1usize << 20) as f64
+            );
+            rows.push((n as f64, best.as_secs_f64(), peak, n));
+        }
+        write_bench_csv("sparse_solver", &rows);
+    }
+
     /// Axis 1: number of independent shapes in a single cell.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]

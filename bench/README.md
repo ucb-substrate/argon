@@ -93,6 +93,8 @@ filter keeps the run from also executing the other (`#[ignore]`'d) tests. Each
 test writes `bench/results/<axis>.csv` with columns
 `size,time_s,peak_bytes,n_objects`. `plot_scaling.py` needs only the standard
 library to print the summary table; `matplotlib` is required to draw the figure.
+The kernel-only `sparse_solver.csv` is retained as benchmark data but omitted
+from the figure, which covers end-to-end compiler scaling axes.
 The figure is drawn for the ACM `acmart` `sigconf` camera-ready format: it is
 sized to the full two-column text width (~7 in, i.e. a `figure*`), uses a
 colorblind-safe palette with distinct markers (legible in grayscale), and
@@ -114,6 +116,7 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
 | `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024,2048,4096,8192,16384` |
+| `ARGON_BENCH_SPARSE_SOLVER` | sparse solver variables | `256,512,1024,2048,4096,8192,16384` |
 | `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,64,128,256,512,1024,2048` |
 | `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `4,8,16,32,64,128,256,512,1024,2048` |
 
@@ -130,10 +133,12 @@ on the current build; they are not claims about how any axis "should" scale.
 
 - **Time**: minimum wall-clock time over a few repetitions (`min` is robust to
   noise on a shared machine). Parsing/static analysis is done once per size and
-  excluded from the hierarchy timings; everything else is end-to-end `compile()`.
+  excluded from the hierarchy timings; everything else is end-to-end `compile()`,
+  except `bench_sparse_solver`, which times only `Solver::solve()` after fixture
+  construction.
 - **Memory**: a `#[global_allocator]` compiled only into the test binary
   (`bench_alloc::Tracking` in `lib.rs`) tracks live and peak heap bytes. We
-  report the peak heap *growth* during a single `compile()`.
+  report the peak heap *growth* during the timed region.
 - **Build**: release profile. Numbers below were collected on a Linux machine;
   absolute values are machine-dependent but the *scaling* is not.
 

@@ -3,6 +3,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools, multiunzip};
 use nalgebra::{CsMatrix, DMatrix, DVector};
 use serde::{Deserialize, Serialize};
+use sparse_linear_solver::System as SparseLinearSystem;
 use std::collections::VecDeque;
 
 const EPSILON: f64 = 1e-8;
@@ -386,6 +387,9 @@ impl Solver {
         if n_vars == 0 || constraints.is_empty() {
             return;
         }
+        if self.try_solve_sparse_component(vars, constraints) {
+            return;
+        }
         let var_indices: IndexMap<Var, usize> =
             IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
@@ -430,6 +434,49 @@ impl Solver {
                 self.solve_var(*var, rounded_val);
             }
         }
+    }
+
+    /// Attempts to solve a sparse, provably nonsingular component without ever
+    /// materializing a dense matrix.
+    ///
+    /// Each constraint must have a unique strictly dominant variable, and those
+    /// variables must form a permutation of the component variables. After rows
+    /// are put in that order, the Levy--Desplanques theorem proves that the matrix
+    /// is nonsingular. This lets the iterative solvers mark every variable as
+    /// determined without computing the dense SVD nullspace. A failed iteration
+    /// or backward-error check simply returns to the dense path.
+    fn try_solve_sparse_component(
+        &mut self,
+        vars: &IndexSet<Var>,
+        constraints: &[ConstraintId],
+    ) -> bool {
+        let var_indices: IndexMap<Var, usize> =
+            IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let rows = constraints
+            .iter()
+            .map(|id| {
+                self.constraints[id]
+                    .coeffs
+                    .iter()
+                    .filter_map(|(value, var)| var_indices.get(var).map(|&column| (column, *value)))
+                    .collect()
+            })
+            .collect();
+        let rhs = constraints
+            .iter()
+            .map(|id| -self.constraints[id].constant)
+            .collect();
+        let Some(system) = SparseLinearSystem::new(rows, rhs) else {
+            return false;
+        };
+        let Some(solution) = system.solve() else {
+            return false;
+        };
+
+        for (&var, &value) in vars.iter().zip(&solution) {
+            self.assign_var(var, value);
+        }
+        true
     }
 
     fn rowspace_component_vecs(
@@ -849,6 +896,60 @@ mod tests {
         assert_relative_eq!(s.value_of(a).unwrap(), 10., epsilon = EPSILON);
         assert_relative_eq!(s.value_of(b).unwrap(), 9., epsilon = EPSILON);
         assert_relative_eq!(s.value_of(d).unwrap(), 8., epsilon = EPSILON);
+    }
+
+    fn coupled_ring_system(n: usize, left: f64, right: f64) -> (Solver, Vec<Var>, Vec<f64>) {
+        let mut solver = Solver::new();
+        let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
+        let expected: Vec<_> = (0..n).map(|i| ((i % 11) as f64 - 5.) * 0.1).collect();
+        for i in 0..n {
+            let previous = (i + n - 1) % n;
+            let next = (i + 1) % n;
+            let diagonal = left.abs() + right.abs() + 2.;
+            let rhs = left * expected[previous] + diagonal * expected[i] + right * expected[next];
+            solver.constrain_eq0(c(
+                vec![
+                    (left, vars[previous]),
+                    (diagonal, vars[i]),
+                    (right, vars[next]),
+                ],
+                -rhs,
+            ));
+        }
+        (solver, vars, expected)
+    }
+
+    /// Every row has three unknowns, so neither insertion-time back-substitution
+    /// nor the size-2 elimination pass can make progress. The symmetric sparse
+    /// component is solved by PCG and never materializes the dense SVD matrix.
+    #[test]
+    fn sparse_symmetric_ring_uses_iterative_solver() {
+        let (mut solver, vars, expected) = coupled_ring_system(128, -1., -1.);
+        assert!(vars.iter().all(|&var| !solver.is_solved(var)));
+
+        solver.solve();
+        assert!(solver.fully_solved());
+        for (&var, &value) in vars.iter().zip(&expected) {
+            assert_relative_eq!(solver.value_of(var).unwrap(), value, epsilon = EPSILON);
+        }
+        assert!(solver.inconsistent_constraints().is_empty());
+        assert!(solver.invalid_rounding().is_empty());
+    }
+
+    /// The same irreducible shape with asymmetric neighbor coefficients exercises
+    /// the CGLS path.
+    #[test]
+    fn sparse_nonsymmetric_ring_uses_iterative_solver() {
+        let (mut solver, vars, expected) = coupled_ring_system(127, -1., -2.);
+        assert!(vars.iter().all(|&var| !solver.is_solved(var)));
+
+        solver.solve();
+        assert!(solver.fully_solved());
+        for (&var, &value) in vars.iter().zip(&expected) {
+            assert_relative_eq!(solver.value_of(var).unwrap(), value, epsilon = EPSILON);
+        }
+        assert!(solver.inconsistent_constraints().is_empty());
+        assert!(solver.invalid_rounding().is_empty());
     }
 
     /// A fully-coupled 3x3 block has no size-<=2 pivot: the pre-pass is a no-op and the

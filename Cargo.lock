@@ -266,6 +266,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sky130",
+ "sparse-linear-solver",
  "thiserror 2.0.20",
  "tracing",
  "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
@@ -7031,6 +7032,10 @@ dependencies = [
  "libc",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "sparse-linear-solver"
+version = "0.1.0"
 
 [[package]]
 name = "spectre"
