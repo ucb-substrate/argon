@@ -7,6 +7,7 @@ members = [
     "crates/argon",
     "crates/compiler",
     "crates/gui",
+    "crates/sparse-linear-solver",
     "crates/tests",
 ]
 
