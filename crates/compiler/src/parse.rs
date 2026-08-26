@@ -18,6 +18,9 @@ pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;
 pub const STD_PATH: &str = "<argon-std>/lib.ar";
 /// Source text embedded into the compiler for the Argon standard library.
 pub const STD_SOURCE: &str = include_str!("std/lib.ar");
+/// Virtual path used for diagnostics originating in a cell invocation supplied
+/// by a compiler entry point rather than by a source file.
+pub const CELL_PATH: &str = "<argon-cell>";
 
 impl AstMetadata for ParseMetadata {
     type Ident = ();
@@ -282,6 +285,192 @@ fn add_gds_imports(output: &mut ParseOutput, imports: impl IntoIterator<Item = (
             output.errs.insert(import_path, (diagnostics, Vec::new()));
         }
     }
+}
+
+/// A cell invocation spliced into the root module as a generated entry cell, so
+/// that name resolution, type checking, and evaluation all treat it as ordinary
+/// source. Returned by [`add_cell_invocation`].
+pub struct CellInvocation {
+    /// Name of the generated entry cell.
+    pub entry_cell: String,
+    /// Name of the generated binding holding the invocation's value.
+    pub binding: String,
+    /// The invocation as supplied by the caller, for diagnostics.
+    pub source: String,
+    /// Offsets within `source` bounding the call expression that was spliced.
+    base: usize,
+    call_end: usize,
+    /// Offset within the root module's backing text of the spliced call.
+    call_offset: usize,
+    /// Offset within the root module's backing text of the generated cell.
+    generated_offset: usize,
+    /// Root module path, which the two offsets above index.
+    path: PathBuf,
+}
+
+impl CellInvocation {
+    /// Span of the spliced call within the root module. [`Self::remap`]
+    /// translates it back onto the invocation.
+    pub fn span(&self) -> Span {
+        Span {
+            path: self.path.clone(),
+            span: cfgrammar::Span::new(
+                self.call_offset,
+                self.call_offset + (self.call_end - self.base),
+            ),
+        }
+    }
+
+    /// Translates a span inside the generated entry cell into a span over the
+    /// invocation itself, so diagnostics point at what the caller wrote.
+    /// Returns `None` for spans that are not in the generated region.
+    pub fn remap(&self, span: &Span) -> Option<Span> {
+        if span.path != self.path || span.span.start() < self.generated_offset {
+            return None;
+        }
+        // Positions in the generated wrapper collapse onto the start of the
+        // call, which is the closest thing the caller actually wrote.
+        let onto_source = |position: usize| {
+            (position.saturating_sub(self.call_offset) + self.base).min(self.source.len())
+        };
+        let start = onto_source(span.span.start());
+        let end = onto_source(span.span.end()).max(start);
+        Some(Span {
+            path: PathBuf::from(CELL_PATH),
+            span: cfgrammar::Span::new(start, end),
+        })
+    }
+}
+
+/// Splices a cell invocation such as `top(10., 20.)` into the root module of a
+/// freshly parsed workspace, and refreshes that module's parse diagnostics.
+///
+/// See [`splice_cell_invocation`] for what the generated declaration looks like.
+pub fn add_cell_invocation(
+    output: &mut ParseOutput,
+    invocation: &str,
+) -> Result<CellInvocation, anyhow::Error> {
+    let root = ModPath::new();
+    let Some((existing, _)) = output.asts.get(&root) else {
+        bail!("workspace has no root module");
+    };
+    let entry = EntryCell::new(
+        output.asts.values().map(|(ast, _)| &ast.text),
+        existing,
+        invocation,
+    )?;
+    let source_path = entry.path.clone();
+    let (result, diagnostics, invocation) = entry.parse();
+    let mod_spans = output
+        .errs
+        .get(&source_path)
+        .map(|(_, spans)| spans.clone())
+        .unwrap_or_default();
+    output.errs.insert(source_path, (diagnostics, mod_spans));
+    output.asts.insert(root, result);
+    Ok(invocation)
+}
+
+/// Splices a cell invocation into the root module of `asts` as a generated entry
+/// cell:
+///
+/// ```argon
+/// cell __argon_entry_0__() { let __argon_top_0__ = top(10., 20.); }
+/// ```
+///
+/// Compiling that cell evaluates the invocation with the same passes that run
+/// source files, so its arguments may be arbitrary expressions. The invocation
+/// is validated with [`parse_cell`] first, which keeps its "exactly one call
+/// expression" contract and its precise syntax errors.
+pub fn splice_cell_invocation(
+    asts: &mut WorkspaceParseAst,
+    invocation: &str,
+) -> Result<CellInvocation, anyhow::Error> {
+    let root = ModPath::new();
+    let Some(existing) = asts.get(&root) else {
+        bail!("workspace has no root module");
+    };
+    let entry = EntryCell::new(asts.values().map(|ast| &ast.text), existing, invocation)?;
+    let (result, _, invocation) = entry.parse();
+    asts.insert(root, result.0);
+    Ok(invocation)
+}
+
+/// A root module rewritten to declare the entry cell for an invocation.
+struct EntryCell {
+    /// The module's text with the generated declaration appended.
+    text: ArcStr,
+    path: PathBuf,
+    /// Editor-visible text, which re-parsing would otherwise overwrite.
+    source_text: ArcStr,
+    generated_declarations: usize,
+    invocation: CellInvocation,
+}
+
+impl EntryCell {
+    fn new<'a>(
+        texts: impl Iterator<Item = &'a ArcStr>,
+        existing: &AnnotatedParseAst,
+        invocation: &str,
+    ) -> Result<Self, anyhow::Error> {
+        let call = parse_cell(invocation)?;
+        if !call.args.kwargs.is_empty() {
+            bail!("cells take positional arguments only; keyword arguments are not supported");
+        }
+        // Splice the call expression itself rather than the raw argument:
+        // trailing trivia such as a line comment would otherwise swallow the
+        // generated `;`.
+        let base = call.span.start();
+        let texts = texts.collect::<Vec<_>>();
+        let unused = |name: &str| texts.iter().all(|text| !text.contains(name));
+        let entry_cell = generated_name("__argon_entry_", unused);
+        let binding = generated_name("__argon_top_", unused);
+        let prefix = format!("cell {entry_cell}() {{ let {binding} = ");
+        let generated = format!("{prefix}{}; }}\n", &invocation[base..call.span.end()]);
+        let generated_offset = existing.text.len() + 1;
+        Ok(Self {
+            text: ArcStr::from(format!("{}\n{generated}", existing.text)),
+            path: existing.path.clone(),
+            source_text: existing.source_text.clone(),
+            generated_declarations: existing.generated_declarations,
+            invocation: CellInvocation {
+                entry_cell,
+                binding,
+                source: invocation.to_owned(),
+                base,
+                call_end: call.span.end(),
+                call_offset: generated_offset + prefix.len(),
+                generated_offset,
+                path: existing.path.clone(),
+            },
+        })
+    }
+
+    /// Re-parses the rewritten module, restoring the declaration order and
+    /// editor-visible text that a fresh parse does not carry over.
+    fn parse(self) -> (ParseResult, ParseDiagnostics, CellInvocation) {
+        let (mut result, diagnostics) = parse_source(self.text, self.path);
+        if result.1.is_none() {
+            // Re-parsing restarts declaration order, so restore the generated
+            // declarations that `add_gds_imports` promoted to the front while
+            // keeping the entry cell last.
+            let entry = result.0.ast.decls.pop().expect("entry cell should parse");
+            result
+                .0
+                .promote_last_declarations(self.generated_declarations);
+            result.0.ast.decls.push(entry);
+        }
+        result.0.source_text = self.source_text;
+        (result, diagnostics, self.invocation)
+    }
+}
+
+/// Builds a name with `prefix` that no module in the workspace uses.
+fn generated_name(prefix: &str, unused: impl Fn(&str) -> bool) -> String {
+    (0..)
+        .map(|index| format!("{prefix}{index}"))
+        .find(|name| unused(name))
+        .expect("an unused generated name always exists")
 }
 
 pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {

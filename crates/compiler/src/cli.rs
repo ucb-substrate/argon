@@ -6,14 +6,13 @@ use std::{
 
 use crate::{
     artifact,
-    compile::{self, CellArg, CompileInput, CompileOutput},
+    compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
     gds::GdsMap,
-    parse::{self, parse_workspace_with_std_deps_and_gds},
+    parse::{self, CellInvocation, parse_workspace_with_std_deps_and_gds},
 };
 use clap::{Parser, ValueEnum};
 use gds::GdsUnits;
-use itertools::Itertools;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ErrorFormat {
@@ -107,11 +106,36 @@ fn execute(args: Args) -> Result<(), Failed> {
         }
     }
 
-    let analysis = compile::analyze_workspace(parse_workspace_with_std_deps_and_gds(
-        &root,
-        args.dependencies,
-        args.gds_imports.clone(),
-    ));
+    // The invocation is spliced into the workspace before analysis so that its
+    // arguments are resolved, type-checked, and evaluated like any source
+    // expression, which means the entry point must be resolved before parsing.
+    let entry = if args.check {
+        None
+    } else {
+        let Some(cell) = args.cell.as_deref() else {
+            return Err(fail(format, "either --check or --cell is required"));
+        };
+        let Some(lyp) = args.lyp.as_deref() else {
+            return Err(fail(
+                format,
+                "--lyp is required when compiling a cell; pass the path to a KLayout layer-properties file",
+            ));
+        };
+        crate::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
+        Some((cell, lyp))
+    };
+
+    let mut parse_output =
+        parse_workspace_with_std_deps_and_gds(&root, args.dependencies, args.gds_imports.clone());
+    let entry = match entry {
+        Some((cell, lyp)) => Some((
+            parse::add_cell_invocation(&mut parse_output, cell)
+                .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?,
+            lyp,
+        )),
+        None => None,
+    };
+    let analysis = compile::analyze_workspace(parse_output);
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(
             format,
@@ -124,59 +148,18 @@ fn execute(args: Args) -> Result<(), Failed> {
             CompileOutput::StaticErrors(compile::StaticErrorCompileOutput {
                 errors: analysis.errors,
             }),
+            entry.as_ref().map(|(invocation, _)| invocation),
         ));
     }
-    if args.check {
+    // Nothing left to do for a `--check` run.
+    let Some((invocation, lyp)) = entry else {
         return Ok(());
-    }
+    };
 
-    let Some(cell) = args.cell.as_deref() else {
-        return Err(fail(format, "either --check or --cell is required"));
-    };
-    let Some(lyp) = args.lyp.as_deref() else {
-        return Err(fail(
-            format,
-            "--lyp is required when compiling a cell; pass the path to a KLayout layer-properties file",
-        ));
-    };
-    crate::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
-    let cell_ast = parse::parse_cell(cell)
-        .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?;
-    if !cell_ast.args.kwargs.is_empty() {
-        return Err(fail(
-            format,
-            "keyword arguments are not supported in --cell yet",
-        ));
-    }
-    let cell_path = cell_ast
-        .func
-        .path
-        .iter()
-        .map(|ident| ident.name)
-        .collect_vec();
-    let cell_args = cell_ast
-        .args
-        .posargs
-        .iter()
-        .map(CellArg::from_literal)
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            fail(
-                format,
-                "--cell arguments must be integer, float, boolean, or empty-list literals",
-            )
-        })?;
-    let output = compile::dynamic_compile_with_gds(
-        &typed_ast,
-        CompileInput {
-            cell: &cell_path,
-            args: cell_args,
-            lyp_file: lyp,
-        },
-        &args.gds_imports,
-    );
+    let output =
+        compile::dynamic_compile_invocation(&typed_ast, &invocation, lyp, &args.gds_imports);
     if !matches!(output, CompileOutput::Valid(_)) {
-        return Err(compile_failed(format, output));
+        return Err(compile_failed(format, output, Some(&invocation)));
     }
     let output_path = args.output.unwrap_or_else(|| root.with_extension("bin"));
     artifact::write(&output, &output_path).map_err(|error| {
@@ -244,8 +227,16 @@ fn fail(format: ErrorFormat, message: impl Into<String>) -> Failed {
     Failed(format, vec![Diagnostic::error(message)])
 }
 
-fn compile_failed(format: ErrorFormat, output: CompileOutput) -> Failed {
-    Failed(format, diagnostics::from_compile_output(&output))
+fn compile_failed(
+    format: ErrorFormat,
+    output: CompileOutput,
+    invocation: Option<&CellInvocation>,
+) -> Failed {
+    let mut diagnostics = diagnostics::from_compile_output(&output);
+    if let Some(invocation) = invocation {
+        diagnostics::remap_invocation(&mut diagnostics, invocation);
+    }
+    Failed(format, diagnostics)
 }
 
 #[cfg(test)]
@@ -256,7 +247,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{artifact, compile::CompileOutput};
+    use crate::{
+        artifact,
+        compile::{CompileOutput, Rect},
+        solver::LinearExpr,
+    };
     use clap::{CommandFactory, Parser};
     use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPath, GdsPoint, GdsStruct};
 
@@ -486,36 +481,96 @@ mod tests {
         assert!(execute(args).is_ok());
     }
 
+    /// Reads the sole rect from an invocation-compiled artifact.
+    fn compiled_rect(name: &str, source: PathBuf, cell: &str) -> Rect<(f64, LinearExpr)> {
+        let artifact_path = source.with_file_name(format!("{name}.bin"));
+        let mut args = execution_args(source, cell, basic_lyp());
+        args.output = Some(artifact_path.clone());
+        if let Err(error) = execute(args) {
+            panic!("`{cell}` should compile: {}", render_failed(error));
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("`{cell}` should compile successfully");
+        };
+        let top = &output.cells[&output.top];
+        // The generated entry cell is an implementation detail and must not
+        // reach the output, and the target keeps its own root scope name.
+        assert_eq!(output.cells.len(), 1, "entry cell should not be emitted");
+        assert_eq!(top.scopes[&top.root].name, "cell top");
+        top.objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top should emit a rect")
+            .clone()
+    }
+
     #[test]
-    fn execution_accepts_negated_cell_arguments() {
+    fn execution_evaluates_arithmetic_cell_arguments() {
         let source = temp_source(
-            "negated-args",
+            "arithmetic-args",
             "cell top(x: Float, n: Int, flag: Bool) {\n\
              let h = if flag { 10. } else { 20. };\n\
              let r = rect(\"met1\", x0=x, y0=n as Float, x1=x + 10., y1=n as Float + h);\n\
              }\n",
         );
-        let artifact_path = source.with_file_name("negated.bin");
-        let mut args = execution_args(source, "top(-5., -2, !true)", basic_lyp());
-        args.output = Some(artifact_path.clone());
-
-        if let Err(error) = execute(args) {
-            panic!("negated arguments should compile: {}", render_failed(error));
-        }
-        let CompileOutput::Valid(output) =
-            artifact::read(artifact_path).expect("artifact should decode")
-        else {
-            panic!("negated arguments should compile successfully");
-        };
-        let top = &output.cells[&output.top];
-        let rect = top
-            .objects
-            .values()
-            .find_map(|object| object.get_rect())
-            .expect("top should emit a rect");
+        let rect = compiled_rect("arithmetic", source, "top(-2.5 * 2., 2 * -1, false)");
         assert_eq!(rect.x0.0, -5.);
         assert_eq!(rect.y0.0, -2.);
         assert_eq!(rect.y1.0, 18.);
+    }
+
+    #[test]
+    fn execution_evaluates_a_function_call_and_string_cell_argument() {
+        let source = temp_source(
+            "call-args",
+            "fn double(x: Float) -> Float { 2. * x }\n\
+             cell top(layer: String, w: Float) {\n\
+             let r = rect(layer, x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("call", source, "top(\"met1\", double(25.))");
+        assert_eq!(rect.x1.0, 50.);
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+    }
+
+    #[test]
+    fn execution_evaluates_a_sequence_cell_argument() {
+        let source = temp_source(
+            "seq-args",
+            "cell top(items: [Float]) {\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=head(items), y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("seq", source, "top(cons(30., cons(40., [])))");
+        assert_eq!(rect.x1.0, 30.);
+    }
+
+    #[test]
+    fn execution_accepts_an_empty_sequence_cell_argument() {
+        let source = temp_source(
+            "empty-seq-args",
+            "cell top(items: [Float]) {\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("empty-seq", source, "top([])");
+        assert_eq!(rect.y1.0, 20.);
+    }
+
+    #[test]
+    fn execution_evaluates_an_enum_cell_argument() {
+        let source = temp_source(
+            "enum-args",
+            "enum Mode { Fast, Slow, }\n\
+             cell top(m: Mode) {\n\
+             let w = match m { Mode::Fast => 10., Mode::Slow => 20., };\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("enum", source, "top(Mode::Slow)");
+        assert_eq!(rect.x1.0, 20.);
     }
 
     #[test]
@@ -533,13 +588,35 @@ mod tests {
     }
 
     #[test]
-    fn non_literal_cell_arguments_are_reported_cleanly() {
-        let source = temp_source("non-literal-args", "cell top(x: Float) {}\n");
-        let diagnostic = render_failed(failed(execution_args(source, "top(1. + 1.)", basic_lyp())));
+    fn a_non_cell_invocation_is_reported_cleanly() {
+        let source = temp_source(
+            "not-a-cell",
+            "fn double(x: Float) -> Float { 2. * x }\ncell top() {}\n",
+        );
+        let diagnostic = render_failed(failed(execution_args(source, "double(2.)", basic_lyp())));
         assert!(
-            diagnostic.contains("--cell arguments must be integer, float, boolean, or empty-list"),
+            diagnostic.contains("expected type category Cell, found Float"),
             "{diagnostic}"
         );
+    }
+
+    #[test]
+    fn an_error_in_a_cell_argument_points_at_the_invocation() {
+        let source = temp_source("arg-diagnostic", "cell top(x: Float, y: Float) {}\n");
+        let diagnostic = render_failed(failed(execution_args(
+            source,
+            "top(1 + 1, 20.)",
+            basic_lyp(),
+        )));
+        assert!(
+            diagnostic.contains("expected type Float, found Int"),
+            "{diagnostic}"
+        );
+        // The caret must land on the argument the caller wrote, not on a
+        // position in the library source that it was spliced into.
+        assert!(diagnostic.contains("--> <argon-cell>:1:5"), "{diagnostic}");
+        assert!(diagnostic.contains("1 | top(1 + 1, 20.)"), "{diagnostic}");
+        assert!(diagnostic.contains("^^^^^"), "{diagnostic}");
     }
 
     #[test]
@@ -746,7 +823,7 @@ mod tests {
         args.output = Some(std::env::temp_dir().join("argonc-invalid-argument.bin"));
         let diagnostic = render_failed(failed(args));
         assert!(
-            diagnostic.contains("invalid cell argument 1: expected Bool, found Int"),
+            diagnostic.contains("expected type Bool, found Int"),
             "{diagnostic}"
         );
     }
