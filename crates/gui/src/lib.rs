@@ -114,6 +114,7 @@ fn run_inner(
                     items: vec![
                         MenuItem::action("Rect", DrawRect),
                         MenuItem::action("Polygon", DrawPolygon),
+                        MenuItem::action("Path", DrawPath),
                         MenuItem::action("Dim", DrawDim),
                         MenuItem::action("Edit", Edit),
                     ],

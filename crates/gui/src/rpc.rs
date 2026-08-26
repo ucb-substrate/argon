@@ -8,7 +8,7 @@ use std::{
 
 use analyzer::rpc::{
     DimensionParams, Gui, InitialConditionEdit, InstancePreview, LangServerAction,
-    LangServerClient, PolygonParams, ValueEdit,
+    LangServerClient, PathParams, PolygonParams, ValueEdit,
 };
 use anyhow::{Result, anyhow};
 use argonc::{
@@ -284,6 +284,24 @@ impl SyncLangServerClient {
             async move {
                 client
                     .draw_polygon(context::current(), scope_span, var_name, polygon)
+                    .await
+            }
+        })
+    }
+
+    pub fn draw_path(
+        &self,
+        scope_span: Span,
+        var_name: String,
+        path: PathParams,
+    ) -> Result<Option<Span>> {
+        self.call(move |client| {
+            let scope_span = scope_span.clone();
+            let var_name = var_name.clone();
+            let path = path.clone();
+            async move {
+                client
+                    .draw_path(context::current(), scope_span, var_name, path)
                     .await
             }
         })
