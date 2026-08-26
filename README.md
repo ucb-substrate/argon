@@ -250,45 +250,13 @@ The analyzer and Argone write to one shared log at
 written to `$XDG_STATE_HOME/argon/argon.log` instead. While the analyzer is
 running, open it with `:Argon log`.
 
-Configure analyzer, GUI, and logging behavior in `~/.config/argon/config.toml` (or
+Configure the log level in `~/.config/argon/config.toml` (or
 `$XDG_CONFIG_HOME/argon/config.toml`):
 
 ```toml
-[analyzer]
-# Delay after an editor change; use 0 to disable debouncing.
-compile_debounce_ms = 150
-
-[gui]
-dark_mode = true
-# Omit hierarchy_depth for unlimited hierarchy rendering.
-# hierarchy_depth = 2
-
 [log]
 level = "debug"
 ```
-
-After editing the file, run `:Argon reload` to apply analyzer and GUI settings
-without restarting Neovim. The Neovim `vim.g.argon` table is reserved for
-bootstrapping the analyzer executable or a custom LSP transport.
-
-Settings can also be changed for the current analyzer process without touching
-the file. `:Argon set` accepts a dotted key and a TOML value; bare, whitespace-free
-strings are accepted for convenience:
-
-```vim
-:Argon set gui.hierarchy_depth 2
-:Argon set gui.dark_mode false
-:Argon set analyzer.compile_debounce_ms 0
-:Argon set log.level analyzer=debug
-```
-
-Omit the value to reset a setting that currently differs from its default, for
-example `:Argon set gui.hierarchy_depth`. Runtime changes are discarded by
-`:Argon reload` or when the analyzer exits. To make the complete live
-configuration persistent, run `:Argon saveConfig`; an optional path writes it
-somewhere other than the standard `config.toml` location. Saving serializes the
-configuration afresh, so comments in an existing destination file are not
-preserved.
 
 The level follows [`RUST_LOG` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables).
 It defaults to `error`; `warn` or `error` is recommended unless you are
