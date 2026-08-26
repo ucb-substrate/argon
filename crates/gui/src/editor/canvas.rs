@@ -2,6 +2,8 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     ops::{Add, Sub},
+    sync::Arc,
+    time::Duration,
 };
 
 use analyzer::rpc::{
@@ -18,8 +20,8 @@ use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
     Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
-    pattern_slash, px, rgb, size, solid_background,
+    RenderImage, Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Task,
+    TextRun, Timer, Window, div, pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -39,6 +41,18 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
+/// Stop expanding a hierarchy node when its screen-space area is small.
+/// Painting every transistor inside a tiny SRAM bit cell creates millions of
+/// primitives without adding useful visible detail.
+const HIERARCHY_LOD_AREA_PX: f32 = 64. * 64.;
+/// Above this size, retain a viewport raster for interactive redraws. GPUI can
+/// replay a clean retained view, but pan/zoom dirties this immediate element;
+/// transforming one sprite avoids rebuilding hundreds of thousands of quads.
+const RASTER_CACHE_GEOMETRY_THRESHOLD: usize = 50_000;
+/// The interaction cache is deliberately half resolution. Its geometry is
+/// shown only between exact vector rebuilds, and quartering its pixel count
+/// keeps cache generation bounded even for long overlapping routes.
+const RASTER_CACHE_RESOLUTION: f32 = 0.5;
 /// Side length of the square drag handles drawn on unconstrained edges.
 const HANDLE_SIZE: Pixels = px(12.);
 /// Side length of the (larger, invisible) clickable area around each handle, so
@@ -639,6 +653,7 @@ pub struct LayoutCanvas {
     // shared between SSE and dragging
     drag_start: Point<Pixels>,
     mouse_position: Point<Pixels>,
+    hover_hit: Option<SelectionHit>,
     // zoom state
     scale: f32,
     screen_bounds: Bounds<Pixels>,
@@ -648,10 +663,29 @@ pub struct LayoutCanvas {
     polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
+    raster_cache: Option<LayoutRasterCache>,
+    raster_refinement: Option<Task<()>>,
     // True if waiting on render step to finish some initialization.
     //
     // Final bounds of layout canvas only determined in paint step.
     pending_init: bool,
+}
+
+#[derive(Clone)]
+struct LayoutRasterCache {
+    image: Arc<RenderImage>,
+    texts: Arc<[TextLabel]>,
+    scope_labels: Arc<[LabeledBbox]>,
+    viewport: Size<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+struct ViewportTransform {
+    size: Size<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
 }
 
 impl IntoElement for CanvasElement {
@@ -696,6 +730,290 @@ fn get_rect_bounds(
     Bounds::new(
         Point::new(scale * px(x0), scale * px(-y1)) + offset + bounds.origin,
         Size::new(scale * px(x1 - x0), scale * px(y1 - y0)),
+    )
+}
+
+fn raster_channel(value: f32) -> f32 {
+    value.clamp(0., 1.)
+}
+
+/// Blend a GPUI color into the BGRA image format expected by `RenderImage`.
+fn blend_raster_pixel(buffer: &mut [u8], pixel: usize, color: Rgba) {
+    let source_alpha = raster_channel(color.a);
+    if source_alpha <= 0. {
+        return;
+    }
+    let index = pixel * 4;
+    let destination_alpha = buffer[index + 3] as f32 / 255.;
+    let output_alpha = source_alpha + destination_alpha * (1. - source_alpha);
+    let source = [color.b, color.g, color.r];
+    if output_alpha > 0. {
+        for channel in 0..3 {
+            let destination = buffer[index + channel] as f32 / 255.;
+            let output = (raster_channel(source[channel]) * source_alpha
+                + destination * destination_alpha * (1. - source_alpha))
+                / output_alpha;
+            buffer[index + channel] = (output * 255.).round() as u8;
+        }
+    }
+    buffer[index + 3] = (output_alpha * 255.).round() as u8;
+}
+
+fn raster_pixel_range(start: f32, stop: f32, limit: u32) -> Option<(u32, u32)> {
+    let lower = start.min(stop).floor().clamp(0., limit as f32) as u32;
+    let upper = start.max(stop).ceil().clamp(0., limit as f32) as u32;
+    (lower < upper).then_some((lower, upper))
+}
+
+fn fill_raster_rect(
+    buffer: &mut [u8],
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+    color: Rgba,
+) {
+    let Some((x0, x1)) = raster_pixel_range(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.x + bounds.size.width),
+        width,
+    ) else {
+        return;
+    };
+    let Some((y0, y1)) = raster_pixel_range(
+        f32::from(bounds.origin.y),
+        f32::from(bounds.origin.y + bounds.size.height),
+        height,
+    ) else {
+        return;
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            blend_raster_pixel(buffer, (y * width + x) as usize, color);
+        }
+    }
+}
+
+fn stroke_raster_rect(
+    buffer: &mut [u8],
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+    color: Rgba,
+) {
+    let one = px(1.);
+    fill_raster_rect(
+        buffer,
+        width,
+        height,
+        Bounds::new(bounds.origin, Size::new(bounds.size.width, one)),
+        color,
+    );
+    fill_raster_rect(
+        buffer,
+        width,
+        height,
+        Bounds::new(
+            Point::new(bounds.origin.x, bounds.origin.y + bounds.size.height - one),
+            Size::new(bounds.size.width, one),
+        ),
+        color,
+    );
+    fill_raster_rect(
+        buffer,
+        width,
+        height,
+        Bounds::new(bounds.origin, Size::new(one, bounds.size.height)),
+        color,
+    );
+    fill_raster_rect(
+        buffer,
+        width,
+        height,
+        Bounds::new(
+            Point::new(bounds.origin.x + bounds.size.width - one, bounds.origin.y),
+            Size::new(one, bounds.size.height),
+        ),
+        color,
+    );
+}
+
+fn fill_raster_polygon(
+    buffer: &mut [u8],
+    width: u32,
+    height: u32,
+    points: &[Point<f32>],
+    color: Rgba,
+) {
+    if points.len() < 3 {
+        return;
+    }
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let Some((y0, y1)) = raster_pixel_range(min_y, max_y, height) else {
+        return;
+    };
+    let mut intersections = Vec::with_capacity(points.len());
+    for y in y0..y1 {
+        intersections.clear();
+        let scan_y = y as f32 + 0.5;
+        for (start, stop) in points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+        {
+            if (start.y <= scan_y && stop.y > scan_y) || (stop.y <= scan_y && start.y > scan_y) {
+                let fraction = (scan_y - start.y) / (stop.y - start.y);
+                intersections.push(start.x + fraction * (stop.x - start.x));
+            }
+        }
+        intersections.sort_by(f32::total_cmp);
+        for pair in intersections.chunks_exact(2) {
+            let Some((x0, x1)) = raster_pixel_range(pair[0], pair[1], width) else {
+                continue;
+            };
+            for x in x0..x1 {
+                blend_raster_pixel(buffer, (y * width + x) as usize, color);
+            }
+        }
+    }
+}
+
+fn stroke_raster_line(
+    buffer: &mut [u8],
+    width: u32,
+    height: u32,
+    start: Point<f32>,
+    stop: Point<f32>,
+    color: Rgba,
+) {
+    let steps = (stop.x - start.x)
+        .abs()
+        .max((stop.y - start.y).abs())
+        .ceil() as usize;
+    for step in 0..=steps {
+        let fraction = if steps == 0 {
+            0.
+        } else {
+            step as f32 / steps as f32
+        };
+        let x = (start.x + fraction * (stop.x - start.x)).round() as i32;
+        let y = (start.y + fraction * (stop.y - start.y)).round() as i32;
+        if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
+            blend_raster_pixel(buffer, (y as u32 * width + x as u32) as usize, color);
+        }
+    }
+}
+
+fn build_layout_raster(
+    rects: &[(Rect, LayerState)],
+    polygons: &[(Polygon, LayerState)],
+    scope_rects: &[LabeledBbox],
+    texts: &[TextLabel],
+    viewport: ViewportTransform,
+    theme: &crate::theme::Theme,
+) -> Option<LayoutRasterCache> {
+    let width = (f32::from(viewport.size.width) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    let height = (f32::from(viewport.size.height) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut buffer = vec![0; width as usize * height as usize * 4];
+    let local_bounds = Bounds::new(
+        Point::default(),
+        Size::new(px(width as f32), px(height as f32)),
+    );
+    let raster_scale = viewport.scale * RASTER_CACHE_RESOLUTION;
+    let raster_offset = Point::new(
+        viewport.offset.x * RASTER_CACHE_RESOLUTION,
+        viewport.offset.y * RASTER_CACHE_RESOLUTION,
+    );
+    for (rect, layer) in rects {
+        let bounds = get_rect_bounds(rect, local_bounds, raster_scale, raster_offset);
+        fill_raster_rect(&mut buffer, width, height, bounds, layer.color);
+        stroke_raster_rect(&mut buffer, width, height, bounds, layer.border_color);
+    }
+    for (polygon, layer) in polygons {
+        let points = polygon
+            .points
+            .iter()
+            .map(|point| {
+                Point::new(
+                    raster_scale * point.x + f32::from(raster_offset.x),
+                    raster_scale * -point.y + f32::from(raster_offset.y),
+                )
+            })
+            .collect::<Vec<_>>();
+        fill_raster_polygon(&mut buffer, width, height, &points, layer.color);
+        for (start, stop) in points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+        {
+            stroke_raster_line(
+                &mut buffer,
+                width,
+                height,
+                *start,
+                *stop,
+                layer.border_color,
+            );
+        }
+    }
+    for bbox in scope_rects {
+        let bounds = get_rect_bounds(&bbox.rect, local_bounds, raster_scale, raster_offset);
+        if bbox.label.is_empty() {
+            fill_raster_rect(
+                &mut buffer,
+                width,
+                height,
+                bounds,
+                Rgba {
+                    a: 0.08,
+                    ..theme.text
+                },
+            );
+        }
+        stroke_raster_rect(&mut buffer, width, height, bounds, theme.text);
+    }
+    let image = image::RgbaImage::from_raw(width, height, buffer)?;
+    Some(LayoutRasterCache {
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+        texts: texts.to_vec().into(),
+        scope_labels: scope_rects
+            .iter()
+            .filter(|bbox| !bbox.label.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .into(),
+        viewport: viewport.size,
+        scale: viewport.scale,
+        offset: viewport.offset,
+    })
+}
+
+fn raster_bounds(
+    cache: &LayoutRasterCache,
+    bounds: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Bounds<Pixels> {
+    let ratio = scale / cache.scale;
+    Bounds::new(
+        Point::new(
+            bounds.origin.x + offset.x - cache.offset.x * ratio,
+            bounds.origin.y + offset.y - cache.offset.y * ratio,
+        ),
+        Size::new(cache.viewport.width * ratio, cache.viewport.height * ratio),
     )
 }
 
@@ -1041,6 +1359,119 @@ impl Element for CanvasElement {
         let hide_external_geometry = &inner.state.read(cx).hide_external_geometry;
         let state = inner.state.read(cx);
         let tool = state.tool.read(cx).clone();
+        if matches!(
+            &tool,
+            ToolState::Select(SelectToolState { selected_obj: None })
+        ) && let Some(cache) = inner.raster_cache.clone()
+        {
+            let theme = state.theme();
+            let bg_style = inner.bg_style.clone();
+            let scale = inner.scale;
+            let offset = inner.offset;
+            let origin_coords = inner.layout_to_px(Point::new(0., 0.));
+            let hover_hit = inner.hover_hit.clone();
+            bg_style.paint(bounds, window, cx, |window, cx| {
+                window.paint_layer(bounds, |window| {
+                    window.paint_quad(get_paint_path(
+                        Bounds::new(
+                            Point::new(origin_coords.x, bounds.origin.y),
+                            Size::new(px(0.), bounds.size.height),
+                        ),
+                        theme.axes,
+                        DEFAULT_BORDER_WIDTH,
+                    ));
+                    window.paint_quad(get_paint_path(
+                        Bounds::new(
+                            Point::new(bounds.origin.x, origin_coords.y),
+                            Size::new(bounds.size.width, px(0.)),
+                        ),
+                        theme.axes,
+                        DEFAULT_BORDER_WIDTH,
+                    ));
+                    window
+                        .paint_image(
+                            raster_bounds(&cache, bounds, scale, offset),
+                            Corners::all(px(0.)),
+                            cache.image.clone(),
+                            0,
+                            false,
+                        )
+                        .unwrap();
+                    for label in cache.texts.iter() {
+                        let font_size = px(16.);
+                        let runs = &[TextRun {
+                            len: label.text.len(),
+                            font: window.text_style().font(),
+                            color: label.layer.border_color.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }];
+                        window
+                            .text_system()
+                            .shape_line(label.text.clone(), font_size, runs, None)
+                            .paint(
+                                Point::new(
+                                    scale * px(label.position.x),
+                                    scale * px(-label.position.y),
+                                ) + offset
+                                    + bounds.origin,
+                                px(18.),
+                                window,
+                                cx,
+                            )
+                            .unwrap();
+                    }
+                    for bbox in cache.scope_labels.iter() {
+                        let font_size = px(12.);
+                        let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
+                            + Point::new(px(4.), px(2.));
+                        let runs = &[TextRun {
+                            len: bbox.label.len(),
+                            font: window.text_style().font(),
+                            color: theme.text.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }];
+                        window
+                            .text_system()
+                            .shape_line(bbox.label.clone(), font_size, runs, None)
+                            .paint(text_origin, px(14.), window, cx)
+                            .unwrap();
+                    }
+                    if let Some(hit) = hover_hit {
+                        match hit.outline {
+                            SelectionOutline::Rect {
+                                bounds,
+                                border_styles,
+                            } => window.paint_quad(get_paint_quad(
+                                bounds,
+                                ShapeFill::Solid,
+                                Rgba {
+                                    a: 0.,
+                                    ..rgb(0xffff00)
+                                },
+                                rgb(0xffff00),
+                                Edges::all(SELECT_WIDTH),
+                                border_styles,
+                            )),
+                            SelectionOutline::Polygon {
+                                points,
+                                edge_styles,
+                            } => paint_polygon_border(
+                                window,
+                                &points,
+                                &edge_styles,
+                                SELECT_WIDTH,
+                                rgb(0xffff00),
+                            ),
+                        }
+                    }
+                });
+            });
+            return;
+        }
         let layers = state.layers.read(cx);
         let mut sse_dv = None;
 
@@ -1086,28 +1517,35 @@ impl Element for CanvasElement {
                 mat,
                 ofs,
                 depth,
-                mut show,
+                show,
                 path,
             )) = queue.pop_front()
             {
                 let cell_info = &solved_cell.output.cells[&cell];
                 let scope_info = &cell_info.scopes[&scope];
                 let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
-                if depth >= state.hierarchy_depth || !scope_state.visible {
-                    if let Some(bbox) = &scope_state.bbox {
-                        let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
-                        let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
-                        let rect = Rect {
-                            x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                            y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                            x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                            y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                            id: Some(scope_info.span.clone()),
-                            object_path: Vec::new(),
-                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                            border_styles: Edges::all(BorderStyle::Solid),
-                            cvars: None,
-                        };
+                if let Some(bbox) = &scope_state.bbox {
+                    let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
+                    let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
+                    let rect = Rect {
+                        x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                        y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                        x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                        y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                        id: Some(scope_info.span.clone()),
+                        object_path: Vec::new(),
+                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                        border_styles: Edges::all(BorderStyle::Solid),
+                        cvars: None,
+                    };
+                    let pixel_bounds = get_rect_bounds(&rect, bounds, inner.scale, inner.offset);
+                    if depth > 0 && !pixel_bounds.intersects(&bounds) {
+                        continue;
+                    }
+                    let automatic_lod = depth > 0
+                        && f32::from(pixel_bounds.size.width) * f32::from(pixel_bounds.size.height)
+                            <= HIERARCHY_LOD_AREA_PX;
+                    if depth >= state.hierarchy_depth || !scope_state.visible || automatic_lod {
                         if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                             && &rect.id == selected_obj
                         {
@@ -1119,12 +1557,18 @@ impl Element for CanvasElement {
                         if show {
                             scope_rects.push(LabeledBbox {
                                 rect,
-                                label: scope_info.name.clone().into(),
+                                // Labels on automatic LOD boxes overlap heavily
+                                // and are not legible at this scale.
+                                label: if automatic_lod {
+                                    SharedString::default()
+                                } else {
+                                    scope_info.name.clone().into()
+                                },
                                 origin: None,
                             });
                         }
+                        continue;
                     }
-                    show = false;
                 }
                 for (obj, _) in &scope_info.emit {
                     let mut object_path = path.clone();
@@ -1769,14 +2213,21 @@ impl Element for CanvasElement {
                             .unwrap();
                     }
                     for bbox in &scope_rects {
+                        let automatic_lod = bbox.label.is_empty();
                         window.paint_quad(get_paint_quad(
                             get_rect_bounds(&bbox.rect, bounds, scale, offset),
                             ShapeFill::Solid,
-                            Rgba { a: 0., ..theme.text },
+                            Rgba {
+                                a: if automatic_lod { 0.08 } else { 0. },
+                                ..theme.text
+                            },
                             theme.text,
                             bbox.rect.border_widths,
                             bbox.rect.border_styles,
                         ));
+                        if automatic_lod {
+                            continue;
+                        }
                         let font_size = px(12.);
                         let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
                             + Point::new(px(4.), px(2.));
@@ -2470,14 +2921,31 @@ impl Element for CanvasElement {
                     }
                 })
             });
-        self.inner.update(cx, |inner, cx| {
+        let raster_cache = (rects.len() + polygons.len() + scope_rects.len()
+            >= RASTER_CACHE_GEOMETRY_THRESHOLD)
+            .then(|| {
+                build_layout_raster(
+                    &rects,
+                    &polygons,
+                    &scope_rects,
+                    &texts,
+                    ViewportTransform {
+                        size: bounds.size,
+                        scale,
+                        offset,
+                    },
+                    theme,
+                )
+            })
+            .flatten();
+        self.inner.update(cx, |inner, _cx| {
+            inner.raster_cache = raster_cache;
             inner.rects = rects;
             inner.polygons = polygons;
             inner.scope_rects = scope_rects;
             inner.dim_hitboxes = dim_hitboxes;
             inner.sse_handles = sse_handles;
             inner.sse_bodies = sse_bodies;
-            cx.notify();
         });
     }
 }
@@ -2555,14 +3023,20 @@ impl LayoutCanvas {
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
+            hover_hit: None,
             scale: 1.0,
             screen_bounds: Bounds::default(),
-            subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
+            subscriptions: vec![cx.observe(state, |canvas, _, cx| {
+                canvas.raster_cache = None;
+                cx.notify();
+            })],
             state: state.clone(),
             rects: Vec::new(),
             polygons: Vec::new(),
             scope_rects: Vec::new(),
             dim_hitboxes: Vec::new(),
+            raster_cache: None,
+            raster_refinement: None,
             pending_init: true,
         }
     }
@@ -3628,8 +4102,12 @@ impl LayoutCanvas {
         self.mouse_position = event.position;
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
+            self.hover_hit = None;
         } else if self.is_sse_dragging {
             self.sse_delta = self.mouse_position - self.drag_start;
+            self.hover_hit = None;
+        } else {
+            self.hover_hit = self.selection_hits_at(event.position).into_iter().next();
         }
         cx.notify();
     }
@@ -3638,12 +4116,16 @@ impl LayoutCanvas {
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        let was_dragging = self.is_dragging;
         self.is_dragging = false;
         self.is_sse_dragging = false;
         self.sse_delta = Point::default();
         self.sse_targets.clear();
+        if was_dragging && self.raster_cache.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// Computes replacements for existing fallbacks plus AST-aware requests to
@@ -3762,6 +4244,17 @@ impl LayoutCanvas {
             + event.position;
         self.offset = b1 - self.screen_bounds.origin;
         self.scale = new_scale;
+        self.hover_hit = None;
+
+        // Keep transforming the retained overview while wheel events arrive,
+        // then rebuild it once at the settled viewport for crisp detail.
+        self.raster_refinement = Some(cx.spawn(async move |canvas, cx| {
+            Timer::after(Duration::from_millis(150)).await;
+            let _ = canvas.update(cx, |canvas, cx| {
+                canvas.raster_cache = None;
+                cx.notify();
+            });
+        }));
 
         cx.notify();
     }
@@ -3817,6 +4310,30 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raster_pixel_ranges_are_clipped_to_the_viewport() {
+        assert_eq!(raster_pixel_range(-2.5, 2.2, 10), Some((0, 3)));
+        assert_eq!(raster_pixel_range(8.1, 12., 10), Some((8, 10)));
+        assert_eq!(raster_pixel_range(12., 14., 10), None);
+        assert_eq!(raster_pixel_range(4., 4., 10), None);
+    }
+
+    #[test]
+    fn raster_pixels_use_bgra_channel_order() {
+        let mut pixel = [0; 4];
+        blend_raster_pixel(
+            &mut pixel,
+            0,
+            Rgba {
+                r: 1.,
+                g: 0.5,
+                b: 0.,
+                a: 1.,
+            },
+        );
+        assert_eq!(pixel, [0, 128, 255, 255]);
+    }
 
     fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
         (
