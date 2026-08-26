@@ -2547,7 +2547,7 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
-    rowspace_vecs: Vec<Vec<(f64, Var)>>,
+    sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
@@ -2871,7 +2871,7 @@ impl<'a> ExecPass<'a> {
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
-                        rowspace_vecs: Vec::new(),
+                        sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
@@ -2960,7 +2960,10 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
                     state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
-                    state.rowspace_vecs = state.solver.rowspace_vecs();
+                    state.sse_basis = match state.solver.sparse_nullspace_vecs() {
+                        Some(vectors) => SseBasis::Nullspace(vectors),
+                        None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+                    };
                     self.errors.push(ExecError {
                         span: None,
                         cell: cell_id,
@@ -3196,7 +3199,7 @@ impl<'a> ExecPass<'a> {
                     scopes,
                     root,
                     fields,
-                    rowspace_vecs: Vec::new(),
+                    sse_basis: SseBasis::Nullspace(Vec::new()),
                     objects,
                     fallback_constraints_used: Vec::new(),
                     unsolved_vars: IndexSet::new(),
@@ -3358,7 +3361,7 @@ impl<'a> ExecPass<'a> {
             scopes: IndexMap::new(),
             root: state.root_scope,
             fields: IndexMap::new(),
-            rowspace_vecs: state.rowspace_vecs.clone(),
+            sse_basis: state.sse_basis.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
             inconsistent_constraints: state.solver.inconsistent_constraints().clone(),
@@ -5806,11 +5809,21 @@ pub enum RectInitialCondition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SseBasis {
+    /// An orthonormal constraint row-space basis. SSE obtains allowed motion
+    /// by subtracting the projection onto these vectors.
+    Rowspace(Vec<Vec<(f64, Var)>>),
+    /// An orthonormal constraint null-space basis. SSE projects allowed motion
+    /// directly onto these vectors.
+    Nullspace(Vec<Vec<(f64, Var)>>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCell {
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
     pub fields: IndexMap<String, Arrayed<ObjectId>>,
-    pub rowspace_vecs: Vec<Vec<(f64, Var)>>,
+    pub sse_basis: SseBasis,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<UsedFallback>,
     pub unsolved_vars: IndexSet<Var>,

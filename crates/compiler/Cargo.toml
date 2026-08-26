@@ -8,6 +8,7 @@ autobins = false
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.35", features = ["sparse"] }
+sparse-linear-solver = { path = "../sparse-linear-solver" }
 klayout-lyp = "0.1"
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 anyhow = { workspace = true }
