@@ -241,6 +241,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon-tests"
+version = "0.1.0"
+dependencies = [
+ "argon-analyzer",
+ "argonc",
+ "futures",
+ "tarpc",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "argonc"
 version = "0.1.0"
 dependencies = [
