@@ -1,0 +1,14 @@
+[package]
+name = "argon-tests"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[dependencies]
+analyzer = { package = "argon-analyzer", path = "../analyzer" }
+argonc = { path = "../compiler" }
+futures = { workspace = true }
+tarpc = { workspace = true }
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["full"] }

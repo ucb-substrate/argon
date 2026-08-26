@@ -18,6 +18,8 @@
 ---
 ---Override the `argon-analyzer` executable discovered on PATH.
 ---@field analyzer? string
+---Override the complete LSP transport. See |vim.lsp.ClientConfig.cmd|.
+---@field cmd? string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
 
 local config = {}
 
@@ -41,6 +43,10 @@ local Config = {
     --- Defaults to the `argon-analyzer` executable discovered on PATH.
     ---@type string
     analyzer = exepath_or_binary('argon-analyzer'),
+    --- Defaults to launching `analyzer`. A function can connect to an existing
+    --- analyzer transport, for example with |vim.lsp.rpc.connect()|.
+    ---@type nil | string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
+    cmd = nil,
     log = {
         --- Log level following [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
         --- Defaults to `nil`.

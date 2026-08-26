@@ -75,7 +75,7 @@ end
 ---@param bufnr? number The buffer number (optional), defaults to the current buffer
 M.start = function(bufnr)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
-    if vim.fn.executable(config.analyzer) ~= 1 then
+    if not config.cmd and vim.fn.executable(config.analyzer) ~= 1 then
         vim.notify(
           'argon: Could not find argon-analyzer. Install it with Cargo or configure vim.g.argon.analyzer.',
           vim.log.levels.ERROR
@@ -94,14 +94,17 @@ M.start = function(bufnr)
     if config.log.level then
         cmd_env.ARGON_LOG = config.log.level
     end
-    local analyzer_cmd = { config.analyzer }
-    if vim.g.argon_analyzer_rpc_port then
+    local analyzer_cmd = config.cmd or { config.analyzer }
+    if type(analyzer_cmd) == 'table' then
+      analyzer_cmd = vim.deepcopy(analyzer_cmd)
+    end
+    if type(analyzer_cmd) == 'table' and vim.g.argon_analyzer_rpc_port then
         vim.list_extend(analyzer_cmd, {
             '--rpc-port',
             tostring(vim.g.argon_analyzer_rpc_port),
         })
     end
-    if vim.g.argon_analyzer_relay then
+    if type(analyzer_cmd) == 'table' and vim.g.argon_analyzer_relay then
         vim.list_extend(analyzer_cmd, {
             '--relay-socket',
             tostring(vim.g.argon_analyzer_relay),
