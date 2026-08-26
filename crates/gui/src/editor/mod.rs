@@ -190,6 +190,31 @@ impl EditorState {
                         );
                     }
                 }
+                SolvedValue::Path(path) => {
+                    bbox = bbox_union(bbox, path.bbox());
+                    let layer = SharedString::from(&path.layer);
+                    if let Some(layer_info) = state.layers.get_mut(&layer) {
+                        layer_info.used = true;
+                    } else {
+                        let mut s = DefaultHasher::new();
+                        layer.hash(&mut s);
+                        let hash = s.finish() as usize;
+                        let color =
+                            rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+                        state.layers.insert(
+                            layer.clone(),
+                            LayerState {
+                                name: layer,
+                                color,
+                                fill: ShapeFill::Stippling,
+                                border_color: color,
+                                visible: true,
+                                used: true,
+                                z: state.layers.len(),
+                            },
+                        );
+                    }
+                }
                 SolvedValue::Instance(inst) => {
                     let inst_address = ScopeAddress {
                         scope: solved_cell.cells[&inst.cell].root,
