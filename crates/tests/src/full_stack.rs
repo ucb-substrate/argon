@@ -2,7 +2,10 @@
 
 use std::{net::Ipv4Addr, path::PathBuf};
 
-use analyzer::rpc::{Gui, InstancePreview, LangServerClient};
+use analyzer::{
+    ArgonConfig,
+    rpc::{CompilationSnapshot, Gui, InstancePreview, LangServerClient},
+};
 use argonc::{
     ast::Span,
     compile::{CompileOutput, CompiledData},
@@ -24,8 +27,14 @@ pub enum OutputKind {
 #[derive(Debug)]
 pub enum GuiEvent {
     OpenCell {
+        revision: u64,
         kind: OutputKind,
-        update: bool,
+        scope: Option<Span>,
+        rect_count: usize,
+    },
+    UpdateCell {
+        revision: u64,
+        kind: OutputKind,
         scope: Option<Span>,
         rect_count: usize,
     },
@@ -38,18 +47,24 @@ struct HeadlessGui {
 }
 
 impl Gui for HeadlessGui {
-    async fn open_cell(self, _: context::Context, output: CompileOutput, update: bool) {
-        let (kind, data) = match &output {
-            CompileOutput::Valid(data) => (OutputKind::Data, Some(data)),
-            CompileOutput::ExecErrors(output) => (OutputKind::Data, output.output.as_ref()),
-            CompileOutput::StaticErrors(_) => (OutputKind::StaticErrors, None),
-            CompileOutput::FatalParseErrors => (OutputKind::FatalParseErrors, None),
-        };
-        let (scope, rect_count) = data.map(gui_snapshot).unwrap_or((None, 0));
+    async fn open_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
+        let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
         self.events
             .send(GuiEvent::OpenCell {
+                revision: snapshot.revision,
                 kind,
-                update,
+                scope,
+                rect_count,
+            })
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
+        let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
+        self.events
+            .send(GuiEvent::UpdateCell {
+                revision: snapshot.revision,
+                kind,
                 scope,
                 rect_count,
             })
@@ -68,9 +83,20 @@ impl Gui for HeadlessGui {
 
     async fn place_instance(self, _: context::Context, _: InstancePreview) {}
 
-    async fn set(self, _: context::Context, _: String, _: String) {}
+    async fn configure(self, _: context::Context, _: ArgonConfig) {}
 
     async fn activate(self, _: context::Context) {}
+}
+
+fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize) {
+    let (kind, data) = match output {
+        CompileOutput::Valid(data) => (OutputKind::Data, Some(data)),
+        CompileOutput::ExecErrors(output) => (OutputKind::Data, output.output.as_ref()),
+        CompileOutput::StaticErrors(_) => (OutputKind::StaticErrors, None),
+        CompileOutput::FatalParseErrors => (OutputKind::FatalParseErrors, None),
+    };
+    let (scope, rect_count) = data.map(gui_snapshot).unwrap_or((None, 0));
+    (kind, scope, rect_count)
 }
 
 fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize) {
@@ -278,11 +304,12 @@ mod tests {
             let mut drew_rect = false;
             let mut saw_editor_update = false;
             let mut saw_workspace_modified = false;
+            let mut opened_revision = None;
             while !(saw_editor_update && saw_workspace_modified) {
                 match session.next_event().await {
                     GuiEvent::OpenCell {
+                        revision,
                         kind: OutputKind::Data,
-                        update,
                         scope,
                         rect_count,
                     } if !drew_rect => {
@@ -304,22 +331,22 @@ mod tests {
                             .await
                             .expect("GUI draw request should reach analyzer");
                         assert!(inserted.is_some(), "GUI draw should edit the source buffer");
-                        assert!(!update);
                         assert_eq!(rect_count, 0);
+                        opened_revision = Some(revision);
                         drew_rect = true;
                     }
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
+                        revision,
                         kind: OutputKind::Data,
-                        update: true,
                         rect_count: 1,
                         ..
                     } => {
+                        assert!(Some(revision) > opened_revision);
                         std::fs::write(&session.gui_edit_ack, "ok\n")
                             .expect("acknowledge compiled GUI edit");
                     }
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         kind: OutputKind::Data,
-                        update: true,
                         rect_count,
                         ..
                     } if rect_count >= 2 => saw_editor_update = true,
@@ -364,7 +391,7 @@ mod tests {
                         std::fs::write(&session.diagnostic_ack, "ok\n")
                             .expect("acknowledge GUI diagnostics");
                     }
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         kind: OutputKind::Data,
                         ..
                     } if saw_errors => saw_recovery = true,

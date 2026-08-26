@@ -24,10 +24,8 @@ function M.instantiate(cell)
     end
 end
 
-function M.set(kv)
-    client.buf_request(0, "custom/set", {
-        kv = kv
-    }, client.print_error)
+function M.reload_config()
+    client.buf_request(0, "custom/reloadConfig", nil, client.print_error)
 end
 
 return M

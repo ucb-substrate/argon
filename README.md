@@ -241,13 +241,26 @@ The analyzer and Argone write to one shared log at
 written to `$XDG_STATE_HOME/argon/argon.log` instead. While the analyzer is
 running, open it with `:Argon log`.
 
-Configure the log level in `~/.config/argon/config.toml` (or
+Configure analyzer, GUI, and logging behavior in `~/.config/argon/config.toml` (or
 `$XDG_CONFIG_HOME/argon/config.toml`):
 
 ```toml
+[analyzer]
+# Delay after an editor change; use 0 to disable debouncing.
+compile_debounce_ms = 150
+
+[gui]
+dark_mode = true
+# Omit hierarchy_depth for unlimited hierarchy rendering.
+# hierarchy_depth = 2
+
 [log]
 level = "debug"
 ```
+
+After editing the file, run `:Argon reload` to apply analyzer and GUI settings
+without restarting Neovim. The Neovim `vim.g.argon` table is reserved for
+bootstrapping the analyzer executable or a custom LSP transport.
 
 The level follows [`RUST_LOG` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables).
 It defaults to `error`; `warn` or `error` is recommended unless you are

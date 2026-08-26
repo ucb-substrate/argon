@@ -29,9 +29,9 @@ local argon_command_tbl = {
       gui.instantiate(table.concat(args, " "))
     end,
   },
-  set = {
-    impl = function(args, opts)
-      gui.set(table.concat(args, " "))
+  reload = {
+    impl = function()
+      gui.reload_config()
     end,
   },
   diagnostics = {

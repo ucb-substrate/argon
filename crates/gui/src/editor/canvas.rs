@@ -5,8 +5,8 @@ use std::{
 };
 
 use analyzer::rpc::{
-    DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, ValueEdit,
+    CompilationSnapshot, DimensionParams, DrawSegmentConstraint, InitialConditionEdit,
+    InstancePreview, PathParams, PolygonParams, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -816,7 +816,8 @@ pub struct LayoutCanvas {
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
     pending_sse_values: Vec<PendingSseValue>,
-    deferred_compile_output: Option<(compile::CompileOutput, bool)>,
+    deferred_snapshot: Option<CompilationSnapshot>,
+    sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
@@ -1060,6 +1061,10 @@ fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseV
                         && (-fallback.constraint.constant - expected.value).abs() < 1e-8
                 })
         })
+}
+
+fn snapshot_follows_revision(snapshot_revision: u64, revision: Option<u64>) -> bool {
+    revision.is_none_or(|revision| snapshot_revision > revision)
 }
 
 fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>) -> f64 {
@@ -3030,7 +3035,8 @@ impl LayoutCanvas {
             is_sse_dragging: false,
             is_sse_persisting: false,
             pending_sse_values: Vec::new(),
-            deferred_compile_output: None,
+            deferred_snapshot: None,
+            sse_persist_after_revision: None,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
             sse_handles: Vec::new(),
@@ -3069,14 +3075,12 @@ impl LayoutCanvas {
         self.is_sse_dragging
     }
 
-    pub(crate) fn defer_compile_output(&mut self, output: compile::CompileOutput, update: bool) {
-        self.deferred_compile_output = Some((output, update));
+    pub(crate) fn defer_snapshot(&mut self, snapshot: CompilationSnapshot) {
+        self.deferred_snapshot = Some(snapshot);
     }
 
-    pub(crate) fn take_deferred_compile_output(
-        &mut self,
-    ) -> Option<(compile::CompileOutput, bool)> {
-        self.deferred_compile_output.take()
+    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<CompilationSnapshot> {
+        self.deferred_snapshot.take()
     }
 
     fn sse_drag_delta_for_targets(
@@ -3914,7 +3918,8 @@ impl LayoutCanvas {
                     if let Some(handle) = handle {
                         self.is_sse_persisting = false;
                         self.pending_sse_values.clear();
-                        self.deferred_compile_output = None;
+                        self.deferred_snapshot = None;
+                        self.sse_persist_after_revision = None;
                         self.is_sse_dragging = true;
                         self.drag_start = event.position;
                         self.sse_delta = Point::default();
@@ -3940,7 +3945,8 @@ impl LayoutCanvas {
                             {
                                 self.is_sse_persisting = false;
                                 self.pending_sse_values.clear();
-                                self.deferred_compile_output = None;
+                                self.deferred_snapshot = None;
+                                self.sse_persist_after_revision = None;
                                 self.is_sse_dragging = true;
                                 self.drag_start = event.position;
                                 self.sse_delta = Point::default();
@@ -4344,9 +4350,10 @@ impl LayoutCanvas {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
                         self.pending_sse_values = pending_sse_values(&applied_edits);
+                        self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
                         // Anything deferred before the workspace edit was
                         // accepted belongs to the pre-drag source revision.
-                        self.deferred_compile_output = None;
+                        self.deferred_snapshot = None;
                         let selected_after_edits = {
                             let tool = self.state.read(cx).tool.read(cx);
                             match tool {
@@ -4369,12 +4376,14 @@ impl LayoutCanvas {
                     Ok(None) => {
                         self.is_sse_dragging = false;
                         self.pending_sse_values.clear();
+                        self.sse_persist_after_revision = None;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
                     Err(_) => {
                         self.is_sse_dragging = false;
                         self.pending_sse_values.clear();
+                        self.sse_persist_after_revision = None;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
@@ -4386,11 +4395,14 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
-    pub(crate) fn accepts_compile_output(&self, output: &compile::CompileOutput) -> bool {
+    pub(crate) fn accepts_snapshot(&self, snapshot: &CompilationSnapshot) -> bool {
         if !self.is_sse_persisting {
             return true;
         }
-        let data = match output {
+        if !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision) {
+            return false;
+        }
+        let data = match &snapshot.output {
             compile::CompileOutput::Valid(data) => Some(data),
             compile::CompileOutput::ExecErrors(output) => output.output.as_ref(),
             compile::CompileOutput::StaticErrors(_) | compile::CompileOutput::FatalParseErrors => {
@@ -4407,6 +4419,7 @@ impl LayoutCanvas {
         if self.is_sse_persisting {
             self.is_sse_persisting = false;
             self.pending_sse_values.clear();
+            self.sse_persist_after_revision = None;
             self.sse_delta = Point::default();
             self.sse_targets.clear();
             cx.notify();
@@ -5048,6 +5061,14 @@ mod tests {
         assert!(compiled_data_matches_pending_sse(&output, &pending));
         pending[0].value += 1.;
         assert!(!compiled_data_matches_pending_sse(&output, &pending));
+    }
+
+    #[test]
+    fn drag_preview_only_accepts_a_newer_compilation_revision() {
+        assert!(snapshot_follows_revision(4, None));
+        assert!(!snapshot_follows_revision(3, Some(3)));
+        assert!(!snapshot_follows_revision(2, Some(3)));
+        assert!(snapshot_follows_revision(4, Some(3)));
     }
 
     #[test]

@@ -8,6 +8,9 @@ pub mod layer;
 pub mod parse;
 mod parser;
 pub mod solver;
+pub mod workspace;
+
+pub use workspace::WorkspaceConfig;
 
 /// A global allocator that tracks live and peak heap usage so that the scaling
 /// benchmarks in the test module can report memory consumption alongside

@@ -8,13 +8,13 @@ use argonc::{
 };
 
 use serde::{Deserialize, Serialize};
-use tarpc::tokio_serde::formats::Json;
+use tarpc::{context, tokio_serde::formats::Json};
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
     Uri, WorkspaceEdit,
 };
 
-use crate::{Redo, Save, State, StateMut, Undo, document::Document};
+use crate::{ArgonConfig, Redo, Save, State, StateMut, Undo, document::Document};
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
 /// persist solution-space-exploration drags by updating initial-condition
@@ -80,6 +80,14 @@ pub struct InstancePreview {
     pub scope_span: Span,
 }
 
+/// A compiled GUI result tied to the exact analyzer source revision that
+/// produced it. Diagnostics continue to travel over LSP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationSnapshot {
+    pub revision: u64,
+    pub output: CompileOutput,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LangServerAction {
     Save,
@@ -114,11 +122,12 @@ pub trait LangServer {
 
 #[tarpc::service]
 pub trait Gui {
-    async fn open_cell(cell: CompileOutput, update: bool);
+    async fn open_cell(snapshot: CompilationSnapshot);
+    async fn update_cell(snapshot: CompilationSnapshot);
     async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
     async fn place_instance(preview: InstancePreview);
-    async fn set(key: String, value: String);
+    async fn configure(config: ArgonConfig);
     async fn activate();
 }
 
@@ -390,19 +399,36 @@ impl LangServer for State {
             state_mut.gui_client = Some(gui_client.clone());
             state_mut.workspace_modified
         };
+        if let Err(error) = gui_client
+            .configure(context::current(), self.config())
+            .await
+        {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not configure the GUI: {error}"),
+                )
+                .await;
+            self.state_mut.lock().await.gui_client = None;
+            return;
+        }
         self.publish_workspace_modified(modified, Some(gui_client))
             .await;
         let mut state_mut = self.state_mut.lock().await;
         let revision = state_mut.incremental_compiler.revision();
         self.requested_revision
             .store(revision, std::sync::atomic::Ordering::Release);
-        state_mut
+        let snapshot = state_mut
             .compile(
                 &self.editor_client,
-                false,
                 Some((&self.requested_revision, revision)),
             )
             .await;
+        if let Some(snapshot) = snapshot {
+            state_mut
+                .open_cell_snapshot(&self.editor_client, snapshot)
+                .await;
+        }
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
@@ -904,13 +930,17 @@ impl LangServer for State {
             let revision = state_mut.incremental_compiler.revision();
             self.requested_revision
                 .store(revision, std::sync::atomic::Ordering::Release);
-            state_mut
+            let snapshot = state_mut
                 .compile(
                     &self.editor_client,
-                    false,
                     Some((&self.requested_revision, revision)),
                 )
                 .await;
+            if let Some(snapshot) = snapshot {
+                state_mut
+                    .open_cell_snapshot(&self.editor_client, snapshot)
+                    .await;
+            }
         });
     }
 
@@ -952,7 +982,7 @@ impl LangServer for State {
 
 #[cfg(test)]
 mod tests {
-    use argonc::parse;
+    use argonc::{WorkspaceConfig, parse};
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
@@ -968,12 +998,9 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         let source = "cell top() {}\n";
         std::fs::write(&source_path, source).unwrap();
-        let ast = parse::parse_workspace_with_std_deps_and_gds(
-            &source_path,
-            std::iter::empty(),
-            [("ring_osc".to_owned(), directory.path().join("ring_osc.gds"))],
-        )
-        .ast();
+        let config = WorkspaceConfig::new(&source_path)
+            .with_gds_imports([("ring_osc".to_owned(), directory.path().join("ring_osc.gds"))]);
+        let ast = parse::parse_workspace_with_config(&config).ast();
         let uri = Uri::from_file_path(&source_path).unwrap();
         let mut state = StateMut {
             ast,

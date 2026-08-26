@@ -19,6 +19,7 @@ use crate::{
         self, CellArg, CompileInput, CompileOutput, StaticAnalysis, StaticErrorCompileOutput,
     },
     parse,
+    workspace::WorkspaceConfig,
 };
 
 type FileRevision = (u64, u32, u64);
@@ -156,13 +157,8 @@ impl IncrementalCompiler {
         self.revision
     }
 
-    pub fn analyze_workspace(
-        &mut self,
-        root_lib: &Path,
-        dependencies: &[(String, PathBuf)],
-        gds_imports: &[(String, PathBuf)],
-    ) -> StaticAnalysis {
-        self.ensure_analysis(root_lib, dependencies, gds_imports);
+    pub fn analyze_workspace(&mut self, config: &WorkspaceConfig) -> StaticAnalysis {
+        self.ensure_analysis(config);
         self.static_cache
             .as_ref()
             .expect("analysis cache was populated")
@@ -170,17 +166,11 @@ impl IncrementalCompiler {
             .clone()
     }
 
-    fn ensure_analysis(
-        &mut self,
-        root_lib: &Path,
-        dependencies: &[(String, PathBuf)],
-        gds_imports: &[(String, PathBuf)],
-    ) {
-        let key = self.static_key(root_lib, dependencies, gds_imports);
+    fn ensure_analysis(&mut self, config: &WorkspaceConfig) {
+        let key = self.static_key(config);
         if let Some(cache) = &self.static_cache
             && cache.key == key
-            && cache.disk_revisions
-                == self.tracked_file_revisions(root_lib, dependencies, &cache.analysis)
+            && cache.disk_revisions == self.tracked_file_revisions(config, &cache.analysis)
         {
             self.stats.static_cache_hits += 1;
             return;
@@ -191,16 +181,14 @@ impl IncrementalCompiler {
         let parse_hits = self.parse_cache.hits();
         let parse_misses = self.parse_cache.misses();
         let analysis =
-            compile::analyze_workspace(parse::parse_workspace_with_std_deps_gds_sources_and_cache(
-                root_lib,
-                dependencies.iter().cloned(),
-                gds_imports.iter().cloned(),
+            compile::analyze_workspace(parse::parse_workspace_with_config_sources_and_cache(
+                config,
                 &self.sources,
                 &mut self.parse_cache,
             ));
         self.stats.parse_cache_hits += self.parse_cache.hits() - parse_hits;
         self.stats.files_reparsed += self.parse_cache.misses() - parse_misses;
-        let disk_revisions = self.tracked_file_revisions(root_lib, dependencies, &analysis);
+        let disk_revisions = self.tracked_file_revisions(config, &analysis);
         self.static_cache = Some(StaticCache {
             key,
             disk_revisions,
@@ -212,14 +200,12 @@ impl IncrementalCompiler {
     /// repeated requests in the same source revision.
     pub fn compile_cell(
         &mut self,
-        root_lib: &Path,
-        dependencies: &[(String, PathBuf)],
-        gds_imports: &[(String, PathBuf)],
+        config: &WorkspaceConfig,
         cell: &[String],
         args: Vec<CellArg>,
         lyp_file: &Path,
     ) -> CompileOutput {
-        self.ensure_analysis(root_lib, dependencies, gds_imports);
+        self.ensure_analysis(config);
         let analysis = &self
             .static_cache
             .as_ref()
@@ -235,13 +221,12 @@ impl IncrementalCompiler {
         };
 
         let mut hasher = DefaultHasher::new();
-        let environment = execution_environment_key(lyp_file, gds_imports);
+        let environment = execution_environment_key(lyp_file, &config.gds_imports);
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
             self.execution_environment = Some(environment);
         }
-        self.static_key(root_lib, dependencies, gds_imports)
-            .hash(&mut hasher);
+        self.static_key(config).hash(&mut hasher);
         cell.hash(&mut hasher);
         hash_cell_args(&args, &mut hasher);
         environment.hash(&mut hasher);
@@ -253,14 +238,14 @@ impl IncrementalCompiler {
 
         self.stats.execution_cache_misses += 1;
         let cell_refs = cell.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = compile::dynamic_compile_with_gds(
+        let output = compile::dynamic_compile_with_config(
             ast,
             CompileInput {
                 cell: &cell_refs,
                 args,
                 lyp_file,
             },
-            gds_imports,
+            config,
         );
         self.execution_cache.insert(key, output.clone());
         output
@@ -274,24 +259,16 @@ impl IncrementalCompiler {
         self.execution_environment = None;
     }
 
-    fn static_key(
-        &self,
-        root_lib: &Path,
-        dependencies: &[(String, PathBuf)],
-        gds_imports: &[(String, PathBuf)],
-    ) -> u64 {
+    fn static_key(&self, config: &WorkspaceConfig) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.revision.hash(&mut hasher);
-        root_lib.hash(&mut hasher);
-        dependencies.hash(&mut hasher);
-        gds_imports.hash(&mut hasher);
+        config.hash(&mut hasher);
         hasher.finish()
     }
 
     fn tracked_file_revisions(
         &self,
-        root_lib: &Path,
-        dependencies: &[(String, PathBuf)],
+        config: &WorkspaceConfig,
         analysis: &StaticAnalysis,
     ) -> Vec<TrackedFileRevision> {
         let mut files = analysis
@@ -300,11 +277,11 @@ impl IncrementalCompiler {
             .map(|ast| ast.path.clone())
             .filter(|path| path.extension().is_some_and(|extension| extension == "ar"))
             .collect::<Vec<_>>();
-        files.push(root_lib.to_path_buf());
-        if let Some(parent) = root_lib.parent() {
+        files.push(config.root_lib.clone());
+        if let Some(parent) = config.root_lib.parent() {
             files.push(parent.join("Argon.toml"));
         }
-        for (_, path) in dependencies {
+        for (_, path) in &config.dependencies {
             if path.is_dir() {
                 files.push(path.join("lib.ar"));
                 files.push(path.join("Argon.toml"));
@@ -408,15 +385,16 @@ mod tests {
         let root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/immediate/lib.ar");
         let disk_source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), "cell unsaved() {");
 
-        let first = compiler.analyze_workspace(&root, &[], &[]);
+        let first = compiler.analyze_workspace(&config);
         assert!(!first.errors.is_empty());
         assert_eq!(std::fs::read_to_string(&root).unwrap(), disk_source);
         assert_eq!(compiler.stats().static_cache_misses, 1);
 
-        let second = compiler.analyze_workspace(&root, &[], &[]);
+        let second = compiler.analyze_workspace(&config);
         assert!(!second.errors.is_empty());
         assert_eq!(compiler.stats().static_cache_hits, 1);
     }
@@ -426,14 +404,15 @@ mod tests {
         let root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/argon_library/lib.ar");
         let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), source.clone());
-        let first = compiler.analyze_workspace(&root, &[], &[]);
+        let first = compiler.analyze_workspace(&config);
         assert!(first.errors.is_empty(), "{:?}", first.errors);
         let initial = compiler.stats();
 
         compiler.set_source_text(root.clone(), format!("// editor comment\n{source}"));
-        let second = compiler.analyze_workspace(&root, &[], &[]);
+        let second = compiler.analyze_workspace(&config);
         assert!(second.errors.is_empty(), "{:?}", second.errors);
         let edited = compiler.stats();
 
@@ -446,15 +425,16 @@ mod tests {
         let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
         let root = examples.join("immediate/lib.ar");
         let lyp = examples.join("lyp/basic.lyp");
+        let config = WorkspaceConfig::new(&root);
         let mut compiler = IncrementalCompiler::new();
         let cell = vec!["immediate".to_owned()];
 
-        let first = compiler.compile_cell(&root, &[], &[], &cell, Vec::new(), &lyp);
+        let first = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
         assert!(matches!(
             first,
             CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
         ));
-        let second = compiler.compile_cell(&root, &[], &[], &cell, Vec::new(), &lyp);
+        let second = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
         assert!(matches!(
             second,
             CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
@@ -470,19 +450,16 @@ mod tests {
         let lyp = examples.join("lyp/basic.lyp");
         let source = "cell immediate() {\n  let x0 = 31;\n  let y0 = 2;\n}\n";
         let cell = vec!["immediate".to_owned()];
+        let config = WorkspaceConfig::new(&root);
 
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), source);
-        let incremental = compiler.compile_cell(&root, &[], &[], &cell, Vec::new(), &lyp);
+        let incremental = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
 
         let sources = IndexMap::from([(root.clone(), ArcStr::from(source))]);
-        let analysis =
-            compile::analyze_workspace(parse::parse_workspace_with_std_deps_gds_and_sources(
-                &root,
-                std::iter::empty(),
-                std::iter::empty(),
-                &sources,
-            ));
+        let analysis = compile::analyze_workspace(parse::parse_workspace_with_config_and_sources(
+            &config, &sources,
+        ));
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         let typed = analysis.typed_ast.unwrap();
         let fresh = compile::dynamic_compile(
@@ -508,19 +485,20 @@ mod tests {
         let lyp = examples.join("lyp/basic.lyp");
         let source = std::fs::read_to_string(&root).unwrap();
         let cell = vec!["immediate".to_owned()];
+        let config = WorkspaceConfig::new(&root);
         let retained_before = crate::bench_alloc::live();
         let mut compiler = IncrementalCompiler::new();
 
         let start = std::time::Instant::now();
-        let _ = compiler.compile_cell(&root, &[], &[], &cell, Vec::new(), &lyp);
+        let _ = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
         let cold = start.elapsed();
         let start = std::time::Instant::now();
-        let _ = compiler.compile_cell(&root, &[], &[], &cell, Vec::new(), &lyp);
+        let _ = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
         let warm = start.elapsed();
 
         compiler.set_source_text(root.clone(), format!("{source}\n// isolated edit\n"));
         let start = std::time::Instant::now();
-        let _ = compiler.compile_cell(&root, &[], &[], &cell, Vec::new(), &lyp);
+        let _ = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
         let edited = start.elapsed();
         let retained = crate::bench_alloc::live().saturating_sub(retained_before);
         eprintln!(

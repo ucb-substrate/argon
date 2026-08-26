@@ -18,7 +18,6 @@
 ---
 ---Override the `argon-analyzer` executable discovered on PATH.
 ---@field analyzer? string
----@field compile_debounce_ms? number Delay before compiling editor changes; use 0 to disable.
 ---Override the complete LSP transport. See |vim.lsp.ClientConfig.cmd|.
 ---@field cmd? string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
 
@@ -44,7 +43,6 @@ local Config = {
     --- Defaults to the `argon-analyzer` executable discovered on PATH.
     ---@type string
     analyzer = exepath_or_binary('argon-analyzer'),
-    compile_debounce_ms = 150,
     --- Defaults to launching `analyzer`. A function can connect to an existing
     --- analyzer transport, for example with |vim.lsp.rpc.connect()|.
     ---@type nil | string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient

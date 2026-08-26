@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -17,6 +17,7 @@ use std::{
 
 use arc::Library;
 use argonc::{
+    WorkspaceConfig,
     ast::{Span, WorkspaceAst},
     compile::{
         self, Arrayed, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
@@ -27,7 +28,7 @@ use argonc::{
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
-use rpc::{GuiClient, InstancePreview, LangServer, insert_statement};
+use rpc::{CompilationSnapshot, GuiClient, InstancePreview, LangServer, insert_statement};
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Json};
 use tokio::{
@@ -39,23 +40,59 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{request::Request, *};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
+};
 
 use crate::document::{Document, DocumentChange};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
+static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct ArgonConfig {
-    log: LogConfig,
+pub struct ArgonConfig {
+    pub analyzer: AnalyzerConfig,
+    pub gui: GuiConfig,
+    pub log: LogConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct LogConfig {
-    level: String,
+pub struct AnalyzerConfig {
+    pub compile_debounce_ms: u64,
+}
+
+impl Default for AnalyzerConfig {
+    fn default() -> Self {
+        Self {
+            compile_debounce_ms: 150,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuiConfig {
+    pub dark_mode: bool,
+    /// Maximum rendered hierarchy depth. Omitted means unlimited.
+    pub hierarchy_depth: Option<usize>,
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        Self {
+            dark_mode: true,
+            hierarchy_depth: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    pub level: String,
 }
 
 impl Default for LogConfig {
@@ -138,11 +175,23 @@ pub fn init_logging() {
         );
         return;
     }
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(tracing_appender::rolling::never(log_dir, LOG_FILE))
-        .with_ansi(false)
-        .try_init();
+    let (filter, reload_handle) = reload::Layer::new(filter);
+    let subscriber = tracing_subscriber::registry().with(filter).with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(tracing_appender::rolling::never(log_dir, LOG_FILE))
+            .with_ansi(false),
+    );
+    if subscriber.try_init().is_ok() {
+        let _ = LOG_RELOAD.set(reload_handle);
+    }
+}
+
+pub fn reload_log_filter(level: &str) -> std::result::Result<(), String> {
+    let filter = EnvFilter::try_new(level).map_err(|error| error.to_string())?;
+    if let Some(handle) = LOG_RELOAD.get() {
+        handle.reload(filter).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 // TODO: finer-grained synchronization?
@@ -188,13 +237,6 @@ fn blocking_compile_error_messages(output: &CompileOutput) -> Vec<String> {
     }
 }
 
-fn parse_setting(input: &str) -> Option<(&str, &str)> {
-    let separator = input.find(char::is_whitespace)?;
-    let (key, value) = input.split_at(separator);
-    let value = value.trim_start();
-    (!key.is_empty() && !value.is_empty()).then_some((key, value))
-}
-
 fn revision_is_stale(
     compiler: &IncrementalCompiler,
     expected_revision: Option<(&AtomicU64, u64)>,
@@ -208,23 +250,42 @@ fn save_needs_compile(current_revision: u64, compiled_revision: u64) -> bool {
     current_revision != compiled_revision
 }
 
+fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceConfig {
+    let Some(library) = library else {
+        return WorkspaceConfig::new(root_lib);
+    };
+    WorkspaceConfig::new(root_lib)
+        .with_dependencies(
+            library
+                .dependencies
+                .iter()
+                .map(|(name, path)| (name.clone(), path.clone())),
+        )
+        .with_gds_imports(
+            library
+                .gds
+                .iter()
+                .map(|(name, path)| (name.clone(), path.clone())),
+        )
+}
+
 async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     cell: &str,
     lyp: &Path,
-    gds_imports: &[(String, PathBuf)],
+    config: &WorkspaceConfig,
     client: &Client,
 ) -> Option<CompileOutput> {
     let (cell_path, args) = open_cell_input(cell, lyp, client).await?;
     let cell_path = cell_path.iter().map(String::as_str).collect::<Vec<_>>();
-    Some(compile::dynamic_compile_with_gds(
+    Some(compile::dynamic_compile_with_config(
         ast,
         CompileInput {
             cell: &cell_path,
             args,
             lyp_file: lyp,
         },
-        gds_imports,
+        config,
     ))
 }
 
@@ -340,11 +401,10 @@ impl StateMut {
     async fn compile(
         &mut self,
         client: &Client,
-        update: bool,
         expected_revision: Option<(&AtomicU64, u64)>,
-    ) {
+    ) -> Option<CompilationSnapshot> {
         let Some(root_dir) = &self.root_dir else {
-            return;
+            return None;
         };
         let manifest_path = root_dir.join("Argon.toml");
         self.config = if manifest_path.is_file() {
@@ -355,35 +415,15 @@ impl StateMut {
                         .show_message(MessageType::ERROR, error.to_string())
                         .await;
                     self.compile_output = None;
-                    return;
+                    return None;
                 }
             }
         } else {
             None
         };
         let lyp = self.config.as_ref().and_then(|config| config.lyp.clone());
-        let dependencies = self
-            .config
-            .as_ref()
-            .map(|config| config.dependencies.clone())
-            .unwrap_or_default();
-        let gds_imports = self
-            .config
-            .as_ref()
-            .map(|config| {
-                config
-                    .gds
-                    .iter()
-                    .map(|(name, path)| (name.clone(), path.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let dependencies = dependencies.into_iter().collect::<Vec<_>>();
-        let analysis = self.incremental_compiler.analyze_workspace(
-            &root_dir.join("lib.ar"),
-            &dependencies,
-            &gds_imports,
-        );
+        let workspace = workspace_config(root_dir.join("lib.ar"), self.config.as_ref());
+        let analysis = self.incremental_compiler.analyze_workspace(&workspace);
         self.ast = analysis.ast;
 
         let o = if analysis.typed_ast.is_some() {
@@ -411,20 +451,16 @@ impl StateMut {
                         )
                         .await;
                     self.compile_output = None;
-                    return;
+                    return None;
                 };
                 let Some((cell_path, args)) = open_cell_input(cell, lyp, client).await else {
                     self.compile_output = None;
-                    return;
+                    return None;
                 };
-                Some(self.incremental_compiler.compile_cell(
-                    &root_dir.join("lib.ar"),
-                    &dependencies,
-                    &gds_imports,
-                    &cell_path,
-                    args,
-                    lyp,
-                ))
+                Some(
+                    self.incremental_compiler
+                        .compile_cell(&workspace, &cell_path, args, lyp),
+                )
             } else {
                 None
             }
@@ -432,19 +468,9 @@ impl StateMut {
             Some(CompileOutput::FatalParseErrors)
         };
         if revision_is_stale(&self.incremental_compiler, expected_revision) {
-            return;
+            return None;
         }
         self.compile_output = o;
-        if !update && let Some(output) = &self.compile_output {
-            for message in blocking_compile_error_messages(output) {
-                client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not open cell: {message}"),
-                    )
-                    .await;
-            }
-        }
         let mut diagnostics = self.diagnostics();
         let previous = std::mem::replace(&mut self.prev_diagnostics, diagnostics.clone());
         for uri in previous.into_keys() {
@@ -452,26 +478,57 @@ impl StateMut {
         }
         for (uri, diagnostics) in diagnostics {
             if revision_is_stale(&self.incremental_compiler, expected_revision) {
-                return;
+                return None;
             }
             // TODO: potentially add version number
             client.publish_diagnostics(uri, diagnostics, None).await;
         }
         if revision_is_stale(&self.incremental_compiler, expected_revision) {
-            return;
+            return None;
         }
-        if let Some(o) = &self.compile_output
-            && let Some(gui_client) = self.gui_client.as_mut()
-            && let Err(e) = gui_client
-                .open_cell(context::current(), o.clone(), update)
-                .await
-        {
+        let revision = self.incremental_compiler.revision();
+        self.compiled_revision = revision;
+        self.compile_output
+            .clone()
+            .map(|output| CompilationSnapshot { revision, output })
+    }
+
+    async fn open_cell_snapshot(&mut self, client: &Client, snapshot: CompilationSnapshot) {
+        for message in blocking_compile_error_messages(&snapshot.output) {
             client
-                .show_message(MessageType::ERROR, format!("{e}"))
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not open cell: {message}"),
+                )
+                .await;
+        }
+        let Some(gui_client) = self.gui_client.clone() else {
+            return;
+        };
+        if let Err(error) = gui_client.open_cell(context::current(), snapshot).await {
+            client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not contact the GUI: {error}"),
+                )
                 .await;
             self.gui_client = None;
         }
-        self.compiled_revision = self.incremental_compiler.revision();
+    }
+
+    async fn update_cell_snapshot(&mut self, client: &Client, snapshot: CompilationSnapshot) {
+        let Some(gui_client) = self.gui_client.clone() else {
+            return;
+        };
+        if let Err(error) = gui_client.update_cell(context::current(), snapshot).await {
+            client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not contact the GUI: {error}"),
+                )
+                .await;
+            self.gui_client = None;
+        }
     }
 }
 
@@ -482,17 +539,39 @@ pub struct State {
     state_mut: Arc<Mutex<StateMut>>,
     requested_revision: Arc<AtomicU64>,
     compile_debounce_ms: Arc<AtomicU64>,
+    app_config: Arc<RwLock<ArgonConfig>>,
 }
 
 impl State {
     fn new(server_addr: SocketAddr, editor_client: Client) -> Self {
+        let config = read_config().unwrap_or_else(|error| {
+            error!("{error}; using default configuration");
+            ArgonConfig::default()
+        });
         Self {
             server_addr,
             editor_client,
             state_mut: Default::default(),
             requested_revision: Arc::new(AtomicU64::new(0)),
-            compile_debounce_ms: Arc::new(AtomicU64::new(150)),
+            compile_debounce_ms: Arc::new(AtomicU64::new(config.analyzer.compile_debounce_ms)),
+            app_config: Arc::new(RwLock::new(config)),
         }
+    }
+
+    fn apply_config(&self, config: ArgonConfig) {
+        self.compile_debounce_ms
+            .store(config.analyzer.compile_debounce_ms, Ordering::Release);
+        *self
+            .app_config
+            .write()
+            .expect("configuration lock poisoned") = config;
+    }
+
+    fn config(&self) -> ArgonConfig {
+        self.app_config
+            .read()
+            .expect("configuration lock poisoned")
+            .clone()
     }
 
     async fn publish_workspace_modified(&self, modified: bool, gui_client: Option<GuiClient>) {
@@ -545,13 +624,17 @@ impl Backend {
         {
             return;
         }
-        state_mut
+        let snapshot = state_mut
             .compile(
                 &self.state.editor_client,
-                true,
                 Some((&self.state.requested_revision, revision)),
             )
             .await;
+        if let Some(snapshot) = snapshot {
+            state_mut
+                .update_cell_snapshot(&self.state.editor_client, snapshot)
+                .await;
+        }
     }
 
     async fn workspace_modified(&self, params: WorkspaceModifiedParams) -> Result<()> {
@@ -612,21 +695,6 @@ impl Request for FocusEditor {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct AnalyzerOptions {
-            compile_debounce_ms: Option<u64>,
-        }
-        if let Some(debounce_ms) = params
-            .initialization_options
-            .as_ref()
-            .and_then(|value| serde_json::from_value::<AnalyzerOptions>(value.clone()).ok())
-            .and_then(|options| options.compile_debounce_ms)
-        {
-            self.state
-                .compile_debounce_ms
-                .store(debounce_ms, Ordering::Release);
-        }
         #[allow(deprecated)]
         {
             self.state.state_mut.lock().await.root_dir = params
@@ -778,11 +846,6 @@ struct OpenCellParams {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SetParams {
-    kv: String,
-}
-
-#[derive(Serialize, Deserialize)]
 struct InstantiateParams {
     cell: String,
 }
@@ -899,13 +962,17 @@ impl Backend {
         self.state
             .requested_revision
             .store(revision, Ordering::Release);
-        state_mut
+        let snapshot = state_mut
             .compile(
                 &self.state.editor_client,
-                false,
                 Some((&self.state.requested_revision, revision)),
             )
             .await;
+        if let Some(snapshot) = snapshot {
+            state_mut
+                .open_cell_snapshot(&self.state.editor_client, snapshot)
+                .await;
+        }
     }
 
     /// Compiles the current workspace and the open cell if it exists.
@@ -915,13 +982,17 @@ impl Backend {
         self.state
             .requested_revision
             .store(revision, Ordering::Release);
-        state_mut
+        let snapshot = state_mut
             .compile(
                 &self.state.editor_client,
-                true,
                 Some((&self.state.requested_revision, revision)),
             )
             .await;
+        if let Some(snapshot) = snapshot {
+            state_mut
+                .update_cell_snapshot(&self.state.editor_client, snapshot)
+                .await;
+        }
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
@@ -1080,6 +1151,9 @@ impl Backend {
                 .await;
             return Ok(());
         };
+        let Some(root_dir) = state_mut.root_dir.as_ref() else {
+            return Ok(());
+        };
         let Some(lyp) = state_mut
             .config
             .as_ref()
@@ -1094,22 +1168,12 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let gds_imports = state_mut
-            .config
-            .as_ref()
-            .map(|config| {
-                config
-                    .gds
-                    .iter()
-                    .map(|(name, path)| (name.clone(), path.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let workspace = workspace_config(root_dir.join("lib.ar"), state_mut.config.as_ref());
         let Some(compiled) = compile_open_cell(
             &typed_ast,
             &open_cell,
             &lyp,
-            &gds_imports,
+            &workspace,
             &self.state.editor_client,
         )
         .await
@@ -1163,28 +1227,52 @@ impl Backend {
         Ok(())
     }
 
-    async fn set(&self, params: SetParams) -> Result<()> {
-        let Some((key, value)) = parse_setting(&params.kv) else {
+    async fn reload_config(&self, _: ()) -> Result<()> {
+        let config = match read_config() {
+            Ok(config) => config,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, error)
+                    .await;
+                return Ok(());
+            }
+        };
+        if let Err(error) = reload_log_filter(&config.log.level) {
             self.state
                 .editor_client
-                .show_message(MessageType::ERROR, "Expected a setting in KEY VALUE form")
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Invalid log level '{}': {error}", config.log.level),
+                )
                 .await;
             return Ok(());
-        };
-        let (key, value) = (key.to_owned(), value.to_owned());
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let mut state_mut = state.state_mut.lock().await;
-            if let Some(client) = state_mut.gui_client.as_mut()
-                && let Err(e) = client.set(context::current(), key, value).await
-            {
-                state
-                    .editor_client
-                    .show_message(MessageType::ERROR, format!("{e}"))
-                    .await;
-                state_mut.gui_client = None;
-            }
-        });
+        }
+        self.state.apply_config(config.clone());
+        let gui_client = self.state.state_mut.lock().await.gui_client.clone();
+        if let Some(gui_client) = gui_client
+            && let Err(error) = gui_client.configure(context::current(), config).await
+        {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not reload GUI configuration: {error}"),
+                )
+                .await;
+            self.state.state_mut.lock().await.gui_client = None;
+            return Ok(());
+        }
+        let path = argon_config_path()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the default configuration".to_owned());
+        self.state
+            .editor_client
+            .show_message(
+                MessageType::INFO,
+                format!("Reloaded Argon configuration from {path}"),
+            )
+            .await;
         Ok(())
     }
 }
@@ -1287,7 +1375,7 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/startGui", Backend::start_gui)
     .custom_method("custom/openCell", Backend::open_cell)
     .custom_method("custom/inst", Backend::instantiate)
-    .custom_method("custom/set", Backend::set)
+    .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/workspaceModified", Backend::workspace_modified)
     .finish();
     let Some(state) = ext_state else {
@@ -1335,7 +1423,7 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_LOG_LEVEL, parse_config, parse_setting, preview_instance_cell, revision_is_stale,
+        DEFAULT_LOG_LEVEL, parse_config, preview_instance_cell, revision_is_stale,
         save_needs_compile,
     };
 
@@ -1354,18 +1442,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_configuration_is_loaded_from_toml() {
+        let config = parse_config(
+            "[analyzer]\ncompile_debounce_ms = 0\n\
+             [gui]\ndark_mode = false\nhierarchy_depth = 3\n",
+        )
+        .expect("valid runtime configuration");
+        assert_eq!(config.analyzer.compile_debounce_ms, 0);
+        assert!(!config.gui.dark_mode);
+        assert_eq!(config.gui.hierarchy_depth, Some(3));
+        assert!(parse_config("[gui]\nunknown = true\n").is_err());
+    }
+
+    #[test]
     fn open_cell_accepts_boolean_literals() {
         let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
         let arg = CellArg::from_literal(&call.args.posargs[0]).expect("boolean should convert");
         assert!(matches!(arg, CellArg::Bool(true)));
-    }
-
-    #[test]
-    fn setting_requires_a_key_and_value() {
-        assert_eq!(parse_setting("grid 10"), Some(("grid", "10")));
-        assert_eq!(parse_setting("grid   10 20"), Some(("grid", "10 20")));
-        assert_eq!(parse_setting("grid"), None);
-        assert_eq!(parse_setting("grid   "), None);
     }
 
     #[test]

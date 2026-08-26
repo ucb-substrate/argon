@@ -227,9 +227,6 @@ M.start = function(bufnr)
                 return vim.NIL
             end,
         },
-        initialization_options = {
-            compileDebounceMs = config.compile_debounce_ms,
-        },
         root_dir = root_dir
     }
 

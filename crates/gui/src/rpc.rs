@@ -6,15 +6,13 @@ use std::{
     time::Duration,
 };
 
+use analyzer::ArgonConfig;
 use analyzer::rpc::{
-    DimensionParams, Gui, InitialConditionEdit, InstancePreview, LangServerAction,
-    LangServerClient, PathParams, PolygonParams, ValueEdit,
+    CompilationSnapshot, DimensionParams, Gui, InitialConditionEdit, InstancePreview,
+    LangServerAction, LangServerClient, PathParams, PolygonParams, ValueEdit,
 };
 use anyhow::{Result, anyhow};
-use argonc::{
-    ast::Span,
-    compile::{BasicRect, CompileOutput},
-};
+use argonc::{ast::Span, compile::BasicRect};
 use async_compat::CompatExt;
 use futures::{
     channel::{
@@ -409,15 +407,22 @@ pub struct GuiServer {
 }
 
 impl Gui for GuiServer {
-    async fn open_cell(mut self, _: context::Context, cell: CompileOutput, update: bool) {
+    async fn open_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
-                    editor.open_cell(cx, cell, update);
-                    if !update {
-                        focus::activate_gui(cx);
-                    }
+                    editor.open_cell(cx, snapshot);
+                    focus::activate_gui(cx);
                 });
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.update_cell(cx, snapshot));
             }))
             .await
             .unwrap();
@@ -458,44 +463,21 @@ impl Gui for GuiServer {
             .await
             .unwrap();
     }
-    async fn set(mut self, _: tarpc::context::Context, key: String, value: String) -> () {
-        match key.as_str() {
-            "hierarchyDepth" => {
-                self.to_exec
-                    .send(Box::new(move |editor, cx| {
-                        editor
-                            .state
-                            .update(cx, |state, cx| {
-                                // TODO: Need better way to specify infinite hierarchy depth.
-                                state.hierarchy_depth = value.parse().unwrap_or(usize::MAX);
-                                cx.notify();
-                            })
-                            .unwrap();
-                    }))
-                    .await
+    async fn configure(mut self, _: tarpc::context::Context, config: ArgonConfig) -> () {
+        let _ = analyzer::reload_log_filter(&config.log.level);
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                editor
+                    .state
+                    .update(cx, |state, cx| {
+                        state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
+                        state.dark_mode = config.gui.dark_mode;
+                        cx.notify();
+                    })
                     .unwrap();
-            }
-            "darkMode" => {
-                self.to_exec
-                    .send(Box::new(move |editor, cx| {
-                        if let Ok(new_mode) = value.parse() {
-                            editor
-                                .state
-                                .update(cx, |state, cx| {
-                                    // TODO: Need better way to specify infinite hierarchy depth.
-                                    state.dark_mode = new_mode;
-                                    cx.notify();
-                                })
-                                .unwrap();
-                        }
-                    }))
-                    .await
-                    .unwrap();
-            }
-            _ => {
-                // TODO: handle errors.
-            }
-        }
+            }))
+            .await
+            .unwrap();
     }
 
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {

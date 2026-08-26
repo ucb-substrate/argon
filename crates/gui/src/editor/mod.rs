@@ -3,8 +3,7 @@ use std::{
     net::SocketAddr,
 };
 
-use analyzer::rpc::InstancePreview;
-use analyzer::rpc::LangServerAction;
+use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
 use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
     bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
@@ -76,6 +75,7 @@ pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
     pub workspace_modified: bool,
+    pub compilation_revision: Option<u64>,
     pub fatal_error: Option<SharedString>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
@@ -401,6 +401,7 @@ impl Editor {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
                 workspace_modified: false,
+                compilation_revision: None,
                 fatal_error: None,
                 connection_error: None,
                 solved_cell,
@@ -453,51 +454,67 @@ impl Editor {
         editor
     }
 
-    pub fn open_cell(&self, cx: &mut App, output: CompileOutput, update: bool) {
-        if self.canvas.read(cx).is_sse_dragging() {
-            self.canvas
-                .update(cx, |canvas, _| canvas.defer_compile_output(output, update));
-            return;
-        }
-        if update && !self.canvas.read(cx).accepts_compile_output(&output) {
-            return;
+    fn apply_snapshot(&self, cx: &mut App, snapshot: CompilationSnapshot) -> bool {
+        if self
+            .state
+            .read(cx)
+            .compilation_revision
+            .is_some_and(|revision| snapshot.revision < revision)
+        {
+            return false;
         }
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
-            state.update(cx, output);
+            state.compilation_revision = Some(snapshot.revision);
+            state.update(cx, snapshot.output);
             cx.notify();
         });
         self.canvas
             .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
-        if update {
-            let state = self.state.clone();
-            self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
-                let scope_paths: IndexSet<_> = state
-                    .read(cx)
-                    .solved_cell
-                    .read(cx)
-                    .as_ref()
-                    .map(|cell| cell.state.keys().cloned().collect())
-                    .unwrap_or_default();
-                sidebar.state.update(cx, |state, _cx| {
-                    state
-                        .expanded_scopes
-                        .retain(|path| scope_paths.contains(path));
-                });
-                cx.notify();
-            });
-        } else {
-            self.canvas.update(cx, |canvas, cx| {
-                canvas.fit_to_screen(cx);
-                cx.notify();
-            });
-            self.hierarchy_sidebar.update(cx, |sidebar, cx| {
-                sidebar.state.update(cx, |state, cx| {
-                    state.expanded_scopes.clear();
-                    cx.notify();
-                });
-            });
+        true
+    }
+
+    pub fn open_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
+        if !self.apply_snapshot(cx, snapshot) {
+            return;
         }
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.fit_to_screen(cx);
+            cx.notify();
+        });
+        self.hierarchy_sidebar.update(cx, |sidebar, cx| {
+            sidebar.state.update(cx, |state, cx| {
+                state.expanded_scopes.clear();
+                cx.notify();
+            });
+        });
+    }
+
+    pub fn update_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
+        if self.canvas.read(cx).is_sse_dragging() {
+            self.canvas
+                .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
+            return;
+        }
+        if !self.canvas.read(cx).accepts_snapshot(&snapshot) || !self.apply_snapshot(cx, snapshot) {
+            return;
+        }
+        let state = self.state.clone();
+        self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
+            let scope_paths: IndexSet<_> = state
+                .read(cx)
+                .solved_cell
+                .read(cx)
+                .as_ref()
+                .map(|cell| cell.state.keys().cloned().collect())
+                .unwrap_or_default();
+            sidebar.state.update(cx, |state, _cx| {
+                state
+                    .expanded_scopes
+                    .retain(|path| scope_paths.contains(path));
+            });
+            cx.notify();
+        });
     }
 
     pub fn set_workspace_modified(&self, cx: &mut App, modified: bool) {
@@ -544,9 +561,9 @@ impl Editor {
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let deferred = self
             .canvas
-            .update(cx, |canvas, _| canvas.take_deferred_compile_output());
-        if let Some((output, update)) = deferred {
-            self.open_cell(cx, output, update);
+            .update(cx, |canvas, _| canvas.take_deferred_snapshot());
+        if let Some(snapshot) = deferred {
+            self.update_cell(cx, snapshot);
         }
     }
 

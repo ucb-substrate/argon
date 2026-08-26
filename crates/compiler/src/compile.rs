@@ -31,6 +31,7 @@ use crate::gds::{ImportedGdsElement, import_gds};
 use crate::layer::LayerProperties;
 use crate::parse::{ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
+use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -109,16 +110,17 @@ pub fn dynamic_compile(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
 ) -> CompileOutput {
-    dynamic_compile_with_gds(ast, input, &[])
+    dynamic_compile_with_config(ast, input, &WorkspaceConfig::default())
 }
 
-pub fn dynamic_compile_with_gds(
+/// Executes a cell using workspace-wide external inputs from `config`.
+pub fn dynamic_compile_with_config(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
     let lyp_file = input.lyp_file;
-    let res = ExecPass::new(ast, lyp_file, gds_imports).execute(input);
+    let res = ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -141,14 +143,27 @@ pub fn dynamic_compile_with_gds(
     }
 }
 
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-    compile_with_gds(ast, input, &[])
-}
-
-pub fn compile_with_gds(
-    ast: &WorkspaceParseAst,
+/// Compatibility wrapper for callers that have not adopted [`WorkspaceConfig`].
+pub fn dynamic_compile_with_gds(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
     gds_imports: &[(String, PathBuf)],
+) -> CompileOutput {
+    let config = WorkspaceConfig {
+        gds_imports: gds_imports.to_vec(),
+        ..WorkspaceConfig::default()
+    };
+    dynamic_compile_with_config(ast, input, &config)
+}
+
+pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+    compile_with_config(ast, input, &WorkspaceConfig::default())
+}
+
+pub fn compile_with_config(
+    ast: &WorkspaceParseAst,
+    input: CompileInput<'_>,
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
     let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
         static_output
@@ -159,7 +174,20 @@ pub fn compile_with_gds(
         return CompileOutput::StaticErrors(static_output);
     };
 
-    dynamic_compile_with_gds(&ast, input, gds_imports)
+    dynamic_compile_with_config(&ast, input, config)
+}
+
+/// Compatibility wrapper for callers that have not adopted [`WorkspaceConfig`].
+pub fn compile_with_gds(
+    ast: &WorkspaceParseAst,
+    input: CompileInput<'_>,
+    gds_imports: &[(String, PathBuf)],
+) -> CompileOutput {
+    let config = WorkspaceConfig {
+        gds_imports: gds_imports.to_vec(),
+        ..WorkspaceConfig::default()
+    };
+    compile_with_config(ast, input, &config)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;

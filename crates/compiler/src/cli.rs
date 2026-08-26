@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
-    artifact,
+    WorkspaceConfig, artifact,
     compile::{self, CellArg, CompileInput, CompileOutput},
     diagnostics::{self, Diagnostic},
     gds::GdsMap,
-    parse::{self, parse_workspace_with_std_deps_and_gds},
+    parse::{self, parse_workspace_with_config},
 };
 use clap::{Parser, ValueEnum};
 use gds::GdsUnits;
@@ -107,11 +107,10 @@ fn execute(args: Args) -> Result<(), Failed> {
         }
     }
 
-    let analysis = compile::analyze_workspace(parse_workspace_with_std_deps_and_gds(
-        &root,
-        args.dependencies,
-        args.gds_imports.clone(),
-    ));
+    let workspace = WorkspaceConfig::new(&root)
+        .with_dependencies(args.dependencies.clone())
+        .with_gds_imports(args.gds_imports.clone());
+    let analysis = compile::analyze_workspace(parse_workspace_with_config(&workspace));
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(
             format,
@@ -166,14 +165,14 @@ fn execute(args: Args) -> Result<(), Failed> {
                 "--cell arguments must be integer, float, boolean, or empty-list literals",
             )
         })?;
-    let output = compile::dynamic_compile_with_gds(
+    let output = compile::dynamic_compile_with_config(
         &typed_ast,
         CompileInput {
             cell: &cell_path,
             args: cell_args,
             lyp_file: lyp,
         },
-        &args.gds_imports,
+        &workspace,
     );
     if !matches!(output, CompileOutput::Valid(_)) {
         return Err(compile_failed(format, output));
