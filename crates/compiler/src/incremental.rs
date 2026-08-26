@@ -21,6 +21,9 @@ use crate::{
     parse,
 };
 
+type FileRevision = (u64, u32, u64);
+type TrackedFileRevision = (PathBuf, Option<FileRevision>);
+
 /// A byte-oriented replacement applied to the current version of a source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceEdit {
@@ -56,7 +59,7 @@ pub struct IncrementalStats {
 #[derive(Clone)]
 struct StaticCache {
     key: u64,
-    disk_revisions: Vec<(PathBuf, Option<(u64, u32, u64)>)>,
+    disk_revisions: Vec<TrackedFileRevision>,
     analysis: StaticAnalysis,
 }
 
@@ -290,7 +293,7 @@ impl IncrementalCompiler {
         root_lib: &Path,
         dependencies: &[(String, PathBuf)],
         analysis: &StaticAnalysis,
-    ) -> Vec<(PathBuf, Option<(u64, u32, u64)>)> {
+    ) -> Vec<TrackedFileRevision> {
         let mut files = analysis
             .ast
             .values()
@@ -325,7 +328,7 @@ impl IncrementalCompiler {
     }
 }
 
-fn file_revision(path: &Path) -> Option<(u64, u32, u64)> {
+fn file_revision(path: &Path) -> Option<FileRevision> {
     let metadata = std::fs::metadata(path).ok()?;
     let modified = metadata
         .modified()

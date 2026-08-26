@@ -521,7 +521,7 @@ impl LangServer for State {
         };
         drop(state_mut);
 
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
