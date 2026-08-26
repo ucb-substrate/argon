@@ -1,0 +1,19 @@
+cell top() {
+    let p = polygon("met1", list(
+        (float(), float(),),
+        (float(), float(),),
+        (float(), float(),),
+        (float(), float(),),
+    ));
+
+    // Each coordinate remains an independent linear expression.
+    eq(p.points[0].x, 0.);
+    eq(p.points[0].y, 0.);
+    eq(p.points[1].x, 100.);
+    eq(p.points[1].y, 0.);
+    eq(p.points[2].x, p.points[1].x + 50.);
+    eq(p.points[2].y, 75.);
+    // Positional access remains available for tuple-style geometry code.
+    eq(p.points[3].0, 0.);
+    eq(p.points[3].1, 50.);
+}

@@ -200,6 +200,9 @@ pub enum ExecErrorKind {
     /// Rectangle edges appear in the wrong order.
     #[error("rect edges are in the wrong order: {0}")]
     FlippedRect(String),
+    /// A polygon does not contain enough vertices.
+    #[error("a polygon requires at least three points")]
+    InvalidPolygon,
     /// An operation received an incompatible runtime value.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,

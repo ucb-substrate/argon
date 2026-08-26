@@ -99,7 +99,7 @@ mod tests {
         gds::GdsMap,
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
-    use ::gds::GdsUnits;
+    use ::gds::{GdsElement, GdsLibrary, GdsUnits};
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
@@ -158,6 +158,7 @@ mod tests {
     const ARGON_RANGE_PERF: &str = concatcp!(EXAMPLES_DIR, "/range_perf/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
+    const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -1724,6 +1725,56 @@ mod tests {
         assert_relative_eq!(r.y0.0, 5., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 25., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 53., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_polygon_points_are_independently_constrained() {
+        let o = parse_workspace_with_std(ARGON_POLYGON);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let gds_path =
+            std::env::temp_dir().join(format!("argon-polygon-{}.gds", std::process::id()));
+        output
+            .to_gds(
+                GdsMap::from_lyp(BASIC_LYP).expect("polygon GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                &gds_path,
+            )
+            .expect("export polygon GDS");
+        let gds = GdsLibrary::load(gds_path).expect("reload polygon GDS");
+        let boundary = gds.structs[0]
+            .elems
+            .iter()
+            .find_map(|element| match element {
+                GdsElement::GdsBoundary(boundary) => Some(boundary),
+                _ => None,
+            })
+            .expect("polygon boundary");
+        assert_eq!(boundary.xy.len(), 5);
+        assert_eq!(boundary.xy.first(), boundary.xy.last());
+
+        let cells = output.unwrap_valid();
+
+        let polygon = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_polygon)
+            .expect("compiled polygon");
+        let points = polygon
+            .points
+            .iter()
+            .map(|(x, y)| (x.0, y.0))
+            .collect::<Vec<_>>();
+        assert_eq!(points, [(0., 0.), (100., 0.), (150., 75.), (0., 50.)]);
+        assert_ne!(polygon.points[0].0.1, polygon.points[1].0.1);
     }
 
     #[test]

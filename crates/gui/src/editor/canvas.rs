@@ -15,8 +15,8 @@ use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
     Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
-    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, Pixels, Point, Render,
+    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
     pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
@@ -198,6 +198,54 @@ pub struct Rect {
     pub border_widths: Edges<Pixels>,
     pub border_styles: Edges<BorderStyle>,
     pub cvars: Option<Edges<LinearExpr>>,
+}
+
+#[derive(Clone, Debug)]
+struct Polygon {
+    points: Vec<Point<f32>>,
+    id: Option<Span>,
+    object_path: Vec<ObjectId>,
+    cvars: Option<Vec<(LinearExpr, LinearExpr)>>,
+}
+
+impl Polygon {
+    fn bbox(&self) -> Option<Rect> {
+        let first = self.points.first()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (first.x, first.y, first.x, first.y);
+        for point in &self.points[1..] {
+            x0 = x0.min(point.x);
+            y0 = y0.min(point.y);
+            x1 = x1.max(point.x);
+            y1 = y1.max(point.y);
+        }
+        Some(Rect {
+            x0,
+            x1,
+            y0,
+            y1,
+            id: self.id.clone(),
+            object_path: self.object_path.clone(),
+            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            border_styles: Edges::all(BorderStyle::Solid),
+            cvars: None,
+        })
+    }
+
+    fn transform(&self, mat: TransformationMatrix, ofs: (f64, f64)) -> Self {
+        Self {
+            points: self
+                .points
+                .iter()
+                .map(|point| {
+                    let point = ifmatvec(mat, (point.x as f64, point.y as f64));
+                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                })
+                .collect(),
+            id: self.id.clone(),
+            object_path: self.object_path.clone(),
+            cvars: self.cvars.clone(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -387,6 +435,7 @@ pub(crate) struct PlaceInstanceToolState {
     invocation: String,
     scope_span: Span,
     rects: Vec<Rect>,
+    polygons: Vec<Polygon>,
 }
 
 #[enumify]
@@ -433,6 +482,7 @@ pub struct LayoutCanvas {
     #[allow(unused)]
     subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
+    polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
     // True if waiting on render step to finish some initialization.
@@ -552,8 +602,9 @@ fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
 /// Flatten the solved geometry of one compiled cell into rectangles relative
 /// to that cell's origin. Placement paints these as a single pointer-following
 /// outline without disturbing the layout currently open in the editor.
-fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
+fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>, Vec<Polygon>) {
     let mut rects = Vec::new();
+    let mut polygons = Vec::new();
     let mut queue = VecDeque::from_iter([(
         cell,
         output.cells[&cell].root,
@@ -585,6 +636,21 @@ fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
                         cvars: None,
                     });
                 }
+                SolvedValue::Polygon(polygon) => {
+                    polygons.push(Polygon {
+                        points: polygon
+                            .points
+                            .iter()
+                            .map(|(x, y)| {
+                                let point = ifmatvec(mat, (x.0, y.0));
+                                Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                            })
+                            .collect(),
+                        id: None,
+                        object_path: Vec::new(),
+                        cvars: None,
+                    });
+                }
                 SolvedValue::Instance(instance) if !instance.construction => {
                     let mut instance_mat = TransformationMatrix::identity();
                     if instance.reflect {
@@ -607,7 +673,7 @@ fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
             queue.push_back((cell, *child, mat, ofs));
         }
     }
-    rects
+    (rects, polygons)
 }
 
 fn get_paint_quad(
@@ -704,6 +770,7 @@ impl Element for CanvasElement {
 
         // TODO: Clean up code.
         let mut rects = Vec::new();
+        let mut polygons = Vec::new();
         let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
         let mut instance_sse_candidates = Vec::new();
@@ -875,6 +942,44 @@ impl Element for CanvasElement {
                                 }
                             }
                         }
+                        SolvedValue::Polygon(polygon) => {
+                            let Some(layer) = layers.layers.get(polygon.layer.as_str()) else {
+                                continue;
+                            };
+                            let points = polygon
+                                .points
+                                .iter()
+                                .map(|(x, y)| {
+                                    let (dx, dy) = if depth == 0 {
+                                        sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
+                                            (
+                                                crate::sse::dot(&SparseVec::from(&x.1), sse_dv),
+                                                crate::sse::dot(&SparseVec::from(&y.1), sse_dv),
+                                            )
+                                        })
+                                    } else {
+                                        (0., 0.)
+                                    };
+                                    let point = ifmatvec(mat, (x.0 + dx, y.0 + dy));
+                                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                                })
+                                .collect();
+                            let polygon = Polygon {
+                                points,
+                                id: polygon.span.clone(),
+                                object_path,
+                                cvars: (depth == 0).then(|| {
+                                    polygon
+                                        .points
+                                        .iter()
+                                        .map(|(x, y)| (x.1.clone(), y.1.clone()))
+                                        .collect()
+                                }),
+                            };
+                            if show && layer.visible {
+                                polygons.push((polygon, layer.clone()));
+                            }
+                        }
                         SolvedValue::Instance(inst) => {
                             if inst.construction {
                                 continue;
@@ -1035,6 +1140,10 @@ impl Element for CanvasElement {
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
             .collect_vec();
+        let polygons = polygons
+            .into_iter()
+            .sorted_by_key(|(_, layer)| layer.z)
+            .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
@@ -1086,6 +1195,35 @@ impl Element for CanvasElement {
                     span: span.clone(),
                     targets,
                 });
+            }
+        }
+        if let Some(sse_cell) = sse_cell {
+            for (polygon, _) in &polygons {
+                let (Some(span), Some(cvars)) = (&polygon.id, &polygon.cvars) else {
+                    continue;
+                };
+                if !matches!(
+                    &tool,
+                    ToolState::Select(SelectToolState {
+                        selected_obj: Some(selected),
+                    }) if selected == span
+                ) {
+                    continue;
+                }
+                for (point, (x, y)) in polygon.points.iter().zip(cvars) {
+                    let targets = corner_sse_targets(x, y);
+                    if LayoutCanvas::sse_targets_support_2d(&targets, sse_cell) {
+                        let mid = inner.layout_to_px(*point);
+                        let hit_half = HANDLE_HIT.half();
+                        sse_handles.push(SseHandle {
+                            bounds: Bounds::new(
+                                Point::new(mid.x - hit_half, mid.y - hit_half),
+                                Size::new(HANDLE_HIT, HANDLE_HIT),
+                            ),
+                            targets,
+                        });
+                    }
+                }
             }
         }
         if let Some(sse_cell) = sse_cell {
@@ -1166,6 +1304,40 @@ impl Element for CanvasElement {
                             r.border_styles,
                         ));
                     }
+                    for (polygon, layer) in &polygons {
+                        let points = polygon
+                            .points
+                            .iter()
+                            .map(|point| self.inner.read(cx).layout_to_px(*point))
+                            .collect::<Vec<_>>();
+                        let mut fill = PathBuilder::fill();
+                        fill.add_polygon(&points, true);
+                        if let Ok(path) = fill.build() {
+                            window.paint_path(path, Rgba { a: 0.35, ..layer.color });
+                        }
+                        let selected = matches!(
+                            &tool,
+                            ToolState::Select(SelectToolState {
+                                selected_obj: Some(selected),
+                            }) if polygon.id.as_ref() == Some(selected)
+                        );
+                        let mut border = PathBuilder::stroke(if selected {
+                            SELECT_WIDTH
+                        } else {
+                            DEFAULT_BORDER_WIDTH
+                        });
+                        border.add_polygon(&points, true);
+                        if let Ok(path) = border.build() {
+                            window.paint_path(
+                                path,
+                                if selected {
+                                    rgb(0xffff00)
+                                } else {
+                                    layer.border_color
+                                },
+                            );
+                        }
+                    }
                     for bbox in &scope_rects {
                         window.paint_quad(get_paint_quad(
                             get_rect_bounds(&bbox.rect, bounds, scale, offset),
@@ -1231,6 +1403,25 @@ impl Element for CanvasElement {
                                 rect.border_widths,
                                 rect.border_styles,
                             ));
+                        }
+                        for polygon in &placement.polygons {
+                            let polygon = polygon.transform(
+                                TransformationMatrix::identity(),
+                                (
+                                    layout_mouse_position.x as f64,
+                                    layout_mouse_position.y as f64,
+                                ),
+                            );
+                            let points = polygon
+                                .points
+                                .iter()
+                                .map(|point| self.inner.read(cx).layout_to_px(*point))
+                                .collect::<Vec<_>>();
+                            let mut border = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
+                            border.add_polygon(&points, true);
+                            if let Ok(path) = border.build() {
+                                window.paint_path(path, rgb(0xffff00));
+                            }
                         }
                     }
                     for r in &select_rects {
@@ -1827,6 +2018,7 @@ impl Element for CanvasElement {
             });
         self.inner.update(cx, |inner, cx| {
             inner.rects = rects;
+            inner.polygons = polygons;
             inner.scope_rects = scope_rects;
             inner.dim_hitboxes = dim_hitboxes;
             inner.sse_handles = sse_handles;
@@ -1912,6 +2104,7 @@ impl LayoutCanvas {
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
             state: state.clone(),
             rects: Vec::new(),
+            polygons: Vec::new(),
             scope_rects: Vec::new(),
             dim_hitboxes: Vec::new(),
             pending_init: true,
@@ -1919,13 +2112,14 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn place_instance(&mut self, preview: InstancePreview, cx: &mut Context<Self>) {
-        let rects = instance_preview_rects(&preview.output, preview.cell);
+        let (rects, polygons) = instance_preview_geometry(&preview.output, preview.cell);
         let tool = self.state.read(cx).tool.clone();
         tool.update(cx, |tool, cx| {
             *tool = ToolState::PlaceInstance(PlaceInstanceToolState {
                 invocation: preview.invocation,
                 scope_span: preview.scope_span,
                 rects,
+                polygons,
             });
             cx.notify();
         });
@@ -1988,6 +2182,21 @@ impl LayoutCanvas {
                 continue;
             };
             let bounds = get_rect_bounds(rect, self.screen_bounds, self.scale, self.offset);
+            if bounds.contains(&position) {
+                hits.push(SelectionHit {
+                    span: span.clone(),
+                    bounds,
+                    layer: SelectionLayer::Layout(layer.z),
+                    paint_order,
+                });
+            }
+        }
+
+        for (paint_order, (polygon, layer)) in self.polygons.iter().enumerate() {
+            let (Some(span), Some(rect)) = (&polygon.id, polygon.bbox()) else {
+                continue;
+            };
+            let bounds = get_rect_bounds(&rect, self.screen_bounds, self.scale, self.offset);
             if bounds.contains(&position) {
                 hits.push(SelectionHit {
                     span: span.clone(),
@@ -3012,7 +3221,7 @@ pub(crate) fn find_obj_path(
         .reachable_objs(current_scope.cell, current_scope.scope);
     if let Some(name) = reachable_objs.swap_remove(obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
-            SolvedValue::Rect(_) => string_path.push(name),
+            SolvedValue::Rect(_) | SolvedValue::Polygon(_) => string_path.push(name),
             SolvedValue::Instance(_) => {
                 string_path.push(name);
                 string_path = vec![format!("bbox({})", string_path.join("."))];
@@ -3253,8 +3462,9 @@ cell top() {
             output => panic!("preview fixture should compile: {output:?}"),
         };
 
-        let rects = instance_preview_rects(&output, output.top);
+        let (rects, polygons) = instance_preview_geometry(&output, output.top);
         assert_eq!(rects.len(), 1);
+        assert!(polygons.is_empty());
         assert_eq!(
             (rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1),
             (3., 4., 13., 9.)
