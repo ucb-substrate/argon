@@ -203,6 +203,9 @@ pub enum ExecErrorKind {
     /// A polygon does not contain enough vertices.
     #[error("a polygon requires at least three points")]
     InvalidPolygon,
+    /// A path does not contain enough centerline points.
+    #[error("a path requires at least two points")]
+    InvalidPath,
     /// An operation received an incompatible runtime value.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,

@@ -4,7 +4,7 @@
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use arcstr::Substr;
@@ -40,7 +40,7 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 14] = [
+pub const BUILTINS: [&str; 15] = [
     "list",
     "cons",
     "head",
@@ -49,6 +49,7 @@ pub const BUILTINS: [&str; 14] = [
     "crect",
     "rect",
     "polygon",
+    "path",
     "text",
     "float",
     "eq",
@@ -588,7 +589,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
     for layer in data.layers.layers.iter() {
         layers.insert(layer.name.clone());
@@ -598,6 +599,7 @@ fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>)
             let (layer, span) = match obj {
                 SolvedValue::Rect(r) => (r.layer.as_ref(), r.span.clone()),
                 SolvedValue::Polygon(p) => (Some(&p.layer), p.span.clone()),
+                SolvedValue::Path(p) => (Some(&p.layer), p.span.clone()),
                 _ => continue,
             };
             if let Some(layer) = layer
@@ -721,6 +723,7 @@ pub enum Ty {
     Int,
     Rect,
     Polygon,
+    Path,
     Point,
     String,
     Cell(Arc<CellTy>),
@@ -777,6 +780,7 @@ impl Ty {
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
             "Polygon" => Some(Ty::Polygon),
+            "Path" => Some(Ty::Path),
             "Point" => Some(Ty::Point),
             "Any" => Some(Ty::Any),
             "String" => Some(Ty::String),
@@ -1786,6 +1790,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
                 _ => self.no_field_on_ty(field, Ty::Polygon),
             },
+            Ty::Path => match field.name.as_str() {
+                "points" => Ty::Seq(Box::new(Ty::Point)),
+                "layer" => Ty::String,
+                "width" => Ty::Float,
+                name if polygon_coordinate(name).is_some_and(|coordinate| !coordinate.initial) => {
+                    Ty::Float
+                }
+                _ => self.no_field_on_ty(field, Ty::Path),
+            },
             Ty::Point => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
@@ -1922,6 +1935,28 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         .collect();
                     self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Polygon)
+                }
+                "path" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
+                    if let Some(layer) = args.posargs.first() {
+                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
+                    }
+                    if let Some(points) = args.posargs.get(1) {
+                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
+                    }
+                    let kwarg_defs = args
+                        .kwargs
+                        .iter()
+                        .filter_map(|kwarg| {
+                            let name = kwarg.name.name.as_str();
+                            (name == "width"
+                                || name == "widthi"
+                                || polygon_coordinate(name).is_some())
+                            .then_some((name, Ty::Float))
+                        })
+                        .collect();
+                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    (None, Ty::Path)
                 }
                 "text" => {
                     // text, layer, x, y
@@ -2347,7 +2382,7 @@ pub struct CompileInput<'a> {
     /// Full path to cell.
     pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
-    pub lyp_file: &'a Path,
+    pub lyp_file: &'a FsPath,
 }
 
 pub type VarId = u64;
@@ -2390,6 +2425,21 @@ pub struct Polygon<T> {
     pub layer: String,
     pub id: ObjectId,
     pub points: Vec<(T, T)>,
+    pub span: Option<Span>,
+}
+
+/// A constant-width GDS-style path whose centerline coordinates are
+/// independent solver values.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Path<T> {
+    pub layer: String,
+    pub id: ObjectId,
+    pub width: T,
+    pub points: Vec<(T, T)>,
+    /// Distance by which the path extends before and after its centerline.
+    /// These retain the geometry of imported GDS path types 0, 2, and 4.
+    pub begin_extension: f64,
+    pub end_extension: f64,
     pub span: Option<Span>,
 }
 
@@ -2535,7 +2585,7 @@ struct CellState {
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    lyp_file: &'a Path,
+    lyp_file: &'a FsPath,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
@@ -2584,7 +2634,7 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 impl<'a> ExecPass<'a> {
     pub(crate) fn new(
         ast: &'a WorkspaceAst<VarIdTyMetadata>,
-        lyp_file: &'a Path,
+        lyp_file: &'a FsPath,
         gds_imports: &[(String, PathBuf)],
     ) -> Self {
         let gds_imports = gds_imports
@@ -3018,7 +3068,7 @@ impl<'a> ExecPass<'a> {
     fn execute_gds_cell(
         &mut self,
         declared_name: &str,
-        path: &Path,
+        path: &FsPath,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
         let imported = match import_gds(path, declared_name, self.lyp_file) {
@@ -3102,6 +3152,28 @@ impl<'a> ExecPass<'a> {
                             span: None,
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_polygon_{element_index}"))),
+                    ),
+                    ImportedGdsElement::Path {
+                        layer,
+                        name,
+                        width,
+                        points,
+                        begin_extension,
+                        end_extension,
+                    } => (
+                        SolvedValue::Path(Path {
+                            id,
+                            layer,
+                            width: (width, LinearExpr::from(width)),
+                            points: points
+                                .into_iter()
+                                .map(|(x, y)| ((x, LinearExpr::from(x)), (y, LinearExpr::from(y))))
+                                .collect(),
+                            begin_extension,
+                            end_extension,
+                            span: None,
+                        }),
+                        Some(name.unwrap_or_else(|| format!("gds_path_{element_index}"))),
                     ),
                     ImportedGdsElement::Text { layer, text, x, y } => (
                         SolvedValue::Text(Text {
@@ -3253,6 +3325,36 @@ impl<'a> ExecPass<'a> {
                         })
                         .collect(),
                     span: polygon.span.clone(),
+                }),
+                Object::Path(path) => SolvedValue::Path(Path {
+                    id: path.id,
+                    layer: path.layer.clone(),
+                    width: (
+                        state
+                            .solver
+                            .eval_expr(&path.width)
+                            .expect("path width not solved"),
+                        path.width.clone(),
+                    ),
+                    points: path
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            (
+                                (
+                                    state.solver.eval_expr(x).expect("path x not solved"),
+                                    x.clone(),
+                                ),
+                                (
+                                    state.solver.eval_expr(y).expect("path y not solved"),
+                                    y.clone(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                    begin_extension: path.begin_extension,
+                    end_extension: path.end_extension,
+                    span: path.span.clone(),
                 }),
                 Object::Text(text) => SolvedValue::Text(Text {
                     id: text.id,
@@ -4147,6 +4249,132 @@ impl<'a> ExecPass<'a> {
                                             ),
                                         },
                                     ),
+                                })
+                            });
+                        }
+                        true
+                    } else {
+                        for arg in &c.state.posargs {
+                            if !self.values[arg].is_ready() {
+                                self.add_value_dependent(*arg, vid);
+                            }
+                        }
+                        false
+                    }
+                }
+                "path" => {
+                    if let (Defer::Ready(layer), Defer::Ready(point_spec)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let layer = layer.as_ref().unwrap_string().clone();
+                        let count = match point_spec.as_ref() {
+                            ValueRef::Int(count) => usize::try_from(*count).ok(),
+                            _ => {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, c.expr.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
+                        };
+                        let Some(count) = count.filter(|count| *count >= 2) else {
+                            self.errors.push(ExecError {
+                                span: Some(self.span(&vref.loc, c.expr.span)),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidPath,
+                            });
+                            return Err(());
+                        };
+                        for kwarg in &c.expr.args.kwargs {
+                            let name = kwarg.name.name.as_str();
+                            if let Some(coordinate) = polygon_coordinate(name)
+                                && coordinate.index >= count
+                            {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, kwarg.name.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::IndexOutOfBounds,
+                                });
+                                return Err(());
+                            }
+                        }
+
+                        let id = self.object_id();
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let state = self.cell_state_mut(cell_id);
+                        let width = state.solver.new_var().into();
+                        let points = (0..count)
+                            .map(|_| (state.solver.new_var().into(), state.solver.new_var().into()))
+                            .collect();
+                        let path = Path {
+                            id,
+                            layer,
+                            width,
+                            points,
+                            begin_extension: 0.,
+                            end_extension: 0.,
+                            span: Some(span.clone()),
+                        };
+                        state.objects.insert(id, path.clone().into());
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
+                        self.values
+                            .insert(vid, Defer::Ready(Value::Path(path.clone())));
+                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
+                            let name = kwarg.name.name.as_str();
+                            let (expr, fallback, priority, initial_condition) = if name == "width"
+                                || name == "widthi"
+                            {
+                                (
+                                    path.width.clone(),
+                                    name == "widthi",
+                                    i32::MAX,
+                                    (name == "widthi")
+                                        .then_some(RectInitialCondition::PathWidth(path.id)),
+                                )
+                            } else {
+                                let coordinate = polygon_coordinate(name)
+                                    .expect("path kwargs were statically validated");
+                                let expr = match coordinate.axis {
+                                    PolygonAxis::X => path.points[coordinate.index].0.clone(),
+                                    PolygonAxis::Y => path.points[coordinate.index].1.clone(),
+                                };
+                                let initial_condition =
+                                    coordinate.initial.then_some(match coordinate.axis {
+                                        PolygonAxis::X => {
+                                            RectInitialCondition::PathX(path.id, coordinate.index)
+                                        }
+                                        PolygonAxis::Y => {
+                                            RectInitialCondition::PathY(path.id, coordinate.index)
+                                        }
+                                    });
+                                (
+                                    expr,
+                                    coordinate.initial,
+                                    i32::MAX
+                                        - 1
+                                        - i32::try_from(coordinate.index.saturating_mul(2))
+                                            .unwrap_or(i32::MAX)
+                                        - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
+                                    initial_condition,
+                                )
+                            };
+                            let lhs = self.value_id();
+                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
+                            let span = self.span(&vref.loc, kwarg.value.span());
+                            self.new_deferred_value(vref.loc, |_| {
+                                PartialEvalState::Constraint(PartialConstraint {
+                                    lhs,
+                                    rhs: *rhs,
+                                    fallback,
+                                    priority,
+                                    span,
+                                    initial_condition,
                                 })
                             });
                         }
@@ -5152,6 +5380,51 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
                         }
+                        ValueRef::Path(path) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            let val = match field {
+                                "points" => Value::Seq(
+                                    path.points
+                                        .iter()
+                                        .map(|(x, y)| Value::Point((x.clone(), y.clone())))
+                                        .collect(),
+                                ),
+                                "layer" => Value::String(path.layer.clone()),
+                                "width" => Value::Linear(path.width.clone()),
+                                name if polygon_coordinate(name)
+                                    .is_some_and(|coordinate| !coordinate.initial) =>
+                                {
+                                    let coordinate = polygon_coordinate(name).unwrap();
+                                    let Some(point) = path.points.get(coordinate.index) else {
+                                        self.errors.push(ExecError {
+                                            span: Some(self.span(
+                                                &vref.loc,
+                                                field_access_expr.expr.field.span,
+                                            )),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::IndexOutOfBounds,
+                                        });
+                                        return Err(());
+                                    };
+                                    Value::Linear(match coordinate.axis {
+                                        PolygonAxis::X => point.0.clone(),
+                                        PolygonAxis::Y => point.1.clone(),
+                                    })
+                                }
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(
+                                            self.span(&vref.loc, field_access_expr.expr.span),
+                                        ),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
                         ValueRef::Point(point) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
                                 "x" => Value::Linear(point.0.clone()),
@@ -5263,6 +5536,38 @@ impl<'a> ExecPass<'a> {
                                                     objects
                                                         .insert(polygon.id, polygon.clone().into());
                                                     Value::Polygon(polygon)
+                                                }
+                                                SolvedValue::Path(path) => {
+                                                    let id = object_id(obj_id);
+                                                    let mat = tmat(inst.angle, inst.reflect);
+                                                    let path = Path {
+                                                        id,
+                                                        layer: path.layer.clone(),
+                                                        width: LinearExpr::from(path.width.0),
+                                                        points: path
+                                                            .points
+                                                            .iter()
+                                                            .map(|(x, y)| {
+                                                                let (x, y) =
+                                                                    ifmatvec(mat, (x.0, y.0));
+                                                                (
+                                                                    LinearExpr::add(
+                                                                        x,
+                                                                        inst.x.clone(),
+                                                                    ),
+                                                                    LinearExpr::add(
+                                                                        y,
+                                                                        inst.y.clone(),
+                                                                    ),
+                                                                )
+                                                            })
+                                                            .collect(),
+                                                        begin_extension: path.begin_extension,
+                                                        end_extension: path.end_extension,
+                                                        span: path.span.clone(),
+                                                    };
+                                                    objects.insert(path.id, path.clone().into());
+                                                    Value::Path(path)
                                                 }
                                                 SolvedValue::Instance(cinst) => {
                                                     let (angle, reflect, cx, cy) = cascade(
@@ -5547,6 +5852,7 @@ impl<'a> ExecPass<'a> {
             match o {
                 SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
                 SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
+                SolvedValue::Path(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Instance(i) => {
                     let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
                     bbox = bbox_union(bbox, cell_bbox);
@@ -5577,6 +5883,7 @@ pub enum Value {
     Int(i64),
     Rect(Rect<LinearExpr>),
     Polygon(Polygon<LinearExpr>),
+    Path(Path<LinearExpr>),
     Point((LinearExpr, LinearExpr)),
     Bool(bool),
     Fn(FnDecl<Substr, VarIdTyMetadata>),
@@ -5628,6 +5935,7 @@ impl Value {
         match self {
             Self::Rect(r) => Some(Object::Rect(r.clone())),
             Self::Polygon(p) => Some(Object::Polygon(p.clone())),
+            Self::Path(p) => Some(Object::Path(p.clone())),
             Self::Inst(i) => Some(Object::Inst(i.clone())),
             _ => None,
         }
@@ -5646,6 +5954,7 @@ impl Value {
         match self {
             Value::Rect(r) => Some(Arrayed::Elem(r.id)),
             Value::Polygon(p) => Some(Arrayed::Elem(p.id)),
+            Value::Path(p) => Some(Arrayed::Elem(p.id)),
             Value::Inst(i) => Some(Arrayed::Elem(i.id)),
             Value::Seq(s) => Some(Arrayed::Array(
                 s.iter().map(|v| v.obj_ids()).collect::<Option<Vec<_>>>()?,
@@ -5698,6 +6007,7 @@ pub struct SolvedInstance {
 pub enum SolvedValue {
     Rect(Rect<(f64, LinearExpr)>),
     Polygon(Polygon<(f64, LinearExpr)>),
+    Path(Path<(f64, LinearExpr)>),
     Text(Text<f64>),
     Dimension(Dimension<(f64, LinearExpr)>),
     Instance(SolvedInstance),
@@ -5708,6 +6018,7 @@ pub enum SolvedValue {
 pub enum Object {
     Rect(Rect<LinearExpr>),
     Polygon(Polygon<LinearExpr>),
+    Path(Path<LinearExpr>),
     Text(Text<LinearExpr>),
     Dimension(Dimension<LinearExpr>),
     Inst(Instance),
@@ -5722,6 +6033,12 @@ impl From<Rect<LinearExpr>> for Object {
 impl From<Polygon<LinearExpr>> for Object {
     fn from(value: Polygon<LinearExpr>) -> Self {
         Self::Polygon(value)
+    }
+}
+
+impl From<Path<LinearExpr>> for Object {
+    fn from(value: Path<LinearExpr>) -> Self {
+        Self::Path(value)
     }
 }
 
@@ -5781,6 +6098,9 @@ pub enum RectInitialCondition {
     Y1(ObjectId),
     PolygonX(ObjectId, usize),
     PolygonY(ObjectId, usize),
+    PathX(ObjectId, usize),
+    PathY(ObjectId, usize),
+    PathWidth(ObjectId),
     InstanceX(ObjectId),
     InstanceY(ObjectId),
 }
@@ -6152,6 +6472,106 @@ impl<T> Polygon<(f64, T)> {
     }
 }
 
+impl<T> Path<(f64, T)> {
+    /// Returns the non-rounded outline of this path, using mitered joins and
+    /// the path's begin/end extensions.
+    pub fn outline(&self) -> Option<Vec<(f64, f64)>> {
+        let mut points = self
+            .points
+            .iter()
+            .map(|(x, y)| (x.0, y.0))
+            .collect::<Vec<_>>();
+        points.dedup();
+        if points.len() < 2 {
+            return None;
+        }
+        let directions = points
+            .windows(2)
+            .map(|points| {
+                let dx = points[1].0 - points[0].0;
+                let dy = points[1].1 - points[0].1;
+                let length = dx.hypot(dy);
+                (dx / length, dy / length)
+            })
+            .collect::<Vec<_>>();
+        if directions
+            .iter()
+            .any(|direction| !direction.0.is_finite() || !direction.1.is_finite())
+        {
+            return None;
+        }
+        let half_width = self.width.0.abs() / 2.;
+        let normal = |direction: (f64, f64)| (-direction.1, direction.0);
+        let start_direction = directions[0];
+        let start = (
+            points[0].0 - start_direction.0 * self.begin_extension,
+            points[0].1 - start_direction.1 * self.begin_extension,
+        );
+        let start_normal = normal(start_direction);
+        let mut left = vec![(
+            start.0 + start_normal.0 * half_width,
+            start.1 + start_normal.1 * half_width,
+        )];
+        let mut right = vec![(
+            start.0 - start_normal.0 * half_width,
+            start.1 - start_normal.1 * half_width,
+        )];
+        for (index, point) in points.iter().enumerate().skip(1).take(points.len() - 2) {
+            let previous = normal(directions[index - 1]);
+            let next = normal(directions[index]);
+            let denominator = 1. + previous.0 * next.0 + previous.1 * next.1;
+            let offset = if denominator.abs() < 1e-12 {
+                (next.0 * half_width, next.1 * half_width)
+            } else {
+                let scale = half_width / denominator;
+                ((previous.0 + next.0) * scale, (previous.1 + next.1) * scale)
+            };
+            left.push((point.0 + offset.0, point.1 + offset.1));
+            right.push((point.0 - offset.0, point.1 - offset.1));
+        }
+        let end_direction = directions[directions.len() - 1];
+        let end = points[points.len() - 1];
+        let end = (
+            end.0 + end_direction.0 * self.end_extension,
+            end.1 + end_direction.1 * self.end_extension,
+        );
+        let end_normal = normal(end_direction);
+        left.push((
+            end.0 + end_normal.0 * half_width,
+            end.1 + end_normal.1 * half_width,
+        ));
+        right.push((
+            end.0 - end_normal.0 * half_width,
+            end.1 - end_normal.1 * half_width,
+        ));
+        left.extend(right.into_iter().rev());
+        Some(left)
+    }
+
+    pub fn bbox(&self) -> Option<Rect<f64>> {
+        let outline = self.outline()?;
+        let mut points = outline.into_iter();
+        let (x, y) = points.next()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+        for (x, y) in points {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        Some(Rect {
+            id: self.id,
+            layer: None,
+            x0,
+            y0,
+            x1,
+            y1,
+            construction: true,
+            span: self.span.clone(),
+        })
+    }
+}
+
 impl Rect<f64> {
     fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
         let mat = tmat(angle, reflect_vert);
@@ -6250,6 +6670,9 @@ impl CompiledData {
                     set.insert(r.id, name.to_owned());
                 }
                 SolvedValue::Polygon(p) => {
+                    set.insert(p.id, name.to_owned());
+                }
+                SolvedValue::Path(p) => {
                     set.insert(p.id, name.to_owned());
                 }
                 SolvedValue::Instance(inst) => {

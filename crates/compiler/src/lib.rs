@@ -1896,6 +1896,77 @@ mod tests {
     }
 
     #[test]
+    fn argon_path_points_and_width_are_constrained_and_exported() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let route = path("met1", 3,
+                        width=20.,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        y2=50.,
+                    );
+                    eq(route.x2, route.points[1].x);
+                    eq(route.width, 20.);
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let CompileOutput::Valid(cells) = &output else {
+            panic!("path should be fully constrained: {output:?}");
+        };
+        let path = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .expect("compiled path");
+        assert_eq!(path.width.0, 20.);
+        assert_eq!(
+            path.points
+                .iter()
+                .map(|(x, y)| (x.0, y.0))
+                .collect::<Vec<_>>(),
+            [(0., 0.), (100., 0.), (100., 50.)]
+        );
+
+        let gds_path = std::env::temp_dir().join(format!("argon-path-{}.gds", std::process::id()));
+        output
+            .to_gds(
+                GdsMap::from_lyp(BASIC_LYP).expect("path GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                &gds_path,
+            )
+            .expect("export path GDS");
+        let gds = GdsLibrary::load(gds_path).expect("reload path GDS");
+        let path = gds.structs[0]
+            .elems
+            .iter()
+            .find_map(|element| match element {
+                GdsElement::GdsPath(path) => Some(path),
+                _ => None,
+            })
+            .expect("GDS path element");
+        assert_eq!(path.width, Some(20));
+        assert_eq!(path.path_type, None);
+        assert_eq!(path.xy.len(), 3);
+    }
+
+    #[test]
     fn argon_tuple_any() {
         let o = parse_workspace_with_std(ARGON_TUPLE_ANY);
         assert!(o.static_errors().is_empty());

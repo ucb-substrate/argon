@@ -736,6 +736,9 @@ fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> 
             RectInitialCondition::Y1(id) => (id, 3),
             RectInitialCondition::PolygonX(_, _)
             | RectInitialCondition::PolygonY(_, _)
+            | RectInitialCondition::PathX(_, _)
+            | RectInitialCondition::PathY(_, _)
+            | RectInitialCondition::PathWidth(_)
             | RectInitialCondition::InstanceX(_)
             | RectInitialCondition::InstanceY(_) => {
                 continue;
@@ -903,6 +906,24 @@ fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>,
                         object_path: Vec::new(),
                         cvars: None,
                     });
+                }
+                SolvedValue::Path(path) => {
+                    if let Some(outline) = path.outline() {
+                        let point_count = outline.len();
+                        polygons.push(Polygon {
+                            points: outline
+                                .into_iter()
+                                .map(|point| {
+                                    let point = ifmatvec(mat, point);
+                                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                                })
+                                .collect(),
+                            edge_styles: vec![BorderStyle::Dashed; point_count],
+                            id: None,
+                            object_path: Vec::new(),
+                            cvars: None,
+                        });
+                    }
                 }
                 SolvedValue::Instance(instance) if !instance.construction => {
                     let mut instance_mat = TransformationMatrix::identity();
@@ -1277,6 +1298,79 @@ impl Element for CanvasElement {
                                         .map(|(x, y)| (x.1.clone(), y.1.clone()))
                                         .collect()
                                 }),
+                            };
+                            if show && layer.visible {
+                                polygons.push((polygon, layer.clone()));
+                            }
+                        }
+                        SolvedValue::Path(path) => {
+                            if depth == 0
+                                && let Some(span) = &path.span
+                            {
+                                let mut coordinates = path
+                                    .points
+                                    .iter()
+                                    .enumerate()
+                                    .flat_map(|(index, (x, y))| {
+                                        [
+                                            (x.1.clone(), format!("x{index}i"), x.0),
+                                            (y.1.clone(), format!("y{index}i"), y.0),
+                                        ]
+                                    })
+                                    .collect::<Vec<_>>();
+                                coordinates.push((
+                                    path.width.1.clone(),
+                                    "widthi".to_owned(),
+                                    path.width.0,
+                                ));
+                                source_coordinates.insert(span.clone(), coordinates);
+                            }
+                            let Some(layer) = layers.layers.get(path.layer.as_str()) else {
+                                continue;
+                            };
+                            let mut displayed = path.clone();
+                            if depth == 0
+                                && let Some(sse_dv) = &sse_dv
+                            {
+                                displayed.width.0 +=
+                                    crate::sse::dot(&SparseVec::from(&path.width.1), sse_dv);
+                                for ((x, y), (display_x, display_y)) in
+                                    path.points.iter().zip(&mut displayed.points)
+                                {
+                                    display_x.0 += crate::sse::dot(&SparseVec::from(&x.1), sse_dv);
+                                    display_y.0 += crate::sse::dot(&SparseVec::from(&y.1), sse_dv);
+                                }
+                            }
+                            let Some(outline) = displayed.outline() else {
+                                continue;
+                            };
+                            let unconstrained = depth == 0
+                                && std::iter::once(&path.width.1)
+                                    .chain(path.points.iter().flat_map(|(x, y)| [&x.1, &y.1]))
+                                    .flat_map(|expr| &expr.coeffs)
+                                    .any(|(_, var)| cell_info.unsolved_vars.contains(var));
+                            let polygon = Polygon {
+                                edge_styles: vec![
+                                    if unconstrained {
+                                        BorderStyle::Dashed
+                                    } else {
+                                        BorderStyle::Solid
+                                    };
+                                    outline.len()
+                                ],
+                                points: outline
+                                    .into_iter()
+                                    .map(|point| {
+                                        let point = ifmatvec(mat, point);
+                                        Point::new(
+                                            (point.0 + ofs.0) as f32,
+                                            (point.1 + ofs.1) as f32,
+                                        )
+                                    })
+                                    .collect(),
+                                id: path.span.clone(),
+                                object_path,
+                                cvars: None,
                             };
                             if show && layer.visible {
                                 polygons.push((polygon, layer.clone()));
@@ -3734,7 +3828,9 @@ pub(crate) fn find_obj_path(
         .reachable_objs(current_scope.cell, current_scope.scope);
     if let Some(name) = reachable_objs.swap_remove(obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
-            SolvedValue::Rect(_) | SolvedValue::Polygon(_) => string_path.push(name),
+            SolvedValue::Rect(_) | SolvedValue::Polygon(_) | SolvedValue::Path(_) => {
+                string_path.push(name)
+            }
             SolvedValue::Instance(_) => {
                 string_path.push(name);
                 string_path = vec![format!("bbox({})", string_path.join("."))];

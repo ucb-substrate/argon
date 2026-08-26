@@ -258,7 +258,7 @@ mod tests {
 
     use argonc::{artifact, compile::CompileOutput};
     use clap::{CommandFactory, Parser};
-    use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
+    use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPath, GdsPoint, GdsStruct};
 
     use super::{Args, ErrorFormat, Failed, run};
 
@@ -298,6 +298,30 @@ mod tests {
         library
             .save(&path)
             .expect("temporary GDS should be written");
+        path
+    }
+
+    fn temp_path_gds(name: &str) -> PathBuf {
+        let source = temp_source(name, "");
+        let path = source.with_extension("gds");
+        let mut library = GdsLibrary::new("fixture");
+        let mut structure = GdsStruct::new("layout_top");
+        structure.elems.push(GdsElement::GdsPath(GdsPath {
+            layer: 235,
+            datatype: 4,
+            width: Some(20),
+            path_type: Some(2),
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(100, 0),
+                GdsPoint::new(100, 50),
+            ],
+            ..Default::default()
+        }));
+        library.structs.push(structure);
+        library
+            .save(&path)
+            .expect("temporary path GDS should be written");
         path
     }
 
@@ -498,6 +522,62 @@ mod tests {
         let imported_cell = &output.cells[&imported.cell];
         assert_eq!(imported_cell.objects.len(), 1);
         assert!(imported_cell.fields.contains_key("gds_rect_0"));
+    }
+
+    #[test]
+    fn imports_and_reexports_a_non_rounded_gds_path() {
+        let source = temp_source(
+            "gds-path-root",
+            "cell top() {\n\
+             let imported = inst(routes(), x=0., y=0.);\n\
+             eq(imported.gds_path_0.width, 20.);\n\
+             eq(imported.gds_path_0.x1, 100.);\n\
+             }\n",
+        );
+        let directory = source.parent().expect("source should have a parent");
+        let artifact_path = directory.join("imported.bin");
+        let exported_path = directory.join("roundtrip.gds");
+        let mut args = execution_args(source, "top()", basic_lyp());
+        args.gds_imports
+            .push(("routes".to_owned(), temp_path_gds("gds-path-import")));
+        args.output = Some(artifact_path.clone());
+        args.gds = Some(exported_path.clone());
+
+        if let Err(error) = run(args) {
+            panic!("GDS path import should compile: {}", render_failed(error));
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("GDS path import should compile successfully");
+        };
+        let imported = output.cells[&output.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_instance())
+            .expect("top should instantiate the imported cell");
+        let imported_path = output.cells[&imported.cell]
+            .objects
+            .values()
+            .find_map(|object| object.get_path())
+            .expect("imported cell should contain a path");
+        assert_eq!(imported_path.width.0, 20.);
+        assert_eq!(imported_path.begin_extension, 10.);
+        assert_eq!(imported_path.end_extension, 10.);
+
+        let exported = GdsLibrary::load(exported_path).expect("round-trip GDS should load");
+        let exported_path = exported
+            .structs
+            .iter()
+            .flat_map(|structure| &structure.elems)
+            .find_map(|element| match element {
+                GdsElement::GdsPath(path) => Some(path),
+                _ => None,
+            })
+            .expect("round-trip GDS should contain a path");
+        assert_eq!(exported_path.width, Some(20));
+        assert_eq!(exported_path.path_type, Some(2));
+        assert_eq!(exported_path.xy.len(), 3);
     }
 
     #[test]
