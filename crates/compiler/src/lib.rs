@@ -2172,6 +2172,53 @@ mod tests {
     }
 
     #[test]
+    fn sharp_path_corner_matches_klayout_cutoff_outline() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    path("met1", 4,
+                        width=20.,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        x2=150., y2=75.,
+                        x3=110.3, y3=14.9,
+                    );
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        )
+        .unwrap_valid();
+        let path = output.cells[&output.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .unwrap();
+        let outline = path.outline().unwrap();
+        let bbox = path.bbox().unwrap();
+
+        assert_eq!(outline.len(), 11);
+        assert_relative_eq!(bbox.x0, 0., epsilon = EPSILON);
+        assert_relative_eq!(bbox.y0, -10., epsilon = EPSILON);
+        assert_relative_eq!(bbox.x1, 163.85563301818058, epsilon = EPSILON);
+        assert_relative_eq!(bbox.y1, 88.86750490563072, epsilon = EPSILON);
+    }
+
+    #[test]
     fn argon_tuple_any() {
         let o = parse_workspace_with_std(ARGON_TUPLE_ANY);
         assert!(o.static_errors().is_empty());

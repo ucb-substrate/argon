@@ -6575,80 +6575,196 @@ impl<T> Polygon<(f64, T)> {
     }
 }
 
+const PATH_OUTLINE_EPSILON: f64 = 1e-12;
+
+fn path_real_points(points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    let mut result = Vec::<(f64, f64)>::with_capacity(points.len());
+    for point in points {
+        if result.last() == Some(&point) {
+            continue;
+        }
+        while result.len() >= 2 {
+            let a = result[result.len() - 2];
+            let b = result[result.len() - 1];
+            let ab = (b.0 - a.0, b.1 - a.1);
+            let bc = (point.0 - b.0, point.1 - b.1);
+            if path_cross(ab, bc).abs() <= PATH_OUTLINE_EPSILON && path_dot(ab, bc) >= 0. {
+                result.pop();
+            } else {
+                break;
+            }
+        }
+        result.push(point);
+    }
+    result
+}
+
+fn path_shifted_side(
+    points: &[(f64, f64)],
+    half_width: f64,
+    begin_extension: f64,
+    end_extension: f64,
+) -> Option<Vec<(f64, f64)>> {
+    let directions = points
+        .windows(2)
+        .map(|points| path_unit(points[0], points[1]))
+        .collect::<Option<Vec<_>>>()?;
+    let mut shifted = Vec::with_capacity(points.len() * 2);
+
+    let first_direction = directions[0];
+    let first_normal = path_scale(path_normal(first_direction), half_width);
+    shifted.push(path_add(
+        points[0],
+        path_add(path_scale(first_direction, -begin_extension), first_normal),
+    ));
+
+    for index in 1..points.len() - 1 {
+        let point = points[index];
+        let previous_direction = directions[index - 1];
+        let next_direction = directions[index];
+        let previous_normal = path_scale(path_normal(previous_direction), half_width);
+        let next_normal = path_scale(path_normal(next_direction), half_width);
+        let turn = path_cross(previous_direction, next_direction);
+
+        if turn.abs() > PATH_OUTLINE_EPSILON {
+            let normal_delta = (
+                next_normal.0 - previous_normal.0,
+                next_normal.1 - previous_normal.1,
+            );
+            let previous_length = path_distance(points[index - 1], point);
+            let next_length = path_distance(points[index + 1], point);
+            let previous_offset = path_cross(normal_delta, next_direction) / turn;
+            let next_offset = path_cross(
+                (
+                    previous_normal.0 - next_normal.0,
+                    previous_normal.1 - next_normal.1,
+                ),
+                previous_direction,
+            ) / turn;
+            let previous_min = -previous_length - half_width;
+            let next_min = -next_length - half_width;
+
+            if previous_offset < previous_min - PATH_OUTLINE_EPSILON
+                || next_offset < next_min - PATH_OUTLINE_EPSILON
+            {
+                shifted.push(path_add(point, previous_normal));
+                shifted.push(point);
+                shifted.push(path_add(point, next_normal));
+            } else if previous_offset <= half_width + PATH_OUTLINE_EPSILON
+                && next_offset <= half_width + PATH_OUTLINE_EPSILON
+            {
+                shifted.push(path_add(
+                    point,
+                    path_add(
+                        previous_normal,
+                        path_scale(previous_direction, previous_offset),
+                    ),
+                ));
+            } else {
+                shifted.push(path_add(
+                    point,
+                    path_add(
+                        previous_normal,
+                        path_scale(previous_direction, previous_offset.min(half_width)),
+                    ),
+                ));
+                shifted.push(path_add(
+                    point,
+                    path_add(
+                        next_normal,
+                        path_scale(next_direction, -next_offset.min(half_width)),
+                    ),
+                ));
+            }
+        } else if path_dot(previous_direction, next_direction) < -PATH_OUTLINE_EPSILON {
+            shifted.push(path_add(
+                point,
+                path_add(previous_normal, path_scale(previous_direction, half_width)),
+            ));
+            shifted.push(path_add(
+                point,
+                path_add(next_normal, path_scale(next_direction, -half_width)),
+            ));
+        }
+    }
+
+    let last_direction = directions[directions.len() - 1];
+    let last_normal = path_scale(path_normal(last_direction), half_width);
+    shifted.push(path_add(
+        points[points.len() - 1],
+        path_add(path_scale(last_direction, end_extension), last_normal),
+    ));
+    Some(shifted)
+}
+
+fn path_unit(from: (f64, f64), to: (f64, f64)) -> Option<(f64, f64)> {
+    let vector = (to.0 - from.0, to.1 - from.1);
+    let length = vector.0.hypot(vector.1);
+    (length.is_finite() && length > 0.).then_some((vector.0 / length, vector.1 / length))
+}
+
+fn path_add(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 + b.0, a.1 + b.1)
+}
+
+fn path_scale(vector: (f64, f64), scale: f64) -> (f64, f64) {
+    (vector.0 * scale, vector.1 * scale)
+}
+
+fn path_normal(vector: (f64, f64)) -> (f64, f64) {
+    (-vector.1, vector.0)
+}
+
+fn path_cross(a: (f64, f64), b: (f64, f64)) -> f64 {
+    a.0 * b.1 - a.1 * b.0
+}
+
+fn path_dot(a: (f64, f64), b: (f64, f64)) -> f64 {
+    a.0 * b.0 + a.1 * b.1
+}
+
+fn path_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
 impl<T> Path<(f64, T)> {
-    /// Returns the non-rounded outline of this path, using mitered joins and
-    /// the path's begin/end extensions.
+    /// Returns the non-rounded outline of this path, using bounded mitered
+    /// joins and the path's begin/end extensions.
     pub fn outline(&self) -> Option<Vec<(f64, f64)>> {
-        let mut points = self
+        let points = self
             .points
             .iter()
             .map(|(x, y)| (x.0, y.0))
             .collect::<Vec<_>>();
-        points.dedup();
+        let points = path_real_points(points);
         if points.len() < 2 {
             return None;
         }
-        let directions = points
-            .windows(2)
-            .map(|points| {
-                let dx = points[1].0 - points[0].0;
-                let dy = points[1].1 - points[0].1;
-                let length = dx.hypot(dy);
-                (dx / length, dy / length)
-            })
-            .collect::<Vec<_>>();
-        if directions
-            .iter()
-            .any(|direction| !direction.0.is_finite() || !direction.1.is_finite())
+        let half_width = self.width.0.abs() / 2.;
+        if !half_width.is_finite()
+            || !self.begin_extension.0.is_finite()
+            || !self.end_extension.0.is_finite()
         {
             return None;
         }
-        let half_width = self.width.0.abs() / 2.;
-        let normal = |direction: (f64, f64)| (-direction.1, direction.0);
-        let start_direction = directions[0];
-        let start = (
-            points[0].0 - start_direction.0 * self.begin_extension.0,
-            points[0].1 - start_direction.1 * self.begin_extension.0,
-        );
-        let start_normal = normal(start_direction);
-        let mut left = vec![(
-            start.0 + start_normal.0 * half_width,
-            start.1 + start_normal.1 * half_width,
-        )];
-        let mut right = vec![(
-            start.0 - start_normal.0 * half_width,
-            start.1 - start_normal.1 * half_width,
-        )];
-        for (index, point) in points.iter().enumerate().skip(1).take(points.len() - 2) {
-            let previous = normal(directions[index - 1]);
-            let next = normal(directions[index]);
-            let denominator = 1. + previous.0 * next.0 + previous.1 * next.1;
-            let offset = if denominator.abs() < 1e-12 {
-                (next.0 * half_width, next.1 * half_width)
-            } else {
-                let scale = half_width / denominator;
-                ((previous.0 + next.0) * scale, (previous.1 + next.1) * scale)
-            };
-            left.push((point.0 + offset.0, point.1 + offset.1));
-            right.push((point.0 - offset.0, point.1 - offset.1));
-        }
-        let end_direction = directions[directions.len() - 1];
-        let end = points[points.len() - 1];
-        let end = (
-            end.0 + end_direction.0 * self.end_extension.0,
-            end.1 + end_direction.1 * self.end_extension.0,
-        );
-        let end_normal = normal(end_direction);
-        left.push((
-            end.0 + end_normal.0 * half_width,
-            end.1 + end_normal.1 * half_width,
-        ));
-        right.push((
-            end.0 - end_normal.0 * half_width,
-            end.1 - end_normal.1 * half_width,
-        ));
-        left.extend(right.into_iter().rev());
-        Some(left)
+
+        let mut outline = path_shifted_side(
+            &points,
+            half_width,
+            self.begin_extension.0,
+            self.end_extension.0,
+        )?;
+        let reversed = points.iter().rev().copied().collect::<Vec<_>>();
+        outline.extend(path_shifted_side(
+            &reversed,
+            half_width,
+            self.end_extension.0,
+            self.begin_extension.0,
+        )?);
+        outline
+            .iter()
+            .all(|(x, y)| x.is_finite() && y.is_finite())
+            .then_some(outline)
     }
 
     pub fn bbox(&self) -> Option<Rect<f64>> {

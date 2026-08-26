@@ -5,7 +5,7 @@ use std::{
 };
 
 use analyzer::rpc::{
-    DimensionParams, InitialConditionEdit, InstancePreview, PolygonParams, ValueEdit,
+    DimensionParams, InitialConditionEdit, InstancePreview, PathParams, PolygonParams, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -39,6 +39,7 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
+const DEFAULT_DRAW_PATH_WIDTH: f32 = 20.;
 /// Side length of the square drag handles drawn on unconstrained edges.
 const HANDLE_SIZE: Pixels = px(12.);
 /// Side length of the (larger, invisible) clickable area around each handle, so
@@ -597,6 +598,11 @@ pub(crate) struct DrawPolygonToolState {
     points: Vec<Point<f32>>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DrawPathToolState {
+    points: Vec<Point<f32>>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum DimEdge<T> {
     /// y-axis
@@ -664,6 +670,7 @@ pub(crate) struct PlaceInstanceToolState {
 pub(crate) enum ToolState {
     DrawRect(DrawRectToolState),
     DrawPolygon(DrawPolygonToolState),
+    DrawPath(DrawPathToolState),
     DrawDim(DrawDimToolState),
     EditDim(EditDimToolState),
     PlaceInstance(PlaceInstanceToolState),
@@ -1938,22 +1945,29 @@ impl Element for CanvasElement {
                             Edges::all(BorderStyle::Solid),
                         ));
                     }
-                    if let ToolState::DrawPolygon(polygon_tool) = &tool
-                        && !polygon_tool.points.is_empty()
-                    {
-                        let points = polygon_tool
-                            .points
+                    let draw_points = match &tool {
+                        ToolState::DrawPolygon(tool) if !tool.points.is_empty() => {
+                            Some((&tool.points, DEFAULT_BORDER_WIDTH))
+                        }
+                        ToolState::DrawPath(tool) if !tool.points.is_empty() => Some((
+                            &tool.points,
+                            self.inner.read(cx).scale * px(DEFAULT_DRAW_PATH_WIDTH),
+                        )),
+                        _ => None,
+                    };
+                    if let Some((draw_points, stroke_width)) = draw_points {
+                        let points = draw_points
                             .iter()
                             .copied()
                             .chain(std::iter::once(layout_mouse_position))
                             .map(|point| self.inner.read(cx).layout_to_px(point))
                             .collect::<Vec<_>>();
-                        let mut preview = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
+                        let mut preview = PathBuilder::stroke(stroke_width);
                         preview.add_polygon(&points, false);
                         if let Ok(path) = preview.build() {
                             window.paint_path(path, rgb(0xffff00));
                         }
-                        for point in points.iter().take(polygon_tool.points.len()) {
+                        for point in points.iter().take(draw_points.len()) {
                             let draw_half = HANDLE_SIZE.half();
                             window.paint_quad(get_paint_quad(
                                 Bounds::new(
@@ -2724,6 +2738,7 @@ impl Render for LayoutCanvas {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_polygon))
+            .on_action(cx.listener(Self::draw_path))
             .on_action(cx.listener(Self::select_mode))
             .on_action(cx.listener(Self::draw_dim))
             .on_action(cx.listener(Self::edit_action))
@@ -2732,7 +2747,7 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::one_hierarchy))
             .on_action(cx.listener(Self::all_hierarchy))
             .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::finish_polygon))
+            .on_action(cx.listener(Self::finish_draw_points))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
@@ -3114,6 +3129,33 @@ impl LayoutCanvas {
                             );
                             if polygon_tool.points.last() != Some(&point) {
                                 polygon_tool.points.push(point);
+                                cx.notify();
+                            }
+                        } else {
+                            let _ = state.lang_server_client.show_message(
+                                MessageType::ERROR,
+                                "Cannot draw on an invisible layer.",
+                            );
+                        }
+                    } else {
+                        let _ = state
+                            .lang_server_client
+                            .show_message(MessageType::ERROR, "No layer has been selected.");
+                    }
+                }
+                ToolState::DrawPath(path_tool) => {
+                    let state = self.state.read(cx);
+                    let layers = state.layers.read(cx);
+                    if let Some(layer) = &layers.selected_layer
+                        && let Some(layer_info) = layers.layers.get(layer)
+                    {
+                        if layer_info.visible {
+                            let point = Point::new(
+                                (layout_mouse_position.x * 10.).round() / 10.,
+                                (layout_mouse_position.y * 10.).round() / 10.,
+                            );
+                            if path_tool.points.last() != Some(&point) {
+                                path_tool.points.push(point);
                                 cx.notify();
                             }
                         } else {
@@ -3634,25 +3676,38 @@ impl LayoutCanvas {
         });
     }
 
-    pub(crate) fn finish_polygon(
+    pub(crate) fn draw_path(&mut self, _: &DrawPath, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            if !tool.is_draw_path() {
+                *tool = ToolState::DrawPath(DrawPathToolState::default());
+                cx.notify();
+            }
+        });
+    }
+
+    pub(crate) fn finish_draw_points(
         &mut self,
         _: &Enter,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.state.read(cx).tool.clone().update(cx, |tool, cx| {
-            let ToolState::DrawPolygon(polygon_tool) = tool else {
-                return;
+            let (draw_points, is_path) = match tool {
+                ToolState::DrawPolygon(tool) => (&mut tool.points, false),
+                ToolState::DrawPath(tool) => (&mut tool.points, true),
+                _ => return,
             };
-            if polygon_tool.points.len() < 3 {
+            let minimum_points = if is_path { 2 } else { 3 };
+            if draw_points.len() < minimum_points {
+                let shape = if is_path { "path" } else { "polygon" };
+                let count = if is_path { "two" } else { "three" };
                 let _ = self.state.read(cx).lang_server_client.show_message(
                     MessageType::ERROR,
-                    "A polygon requires at least three points before pressing Enter.",
+                    format!("A {shape} requires at least {count} points before pressing Enter."),
                 );
                 return;
             }
-            let points = polygon_tool
-                .points
+            let points = draw_points
                 .iter()
                 .map(|point| (f64::from(point.x), f64::from(point.y)))
                 .collect::<Vec<_>>();
@@ -3684,22 +3739,36 @@ impl LayoutCanvas {
                         .output
                         .reachable_objs(scope_address.cell, scope_address.scope);
                     let names: IndexSet<_> = reachable_objs.values().collect();
-                    let polygon_name = (0..)
-                        .map(|index| format!("polygon{index}"))
+                    let name_prefix = if is_path { "path" } else { "polygon" };
+                    let object_name = (0..)
+                        .map(|index| format!("{name_prefix}{index}"))
                         .find(|name| !names.contains(name))
                         .unwrap();
                     let scope_span = cell.output.cells[&scope_address.cell].scopes
                         [&scope_address.scope]
                         .span
                         .clone();
-                    match state.lang_server_client.draw_polygon(
-                        scope_span,
-                        polygon_name,
-                        PolygonParams {
-                            layer: layer.clone(),
-                            points: points.clone(),
-                        },
-                    ) {
+                    let result = if is_path {
+                        state.lang_server_client.draw_path(
+                            scope_span,
+                            object_name,
+                            PathParams {
+                                layer: layer.clone(),
+                                width: f64::from(DEFAULT_DRAW_PATH_WIDTH),
+                                points: points.clone(),
+                            },
+                        )
+                    } else {
+                        state.lang_server_client.draw_polygon(
+                            scope_span,
+                            object_name,
+                            PolygonParams {
+                                layer: layer.clone(),
+                                points: points.clone(),
+                            },
+                        )
+                    };
+                    match result {
                         Ok(Some(_)) => {
                             inserted = true;
                             None
@@ -3713,7 +3782,7 @@ impl LayoutCanvas {
                 }
             });
             if inserted {
-                polygon_tool.points.clear();
+                draw_points.clear();
                 cx.notify();
             }
         });
@@ -3807,6 +3876,9 @@ impl LayoutCanvas {
                     *p0 = None;
                 }
                 ToolState::DrawPolygon(DrawPolygonToolState { points }) if !points.is_empty() => {
+                    points.clear();
+                }
+                ToolState::DrawPath(DrawPathToolState { points }) if !points.is_empty() => {
                     points.clear();
                 }
                 ToolState::DrawDim(DrawDimToolState { edges }) if !edges.is_empty() => {
