@@ -1363,6 +1363,7 @@ impl Element for CanvasElement {
             &tool,
             ToolState::Select(SelectToolState { selected_obj: None })
         ) && let Some(cache) = inner.raster_cache.clone()
+            && cache.viewport == bounds.size
         {
             let theme = state.theme();
             let bg_style = inner.bg_style.clone();
@@ -3201,6 +3202,9 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn fit_to_screen(&mut self, cx: &mut Context<Self>) {
+        self.raster_cache = None;
+        self.raster_refinement = None;
+        self.hover_hit = None;
         if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
                 let scope_address = &cell.state[&cell.selected_scope].address;
