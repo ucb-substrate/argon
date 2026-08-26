@@ -474,19 +474,10 @@ impl Editor {
         true
     }
 
-    pub fn open_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
-        if !self.apply_snapshot(cx, snapshot) {
-            return;
-        }
+    pub fn fit_to_screen(&self, cx: &mut App) {
         self.canvas.update(cx, |canvas, cx| {
             canvas.fit_to_screen(cx);
             cx.notify();
-        });
-        self.hierarchy_sidebar.update(cx, |sidebar, cx| {
-            sidebar.state.update(cx, |state, cx| {
-                state.expanded_scopes.clear();
-                cx.notify();
-            });
         });
     }
 

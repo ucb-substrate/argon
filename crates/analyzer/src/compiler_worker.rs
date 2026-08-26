@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::mpsc, thread};
 
 use arc::Library;
 use argonc::{
+    WorkspaceConfig,
     compile::{CompileOutput, StaticErrorCompileOutput},
     incremental::IncrementalCompiler,
     parse::WorkspaceParseAst,
@@ -10,18 +11,23 @@ use tokio::sync::oneshot;
 
 use crate::{open_cell_input, workspace_config};
 
-#[derive(Debug)]
-pub(crate) struct CompileRequest {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompileIdentity {
     pub(crate) revision: u64,
-    pub(crate) root_dir: PathBuf,
     pub(crate) cell: Option<String>,
 }
 
 #[derive(Debug)]
-pub(crate) struct CompileResult {
-    pub(crate) revision: u64,
+pub(crate) struct CompileRequest {
+    pub(crate) identity: CompileIdentity,
     pub(crate) root_dir: PathBuf,
-    pub(crate) config: Option<Library>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompileResult {
+    pub(crate) identity: CompileIdentity,
+    pub(crate) root_dir: PathBuf,
+    pub(crate) config: WorkspaceConfig,
     pub(crate) ast: WorkspaceParseAst,
     pub(crate) output: Option<CompileOutput>,
     pub(crate) messages: Vec<String>,
@@ -91,15 +97,16 @@ fn run(commands: mpsc::Receiver<Command>) {
 }
 
 fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> CompileResult {
-    let manifest_path = request.root_dir.join("Argon.toml");
-    let config = if manifest_path.is_file() {
+    let CompileRequest { identity, root_dir } = request;
+    let manifest_path = root_dir.join("Argon.toml");
+    let library = if manifest_path.is_file() {
         match Library::load(&manifest_path) {
-            Ok(config) => Some(config),
+            Ok(library) => Some(library),
             Err(error) => {
                 return CompileResult {
-                    revision: request.revision,
-                    root_dir: request.root_dir,
-                    config: None,
+                    identity,
+                    config: WorkspaceConfig::new(root_dir.join("lib.ar")),
+                    root_dir,
                     ast: WorkspaceParseAst::default(),
                     output: None,
                     messages: vec![error.to_string()],
@@ -109,8 +116,7 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
     } else {
         None
     };
-    let lyp = config.as_ref().and_then(|config| config.lyp.clone());
-    let workspace = workspace_config(request.root_dir.join("lib.ar"), config.as_ref());
+    let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
     let analysis = compiler.analyze_workspace(&workspace);
     let ast = analysis.ast;
     let mut messages = Vec::new();
@@ -120,8 +126,8 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
             Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
                 errors: analysis.errors,
             }))
-        } else if let Some(cell) = request.cell {
-            let Some(lyp) = lyp.as_deref() else {
+        } else if let Some(cell) = identity.cell.as_deref() {
+            if workspace.lyp.is_none() {
                 let message = if manifest_path.is_file() {
                     format!(
                         "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
@@ -135,15 +141,15 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                 };
                 messages.push(format!("Could not open cell: {message}"));
                 return CompileResult {
-                    revision: request.revision,
-                    root_dir: request.root_dir,
-                    config,
+                    identity,
+                    root_dir,
+                    config: workspace,
                     ast,
                     output: None,
                     messages,
                 };
-            };
-            match open_cell_input(&cell, lyp) {
+            }
+            match open_cell_input(cell) {
                 Ok((cell_path, args)) => Some(compiler.compile_cell(&workspace, &cell_path, args)),
                 Err(message) => {
                     messages.push(message);
@@ -158,9 +164,9 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
     };
 
     CompileResult {
-        revision: request.revision,
-        root_dir: request.root_dir,
-        config,
+        identity,
+        root_dir,
+        config: workspace,
         ast,
         output,
         messages,
@@ -192,25 +198,29 @@ mod tests {
         worker.set_source_text(root.clone(), "cell top() { missing; }\n".to_owned());
         let first = worker
             .compile(CompileRequest {
-                revision: 1,
+                identity: CompileIdentity {
+                    revision: 1,
+                    cell: Some("top()".to_owned()),
+                },
                 root_dir: directory.path().to_path_buf(),
-                cell: Some("top()".to_owned()),
             })
             .await
             .unwrap();
-        assert_eq!(first.revision, 1);
+        assert_eq!(first.identity.revision, 1);
         assert!(matches!(first.output, Some(CompileOutput::StaticErrors(_))));
 
         worker.set_source_text(root, "cell top() {}\n".to_owned());
         let second = worker
             .compile(CompileRequest {
-                revision: 2,
+                identity: CompileIdentity {
+                    revision: 2,
+                    cell: Some("top()".to_owned()),
+                },
                 root_dir: directory.path().to_path_buf(),
-                cell: Some("top()".to_owned()),
             })
             .await
             .unwrap();
-        assert_eq!(second.revision, 2);
+        assert_eq!(second.identity.revision, 2);
         assert!(matches!(second.output, Some(CompileOutput::Valid(_))));
     }
 }

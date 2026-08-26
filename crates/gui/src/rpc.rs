@@ -407,22 +407,19 @@ pub struct GuiServer {
 }
 
 impl Gui for GuiServer {
-    async fn open_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
+    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                let _ = cx.update(|cx| {
-                    editor.open_cell(cx, snapshot);
-                    focus::activate_gui(cx);
-                });
+                let _ = cx.update(|cx| editor.update_cell(cx, snapshot));
             }))
             .await
             .unwrap();
     }
 
-    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
+    async fn fit(mut self, _: context::Context) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                let _ = cx.update(|cx| editor.update_cell(cx, snapshot));
+                let _ = cx.update(|cx| editor.fit_to_screen(cx));
             }))
             .await
             .unwrap();

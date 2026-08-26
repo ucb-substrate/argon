@@ -9,10 +9,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{
-        Arc, OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, OnceLock, RwLock, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -44,7 +41,7 @@ use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
-use crate::compiler_worker::{CompileRequest, CompileResult, CompilerWorker};
+use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
 use crate::document::{Document, DocumentChange};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
@@ -275,15 +272,30 @@ pub fn reload_log_filter(level: &str) -> std::result::Result<(), String> {
 
 #[derive(Debug, Default)]
 pub(crate) struct SourceState {
+    pub(crate) revision: u64,
     pub(crate) cell: Option<String>,
     pub(crate) editor_files: IndexMap<Uri, Document>,
     pub(crate) pending_workspace_edits: IndexMap<Uri, usize>,
     pub(crate) workspace_modified: bool,
 }
 
+impl SourceState {
+    fn advance_revision(&mut self) -> u64 {
+        self.revision = self.revision.saturating_add(1);
+        self.revision
+    }
+
+    fn compile_identity(&self) -> CompileIdentity {
+        CompileIdentity {
+            revision: self.revision,
+            cell: self.cell.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct PublishedState {
-    pub(crate) config: Option<Library>,
+    pub(crate) config: WorkspaceConfig,
     pub(crate) ast: Arc<WorkspaceParseAst>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
@@ -293,12 +305,6 @@ pub(crate) struct PublishedState {
 struct GuiConnection {
     id: u64,
     client: GuiClient,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Presentation {
-    Open,
-    Update,
 }
 
 /// Errors that actually prevent the GUI from displaying a compiled cell.
@@ -348,11 +354,10 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
 async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     cell: &str,
-    lyp: &Path,
     config: &WorkspaceConfig,
     client: &Client,
 ) -> Option<CompileOutput> {
-    let (cell_path, args) = match open_cell_input(cell, lyp) {
+    let (cell_path, args) = match open_cell_input(cell) {
         Ok(input) => input,
         Err(message) => {
             client.show_message(MessageType::ERROR, message).await;
@@ -370,14 +375,7 @@ async fn compile_open_cell(
     ))
 }
 
-fn open_cell_input(
-    cell: &str,
-    lyp: &Path,
-) -> std::result::Result<(Vec<String>, Vec<CellArg>), String> {
-    if let Err(error) = argonc::layer::read_lyp(lyp) {
-        return Err(format!("Could not open cell: {error}"));
-    }
-
+fn open_cell_input(cell: &str) -> std::result::Result<(Vec<String>, Vec<CellArg>), String> {
     let cell_ast = match parse::parse_cell(cell) {
         Ok(cell_ast) => cell_ast,
         Err(error) => return Err(format!("Open cell is invalid: {error}")),
@@ -469,16 +467,9 @@ pub struct State {
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
-    // Content identity and request cancellation are deliberately separate:
-    // several cell-open requests may target the same source revision.
-    source_revision: Arc<AtomicU64>,
-    // Incrementing this generation supersedes queued, running, or publishing
-    // compilation work without assigning a magic source revision.
-    compile_generation: Arc<AtomicU64>,
     gui_client: Arc<Mutex<Option<GuiConnection>>>,
     gui_process: Arc<Mutex<Option<Child>>>,
     gui_generation: Arc<AtomicU64>,
-    compile_debounce_ms: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
 }
 
@@ -495,19 +486,14 @@ impl State {
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
-            source_revision: Arc::new(AtomicU64::new(0)),
-            compile_generation: Arc::new(AtomicU64::new(0)),
             gui_client: Default::default(),
             gui_process: Default::default(),
             gui_generation: Arc::new(AtomicU64::new(0)),
-            compile_debounce_ms: Arc::new(AtomicU64::new(config.analyzer.compile_debounce_ms)),
             app_config: Arc::new(RwLock::new(config)),
         }
     }
 
     fn apply_config(&self, config: ArgonConfig) {
-        self.compile_debounce_ms
-            .store(config.analyzer.compile_debounce_ms, Ordering::Release);
         *self
             .app_config
             .write()
@@ -521,17 +507,9 @@ impl State {
             .clone()
     }
 
-    fn supersede_compilation(&self) -> u64 {
-        self.compile_generation.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    fn compilation_is_current(&self, generation: u64, revision: u64) -> bool {
-        self.compile_generation.load(Ordering::Acquire) == generation
-            && self.source_revision.load(Ordering::Acquire) == revision
-    }
-
-    fn advance_source_revision(&self) -> u64 {
-        self.source_revision.fetch_add(1, Ordering::AcqRel) + 1
+    async fn compilation_is_current(&self, identity: &CompileIdentity) -> bool {
+        let source = self.source_state.lock().await;
+        source.compile_identity() == *identity
     }
 
     async fn gui_connection(&self) -> Option<GuiConnection> {
@@ -608,78 +586,58 @@ impl Backend {
         Ok(())
     }
 
-    fn schedule_compile(&self, revision: u64, generation: u64) {
+    fn schedule_compile(&self, identity: CompileIdentity) {
         let backend = self.clone();
-        let delay = self.state.compile_debounce_ms.load(Ordering::Acquire);
+        let delay = self.state.config().analyzer.compile_debounce_ms;
         tokio::spawn(async move {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            if backend.state.compilation_is_current(generation, revision) {
-                backend
-                    .compile_revision(revision, generation, Presentation::Update)
-                    .await;
+            if backend.state.compilation_is_current(&identity).await {
+                backend.update_cell(identity).await;
             }
         });
     }
 
-    async fn compile_revision(&self, revision: u64, generation: u64, presentation: Presentation) {
-        if !self.state.compilation_is_current(generation, revision) {
-            return;
-        }
+    /// Compile and publish diagnostics for an exact source/cell identity.
+    /// GUI presentation is deliberately handled by the caller.
+    async fn compile_snapshot(&self, identity: CompileIdentity) -> Option<CompilationSnapshot> {
         let request = {
             let source = self.state.source_state.lock().await;
-            if self.state.source_revision.load(Ordering::Acquire) != revision {
-                return;
+            if source.compile_identity() != identity {
+                return None;
             }
-            let Some(root_dir) = self.state.root_dir.get().cloned() else {
-                return;
-            };
+            let root_dir = self.state.root_dir.get().cloned()?;
             CompileRequest {
-                revision,
+                identity: identity.clone(),
                 root_dir,
-                cell: source.cell.clone(),
             }
         };
-        let Some(result) = self.state.compiler.compile(request).await else {
-            return;
-        };
-        if !self.state.compilation_is_current(generation, revision) {
-            return;
+        let result = self.state.compiler.compile(request).await?;
+        if !self.state.compilation_is_current(&result.identity).await {
+            return None;
         }
-        self.commit_and_publish(result, generation, presentation)
-            .await;
+        self.publish_compilation(result).await
     }
 
-    async fn commit_and_publish(
-        &self,
-        result: CompileResult,
-        generation: u64,
-        presentation: Presentation,
-    ) {
-        if !self
-            .state
-            .compilation_is_current(generation, result.revision)
-        {
-            return;
+    async fn publish_compilation(&self, result: CompileResult) -> Option<CompilationSnapshot> {
+        let identity = result.identity.clone();
+        if !self.state.compilation_is_current(&identity).await {
+            return None;
         }
         let mut current_diagnostics =
             diagnostics(&result.root_dir, &result.ast, result.output.as_ref());
         let snapshot = result.output.clone().map(|output| CompilationSnapshot {
-            revision: result.revision,
+            revision: identity.revision,
             output,
         });
         {
-            // Source transitions take this same lock before superseding their
-            // generation, making the freshness check and commit atomic with
-            // respect to editor changes.
-            let _source = self.state.source_state.lock().await;
+            // The freshness check and commit are atomic with respect to source
+            // and cell changes because they take this same lock.
+            let source = self.state.source_state.lock().await;
             let mut compiled = self.state.published_state.lock().await;
-            if !self
-                .state
-                .compilation_is_current(generation, result.revision)
-            {
-                return;
+            if source.compile_identity() != identity {
+                return None;
             }
             let previous =
                 std::mem::replace(&mut compiled.prev_diagnostics, current_diagnostics.clone());
@@ -688,15 +646,12 @@ impl Backend {
             }
             compiled.config = result.config;
             compiled.ast = Arc::new(result.ast);
-            compiled.compiled_revision = result.revision;
+            compiled.compiled_revision = identity.revision;
         }
 
         for message in result.messages {
-            if !self
-                .state
-                .compilation_is_current(generation, result.revision)
-            {
-                return;
+            if !self.state.compilation_is_current(&identity).await {
+                return None;
             }
             self.state
                 .editor_client
@@ -704,81 +659,80 @@ impl Backend {
                 .await;
         }
         for (uri, diagnostics) in current_diagnostics {
-            if !self
-                .state
-                .compilation_is_current(generation, result.revision)
-            {
-                return;
+            if !self.state.compilation_is_current(&identity).await {
+                return None;
             }
             self.state
                 .editor_client
                 .publish_diagnostics(uri, diagnostics, None)
                 .await;
         }
-        let Some(snapshot) = snapshot else {
-            return;
-        };
-        if !self
-            .state
-            .compilation_is_current(generation, result.revision)
-        {
-            return;
+        let snapshot = snapshot?;
+        if !self.state.compilation_is_current(&identity).await {
+            return None;
         }
-        if matches!(presentation, Presentation::Open) {
-            for message in blocking_compile_error_messages(&snapshot.output) {
-                if !self
-                    .state
-                    .compilation_is_current(generation, result.revision)
-                {
-                    return;
-                }
+        Some(snapshot)
+    }
+
+    async fn send_cell_update(
+        &self,
+        identity: &CompileIdentity,
+        snapshot: CompilationSnapshot,
+    ) -> Option<GuiConnection> {
+        if !self.state.compilation_is_current(identity).await {
+            return None;
+        }
+        let connection = self.state.gui_connection().await?;
+        if !self.state.compilation_is_current(identity).await {
+            return None;
+        }
+        let result = connection
+            .client
+            .update_cell(context::current(), snapshot)
+            .await;
+        self.handle_gui_result(&connection, result).await?;
+        Some(connection)
+    }
+
+    async fn handle_gui_result<T>(
+        &self,
+        connection: &GuiConnection,
+        result: std::result::Result<T, tarpc::client::RpcError>,
+    ) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(error) => {
                 self.state
                     .editor_client
                     .show_message(
                         MessageType::ERROR,
-                        format!("Could not open cell: {message}"),
+                        format!("Could not contact the GUI: {error}"),
                     )
                     .await;
+                self.state.clear_gui_connection(connection.id).await;
+                None
             }
         }
-        if !self
-            .state
-            .compilation_is_current(generation, result.revision)
-        {
-            return;
-        }
-        let Some(connection) = self.state.gui_connection().await else {
+    }
+
+    async fn update_cell(&self, identity: CompileIdentity) -> Option<GuiConnection> {
+        let snapshot = self.compile_snapshot(identity.clone()).await?;
+        self.send_cell_update(&identity, snapshot).await
+    }
+
+    async fn open_cell_view(&self, identity: CompileIdentity) {
+        let Some(connection) = self.update_cell(identity.clone()).await else {
             return;
         };
-        if !self
-            .state
-            .compilation_is_current(generation, result.revision)
-        {
+        if !self.state.compilation_is_current(&identity).await {
             return;
         }
-        let result = match presentation {
-            Presentation::Open => {
-                connection
-                    .client
-                    .open_cell(context::current(), snapshot)
-                    .await
-            }
-            Presentation::Update => {
-                connection
-                    .client
-                    .update_cell(context::current(), snapshot)
-                    .await
-            }
-        };
-        if let Err(error) = result {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not contact the GUI: {error}"),
-                )
-                .await;
-            self.state.clear_gui_connection(connection.id).await;
+        let result = connection.client.fit(context::current()).await;
+        if self.handle_gui_result(&connection, result).await.is_none() {
+            return;
+        }
+        if self.state.compilation_is_current(&identity).await {
+            let _ = connection.client.activate(context::current()).await;
         }
     }
 
@@ -871,12 +825,11 @@ impl LanguageServer for Backend {
             .editor_client
             .log_message(MessageType::INFO, "server initialized!")
             .await;
-        self.compile().await;
+        self.update_current().await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let generation = self.state.supersede_compilation();
         let doc = Document::new(params.text_document.text, params.text_document.version);
         let uri = params.text_document.uri;
         if let Some(path) = uri.to_file_path().map(|path| path.into_owned()) {
@@ -885,14 +838,14 @@ impl LanguageServer for Backend {
                 .set_source_text(path, doc.contents().to_owned());
         }
         source.editor_files.insert(uri, doc);
-        let revision = self.state.advance_source_revision();
+        source.advance_revision();
+        let identity = source.compile_identity();
         drop(source);
-        self.schedule_compile(revision, generation);
+        self.schedule_compile(identity);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let generation = self.state.supersede_compilation();
         let analyzer_edit = source
             .pending_workspace_edits
             .contains_key(&params.text_document.uri);
@@ -935,34 +888,31 @@ impl LanguageServer for Backend {
         } else {
             // optional: log error, or handle missing document
         }
-        let revision = if let Some((path, contents)) = changed_source {
+        if let Some((path, contents)) = changed_source {
             self.state.compiler.set_source_text(path, contents);
-            self.state.advance_source_revision()
-        } else {
-            self.state.source_revision.load(Ordering::Acquire)
-        };
+            source.advance_revision();
+        }
+        let identity = source.compile_identity();
         drop(source);
         if analyzer_edit {
-            self.compile_revision(revision, generation, Presentation::Update)
-                .await;
+            self.update_cell(identity).await;
         } else {
-            self.schedule_compile(revision, generation);
+            self.schedule_compile(identity);
         }
     }
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {
-        let revision = self.state.source_revision.load(Ordering::Acquire);
+        let revision = self.state.source_state.lock().await.revision;
         let compiled_revision = self.state.published_state.lock().await.compiled_revision;
         // Saving persists the buffer; it only needs to compile when the latest
         // source revision has not already produced a committed result.
         if revision != compiled_revision {
-            self.compile().await;
+            self.update_current().await;
         }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let generation = self.state.supersede_compilation();
         source.editor_files.swap_remove(&params.text_document.uri);
         if let Some(path) = params
             .text_document
@@ -972,9 +922,10 @@ impl LanguageServer for Backend {
         {
             self.state.compiler.remove_source(path);
         }
-        let revision = self.state.advance_source_revision();
+        source.advance_revision();
+        let identity = source.compile_identity();
         drop(source);
-        self.schedule_compile(revision, generation);
+        self.schedule_compile(identity);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1100,36 +1051,23 @@ impl Backend {
         Ok(())
     }
 
-    /// Compiles a cell.
-    async fn compile_cell(&self, cell: impl Into<String>) {
-        let (revision, generation) = {
+    async fn select_and_open_cell(&self, cell: impl Into<String>) {
+        let identity = {
             let mut source = self.state.source_state.lock().await;
-            let generation = self.state.supersede_compilation();
             source.cell = Some(cell.into());
-            (
-                self.state.source_revision.load(Ordering::Acquire),
-                generation,
-            )
+            source.compile_identity()
         };
-        self.compile_revision(revision, generation, Presentation::Open)
-            .await;
+        self.open_cell_view(identity).await;
     }
 
-    /// Compiles the current workspace and the open cell if it exists.
-    async fn compile(&self) {
-        self.compile_current(Presentation::Update).await;
+    async fn update_current(&self) {
+        let identity = self.state.source_state.lock().await.compile_identity();
+        self.update_cell(identity).await;
     }
 
-    async fn compile_current(&self, presentation: Presentation) {
-        let (revision, generation) = {
-            let _source = self.state.source_state.lock().await;
-            (
-                self.state.source_revision.load(Ordering::Acquire),
-                self.state.supersede_compilation(),
-            )
-        };
-        self.compile_revision(revision, generation, presentation)
-            .await;
+    async fn open_current(&self) {
+        let identity = self.state.source_state.lock().await.compile_identity();
+        self.open_cell_view(identity).await;
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
@@ -1138,7 +1076,7 @@ impl Backend {
             .editor_client
             .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
-        self.compile_cell(params.cell).await;
+        self.select_and_open_cell(params.cell).await;
         Ok(())
     }
 
@@ -1192,8 +1130,7 @@ impl Backend {
         }
         let workspace_ast = compiled.ast.clone();
         let open_cell = source.cell.clone();
-        let root_dir = self.state.root_dir.get().cloned();
-        let library = compiled.config.clone();
+        let workspace = compiled.config.clone();
         drop(compiled);
         drop(source);
         let selected_scope = Some(selected_scope).filter(|span| {
@@ -1293,10 +1230,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let Some(root_dir) = root_dir else {
-            return Ok(());
-        };
-        let Some(lyp) = library.as_ref().and_then(|config| config.lyp.clone()) else {
+        if workspace.lyp.is_none() {
             self.state
                 .editor_client
                 .show_message(
@@ -1305,12 +1239,10 @@ impl Backend {
                 )
                 .await;
             return Ok(());
-        };
-        let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
+        }
         let Some(compiled) = compile_open_cell(
             &typed_ast,
             &open_cell,
-            &lyp,
             &workspace,
             &self.state.editor_client,
         )
@@ -1612,9 +1544,25 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, config_with_key, parse_config, preview_instance_cell,
-        write_config,
+        ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, open_cell_input,
+        parse_config, preview_instance_cell, write_config,
     };
+
+    #[test]
+    fn compilation_identity_changes_only_with_source_or_cell() {
+        let mut source = SourceState::default();
+        let initial = source.compile_identity();
+        assert_eq!(initial, source.compile_identity());
+
+        source.advance_revision();
+        let edited = source.compile_identity();
+        assert_ne!(initial, edited);
+
+        source.cell = Some("top()".to_owned());
+        let opened = source.compile_identity();
+        assert_ne!(edited, opened);
+        assert_eq!(opened, source.compile_identity());
+    }
 
     #[test]
     fn logging_config_defaults_to_errors() {
@@ -1682,9 +1630,9 @@ mod tests {
 
     #[test]
     fn open_cell_accepts_boolean_literals() {
-        let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
-        let arg = CellArg::from_literal(&call.args.posargs[0]).expect("boolean should convert");
-        assert!(matches!(arg, CellArg::Bool(true)));
+        let (cell, args) = open_cell_input("fet1v8(true, 150., 5)").unwrap();
+        assert_eq!(cell, ["fet1v8"]);
+        assert!(matches!(args[0], CellArg::Bool(true)));
     }
 
     #[test]

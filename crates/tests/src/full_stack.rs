@@ -26,18 +26,13 @@ pub enum OutputKind {
 
 #[derive(Debug)]
 pub enum GuiEvent {
-    OpenCell {
-        revision: u64,
-        kind: OutputKind,
-        scope: Option<Span>,
-        rect_count: usize,
-    },
     UpdateCell {
         revision: u64,
         kind: OutputKind,
         scope: Option<Span>,
         rect_count: usize,
     },
+    Fit,
     WorkspaceModified(bool),
 }
 
@@ -47,18 +42,6 @@ struct HeadlessGui {
 }
 
 impl Gui for HeadlessGui {
-    async fn open_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
-        let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
-        self.events
-            .send(GuiEvent::OpenCell {
-                revision: snapshot.revision,
-                kind,
-                scope,
-                rect_count,
-            })
-            .expect("full-stack test should still be receiving GUI events");
-    }
-
     async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
         let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
         self.events
@@ -68,6 +51,12 @@ impl Gui for HeadlessGui {
                 scope,
                 rect_count,
             })
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn fit(self, _: context::Context) {
+        self.events
+            .send(GuiEvent::Fit)
             .expect("full-stack test should still be receiving GUI events");
     }
 
@@ -304,10 +293,11 @@ mod tests {
             let mut drew_rect = false;
             let mut saw_editor_update = false;
             let mut saw_workspace_modified = false;
+            let mut saw_fit = false;
             let mut opened_revision = None;
-            while !(saw_editor_update && saw_workspace_modified) {
+            while !(saw_editor_update && saw_workspace_modified && saw_fit) {
                 match session.next_event().await {
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         revision,
                         kind: OutputKind::Data,
                         scope,
@@ -350,6 +340,7 @@ mod tests {
                         rect_count,
                         ..
                     } if rect_count >= 2 => saw_editor_update = true,
+                    GuiEvent::Fit => saw_fit = true,
                     GuiEvent::WorkspaceModified(true) => saw_workspace_modified = true,
                     _ => {}
                 }
@@ -383,7 +374,7 @@ mod tests {
             let mut saw_recovery = false;
             while !saw_recovery {
                 match session.next_event().await {
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         kind: OutputKind::StaticErrors,
                         ..
                     } => {

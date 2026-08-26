@@ -15,8 +15,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::{
-    ArgonConfig, Backend, GuiConnection, Presentation, PublishedState, Redo, Save, SourceState,
-    State, Undo, document::Document,
+    ArgonConfig, Backend, GuiConnection, PublishedState, Redo, Save, SourceState, State, Undo,
+    document::Document,
 };
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
@@ -125,8 +125,8 @@ pub trait LangServer {
 
 #[tarpc::service]
 pub trait Gui {
-    async fn open_cell(snapshot: CompilationSnapshot);
     async fn update_cell(snapshot: CompilationSnapshot);
+    async fn fit();
     async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
     async fn place_instance(preview: InstancePreview);
@@ -424,7 +424,7 @@ impl LangServer for State {
         Backend {
             state: self.clone(),
         }
-        .compile_current(Presentation::Open)
+        .open_current()
         .await;
     }
 
@@ -883,7 +883,7 @@ impl LangServer for State {
             .show_message(MessageType::INFO, &format!("cell {}", cell))
             .await;
         tokio::spawn(async move {
-            Backend { state: self }.compile_cell(cell).await;
+            Backend { state: self }.select_and_open_cell(cell).await;
         });
     }
 
