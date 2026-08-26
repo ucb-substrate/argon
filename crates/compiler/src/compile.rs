@@ -5974,6 +5974,7 @@ impl<'a> ExecPass<'a> {
         Ok(progress)
     }
 
+    /// The bounding box of `cell`'s geometry, in `cell`'s own coordinate frame.
     pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
         let mut bbox = None;
         let cell = &self.compiled_cells[&cell];
@@ -5983,7 +5984,9 @@ impl<'a> ExecPass<'a> {
                 SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Path(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Instance(i) => {
-                    let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
+                    let cell_bbox = self
+                        .bbox(i.cell)
+                        .map(|r| r.transform(i.reflect, i.angle).translate(i.x, i.y));
                     bbox = bbox_union(bbox, cell_bbox);
                 }
                 _ => (),
@@ -6850,6 +6853,17 @@ impl Rect<f64> {
             y1: p0p.1.max(p1p.1),
             construction: self.construction,
             span: None,
+        }
+    }
+
+    /// Translates the rect by `(dx, dy)`.
+    fn translate(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            x0: self.x0 + dx,
+            y0: self.y0 + dy,
+            x1: self.x1 + dx,
+            y1: self.y1 + dy,
+            ..self.clone()
         }
     }
 }
