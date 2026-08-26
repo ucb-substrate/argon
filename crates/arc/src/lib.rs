@@ -192,6 +192,37 @@ mod tests {
 
     use super::{Library, Manifest};
 
+    fn example_library_dirs(directory: &std::path::Path, output: &mut Vec<PathBuf>) {
+        if directory.join("lib.ar").is_file() {
+            output.push(directory.to_path_buf());
+        }
+        for entry in fs::read_dir(directory).expect("example directory should be readable") {
+            let path = entry.expect("example entry should be readable").path();
+            if path.is_dir() {
+                example_library_dirs(&path, output);
+            }
+        }
+    }
+
+    #[test]
+    fn every_example_library_has_a_gui_manifest() {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut libraries = Vec::new();
+        example_library_dirs(&examples, &mut libraries);
+        assert!(!libraries.is_empty());
+
+        for directory in libraries {
+            let manifest = directory.join("Argon.toml");
+            assert!(manifest.is_file(), "missing `{}`", manifest.display());
+            let library = Library::load(&manifest)
+                .unwrap_or_else(|error| panic!("invalid `{}`: {error:#}", manifest.display()));
+            let lyp = library
+                .lyp
+                .unwrap_or_else(|| panic!("`{}` does not set `lyp`", manifest.display()));
+            assert!(lyp.is_file(), "missing LYP `{}`", lyp.display());
+        }
+    }
+
     #[test]
     fn parses_manifest() {
         let manifest: Manifest = toml::from_str(

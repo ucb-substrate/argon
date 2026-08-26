@@ -88,6 +88,31 @@ and a leading `~/` is expanded to the user's home directory.
 When invoking `argonc` directly, pass the same mapping as
 `--gds-import 'macros::sram=layout/sram.gds'`.
 
+Polygons normally take a layer and a point count. Each generated point has
+independent solver coordinates, addressable either as `polygon.x0`,
+`polygon.y0`, and so on, or through `polygon.points[0].x` and `.y`:
+
+```argon
+let outline = polygon("met1", 3,
+    x0=0., y0=0.,
+    x1=100., y1=0.,
+    y2=100.,
+);
+eq(outline.x2, 50.);
+```
+
+The GUI polygon tool (toolbar button or `p`) places vertices in click order;
+press Enter after the final vertex to close and insert the polygon. It writes
+editable fallback coordinates (`x0i`, `y0i`, `x1i`, `y1i`, and so on), so
+vertex drags persist. Add hard `x0`/`y0` kwargs or `eq` constraints later when
+coordinates should become fixed. Handwritten geometry does not need fallback
+kwargs up front: the first drag inserts any missing `*i` coordinates into
+polygon, rectangle, or instance constructors. Escape clears an in-progress
+polygon. Polygon edges touching a point with any unconstrained coordinate are
+dashed; a point constrained in only one axis remains draggable along its free
+axis. Polygon fills use the layer's solid or stippled fill style just like
+rectangles.
+
 Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
 receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
 text from a contained `<layer>.label` as its field name. Repeated pin names are

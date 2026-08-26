@@ -99,7 +99,7 @@ mod tests {
         gds::GdsMap,
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
-    use ::gds::GdsUnits;
+    use ::gds::{GdsElement, GdsLibrary, GdsUnits};
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
@@ -158,6 +158,7 @@ mod tests {
     const ARGON_RANGE_PERF: &str = concatcp!(EXAMPLES_DIR, "/range_perf/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
+    const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -988,6 +989,14 @@ mod tests {
         .unwrap();
         let cell = &cells.cells[&cells.top];
         assert!(!cell.fallback_constraints_used.is_empty());
+        assert!(
+            cell.fallback_constraints_used
+                .iter()
+                .any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::InstanceX(_))
+                ))
+        );
         let inst = cell
             .objects
             .values()
@@ -1724,6 +1733,166 @@ mod tests {
         assert_relative_eq!(r.y0.0, 5., epsilon = EPSILON);
         assert_relative_eq!(r.x1.0, 25., epsilon = EPSILON);
         assert_relative_eq!(r.y1.0, 53., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn argon_polygon_points_are_independently_constrained() {
+        let o = parse_workspace_with_std(ARGON_POLYGON);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let gds_path =
+            std::env::temp_dir().join(format!("argon-polygon-{}.gds", std::process::id()));
+        output
+            .to_gds(
+                GdsMap::from_lyp(BASIC_LYP).expect("polygon GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                &gds_path,
+            )
+            .expect("export polygon GDS");
+        let gds = GdsLibrary::load(gds_path).expect("reload polygon GDS");
+        let boundary = gds.structs[0]
+            .elems
+            .iter()
+            .find_map(|element| match element {
+                GdsElement::GdsBoundary(boundary) => Some(boundary),
+                _ => None,
+            })
+            .expect("polygon boundary");
+        assert_eq!(boundary.xy.len(), 5);
+        assert_eq!(boundary.xy.first(), boundary.xy.last());
+
+        let cells = match output {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(output) => {
+                output.output.expect("underconstrained polygon output")
+            }
+            output => panic!("polygon should compile: {output:?}"),
+        };
+
+        let polygon = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_polygon)
+            .expect("compiled polygon");
+        let points = polygon
+            .points
+            .iter()
+            .map(|(x, y)| (x.0, y.0))
+            .collect::<Vec<_>>();
+        assert_eq!(&points[..3], &[(0., 0.), (100., 0.), (150., 75.)]);
+        assert!(points[3].0.is_finite() && points[3].1.is_finite());
+        assert_ne!(polygon.points[0].0.1, polygon.points[1].0.1);
+        let unsolved = &cells.cells[&cells.top].unsolved_vars;
+        assert!(
+            polygon.points[3]
+                .0
+                .1
+                .coeffs
+                .iter()
+                .any(|(_, var)| unsolved.contains(var))
+        );
+        assert!(
+            polygon.points[3]
+                .1
+                .1
+                .coeffs
+                .iter()
+                .any(|(_, var)| unsolved.contains(var))
+        );
+
+        let initial = compile(
+            &ast,
+            CompileInput {
+                cell: &["initial_points"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let initial = match initial {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(output) => output.output.expect("fallback polygon output"),
+            output => panic!("fallback polygon should compile: {output:?}"),
+        };
+        let fallbacks = &initial.cells[&initial.top].fallback_constraints_used;
+        assert_eq!(fallbacks.len(), 6);
+        assert!(fallbacks.iter().all(|fallback| matches!(
+            fallback.initial_condition,
+            Some(RectInitialCondition::PolygonX(_, _)) | Some(RectInitialCondition::PolygonY(_, _))
+        )));
+        let source = std::fs::read_to_string(ARGON_POLYGON).unwrap();
+        assert!(fallbacks.iter().all(|fallback| {
+            source[fallback.span.span.start()..fallback.span.span.end()].ends_with('.')
+        }));
+    }
+
+    #[test]
+    fn polygon_points_require_named_coordinate_fields() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let p = polygon("met1", 3,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        x2=50., y2=50.,
+                    );
+                    eq(p.points[0].0, 0.);
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.iter().any(|error| matches!(
+            error.kind,
+            StaticErrorKind::CannotIndexFieldAccess {
+                ty: crate::compile::Ty::Point
+            }
+        )));
+    }
+
+    #[test]
+    fn polygon_constructor_has_one_count_based_signature() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let p = polygon("met1", list(
+                        (0., 0.,),
+                        (10., 0.,),
+                        (0., 10.,),
+                    ));
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.iter().any(|error| matches!(
+            error.kind,
+            StaticErrorKind::IncorrectTy {
+                expected: crate::compile::Ty::Int,
+                ..
+            }
+        )));
     }
 
     #[test]
