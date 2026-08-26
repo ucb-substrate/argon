@@ -9,7 +9,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
     time::Duration,
 };
 
@@ -34,7 +34,7 @@ use tokio::{
     sync::Mutex,
 };
 use tower_lsp_server::jsonrpc::Result;
-use tower_lsp_server::ls_types::{request::Request, *};
+use tower_lsp_server::ls_types::{notification::Notification, request::Request, *};
 use tower_lsp_server::{Client, LanguageServer, LspService, Server};
 use tracing::{error, info};
 use tracing_subscriber::{
@@ -46,6 +46,22 @@ use crate::document::{Document, DocumentChange};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
+
+fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        // Configuration updates replace the whole value, so no partially
+        // mutated configuration needs to be rolled back after a panic.
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -497,17 +513,11 @@ impl State {
     }
 
     fn apply_config(&self, config: ArgonConfig) {
-        *self
-            .app_config
-            .write()
-            .expect("configuration lock poisoned") = config;
+        *write_unpoisoned(&self.app_config) = config;
     }
 
     fn config(&self) -> ArgonConfig {
-        self.app_config
-            .read()
-            .expect("configuration lock poisoned")
-            .clone()
+        read_unpoisoned(&self.app_config).clone()
     }
 
     async fn is_latest_compile_request(&self, identity: &CompileIdentity) -> bool {
@@ -833,9 +843,8 @@ impl Request for Save {
 #[derive(Debug, Clone, Copy)]
 struct FocusEditor;
 
-impl Request for FocusEditor {
+impl Notification for FocusEditor {
     type Params = Option<String>;
-    type Result = ();
 
     const METHOD: &'static str = "custom/focusEditor";
 }
@@ -1585,6 +1594,7 @@ pub async fn main_with_io_on_listener<I, O>(
 mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, RwLock};
 
     use argonc::{
         compile::{self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput},
@@ -1593,8 +1603,29 @@ mod tests {
 
     use super::{
         ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, open_cell_input,
-        parse_config, preview_instance_cell, write_config,
+        parse_config, preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
     };
+
+    fn poison_rwlock(lock: &Arc<RwLock<i32>>) {
+        let lock = lock.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = write_unpoisoned(&lock);
+            panic!("poison test lock");
+        })
+        .join();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn configuration_lock_recovers_from_poisoning() {
+        let lock = Arc::new(RwLock::new(1));
+        poison_rwlock(&lock);
+        assert_eq!(*read_unpoisoned(&lock), 1);
+
+        poison_rwlock(&lock);
+        *write_unpoisoned(&lock) = 2;
+        assert_eq!(*read_unpoisoned(&lock), 2);
+    }
 
     #[test]
     fn compilation_identity_changes_only_with_source_or_cell() {

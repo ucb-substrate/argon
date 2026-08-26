@@ -904,18 +904,9 @@ impl LangServer for State {
     }
 
     async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
-        if let Err(error) = self
-            .editor_client
-            .send_request::<crate::FocusEditor>(command)
-            .await
-        {
-            self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not focus the editor: {error}"),
-                )
-                .await;
-        }
+        self.editor_client
+            .send_notification::<crate::FocusEditor>(command)
+            .await;
     }
 }
 

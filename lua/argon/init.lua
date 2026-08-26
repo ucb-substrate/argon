@@ -211,11 +211,7 @@ M.start = function(bufnr)
 
                 return vim.NIL
             end,
-            ['custom/focusEditor'] = function(err, command, ctx)
-                if err then
-                    client.print_error(err)
-                    return vim.NIL
-                end
+            ['custom/focusEditor'] = function(_, command, _)
                 vim.schedule(function()
                     local mode = vim.api.nvim_get_mode().mode
                     local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
@@ -224,7 +220,6 @@ M.start = function(bufnr)
                     end
                     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
                 end)
-                return vim.NIL
             end,
         },
         root_dir = root_dir

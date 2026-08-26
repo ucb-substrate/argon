@@ -630,12 +630,14 @@ impl Editor {
     }
 
     fn open_invoking_command(&mut self, command: Option<&str>, cx: &mut Context<Self>) {
+        // Neovim may be blocked at a hit-enter or error prompt. Focus it
+        // before queuing the notification so the user can clear that prompt.
+        self.focus_invoker(cx);
         let _ = self
             .state
             .read(cx)
             .lang_server_client
             .open_command_bar(command.map(str::to_owned));
-        self.focus_invoker(cx);
     }
 
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
