@@ -132,6 +132,7 @@ mod tests {
     const ARGON_PARAM_INT: &str = concatcp!(EXAMPLES_DIR, "/param_int/lib.ar");
     const ARGON_ENUMERATIONS: &str = concatcp!(EXAMPLES_DIR, "/enumerations/lib.ar");
     const ARGON_BBOX: &str = concatcp!(EXAMPLES_DIR, "/bbox/lib.ar");
+    const ARGON_BBOX_NESTED: &str = concatcp!(EXAMPLES_DIR, "/bbox_nested/lib.ar");
     const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
@@ -1436,6 +1437,45 @@ mod tests {
         assert_eq!(translated_bbox_rect.y0.0, 100.);
         assert_eq!(translated_bbox_rect.x1.0, 200.);
         assert_eq!(translated_bbox_rect.y1.0, 200.);
+    }
+
+    #[test]
+    fn argon_bbox_nested() {
+        let o = parse_workspace_with_std(ARGON_BBOX_NESTED);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let rect_on = |layer: &str| {
+            cell.objects
+                .values()
+                .filter_map(|object| object.get_rect())
+                .find(|rect| rect.layer.as_deref() == Some(layer))
+                .unwrap_or_else(|| panic!("{layer} should copy a bbox"))
+        };
+
+        // `mid` holds `leaf` at x=1000, so the cell bbox must include that offset.
+        let cell_bbox = rect_on("met2");
+        assert_eq!(cell_bbox.x0.0, 1000.);
+        assert_eq!(cell_bbox.y0.0, 0.);
+        assert_eq!(cell_bbox.x1.0, 1100.);
+        assert_eq!(cell_bbox.y1.0, 100.);
+
+        // Rotating by 90 maps (x, y) to (-y, x); the placement then adds x=500.
+        let inst_bbox = rect_on("met3");
+        assert_eq!(inst_bbox.x0.0, 400.);
+        assert_eq!(inst_bbox.y0.0, 1000.);
+        assert_eq!(inst_bbox.x1.0, 500.);
+        assert_eq!(inst_bbox.y1.0, 1100.);
     }
 
     #[test]
