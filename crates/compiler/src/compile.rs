@@ -2514,6 +2514,14 @@ pub struct SeqNum(u64);
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ObjectId(u64);
 
+impl ObjectId {
+    /// Monotonic allocation order used to preserve source creation order in
+    /// consumers that flatten objects for display.
+    pub fn creation_order(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ScopeId(u64);
 
@@ -6736,35 +6744,12 @@ impl<T> Path<(f64, T)> {
             .iter()
             .map(|(x, y)| (x.0, y.0))
             .collect::<Vec<_>>();
-        let points = path_real_points(points);
-        if points.len() < 2 {
-            return None;
-        }
-        let half_width = self.width.0.abs() / 2.;
-        if !half_width.is_finite()
-            || !self.begin_extension.0.is_finite()
-            || !self.end_extension.0.is_finite()
-        {
-            return None;
-        }
-
-        let mut outline = path_shifted_side(
+        path_outline(
             &points,
-            half_width,
+            self.width.0,
             self.begin_extension.0,
             self.end_extension.0,
-        )?;
-        let reversed = points.iter().rev().copied().collect::<Vec<_>>();
-        outline.extend(path_shifted_side(
-            &reversed,
-            half_width,
-            self.end_extension.0,
-            self.begin_extension.0,
-        )?);
-        outline
-            .iter()
-            .all(|(x, y)| x.is_finite() && y.is_finite())
-            .then_some(outline)
+        )
     }
 
     pub fn bbox(&self) -> Option<Rect<f64>> {
@@ -6789,6 +6774,36 @@ impl<T> Path<(f64, T)> {
             span: self.span.clone(),
         })
     }
+}
+
+/// Returns the non-rounded outline for a path centerline and extensions.
+pub fn path_outline(
+    points: &[(f64, f64)],
+    width: f64,
+    begin_extension: f64,
+    end_extension: f64,
+) -> Option<Vec<(f64, f64)>> {
+    let points = path_real_points(points.to_vec());
+    if points.len() < 2 {
+        return None;
+    }
+    let half_width = width.abs() / 2.;
+    if !half_width.is_finite() || !begin_extension.is_finite() || !end_extension.is_finite() {
+        return None;
+    }
+
+    let mut outline = path_shifted_side(&points, half_width, begin_extension, end_extension)?;
+    let reversed = points.iter().rev().copied().collect::<Vec<_>>();
+    outline.extend(path_shifted_side(
+        &reversed,
+        half_width,
+        end_extension,
+        begin_extension,
+    )?);
+    outline
+        .iter()
+        .all(|(x, y)| x.is_finite() && y.is_finite())
+        .then_some(outline)
 }
 
 impl Rect<f64> {
