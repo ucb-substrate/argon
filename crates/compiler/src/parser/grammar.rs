@@ -12,6 +12,8 @@
 //! `as`) binds tighter than the binary operators; `* / %` > `+ -` > comparisons;
 //! all binary operators are left-associative.
 
+use std::str::FromStr;
+
 use cfgrammar::Span;
 
 use crate::ast::{
@@ -915,9 +917,10 @@ impl<'a> Parser<'a> {
                     }
                     TokenKind::IntLit => {
                         let t = self.bump();
+                        let span = self.span(t);
                         let field = IntLiteral {
-                            span: self.span(t),
-                            value: self.slice_tok(t).parse::<i64>().unwrap_or_default(),
+                            span,
+                            value: self.literal_value(span, "integer"),
                         };
                         Expr::IndexFieldAccess(Box::new(IndexFieldAccessExpr {
                             base: lhs,
@@ -1176,9 +1179,9 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `INTLIT` optionally followed by `. INTLIT?` to form a float. The value is
-    /// parsed from the raw source slice (including any interior trivia) and
-    /// defaults to 0 on failure, matching the ANTLR `AstBuilder`.
+    /// `INTLIT` optionally followed by `. INTLIT?` to form a float.
+    ///
+    /// See `literal_value` for a slice that does not parse.
     fn parse_int_or_float(&mut self) -> Expr<&'a str, Md> {
         let i0 = self.bump();
         // `INTLIT .` forms a float (`1.`, `1.5`) — except when the `.` is
@@ -1197,15 +1200,24 @@ impl<'a> Parser<'a> {
             let span = Span::new(i0.start as usize, end as usize);
             Expr::FloatLiteral(FloatLiteral {
                 span,
-                value: self.slice_span(span).parse::<f64>().unwrap_or_default(),
+                value: self.literal_value(span, "float"),
             })
         } else {
             let span = self.span(i0);
             Expr::IntLiteral(IntLiteral {
                 span,
-                value: self.slice_tok(i0).parse::<i64>().unwrap_or_default(),
+                value: self.literal_value(span, "integer"),
             })
         }
+    }
+
+    /// Parses a numeric literal from its source slice.
+    fn literal_value<T: Default + FromStr>(&mut self, span: Span, kind: &str) -> T {
+        let slice = self.slice_span(span);
+        slice.parse().unwrap_or_else(|_| {
+            self.error_at(span, format!("invalid {kind} literal `{slice}`"));
+            T::default()
+        })
     }
 
     /// `stringLiteral : STRLIT` — span includes the quotes; value trims them.

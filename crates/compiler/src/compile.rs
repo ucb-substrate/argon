@@ -2308,6 +2308,16 @@ impl CellArg {
             Expr::IntLiteral(value) => Some(Self::Int(value.value)),
             Expr::BoolLiteral(value) => Some(Self::Bool(value.value)),
             Expr::SeqNil(_) => Some(Self::Seq(Vec::new())),
+            Expr::UnaryOp(unary) => Self::from_literal(&unary.operand)?.apply_unary(unary.op),
+            _ => None,
+        }
+    }
+
+    fn apply_unary(self, op: UnaryOp) -> Option<Self> {
+        match (op, self) {
+            (UnaryOp::Neg, Self::Float(value)) => Some(Self::Float(-value)),
+            (UnaryOp::Neg, Self::Int(value)) => Some(Self::Int(value.checked_neg()?)),
+            (UnaryOp::Not, Self::Bool(value)) => Some(Self::Bool(!value)),
             _ => None,
         }
     }

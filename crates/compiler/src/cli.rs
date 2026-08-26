@@ -463,6 +463,62 @@ mod tests {
     }
 
     #[test]
+    fn execution_accepts_negated_cell_arguments() {
+        let source = temp_source(
+            "negated-args",
+            "cell top(x: Float, n: Int, flag: Bool) {\n\
+             let h = if flag { 10. } else { 20. };\n\
+             let r = rect(\"met1\", x0=x, y0=n as Float, x1=x + 10., y1=n as Float + h);\n\
+             }\n",
+        );
+        let artifact_path = source.with_file_name("negated.bin");
+        let mut args = execution_args(source, "top(-5., -2, !true)", basic_lyp());
+        args.output = Some(artifact_path.clone());
+
+        if let Err(error) = execute(args) {
+            panic!("negated arguments should compile: {}", render_failed(error));
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("negated arguments should compile successfully");
+        };
+        let top = &output.cells[&output.top];
+        let rect = top
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top should emit a rect");
+        assert_eq!(rect.x0.0, -5.);
+        assert_eq!(rect.y0.0, -2.);
+        assert_eq!(rect.y1.0, 18.);
+    }
+
+    #[test]
+    fn out_of_range_cell_argument_is_reported_cleanly() {
+        let source = temp_source("out-of-range-arg", "cell top(n: Int) {}\n");
+        let diagnostic = render_failed(failed(execution_args(
+            source,
+            "top(99999999999999999999)",
+            basic_lyp(),
+        )));
+        assert!(
+            diagnostic.contains("invalid integer literal `99999999999999999999`"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn non_literal_cell_arguments_are_reported_cleanly() {
+        let source = temp_source("non-literal-args", "cell top(x: Float) {}\n");
+        let diagnostic = render_failed(failed(execution_args(source, "top(1. + 1.)", basic_lyp())));
+        assert!(
+            diagnostic.contains("--cell arguments must be integer, float, boolean, or empty-list"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
     fn imports_a_gds_cell_at_a_module_path() {
         let source = temp_source(
             "gds-root",
