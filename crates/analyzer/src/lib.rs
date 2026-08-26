@@ -13,12 +13,12 @@ use std::{
 
 use arc::Library;
 use argonc::{
-    ast::{Span, WorkspaceAst},
+    ast::{ModPath, Span, WorkspaceAst},
     compile::{
-        self, Arrayed, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
-        StaticErrorCompileOutput, VarIdTyMetadata,
+        self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
+        VarIdTyMetadata,
     },
-    parse::{self, WorkspaceParseAst},
+    parse::{self, CellInvocation, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
@@ -188,7 +188,7 @@ fn parse_setting(input: &str) -> Option<(&str, &str)> {
 
 async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
-    cell: &str,
+    invocation: &CellInvocation,
     lyp: &Path,
     gds_imports: &[(String, PathBuf)],
     client: &Client,
@@ -199,54 +199,10 @@ async fn compile_open_cell(
             .await;
         return None;
     }
-
-    let cell_ast = match parse::parse_cell(cell) {
-        Ok(cell_ast) => cell_ast,
-        Err(error) => {
-            client
-                .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
-                .await;
-            return None;
-        }
-    };
-    if !cell_ast.args.kwargs.is_empty() {
-        client
-            .show_message(
-                MessageType::ERROR,
-                "Open cell does not support keyword arguments yet",
-            )
-            .await;
-        return None;
-    }
-    let Some(args) = cell_ast
-        .args
-        .posargs
-        .iter()
-        .map(CellArg::from_literal)
-        .collect::<Option<Vec<_>>>()
-    else {
-        client
-            .show_message(
-                MessageType::ERROR,
-                "Open cell arguments must be integer, float, boolean, or empty-list literals",
-            )
-            .await;
-        return None;
-    };
-    let cell_path = cell_ast
-        .func
-        .path
-        .iter()
-        .map(|ident| ident.name)
-        .collect::<Vec<_>>();
-
-    Some(compile::dynamic_compile_with_gds(
+    Some(compile::dynamic_compile_invocation(
         ast,
-        CompileInput {
-            cell: &cell_path,
-            args,
-            lyp_file: lyp,
-        },
+        invocation,
+        lyp,
         gds_imports,
     ))
 }
@@ -287,7 +243,11 @@ impl StateMut {
                 CompileOutput::Valid(_) => vec![],
             };
             for (span, message) in errs {
+                // Generated declarations are appended past the editor-visible
+                // text, so their spans do not name a position in any file. Those
+                // errors reach the user through `show_message` instead.
                 if let Some(ast) = self.ast.values().find(|ast| ast.path == span.path)
+                    && span.span.start() <= ast.source_text.len()
                     && let Some(url) = Uri::from_file_path(&span.path)
                 {
                     let doc = Document::new(&ast.source_text, 0);
@@ -342,19 +302,42 @@ impl StateMut {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let analysis = compile::analyze_workspace(parse::parse_workspace_with_std_deps_and_gds(
+        let mut parse_output = parse::parse_workspace_with_std_deps_and_gds(
             root_dir.join("lib.ar"),
             dependencies,
             gds_imports.clone(),
-        ));
+        );
+        // Editor features read `self.ast`, and the instantiate flow re-parses
+        // its text, so keep the pristine root module out of the splice below.
+        let pristine_root = parse_output
+            .asts
+            .get(&ModPath::new())
+            .map(|(ast, _)| ast.clone());
+        // The invocation is spliced in before analysis so its arguments are
+        // resolved, type-checked, and evaluated like any source expression.
+        let mut invocation = None;
+        if let Some(cell) = self.cell.clone() {
+            match parse::add_cell_invocation(&mut parse_output, &cell) {
+                Ok(spliced) => invocation = Some(spliced),
+                Err(error) => {
+                    client
+                        .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                        .await;
+                }
+            }
+        }
+        let analysis = compile::analyze_workspace(parse_output);
         self.ast = analysis.ast;
+        if let Some(root) = pristine_root {
+            self.ast.insert(ModPath::new(), root);
+        }
 
         let o = if let Some(ast) = analysis.typed_ast {
             if !analysis.errors.is_empty() {
                 Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
                     errors: analysis.errors,
                 }))
-            } else if let Some(cell) = &self.cell {
+            } else if let Some(invocation) = &invocation {
                 let Some(lyp) = lyp.as_deref() else {
                     let message = if manifest_path.is_file() {
                         format!(
@@ -376,7 +359,7 @@ impl StateMut {
                     self.compile_output = None;
                     return;
                 };
-                compile_open_cell(&ast, cell, lyp, &gds_imports, client).await
+                compile_open_cell(&ast, invocation, lyp, &gds_imports, client).await
             } else {
                 None
             }
@@ -814,6 +797,25 @@ impl Backend {
         preview_module.promote_last_declarations(ast.generated_declarations);
         let mut preview_ast = state_mut.ast.clone();
         preview_ast.insert(module_path, preview_module);
+        let Some(open_cell) = state_mut.cell.clone() else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
+                .await;
+            return Ok(());
+        };
+        // The open cell is recompiled against the preview, so its invocation is
+        // spliced in before the preview is type-checked.
+        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                    .await;
+                return Ok(());
+            }
+        };
         let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
             self.state
                 .editor_client
@@ -837,13 +839,6 @@ impl Backend {
                 .await;
             return Ok(());
         }
-        let Some(open_cell) = state_mut.cell.clone() else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
-                .await;
-            return Ok(());
-        };
         let Some(lyp) = state_mut
             .config
             .as_ref()
@@ -871,7 +866,7 @@ impl Backend {
             .unwrap_or_default();
         let Some(compiled) = compile_open_cell(
             &typed_ast,
-            &open_cell,
+            &invocation,
             &lyp,
             &gds_imports,
             &self.state.editor_client,
@@ -1114,10 +1109,35 @@ mod tests {
     }
 
     #[test]
-    fn open_cell_accepts_boolean_literals() {
-        let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
-        let arg = CellArg::from_literal(&call.args.posargs[0]).expect("boolean should convert");
-        assert!(matches!(arg, CellArg::Bool(true)));
+    fn open_cell_evaluates_expression_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            "fn double(x: Float) -> Float { 2. * x }\n\
+             cell top(w: Float) {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        )
+        .unwrap();
+        let mut ast = parse::parse_workspace_with_std(&source_path).ast();
+        let invocation = parse::splice_cell_invocation(&mut ast, "top(double(25.))")
+            .expect("invocation should splice");
+        let (typed, errors) = compile::static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = compile::dynamic_compile_invocation(&typed, &invocation, &lyp, &[]);
+        let CompileOutput::Valid(output) = output else {
+            panic!("open cell should compile: {output:?}");
+        };
+        let top = &output.cells[&output.top];
+        let rect = top
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top should emit a rect");
+        assert_eq!(rect.x1.0, 50.);
     }
 
     #[test]
