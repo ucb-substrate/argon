@@ -1,5 +1,14 @@
+local deadline = vim.uv.hrtime() + 20 * 1000000000
+
 local function wait_for(description, predicate)
-  assert(vim.wait(20000, predicate, 25), 'timed out waiting for ' .. description)
+  if predicate() then
+    return
+  end
+  local remaining_ms = math.floor((deadline - vim.uv.hrtime()) / 1000000)
+  assert(
+    remaining_ms > 0 and vim.wait(remaining_ms, predicate, 25),
+    'timed out waiting for ' .. description
+  )
 end
 
 local bufnr = vim.api.nvim_get_current_buf()

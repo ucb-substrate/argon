@@ -904,12 +904,34 @@ pub async fn main_with_io<I, O>(
 {
     // Start server for communication with GUI.
     let port = rpc_port.unwrap_or(0);
+    let listener = match tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("failed to bind analyzer RPC server to port {port}: {error}");
+            return;
+        }
+    };
+    main_with_io_on_listener(listener, relay_socket, stdin, stdout).await;
+}
+
+/// Runs the analyzer using pre-bound GUI RPC and LSP transports.
+///
+/// Supplying the listener lets tests reserve the RPC address without a
+/// bind-release-bind race.
+pub async fn main_with_io_on_listener<I, O>(
+    rpc_listener: tokio::net::TcpListener,
+    relay_socket: Option<PathBuf>,
+    stdin: I,
+    stdout: O,
+) where
+    I: AsyncRead + Unpin,
+    O: AsyncWrite,
+{
     let mut listener =
-        match tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default).await
-        {
+        match tarpc::serde_transport::tcp::listen_on(rpc_listener, Json::default).await {
             Ok(listener) => listener,
             Err(error) => {
-                eprintln!("failed to bind analyzer RPC server to port {port}: {error}");
+                eprintln!("failed to configure analyzer RPC listener: {error}");
                 return;
             }
         };

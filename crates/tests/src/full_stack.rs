@@ -1,32 +1,28 @@
 //! Neovim, analyzer, and headless-GUI test scenarios.
 
-use std::{net::Ipv4Addr, path::PathBuf, time::Instant};
+use std::{net::Ipv4Addr, path::PathBuf};
 
 use analyzer::rpc::{Gui, InstancePreview, LangServerClient};
 use argonc::{
     ast::Span,
-    compile::{BasicRect, CompileOutput, CompiledData},
+    compile::{CompileOutput, CompiledData},
 };
 use futures::prelude::*;
 use tarpc::{context, server::Channel, tokio_serde::formats::Json};
 use tempfile::TempDir;
 use tokio::{sync::mpsc, time};
 
-use crate::{TEST_TIMEOUT, finish_nvim, nvim_command, repository_root};
-
-// Process-heavy scenarios share ports and startup deadlines, so keep them
-// serial even though Cargo runs Rust tests in parallel by default.
-static FULL_STACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+use crate::{TEST_TIMEOUT, nvim_command, repository_root};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputKind {
+pub enum OutputKind {
     Data,
     StaticErrors,
     FatalParseErrors,
 }
 
 #[derive(Debug)]
-enum GuiEvent {
+pub enum GuiEvent {
     OpenCell {
         kind: OutputKind,
         update: bool,
@@ -83,13 +79,14 @@ fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize) {
     (scope, rect_count)
 }
 
-struct Session {
+pub struct Session {
     _directory: TempDir,
     project: PathBuf,
     ack: PathBuf,
     gui_edit_ack: PathBuf,
     diagnostic_ack: PathBuf,
-    analyzer_port: u16,
+    analyzer_addr: std::net::SocketAddr,
+    analyzer_listener: Option<tokio::net::TcpListener>,
     lsp_port: u16,
     lsp_listener: Option<tokio::net::TcpListener>,
     gui_addr: std::net::SocketAddr,
@@ -97,7 +94,7 @@ struct Session {
 }
 
 impl Session {
-    async fn new(source: &str) -> Self {
+    pub async fn new(source: &str) -> Self {
         let directory = tempfile::tempdir().expect("create full-stack test directory");
         let project = directory.path().join("project");
         std::fs::create_dir(&project).expect("create test project");
@@ -113,7 +110,12 @@ impl Session {
         )
         .expect("copy test layer properties");
 
-        let analyzer_port = unused_port();
+        let analyzer_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind analyzer GUI RPC listener");
+        let analyzer_addr = analyzer_listener
+            .local_addr()
+            .expect("read analyzer GUI RPC address");
         let lsp_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind analyzer LSP listener");
@@ -156,7 +158,8 @@ impl Session {
             ack,
             gui_edit_ack,
             diagnostic_ack,
-            analyzer_port,
+            analyzer_addr,
+            analyzer_listener: Some(analyzer_listener),
             lsp_port,
             lsp_listener: Some(lsp_listener),
             gui_addr,
@@ -164,20 +167,27 @@ impl Session {
         }
     }
 
-    fn start_analyzer(&mut self) {
+    pub fn start_analyzer(&mut self) {
         let listener = self
             .lsp_listener
             .take()
             .expect("analyzer should only be started once");
-        let rpc_port = self.analyzer_port;
+        let rpc_listener = self
+            .analyzer_listener
+            .take()
+            .expect("analyzer should only be started once");
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept Neovim LSP stream");
             let (reader, writer) = tokio::io::split(stream);
-            analyzer::main_with_io(Some(rpc_port), None, reader, writer).await;
+            analyzer::main_with_io_on_listener(rpc_listener, None, reader, writer).await;
         });
     }
 
-    fn spawn_nvim(&self, mode: &str) -> tokio::process::Child {
+    pub fn gui_addr(&self) -> std::net::SocketAddr {
+        self.gui_addr
+    }
+
+    pub fn spawn_nvim(&self, mode: &str) -> tokio::process::Child {
         let mut command = nvim_command();
         command
             .current_dir(&self.project)
@@ -201,144 +211,160 @@ impl Session {
         command.spawn().expect("start headless Neovim")
     }
 
-    async fn connect_analyzer(&self) -> LangServerClient {
-        let deadline = Instant::now() + TEST_TIMEOUT;
-        loop {
-            let mut transport = tarpc::serde_transport::tcp::connect(
-                (Ipv4Addr::LOCALHOST, self.analyzer_port),
-                Json::default,
-            );
-            transport.config_mut().max_frame_length(usize::MAX);
-            if let Ok(transport) = transport.await {
-                return LangServerClient::new(tarpc::client::Config::default(), transport).spawn();
+    pub async fn connect_analyzer(&self) -> LangServerClient {
+        time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let mut transport =
+                    tarpc::serde_transport::tcp::connect(self.analyzer_addr, Json::default);
+                transport.config_mut().max_frame_length(usize::MAX);
+                if let Ok(transport) = transport.await {
+                    return LangServerClient::new(tarpc::client::Config::default(), transport)
+                        .spawn();
+                }
+                time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            assert!(
-                Instant::now() < deadline,
-                "analyzer RPC server did not start"
-            );
-            time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        })
+        .await
+        .expect("analyzer RPC server did not start")
     }
 
-    async fn next_event(&mut self) -> GuiEvent {
-        time::timeout(TEST_TIMEOUT, self.events.recv())
+    pub async fn next_event(&mut self) -> GuiEvent {
+        self.events
+            .recv()
             .await
-            .expect("timed out waiting for GUI event")
             .expect("headless GUI event stream closed")
     }
 }
 
-fn unused_port() -> u16 {
-    std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .expect("reserve analyzer port")
-        .local_addr()
-        .expect("read analyzer port")
-        .port()
-}
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn gui_edit_roundtrip() {
-    let _guard = FULL_STACK_LOCK.lock().await;
-    let mut session = Session::new("cell top() {\n}\n").await;
-    session.start_analyzer();
-    let child = session.spawn_nvim("roundtrip");
-    let analyzer = session.connect_analyzer().await;
-    analyzer
-        .register(context::current(), session.gui_addr)
-        .await
-        .expect("register headless GUI");
+    use argonc::compile::BasicRect;
 
-    let mut drew_rect = false;
-    let mut saw_editor_update = false;
-    while !saw_editor_update {
-        match session.next_event().await {
-            GuiEvent::OpenCell {
-                kind: OutputKind::Data,
-                update,
-                scope,
-                rect_count,
-            } if !drew_rect => {
-                let scope = scope.expect("compiled top cell should expose its root scope");
-                let inserted = analyzer
-                    .draw_rect(
-                        context::current(),
+    use super::*;
+    use crate::finish_nvim;
+
+    // Process-heavy scenarios share ports and startup deadlines, so keep them
+    // serial even though Cargo runs Rust tests in parallel by default.
+    static FULL_STACK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn assert_completes(description: &str, future: impl Future<Output = ()>) {
+        time::timeout(TEST_TIMEOUT, future)
+            .await
+            .unwrap_or_else(|_| panic!("timed out {description}"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gui_edit_roundtrip() {
+        assert_completes("waiting for GUI/editor round trip", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("roundtrip");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+
+            let mut drew_rect = false;
+            let mut saw_editor_update = false;
+            while !saw_editor_update {
+                match session.next_event().await {
+                    GuiEvent::OpenCell {
+                        kind: OutputKind::Data,
+                        update,
                         scope,
-                        "gui_rect".to_owned(),
-                        BasicRect {
-                            layer: Some("met1".to_owned()),
-                            x0: 0.0,
-                            y0: 0.0,
-                            x1: 10.0,
-                            y1: 10.0,
-                            construction: false,
-                        },
-                    )
-                    .await
-                    .expect("GUI draw request should reach analyzer");
-                assert!(inserted.is_some(), "GUI draw should edit the source buffer");
-                assert!(!update);
-                assert_eq!(rect_count, 0);
-                drew_rect = true;
+                        rect_count,
+                    } if !drew_rect => {
+                        let scope = scope.expect("compiled top cell should expose its root scope");
+                        let inserted = analyzer
+                            .draw_rect(
+                                context::current(),
+                                scope,
+                                "gui_rect".to_owned(),
+                                BasicRect {
+                                    layer: Some("met1".to_owned()),
+                                    x0: 0.0,
+                                    y0: 0.0,
+                                    x1: 10.0,
+                                    y1: 10.0,
+                                    construction: false,
+                                },
+                            )
+                            .await
+                            .expect("GUI draw request should reach analyzer");
+                        assert!(inserted.is_some(), "GUI draw should edit the source buffer");
+                        assert!(!update);
+                        assert_eq!(rect_count, 0);
+                        drew_rect = true;
+                    }
+                    GuiEvent::OpenCell {
+                        kind: OutputKind::Data,
+                        update: true,
+                        rect_count: 1,
+                        ..
+                    } => {
+                        std::fs::write(&session.gui_edit_ack, "ok\n")
+                            .expect("acknowledge compiled GUI edit");
+                    }
+                    GuiEvent::OpenCell {
+                        kind: OutputKind::Data,
+                        update: true,
+                        rect_count,
+                        ..
+                    } if rect_count >= 2 => saw_editor_update = true,
+                    _ => {}
+                }
             }
-            GuiEvent::OpenCell {
-                kind: OutputKind::Data,
-                update: true,
-                rect_count: 1,
-                ..
-            } => {
-                std::fs::write(&session.gui_edit_ack, "ok\n")
-                    .expect("acknowledge compiled GUI edit");
-            }
-            GuiEvent::OpenCell {
-                kind: OutputKind::Data,
-                update: true,
-                rect_count,
-                ..
-            } if rect_count >= 2 => saw_editor_update = true,
-            _ => {}
-        }
+
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let source = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read round-tripped source");
+            assert!(source.contains("let gui_rect = rect("));
+            assert!(source.contains("let editor_rect = rect("));
+        })
+        .await;
     }
 
-    std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
-    finish_nvim(child).await;
-    let source =
-        std::fs::read_to_string(session.project.join("lib.ar")).expect("read round-tripped source");
-    assert!(source.contains("let gui_rect = rect("));
-    assert!(source.contains("let editor_rect = rect("));
-}
+    #[tokio::test(flavor = "multi_thread")]
+    async fn diagnostic_recovery() {
+        assert_completes("waiting for diagnostic recovery", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n    missing;\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("diagnostics");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
 
-#[tokio::test(flavor = "multi_thread")]
-async fn diagnostic_recovery() {
-    let _guard = FULL_STACK_LOCK.lock().await;
-    let mut session = Session::new("cell top() {\n    missing;\n}\n").await;
-    session.start_analyzer();
-    let child = session.spawn_nvim("diagnostics");
-    let analyzer = session.connect_analyzer().await;
-    analyzer
-        .register(context::current(), session.gui_addr)
-        .await
-        .expect("register headless GUI");
-
-    let mut saw_errors = false;
-    let mut saw_recovery = false;
-    while !saw_recovery {
-        match session.next_event().await {
-            GuiEvent::OpenCell {
-                kind: OutputKind::StaticErrors,
-                ..
-            } => {
-                saw_errors = true;
-                std::fs::write(&session.diagnostic_ack, "ok\n")
-                    .expect("acknowledge GUI diagnostics");
+            let mut saw_errors = false;
+            let mut saw_recovery = false;
+            while !saw_recovery {
+                match session.next_event().await {
+                    GuiEvent::OpenCell {
+                        kind: OutputKind::StaticErrors,
+                        ..
+                    } => {
+                        saw_errors = true;
+                        std::fs::write(&session.diagnostic_ack, "ok\n")
+                            .expect("acknowledge GUI diagnostics");
+                    }
+                    GuiEvent::OpenCell {
+                        kind: OutputKind::Data,
+                        ..
+                    } if saw_errors => saw_recovery = true,
+                    _ => {}
+                }
             }
-            GuiEvent::OpenCell {
-                kind: OutputKind::Data,
-                ..
-            } if saw_errors => saw_recovery = true,
-            _ => {}
-        }
-    }
 
-    std::fs::write(&session.ack, "ok\n").expect("acknowledge diagnostic recovery");
-    finish_nvim(child).await;
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge diagnostic recovery");
+            finish_nvim(child).await;
+        })
+        .await;
+    }
 }

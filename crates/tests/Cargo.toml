@@ -5,7 +5,7 @@ edition = "2024"
 license.workspace = true
 publish = false
 
-[dev-dependencies]
+[dependencies]
 analyzer = { package = "argon-analyzer", path = "../analyzer" }
 argonc = { path = "../compiler" }
 futures = { workspace = true }
