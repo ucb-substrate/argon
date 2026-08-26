@@ -43,7 +43,7 @@ struct SimplicialData<'a> {
 /// a rank-revealing fallback that solves only uniquely determined variables.
 pub fn solve(ncols: usize, rows: &[Vec<(usize, f64)>], rhs: &[f64]) -> Option<Vec<f64>> {
     let nrows = rows.len();
-    if ncols == 0 || nrows < ncols || rhs.len() != nrows {
+    if ncols == 0 || nrows < ncols || rhs.len() != nrows || !rows_are_safely_scaled(rows) {
         return None;
     }
 
@@ -100,6 +100,9 @@ pub fn solve(ncols: usize, rows: &[Vec<(usize, f64)>], rhs: &[f64]) -> Option<Ve
 /// QR; rank-deficient systems use CGLS for a particular least-squares solution
 /// and sparse Householder QR for an orthonormal null-space basis.
 pub fn analyze(ncols: usize, rows: &[Vec<(usize, f64)>], rhs: &[f64]) -> Option<Analysis> {
+    if !rows_are_safely_scaled(rows) {
+        return None;
+    }
     if let Some(solution) = solve(ncols, rows, rhs) {
         return Some(Analysis {
             solution,
@@ -120,6 +123,9 @@ pub fn analyze(ncols: usize, rows: &[Vec<(usize, f64)>], rhs: &[f64]) -> Option<
 /// Returns an orthonormal basis of `null(A)` without constructing a dense input
 /// matrix. The output itself can be dense when the mathematical null space is.
 pub fn nullspace(ncols: usize, rows: &[Vec<(usize, f64)>]) -> Option<Vec<Vec<(usize, f64)>>> {
+    if !rows_are_safely_scaled(rows) {
+        return None;
+    }
     if ncols == 0 {
         return Some(Vec::new());
     }
@@ -228,6 +234,30 @@ pub fn nullspace(ncols: usize, rows: &[Vec<(usize, f64)>]) -> Option<Vec<Vec<(us
             })
             .collect(),
     )
+}
+
+/// Rejects systems whose equation scales exceed the numerical rank tolerance.
+/// The comparison is relative, so multiplying the whole system by any finite
+/// nonzero constant does not change the routing decision. Zero rows are ignored.
+fn rows_are_safely_scaled(rows: &[Vec<(usize, f64)>]) -> bool {
+    let mut smallest_row_scale = f64::INFINITY;
+    let mut largest_row_scale = 0f64;
+
+    for row in rows {
+        let mut row_scale = 0f64;
+        for &(_, coefficient) in row {
+            if !coefficient.is_finite() {
+                return false;
+            }
+            row_scale = row_scale.max(coefficient.abs());
+        }
+        if row_scale > 0. {
+            smallest_row_scale = smallest_row_scale.min(row_scale);
+            largest_row_scale = largest_row_scale.max(row_scale);
+        }
+    }
+
+    smallest_row_scale == f64::INFINITY || smallest_row_scale >= largest_row_scale * ZERO_TOLERANCE
 }
 
 fn sparse_matrix(ncols: usize, rows: &[Vec<(usize, f64)>]) -> Option<SparseColMat<usize, f64>> {
@@ -719,6 +749,19 @@ mod tests {
 
         let underdetermined = vec![vec![(0, 1.), (1, 1.)]];
         assert!(solve(2, &underdetermined, &[1.]).is_none());
+    }
+
+    #[test]
+    fn scale_preflight_is_relative_and_routes_extreme_ranges() {
+        let ordinary = vec![vec![(0, 1.)], vec![(1, 1e-6)]];
+        let uniformly_tiny = vec![vec![(0, 1e-100)], vec![(1, 1e-106)]];
+        assert!(rows_are_safely_scaled(&ordinary));
+        assert!(rows_are_safely_scaled(&uniformly_tiny));
+        assert!(rows_are_safely_scaled(&[Vec::new(), vec![(0, 1.)]]));
+
+        let ill_scaled = vec![vec![(0, 1e-12)], vec![(1, 1e12)]];
+        assert!(!rows_are_safely_scaled(&ill_scaled));
+        assert!(analyze(2, &ill_scaled, &[1e-12, 1e12]).is_none());
     }
 
     fn dense(vector: &[(usize, f64)], ncols: usize) -> Vec<f64> {
