@@ -31,6 +31,7 @@ use crate::gds::{ImportedGdsElement, import_gds};
 use crate::layer::LayerProperties;
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
+use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -95,6 +96,7 @@ pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
     }
 }
 
+#[derive(Clone)]
 pub struct StaticAnalysis {
     /// Parsed source AST used for source-aware tooling.
     pub ast: WorkspaceParseAst,
@@ -104,38 +106,47 @@ pub struct StaticAnalysis {
     pub errors: Vec<StaticError>,
 }
 
-pub fn dynamic_compile(
+/// Executes a cell using workspace-wide external inputs from `config`.
+pub fn execute_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
-    dynamic_compile_with_gds(ast, input, &[])
-}
-
-pub fn dynamic_compile_with_gds(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
-    input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
-) -> CompileOutput {
-    let lyp_file = input.lyp_file;
+    let Some(lyp_file) = config.lyp.as_deref() else {
+        return missing_lyp_output();
+    };
     check_output_layers(
-        ExecPass::new(ast, lyp_file, gds_imports).execute(input),
+        ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input),
         lyp_file,
     )
 }
 
-/// Compiles a cell invocation spliced into `ast` by
+/// Executes a cell invocation spliced into `ast` by
 /// [`crate::parse::add_cell_invocation`]. Its arguments are evaluated by the
 /// ordinary expression evaluator, so they may be any expression.
-pub fn dynamic_compile_invocation(
+pub fn execute_cell_invocation(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     invocation: &CellInvocation,
-    lyp_file: &FsPath,
-    gds_imports: &[(String, PathBuf)],
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
+    let Some(lyp_file) = config.lyp.as_deref() else {
+        return missing_lyp_output();
+    };
     check_output_layers(
-        ExecPass::new(ast, lyp_file, gds_imports).execute_invocation(invocation),
+        ExecPass::new(ast, lyp_file, &config.gds_imports).execute_invocation(invocation),
         lyp_file,
     )
+}
+
+fn missing_lyp_output() -> CompileOutput {
+    CompileOutput::ExecErrors(ExecErrorCompileOutput {
+        errors: vec![ExecError {
+            span: None,
+            cell: 0,
+            kind: ExecErrorKind::MissingLyp,
+        }],
+        output: None,
+    })
 }
 
 fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
@@ -161,14 +172,10 @@ fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
     }
 }
 
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-    compile_with_gds(ast, input, &[])
-}
-
-pub fn compile_with_gds(
+pub fn compile(
     ast: &WorkspaceParseAst,
     input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
     let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
         static_output
@@ -179,7 +186,7 @@ pub fn compile_with_gds(
         return CompileOutput::StaticErrors(static_output);
     };
 
-    dynamic_compile_with_gds(&ast, input, gds_imports)
+    execute_cell(&ast, input, config)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -2444,7 +2451,6 @@ pub struct CompileInput<'a> {
     /// Full path to cell.
     pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
-    pub lyp_file: &'a FsPath,
 }
 
 pub type VarId = u64;
@@ -2463,6 +2469,35 @@ pub struct BasicRect<T> {
     pub x1: T,
     pub y1: T,
     pub construction: bool,
+}
+
+/// Formats a GUI-created layout coordinate as an Argon float literal.
+///
+/// Coordinates are snapped to the solver's 0.1 grid, use at most one decimal
+/// place, and always contain a decimal point so they continue to parse as
+/// floats rather than integers.
+pub fn format_initial_condition(value: f64) -> String {
+    // Adding positive zero normalizes a rounded `-0.0` to `0.0`.
+    let snapped = (value * 10.0).round() / 10.0 + 0.0;
+    let value = format!("{snapped}");
+    if value.contains('.') {
+        value
+    } else {
+        format!("{value}.")
+    }
+}
+
+#[cfg(test)]
+mod initial_condition_format_tests {
+    use super::format_initial_condition;
+
+    #[test]
+    fn limits_gui_coordinates_to_one_decimal_place() {
+        assert_eq!(format_initial_condition(12.345678), "12.3");
+        assert_eq!(format_initial_condition(12.0), "12.");
+        assert_eq!(format_initial_condition(-0.04), "0.");
+        assert_eq!(format_initial_condition(1.2000000476837158), "1.2");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

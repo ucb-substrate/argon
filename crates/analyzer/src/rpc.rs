@@ -8,13 +8,15 @@ use argonc::{
 };
 
 use serde::{Deserialize, Serialize};
-use tarpc::tokio_serde::formats::Json;
+use tarpc::{context, tokio_serde::formats::Json};
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
     Uri, WorkspaceEdit,
 };
 
-use crate::{ForceSave, Redo, State, StateMut, Undo, document::Document};
+use crate::{
+    ArgonConfig, Backend, PublishedState, Redo, Save, SourceState, State, Undo, document::Document,
+};
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
 /// persist solution-space-exploration drags by updating initial-condition
@@ -80,8 +82,17 @@ pub struct InstancePreview {
     pub scope_span: Span,
 }
 
+/// A compiled GUI result tied to the exact analyzer source revision that
+/// produced it. Diagnostics continue to travel over LSP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationSnapshot {
+    pub revision: u64,
+    pub output: CompileOutput,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LangServerAction {
+    Save,
     Undo,
     Redo,
 }
@@ -113,20 +124,29 @@ pub trait LangServer {
 
 #[tarpc::service]
 pub trait Gui {
-    async fn open_cell(cell: CompileOutput, update: bool);
+    async fn update_cell(snapshot: CompilationSnapshot);
+    async fn fit();
+    async fn set_workspace_path(path: Option<PathBuf>);
+    async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
     async fn place_instance(preview: InstancePreview);
-    async fn set(key: String, value: String);
+    async fn configure(config: ArgonConfig);
     async fn activate();
 }
 
 pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
 
-pub(crate) fn editor_buffers_are_current(state: &StateMut) -> bool {
-    state.ast.values().all(|ast| {
+pub(crate) fn editor_buffers_are_current(source: &SourceState, compiled: &PublishedState) -> bool {
+    compiled.ast.values().all(|ast| {
         Uri::from_file_path(&ast.path)
-            .and_then(|uri| state.editor_files.get(&uri))
-            .is_none_or(|document| document.contents() == ast.source_text)
+            .map(|uri| {
+                source.pending_workspace_edits.contains_key(&uri)
+                    || source
+                        .editor_files
+                        .get(&uri)
+                        .is_none_or(|document| document.contents() == ast.source_text)
+            })
+            .unwrap_or(true)
     })
 }
 
@@ -291,9 +311,18 @@ impl State {
     async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
-        paths: impl IntoIterator<Item = PathBuf>,
         focus: Option<Uri>,
     ) -> bool {
+        let pending_uris = changes.keys().cloned().collect::<Vec<_>>();
+        {
+            let mut state = self.source_state.lock().await;
+            for uri in &pending_uris {
+                *state
+                    .pending_workspace_edits
+                    .entry(uri.clone())
+                    .or_default() += 1;
+            }
+        }
         let result: Result<(), String> = async {
             if let Some(uri) = focus {
                 self.editor_client
@@ -322,17 +351,21 @@ impl State {
                     .unwrap_or_else(|| "editor rejected source edit".to_owned()));
             }
 
-            for path in paths {
-                self.editor_client
-                    .send_request::<ForceSave>(path)
-                    .await
-                    .map_err(|error| format!("could not save edited source: {error}"))?;
-            }
             Ok(())
         }
         .await;
 
         if let Err(error) = result {
+            let mut state = self.source_state.lock().await;
+            for uri in pending_uris {
+                if let Some(count) = state.pending_workspace_edits.get_mut(&uri) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        state.pending_workspace_edits.shift_remove(&uri);
+                    }
+                }
+            }
+            drop(state);
             self.editor_client
                 .show_message(MessageType::ERROR, error)
                 .await;
@@ -342,13 +375,9 @@ impl State {
         }
     }
 
-    async fn apply_source_edit(&self, uri: Uri, path: PathBuf, edit: TextEdit) -> bool {
-        self.apply_source_changes(
-            HashMap::from([(uri.clone(), vec![edit])]),
-            [path],
-            Some(uri),
-        )
-        .await
+    async fn apply_source_edit(&self, uri: Uri, edit: TextEdit) -> bool {
+        self.apply_source_changes(HashMap::from([(uri.clone(), vec![edit])]), Some(uri))
+            .await
     }
 }
 
@@ -368,15 +397,39 @@ impl LangServer for State {
                 return;
             }
         };
-        let mut state_mut = self.state_mut.lock().await;
-        state_mut.gui_client = Some(gui_client);
-        state_mut.compile(&self.editor_client, false).await;
+        let connection = self.install_gui_connection(gui_client.clone()).await;
+        let modified = self.source_state.lock().await.workspace_modified;
+        if let Err(error) = gui_client
+            .configure(context::current(), self.config())
+            .await
+        {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not configure the GUI: {error}"),
+                )
+                .await;
+            if crate::is_gui_disconnected(&error) {
+                self.clear_gui_connection(connection.id).await;
+                return;
+            }
+        }
+        if !self.publish_workspace_path(Some(connection.clone())).await {
+            return;
+        }
+        self.publish_workspace_modified(modified, Some(connection))
+            .await;
+        Backend {
+            state: self.clone(),
+        }
+        .open_current()
+        .await;
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
         // TODO: check that vim file is in sync with GUI file.
-        let state_mut = self.state_mut.lock().await;
-        if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path) {
+        let compiled = self.published_state.lock().await;
+        if let Some(ast) = compiled.ast.values().find(|ast| ast.path == span.path) {
             let doc = Document::new(&ast.source_text, 0);
             let Some(url) = Uri::from_file_path(&span.path) else {
                 return;
@@ -390,6 +443,7 @@ impl LangServer for State {
                 message: "selected rect".to_string(),
                 ..Default::default()
             }];
+            drop(compiled);
             self.editor_client
                 .publish_diagnostics(url, diagnostics, None)
                 .await;
@@ -403,31 +457,28 @@ impl LangServer for State {
         var_name: String,
         rect: BasicRect<f64>,
     ) -> Option<Span> {
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = state_mut
-            .ast
+        let ast = workspace_ast
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
         let document = Document::new(&ast.source_text, 0);
         let expression = format!(
-            "rect({}x0i = {:?}, y0i = {:?}, x1i = {:?}, y1i = {:?})",
+            "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
             rect.layer
                 .as_ref()
                 .map(|layer| format!("\"{layer}\", "))
                 .unwrap_or_default(),
-            rect.x0,
-            rect.y0,
-            rect.x1,
-            rect.y1,
+            argonc::compile::format_initial_condition(rect.x0),
+            argonc::compile::format_initial_condition(rect.y0),
+            argonc::compile::format_initial_condition(rect.x1),
+            argonc::compile::format_initial_condition(rect.y1),
         );
         let prefix = format!("let {var_name} = ");
         let insertion = insert_statement(
@@ -441,9 +492,7 @@ impl LangServer for State {
             path: scope_span.path.clone(),
             span: insertion.tracked_span,
         };
-        drop(state_mut);
-
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
@@ -458,17 +507,14 @@ impl LangServer for State {
         if polygon.points.len() < 3 {
             return None;
         }
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = state_mut
-            .ast
+        let ast = workspace_ast
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
@@ -487,9 +533,7 @@ impl LangServer for State {
             path: scope_span.path.clone(),
             span: insertion.tracked_span,
         };
-        drop(state_mut);
-
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
@@ -504,17 +548,14 @@ impl LangServer for State {
         if path.points.len() < 2 || !path.width.is_finite() || path.width <= 0. {
             return None;
         }
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = state_mut
-            .ast
+        let ast = workspace_ast
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
@@ -533,9 +574,7 @@ impl LangServer for State {
             path: scope_span.path.clone(),
             span: insertion.tracked_span,
         };
-        drop(state_mut);
-
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
@@ -548,17 +587,14 @@ impl LangServer for State {
         x: f64,
         y: f64,
     ) -> Option<Span> {
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = state_mut
-            .ast
+        let ast = workspace_ast
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
@@ -592,9 +628,7 @@ impl LangServer for State {
                 scope.span.end() + insertion.edit.new_text.len(),
             ),
         };
-        drop(state_mut);
-
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(updated_scope_span)
     }
@@ -605,17 +639,14 @@ impl LangServer for State {
         scope_span: Span,
         params: DimensionParams,
     ) -> Option<Span> {
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = state_mut
-            .ast
+        let ast = workspace_ast
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
@@ -641,9 +672,7 @@ impl LangServer for State {
             path: scope_span.path.clone(),
             span: insertion.tracked_span,
         };
-        drop(state_mut);
-
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
@@ -654,16 +683,14 @@ impl LangServer for State {
         span: Span,
         value: String,
     ) -> Option<Span> {
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
         let url = Uri::from_file_path(&span.path)?;
-        let ast = state_mut.ast.values().find(|ast| ast.path == span.path)?;
+        let ast = workspace_ast.values().find(|ast| ast.path == span.path)?;
         let call = ast.span2call.get(&span)?;
         let old_value = call.args.posargs.get(2)?;
         let document = Document::new(&ast.source_text, 0);
@@ -681,15 +708,14 @@ impl LangServer for State {
                 old_value.span().start() + value.len(),
             ),
         };
-        drop(state_mut);
-
-        self.apply_source_edit(url, span.path, edit)
+        self.apply_source_edit(url, edit)
             .await
             .then_some(updated_span)
     }
 
     /// Rewrites existing initial-condition values and inserts any missing
-    /// geometry kwargs in one workspace edit, then saves to trigger a compile.
+    /// geometry kwargs in one workspace edit. The resulting `didChange`
+    /// recompiles the dirty in-memory buffers without saving them.
     async fn update_values(
         self,
         _: tarpc::context::Context,
@@ -699,14 +725,12 @@ impl LangServer for State {
         if edits.is_empty() && initial_conditions.is_empty() {
             return Some(Vec::new());
         }
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
-        }
+        };
 
         // Resolve "ensure kwarg" requests against the current AST. Existing
         // kwargs become ordinary value replacements. Missing kwargs sharing a
@@ -718,8 +742,7 @@ impl LangServer for State {
             value,
         } in initial_conditions
         {
-            let Some(ast) = state_mut
-                .ast
+            let Some(ast) = workspace_ast
                 .values()
                 .find(|ast| ast.path == call_span.path)
             else {
@@ -755,8 +778,7 @@ impl LangServer for State {
         }
 
         for (call_span, values) in missing {
-            let Some(ast) = state_mut
-                .ast
+            let Some(ast) = workspace_ast
                 .values()
                 .find(|ast| ast.path == call_span.path)
             else {
@@ -787,9 +809,8 @@ impl LangServer for State {
         // file are sorted by descending start offset so they can be applied
         // back-to-front without invalidating each other's offsets.
         let mut pending: HashMap<Uri, Vec<(usize, TextEdit)>> = HashMap::new();
-        let mut paths = Vec::new();
         for ValueEdit { span, value } in &edits {
-            if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
+            if let Some(ast) = workspace_ast.values().find(|ast| ast.path == span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
             {
                 let doc = Document::new(&ast.source_text, 0);
@@ -802,9 +823,6 @@ impl LangServer for State {
                         new_text: value.clone(),
                     },
                 ));
-                if !paths.contains(&span.path) {
-                    paths.push(span.path.clone());
-                }
             }
         }
         if pending.is_empty() {
@@ -817,9 +835,7 @@ impl LangServer for State {
                 (uri, edits.into_iter().map(|(_, edit)| edit).collect())
             })
             .collect();
-        drop(state_mut);
-
-        self.apply_source_changes(changes, paths, None)
+        self.apply_source_changes(changes, None)
             .await
             .then_some(edits)
     }
@@ -831,19 +847,16 @@ impl LangServer for State {
         lhs: String,
         rhs: String,
     ) {
-        let state_mut = self.state_mut.lock().await;
-        if !editor_buffers_are_current(&state_mut) {
-            drop(state_mut);
+        let Some(workspace_ast) = self.current_editor_ast().await else {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return;
-        }
+        };
         let Some(url) = Uri::from_file_path(&scope_span.path) else {
             return;
         };
-        let Some(ast) = state_mut
-            .ast
+        let Some(ast) = workspace_ast
             .values()
             .find(|ast| ast.path == scope_span.path)
         else {
@@ -860,10 +873,7 @@ impl LangServer for State {
             &format!("eq({lhs}, {rhs});"),
             0..0,
         );
-        drop(state_mut);
-
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
-            .await;
+        self.apply_source_edit(url, insertion.edit).await;
     }
 
     async fn open_cell(self, _: tarpc::context::Context, cell: String) {
@@ -871,9 +881,7 @@ impl LangServer for State {
             .show_message(MessageType::INFO, &format!("cell {}", cell))
             .await;
         tokio::spawn(async move {
-            let mut state_mut = self.state_mut.lock().await;
-            state_mut.cell = Some(cell);
-            state_mut.compile(&self.editor_client, false).await;
+            Backend { state: self }.select_and_open_cell(cell).await;
         });
     }
 
@@ -883,6 +891,7 @@ impl LangServer for State {
 
     async fn dispatch_action(self, _: tarpc::context::Context, action: LangServerAction) {
         let result = match action {
+            LangServerAction::Save => self.editor_client.send_request::<Save>(()).await,
             LangServerAction::Undo => self.editor_client.send_request::<Undo>(()).await,
             LangServerAction::Redo => self.editor_client.send_request::<Redo>(()).await,
         };
@@ -897,24 +906,15 @@ impl LangServer for State {
     }
 
     async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
-        if let Err(error) = self
-            .editor_client
-            .send_request::<crate::FocusEditor>(command)
-            .await
-        {
-            self.editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not focus the editor: {error}"),
-                )
-                .await;
-        }
+        self.editor_client
+            .send_notification::<crate::FocusEditor>(command)
+            .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use argonc::parse;
+    use argonc::{WorkspaceConfig, parse};
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
@@ -922,7 +922,7 @@ mod tests {
         insert_statement, instance_placement_expression, missing_initial_condition_edit,
         path_expression, polygon_expression, segment_constraint_statements,
     };
-    use crate::StateMut;
+    use crate::{PublishedState, SourceState};
 
     #[test]
     fn generated_gds_declarations_do_not_make_editor_buffers_stale() {
@@ -930,20 +930,41 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         let source = "cell top() {}\n";
         std::fs::write(&source_path, source).unwrap();
-        let ast = parse::parse_workspace_with_std_deps_and_gds(
-            &source_path,
-            std::iter::empty(),
-            [("ring_osc".to_owned(), directory.path().join("ring_osc.gds"))],
-        )
-        .ast();
+        let config = WorkspaceConfig::new(&source_path)
+            .with_gds_imports([("ring_osc".to_owned(), directory.path().join("ring_osc.gds"))]);
+        let ast = parse::parse_workspace_with_config(&config).ast();
         let uri = Uri::from_file_path(&source_path).unwrap();
-        let mut state = StateMut {
-            ast,
+        let compiled = PublishedState {
+            ast: std::sync::Arc::new(ast),
             ..Default::default()
         };
-        state.editor_files.insert(uri, Document::new(source, 1));
+        let mut source_state = SourceState::default();
+        source_state
+            .editor_files
+            .insert(uri, Document::new(source, 1));
 
-        assert!(editor_buffers_are_current(&state));
+        assert!(editor_buffers_are_current(&source_state, &compiled));
+    }
+
+    #[test]
+    fn accepted_workspace_edits_are_not_reported_as_out_of_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(&source_path, "cell top() {}\n").unwrap();
+        let ast = parse::parse_workspace_with_std(&source_path).ast();
+        let uri = Uri::from_file_path(&source_path).unwrap();
+        let compiled = PublishedState {
+            ast: std::sync::Arc::new(ast),
+            ..Default::default()
+        };
+        let mut source_state = SourceState::default();
+        source_state
+            .editor_files
+            .insert(uri.clone(), Document::new("cell top() { rect(); }\n", 2));
+        assert!(!editor_buffers_are_current(&source_state, &compiled));
+
+        source_state.pending_workspace_edits.insert(uri, 1);
+        assert!(editor_buffers_are_current(&source_state, &compiled));
     }
 
     #[test]

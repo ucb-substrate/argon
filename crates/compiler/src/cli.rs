@@ -5,11 +5,11 @@ use std::{
 };
 
 use crate::{
-    artifact,
+    WorkspaceConfig, artifact,
     compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
     gds::GdsMap,
-    parse::{self, CellInvocation, parse_workspace_with_std_deps_and_gds},
+    parse::{self, CellInvocation, parse_workspace_with_config},
 };
 use clap::{Parser, ValueEnum};
 use gds::GdsUnits;
@@ -106,6 +106,10 @@ fn execute(args: Args) -> Result<(), Failed> {
         }
     }
 
+    let workspace = WorkspaceConfig::new(&root)
+        .with_dependencies(args.dependencies.clone())
+        .with_lyp(args.lyp.clone())
+        .with_gds_imports(args.gds_imports.clone());
     // The invocation is spliced into the workspace before analysis so that its
     // arguments are resolved, type-checked, and evaluated like any source
     // expression, which means the entry point must be resolved before parsing.
@@ -125,8 +129,7 @@ fn execute(args: Args) -> Result<(), Failed> {
         Some((cell, lyp))
     };
 
-    let mut parse_output =
-        parse_workspace_with_std_deps_and_gds(&root, args.dependencies, args.gds_imports.clone());
+    let mut parse_output = parse_workspace_with_config(&workspace);
     let entry = match entry {
         Some((cell, lyp)) => Some((
             parse::add_cell_invocation(&mut parse_output, cell)
@@ -156,8 +159,7 @@ fn execute(args: Args) -> Result<(), Failed> {
         return Ok(());
     };
 
-    let output =
-        compile::dynamic_compile_invocation(&typed_ast, &invocation, lyp, &args.gds_imports);
+    let output = compile::execute_cell_invocation(&typed_ast, &invocation, &workspace);
     if !matches!(output, CompileOutput::Valid(_)) {
         return Err(compile_failed(format, output, Some(&invocation)));
     }

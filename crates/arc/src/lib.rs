@@ -560,6 +560,7 @@ mod tests {
     };
 
     use argonc::{
+        WorkspaceConfig,
         compile::{CompileInput, compile},
         parse::parse_workspace_with_std,
     };
@@ -692,8 +693,8 @@ cell top() {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: lyp,
             },
+            &WorkspaceConfig::new(&library.root).with_lyp(Some(lyp.clone())),
         )
         .unwrap_valid();
         let label = output.cells[&output.top]

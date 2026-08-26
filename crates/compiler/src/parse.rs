@@ -8,6 +8,7 @@ use crate::{
     ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
     compile::{StaticError, StaticErrorKind},
     parser::ParseError,
+    workspace::WorkspaceConfig,
 };
 
 pub struct ParseMetadata;
@@ -84,6 +85,25 @@ pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, an
 type ParseResult = (AnnotatedParseAst, Option<anyhow::Error>);
 type ParseDiagnostics = Vec<ParseDiagnostic>;
 type ModSpans = Vec<(cfgrammar::Span, ModPath)>;
+
+/// Successful per-file parses retained by an incremental compiler session.
+/// Syntax-error recovery is deliberately reparsed on the next request.
+#[derive(Default, Clone)]
+pub struct ParseCache {
+    entries: IndexMap<PathBuf, (ArcStr, AnnotatedParseAst)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl ParseCache {
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ParseDiagnostic {
@@ -199,7 +219,7 @@ fn parse_result_from_errors(
 }
 
 pub fn parse_workspace_with_std(root_lib: impl AsRef<Path>) -> ParseOutput {
-    parse_workspace_with_std_and_deps(root_lib, std::iter::empty::<(String, PathBuf)>())
+    parse_workspace_with_config(&WorkspaceConfig::new(root_lib.as_ref()))
 }
 
 /// Parses a library, its explicitly supplied path dependencies, and the Argon
@@ -210,11 +230,14 @@ pub fn parse_workspace_with_std_and_deps(
     root_lib: impl AsRef<Path>,
     dependencies: impl IntoIterator<Item = (String, PathBuf)>,
 ) -> ParseOutput {
-    parse_workspace_with_std_deps_and_gds(
-        root_lib,
-        dependencies,
-        std::iter::empty::<(String, PathBuf)>(),
+    parse_workspace_with_config(
+        &WorkspaceConfig::new(root_lib.as_ref()).with_dependencies(dependencies),
     )
+}
+
+/// Parses a resolved workspace and its embedded standard library.
+pub fn parse_workspace_with_config(config: &WorkspaceConfig) -> ParseOutput {
+    parse_workspace_with_config_and_sources(config, &IndexMap::new())
 }
 
 /// Parses a workspace and adds zero-argument cell declarations backed by GDS
@@ -225,24 +248,85 @@ pub fn parse_workspace_with_std_deps_and_gds(
     dependencies: impl IntoIterator<Item = (String, PathBuf)>,
     gds_imports: impl IntoIterator<Item = (String, PathBuf)>,
 ) -> ParseOutput {
-    let root_lib = root_lib.as_ref();
+    parse_workspace_with_config(
+        &WorkspaceConfig::new(root_lib.as_ref())
+            .with_dependencies(dependencies)
+            .with_gds_imports(gds_imports),
+    )
+}
+
+/// Parses a resolved workspace using open editor documents as source overlays.
+pub fn parse_workspace_with_config_and_sources(
+    config: &WorkspaceConfig,
+    sources: &IndexMap<PathBuf, ArcStr>,
+) -> ParseOutput {
+    parse_workspace_with_config_sources_and_cache(config, sources, &mut ParseCache::default())
+}
+
+/// Parses a workspace while taking the contents of open editor documents from
+/// `sources`. Files absent from the map are read from disk. Paths in the map
+/// must be the same absolute (or consistently relative) paths used by the
+/// workspace and dependency roots.
+pub fn parse_workspace_with_std_deps_gds_and_sources(
+    root_lib: impl AsRef<Path>,
+    dependencies: impl IntoIterator<Item = (String, PathBuf)>,
+    gds_imports: impl IntoIterator<Item = (String, PathBuf)>,
+    sources: &IndexMap<PathBuf, ArcStr>,
+) -> ParseOutput {
+    parse_workspace_with_config_and_sources(
+        &WorkspaceConfig::new(root_lib.as_ref())
+            .with_dependencies(dependencies)
+            .with_gds_imports(gds_imports),
+        sources,
+    )
+}
+
+/// Overlay-aware workspace parsing with a reusable successful-file cache.
+pub fn parse_workspace_with_config_sources_and_cache(
+    config: &WorkspaceConfig,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    cache: &mut ParseCache,
+) -> ParseOutput {
     let mut output = ParseOutput::default();
-    for (name, path) in dependencies {
+    for (name, path) in &config.dependencies {
         let dep_root = if path.is_dir() {
             path.join("lib.ar")
         } else {
-            path
+            path.clone()
         };
-        output.merge(parse_workspace(dep_root), Some(&name));
+        output.merge(
+            parse_workspace_with_sources(dep_root, sources, cache),
+            Some(name),
+        );
     }
-    output.merge(parse_workspace(root_lib), None);
-    add_gds_imports(&mut output, gds_imports);
+    output.merge(
+        parse_workspace_with_sources(config.root_lib(), sources, cache),
+        None,
+    );
+    add_gds_imports(&mut output, config.gds_imports.iter().cloned());
     let std_path = PathBuf::from(STD_PATH);
     let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
     // TODO: fix std library overwriting user-defined std mods.
     output.asts.insert(vec!["std".to_string()], std_ast);
     output.errs.insert(std_path, (std_diagnostics, Vec::new()));
     output
+}
+
+/// Overlay-aware workspace parsing with a reusable successful-file cache.
+pub fn parse_workspace_with_std_deps_gds_sources_and_cache(
+    root_lib: impl AsRef<Path>,
+    dependencies: impl IntoIterator<Item = (String, PathBuf)>,
+    gds_imports: impl IntoIterator<Item = (String, PathBuf)>,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    cache: &mut ParseCache,
+) -> ParseOutput {
+    parse_workspace_with_config_sources_and_cache(
+        &WorkspaceConfig::new(root_lib.as_ref())
+            .with_dependencies(dependencies)
+            .with_gds_imports(gds_imports),
+        sources,
+        cache,
+    )
 }
 
 fn add_gds_imports(output: &mut ParseOutput, imports: impl IntoIterator<Item = (String, PathBuf)>) {
@@ -474,6 +558,14 @@ fn generated_name(prefix: &str, unused: impl Fn(&str) -> bool) -> String {
 }
 
 pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
+    parse_workspace_with_sources(root_lib, &IndexMap::new(), &mut ParseCache::default())
+}
+
+fn parse_workspace_with_sources(
+    root_lib: impl AsRef<Path>,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    cache: &mut ParseCache,
+) -> ParseOutput {
     let root_lib = root_lib.as_ref();
 
     let mut stack = vec![vec![]];
@@ -483,7 +575,7 @@ pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
     while let Some(path) = stack.pop() {
         match get_mod(root_lib, &path) {
             Ok(file_path) => {
-                let (ast, errs) = parse(&file_path);
+                let (ast, errs) = parse_cached(&file_path, sources, cache);
                 let mut mod_spans = Vec::new();
                 for decl in &ast.0.ast.decls {
                     if let Decl::Mod(decl) = decl {
@@ -522,15 +614,45 @@ pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
     }
 }
 
-fn parse(path: impl Into<PathBuf>) -> (ParseResult, ParseDiagnostics) {
-    let path = path.into();
-    match std::fs::read_to_string(&path) {
-        Ok(input) => parse_source(ArcStr::from(input), path),
-        Err(e) => (
-            (make_backup_ast("".into(), path), Some(e.into())),
-            Vec::new(),
-        ),
+fn parse_cached(
+    path: &Path,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    cache: &mut ParseCache,
+) -> (ParseResult, ParseDiagnostics) {
+    let source = match sources.get(path).cloned() {
+        Some(source) => Ok(source),
+        None => std::fs::read_to_string(path).map(ArcStr::from),
+    };
+    let source = match source {
+        Ok(source) => source,
+        Err(error) => {
+            cache.misses += 1;
+            return (
+                (
+                    make_backup_ast("".into(), path.to_path_buf()),
+                    Some(error.into()),
+                ),
+                Vec::new(),
+            );
+        }
+    };
+    if let Some((cached_source, ast)) = cache.entries.get(path)
+        && cached_source == &source
+    {
+        cache.hits += 1;
+        return ((ast.clone(), None), Vec::new());
     }
+
+    cache.misses += 1;
+    let result = parse_source(source.clone(), path.to_path_buf());
+    if result.0.1.is_none() {
+        cache
+            .entries
+            .insert(path.to_path_buf(), (source, result.0.0.clone()));
+    } else {
+        cache.entries.shift_remove(path);
+    }
+    result
 }
 
 fn parse_source(input: ArcStr, path: PathBuf) -> (ParseResult, ParseDiagnostics) {

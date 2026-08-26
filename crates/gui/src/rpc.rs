@@ -2,19 +2,17 @@ use std::{
     fmt::Display,
     future::Future,
     net::{Ipv4Addr, SocketAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
+use analyzer::ArgonConfig;
 use analyzer::rpc::{
-    DimensionParams, Gui, InitialConditionEdit, InstancePreview, LangServerAction,
-    LangServerClient, PathParams, PolygonParams, ValueEdit,
+    CompilationSnapshot, DimensionParams, Gui, InitialConditionEdit, InstancePreview,
+    LangServerAction, LangServerClient, PathParams, PolygonParams, ValueEdit,
 };
 use anyhow::{Result, anyhow};
-use argonc::{
-    ast::Span,
-    compile::{BasicRect, CompileOutput},
-};
+use argonc::{ast::Span, compile::BasicRect};
 use async_compat::CompatExt;
 use futures::{
     channel::{
@@ -35,6 +33,15 @@ use tracing::error;
 use crate::{editor::Editor, editor_window_options, focus};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        // This lock only protects cloning or replacing a complete RPC client,
+        // so the contained value remains usable after a panicking caller.
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
+}
 
 #[derive(Clone)]
 pub struct SyncLangServerClient {
@@ -96,7 +103,7 @@ impl SyncLangServerClient {
         F: Fn(LangServerClient) -> Fut,
         Fut: Future<Output = std::result::Result<T, tarpc::client::RpcError>> + Send + 'static,
     {
-        let client = self.client.lock().unwrap().clone();
+        let client = lock_unpoisoned(&self.client).clone();
         let result = self.call_once(request(client));
         let result = match result {
             Err(RpcCallError::Rpc(error)) if is_disconnected(&error) => match self.reconnect() {
@@ -138,7 +145,7 @@ impl SyncLangServerClient {
 
     fn reconnect(&self) -> Result<LangServerClient> {
         let client = connect_client(&self.app, self.lang_server_addr)?;
-        *self.client.lock().unwrap() = client.clone();
+        *lock_unpoisoned(&self.client) = client.clone();
         Ok(client)
     }
 
@@ -222,7 +229,7 @@ impl SyncLangServerClient {
                 .compat(),
             )
             .detach();
-        let client_clone = self.client.lock().unwrap().clone();
+        let client_clone = lock_unpoisoned(&self.client).clone();
         match self
             .app
             .background_executor()
@@ -409,15 +416,37 @@ pub struct GuiServer {
 }
 
 impl Gui for GuiServer {
-    async fn open_cell(mut self, _: context::Context, cell: CompileOutput, update: bool) {
+    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                let _ = cx.update(|cx| {
-                    editor.open_cell(cx, cell, update);
-                    if !update {
-                        focus::activate_gui(cx);
-                    }
-                });
+                let _ = cx.update(|cx| editor.update_cell(cx, snapshot));
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn fit(mut self, _: context::Context) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.fit_to_screen(cx));
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn set_workspace_path(mut self, _: context::Context, path: Option<std::path::PathBuf>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_workspace_path(cx, path));
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn workspace_modified(mut self, _: context::Context, modified: bool) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_workspace_modified(cx, modified));
             }))
             .await
             .unwrap();
@@ -449,44 +478,21 @@ impl Gui for GuiServer {
             .await
             .unwrap();
     }
-    async fn set(mut self, _: tarpc::context::Context, key: String, value: String) -> () {
-        match key.as_str() {
-            "hierarchyDepth" => {
-                self.to_exec
-                    .send(Box::new(move |editor, cx| {
-                        editor
-                            .state
-                            .update(cx, |state, cx| {
-                                // TODO: Need better way to specify infinite hierarchy depth.
-                                state.hierarchy_depth = value.parse().unwrap_or(usize::MAX);
-                                cx.notify();
-                            })
-                            .unwrap();
-                    }))
-                    .await
+    async fn configure(mut self, _: tarpc::context::Context, config: ArgonConfig) -> () {
+        let _ = analyzer::reload_log_filter(&config.log.level);
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                editor
+                    .state
+                    .update(cx, |state, cx| {
+                        state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
+                        state.dark_mode = config.gui.dark_mode;
+                        cx.notify();
+                    })
                     .unwrap();
-            }
-            "darkMode" => {
-                self.to_exec
-                    .send(Box::new(move |editor, cx| {
-                        if let Ok(new_mode) = value.parse() {
-                            editor
-                                .state
-                                .update(cx, |state, cx| {
-                                    // TODO: Need better way to specify infinite hierarchy depth.
-                                    state.dark_mode = new_mode;
-                                    cx.notify();
-                                })
-                                .unwrap();
-                        }
-                    }))
-                    .await
-                    .unwrap();
-            }
-            _ => {
-                // TODO: handle errors.
-            }
-        }
+            }))
+            .await
+            .unwrap();
     }
 
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
@@ -509,7 +515,24 @@ impl Gui for GuiServer {
 
 #[cfg(test)]
 mod tests {
-    use super::is_disconnected;
+    use std::sync::{Arc, Mutex};
+
+    use super::{is_disconnected, lock_unpoisoned};
+
+    #[test]
+    fn client_lock_recovers_from_poisoning() {
+        let lock = Arc::new(Mutex::new(1));
+        let poisoned_lock = lock.clone();
+        let result = std::thread::spawn(move || {
+            let _guard = lock_unpoisoned(&poisoned_lock);
+            panic!("poison test lock");
+        })
+        .join();
+        assert!(result.is_err());
+
+        *lock_unpoisoned(&lock) = 2;
+        assert_eq!(*lock_unpoisoned(&lock), 2);
+    }
 
     #[test]
     fn reconnects_only_for_transport_failures() {

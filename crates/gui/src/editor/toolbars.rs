@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use analyzer::rpc::LangServerAction;
@@ -32,20 +33,55 @@ impl TitleBar {
     }
 }
 
+fn workspace_title(path: Option<&Path>) -> String {
+    path.map_or_else(
+        || "Argon".to_owned(),
+        |path| format!("Argon — {}", path.display()),
+    )
+}
+
 impl Render for TitleBar {
     fn render(
         &mut self,
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let theme = self.state.read(cx).theme();
+        let state = self.state.read(cx);
+        let theme = state.theme();
+        let mut centered_title = div()
+            .relative()
+            .child(workspace_title(state.workspace_path.as_deref()));
+        if state.workspace_modified {
+            centered_title = centered_title.child(div().absolute().left_full().ml_1().child("[+]"));
+        }
         div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
             .p_1()
             .bg(theme.titlebar)
-            .text_center()
-            .child("Argon")
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(centered_title)
+    }
+}
+
+#[cfg(test)]
+mod title_bar_tests {
+    use std::path::Path;
+
+    use super::workspace_title;
+
+    #[test]
+    fn title_shows_workspace() {
+        let workspace = Path::new("/projects/inverter");
+        assert_eq!(
+            workspace_title(Some(workspace)),
+            "Argon — /projects/inverter"
+        );
+        assert_eq!(workspace_title(None), "Argon");
     }
 }
 

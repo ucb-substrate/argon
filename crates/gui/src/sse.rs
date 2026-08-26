@@ -263,10 +263,7 @@ pub(crate) fn initial_condition_after_drag(constraint: &LinearExpr, dv: &SparseV
 /// snapped to the solver's 0.1 grid so the written code stays clean and matches
 /// what recompilation produces.
 pub(crate) fn format_value(v: f64) -> String {
-    // `+ 0.0` collapses a possible `-0.0` to `0.0`.
-    let snapped = (v * 10.0).round() / 10.0 + 0.0;
-    let s = format!("{snapped}");
-    if s.contains('.') { s } else { format!("{s}.") }
+    argonc::compile::format_initial_condition(v)
 }
 
 #[cfg(test)]
