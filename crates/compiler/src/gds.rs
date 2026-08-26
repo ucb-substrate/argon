@@ -1,8 +1,8 @@
 use std::{io::BufReader, ops::Deref, path::Path};
 
 use ::gds::{
-    GdsArrayRef, GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPoint, GdsStrans, GdsStruct,
-    GdsStructRef, GdsTextElem, GdsUnits,
+    GdsArrayRef, GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPath, GdsPoint, GdsStrans,
+    GdsStruct, GdsStructRef, GdsTextElem, GdsUnits,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -107,6 +107,14 @@ pub(crate) enum ImportedGdsElement {
         layer: String,
         name: Option<String>,
         points: Vec<(f64, f64)>,
+    },
+    Path {
+        layer: String,
+        name: Option<String>,
+        width: f64,
+        points: Vec<(f64, f64)>,
+        begin_extension: f64,
+        end_extension: f64,
     },
     Text {
         layer: String,
@@ -227,10 +235,9 @@ fn import_gds_with_map(
                 GdsElement::GdsArrayRef(array) => {
                     import_array(path, &names, array, scale, &mut elements)?;
                 }
-                GdsElement::GdsPath(_) => bail!(
-                    "imported GDS `{}` contains a path element; only boundaries, boxes, text, and cell references are supported",
-                    path.display()
-                ),
+                GdsElement::GdsPath(gds_path) => {
+                    elements.push(import_path(map, path, gds_path, scale)?);
+                }
                 GdsElement::GdsNode(_) => bail!(
                     "imported GDS `{}` contains a node element, which is not supported",
                     path.display()
@@ -308,6 +315,49 @@ fn import_boundary(
         layer,
         name: None,
         points: polygon_points,
+    })
+}
+
+fn import_path(
+    map: &GdsMap,
+    source: &Path,
+    path: &GdsPath,
+    scale: f64,
+) -> Result<ImportedGdsElement> {
+    if path.xy.len() < 2 {
+        bail!(
+            "imported GDS `{}` contains a path with fewer than two points",
+            source.display()
+        );
+    }
+    let width = path.width.unwrap_or(0).unsigned_abs() as f64 * scale;
+    let (begin_extension, end_extension) = match path.path_type.unwrap_or(0) {
+        0 => (0., 0.),
+        1 => bail!(
+            "imported GDS `{}` contains a rounded path (path type 1), which is not supported",
+            source.display()
+        ),
+        2 => (width / 2., width / 2.),
+        4 => (
+            f64::from(path.begin_extn.unwrap_or(0)) * scale,
+            f64::from(path.end_extn.unwrap_or(0)) * scale,
+        ),
+        path_type => bail!(
+            "imported GDS `{}` contains unsupported path type {path_type}",
+            source.display()
+        ),
+    };
+    Ok(ImportedGdsElement::Path {
+        layer: import_layer(map, source, path.layer, path.datatype)?,
+        name: None,
+        width,
+        points: path
+            .xy
+            .iter()
+            .map(|point| (f64::from(point.x) * scale, f64::from(point.y) * scale))
+            .collect(),
+        begin_extension,
+        end_extension,
     })
 }
 
@@ -580,6 +630,44 @@ impl CompiledData {
                         ..Default::default()
                     }));
                 }
+                SolvedValue::Path(path) => {
+                    let GdsLayerSpec {
+                        layer,
+                        xtype: datatype,
+                    } = exporter.map[&path.layer];
+                    let width = exporter.coord_to_gds(path.width.0.abs());
+                    let begin_extension = exporter.coord_to_gds(path.begin_extension.0);
+                    let end_extension = exporter.coord_to_gds(path.end_extension.0);
+                    let (path_type, begin_extn, end_extn) =
+                        if begin_extension == 0 && end_extension == 0 {
+                            (None, None, None)
+                        } else if (path.begin_extension.0 - path.width.0.abs() / 2.).abs() < 1e-9
+                            && (path.end_extension.0 - path.width.0.abs() / 2.).abs() < 1e-9
+                        {
+                            (Some(2), None, None)
+                        } else {
+                            (Some(4), Some(begin_extension), Some(end_extension))
+                        };
+                    ocell.elems.push(GdsElement::GdsPath(GdsPath {
+                        layer,
+                        datatype,
+                        width: Some(width),
+                        path_type,
+                        begin_extn,
+                        end_extn,
+                        xy: path
+                            .points
+                            .iter()
+                            .map(|(x, y)| {
+                                GdsPoint::new(
+                                    exporter.coord_to_gds(x.0),
+                                    exporter.coord_to_gds(y.0),
+                                )
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }));
+                }
                 SolvedValue::Text(text) => {
                     let GdsLayerSpec {
                         layer,
@@ -641,9 +729,13 @@ fn parse_cell_name(name: &str) -> Result<&str> {
 mod tests {
     use super::*;
 
+    fn test_map() -> GdsMap {
+        GdsMap::from_iter([("met1".to_owned(), GdsLayerSpec { layer: 1, xtype: 0 })])
+    }
+
     #[test]
     fn non_rectangular_boundary_imports_as_polygon() {
-        let map = GdsMap::from_iter([("met1".to_owned(), GdsLayerSpec { layer: 1, xtype: 0 })]);
+        let map = test_map();
         let element = import_boundary(
             &map,
             Path::new("polygon.gds"),
@@ -664,6 +756,66 @@ mod tests {
         };
         assert_eq!(layer, "met1");
         assert_eq!(points, [(0., 0.), (100., 0.), (50., 75.)]);
+    }
+
+    #[test]
+    fn imports_non_rounded_path_types() {
+        for (path_type, begin_extn, end_extn, expected_extensions) in [
+            (None, None, None, (0., 0.)),
+            (Some(2), None, None, (10., 10.)),
+            (Some(4), Some(7), Some(13), (7., 13.)),
+        ] {
+            let element = import_path(
+                &test_map(),
+                Path::new("path.gds"),
+                &GdsPath {
+                    layer: 1,
+                    datatype: 0,
+                    width: Some(20),
+                    path_type,
+                    begin_extn,
+                    end_extn,
+                    xy: vec![GdsPoint::new(0, 0), GdsPoint::new(100, 50)],
+                    ..Default::default()
+                },
+                1.,
+            )
+            .expect("non-rounded path should import");
+            let ImportedGdsElement::Path {
+                layer,
+                width,
+                points,
+                begin_extension,
+                end_extension,
+                ..
+            } = element
+            else {
+                panic!("GDS path should remain a path");
+            };
+            assert_eq!(layer, "met1");
+            assert_eq!(width, 20.);
+            assert_eq!(points, [(0., 0.), (100., 50.)]);
+            assert_eq!((begin_extension, end_extension), expected_extensions);
+        }
+    }
+
+    #[test]
+    fn rejects_rounded_paths() {
+        let error = import_path(
+            &test_map(),
+            Path::new("rounded.gds"),
+            &GdsPath {
+                layer: 1,
+                datatype: 0,
+                width: Some(20),
+                path_type: Some(1),
+                xy: vec![GdsPoint::new(0, 0), GdsPoint::new(100, 0)],
+                ..Default::default()
+            },
+            1.,
+        )
+        .expect_err("rounded path should be rejected");
+        assert!(error.to_string().contains("rounded path"));
     }
 
     #[test]

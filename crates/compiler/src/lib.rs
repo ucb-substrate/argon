@@ -160,6 +160,7 @@ mod tests {
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
     const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
+    const ARGON_PATH: &str = concatcp!(EXAMPLES_DIR, "/path/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -2081,6 +2082,180 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn argon_path_dimensions_are_constrained_and_exported() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let route = path("met1", 3,
+                        width=20.,
+                        begin_extension=5.,
+                        end_extension=7.,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        y2=50.,
+                    );
+                    eq(route.x2, route.points[1].x);
+                    eq(route.width, 20.);
+                    eq(route.begin_extension, 5.);
+                    eq(route.end_extension, 7.);
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let CompileOutput::Valid(cells) = &output else {
+            panic!("path should be fully constrained: {output:?}");
+        };
+        let path = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .expect("compiled path");
+        assert_eq!(path.width.0, 20.);
+        assert_eq!(path.begin_extension.0, 5.);
+        assert_eq!(path.end_extension.0, 7.);
+        assert_eq!(
+            path.points
+                .iter()
+                .map(|(x, y)| (x.0, y.0))
+                .collect::<Vec<_>>(),
+            [(0., 0.), (100., 0.), (100., 50.)]
+        );
+
+        let gds_path = std::env::temp_dir().join(format!("argon-path-{}.gds", std::process::id()));
+        output
+            .to_gds(
+                GdsMap::from_lyp(BASIC_LYP).expect("path GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                &gds_path,
+            )
+            .expect("export path GDS");
+        let gds = GdsLibrary::load(gds_path).expect("reload path GDS");
+        let path = gds.structs[0]
+            .elems
+            .iter()
+            .find_map(|element| match element {
+                GdsElement::GdsPath(path) => Some(path),
+                _ => None,
+            })
+            .expect("GDS path element");
+        assert_eq!(path.width, Some(20));
+        assert_eq!(path.path_type, Some(4));
+        assert_eq!(path.begin_extn, Some(5));
+        assert_eq!(path.end_extn, Some(7));
+        assert_eq!(path.xy.len(), 3);
+    }
+
+    #[test]
+    fn argon_path_example_compiles() {
+        let parsed = parse_workspace_with_std(ARGON_PATH);
+        assert!(
+            parsed.static_errors().is_empty(),
+            "{:?}",
+            parsed.static_errors()
+        );
+        let ast = parsed.ast();
+        for cell_name in ["top", "initial_path", "custom_extensions"] {
+            let output = compile(
+                &ast,
+                CompileInput {
+                    cell: &[cell_name],
+                    args: Vec::new(),
+                    lyp_file: &PathBuf::from(BASIC_LYP),
+                },
+            );
+            let output = match output {
+                CompileOutput::Valid(output) => output,
+                CompileOutput::ExecErrors(output) => output
+                    .output
+                    .unwrap_or_else(|| panic!("path example cell `{cell_name}` needs output")),
+                output => panic!("path example cell `{cell_name}` should compile: {output:?}"),
+            };
+            let path = output.cells[&output.top]
+                .objects
+                .values()
+                .find_map(SolvedValue::get_path)
+                .expect("example cell should contain a path");
+            if cell_name == "custom_extensions" {
+                assert_eq!(path.begin_extension.0, 5.);
+                assert_eq!(path.end_extension.0, 10.);
+            }
+            if cell_name == "initial_path" {
+                let fallbacks = &output.cells[&output.top].fallback_constraints_used;
+                assert!(fallbacks.iter().any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PathBeginExtension(_))
+                )));
+                assert!(fallbacks.iter().any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PathEndExtension(_))
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn sharp_path_corner_matches_klayout_cutoff_outline() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    path("met1", 4,
+                        width=20.,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        x2=150., y2=75.,
+                        x3=110.3, y3=14.9,
+                    );
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        )
+        .unwrap_valid();
+        let path = output.cells[&output.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .unwrap();
+        let outline = path.outline().unwrap();
+        let bbox = path.bbox().unwrap();
+
+        assert_eq!(outline.len(), 11);
+        assert_relative_eq!(bbox.x0, 0., epsilon = EPSILON);
+        assert_relative_eq!(bbox.y0, -10., epsilon = EPSILON);
+        assert_relative_eq!(bbox.x1, 163.85563301818058, epsilon = EPSILON);
+        assert_relative_eq!(bbox.y1, 88.86750490563072, epsilon = EPSILON);
     }
 
     #[test]
