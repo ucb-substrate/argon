@@ -18,10 +18,10 @@ use argonc::{
     WorkspaceConfig,
     ast::{Span, WorkspaceAst},
     compile::{
-        self, Arrayed, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
-        StaticErrorCompileOutput, VarIdTyMetadata,
+        self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
+        VarIdTyMetadata,
     },
-    parse::{self, WorkspaceParseAst},
+    parse::{self, CellInvocation, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
@@ -383,57 +383,12 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
         )
 }
 
-async fn compile_open_cell(
+fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
-    cell: &str,
+    invocation: &CellInvocation,
     config: &WorkspaceConfig,
-    client: &Client,
-) -> Option<CompileOutput> {
-    let (cell_path, args) = match open_cell_input(cell) {
-        Ok(input) => input,
-        Err(message) => {
-            client.show_message(MessageType::ERROR, message).await;
-            return None;
-        }
-    };
-    let cell_path = cell_path.iter().map(String::as_str).collect::<Vec<_>>();
-    Some(compile::dynamic_compile_with_config(
-        ast,
-        CompileInput {
-            cell: &cell_path,
-            args,
-        },
-        config,
-    ))
-}
-
-fn open_cell_input(cell: &str) -> std::result::Result<(Vec<String>, Vec<CellArg>), String> {
-    let cell_ast = match parse::parse_cell(cell) {
-        Ok(cell_ast) => cell_ast,
-        Err(error) => return Err(format!("Open cell is invalid: {error}")),
-    };
-    if !cell_ast.args.kwargs.is_empty() {
-        return Err("Open cell does not support keyword arguments yet".to_owned());
-    }
-    let Some(args) = cell_ast
-        .args
-        .posargs
-        .iter()
-        .map(CellArg::from_literal)
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Err(
-            "Open cell arguments must be integer, float, boolean, or empty-list literals"
-                .to_owned(),
-        );
-    };
-    let cell_path = cell_ast
-        .func
-        .path
-        .iter()
-        .map(|ident| ident.name.to_owned())
-        .collect::<Vec<_>>();
-    Ok((cell_path, args))
+) -> CompileOutput {
+    compile::dynamic_compile_invocation_with_config(ast, invocation, config)
 }
 
 fn diagnostics(
@@ -472,7 +427,10 @@ fn diagnostics(
             CompileOutput::Valid(_) => vec![],
         };
         for (span, message) in errs {
+            // Generated entry declarations are beyond the editor-visible
+            // source. Their diagnostics are reported as analyzer messages.
             if let Some(ast) = ast.values().find(|ast| ast.path == span.path)
+                && span.span.start() <= ast.source_text.len()
                 && let Some(url) = Uri::from_file_path(&span.path)
             {
                 let doc = Document::new(&ast.source_text, 0);
@@ -658,7 +616,7 @@ impl Backend {
         Ok(())
     }
 
-    fn schedule_compile(&self, identity: CompileIdentity) {
+    fn compile_after_debounce(&self, identity: CompileIdentity) {
         let backend = self.clone();
         let delay = self.state.config().analyzer.compile_debounce_ms;
         tokio::spawn(async move {
@@ -915,7 +873,7 @@ impl LanguageServer for Backend {
         source.advance_revision();
         let identity = source.compile_identity();
         drop(source);
-        self.schedule_compile(identity);
+        self.compile_after_debounce(identity);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -971,7 +929,7 @@ impl LanguageServer for Backend {
         if analyzer_edit {
             self.update_cell(identity).await;
         } else {
-            self.schedule_compile(identity);
+            self.compile_after_debounce(identity);
         }
     }
 
@@ -999,7 +957,7 @@ impl LanguageServer for Backend {
         source.advance_revision();
         let identity = source.compile_identity();
         drop(source);
-        self.schedule_compile(identity);
+        self.compile_after_debounce(identity);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1296,6 +1254,26 @@ impl Backend {
         preview_module.promote_last_declarations(ast.generated_declarations);
         let mut preview_ast = (*workspace_ast).clone();
         preview_ast.insert(module_path, preview_module);
+        let Some(open_cell) = open_cell else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
+                .await;
+            return Ok(());
+        };
+        // Recompile the open cell against the preview. Splicing its invocation
+        // before static analysis lets argument expressions use normal name
+        // resolution and type checking.
+        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                    .await;
+                return Ok(());
+            }
+        };
         let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
             self.state
                 .editor_client
@@ -1319,13 +1297,6 @@ impl Backend {
                 .await;
             return Ok(());
         }
-        let Some(open_cell) = open_cell else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
-                .await;
-            return Ok(());
-        };
         if workspace.lyp.is_none() {
             self.state
                 .editor_client
@@ -1336,16 +1307,7 @@ impl Backend {
                 .await;
             return Ok(());
         }
-        let Some(compiled) = compile_open_cell(
-            &typed_ast,
-            &open_cell,
-            &workspace,
-            &self.state.editor_client,
-        )
-        .await
-        else {
-            return Ok(());
-        };
+        let compiled = compile_open_cell(&typed_ast, &invocation, &workspace);
         let output = match compiled {
             CompileOutput::Valid(output) => output,
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -1634,8 +1596,7 @@ mod tests {
 
     use super::{
         ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, is_gui_disconnected,
-        open_cell_input, parse_config, preview_instance_cell, read_unpoisoned, write_config,
-        write_unpoisoned,
+        parse_config, preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
     };
 
     #[test]
@@ -1748,10 +1709,36 @@ mod tests {
     }
 
     #[test]
-    fn open_cell_accepts_boolean_literals() {
-        let (cell, args) = open_cell_input("fet1v8(true, 150., 5)").unwrap();
-        assert_eq!(cell, ["fet1v8"]);
-        assert!(matches!(args[0], CellArg::Bool(true)));
+    fn open_cell_evaluates_expression_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            "fn double(x: Float) -> Float { 2. * x }\n\
+             cell top(w: Float) {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        )
+        .unwrap();
+        let mut ast = parse::parse_workspace_with_std(&source_path).ast();
+        let invocation = parse::splice_cell_invocation(&mut ast, "top(double(25.))")
+            .expect("invocation should splice");
+        let (typed, errors) = compile::static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let config = argonc::WorkspaceConfig::new(&source_path).with_lyp(Some(lyp));
+        let output = compile::dynamic_compile_invocation_with_config(&typed, &invocation, &config);
+        let CompileOutput::Valid(output) = output else {
+            panic!("open cell should compile: {output:?}");
+        };
+        let top = &output.cells[&output.top];
+        let rect = top
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top should emit a rect");
+        assert_eq!(rect.x1.0, 50.);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use argonc::{
 };
 use tokio::sync::oneshot;
 
-use crate::{open_cell_input, workspace_config};
+use crate::workspace_config;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompileIdentity {
@@ -149,10 +149,10 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                     messages,
                 };
             }
-            match open_cell_input(cell) {
-                Ok((cell_path, args)) => Some(compiler.compile_cell(&workspace, &cell_path, args)),
-                Err(message) => {
-                    messages.push(message);
+            match compiler.compile_invocation(&workspace, cell) {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    messages.push(format!("Open cell is invalid: {error}"));
                     None
                 }
             }

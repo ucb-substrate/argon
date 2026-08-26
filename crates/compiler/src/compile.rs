@@ -29,7 +29,7 @@ use crate::ast::{
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::layer::LayerProperties;
-use crate::parse::{ParseOutput, WorkspaceParseAst};
+use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
 use crate::workspace::WorkspaceConfig;
 use crate::{
@@ -113,16 +113,43 @@ pub fn dynamic_compile_with_config(
     config: &WorkspaceConfig,
 ) -> CompileOutput {
     let Some(lyp_file) = config.lyp.as_deref() else {
-        return CompileOutput::ExecErrors(ExecErrorCompileOutput {
-            errors: vec![ExecError {
-                span: None,
-                cell: 0,
-                kind: ExecErrorKind::MissingLyp,
-            }],
-            output: None,
-        });
+        return missing_lyp_output();
     };
-    let res = ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input);
+    check_output_layers(
+        ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input),
+        lyp_file,
+    )
+}
+
+/// Compiles a cell invocation spliced into `ast` by
+/// [`crate::parse::add_cell_invocation`]. Its arguments are evaluated by the
+/// ordinary expression evaluator, so they may be any expression.
+pub fn dynamic_compile_invocation_with_config(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+) -> CompileOutput {
+    let Some(lyp_file) = config.lyp.as_deref() else {
+        return missing_lyp_output();
+    };
+    check_output_layers(
+        ExecPass::new(ast, lyp_file, &config.gds_imports).execute_invocation(invocation),
+        lyp_file,
+    )
+}
+
+fn missing_lyp_output() -> CompileOutput {
+    CompileOutput::ExecErrors(ExecErrorCompileOutput {
+        errors: vec![ExecError {
+            span: None,
+            cell: 0,
+            kind: ExecErrorKind::MissingLyp,
+        }],
+        output: None,
+    })
+}
+
+fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -1168,6 +1195,13 @@ impl<'a> VarIdTyPass<'a> {
 
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
         if *a == Ty::Any || *b == Ty::Any {
+            return true;
+        }
+
+        // An empty sequence belongs to every sequence type, as `Ty::lub` and the
+        // `cons` tail check already assume. The runtime check in
+        // `CellArg::matches_ty` still enforces emptiness where `[]` is declared.
+        if matches!((a, b), (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil)) {
             return true;
         }
 
@@ -2347,28 +2381,21 @@ pub enum CellArg {
     Float(f64),
     Int(i64),
     Bool(bool),
+    String(String),
+    /// An enum variant, identified by name like [`Value::EnumValue`].
+    Enum(String),
     Seq(Vec<CellArg>),
 }
 
 impl CellArg {
-    /// Converts a literal expression accepted at a compiler entry point into
-    /// its runtime representation.
-    pub fn from_literal(expr: &Expr<&str, ParseMetadata>) -> Option<Self> {
-        match expr {
-            Expr::FloatLiteral(value) => Some(Self::Float(value.value)),
-            Expr::IntLiteral(value) => Some(Self::Int(value.value)),
-            Expr::BoolLiteral(value) => Some(Self::Bool(value.value)),
-            Expr::SeqNil(_) => Some(Self::Seq(Vec::new())),
-            _ => None,
-        }
-    }
-
     fn matches_ty(&self, ty: &Ty) -> bool {
         match (self, ty) {
             (_, Ty::Any) => true,
-            (Self::Float(_), Ty::Float) | (Self::Int(_), Ty::Int) | (Self::Bool(_), Ty::Bool) => {
-                true
-            }
+            (Self::Float(_), Ty::Float)
+            | (Self::Int(_), Ty::Int)
+            | (Self::Bool(_), Ty::Bool)
+            | (Self::String(_), Ty::String) => true,
+            (Self::Enum(variant), Ty::Enum(ty)) => ty.variants.contains(variant),
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner))
             }
@@ -2382,6 +2409,8 @@ impl CellArg {
             Self::Float(_) => "Float",
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
+            Self::String(_) => "String",
+            Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
         }
     }
@@ -2399,6 +2428,8 @@ enum CellArgKey {
     Float(u64),
     Int(i64),
     Bool(bool),
+    String(String),
+    Enum(String),
     Seq(Vec<CellArgKey>),
 }
 
@@ -2408,6 +2439,8 @@ impl From<&CellArg> for CellArgKey {
             CellArg::Float(f) => Self::Float(f.to_bits()),
             CellArg::Int(i) => Self::Int(*i),
             CellArg::Bool(b) => Self::Bool(*b),
+            CellArg::String(s) => Self::String(s.clone()),
+            CellArg::Enum(v) => Self::Enum(v.clone()),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
         }
     }
@@ -2676,6 +2709,12 @@ struct ExecPass<'a> {
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    /// Cell declaration generated for a compiler entry point's invocation, and
+    /// the cell it executed as. A call made directly by that cell is the
+    /// top-level invocation rather than a nested instantiation, so it is named
+    /// as if it were the entry point.
+    entry_cell_var: Option<VarId>,
+    entry_cell: Option<CellId>,
     errors: Vec<ExecError>,
 }
 
@@ -2758,6 +2797,8 @@ impl<'a> ExecPass<'a> {
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
             compiled_cell_cache: HashMap::new(),
+            entry_cell_var: None,
+            entry_cell: None,
             errors: Vec::new(),
         }
     }
@@ -2834,36 +2875,7 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = match crate::layer::read_lyp(self.lyp_file) {
-                Ok(layers) => layers,
-                Err(error) => {
-                    return CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                        errors: vec![StaticError {
-                            span: Span {
-                                path: self.ast[&vec![]].path.clone(),
-                                span: cfgrammar::Span::new(0, 0),
-                            },
-                            kind: StaticErrorKind::InvalidLyp(error.to_string()),
-                        }],
-                    });
-                }
-            };
-            if self.errors.is_empty() {
-                CompileOutput::Valid(CompiledData {
-                    cells: self.compiled_cells,
-                    top: cell_id,
-                    layers,
-                })
-            } else {
-                CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                    errors: self.errors,
-                    output: Some(CompiledData {
-                        cells: self.compiled_cells,
-                        top: cell_id,
-                        layers,
-                    }),
-                })
-            }
+            self.finish(cell_id)
         } else {
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
@@ -2872,6 +2884,121 @@ impl<'a> ExecPass<'a> {
                     kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
                 }],
                 output: None,
+            })
+        }
+    }
+
+    /// Executes a cell invocation spliced into the root module by
+    /// [`crate::parse::add_cell_invocation`]. The generated entry cell binds
+    /// the invocation, so evaluating it runs the invocation through the
+    /// ordinary expression evaluator; the cell it produced becomes the top.
+    pub(crate) fn execute_invocation(mut self, invocation: &CellInvocation) -> CompileOutput {
+        self.declare_globals();
+        let ast = self.ast;
+        let root = &ast[&ModPath::new()];
+        let entry = root
+            .ast
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Cell(cell) if cell.name.name == invocation.entry_cell => Some(cell),
+                _ => None,
+            })
+            .expect("generated entry cell should be declared");
+        let value = entry
+            .scope
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                Statement::LetBinding(binding) if binding.name.name == invocation.binding => {
+                    Some(&binding.value)
+                }
+                _ => None,
+            })
+            .expect("generated entry cell should bind the invocation");
+        // Reject a non-cell invocation statically, so the error lands on what
+        // the caller wrote rather than surfacing from the executor.
+        let ty = value.ty();
+        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+            return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                errors: vec![StaticError {
+                    span: Span {
+                        path: root.path.clone(),
+                        span: value.span(),
+                    },
+                    kind: StaticErrorKind::IncorrectTyCategory {
+                        found: ty,
+                        expected: "Cell".into(),
+                    },
+                }],
+            });
+        }
+
+        self.entry_cell_var = Some(entry.metadata.1);
+        let Ok(entry_id) = self.execute_cell(entry.metadata.1, Vec::new(), None) else {
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: None,
+            });
+        };
+        // Arguments are evaluated inside the generated cell, so an unsolvable
+        // system there means an argument did not reduce to a constant.
+        for error in &mut self.errors {
+            if error.cell == entry_id
+                && matches!(
+                    error.kind,
+                    ExecErrorKind::Underconstrained | ExecErrorKind::InconsistentConstraint(_)
+                )
+            {
+                error.kind = ExecErrorKind::UnevaluatedCellArgument;
+                error.span = Some(invocation.span());
+            }
+        }
+        let value_id = self.cell_states[&entry_id].fields[&invocation.binding];
+        let Some(DeferValue::Ready(Value::Cell(top))) = self.values.get(&value_id) else {
+            self.errors.push(ExecError {
+                span: Some(invocation.span()),
+                cell: entry_id,
+                kind: ExecErrorKind::NotACell,
+            });
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: None,
+            });
+        };
+        let top = *top;
+        // The entry cell is an implementation detail of the invocation.
+        self.compiled_cells.shift_remove(&entry_id);
+        self.finish(top)
+    }
+
+    /// Packages the executed cells into a compile output rooted at `top`.
+    fn finish(self, top: CellId) -> CompileOutput {
+        let layers = match crate::layer::read_lyp(self.lyp_file) {
+            Ok(layers) => layers,
+            Err(error) => {
+                return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                    errors: vec![StaticError {
+                        span: Span {
+                            path: self.ast[&ModPath::new()].path.clone(),
+                            span: cfgrammar::Span::new(0, 0),
+                        },
+                        kind: StaticErrorKind::InvalidLyp(error.to_string()),
+                    }],
+                });
+            }
+        };
+        let data = CompiledData {
+            cells: self.compiled_cells,
+            top,
+            layers,
+        };
+        if self.errors.is_empty() {
+            CompileOutput::Valid(data)
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: Some(data),
             })
         }
     }
@@ -2958,6 +3085,9 @@ impl<'a> ExecPass<'a> {
         };
 
         let cell_id = self.alloc_id();
+        if self.entry_cell_var == Some(cell) {
+            self.entry_cell = Some(cell_id);
+        }
         self.partial_cells.push_back(cell_id);
         assert!(
             self.cell_states
@@ -4033,13 +4163,17 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
+    /// Converts an evaluated value into a cell argument. `Ok(None)` means the
+    /// value depends on solver variables that are not resolved yet, so the
+    /// conversion should be retried; `Err` means the value can never be passed
+    /// to a cell and an error has been recorded.
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
         dependent_vid: ValueId,
         val: &Value,
-    ) -> Option<CellArg> {
-        match val {
+    ) -> Result<Option<CellArg>, ()> {
+        Ok(match val {
             Value::Linear(v) => {
                 if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr(v) {
                     Some(CellArg::Float(f))
@@ -4052,13 +4186,28 @@ impl<'a> ExecPass<'a> {
             }
             Value::Int(i) => Some(CellArg::Int(*i)),
             Value::Bool(b) => Some(CellArg::Bool(*b)),
-            Value::Seq(s) => s
-                .iter()
-                .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
-                .collect::<Option<Vec<_>>>()
-                .map(CellArg::Seq),
-            v => unreachable!("invalid cell arg {v:?}"),
-        }
+            Value::String(s) => Some(CellArg::String(s.clone())),
+            Value::EnumValue(v) => Some(CellArg::Enum(v.clone())),
+            Value::SeqNil => Some(CellArg::Seq(Vec::new())),
+            Value::Seq(s) => {
+                let mut args = Vec::with_capacity(s.len());
+                for v in s.iter() {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => args.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Seq(args))
+            }
+            v => {
+                self.errors.push(ExecError {
+                    span: None,
+                    cell: cell_id,
+                    kind: ExecErrorKind::UnsupportedCellArgument(v.kind_name().to_owned()),
+                });
+                return Err(());
+            }
+        })
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -5069,29 +5218,29 @@ impl<'a> ExecPass<'a> {
                 _ => {
                     // Must be calling a cell generator.
                     // User functions are never deferred.
-                    let (arg_vals, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|arg_vid| {
-                            if let Defer::Ready(v) = self.values[arg_vid].clone() {
-                                if let Some(arg) = self.cell_arg_from_value(cell_id, *arg_vid, &v) {
-                                    Either::Left(arg)
-                                } else {
-                                    Either::Right(*arg_vid)
+                    let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
+                    let mut unready = Vec::new();
+                    for arg_vid in c.state.posargs.iter() {
+                        match self.values[arg_vid].clone() {
+                            Defer::Ready(v) => {
+                                match self.cell_arg_from_value(cell_id, *arg_vid, &v)? {
+                                    Some(arg) => arg_vals.push(arg),
+                                    None => unready.push(*arg_vid),
                                 }
-                            } else {
-                                Either::Right(*arg_vid)
                             }
-                        });
+                            _ => unready.push(*arg_vid),
+                        }
+                    }
                     if unready.is_empty() {
-                        let scope_name = format!(
-                            "{} cell {}",
-                            c.expr.scope_order,
-                            c.expr.func.path.iter().map(|ident| &ident.name).join("::")
-                        );
-                        let cell = self.execute_cell(
-                            c.expr.metadata.0.unwrap(),
-                            arg_vals,
-                            Some(scope_name),
-                        )?;
+                        let scope_name = (self.entry_cell != Some(cell_id)).then(|| {
+                            format!(
+                                "{} cell {}",
+                                c.expr.scope_order,
+                                c.expr.func.path.iter().map(|ident| &ident.name).join("::")
+                            )
+                        });
+                        let cell =
+                            self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {
@@ -6077,7 +6226,31 @@ impl Value {
             CellArg::Int(i) => Value::Int(*i),
             CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            CellArg::String(s) => Value::String(s.clone()),
+            CellArg::Enum(v) => Value::EnumValue(v.clone()),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
+        }
+    }
+
+    /// Name of this value's kind, for diagnostics.
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::EnumValue(_) => "enum variant",
+            Self::String(_) => "String",
+            Self::Linear(_) => "Float",
+            Self::Int(_) => "Int",
+            Self::Rect(_) => "Rect",
+            Self::Polygon(_) => "Polygon",
+            Self::Path(_) => "Path",
+            Self::Point(_) => "Point",
+            Self::Bool(_) => "Bool",
+            Self::Fn(_) => "function",
+            Self::CellFn(_) => "cell generator",
+            Self::Cell(_) => "cell",
+            Self::Inst(_) => "instance",
+            Self::Seq(_) | Self::SeqNil => "sequence",
+            Self::Tuple(_) => "tuple",
+            Self::Nil => "nil",
         }
     }
 

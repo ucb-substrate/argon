@@ -249,6 +249,57 @@ impl IncrementalCompiler {
         output
     }
 
+    /// Analyzes and executes a source-level cell invocation. The invocation is
+    /// spliced into a clone of the current snapshot so arbitrary argument
+    /// expressions are resolved and type-checked without polluting the cached
+    /// editor AST.
+    pub fn compile_invocation(
+        &mut self,
+        config: &WorkspaceConfig,
+        source: &str,
+    ) -> Result<CompileOutput, anyhow::Error> {
+        self.ensure_analysis(config);
+        let analysis = &self
+            .static_cache
+            .as_ref()
+            .expect("analysis cache was populated")
+            .analysis;
+        if !analysis.errors.is_empty() {
+            return Ok(CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                errors: analysis.errors.clone(),
+            }));
+        }
+
+        let mut hasher = DefaultHasher::new();
+        let environment = execution_environment_key(config.lyp.as_deref(), &config.gds_imports);
+        if self.execution_environment != Some(environment) {
+            self.execution_cache.clear();
+            self.execution_environment = Some(environment);
+        }
+        self.static_key(config).hash(&mut hasher);
+        source.hash(&mut hasher);
+        environment.hash(&mut hasher);
+        let key = hasher.finish();
+        if let Some(output) = self.execution_cache.get(&key) {
+            self.stats.execution_cache_hits += 1;
+            return Ok(output.clone());
+        }
+
+        self.stats.execution_cache_misses += 1;
+        let mut ast = analysis.ast.clone();
+        let invocation = parse::splice_cell_invocation(&mut ast, source)?;
+        let Some((typed_ast, static_output)) = compile::static_compile(&ast) else {
+            return Ok(CompileOutput::FatalParseErrors);
+        };
+        let output = if static_output.errors.is_empty() {
+            compile::dynamic_compile_invocation_with_config(&typed_ast, &invocation, config)
+        } else {
+            CompileOutput::StaticErrors(static_output)
+        };
+        self.execution_cache.insert(key, output.clone());
+        Ok(output)
+    }
+
     fn invalidate(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.stats.revision = self.revision;
@@ -341,8 +392,16 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
                 2_u8.hash(hasher);
                 value.hash(hasher);
             }
-            CellArg::Seq(values) => {
+            CellArg::String(value) => {
                 3_u8.hash(hasher);
+                value.hash(hasher);
+            }
+            CellArg::Enum(value) => {
+                4_u8.hash(hasher);
+                value.hash(hasher);
+            }
+            CellArg::Seq(values) => {
+                5_u8.hash(hasher);
                 hash_cell_args(values, hasher);
             }
         }
