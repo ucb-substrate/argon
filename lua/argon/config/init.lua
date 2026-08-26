@@ -18,6 +18,7 @@
 ---
 ---Override the `argon-analyzer` executable discovered on PATH.
 ---@field analyzer? string
+---@field compile_debounce_ms? number Delay before compiling editor changes; use 0 to disable.
 
 local config = {}
 
@@ -41,6 +42,7 @@ local Config = {
     --- Defaults to the `argon-analyzer` executable discovered on PATH.
     ---@type string
     analyzer = exepath_or_binary('argon-analyzer'),
+    compile_debounce_ms = 150,
     log = {
         --- Log level following [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
         --- Defaults to `nil`.

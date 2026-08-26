@@ -377,6 +377,15 @@ impl Gui for GuiServer {
             .unwrap();
     }
 
+    async fn workspace_modified(mut self, _: context::Context, modified: bool) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_workspace_modified(cx, modified));
+            }))
+            .await
+            .unwrap();
+    }
+
     async fn selected_scope(mut self, _: context::Context) -> Option<Span> {
         let (sender, receiver) = oneshot::channel();
         self.to_exec

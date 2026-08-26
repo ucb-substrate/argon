@@ -58,6 +58,20 @@ RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon
 
 The compiler-only benchmark commands below do not require these flags.
 
+### Incremental compiler smoke benchmark
+
+The process-local editor session has a focused benchmark that reports cold,
+warm no-op, and isolated-source-edit latency together with cache counters and
+retained heap bytes:
+
+```bash
+cargo test -p argonc --release -- --ignored --test-threads=1 \
+  --nocapture bench_incremental_session
+```
+
+It prints one comma-separated record to stderr and does not rewrite the scaling
+CSV files or figures.
+
 > **Note for AI agents.** Prefer this script over invoking `cargo test`
 > directly — it encodes the flags that are easy to get wrong (release,
 > `--test-threads=1`, the `bench_` name filter) and the figure regeneration.

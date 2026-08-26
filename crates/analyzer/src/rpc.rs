@@ -1,6 +1,6 @@
 //! RPC types shared by the analyzer and Argone.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr};
 
 use argonc::{
     ast::Span,
@@ -14,7 +14,7 @@ use tower_lsp_server::ls_types::{
     Uri, WorkspaceEdit,
 };
 
-use crate::{ForceSave, Redo, State, StateMut, Undo, document::Document};
+use crate::{Redo, Save, State, StateMut, Undo, document::Document};
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
 /// persist solution-space-exploration drags by updating initial-condition
@@ -49,6 +49,7 @@ pub struct InstancePreview {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LangServerAction {
+    Save,
     Undo,
     Redo,
 }
@@ -72,6 +73,7 @@ pub trait LangServer {
 #[tarpc::service]
 pub trait Gui {
     async fn open_cell(cell: CompileOutput, update: bool);
+    async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
     async fn place_instance(preview: InstancePreview);
     async fn set(key: String, value: String);
@@ -83,8 +85,14 @@ pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsisten
 pub(crate) fn editor_buffers_are_current(state: &StateMut) -> bool {
     state.ast.values().all(|ast| {
         Uri::from_file_path(&ast.path)
-            .and_then(|uri| state.editor_files.get(&uri))
-            .is_none_or(|document| document.contents() == ast.source_text)
+            .map(|uri| {
+                state.pending_workspace_edits.contains_key(&uri)
+                    || state
+                        .editor_files
+                        .get(&uri)
+                        .is_none_or(|document| document.contents() == ast.source_text)
+            })
+            .unwrap_or(true)
     })
 }
 
@@ -144,9 +152,18 @@ impl State {
     async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
-        paths: impl IntoIterator<Item = PathBuf>,
         focus: Option<Uri>,
     ) -> bool {
+        let pending_uris = changes.keys().cloned().collect::<Vec<_>>();
+        {
+            let mut state = self.state_mut.lock().await;
+            for uri in &pending_uris {
+                *state
+                    .pending_workspace_edits
+                    .entry(uri.clone())
+                    .or_default() += 1;
+            }
+        }
         let result: Result<(), String> = async {
             if let Some(uri) = focus {
                 self.editor_client
@@ -175,17 +192,21 @@ impl State {
                     .unwrap_or_else(|| "editor rejected source edit".to_owned()));
             }
 
-            for path in paths {
-                self.editor_client
-                    .send_request::<ForceSave>(path)
-                    .await
-                    .map_err(|error| format!("could not save edited source: {error}"))?;
-            }
             Ok(())
         }
         .await;
 
         if let Err(error) = result {
+            let mut state = self.state_mut.lock().await;
+            for uri in pending_uris {
+                if let Some(count) = state.pending_workspace_edits.get_mut(&uri) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        state.pending_workspace_edits.shift_remove(&uri);
+                    }
+                }
+            }
+            drop(state);
             self.editor_client
                 .show_message(MessageType::ERROR, error)
                 .await;
@@ -195,13 +216,9 @@ impl State {
         }
     }
 
-    async fn apply_source_edit(&self, uri: Uri, path: PathBuf, edit: TextEdit) -> bool {
-        self.apply_source_changes(
-            HashMap::from([(uri.clone(), vec![edit])]),
-            [path],
-            Some(uri),
-        )
-        .await
+    async fn apply_source_edit(&self, uri: Uri, edit: TextEdit) -> bool {
+        self.apply_source_changes(HashMap::from([(uri.clone(), vec![edit])]), Some(uri))
+            .await
     }
 }
 
@@ -221,9 +238,24 @@ impl LangServer for State {
                 return;
             }
         };
+        let modified = {
+            let mut state_mut = self.state_mut.lock().await;
+            state_mut.gui_client = Some(gui_client.clone());
+            state_mut.workspace_modified
+        };
+        self.publish_workspace_modified(modified, Some(gui_client))
+            .await;
         let mut state_mut = self.state_mut.lock().await;
-        state_mut.gui_client = Some(gui_client);
-        state_mut.compile(&self.editor_client, false).await;
+        let revision = state_mut.incremental_compiler.revision();
+        self.requested_revision
+            .store(revision, std::sync::atomic::Ordering::Release);
+        state_mut
+            .compile(
+                &self.editor_client,
+                false,
+                Some((&self.requested_revision, revision)),
+            )
+            .await;
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
@@ -296,7 +328,7 @@ impl LangServer for State {
         };
         drop(state_mut);
 
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
@@ -355,7 +387,7 @@ impl LangServer for State {
         };
         drop(state_mut);
 
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(updated_scope_span)
     }
@@ -404,7 +436,7 @@ impl LangServer for State {
         };
         drop(state_mut);
 
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
+        self.apply_source_edit(url, insertion.edit)
             .await
             .then_some(span)
     }
@@ -444,14 +476,13 @@ impl LangServer for State {
         };
         drop(state_mut);
 
-        self.apply_source_edit(url, span.path, edit)
+        self.apply_source_edit(url, edit)
             .await
             .then_some(updated_span)
     }
 
-    /// Rewrites the value text at each given span in a single workspace edit,
-    /// then saves (triggering recompilation). Used to persist SSE drags so the
-    /// dragged layout survives recompilation instead of snapping back.
+    /// Rewrites the value text at each given span in a single workspace edit.
+    /// The resulting `didChange` recompiles the dirty in-memory buffers.
     async fn update_values(self, _: tarpc::context::Context, edits: Vec<ValueEdit>) -> bool {
         if edits.is_empty() {
             return true;
@@ -469,7 +500,6 @@ impl LangServer for State {
         // file are sorted by descending start offset so they can be applied
         // back-to-front without invalidating each other's offsets.
         let mut pending: HashMap<Uri, Vec<(usize, TextEdit)>> = HashMap::new();
-        let mut paths = Vec::new();
         for ValueEdit { span, value } in edits {
             if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
@@ -484,9 +514,6 @@ impl LangServer for State {
                         new_text: value,
                     },
                 ));
-                if !paths.contains(&span.path) {
-                    paths.push(span.path.clone());
-                }
             }
         }
         if pending.is_empty() {
@@ -501,7 +528,7 @@ impl LangServer for State {
             .collect();
         drop(state_mut);
 
-        self.apply_source_changes(changes, paths, None).await
+        self.apply_source_changes(changes, None).await
     }
 
     async fn add_eq_constraint(
@@ -542,8 +569,7 @@ impl LangServer for State {
         );
         drop(state_mut);
 
-        self.apply_source_edit(url, scope_span.path, insertion.edit)
-            .await;
+        self.apply_source_edit(url, insertion.edit).await;
     }
 
     async fn open_cell(self, _: tarpc::context::Context, cell: String) {
@@ -553,7 +579,16 @@ impl LangServer for State {
         tokio::spawn(async move {
             let mut state_mut = self.state_mut.lock().await;
             state_mut.cell = Some(cell);
-            state_mut.compile(&self.editor_client, false).await;
+            let revision = state_mut.incremental_compiler.revision();
+            self.requested_revision
+                .store(revision, std::sync::atomic::Ordering::Release);
+            state_mut
+                .compile(
+                    &self.editor_client,
+                    false,
+                    Some((&self.requested_revision, revision)),
+                )
+                .await;
         });
     }
 
@@ -563,6 +598,7 @@ impl LangServer for State {
 
     async fn dispatch_action(self, _: tarpc::context::Context, action: LangServerAction) {
         let result = match action {
+            LangServerAction::Save => self.editor_client.send_request::<Save>(()).await,
             LangServerAction::Undo => self.editor_client.send_request::<Undo>(()).await,
             LangServerAction::Redo => self.editor_client.send_request::<Redo>(()).await,
         };
@@ -621,6 +657,26 @@ mod tests {
         };
         state.editor_files.insert(uri, Document::new(source, 1));
 
+        assert!(editor_buffers_are_current(&state));
+    }
+
+    #[test]
+    fn accepted_workspace_edits_are_not_reported_as_out_of_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(&source_path, "cell top() {}\n").unwrap();
+        let ast = parse::parse_workspace_with_std(&source_path).ast();
+        let uri = Uri::from_file_path(&source_path).unwrap();
+        let mut state = StateMut {
+            ast,
+            ..Default::default()
+        };
+        state
+            .editor_files
+            .insert(uri.clone(), Document::new("cell top() { rect(); }\n", 2));
+        assert!(!editor_buffers_are_current(&state));
+
+        state.pending_workspace_edits.insert(uri, 1);
         assert!(editor_buffers_are_current(&state));
     }
 

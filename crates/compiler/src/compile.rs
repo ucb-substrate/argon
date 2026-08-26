@@ -93,6 +93,7 @@ pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
     }
 }
 
+#[derive(Clone)]
 pub struct StaticAnalysis {
     /// Parsed source AST used for source-aware tooling.
     pub ast: WorkspaceParseAst,

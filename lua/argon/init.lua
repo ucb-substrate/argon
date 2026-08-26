@@ -3,6 +3,45 @@ local M = {}
 local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
+local save = require('argon.save')
+
+local function schedule_workspace_modified(client_id)
+    vim.schedule(function()
+        save.notify_workspace_modified(client_id)
+    end)
+end
+
+local modified_group = vim.api.nvim_create_augroup('argon_workspace_modified', { clear = true })
+vim.api.nvim_create_autocmd('BufModifiedSet', {
+    group = modified_group,
+    callback = function(args)
+        for _, lsp_client in ipairs(client.get_active_argon_lsp_clients(args.buf)) do
+            schedule_workspace_modified(lsp_client.id)
+        end
+    end,
+})
+vim.api.nvim_create_autocmd('LspAttach', {
+    group = modified_group,
+    callback = function(args)
+        schedule_workspace_modified(args.data.client_id)
+    end,
+})
+vim.api.nvim_create_autocmd({ 'LspDetach', 'BufDelete' }, {
+    group = modified_group,
+    callback = function(args)
+        local client_ids = {}
+        if args.event == 'LspDetach' then
+            client_ids = { args.data.client_id }
+        else
+            for _, lsp_client in ipairs(client.get_active_argon_lsp_clients(args.buf)) do
+                table.insert(client_ids, lsp_client.id)
+            end
+        end
+        for _, client_id in ipairs(client_ids) do
+            schedule_workspace_modified(client_id)
+        end
+    end,
+})
 
 local function focus_gui()
     client.any_buf_request('custom/startGui', nil, client.print_error)
@@ -112,15 +151,15 @@ M.start = function(bufnr)
         cmd = analyzer_cmd,
         cmd_env = cmd_env,
         handlers = {
-            ['custom/forceSave'] = function(err, result, ctx)
-                local bufnr = vim.fn.bufnr(result)
-
-                if bufnr ~= -1 then
-                    vim.api.nvim_buf_call(bufnr, function()
-                        vim.cmd('write')
-                    end)
+            ['custom/save'] = function(err, result, ctx)
+                if err then
+                    client.print_error(err)
+                    return vim.NIL
                 end
 
+                vim.schedule(function()
+                    save.save_modified_buffers(ctx.client_id)
+                end)
                 return vim.NIL
             end,
             ['custom/undo'] = function(err, result, ctx)
@@ -129,7 +168,6 @@ M.start = function(bufnr)
                 if bufnr ~= -1 then
                     vim.api.nvim_buf_call(bufnr, function()
                         vim.cmd('undo')
-                        vim.cmd('write')
                     end)
                 end
 
@@ -141,7 +179,6 @@ M.start = function(bufnr)
                 if bufnr ~= -1 then
                     vim.api.nvim_buf_call(bufnr, function()
                         vim.cmd('redo')
-                        vim.cmd('write')
                     end)
                 end
 
@@ -162,6 +199,9 @@ M.start = function(bufnr)
                 end)
                 return vim.NIL
             end,
+        },
+        initialization_options = {
+            compileDebounceMs = config.compile_debounce_ms,
         },
         root_dir = root_dir
     }

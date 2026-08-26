@@ -3,6 +3,7 @@ pub mod ast;
 pub mod compile;
 pub mod diagnostics;
 pub mod gds;
+pub mod incremental;
 pub mod layer;
 pub mod parse;
 mod parser;

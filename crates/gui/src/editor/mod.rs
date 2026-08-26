@@ -20,7 +20,7 @@ use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::{
-        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Undo,
+        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -75,6 +75,7 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub workspace_modified: bool,
     pub fatal_error: Option<SharedString>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
@@ -345,6 +346,7 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                workspace_modified: false,
                 fatal_error: None,
                 connection_error: None,
                 solved_cell,
@@ -436,6 +438,14 @@ impl Editor {
         }
     }
 
+    pub fn set_workspace_modified(&self, cx: &mut App, modified: bool) {
+        self.state.update(cx, |state, cx| {
+            state.workspace_modified = modified;
+            cx.notify();
+        });
+        self.title_bar.update(cx, |_, cx| cx.notify());
+    }
+
     pub fn place_instance(&self, cx: &mut App, preview: InstancePreview) {
         self.canvas
             .update(cx, |canvas, cx| canvas.place_instance(preview, cx));
@@ -475,6 +485,14 @@ impl Editor {
             .read(cx)
             .lang_server_client
             .dispatch_action(LangServerAction::Undo);
+    }
+
+    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .state
+            .read(cx)
+            .lang_server_client
+            .dispatch_action(LangServerAction::Save);
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
@@ -551,6 +569,7 @@ impl Render for Editor {
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))

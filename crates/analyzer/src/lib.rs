@@ -6,7 +6,11 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use arc::Library;
@@ -16,6 +20,7 @@ use argonc::{
         self, Arrayed, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput,
         StaticErrorCompileOutput, VarIdTyMetadata,
     },
+    incremental::IncrementalCompiler,
     parse::{self, WorkspaceParseAst},
 };
 use futures::prelude::*;
@@ -57,6 +62,10 @@ pub struct StateMut {
     cell: Option<String>,
     gui_client: Option<GuiClient>,
     editor_files: IndexMap<Uri, Document>,
+    pending_workspace_edits: IndexMap<Uri, usize>,
+    workspace_modified: bool,
+    incremental_compiler: IncrementalCompiler,
+    compiled_revision: u64,
 }
 
 /// Errors that actually prevent the GUI from displaying a compiled cell.
@@ -90,6 +99,19 @@ fn parse_setting(input: &str) -> Option<(&str, &str)> {
     (!key.is_empty() && !value.is_empty()).then_some((key, value))
 }
 
+fn revision_is_stale(
+    compiler: &IncrementalCompiler,
+    expected_revision: Option<(&AtomicU64, u64)>,
+) -> bool {
+    expected_revision.is_some_and(|(requested, revision)| {
+        requested.load(Ordering::Acquire) != revision || compiler.revision() != revision
+    })
+}
+
+fn save_needs_compile(current_revision: u64, compiled_revision: u64) -> bool {
+    current_revision != compiled_revision
+}
+
 async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     cell: &str,
@@ -97,6 +119,24 @@ async fn compile_open_cell(
     gds_imports: &[(String, PathBuf)],
     client: &Client,
 ) -> Option<CompileOutput> {
+    let (cell_path, args) = open_cell_input(cell, lyp, client).await?;
+    let cell_path = cell_path.iter().map(String::as_str).collect::<Vec<_>>();
+    Some(compile::dynamic_compile_with_gds(
+        ast,
+        CompileInput {
+            cell: &cell_path,
+            args,
+            lyp_file: lyp,
+        },
+        gds_imports,
+    ))
+}
+
+async fn open_cell_input(
+    cell: &str,
+    lyp: &Path,
+    client: &Client,
+) -> Option<(Vec<String>, Vec<CellArg>)> {
     if let Err(error) = argonc::layer::read_lyp(lyp) {
         client
             .show_message(MessageType::ERROR, format!("Could not open cell: {error}"))
@@ -141,18 +181,9 @@ async fn compile_open_cell(
         .func
         .path
         .iter()
-        .map(|ident| ident.name)
+        .map(|ident| ident.name.to_owned())
         .collect::<Vec<_>>();
-
-    Some(compile::dynamic_compile_with_gds(
-        ast,
-        CompileInput {
-            cell: &cell_path,
-            args,
-            lyp_file: lyp,
-        },
-        gds_imports,
-    ))
+    Some((cell_path, args))
 }
 
 impl StateMut {
@@ -210,7 +241,12 @@ impl StateMut {
         diagnostics
     }
 
-    async fn compile(&mut self, client: &Client, update: bool) {
+    async fn compile(
+        &mut self,
+        client: &Client,
+        update: bool,
+        expected_revision: Option<(&AtomicU64, u64)>,
+    ) {
         let Some(root_dir) = &self.root_dir else {
             return;
         };
@@ -246,14 +282,15 @@ impl StateMut {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let analysis = compile::analyze_workspace(parse::parse_workspace_with_std_deps_and_gds(
-            root_dir.join("lib.ar"),
-            dependencies,
-            gds_imports.clone(),
-        ));
+        let dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        let analysis = self.incremental_compiler.analyze_workspace(
+            &root_dir.join("lib.ar"),
+            &dependencies,
+            &gds_imports,
+        );
         self.ast = analysis.ast;
 
-        let o = if let Some(ast) = analysis.typed_ast {
+        let o = if analysis.typed_ast.is_some() {
             if !analysis.errors.is_empty() {
                 Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
                     errors: analysis.errors,
@@ -280,13 +317,27 @@ impl StateMut {
                     self.compile_output = None;
                     return;
                 };
-                compile_open_cell(&ast, cell, lyp, &gds_imports, client).await
+                let Some((cell_path, args)) = open_cell_input(cell, lyp, client).await else {
+                    self.compile_output = None;
+                    return;
+                };
+                Some(self.incremental_compiler.compile_cell(
+                    &root_dir.join("lib.ar"),
+                    &dependencies,
+                    &gds_imports,
+                    &cell_path,
+                    args,
+                    lyp,
+                ))
             } else {
                 None
             }
         } else {
             Some(CompileOutput::FatalParseErrors)
         };
+        if revision_is_stale(&self.incremental_compiler, expected_revision) {
+            return;
+        }
         self.compile_output = o;
         if !update && let Some(output) = &self.compile_output {
             for message in blocking_compile_error_messages(output) {
@@ -304,8 +355,14 @@ impl StateMut {
             diagnostics.entry(uri).or_default();
         }
         for (uri, diagnostics) in diagnostics {
+            if revision_is_stale(&self.incremental_compiler, expected_revision) {
+                return;
+            }
             // TODO: potentially add version number
             client.publish_diagnostics(uri, diagnostics, None).await;
+        }
+        if revision_is_stale(&self.incremental_compiler, expected_revision) {
+            return;
         }
         if let Some(o) = &self.compile_output
             && let Some(gui_client) = self.gui_client.as_mut()
@@ -318,6 +375,7 @@ impl StateMut {
                 .await;
             self.gui_client = None;
         }
+        self.compiled_revision = self.incremental_compiler.revision();
     }
 }
 
@@ -326,6 +384,8 @@ pub struct State {
     server_addr: SocketAddr,
     editor_client: Client,
     state_mut: Arc<Mutex<StateMut>>,
+    requested_revision: Arc<AtomicU64>,
+    compile_debounce_ms: Arc<AtomicU64>,
 }
 
 impl State {
@@ -334,6 +394,23 @@ impl State {
             server_addr,
             editor_client,
             state_mut: Default::default(),
+            requested_revision: Arc::new(AtomicU64::new(0)),
+            compile_debounce_ms: Arc::new(AtomicU64::new(150)),
+        }
+    }
+
+    async fn publish_workspace_modified(&self, modified: bool, gui_client: Option<GuiClient>) {
+        let Some(gui_client) = gui_client else {
+            return;
+        };
+        if let Err(error) = gui_client
+            .workspace_modified(context::current(), modified)
+            .await
+        {
+            self.editor_client
+                .show_message(MessageType::ERROR, format!("{error}"))
+                .await;
+            self.state_mut.lock().await.gui_client = None;
         }
     }
 }
@@ -341,6 +418,60 @@ impl State {
 #[derive(Debug, Clone)]
 struct Backend {
     state: State,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceModifiedParams {
+    modified: bool,
+}
+
+impl Backend {
+    fn schedule_compile(&self, revision: u64) {
+        self.state
+            .requested_revision
+            .store(revision, Ordering::Release);
+        let backend = self.clone();
+        let delay = self.state.compile_debounce_ms.load(Ordering::Acquire);
+        tokio::spawn(async move {
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            if backend.state.requested_revision.load(Ordering::Acquire) == revision {
+                backend.compile_revision(revision).await;
+            }
+        });
+    }
+
+    async fn compile_revision(&self, revision: u64) {
+        let mut state_mut = self.state.state_mut.lock().await;
+        if state_mut.incremental_compiler.revision() != revision
+            || state_mut.compiled_revision == revision
+        {
+            return;
+        }
+        state_mut
+            .compile(
+                &self.state.editor_client,
+                true,
+                Some((&self.state.requested_revision, revision)),
+            )
+            .await;
+    }
+
+    async fn workspace_modified(&self, params: WorkspaceModifiedParams) -> Result<()> {
+        let gui_client = {
+            let mut state_mut = self.state.state_mut.lock().await;
+            if state_mut.workspace_modified == params.modified {
+                return Ok(());
+            }
+            state_mut.workspace_modified = params.modified;
+            state_mut.gui_client.clone()
+        };
+        self.state
+            .publish_workspace_modified(params.modified, gui_client)
+            .await;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -364,13 +495,13 @@ impl Request for Redo {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ForceSave;
+struct Save;
 
-impl Request for ForceSave {
-    type Params = PathBuf;
+impl Request for Save {
+    type Params = ();
     type Result = ();
 
-    const METHOD: &'static str = "custom/forceSave";
+    const METHOD: &'static str = "custom/save";
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -385,6 +516,21 @@ impl Request for FocusEditor {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AnalyzerOptions {
+            compile_debounce_ms: Option<u64>,
+        }
+        if let Some(debounce_ms) = params
+            .initialization_options
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<AnalyzerOptions>(value.clone()).ok())
+            .and_then(|options| options.compile_debounce_ms)
+        {
+            self.state
+                .compile_debounce_ms
+                .store(debounce_ms, Ordering::Release);
+        }
         #[allow(deprecated)]
         {
             self.state.state_mut.lock().await.root_dir = params
@@ -416,13 +562,42 @@ impl LanguageServer for Backend {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        self.state
+            .requested_revision
+            .store(u64::MAX, Ordering::Release);
         let mut state_mut = self.state.state_mut.lock().await;
         let doc = Document::new(params.text_document.text, params.text_document.version);
-        state_mut.editor_files.insert(params.text_document.uri, doc);
+        let uri = params.text_document.uri;
+        if let Some(path) = uri.to_file_path().map(|path| path.into_owned()) {
+            state_mut
+                .incremental_compiler
+                .set_source_text(path, doc.contents());
+        }
+        state_mut.editor_files.insert(uri, doc);
+        let revision = state_mut.incremental_compiler.revision();
+        drop(state_mut);
+        self.schedule_compile(revision);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        self.state
+            .requested_revision
+            .store(u64::MAX, Ordering::Release);
         let mut state_mut = self.state.state_mut.lock().await;
+        let analyzer_edit = state_mut
+            .pending_workspace_edits
+            .contains_key(&params.text_document.uri);
+        if let Some(count) = state_mut
+            .pending_workspace_edits
+            .get_mut(&params.text_document.uri)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state_mut
+                    .pending_workspace_edits
+                    .shift_remove(&params.text_document.uri);
+            }
+        }
         if let Some(doc) = state_mut.editor_files.get_mut(&params.text_document.uri) {
             // apply each change
             doc.apply_changes(
@@ -436,20 +611,61 @@ impl LanguageServer for Backend {
                     .collect(),
                 params.text_document.version,
             );
+            let contents = doc.contents().to_owned();
+            if let Some(path) = params
+                .text_document
+                .uri
+                .to_file_path()
+                .map(|path| path.into_owned())
+            {
+                state_mut
+                    .incremental_compiler
+                    .set_source_text(path, contents);
+            }
         } else {
             // optional: log error, or handle missing document
+        }
+        let revision = state_mut.incremental_compiler.revision();
+        drop(state_mut);
+        if analyzer_edit {
+            self.state
+                .requested_revision
+                .store(revision, Ordering::Release);
+            self.compile_revision(revision).await;
+        } else {
+            self.schedule_compile(revision);
         }
     }
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {
-        self.compile().await;
+        let state_mut = self.state.state_mut.lock().await;
+        let revision = state_mut.incremental_compiler.revision();
+        let needs_compile = save_needs_compile(revision, state_mut.compiled_revision);
+        drop(state_mut);
+        if needs_compile {
+            self.compile_revision(revision).await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.state
+            .requested_revision
+            .store(u64::MAX, Ordering::Release);
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut
             .editor_files
             .swap_remove(&params.text_document.uri);
+        if let Some(path) = params
+            .text_document
+            .uri
+            .to_file_path()
+            .map(|path| path.into_owned())
+        {
+            state_mut.incremental_compiler.remove_source(&path);
+        }
+        let revision = state_mut.incremental_compiler.revision();
+        drop(state_mut);
+        self.schedule_compile(revision);
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -583,13 +799,33 @@ impl Backend {
     async fn compile_cell(&self, cell: impl Into<String>) {
         let mut state_mut = self.state.state_mut.lock().await;
         state_mut.cell = Some(cell.into());
-        state_mut.compile(&self.state.editor_client, false).await;
+        let revision = state_mut.incremental_compiler.revision();
+        self.state
+            .requested_revision
+            .store(revision, Ordering::Release);
+        state_mut
+            .compile(
+                &self.state.editor_client,
+                false,
+                Some((&self.state.requested_revision, revision)),
+            )
+            .await;
     }
 
     /// Compiles the current workspace and the open cell if it exists.
     async fn compile(&self) {
         let mut state_mut = self.state.state_mut.lock().await;
-        state_mut.compile(&self.state.editor_client, true).await;
+        let revision = state_mut.incremental_compiler.revision();
+        self.state
+            .requested_revision
+            .store(revision, Ordering::Release);
+        state_mut
+            .compile(
+                &self.state.editor_client,
+                true,
+                Some((&self.state.requested_revision, revision)),
+            )
+            .await;
     }
 
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
@@ -916,6 +1152,7 @@ pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
     .custom_method("custom/openCell", Backend::open_cell)
     .custom_method("custom/inst", Backend::instantiate)
     .custom_method("custom/set", Backend::set)
+    .custom_method("custom/workspaceModified", Backend::workspace_modified)
     .finish();
     let Some(state) = ext_state else {
         eprintln!("failed to initialize analyzer state");
@@ -968,7 +1205,7 @@ mod tests {
         parse,
     };
 
-    use super::{parse_setting, preview_instance_cell};
+    use super::{parse_setting, preview_instance_cell, revision_is_stale, save_needs_compile};
 
     #[test]
     fn open_cell_accepts_boolean_literals() {
@@ -983,6 +1220,27 @@ mod tests {
         assert_eq!(parse_setting("grid   10 20"), Some(("grid", "10 20")));
         assert_eq!(parse_setting("grid"), None);
         assert_eq!(parse_setting("grid   "), None);
+    }
+
+    #[test]
+    fn saving_an_already_compiled_revision_is_a_noop() {
+        assert!(!save_needs_compile(8, 8));
+        assert!(save_needs_compile(8, 7));
+    }
+
+    #[test]
+    fn newer_requested_revision_cancels_publication() {
+        let compiler = argonc::incremental::IncrementalCompiler::new();
+        let requested = std::sync::atomic::AtomicU64::new(compiler.revision());
+        assert!(!revision_is_stale(
+            &compiler,
+            Some((&requested, compiler.revision()))
+        ));
+        requested.store(u64::MAX, std::sync::atomic::Ordering::Release);
+        assert!(revision_is_stale(
+            &compiler,
+            Some((&requested, compiler.revision()))
+        ));
     }
 
     #[test]

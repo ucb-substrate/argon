@@ -106,6 +106,10 @@ fn run_inner(
                     items: vec![MenuItem::action("Quit", Quit)],
                 },
                 Menu {
+                    name: "File".into(),
+                    items: vec![MenuItem::action("Save", Save)],
+                },
+                Menu {
                     name: "Edit".into(),
                     items: vec![
                         MenuItem::action("Undo", Undo),
@@ -154,6 +158,7 @@ fn run_inner(
 fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("r", DrawRect, Some("LayoutCanvas")),
         KeyBinding::new("s", SelectMode, Some("LayoutCanvas")),
         KeyBinding::new("d", DrawDim, Some("LayoutCanvas")),
@@ -220,12 +225,14 @@ mod tests {
         instantiate_count: usize,
         open_cell_count: usize,
         focus_invoker_count: usize,
+        save_count: usize,
     }
 
     impl Render for ShortcutTestView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .on_action(cx.listener(|view, _: &Undo, _, _| view.undo_count += 1))
+                .on_action(cx.listener(|view, _: &Save, _, _| view.save_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
@@ -266,6 +273,7 @@ mod tests {
                     instantiate_count: 0,
                     open_cell_count: 0,
                     focus_invoker_count: 0,
+                    save_count: 0,
                 })
             })
             .unwrap()
@@ -274,7 +282,7 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\");
+        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\ cmd-s");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
@@ -283,13 +291,14 @@ mod tests {
                 assert_eq!(view.instantiate_count, 0);
                 assert_eq!(view.open_cell_count, 0);
                 assert_eq!(view.focus_invoker_count, 1);
+                assert_eq!(view.save_count, 1);
             })
             .unwrap();
 
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\");
+        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\ cmd-s");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
@@ -298,6 +307,7 @@ mod tests {
                 assert_eq!(view.instantiate_count, 1);
                 assert_eq!(view.open_cell_count, 1);
                 assert_eq!(view.focus_invoker_count, 2);
+                assert_eq!(view.save_count, 2);
             })
             .unwrap();
     }
