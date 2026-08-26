@@ -517,8 +517,10 @@ floats from `IntLit DOT IntLit?`:
 - `1.0.2` → `IndexFieldAccess(FloatLiteral(1.0), 2)`: the first `.0` completes
   the float, the second `.2` is a tuple-index suffix.
 
-A literal's value is parsed from the raw source slice and defaults to `0` /
-`0.0` on overflow, matching the old behavior.
+A literal's value is parsed from the raw source slice. A slice that does not
+parse — an integer outside `i64`, or a float split by trivia (`1 . 5`) — is a
+parse error; the node keeps `0` / `0.0` so the parse can continue.
+The same check covers a tuple-index suffix (`t.0`).
 
 ### 9.4 The `lhs_start` span subtlety, and prefix vs suffix
 
@@ -582,7 +584,10 @@ Some(call)
 
 So `top(1, 2)` is accepted, while trailing garbage (`top() junk`) and suffixed
 calls (`top()!`, `top().x`, `top()[0]` — whose root node is an `Emit` /
-`FieldAccess` / `Index`, not a `Call`) are all rejected. This is distinct from
+`FieldAccess` / `Index`, not a `Call`) are all rejected. The caller
+(`CellArg::from_literal`) then accepts integer, float, boolean, and `[]`
+arguments, folding unary `-` / `!` over them, so `top(-1., !true)` converts while
+`top(-x)` and `top(1. + 1.)` do not. This is distinct from
 `format_cell_input` in `parse.rs`, which wraps a snippet into a whole `cell { … }`
 program for `parse_ast`; the two are not interchangeable.
 
