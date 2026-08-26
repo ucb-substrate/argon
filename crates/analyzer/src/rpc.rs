@@ -1,6 +1,6 @@
 //! RPC types shared by the analyzer and Argone.
 
-use std::{collections::HashMap, net::SocketAddr};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use argonc::{
     ast::Span,
@@ -15,8 +15,7 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::{
-    ArgonConfig, Backend, GuiConnection, PublishedState, Redo, Save, SourceState, State, Undo,
-    document::Document,
+    ArgonConfig, Backend, PublishedState, Redo, Save, SourceState, State, Undo, document::Document,
 };
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
@@ -127,6 +126,7 @@ pub trait LangServer {
 pub trait Gui {
     async fn update_cell(snapshot: CompilationSnapshot);
     async fn fit();
+    async fn set_workspace_path(path: Option<PathBuf>);
     async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
     async fn place_instance(preview: InstancePreview);
@@ -397,14 +397,7 @@ impl LangServer for State {
                 return;
             }
         };
-        let connection = GuiConnection {
-            id: self
-                .gui_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                + 1,
-            client: gui_client.clone(),
-        };
-        *self.gui_client.lock().await = Some(connection.clone());
+        let connection = self.install_gui_connection(gui_client.clone()).await;
         let modified = self.source_state.lock().await.workspace_modified;
         if let Err(error) = gui_client
             .configure(context::current(), self.config())
@@ -417,6 +410,9 @@ impl LangServer for State {
                 )
                 .await;
             self.clear_gui_connection(connection.id).await;
+            return;
+        }
+        if !self.publish_workspace_path(Some(connection.clone())).await {
             return;
         }
         self.publish_workspace_modified(modified, Some(connection))

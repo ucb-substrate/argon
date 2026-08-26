@@ -9,7 +9,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock, RwLock, atomic::AtomicU64},
+    sync::{Arc, OnceLock, RwLock},
     time::Duration,
 };
 
@@ -307,6 +307,13 @@ struct GuiConnection {
     client: GuiClient,
 }
 
+#[derive(Debug, Default)]
+struct GuiState {
+    connection: Option<GuiConnection>,
+    process: Option<Child>,
+    next_connection_id: u64,
+}
+
 /// Errors that actually prevent the GUI from displaying a compiled cell.
 /// Execution diagnostics may still contain usable output (most notably an
 /// underconstrained cell with initial-condition fallbacks), so those are
@@ -467,9 +474,7 @@ pub struct State {
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
-    gui_client: Arc<Mutex<Option<GuiConnection>>>,
-    gui_process: Arc<Mutex<Option<Child>>>,
-    gui_generation: Arc<AtomicU64>,
+    gui: Arc<Mutex<GuiState>>,
     app_config: Arc<RwLock<ArgonConfig>>,
 }
 
@@ -486,9 +491,7 @@ impl State {
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
-            gui_client: Default::default(),
-            gui_process: Default::default(),
-            gui_generation: Arc::new(AtomicU64::new(0)),
+            gui: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
         }
     }
@@ -507,13 +510,32 @@ impl State {
             .clone()
     }
 
-    async fn compilation_is_current(&self, identity: &CompileIdentity) -> bool {
+    async fn is_latest_compile_request(&self, identity: &CompileIdentity) -> bool {
         let source = self.source_state.lock().await;
         source.compile_identity() == *identity
     }
 
     async fn gui_connection(&self) -> Option<GuiConnection> {
-        self.gui_client.lock().await.clone()
+        self.gui.lock().await.connection.clone()
+    }
+
+    async fn install_gui_connection(&self, client: GuiClient) -> GuiConnection {
+        let mut gui = self.gui.lock().await;
+        gui.next_connection_id = gui.next_connection_id.saturating_add(1);
+        let connection = GuiConnection {
+            id: gui.next_connection_id,
+            client,
+        };
+        gui.connection = Some(connection.clone());
+        connection
+    }
+
+    async fn take_gui_process(&self) -> Option<Child> {
+        self.gui.lock().await.process.take()
+    }
+
+    async fn set_gui_process(&self, process: Child) {
+        self.gui.lock().await.process = Some(process);
     }
 
     pub(crate) async fn current_editor_ast(&self) -> Option<Arc<WorkspaceParseAst>> {
@@ -523,9 +545,13 @@ impl State {
     }
 
     async fn clear_gui_connection(&self, id: u64) {
-        let mut connection = self.gui_client.lock().await;
-        if connection.as_ref().is_some_and(|current| current.id == id) {
-            *connection = None;
+        let mut gui = self.gui.lock().await;
+        if gui
+            .connection
+            .as_ref()
+            .is_some_and(|current| current.id == id)
+        {
+            gui.connection = None;
         }
     }
 
@@ -543,6 +569,27 @@ impl State {
                 .await;
             self.clear_gui_connection(connection.id).await;
         }
+    }
+
+    async fn publish_workspace_path(&self, connection: Option<GuiConnection>) -> bool {
+        let Some(connection) = connection else {
+            return true;
+        };
+        let result = connection
+            .client
+            .set_workspace_path(context::current(), self.root_dir.get().cloned())
+            .await;
+        if let Err(error) = result {
+            self.editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not configure the GUI workspace: {error}"),
+                )
+                .await;
+            self.clear_gui_connection(connection.id).await;
+            return false;
+        }
+        true
     }
 }
 
@@ -593,7 +640,7 @@ impl Backend {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            if backend.state.compilation_is_current(&identity).await {
+            if backend.state.is_latest_compile_request(&identity).await {
                 backend.update_cell(identity).await;
             }
         });
@@ -614,7 +661,7 @@ impl Backend {
             }
         };
         let result = self.state.compiler.compile(request).await?;
-        if !self.state.compilation_is_current(&result.identity).await {
+        if !self.state.is_latest_compile_request(&result.identity).await {
             return None;
         }
         self.publish_compilation(result).await
@@ -622,7 +669,7 @@ impl Backend {
 
     async fn publish_compilation(&self, result: CompileResult) -> Option<CompilationSnapshot> {
         let identity = result.identity.clone();
-        if !self.state.compilation_is_current(&identity).await {
+        if !self.state.is_latest_compile_request(&identity).await {
             return None;
         }
         let mut current_diagnostics =
@@ -650,7 +697,7 @@ impl Backend {
         }
 
         for message in result.messages {
-            if !self.state.compilation_is_current(&identity).await {
+            if !self.state.is_latest_compile_request(&identity).await {
                 return None;
             }
             self.state
@@ -659,7 +706,7 @@ impl Backend {
                 .await;
         }
         for (uri, diagnostics) in current_diagnostics {
-            if !self.state.compilation_is_current(&identity).await {
+            if !self.state.is_latest_compile_request(&identity).await {
                 return None;
             }
             self.state
@@ -668,7 +715,7 @@ impl Backend {
                 .await;
         }
         let snapshot = snapshot?;
-        if !self.state.compilation_is_current(&identity).await {
+        if !self.state.is_latest_compile_request(&identity).await {
             return None;
         }
         Some(snapshot)
@@ -679,11 +726,11 @@ impl Backend {
         identity: &CompileIdentity,
         snapshot: CompilationSnapshot,
     ) -> Option<GuiConnection> {
-        if !self.state.compilation_is_current(identity).await {
+        if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
         let connection = self.state.gui_connection().await?;
-        if !self.state.compilation_is_current(identity).await {
+        if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
         let result = connection
@@ -724,14 +771,14 @@ impl Backend {
         let Some(connection) = self.update_cell(identity.clone()).await else {
             return;
         };
-        if !self.state.compilation_is_current(&identity).await {
+        if !self.state.is_latest_compile_request(&identity).await {
             return;
         }
         let result = connection.client.fit(context::current()).await;
         if self.handle_gui_result(&connection, result).await.is_none() {
             return;
         }
-        if self.state.compilation_is_current(&identity).await {
+        if self.state.is_latest_compile_request(&identity).await {
             let _ = connection.client.activate(context::current()).await;
         }
     }
@@ -796,13 +843,13 @@ impl Request for FocusEditor {
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         #[allow(deprecated)]
-        {
-            if let Some(root_dir) = params
-                .root_uri
-                .and_then(|root| root.to_file_path().map(|path| path.into_owned()))
-            {
-                let _ = self.state.root_dir.set(root_dir);
-            }
+        let root_dir = params
+            .root_uri
+            .and_then(|root| root.to_file_path().map(|path| path.into_owned()));
+        if let Some(root_dir) = root_dir {
+            let _ = self.state.root_dir.set(root_dir);
+            let connection = self.state.gui_connection().await;
+            self.state.publish_workspace_path(connection).await;
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -929,7 +976,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        if let Some(gui) = self.state.gui_process.lock().await.as_mut() {
+        if let Some(mut gui) = self.state.take_gui_process().await {
             let _ = gui.kill().await;
         }
         Ok(())
@@ -989,7 +1036,7 @@ impl Backend {
                 .show_message(MessageType::LOG, "Failed to contact existing GUI.")
                 .await;
         }
-        let old_gui = self.state.gui_process.lock().await.take();
+        let old_gui = self.state.take_gui_process().await;
         if let Some(mut gui) = old_gui {
             let _ = gui.kill().await;
         }
@@ -1021,20 +1068,21 @@ impl Backend {
                         });
                     }
                     if let Some(stderr) = child.stderr.take() {
+                        let stderr_state = state.clone();
                         tokio::spawn(async move {
                             let reader = BufReader::new(stderr);
                             let mut lines = reader.lines();
 
                             while let Ok(Some(line)) = lines.next_line().await {
                                 error!("{}", line);
-                                state
+                                stderr_state
                                     .editor_client
                                     .show_message(MessageType::ERROR, line)
                                     .await;
                             }
                         });
                     }
-                    *state.gui_process.lock().await = Some(child);
+                    state.set_gui_process(child).await;
                 }
                 Err(err) => {
                     let message =

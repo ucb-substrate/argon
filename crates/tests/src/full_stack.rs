@@ -33,6 +33,7 @@ pub enum GuiEvent {
         rect_count: usize,
     },
     Fit,
+    WorkspacePath(Option<PathBuf>),
     WorkspaceModified(bool),
 }
 
@@ -57,6 +58,12 @@ impl Gui for HeadlessGui {
     async fn fit(self, _: context::Context) {
         self.events
             .send(GuiEvent::Fit)
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn set_workspace_path(self, _: context::Context, path: Option<PathBuf>) {
+        self.events
+            .send(GuiEvent::WorkspacePath(path))
             .expect("full-stack test should still be receiving GUI events");
     }
 
@@ -293,9 +300,10 @@ mod tests {
             let mut drew_rect = false;
             let mut saw_editor_update = false;
             let mut saw_workspace_modified = false;
+            let mut saw_workspace_path = false;
             let mut saw_fit = false;
             let mut opened_revision = None;
-            while !(saw_editor_update && saw_workspace_modified && saw_fit) {
+            while !(saw_editor_update && saw_workspace_modified && saw_workspace_path && saw_fit) {
                 match session.next_event().await {
                     GuiEvent::UpdateCell {
                         revision,
@@ -341,6 +349,17 @@ mod tests {
                         ..
                     } if rect_count >= 2 => saw_editor_update = true,
                     GuiEvent::Fit => saw_fit = true,
+                    GuiEvent::WorkspacePath(Some(path)) => {
+                        assert_eq!(
+                            path.canonicalize()
+                                .expect("canonicalize GUI workspace path"),
+                            session
+                                .project
+                                .canonicalize()
+                                .expect("canonicalize test workspace path")
+                        );
+                        saw_workspace_path = true;
+                    }
                     GuiEvent::WorkspaceModified(true) => saw_workspace_modified = true,
                     _ => {}
                 }

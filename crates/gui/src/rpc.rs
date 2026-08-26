@@ -425,6 +425,15 @@ impl Gui for GuiServer {
             .unwrap();
     }
 
+    async fn set_workspace_path(mut self, _: context::Context, path: Option<std::path::PathBuf>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_workspace_path(cx, path));
+            }))
+            .await
+            .unwrap();
+    }
+
     async fn workspace_modified(mut self, _: context::Context, modified: bool) {
         self.to_exec
             .send(Box::new(move |editor, cx| {

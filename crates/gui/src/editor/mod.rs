@@ -1,6 +1,7 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
+    path::PathBuf,
 };
 
 use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
@@ -74,6 +75,7 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
     pub fatal_error: Option<SharedString>,
@@ -400,6 +402,7 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
                 fatal_error: None,
@@ -511,6 +514,14 @@ impl Editor {
     pub fn set_workspace_modified(&self, cx: &mut App, modified: bool) {
         self.state.update(cx, |state, cx| {
             state.workspace_modified = modified;
+            cx.notify();
+        });
+        self.title_bar.update(cx, |_, cx| cx.notify());
+    }
+
+    pub fn set_workspace_path(&self, cx: &mut App, path: Option<PathBuf>) {
+        self.state.update(cx, |state, cx| {
+            state.workspace_path = path;
             cx.notify();
         });
         self.title_bar.update(cx, |_, cx| cx.notify());

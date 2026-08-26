@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use analyzer::rpc::LangServerAction;
@@ -32,6 +33,14 @@ impl TitleBar {
     }
 }
 
+fn workspace_title(path: Option<&Path>, modified: bool) -> String {
+    let modified = if modified { " [+]" } else { "" };
+    path.map_or_else(
+        || format!("Argon{modified}"),
+        |path| format!("Argon — {}{modified}", path.display()),
+    )
+}
+
 impl Render for TitleBar {
     fn render(
         &mut self,
@@ -40,7 +49,7 @@ impl Render for TitleBar {
     ) -> impl gpui::IntoElement {
         let state = self.state.read(cx);
         let theme = state.theme();
-        let mut title = div()
+        div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
             .p_1()
@@ -48,16 +57,32 @@ impl Render for TitleBar {
             .flex()
             .items_center()
             .justify_center()
-            .child("Argon");
-        if state.workspace_modified {
-            title = title.child(
-                div()
-                    .ml_2()
-                    .text_color(theme.error)
-                    .child("● UNSAVED CHANGES"),
-            );
-        }
-        title
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(workspace_title(
+                state.workspace_path.as_deref(),
+                state.workspace_modified,
+            ))
+    }
+}
+
+#[cfg(test)]
+mod title_bar_tests {
+    use std::path::Path;
+
+    use super::workspace_title;
+
+    #[test]
+    fn title_shows_workspace_and_vim_modified_marker() {
+        let workspace = Path::new("/projects/inverter");
+        assert_eq!(
+            workspace_title(Some(workspace), false),
+            "Argon — /projects/inverter"
+        );
+        assert_eq!(
+            workspace_title(Some(workspace), true),
+            "Argon — /projects/inverter [+]"
+        );
     }
 }
 
