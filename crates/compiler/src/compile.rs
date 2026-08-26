@@ -40,7 +40,7 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 13] = [
+pub const BUILTINS: [&str; 14] = [
     "list",
     "cons",
     "head",
@@ -48,6 +48,7 @@ pub const BUILTINS: [&str; 13] = [
     "range_full",
     "crect",
     "rect",
+    "polygon",
     "text",
     "float",
     "eq",
@@ -594,18 +595,42 @@ fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>)
     }
     for (cell_id, cell) in data.cells.iter() {
         for (_, obj) in cell.objects.iter() {
-            if let SolvedValue::Rect(r) = obj
-                && let Some(layer) = &r.layer
-                && !layers.contains(layer)
-            {
-                errs.push(ExecError {
-                    span: r.span.clone(),
-                    cell: *cell_id,
-                    kind: ExecErrorKind::IllegalLayer {
-                        layer: layer.clone(),
-                        lyp: lyp_file.display().to_string(),
-                    },
-                })
+            match obj {
+                SolvedValue::Rect(r) => {
+                    if let Some(layer) = &r.layer
+                        && !layers.contains(layer)
+                    {
+                        errs.push(ExecError {
+                            span: r.span.clone(),
+                            cell: *cell_id,
+                            kind: ExecErrorKind::IllegalLayer {
+                                layer: layer.clone(),
+                                lyp: lyp_file.display().to_string(),
+                            },
+                        });
+                    }
+                }
+                SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+                    errs.push(ExecError {
+                        span: polygon.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalLayer {
+                            layer: polygon.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                SolvedValue::Text(text) if !layers.contains(&text.layer) => {
+                    errs.push(ExecError {
+                        span: text.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalTextLayer {
+                            layer: text.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                _ => {}
             }
         }
     }
@@ -715,6 +740,8 @@ pub enum Ty {
     Float,
     Int,
     Rect,
+    Polygon,
+    Point,
     String,
     Cell(Arc<CellTy>),
     Inst(Arc<CellTy>),
@@ -728,6 +755,40 @@ pub enum Ty {
     Tuple(Vec<Ty>),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PolygonAxis {
+    X,
+    Y,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PolygonCoordinate {
+    axis: PolygonAxis,
+    index: usize,
+    initial: bool,
+}
+
+fn polygon_coordinate(name: &str) -> Option<PolygonCoordinate> {
+    let (axis, index) = name.split_at_checked(1)?;
+    let (index, initial) = index
+        .strip_suffix('i')
+        .map_or((index, false), |index| (index, true));
+    if index.is_empty() || !index.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let index = index.parse().ok()?;
+    let axis = match axis {
+        "x" => PolygonAxis::X,
+        "y" => PolygonAxis::Y,
+        _ => return None,
+    };
+    Some(PolygonCoordinate {
+        axis,
+        index,
+        initial,
+    })
+}
+
 impl Ty {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -735,6 +796,8 @@ impl Ty {
             "Int" => Some(Ty::Int),
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
+            "Polygon" => Some(Ty::Polygon),
+            "Point" => Some(Ty::Point),
             "Any" => Some(Ty::Any),
             "String" => Some(Ty::String),
             "()" => Some(Ty::Nil),
@@ -1735,6 +1798,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "layer" => Ty::String,
                 _ => self.no_field_on_ty(field, Ty::Rect),
             },
+            Ty::Polygon => match field.name.as_str() {
+                "points" => Ty::Seq(Box::new(Ty::Point)),
+                "layer" => Ty::String,
+                name if polygon_coordinate(name).is_some_and(|coordinate| !coordinate.initial) => {
+                    Ty::Float
+                }
+                _ => self.no_field_on_ty(field, Ty::Polygon),
+            },
+            Ty::Point => match field.name.as_str() {
+                "x" | "y" => Ty::Float,
+                _ => self.no_field_on_ty(field, Ty::Point),
+            },
             Ty::Inst(ref c) => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
                 name => c.data.get(name).cloned().unwrap_or_else(|| {
@@ -1848,6 +1923,25 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     };
                     self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Rect)
+                }
+                "polygon" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
+                    if let Some(layer) = args.posargs.first() {
+                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
+                    }
+                    if let Some(points) = args.posargs.get(1) {
+                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
+                    }
+                    let kwarg_defs = args
+                        .kwargs
+                        .iter()
+                        .filter_map(|kwarg| {
+                            polygon_coordinate(kwarg.name.name.as_str())
+                                .map(|_| (kwarg.name.name.as_str(), Ty::Float))
+                        })
+                        .collect();
+                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    (None, Ty::Polygon)
                 }
                 "text" => {
                     // text, layer, x, y
@@ -2303,6 +2397,19 @@ pub struct Rect<T> {
     pub x1: T,
     pub y1: T,
     pub construction: bool,
+    pub span: Option<Span>,
+}
+
+/// A polygon whose vertex coordinates are independent values.
+///
+/// Keeping every coordinate separate is important: an Argon constraint may
+/// refer to `polygon.points[i].x` or `.y` without coupling the vertex to the
+/// rest of the shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Polygon<T> {
+    pub layer: String,
+    pub id: ObjectId,
+    pub points: Vec<(T, T)>,
     pub span: Option<Span>,
 }
 
@@ -3003,6 +3110,22 @@ impl<'a> ExecPass<'a> {
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_rect_{element_index}"))),
                     ),
+                    ImportedGdsElement::Polygon {
+                        layer,
+                        name,
+                        points,
+                    } => (
+                        SolvedValue::Polygon(Polygon {
+                            id,
+                            layer,
+                            points: points
+                                .into_iter()
+                                .map(|(x, y)| ((x, LinearExpr::from(x)), (y, LinearExpr::from(y))))
+                                .collect(),
+                            span: None,
+                        }),
+                        Some(name.unwrap_or_else(|| format!("gds_polygon_{element_index}"))),
+                    ),
                     ImportedGdsElement::Text { layer, text, x, y } => (
                         SolvedValue::Text(Text {
                             id,
@@ -3133,6 +3256,27 @@ impl<'a> ExecPass<'a> {
                         span: rect.span.clone(),
                     })
                 }
+                Object::Polygon(polygon) => SolvedValue::Polygon(Polygon {
+                    id: polygon.id,
+                    layer: polygon.layer.clone(),
+                    points: polygon
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            (
+                                (
+                                    state.solver.eval_expr(x).expect("polygon x not solved"),
+                                    x.clone(),
+                                ),
+                                (
+                                    state.solver.eval_expr(y).expect("polygon y not solved"),
+                                    y.clone(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                    span: polygon.span.clone(),
+                }),
                 Object::Text(text) => SolvedValue::Text(Text {
                     id: text.id,
                     text: text.text.clone(),
@@ -3912,6 +4056,133 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                "polygon" => {
+                    if let (Defer::Ready(layer), Defer::Ready(point_spec)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let layer = layer.as_ref().unwrap_string().clone();
+                        let point_spec = point_spec.clone();
+                        let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
+                            Value::Int(count) => {
+                                let Ok(count) = usize::try_from(count) else {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, c.expr.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidPolygon,
+                                    });
+                                    return Err(());
+                                };
+                                if count < 3 {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, c.expr.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidPolygon,
+                                    });
+                                    return Err(());
+                                }
+                                let state = self.cell_state_mut(cell_id);
+                                (0..count)
+                                    .map(|_| {
+                                        (
+                                            state.solver.new_var().into(),
+                                            state.solver.new_var().into(),
+                                        )
+                                    })
+                                    .collect()
+                            }
+                            _ => {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, c.expr.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
+                        };
+                        if points.len() < 3 {
+                            self.errors.push(ExecError {
+                                span: Some(self.span(&vref.loc, c.expr.span)),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidPolygon,
+                            });
+                            return Err(());
+                        }
+                        for kwarg in &c.expr.args.kwargs {
+                            let coordinate = polygon_coordinate(kwarg.name.name.as_str())
+                                .expect("polygon kwargs were statically validated");
+                            if coordinate.index >= points.len() {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, kwarg.name.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::IndexOutOfBounds,
+                                });
+                                return Err(());
+                            }
+                        }
+
+                        let id = self.object_id();
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let polygon = Polygon {
+                            id,
+                            layer,
+                            points,
+                            span: Some(span.clone()),
+                        };
+                        let state = self.cell_state_mut(cell_id);
+                        state.objects.insert(id, polygon.clone().into());
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
+                        self.values
+                            .insert(vid, Defer::Ready(Value::Polygon(polygon.clone())));
+                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
+                            let coordinate = polygon_coordinate(kwarg.name.name.as_str())
+                                .expect("polygon kwargs were statically validated");
+                            let expr = match coordinate.axis {
+                                PolygonAxis::X => polygon.points[coordinate.index].0.clone(),
+                                PolygonAxis::Y => polygon.points[coordinate.index].1.clone(),
+                            };
+                            let lhs = self.value_id();
+                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
+                            let span = self.span(&vref.loc, kwarg.value.span());
+                            self.new_deferred_value(vref.loc, |_| {
+                                PartialEvalState::Constraint(PartialConstraint {
+                                    lhs,
+                                    rhs: *rhs,
+                                    fallback: coordinate.initial,
+                                    priority: i32::MAX
+                                        - i32::try_from(coordinate.index.saturating_mul(2))
+                                            .unwrap_or(i32::MAX)
+                                        - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
+                                    span,
+                                    initial_condition: coordinate.initial.then_some(
+                                        match coordinate.axis {
+                                            PolygonAxis::X => RectInitialCondition::PolygonX(
+                                                polygon.id,
+                                                coordinate.index,
+                                            ),
+                                            PolygonAxis::Y => RectInitialCondition::PolygonY(
+                                                polygon.id,
+                                                coordinate.index,
+                                            ),
+                                        },
+                                    ),
+                                })
+                            });
+                        }
+                        true
+                    } else {
+                        for arg in &c.state.posargs {
+                            if !self.values[arg].is_ready() {
+                                self.add_value_dependent(*arg, vid);
+                            }
+                        }
+                        false
+                    }
+                }
                 "text" => {
                     let (mut args, unready): (Vec<_>, Vec<_>) =
                         c.state.posargs.iter().partition_map(|v| {
@@ -4423,16 +4694,26 @@ impl<'a> ExecPass<'a> {
                         state.objects.insert(inst.id, inst.clone().into());
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let lhs = self.value_id();
-                            let priority = match kwarg.name.name.as_str() {
-                                "x" | "xi" => {
+                            let (priority, initial_condition) = match kwarg.name.name.as_str() {
+                                "x" => {
                                     self.values
                                         .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
-                                    2
+                                    (2, None)
                                 }
-                                "y" | "yi" => {
+                                "xi" => {
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
+                                    (2, Some(RectInitialCondition::InstanceX(inst.id)))
+                                }
+                                "y" => {
                                     self.values
                                         .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
-                                    1
+                                    (1, None)
+                                }
+                                "yi" => {
+                                    self.values
+                                        .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
+                                    (1, Some(RectInitialCondition::InstanceY(inst.id)))
                                 }
                                 _ => continue,
                             };
@@ -4448,7 +4729,7 @@ impl<'a> ExecPass<'a> {
                                     fallback: kwarg.name.name.ends_with('i'),
                                     priority,
                                     span,
-                                    initial_condition: None,
+                                    initial_condition,
                                 })
                             });
                         }
@@ -4849,6 +5130,69 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
                         }
+                        ValueRef::Polygon(polygon) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            let val = match field {
+                                "points" => Value::Seq(
+                                    polygon
+                                        .points
+                                        .iter()
+                                        .map(|(x, y)| Value::Point((x.clone(), y.clone())))
+                                        .collect(),
+                                ),
+                                "layer" => Value::String(polygon.layer.clone()),
+                                name if polygon_coordinate(name)
+                                    .is_some_and(|coordinate| !coordinate.initial) =>
+                                {
+                                    let coordinate = polygon_coordinate(name).unwrap();
+                                    let Some(point) = polygon.points.get(coordinate.index) else {
+                                        self.errors.push(ExecError {
+                                            span: Some(self.span(
+                                                &vref.loc,
+                                                field_access_expr.expr.field.span,
+                                            )),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::IndexOutOfBounds,
+                                        });
+                                        return Err(());
+                                    };
+                                    Value::Linear(match coordinate.axis {
+                                        PolygonAxis::X => point.0.clone(),
+                                        PolygonAxis::Y => point.1.clone(),
+                                    })
+                                }
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(
+                                            self.span(&vref.loc, field_access_expr.expr.span),
+                                        ),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
+                        ValueRef::Point(point) => {
+                            let val = match field_access_expr.expr.field.name.as_str() {
+                                "x" => Value::Linear(point.0.clone()),
+                                "y" => Value::Linear(point.1.clone()),
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(
+                                            self.span(&vref.loc, field_access_expr.expr.span),
+                                        ),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
                         ValueRef::Inst(inst) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
                                 "x" => Some(Value::Linear(inst.x.clone())),
@@ -4912,6 +5256,36 @@ impl<'a> ExecPass<'a> {
                                                     };
                                                     objects.insert(xrect.id, xrect.clone().into());
                                                     Value::Rect(xrect)
+                                                }
+                                                SolvedValue::Polygon(polygon) => {
+                                                    let id = object_id(obj_id);
+                                                    let mat = tmat(inst.angle, inst.reflect);
+                                                    let polygon = Polygon {
+                                                        id,
+                                                        layer: polygon.layer.clone(),
+                                                        points: polygon
+                                                            .points
+                                                            .iter()
+                                                            .map(|(x, y)| {
+                                                                let (x, y) =
+                                                                    ifmatvec(mat, (x.0, y.0));
+                                                                (
+                                                                    LinearExpr::add(
+                                                                        x,
+                                                                        inst.x.clone(),
+                                                                    ),
+                                                                    LinearExpr::add(
+                                                                        y,
+                                                                        inst.y.clone(),
+                                                                    ),
+                                                                )
+                                                            })
+                                                            .collect(),
+                                                        span: polygon.span.clone(),
+                                                    };
+                                                    objects
+                                                        .insert(polygon.id, polygon.clone().into());
+                                                    Value::Polygon(polygon)
                                                 }
                                                 SolvedValue::Instance(cinst) => {
                                                     let (angle, reflect, cx, cy) = cascade(
@@ -5195,6 +5569,7 @@ impl<'a> ExecPass<'a> {
         for (_, o) in cell.objects.iter() {
             match o {
                 SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
+                SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Instance(i) => {
                     let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
                     bbox = bbox_union(bbox, cell_bbox);
@@ -5224,6 +5599,8 @@ pub enum Value {
     Linear(LinearExpr),
     Int(i64),
     Rect(Rect<LinearExpr>),
+    Polygon(Polygon<LinearExpr>),
+    Point((LinearExpr, LinearExpr)),
     Bool(bool),
     Fn(FnDecl<Substr, VarIdTyMetadata>),
     /// A cell generator.
@@ -5273,6 +5650,7 @@ impl Value {
     pub fn to_obj(&self) -> Option<Object> {
         match self {
             Self::Rect(r) => Some(Object::Rect(r.clone())),
+            Self::Polygon(p) => Some(Object::Polygon(p.clone())),
             Self::Inst(i) => Some(Object::Inst(i.clone())),
             _ => None,
         }
@@ -5290,6 +5668,7 @@ impl Value {
     fn obj_ids(&self) -> Option<Arrayed<ObjectId>> {
         match self {
             Value::Rect(r) => Some(Arrayed::Elem(r.id)),
+            Value::Polygon(p) => Some(Arrayed::Elem(p.id)),
             Value::Inst(i) => Some(Arrayed::Elem(i.id)),
             Value::Seq(s) => Some(Arrayed::Array(
                 s.iter().map(|v| v.obj_ids()).collect::<Option<Vec<_>>>()?,
@@ -5341,6 +5720,7 @@ pub struct SolvedInstance {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SolvedValue {
     Rect(Rect<(f64, LinearExpr)>),
+    Polygon(Polygon<(f64, LinearExpr)>),
     Text(Text<f64>),
     Dimension(Dimension<(f64, LinearExpr)>),
     Instance(SolvedInstance),
@@ -5350,6 +5730,7 @@ pub enum SolvedValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Object {
     Rect(Rect<LinearExpr>),
+    Polygon(Polygon<LinearExpr>),
     Text(Text<LinearExpr>),
     Dimension(Dimension<LinearExpr>),
     Inst(Instance),
@@ -5358,6 +5739,12 @@ pub enum Object {
 impl From<Rect<LinearExpr>> for Object {
     fn from(value: Rect<LinearExpr>) -> Self {
         Self::Rect(value)
+    }
+}
+
+impl From<Polygon<LinearExpr>> for Object {
+    fn from(value: Polygon<LinearExpr>) -> Self {
+        Self::Polygon(value)
     }
 }
 
@@ -5403,18 +5790,22 @@ pub struct UsedFallback {
     /// Source span of the initial-condition value expression (e.g. the `100.`
     /// in `x1i=100.`), so the GUI can rewrite just that value.
     pub span: Span,
-    /// Rectangle edge initialized by this fallback. This lets the GUI keep
-    /// `x0 <= x1` and `y0 <= y1` when a drag crosses the opposite edge.
+    /// Geometry coordinate initialized by this fallback. Rectangle metadata
+    /// lets the GUI keep `x0 <= x1` and `y0 <= y1` when edges cross.
     pub initial_condition: Option<RectInitialCondition>,
 }
 
-/// The rectangle edge associated with a user-written initial condition.
+/// The geometry coordinate associated with a user-written initial condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RectInitialCondition {
     X0(ObjectId),
     X1(ObjectId),
     Y0(ObjectId),
     Y1(ObjectId),
+    PolygonX(ObjectId, usize),
+    PolygonY(ObjectId, usize),
+    InstanceX(ObjectId),
+    InstanceY(ObjectId),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5770,6 +6161,30 @@ impl<T> Rect<(f64, T)> {
     }
 }
 
+impl<T> Polygon<(f64, T)> {
+    pub fn bbox(&self) -> Option<Rect<f64>> {
+        let mut points = self.points.iter();
+        let ((x, _), (y, _)) = points.next()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (*x, *y, *x, *y);
+        for ((x, _), (y, _)) in points {
+            x0 = x0.min(*x);
+            y0 = y0.min(*y);
+            x1 = x1.max(*x);
+            y1 = y1.max(*y);
+        }
+        Some(Rect {
+            id: self.id,
+            layer: None,
+            x0,
+            y0,
+            x1,
+            y1,
+            construction: true,
+            span: self.span.clone(),
+        })
+    }
+}
+
 impl Rect<f64> {
     fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
         let mat = tmat(angle, reflect_vert);
@@ -5866,6 +6281,9 @@ impl CompiledData {
             Arrayed::Elem(obj) => match &cell.objects[obj] {
                 SolvedValue::Rect(r) => {
                     set.insert(r.id, name.to_owned());
+                }
+                SolvedValue::Polygon(p) => {
+                    set.insert(p.id, name.to_owned());
                 }
                 SolvedValue::Instance(inst) => {
                     set.insert(inst.id, name.to_owned());

@@ -7,7 +7,8 @@ use std::{
 };
 
 use analyzer::rpc::{
-    DimensionParams, Gui, InstancePreview, LangServerAction, LangServerClient, ValueEdit,
+    DimensionParams, Gui, InitialConditionEdit, InstancePreview, LangServerAction,
+    LangServerClient, PolygonParams, ValueEdit,
 };
 use anyhow::{Result, anyhow};
 use argonc::{
@@ -270,6 +271,24 @@ impl SyncLangServerClient {
         })
     }
 
+    pub fn draw_polygon(
+        &self,
+        scope_span: Span,
+        var_name: String,
+        polygon: PolygonParams,
+    ) -> Result<Option<Span>> {
+        self.call(move |client| {
+            let scope_span = scope_span.clone();
+            let var_name = var_name.clone();
+            let polygon = polygon.clone();
+            async move {
+                client
+                    .draw_polygon(context::current(), scope_span, var_name, polygon)
+                    .await
+            }
+        })
+    }
+
     pub fn place_instance(
         &self,
         scope_span: Span,
@@ -312,10 +331,19 @@ impl SyncLangServerClient {
         })
     }
 
-    pub fn update_values(&self, edits: Vec<ValueEdit>) -> Result<bool> {
+    pub fn update_values(
+        &self,
+        edits: Vec<ValueEdit>,
+        initial_conditions: Vec<InitialConditionEdit>,
+    ) -> Result<Option<Vec<ValueEdit>>> {
         self.call(move |client| {
             let edits = edits.clone();
-            async move { client.update_values(context::current(), edits).await }
+            let initial_conditions = initial_conditions.clone();
+            async move {
+                client
+                    .update_values(context::current(), edits, initial_conditions)
+                    .await
+            }
         })
     }
 

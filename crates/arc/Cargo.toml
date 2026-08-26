@@ -3,10 +3,7 @@ name = "arc"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
-
-[[bin]]
-name = "arc"
-path = "src/main.rs"
+autobins = false
 
 [dependencies]
 anyhow = { workspace = true }
@@ -16,3 +13,6 @@ indexmap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

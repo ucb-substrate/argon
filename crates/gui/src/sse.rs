@@ -5,7 +5,7 @@ use indexmap::{IndexMap, IndexSet};
 
 /// Values with magnitude below this are treated as zero when deciding whether
 /// a dragged edge still has a free direction to move along.
-const EPSILON: f64 = 1e-8;
+pub(crate) const EPSILON: f64 = 1e-8;
 
 #[derive(Clone, Debug)]
 pub struct SparseVec(pub(crate) IndexMap<Var, f64>);

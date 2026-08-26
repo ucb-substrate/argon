@@ -185,6 +185,9 @@ pub enum ExecErrorKind {
     /// A rectangle uses a layer absent from the layer-properties file.
     #[error("rectangle uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
     IllegalLayer { layer: String, lyp: String },
+    /// A text label uses a layer absent from the layer-properties file.
+    #[error("text uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
+    IllegalTextLayer { layer: String, lyp: String },
     /// A constraint conflicts with the rest of the system.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
@@ -200,6 +203,9 @@ pub enum ExecErrorKind {
     /// Rectangle edges appear in the wrong order.
     #[error("rect edges are in the wrong order: {0}")]
     FlippedRect(String),
+    /// A polygon does not contain enough vertices.
+    #[error("a polygon requires at least three points")]
+    InvalidPolygon,
     /// An operation received an incompatible runtime value.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,

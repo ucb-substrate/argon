@@ -4,7 +4,7 @@ use std::{
     process::ExitCode,
 };
 
-use argonc::{
+use crate::{
     artifact,
     compile::{self, CellArg, CompileInput, CompileOutput},
     diagnostics::{self, Diagnostic},
@@ -60,12 +60,12 @@ struct Args {
     error_format: ErrorFormat,
 }
 
-fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args = Args::parse();
     let format = args.error_format;
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(args)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(args)));
     std::panic::set_hook(previous_hook);
     let result = match result {
         Ok(result) => result,
@@ -91,7 +91,7 @@ fn main() -> ExitCode {
 
 struct Failed(ErrorFormat, Vec<Diagnostic>);
 
-fn run(args: Args) -> Result<(), Failed> {
+fn execute(args: Args) -> Result<(), Failed> {
     let format = args.error_format;
     let root = source_root(&args.root);
     let mut names = HashSet::new();
@@ -139,7 +139,7 @@ fn run(args: Args) -> Result<(), Failed> {
             "--lyp is required when compiling a cell; pass the path to a KLayout layer-properties file",
         ));
     };
-    argonc::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
+    crate::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
     let cell_ast = parse::parse_cell(cell)
         .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?;
     if !cell_ast.args.kwargs.is_empty() {
@@ -256,11 +256,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use argonc::{artifact, compile::CompileOutput};
+    use crate::{artifact, compile::CompileOutput};
     use clap::{CommandFactory, Parser};
     use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
-    use super::{Args, ErrorFormat, Failed, run};
+    use super::{Args, ErrorFormat, Failed, execute};
 
     fn temp_source(name: &str, source: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -359,7 +359,7 @@ mod tests {
     }
 
     fn failed(args: Args) -> Failed {
-        match run(args) {
+        match execute(args) {
             Ok(()) => panic!("compilation should fail"),
             Err(error) => error,
         }
@@ -368,7 +368,7 @@ mod tests {
     fn render_failed(error: Failed) -> String {
         let mut output = Vec::new();
         for diagnostic in error.1 {
-            argonc::diagnostics::render(&mut output, &diagnostic, false)
+            crate::diagnostics::render(&mut output, &diagnostic, false)
                 .expect("diagnostic should render");
         }
         String::from_utf8(output).expect("diagnostics should be UTF-8")
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn checks_a_source_file() {
         let source = temp_source("valid", "cell top() {}\n");
-        assert!(run(check_args(source)).is_ok());
+        assert!(execute(check_args(source)).is_ok());
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
             .parent()
             .expect("source should have a parent")
             .to_owned();
-        assert!(run(check_args(directory)).is_ok());
+        assert!(execute(check_args(directory)).is_ok());
     }
 
     #[test]
@@ -434,7 +434,7 @@ mod tests {
         let mut args = execution_args(source, "top()", basic_lyp());
         args.output = Some(artifact_path.clone());
 
-        assert!(run(args).is_ok());
+        assert!(execute(args).is_ok());
         assert!(matches!(
             artifact::read(artifact_path).expect("artifact should decode"),
             CompileOutput::Valid(_)
@@ -459,7 +459,7 @@ mod tests {
         let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_lyp());
         args.dependencies.push(("devices".to_owned(), dependency));
         args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
-        assert!(run(args).is_ok());
+        assert!(execute(args).is_ok());
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
             .push(("macros::sram".to_owned(), temp_gds("gds-import")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!("GDS import should compile: {}", render_failed(error));
         }
         let CompileOutput::Valid(output) =
@@ -517,7 +517,7 @@ mod tests {
             .push(("sram".to_owned(), temp_gds("gds-shape-field")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!(
                 "GDS shape constraint should compile: {}",
                 render_failed(error)
@@ -554,7 +554,7 @@ mod tests {
             .push(("sram".to_owned(), temp_nested_gds("nested-gds-shape-field")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!(
                 "nested GDS shape constraint should compile: {}",
                 render_failed(error)
@@ -587,7 +587,7 @@ mod tests {
             .push(("sram".to_owned(), temp_gds("gds-declaration-order-import")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!("GDS import should compile: {}", render_failed(error));
         }
         assert!(matches!(
@@ -646,6 +646,23 @@ mod tests {
         );
         assert!(
             diagnostic.contains(&malformed.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn missing_text_layer_is_reported_cleanly() {
+        let source = temp_source(
+            "missing-text-layer",
+            "cell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
+        );
+        let lyp = basic_lyp();
+        let diagnostic = render_failed(failed(execution_args(source, "top()", lyp.clone())));
+        assert!(
+            diagnostic.contains(&format!(
+                "text uses layer `missing.label`, which is not defined in LYP file `{}`",
+                lyp.display()
+            )),
             "{diagnostic}"
         );
     }

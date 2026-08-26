@@ -107,6 +107,30 @@ struct ProcessScopeState {
     scope_paths: IndexMap<ScopeAddress, ScopePath>,
 }
 
+fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
+    let layer = SharedString::from(layer.to_owned());
+    if let Some(layer_info) = state.layers.get_mut(&layer) {
+        layer_info.used = true;
+    } else {
+        let mut hasher = DefaultHasher::new();
+        layer.hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+        state.layers.insert(
+            layer.clone(),
+            LayerState {
+                name: layer,
+                color,
+                fill: ShapeFill::Stippling,
+                border_color: color,
+                visible: true,
+                used: true,
+                z: state.layers.len(),
+            },
+        );
+    }
+}
+
 impl EditorState {
     fn theme(&self) -> &'static Theme {
         if self.dark_mode {
@@ -138,28 +162,32 @@ impl EditorState {
                 SolvedValue::Rect(rect) => {
                     bbox = bbox_union(bbox, Some(rect.to_float()));
                     if let Some(layer) = &rect.layer {
-                        let layer = SharedString::from(layer);
-                        if let Some(layer_info) = state.layers.get_mut(&layer) {
-                            layer_info.used = true;
-                        } else {
-                            let mut s = DefaultHasher::new();
-                            layer.hash(&mut s);
-                            let hash = s.finish() as usize;
-                            let color =
-                                rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-                            state.layers.insert(
-                                layer.clone(),
-                                LayerState {
-                                    name: layer,
-                                    color,
-                                    fill: ShapeFill::Stippling,
-                                    border_color: color,
-                                    visible: true,
-                                    used: true,
-                                    z: state.layers.len(),
-                                },
-                            );
-                        }
+                        mark_layer_used(state, layer);
+                    }
+                }
+                SolvedValue::Polygon(polygon) => {
+                    bbox = bbox_union(bbox, polygon.bbox());
+                    let layer = SharedString::from(&polygon.layer);
+                    if let Some(layer_info) = state.layers.get_mut(&layer) {
+                        layer_info.used = true;
+                    } else {
+                        let mut s = DefaultHasher::new();
+                        layer.hash(&mut s);
+                        let hash = s.finish() as usize;
+                        let color =
+                            rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+                        state.layers.insert(
+                            layer.clone(),
+                            LayerState {
+                                name: layer,
+                                color,
+                                fill: ShapeFill::Stippling,
+                                border_color: color,
+                                visible: true,
+                                used: true,
+                                z: state.layers.len(),
+                            },
+                        );
                     }
                 }
                 SolvedValue::Instance(inst) => {
@@ -199,6 +227,7 @@ impl EditorState {
                 }
                 SolvedValue::Text(t) => {
                     bbox = bbox_text_union(bbox, t);
+                    mark_layer_used(state, &t.layer);
                 }
             }
         }
