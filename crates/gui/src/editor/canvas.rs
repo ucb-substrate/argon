@@ -129,6 +129,13 @@ struct LabeledBbox {
     origin: Option<Point<f32>>,
 }
 
+#[derive(Clone)]
+struct TextLabel {
+    text: SharedString,
+    position: Point<f32>,
+    layer: LayerState,
+}
+
 fn corner_sse_targets(x: &LinearExpr, y: &LinearExpr) -> Vec<SseDragTarget> {
     vec![
         SseDragTarget {
@@ -915,6 +922,22 @@ fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
     }
 }
 
+fn fit_scale(viewport: Size<Pixels>, width: f32, height: f32) -> f32 {
+    let width_scale = (width > 0.).then(|| f32::from(viewport.width) / width);
+    let height_scale = (height > 0.).then(|| f32::from(viewport.height) / height);
+    let scale = match (width_scale, height_scale) {
+        (Some(width), Some(height)) => 0.9 * width.min(height),
+        (Some(width), None) => 0.9 * width,
+        (None, Some(height)) => 0.9 * height,
+        (None, None) => 1.,
+    };
+    if scale.is_finite() && scale > 0. {
+        scale
+    } else {
+        1.
+    }
+}
+
 /// Flatten the solved geometry of one compiled cell into rectangles relative
 /// to that cell's origin. Placement paints these as a single pointer-following
 /// outline without disturbing the layout currently open in the editor.
@@ -1107,6 +1130,7 @@ impl Element for CanvasElement {
 
         // TODO: Clean up code.
         let mut rects = Vec::new();
+        let mut texts = Vec::new();
         let mut polygons = Vec::new();
         let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
@@ -1623,7 +1647,23 @@ impl Element for CanvasElement {
                             ));
                         }
                         SolvedValue::Dimension(_) => {}
-                        SolvedValue::Text(_) => {}
+                        SolvedValue::Text(text) => {
+                            let position = ifmatvec(mat, (text.x, text.y));
+                            let layer = layers.layers.get(text.layer.as_str());
+                            if let Some(layer) = layer
+                                && show
+                                && layer.visible
+                            {
+                                texts.push(TextLabel {
+                                    text: text.text.clone().into(),
+                                    position: Point::new(
+                                        (position.0 + ofs.0) as f32,
+                                        (position.1 + ofs.1) as f32,
+                                    ),
+                                    layer: layer.clone(),
+                                });
+                            }
+                        }
                     }
                 }
                 for child in &scope_info.children {
@@ -1927,6 +1967,31 @@ impl Element for CanvasElement {
                                 Edges::all(BorderStyle::Solid),
                             ));
                         }
+                    }
+                    for label in &texts {
+                        let font_size = px(16.);
+                        let runs = &[TextRun {
+                            len: label.text.len(),
+                            font: window.text_style().font(),
+                            color: label.layer.border_color.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }];
+                        window
+                            .text_system()
+                            .shape_line(label.text.clone(), font_size, runs, None)
+                            .paint(
+                                Point::new(
+                                    scale * px(label.position.x),
+                                    scale * px(-label.position.y),
+                                ) + offset
+                                    + bounds.origin,
+                                px(18.),
+                                window,
+                                cx,
+                            )
+                            .unwrap();
                     }
                     for bbox in &scope_rects {
                         window.paint_quad(get_paint_quad(
@@ -2756,12 +2821,21 @@ impl LayoutCanvas {
                 (target.normal.x * layout_delta.x + target.normal.y * layout_delta.y) as f64
             })
             .collect::<Vec<_>>();
-        let rowspace = cell
-            .rowspace_vecs
-            .iter()
-            .map(SparseVec::from)
-            .collect::<Vec<_>>();
-        crate::sse::drag_delta_multi(&edges, &rowspace, &cell.unsolved_vars, &deltas)
+        match &cell.sse_basis {
+            compile::SseBasis::Nullspace(vectors) => {
+                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+                crate::sse::drag_delta_multi_nullspace(
+                    &edges,
+                    &vectors,
+                    &cell.unsolved_vars,
+                    &deltas,
+                )
+            }
+            compile::SseBasis::Rowspace(vectors) => {
+                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+                crate::sse::drag_delta_multi(&edges, &vectors, &cell.unsolved_vars, &deltas)
+            }
+        }
     }
 
     fn sse_drag_delta(&self, cell: &compile::CompiledCell) -> Option<SparseVec> {
@@ -2898,9 +2972,11 @@ impl LayoutCanvas {
                     .as_ref()
             })
         {
-            let scalex = self.screen_bounds.size.width / (bbox.x1 - bbox.x0) as f32;
-            let scaley = self.screen_bounds.size.height / (bbox.y1 - bbox.y0) as f32;
-            self.scale = 0.9 * f32::from(scalex.min(scaley));
+            self.scale = fit_scale(
+                self.screen_bounds.size,
+                (bbox.x1 - bbox.x0) as f32,
+                (bbox.y1 - bbox.y0) as f32,
+            );
             self.offset = Point::new(
                 px((-(bbox.x0 + bbox.x1) as f32 * self.scale
                     + f32::from(self.screen_bounds.size.width))
@@ -4377,6 +4453,15 @@ mod tests {
         let below_old_floor = zoomed_scale(0.01, -20.);
         assert!(below_old_floor < 0.01);
         assert!(zoomed_scale(below_old_floor, -20.) < below_old_floor);
+    }
+
+    #[test]
+    fn fit_scale_handles_point_and_line_bounds() {
+        let viewport = Size::new(px(1000.), px(500.));
+        assert_eq!(fit_scale(viewport, 0., 0.), 1.);
+        assert_eq!(fit_scale(viewport, 100., 0.), 9.);
+        assert_eq!(fit_scale(viewport, 0., 100.), 4.5);
+        assert_eq!(fit_scale(viewport, 100., 100.), 4.5);
     }
 
     #[test]

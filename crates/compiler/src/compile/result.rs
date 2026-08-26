@@ -185,6 +185,9 @@ pub enum ExecErrorKind {
     /// A rectangle uses a layer absent from the layer-properties file.
     #[error("rectangle uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
     IllegalLayer { layer: String, lyp: String },
+    /// A text label uses a layer absent from the layer-properties file.
+    #[error("text uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
+    IllegalTextLayer { layer: String, lyp: String },
     /// A constraint conflicts with the rest of the system.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
