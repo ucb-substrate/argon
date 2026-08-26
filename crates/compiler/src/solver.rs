@@ -514,18 +514,7 @@ impl Solver {
             .iter()
             .map(|id| -self.constraints[id].constant)
             .collect();
-        let analysis = analyze_sparse_system(vars.len(), &rows, &rhs);
-        #[cfg(test)]
-        if std::env::var_os("ARGON_TRACE_SPARSE_FALLBACK").is_some() {
-            eprintln!(
-                "ARGON_SPARSE_COMPONENT outcome={} vars={} rows={} nnz={}",
-                if analysis.is_some() { "sparse" } else { "dense" },
-                vars.len(),
-                rows.len(),
-                rows.iter().map(Vec::len).sum::<usize>()
-            );
-        }
-        let Some(analysis) = analysis else {
+        let Some(analysis) = analyze_sparse_system(vars.len(), &rows, &rhs) else {
             return false;
         };
 
