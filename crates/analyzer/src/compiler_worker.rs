@@ -144,9 +144,7 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                 };
             };
             match open_cell_input(&cell, lyp) {
-                Ok((cell_path, args)) => {
-                    Some(compiler.compile_cell(&workspace, &cell_path, args, lyp))
-                }
+                Ok((cell_path, args)) => Some(compiler.compile_cell(&workspace, &cell_path, args)),
                 Err(message) => {
                     messages.push(message);
                     None

@@ -106,20 +106,22 @@ pub struct StaticAnalysis {
     pub errors: Vec<StaticError>,
 }
 
-pub fn dynamic_compile(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
-    input: CompileInput<'_>,
-) -> CompileOutput {
-    dynamic_compile_with_config(ast, input, &WorkspaceConfig::default())
-}
-
 /// Executes a cell using workspace-wide external inputs from `config`.
 pub fn dynamic_compile_with_config(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
-    let lyp_file = input.lyp_file;
+    let Some(lyp_file) = config.lyp.as_deref() else {
+        return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors: vec![ExecError {
+                span: None,
+                cell: 0,
+                kind: ExecErrorKind::MissingLyp,
+            }],
+            output: None,
+        });
+    };
     let res = ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
@@ -143,23 +145,6 @@ pub fn dynamic_compile_with_config(
     }
 }
 
-/// Compatibility wrapper for callers that have not adopted [`WorkspaceConfig`].
-pub fn dynamic_compile_with_gds(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
-    input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
-) -> CompileOutput {
-    let config = WorkspaceConfig {
-        gds_imports: gds_imports.to_vec(),
-        ..WorkspaceConfig::default()
-    };
-    dynamic_compile_with_config(ast, input, &config)
-}
-
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-    compile_with_config(ast, input, &WorkspaceConfig::default())
-}
-
 pub fn compile_with_config(
     ast: &WorkspaceParseAst,
     input: CompileInput<'_>,
@@ -175,19 +160,6 @@ pub fn compile_with_config(
     };
 
     dynamic_compile_with_config(&ast, input, config)
-}
-
-/// Compatibility wrapper for callers that have not adopted [`WorkspaceConfig`].
-pub fn compile_with_gds(
-    ast: &WorkspaceParseAst,
-    input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
-) -> CompileOutput {
-    let config = WorkspaceConfig {
-        gds_imports: gds_imports.to_vec(),
-        ..WorkspaceConfig::default()
-    };
-    compile_with_config(ast, input, &config)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -2446,7 +2418,6 @@ pub struct CompileInput<'a> {
     /// Full path to cell.
     pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
-    pub lyp_file: &'a FsPath,
 }
 
 pub type VarId = u64;
@@ -2863,7 +2834,7 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = match crate::layer::read_lyp(input.lyp_file) {
+            let layers = match crate::layer::read_lyp(self.lyp_file) {
                 Ok(layers) => layers,
                 Err(error) => {
                     return CompileOutput::StaticErrors(StaticErrorCompileOutput {

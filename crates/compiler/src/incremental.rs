@@ -203,7 +203,6 @@ impl IncrementalCompiler {
         config: &WorkspaceConfig,
         cell: &[String],
         args: Vec<CellArg>,
-        lyp_file: &Path,
     ) -> CompileOutput {
         self.ensure_analysis(config);
         let analysis = &self
@@ -221,7 +220,7 @@ impl IncrementalCompiler {
         };
 
         let mut hasher = DefaultHasher::new();
-        let environment = execution_environment_key(lyp_file, &config.gds_imports);
+        let environment = execution_environment_key(config.lyp.as_deref(), &config.gds_imports);
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
             self.execution_environment = Some(environment);
@@ -243,7 +242,6 @@ impl IncrementalCompiler {
             CompileInput {
                 cell: &cell_refs,
                 args,
-                lyp_file,
             },
             config,
         );
@@ -315,10 +313,10 @@ fn file_revision(path: &Path) -> Option<FileRevision> {
     Some((modified.as_secs(), modified.subsec_nanos(), metadata.len()))
 }
 
-fn execution_environment_key(lyp_file: &Path, gds_imports: &[(String, PathBuf)]) -> u64 {
+fn execution_environment_key(lyp_file: Option<&Path>, gds_imports: &[(String, PathBuf)]) -> u64 {
     let mut hasher = DefaultHasher::new();
     lyp_file.hash(&mut hasher);
-    file_revision(lyp_file).hash(&mut hasher);
+    lyp_file.and_then(file_revision).hash(&mut hasher);
     for (name, path) in gds_imports {
         name.hash(&mut hasher);
         path.hash(&mut hasher);
@@ -425,16 +423,16 @@ mod tests {
         let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
         let root = examples.join("immediate/lib.ar");
         let lyp = examples.join("lyp/basic.lyp");
-        let config = WorkspaceConfig::new(&root);
+        let config = WorkspaceConfig::new(&root).with_lyp(Some(lyp));
         let mut compiler = IncrementalCompiler::new();
         let cell = vec!["immediate".to_owned()];
 
-        let first = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
+        let first = compiler.compile_cell(&config, &cell, Vec::new());
         assert!(matches!(
             first,
             CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
         ));
-        let second = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
+        let second = compiler.compile_cell(&config, &cell, Vec::new());
         assert!(matches!(
             second,
             CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
@@ -450,11 +448,11 @@ mod tests {
         let lyp = examples.join("lyp/basic.lyp");
         let source = "cell immediate() {\n  let x0 = 31;\n  let y0 = 2;\n}\n";
         let cell = vec!["immediate".to_owned()];
-        let config = WorkspaceConfig::new(&root);
+        let config = WorkspaceConfig::new(&root).with_lyp(Some(lyp));
 
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), source);
-        let incremental = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
+        let incremental = compiler.compile_cell(&config, &cell, Vec::new());
 
         let sources = IndexMap::from([(root.clone(), ArcStr::from(source))]);
         let analysis = compile::analyze_workspace(parse::parse_workspace_with_config_and_sources(
@@ -462,13 +460,13 @@ mod tests {
         ));
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         let typed = analysis.typed_ast.unwrap();
-        let fresh = compile::dynamic_compile(
+        let fresh = compile::dynamic_compile_with_config(
             &typed,
             CompileInput {
                 cell: &["immediate"],
                 args: Vec::new(),
-                lyp_file: &lyp,
             },
+            &config,
         );
 
         assert_eq!(
@@ -485,20 +483,20 @@ mod tests {
         let lyp = examples.join("lyp/basic.lyp");
         let source = std::fs::read_to_string(&root).unwrap();
         let cell = vec!["immediate".to_owned()];
-        let config = WorkspaceConfig::new(&root);
+        let config = WorkspaceConfig::new(&root).with_lyp(Some(lyp));
         let retained_before = crate::bench_alloc::live();
         let mut compiler = IncrementalCompiler::new();
 
         let start = std::time::Instant::now();
-        let _ = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
+        let _ = compiler.compile_cell(&config, &cell, Vec::new());
         let cold = start.elapsed();
         let start = std::time::Instant::now();
-        let _ = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
+        let _ = compiler.compile_cell(&config, &cell, Vec::new());
         let warm = start.elapsed();
 
         compiler.set_source_text(root.clone(), format!("{source}\n// isolated edit\n"));
         let start = std::time::Instant::now();
-        let _ = compiler.compile_cell(&config, &cell, Vec::new(), &lyp);
+        let _ = compiler.compile_cell(&config, &cell, Vec::new());
         let edited = start.elapsed();
         let retained = crate::bench_alloc::live().saturating_sub(retained_before);
         eprintln!(

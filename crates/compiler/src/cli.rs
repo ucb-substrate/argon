@@ -109,6 +109,7 @@ fn execute(args: Args) -> Result<(), Failed> {
 
     let workspace = WorkspaceConfig::new(&root)
         .with_dependencies(args.dependencies.clone())
+        .with_lyp(args.lyp.clone())
         .with_gds_imports(args.gds_imports.clone());
     let analysis = compile::analyze_workspace(parse_workspace_with_config(&workspace));
     let Some(typed_ast) = analysis.typed_ast else {
@@ -170,7 +171,6 @@ fn execute(args: Args) -> Result<(), Failed> {
         CompileInput {
             cell: &cell_path,
             args: cell_args,
-            lyp_file: lyp,
         },
         &workspace,
     );

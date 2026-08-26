@@ -154,6 +154,84 @@ fn parse_config(text: &str) -> std::result::Result<ArgonConfig, toml::de::Error>
     toml::from_str(text)
 }
 
+fn config_with_key(
+    config: &ArgonConfig,
+    key: &str,
+    value: Option<&str>,
+) -> std::result::Result<ArgonConfig, String> {
+    let segments = key.split('.').collect::<Vec<_>>();
+    if segments.is_empty()
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+    {
+        return Err(format!("invalid configuration key '{key}'"));
+    }
+
+    let serialized = toml::to_string(config)
+        .map_err(|error| format!("could not serialize current configuration: {error}"))?;
+    let mut document = serialized
+        .parse::<toml::Table>()
+        .map_err(|error| format!("could not inspect current configuration: {error}"))?;
+    let mut table = &mut document;
+    for segment in &segments[..segments.len() - 1] {
+        let entry = table
+            .entry((*segment).to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        table = entry
+            .as_table_mut()
+            .ok_or_else(|| format!("configuration key '{segment}' is not a table"))?;
+    }
+
+    let leaf = segments[segments.len() - 1];
+    if let Some(value) = value {
+        let assignment = format!("value = {value}");
+        let parsed = match assignment.parse::<toml::Table>() {
+            Ok(mut table) => table
+                .remove("value")
+                .expect("the parsed assignment contains its value"),
+            Err(_) if !value.is_empty() && !value.chars().any(char::is_whitespace) => {
+                toml::Value::String(value.to_owned())
+            }
+            Err(error) => {
+                return Err(format!("invalid TOML value for '{key}': {error}"));
+            }
+        };
+        table.insert(leaf.to_owned(), parsed);
+    } else if table.remove(leaf).is_none() {
+        return Err(format!("configuration key '{key}' is not set"));
+    }
+
+    toml::Value::Table(document)
+        .try_into()
+        .map_err(|error| format!("invalid value for configuration key '{key}': {error}"))
+}
+
+fn write_config(path: &Path, config: &ArgonConfig) -> std::result::Result<(), String> {
+    let text = toml::to_string_pretty(config)
+        .map_err(|error| format!("could not serialize configuration: {error}"))?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "could not create configuration directory '{}': {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(path, text).map_err(|error| {
+        format!(
+            "could not write configuration '{}': {error}",
+            path.display()
+        )
+    })
+}
+
 pub fn init_logging() {
     let config = read_config().unwrap_or_else(|error| {
         eprintln!("argon: {error}; using log level '{DEFAULT_LOG_LEVEL}'");
@@ -258,6 +336,7 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
                 .iter()
                 .map(|(name, path)| (name.clone(), path.clone())),
         )
+        .with_lyp(library.lyp.clone())
         .with_gds_imports(
             library
                 .gds
@@ -286,7 +365,6 @@ async fn compile_open_cell(
         CompileInput {
             cell: &cell_path,
             args,
-            lyp_file: lyp,
         },
         config,
     ))
@@ -500,7 +578,36 @@ struct WorkspaceModifiedParams {
     modified: bool,
 }
 
+#[derive(Deserialize)]
+struct SetConfigParams {
+    key: String,
+    value: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SaveConfigParams {
+    path: Option<PathBuf>,
+}
+
 impl Backend {
+    async fn activate_config(&self, config: ArgonConfig) -> std::result::Result<(), String> {
+        reload_log_filter(&config.log.level)
+            .map_err(|error| format!("invalid log level '{}': {error}", config.log.level))?;
+        self.state.apply_config(config.clone());
+        let Some(connection) = self.state.gui_connection().await else {
+            return Ok(());
+        };
+        if let Err(error) = connection
+            .client
+            .configure(context::current(), config)
+            .await
+        {
+            self.state.clear_gui_connection(connection.id).await;
+            return Err(format!("could not configure GUI: {error}"));
+        }
+        Ok(())
+    }
+
     fn schedule_compile(&self, revision: u64, generation: u64) {
         let backend = self.clone();
         let delay = self.state.compile_debounce_ms.load(Ordering::Acquire);
@@ -1272,32 +1379,11 @@ impl Backend {
                 return Ok(());
             }
         };
-        if let Err(error) = reload_log_filter(&config.log.level) {
+        if let Err(error) = self.activate_config(config).await {
             self.state
                 .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Invalid log level '{}': {error}", config.log.level),
-                )
+                .show_message(MessageType::ERROR, error)
                 .await;
-            return Ok(());
-        }
-        self.state.apply_config(config.clone());
-        let connection = self.state.gui_connection().await;
-        if let Some(connection) = connection
-            && let Err(error) = connection
-                .client
-                .configure(context::current(), config)
-                .await
-        {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not reload GUI configuration: {error}"),
-                )
-                .await;
-            self.state.clear_gui_connection(connection.id).await;
             return Ok(());
         }
         let path = argon_config_path()
@@ -1308,6 +1394,70 @@ impl Backend {
             .show_message(
                 MessageType::INFO,
                 format!("Reloaded Argon configuration from {path}"),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn set_config(&self, params: SetConfigParams) -> Result<()> {
+        let config =
+            match config_with_key(&self.state.config(), &params.key, params.value.as_deref()) {
+                Ok(config) => config,
+                Err(error) => {
+                    self.state
+                        .editor_client
+                        .show_message(MessageType::ERROR, error)
+                        .await;
+                    return Ok(());
+                }
+            };
+        if let Err(error) = self.activate_config(config).await {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, error)
+                .await;
+            return Ok(());
+        }
+        let value = params
+            .value
+            .as_deref()
+            .map_or_else(|| "default".to_owned(), str::to_owned);
+        self.state
+            .editor_client
+            .show_message(
+                MessageType::INFO,
+                format!("Set Argon configuration {} = {value}", params.key),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn save_config(&self, params: SaveConfigParams) -> Result<()> {
+        let path = match params.path.or_else(argon_config_path) {
+            Some(path) => path,
+            None => {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        "Could not determine an Argon configuration path",
+                    )
+                    .await;
+                return Ok(());
+            }
+        };
+        if let Err(error) = write_config(&path, &self.state.config()) {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, error)
+                .await;
+            return Ok(());
+        }
+        self.state
+            .editor_client
+            .show_message(
+                MessageType::INFO,
+                format!("Saved Argon configuration to {}", path.display()),
             )
             .await;
         Ok(())
@@ -1413,6 +1563,8 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/openCell", Backend::open_cell)
     .custom_method("custom/inst", Backend::instantiate)
     .custom_method("custom/reloadConfig", Backend::reload_config)
+    .custom_method("custom/setConfig", Backend::set_config)
+    .custom_method("custom/saveConfig", Backend::save_config)
     .custom_method("custom/workspaceModified", Backend::workspace_modified)
     .finish();
     let Some(state) = ext_state else {
@@ -1459,7 +1611,10 @@ mod tests {
         parse,
     };
 
-    use super::{DEFAULT_LOG_LEVEL, parse_config, preview_instance_cell};
+    use super::{
+        ArgonConfig, DEFAULT_LOG_LEVEL, config_with_key, parse_config, preview_instance_cell,
+        write_config,
+    };
 
     #[test]
     fn logging_config_defaults_to_errors() {
@@ -1489,6 +1644,43 @@ mod tests {
     }
 
     #[test]
+    fn runtime_configuration_updates_dotted_keys_without_changing_other_values() {
+        let config = ArgonConfig::default();
+        let config = config_with_key(&config, "gui.hierarchy_depth", Some("3")).unwrap();
+        let config = config_with_key(&config, "gui.dark_mode", Some("false")).unwrap();
+        let config = config_with_key(&config, "log.level", Some("analyzer=debug")).unwrap();
+
+        assert_eq!(config.gui.hierarchy_depth, Some(3));
+        assert!(!config.gui.dark_mode);
+        assert_eq!(config.log.level, "analyzer=debug");
+        assert_eq!(config.analyzer.compile_debounce_ms, 150);
+    }
+
+    #[test]
+    fn runtime_configuration_validates_keys_and_types_and_can_reset_a_key() {
+        let config =
+            config_with_key(&ArgonConfig::default(), "gui.hierarchy_depth", Some("2")).unwrap();
+        let config = config_with_key(&config, "gui.hierarchy_depth", None).unwrap();
+        assert_eq!(config.gui.hierarchy_depth, None);
+        assert!(config_with_key(&config, "gui.unknown", Some("true")).is_err());
+        assert!(config_with_key(&config, "gui.dark_mode", Some("2")).is_err());
+        assert!(config_with_key(&config, "gui..dark_mode", Some("true")).is_err());
+    }
+
+    #[test]
+    fn live_configuration_can_be_saved_and_loaded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/config.toml");
+        let config =
+            config_with_key(&ArgonConfig::default(), "gui.hierarchy_depth", Some("4")).unwrap();
+
+        write_config(&path, &config).unwrap();
+        let loaded = parse_config(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(loaded.gui.hierarchy_depth, Some(4));
+        assert_eq!(loaded.analyzer.compile_debounce_ms, 150);
+    }
+
+    #[test]
     fn open_cell_accepts_boolean_literals() {
         let call = parse::parse_cell("fet1v8(true, 150., 5)").expect("cell should parse");
         let arg = CellArg::from_literal(&call.args.posargs[0]).expect("boolean should convert");
@@ -1512,13 +1704,13 @@ mod tests {
         assert!(errors.errors.is_empty(), "{:?}", errors.errors);
         let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/lyp/basic.lyp");
-        let output = compile::dynamic_compile(
+        let output = compile::dynamic_compile_with_config(
             &typed,
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(42.)],
-                lyp_file: &lyp,
             },
+            &argonc::WorkspaceConfig::default().with_lyp(Some(lyp)),
         );
         let output = match output {
             CompileOutput::Valid(output) => output,

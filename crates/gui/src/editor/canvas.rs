@@ -4509,6 +4509,19 @@ pub(crate) fn find_obj_path(
 mod tests {
     use super::*;
 
+    fn compile(
+        ast: &argonc::parse::WorkspaceParseAst,
+        input: argonc::compile::CompileInput<'_>,
+    ) -> argonc::compile::CompileOutput {
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        argonc::compile::compile_with_config(
+            ast,
+            input,
+            &argonc::WorkspaceConfig::default().with_lyp(Some(lyp)),
+        )
+    }
+
     fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
         (
             Rect {
@@ -4648,14 +4661,11 @@ mod tests {
         let source =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/path/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["initial_path"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -4689,14 +4699,11 @@ mod tests {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/polygon/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["one_axis_point"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -4737,14 +4744,11 @@ mod tests {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/polygon/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["initial_points"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -5031,14 +5035,11 @@ mod tests {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -5153,14 +5154,11 @@ cell top() {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -5200,14 +5198,11 @@ cell top() {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         )
         .unwrap_valid();

@@ -160,6 +160,9 @@ pub struct ExecError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum ExecErrorKind {
+    /// Dynamic compilation requires a workspace layer-properties file.
+    #[error("workspace does not configure a LYP file")]
+    MissingLyp,
     /// A transformation contains a non-Manhattan rotation.
     #[error("non-Manhattan rotation")]
     InvalidRotation,

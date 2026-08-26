@@ -560,7 +560,8 @@ mod tests {
     };
 
     use argonc::{
-        compile::{CompileInput, compile},
+        WorkspaceConfig,
+        compile::{CompileInput, compile_with_config},
         parse::parse_workspace_with_std,
     };
 
@@ -687,13 +688,13 @@ cell top() {
             .expect("starter manifest should set lyp");
         let parsed = parse_workspace_with_std(&library.root);
         assert!(parsed.static_errors().is_empty());
-        let output = compile(
+        let output = compile_with_config(
             &parsed.ast(),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: lyp,
             },
+            &WorkspaceConfig::new(&library.root).with_lyp(Some(lyp.clone())),
         )
         .unwrap_valid();
         let label = output.cells[&output.top]

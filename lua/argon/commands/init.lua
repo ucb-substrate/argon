@@ -6,6 +6,12 @@ local M = {}
 local argon_cmd_name = 'Argon'
 local gui = require('argon.commands.gui')
 local diagnostics = require('argon.diagnostics')
+local config_keys = {
+  'analyzer.compile_debounce_ms',
+  'gui.dark_mode',
+  'gui.hierarchy_depth',
+  'log.level',
+}
 
 ---@class argon.command_tbl
 ---@field impl fun(args: string[], opts: vim.api.keyset.user_command) The command implementation
@@ -32,6 +38,37 @@ local argon_command_tbl = {
   reload = {
     impl = function()
       gui.reload_config()
+    end,
+  },
+  set = {
+    impl = function(args)
+      if #args == 0 then
+        vim.notify('Argon set: expected a dotted configuration key and optional TOML value', vim.log.levels.ERROR)
+        return
+      end
+      local value = #args > 1 and table.concat(vim.list_slice(args, 2), ' ') or nil
+      gui.set_config(args[1], value)
+    end,
+    complete = function(args)
+      local key_lead = args:match('^%s*(%S*)$')
+      if not key_lead then
+        return {}
+      end
+      return vim.tbl_filter(function(key)
+        return vim.startswith(key, key_lead)
+      end, config_keys)
+    end,
+  },
+  saveConfig = {
+    impl = function(args)
+      if #args > 1 then
+        vim.notify('Argon saveConfig: expected at most one path', vim.log.levels.ERROR)
+        return
+      end
+      gui.save_config(args[1])
+    end,
+    complete = function(args)
+      return vim.fn.getcompletion(args, 'file')
     end,
   },
   diagnostics = {

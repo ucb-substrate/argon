@@ -110,7 +110,10 @@ mod tests {
     use indexmap::IndexMap;
     use pegasus::drc::{DrcParams, run_drc};
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::{
+        WorkspaceConfig,
+        compile::{CellArg, CompileInput, compile_with_config},
+    };
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -119,6 +122,25 @@ mod tests {
     const ARGON_SKY130_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pdks/sky130");
     const ARGON_SKY130_LIB: &str = concatcp!(ARGON_SKY130_DIR, "/lib.ar");
     const SKY130_LYP: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.lyp");
+
+    fn compile(ast: &crate::parse::WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+        compile_with_config(
+            ast,
+            input,
+            &WorkspaceConfig::default().with_lyp(Some(PathBuf::from(BASIC_LYP))),
+        )
+    }
+
+    fn compile_sky130(
+        ast: &crate::parse::WorkspaceParseAst,
+        input: CompileInput<'_>,
+    ) -> CompileOutput {
+        compile_with_config(
+            ast,
+            input,
+            &WorkspaceConfig::default().with_lyp(Some(PathBuf::from(SKY130_LYP))),
+        )
+    }
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
@@ -472,7 +494,6 @@ mod tests {
                     CompileInput {
                         cell: &["shapes"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -516,7 +537,6 @@ mod tests {
                     CompileInput {
                         cell: &["shapes_loop"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -552,7 +572,6 @@ mod tests {
                     CompileInput {
                         cell: &["constraints"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -586,7 +605,6 @@ mod tests {
                     CompileInput {
                         cell: &["instances"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -649,7 +667,6 @@ mod tests {
                     CompileInput {
                         cell: &[&cellname],
                         args: vec![],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -688,7 +705,6 @@ mod tests {
                     CompileInput {
                         cell: &[&cellname],
                         args: vec![],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -716,7 +732,6 @@ mod tests {
                 CompileInput {
                     cell: &[cell],
                     args: vec![CellArg::Int(64)],
-                    lyp_file: &PathBuf::from(BASIC_LYP),
                 },
             );
             let d = out.unwrap_valid();
@@ -740,7 +755,6 @@ mod tests {
             CompileInput {
                 cell: &["constraints"],
                 args: vec![CellArg::Int(32)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         assert!(
@@ -759,7 +773,6 @@ mod tests {
             CompileInput {
                 cell: &["instances"],
                 args: vec![CellArg::Int(64)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let d = out.unwrap_valid();
@@ -782,7 +795,6 @@ mod tests {
             CompileInput {
                 cell: &["h8"],
                 args: vec![],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let d = out.unwrap_valid();
@@ -800,7 +812,6 @@ mod tests {
             CompileInput {
                 cell: &["scopes"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let data = cell.unwrap_valid();
@@ -824,7 +835,6 @@ mod tests {
             CompileInput {
                 cell: &["immediate"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -840,7 +850,6 @@ mod tests {
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -856,7 +865,6 @@ mod tests {
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -873,7 +881,6 @@ mod tests {
             CompileInput {
                 cell: &["via"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -889,7 +896,6 @@ mod tests {
             CompileInput {
                 cell: &["vias"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -919,7 +925,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -935,7 +940,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -951,7 +955,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let data = match cells {
@@ -984,7 +987,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let errors = cells.unwrap_static_errors();
@@ -1115,7 +1117,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_exec_errors()
@@ -1135,7 +1136,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_exec_errors()
@@ -1176,7 +1176,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_exec_errors()
@@ -1211,7 +1210,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1245,7 +1243,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1279,7 +1276,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(50.), CellArg::Float(20.)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1296,7 +1292,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Int(50), CellArg::Int(20)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1313,7 +1308,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:?}");
@@ -1343,7 +1337,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:?}");
@@ -1362,7 +1355,7 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["inv"],
@@ -1371,7 +1364,6 @@ mod tests {
                     CellArg::Float(2_000.),
                     CellArg::Int(4),
                 ],
-                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("cells: {cells:?}");
@@ -1399,7 +1391,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:?}");
@@ -1424,7 +1415,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1453,7 +1443,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1492,7 +1481,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1514,7 +1502,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1540,7 +1527,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1565,7 +1551,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1590,7 +1575,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1615,7 +1599,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1640,7 +1623,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1665,7 +1647,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1686,12 +1667,11 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_TEXT);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1725,7 +1705,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1752,7 +1731,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1779,7 +1757,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1806,7 +1783,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1827,7 +1803,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1850,7 +1825,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1874,7 +1848,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1898,7 +1871,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1938,7 +1910,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let gds_path =
@@ -2006,7 +1977,6 @@ mod tests {
             CompileInput {
                 cell: &["initial_points"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let initial = match initial {
@@ -2121,7 +2091,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let CompileOutput::Valid(cells) = &output else {
@@ -2182,7 +2151,6 @@ mod tests {
                 CompileInput {
                     cell: &[cell_name],
                     args: Vec::new(),
-                    lyp_file: &PathBuf::from(BASIC_LYP),
                 },
             );
             let output = match output {
@@ -2243,7 +2211,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_valid();
@@ -2272,7 +2239,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2299,7 +2265,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2344,7 +2309,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let elapsed = start.elapsed();
@@ -2368,7 +2332,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2392,7 +2355,6 @@ mod tests {
             CompileInput {
                 cell: &["precedence"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2419,12 +2381,11 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["diff_vco_top"],
                 args: vec![],
-                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("cells: {cells:?}");
