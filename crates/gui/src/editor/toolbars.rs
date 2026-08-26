@@ -176,7 +176,6 @@ impl Render for ToolBar {
                             });
                         }),
                     ),
-                    ToolbarItem::Spacer,
                     ToolbarItem::Divider("divider_draw_constraints"),
                     ToolbarItem::Button(
                         "btn_dim",
@@ -194,6 +193,7 @@ impl Render for ToolBar {
                             });
                         }),
                     ),
+                    ToolbarItem::Spacer,
                 ];
                 let wh = 20.;
                 tools

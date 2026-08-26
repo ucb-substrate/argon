@@ -16,11 +16,11 @@ use argonc::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
-    Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
-    pattern_slash, px, rgb, size, solid_background,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FillOptions,
+    FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, PathStyle,
+    Pixels, Point, Render, Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription,
+    TextRun, Window, div, pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -41,6 +41,8 @@ pub enum ShapeFill {
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
 const DEFAULT_DRAW_PATH_WIDTH: f32 = 20.;
+const DOT_DIAMETER: Pixels = px(3.);
+const DOT_SPACING: Pixels = px(7.);
 /// Side length of the square drag handles drawn on unconstrained edges.
 const HANDLE_SIZE: Pixels = px(12.);
 /// Side length of the (larger, invisible) clickable area around each handle, so
@@ -249,10 +251,16 @@ fn paint_polygon_border(
     color: Rgba,
 ) {
     for index in 0..points.len() {
-        let mut edge = PathBuilder::stroke(width);
         if edge_styles.get(index) == Some(&BorderStyle::Dashed) {
-            edge = edge.dash_array(&[px(6.), px(5.)]);
+            paint_dotted_segment(
+                window,
+                points[index],
+                points[(index + 1) % points.len()],
+                color,
+            );
+            continue;
         }
+        let mut edge = PathBuilder::stroke(width);
         edge.move_to(points[index]);
         edge.line_to(points[(index + 1) % points.len()]);
         if let Ok(path) = edge.build() {
@@ -261,8 +269,49 @@ fn paint_polygon_border(
     }
 }
 
-fn paint_polygon_fill(window: &mut Window, points: &[Point<Pixels>], layer: &LayerState) {
-    let mut fill = PathBuilder::fill();
+fn dotted_segment_centers(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels>> {
+    let dx = f32::from(to.x - from.x);
+    let dy = f32::from(to.y - from.y);
+    let length = dx.hypot(dy);
+    let count = (length / f32::from(DOT_SPACING)).ceil().max(1.) as usize;
+    (0..count)
+        .map(|index| {
+            let t = (index as f32 + 0.5) / count as f32;
+            Point::new(from.x + px(dx * t), from.y + px(dy * t))
+        })
+        .collect()
+}
+
+fn paint_dotted_segment(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, color: Rgba) {
+    let radius = DOT_DIAMETER.half();
+    for center in dotted_segment_centers(from, to) {
+        let mut dot = get_paint_quad(
+            Bounds::new(
+                Point::new(center.x - radius, center.y - radius),
+                Size::new(DOT_DIAMETER, DOT_DIAMETER),
+            ),
+            ShapeFill::Solid,
+            color,
+            color,
+            Edges::all(px(0.)),
+            Edges::all(BorderStyle::Solid),
+        );
+        dot.corner_radii = Corners::all(radius);
+        window.paint_quad(dot);
+    }
+}
+
+fn paint_polygon_fill(
+    window: &mut Window,
+    points: &[Point<Pixels>],
+    layer: &LayerState,
+    self_overlapping_path: bool,
+) {
+    let mut fill = if self_overlapping_path {
+        PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()))
+    } else {
+        PathBuilder::fill()
+    };
     fill.add_polygon(points, true);
     if let Ok(path) = fill.build() {
         let background = match layer.fill {
@@ -281,10 +330,11 @@ fn paint_polyline(
     color: Rgba,
 ) {
     for (index, points) in points.windows(2).enumerate() {
-        let mut segment = PathBuilder::stroke(width);
         if segment_styles.get(index) == Some(&BorderStyle::Dashed) {
-            segment = segment.dash_array(&[px(6.), px(5.)]);
+            paint_dotted_segment(window, points[0], points[1], color);
+            continue;
         }
+        let mut segment = PathBuilder::stroke(width);
         segment.move_to(points[0]);
         segment.line_to(points[1]);
         if let Ok(path) = segment.build() {
@@ -1760,7 +1810,7 @@ impl Element for CanvasElement {
                         y1: p0.y.max(layout_mouse_position.y),
                         id: None,
                         border_widths: Edges::all(SELECT_WIDTH),
-                        border_styles: Edges::all(BorderStyle::Solid),
+                        border_styles: Edges::all(BorderStyle::Dashed),
                         cvars: None,
                     },
                     layer,
@@ -1953,7 +2003,12 @@ impl Element for CanvasElement {
                             .iter()
                             .map(|point| self.inner.read(cx).layout_to_px(*point))
                             .collect::<Vec<_>>();
-                        paint_polygon_fill(window, &points, layer);
+                        paint_polygon_fill(
+                            window,
+                            &points,
+                            layer,
+                            polygon.centerline.is_some(),
+                        );
                         paint_polygon_border(
                             window,
                             &points,
@@ -1982,7 +2037,7 @@ impl Element for CanvasElement {
                             .chain(std::iter::once(preview_position))
                             .map(|point| self.inner.read(cx).layout_to_px(point))
                             .collect::<Vec<_>>();
-                        paint_polygon_fill(window, &points, layer);
+                        paint_polygon_fill(window, &points, layer, false);
                         paint_polygon_border(
                             window,
                             &points,
@@ -2042,7 +2097,7 @@ impl Element for CanvasElement {
                                         .layout_to_px(Point::new(x as f32, y as f32))
                                 })
                                 .collect::<Vec<_>>();
-                            paint_polygon_fill(window, &outline, layer);
+                            paint_polygon_fill(window, &outline, layer, true);
                             paint_polygon_border(
                                 window,
                                 &outline,
@@ -3263,10 +3318,10 @@ impl LayoutCanvas {
                                                             .selected_layer
                                                             .clone()
                                                             .map(|s| s.to_string()),
-                                                        x0: p0p.x as f64,
-                                                        y0: p0p.y as f64,
-                                                        x1: p1p.x as f64,
-                                                        y1: p1p.y as f64,
+                                                        x0: draw_source_coordinate(p0p.x),
+                                                        y0: draw_source_coordinate(p0p.y),
+                                                        x1: draw_source_coordinate(p1p.x),
+                                                        y1: draw_source_coordinate(p1p.y),
                                                         construction: false,
                                                     },
                                                 ) {
@@ -4474,6 +4529,21 @@ mod tests {
     #[test]
     fn drawn_coordinates_discard_f32_representation_noise() {
         assert_eq!(draw_source_coordinate(110.3_f32), 110.3);
+    }
+
+    #[test]
+    fn dotted_segments_keep_screen_space_spacing_when_rotated() {
+        let horizontal = dotted_segment_centers(Point::default(), Point::new(px(70.), px(0.)));
+        let diagonal =
+            dotted_segment_centers(Point::default(), Point::new(px(49.497475), px(49.497475)));
+        assert_eq!(horizontal.len(), diagonal.len());
+        for centers in [&horizontal, &diagonal] {
+            for pair in centers.windows(2) {
+                let dx = f32::from(pair[1].x - pair[0].x);
+                let dy = f32::from(pair[1].y - pair[0].y);
+                assert!(dx.hypot(dy) > f32::from(DOT_DIAMETER));
+            }
+        }
     }
 
     #[test]
