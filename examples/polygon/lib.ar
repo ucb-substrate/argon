@@ -1,0 +1,30 @@
+cell top() {
+    let p = polygon("met1", 4,
+        x0=0., y0=0.,
+        x1=100., y1=0.,
+        y2=75.,
+        x3i=0., y3i=50.,
+    );
+
+    // Each coordinate is an independent linear expression. Coordinates can
+    // be accessed concisely on the polygon or as named fields on each point.
+    eq(p.x2, p.points[1].x + 50.);
+}
+
+// GUI-created polygons use editable initial conditions for every coordinate.
+cell initial_points() {
+    let p = polygon("met1", 3,
+        x0i=0., y0i=0.,
+        x1i=100., y1i=0.,
+        x2i=50., y2i=75.,
+    );
+}
+
+// A point with one constrained axis remains draggable along its free axis.
+cell one_axis_point() {
+    let p = polygon("met1", 3,
+        x0=0., y0=0.,
+        x1=100., y1=0.,
+        x2i=50., y2=75.,
+    );
+}

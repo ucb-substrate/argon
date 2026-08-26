@@ -18,7 +18,10 @@ to the headless GUI harness.
 ## Debugging
 
 [`tracing`](https://tokio.rs/tokio/topics/tracing) is used for logging in the analyzer, compiler, and Argone.
-The analyzer and Argone write tracing events to `~/.local/state/argon/analyzer.log` and `~/.local/state/argon/argone.log`, respectively.
+The analyzer and Argone write tracing events to the shared
+`~/.local/state/argon/argon.log` file. The log filter is configured in
+`~/.config/argon/config.toml`; both paths respect their corresponding XDG
+base-directory environment variables.
 
 For example, you may add an `tracing::info!("debug");` statement to a line in the GUI 
 and check the GUI log to determine whether the subsequent code is reached.

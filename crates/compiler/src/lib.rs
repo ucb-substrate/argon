@@ -100,7 +100,7 @@ mod tests {
         gds::GdsMap,
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
-    use ::gds::GdsUnits;
+    use ::gds::{GdsElement, GdsLibrary, GdsUnits};
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
@@ -159,6 +159,7 @@ mod tests {
     const ARGON_RANGE_PERF: &str = concatcp!(EXAMPLES_DIR, "/range_perf/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
+    const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -297,6 +298,154 @@ mod tests {
             ));
         }
         s
+    }
+
+    /// Builds a cyclic tridiagonal system in which every constraint has three
+    /// unknowns. Neither unary back-substitution nor the size-2 elimination
+    /// pass can reduce it, so it exercises the sparse component solver.
+    fn sparse_solver_fixture(
+        n: usize,
+    ) -> (crate::solver::Solver, Vec<crate::solver::Var>, Vec<f64>) {
+        use crate::solver::{LinearExpr, Solver};
+
+        let mut solver = Solver::new();
+        let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
+        let expected: Vec<_> = (0..n).map(|i| ((i % 11) as f64 - 5.) * 0.1).collect();
+        for i in 0..n {
+            let previous = (i + n - 1) % n;
+            let next = (i + 1) % n;
+            // The diagonal magnitude (2) is smaller than the sum of the two
+            // off-diagonal magnitudes (2.1), making this a representative
+            // general sparse-QR fixture rather than a specially dominant one.
+            let rhs = -expected[previous] + 2. * expected[i] - 1.1 * expected[next];
+            solver.constrain_eq0(LinearExpr {
+                coeffs: vec![(-1., vars[previous]), (2., vars[i]), (-1.1, vars[next])],
+                constant: -rhs,
+            });
+        }
+        assert!(vars.iter().all(|&var| !solver.is_solved(var)));
+        (solver, vars, expected)
+    }
+
+    /// General sparse-QR kernel: a non-diagonally-dominant connected component
+    /// with three unknowns per row, timed after fixture construction so only
+    /// `Solver::solve()` is measured.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_sparse_solver() {
+        let _g = bench_guard();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes(
+            "ARGON_BENCH_SPARSE_SOLVER",
+            &[256, 512, 1024, 2048, 4096, 8192, 16384],
+        ) {
+            let n = usize::try_from(n).expect("sparse solver benchmark sizes must be positive");
+            let (template, vars, expected) = sparse_solver_fixture(n);
+            let mut best = std::time::Duration::MAX;
+            let mut peak = 0usize;
+
+            for _ in 0..5 {
+                let mut solver = template.clone();
+                crate::bench_alloc::reset_peak();
+                let base = crate::bench_alloc::live();
+                let start = std::time::Instant::now();
+                solver.solve();
+                best = best.min(start.elapsed());
+                peak = peak.max(crate::bench_alloc::peak().saturating_sub(base));
+
+                assert!(solver.fully_solved());
+                for (&var, &value) in vars.iter().zip(&expected) {
+                    assert!((solver.value_of(var).unwrap() - value).abs() < 1e-8);
+                }
+            }
+
+            eprintln!(
+                "sparse_solver n={n:>6} time={best:>11.3?} peak={:>8.2} MiB",
+                peak as f64 / (1usize << 20) as f64
+            );
+            rows.push((n as f64, best.as_secs_f64(), peak, n));
+        }
+        write_bench_csv("sparse_solver", &rows);
+    }
+
+    /// Builds a connected banded system with `n - 2` independent three-variable
+    /// constraints and exactly two degrees of freedom. This is the SSE workload:
+    /// compute a particular solution and an orthonormal null-space basis.
+    fn sparse_sse_fixture(n: usize) -> (crate::solver::Solver, Vec<crate::solver::Var>) {
+        use crate::solver::{LinearExpr, Solver};
+
+        assert!(n >= 4);
+        let mut solver = Solver::new();
+        let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
+        for i in 0..n - 2 {
+            solver.constrain_eq0(LinearExpr {
+                coeffs: vec![(1., vars[i]), (-0.5, vars[i + 1]), (-0.5, vars[i + 2])],
+                constant: 0.,
+            });
+        }
+        (solver, vars)
+    }
+
+    /// Sparse SSE kernel: solve an underdetermined component and extract its
+    /// two-dimensional null space. Correctness checks orthonormality and A v=0.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_sparse_sse() {
+        let _g = bench_guard();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes(
+            "ARGON_BENCH_SPARSE_SSE",
+            &[256, 512, 1024, 2048, 4096, 8192, 16384],
+        ) {
+            let n = usize::try_from(n).expect("sparse SSE benchmark sizes must be positive");
+            let (template, vars) = sparse_sse_fixture(n);
+            let mut best = std::time::Duration::MAX;
+            let mut peak = 0usize;
+
+            for _ in 0..5 {
+                let mut solver = template.clone();
+                crate::bench_alloc::reset_peak();
+                let base = crate::bench_alloc::live();
+                let start = std::time::Instant::now();
+                solver.solve();
+                let basis = solver.sparse_nullspace_vecs().unwrap();
+                best = best.min(start.elapsed());
+                peak = peak.max(crate::bench_alloc::peak().saturating_sub(base));
+
+                assert_eq!(basis.len(), 2);
+                let coefficients: Vec<indexmap::IndexMap<_, _>> = basis
+                    .iter()
+                    .map(|vector| vector.iter().map(|&(value, var)| (var, value)).collect())
+                    .collect();
+                for (basis_index, vector) in coefficients.iter().enumerate() {
+                    let norm: f64 = vector.values().map(|value| value * value).sum();
+                    assert!((norm - 1.).abs() < 1e-7);
+                    let cross: f64 = coefficients[..basis_index]
+                        .iter()
+                        .map(|other| {
+                            vector
+                                .iter()
+                                .map(|(var, value)| value * other.get(var).unwrap_or(&0.))
+                                .sum::<f64>()
+                        })
+                        .sum();
+                    assert!(cross.abs() < 1e-7);
+                    for i in 0..n - 2 {
+                        let residual = vector.get(&vars[i]).unwrap_or(&0.)
+                            - 0.5 * vector.get(&vars[i + 1]).unwrap_or(&0.)
+                            - 0.5 * vector.get(&vars[i + 2]).unwrap_or(&0.);
+                        assert!(residual.abs() < 1e-7);
+                    }
+                }
+            }
+
+            eprintln!(
+                "sparse_sse    n={n:>6} time={best:>11.3?} peak={:>8.2} MiB",
+                peak as f64 / (1usize << 20) as f64
+            );
+            rows.push((n as f64, best.as_secs_f64(), peak, n));
+        }
+        write_bench_csv("sparse_sse", &rows);
     }
 
     /// Axis 1: number of independent shapes in a single cell.
@@ -989,6 +1138,14 @@ mod tests {
         .unwrap();
         let cell = &cells.cells[&cells.top];
         assert!(!cell.fallback_constraints_used.is_empty());
+        assert!(
+            cell.fallback_constraints_used
+                .iter()
+                .any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::InstanceX(_))
+                ))
+        );
         let inst = cell
             .objects
             .values()
@@ -1728,6 +1885,166 @@ mod tests {
     }
 
     #[test]
+    fn argon_polygon_points_are_independently_constrained() {
+        let o = parse_workspace_with_std(ARGON_POLYGON);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let gds_path =
+            std::env::temp_dir().join(format!("argon-polygon-{}.gds", std::process::id()));
+        output
+            .to_gds(
+                GdsMap::from_lyp(BASIC_LYP).expect("polygon GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                &gds_path,
+            )
+            .expect("export polygon GDS");
+        let gds = GdsLibrary::load(gds_path).expect("reload polygon GDS");
+        let boundary = gds.structs[0]
+            .elems
+            .iter()
+            .find_map(|element| match element {
+                GdsElement::GdsBoundary(boundary) => Some(boundary),
+                _ => None,
+            })
+            .expect("polygon boundary");
+        assert_eq!(boundary.xy.len(), 5);
+        assert_eq!(boundary.xy.first(), boundary.xy.last());
+
+        let cells = match output {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(output) => {
+                output.output.expect("underconstrained polygon output")
+            }
+            output => panic!("polygon should compile: {output:?}"),
+        };
+
+        let polygon = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_polygon)
+            .expect("compiled polygon");
+        let points = polygon
+            .points
+            .iter()
+            .map(|(x, y)| (x.0, y.0))
+            .collect::<Vec<_>>();
+        assert_eq!(&points[..3], &[(0., 0.), (100., 0.), (150., 75.)]);
+        assert!(points[3].0.is_finite() && points[3].1.is_finite());
+        assert_ne!(polygon.points[0].0.1, polygon.points[1].0.1);
+        let unsolved = &cells.cells[&cells.top].unsolved_vars;
+        assert!(
+            polygon.points[3]
+                .0
+                .1
+                .coeffs
+                .iter()
+                .any(|(_, var)| unsolved.contains(var))
+        );
+        assert!(
+            polygon.points[3]
+                .1
+                .1
+                .coeffs
+                .iter()
+                .any(|(_, var)| unsolved.contains(var))
+        );
+
+        let initial = compile(
+            &ast,
+            CompileInput {
+                cell: &["initial_points"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(BASIC_LYP),
+            },
+        );
+        let initial = match initial {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(output) => output.output.expect("fallback polygon output"),
+            output => panic!("fallback polygon should compile: {output:?}"),
+        };
+        let fallbacks = &initial.cells[&initial.top].fallback_constraints_used;
+        assert_eq!(fallbacks.len(), 6);
+        assert!(fallbacks.iter().all(|fallback| matches!(
+            fallback.initial_condition,
+            Some(RectInitialCondition::PolygonX(_, _)) | Some(RectInitialCondition::PolygonY(_, _))
+        )));
+        let source = std::fs::read_to_string(ARGON_POLYGON).unwrap();
+        assert!(fallbacks.iter().all(|fallback| {
+            source[fallback.span.span.start()..fallback.span.span.end()].ends_with('.')
+        }));
+    }
+
+    #[test]
+    fn polygon_points_require_named_coordinate_fields() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let p = polygon("met1", 3,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        x2=50., y2=50.,
+                    );
+                    eq(p.points[0].0, 0.);
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.iter().any(|error| matches!(
+            error.kind,
+            StaticErrorKind::CannotIndexFieldAccess {
+                ty: crate::compile::Ty::Point
+            }
+        )));
+    }
+
+    #[test]
+    fn polygon_constructor_has_one_count_based_signature() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let p = polygon("met1", list(
+                        (0., 0.,),
+                        (10., 0.,),
+                        (0., 10.,),
+                    ));
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.iter().any(|error| matches!(
+            error.kind,
+            StaticErrorKind::IncorrectTy {
+                expected: crate::compile::Ty::Int,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn argon_tuple_any() {
         let o = parse_workspace_with_std(ARGON_TUPLE_ANY);
         assert!(o.static_errors().is_empty());
@@ -1840,8 +2157,11 @@ mod tests {
 
         let cells = cells.unwrap_exec_errors().output.unwrap();
         let cell = &cells.cells[&cells.top];
-        println!("rowspace vecs = {:?}", cell.rowspace_vecs);
-        assert_eq!(cell.rowspace_vecs.len(), 1);
+        println!("SSE basis = {:?}", cell.sse_basis);
+        let crate::compile::SseBasis::Nullspace(vectors) = &cell.sse_basis else {
+            panic!("sparse SSE system should expose a null-space basis");
+        };
+        assert_eq!(vectors.len(), 1);
     }
 
     #[test]
@@ -1917,3 +2237,4 @@ mod tests {
         assert!(data.rule_checks.is_empty());
     }
 }
+pub mod cli;

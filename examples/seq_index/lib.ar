@@ -1,4 +1,3 @@
-
 cell bot() {
     let met1 = rect("met1", x0=0., y0=0., x1=100., y1=500.);
 }

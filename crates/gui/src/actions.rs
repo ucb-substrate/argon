@@ -7,6 +7,7 @@ actions!(
         Quit,
         Save,
         DrawRect,
+        DrawPolygon,
         SelectMode,
         DrawDim,
         Edit,

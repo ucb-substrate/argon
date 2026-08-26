@@ -4,15 +4,15 @@ use std::{
     net::{SocketAddr, TcpListener},
 };
 
-use analyzer::default_argon_home;
 use editor::Editor;
 use gpui::*;
 use rust_embed::RustEmbed;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use crate::actions::*;
 use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
+
+pub mod cli;
 
 pub mod actions;
 pub mod assets;
@@ -47,7 +47,7 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn run(
+pub fn run_gui(
     lang_server_addr: SocketAddr,
     gui_listen_port: Option<u16>,
     gui_register_addr: Option<SocketAddr>,
@@ -76,14 +76,7 @@ fn run_inner(
 ) {
     focus::initialize_target();
 
-    // TODO: Allow configuration via ARGON_HOME environment variable.
-    if let Some(log_dir) = default_argon_home() {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
-            .with_writer(tracing_appender::rolling::never(log_dir, "argone.log"))
-            .with_ansi(false)
-            .init();
-    }
+    analyzer::init_logging();
 
     Application::new()
         .with_assets(Assets)
@@ -120,6 +113,7 @@ fn run_inner(
                     name: "Tools".into(),
                     items: vec![
                         MenuItem::action("Rect", DrawRect),
+                        MenuItem::action("Polygon", DrawPolygon),
                         MenuItem::action("Dim", DrawDim),
                         MenuItem::action("Edit", Edit),
                     ],
@@ -160,6 +154,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-s", Save, None),
         KeyBinding::new("r", DrawRect, Some("LayoutCanvas")),
+        KeyBinding::new("p", DrawPolygon, Some("LayoutCanvas")),
         KeyBinding::new("s", SelectMode, Some("LayoutCanvas")),
         KeyBinding::new("d", DrawDim, Some("LayoutCanvas")),
         KeyBinding::new("i", InstantiateCommand, Some("LayoutCanvas")),
@@ -174,6 +169,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
         KeyBinding::new(":", FocusInvokerCommandBar, None),
         KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
+        KeyBinding::new("enter", Enter, Some("LayoutCanvas")),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
@@ -221,6 +217,7 @@ mod tests {
         input_focus: FocusHandle,
         undo_count: usize,
         draw_rect_count: usize,
+        draw_polygon_count: usize,
         command_bar_count: usize,
         instantiate_count: usize,
         open_cell_count: usize,
@@ -234,6 +231,7 @@ mod tests {
                 .on_action(cx.listener(|view, _: &Undo, _, _| view.undo_count += 1))
                 .on_action(cx.listener(|view, _: &Save, _, _| view.save_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
+                .on_action(cx.listener(|view, _: &DrawPolygon, _, _| view.draw_polygon_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
                         view.command_bar_count += 1
@@ -269,6 +267,7 @@ mod tests {
                     input_focus: cx.focus_handle(),
                     undo_count: 0,
                     draw_rect_count: 0,
+                    draw_polygon_count: 0,
                     command_bar_count: 0,
                     instantiate_count: 0,
                     open_cell_count: 0,
@@ -282,11 +281,12 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\ cmd-s");
+        cx.simulate_keystrokes(*window, "u r p i o : ctrl-\\ cmd-s");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
                 assert_eq!(view.draw_rect_count, 0);
+                assert_eq!(view.draw_polygon_count, 0);
                 assert_eq!(view.command_bar_count, 1);
                 assert_eq!(view.instantiate_count, 0);
                 assert_eq!(view.open_cell_count, 0);
@@ -298,11 +298,12 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\ cmd-s");
+        cx.simulate_keystrokes(*window, "u r p i o : ctrl-\\ cmd-s");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
                 assert_eq!(view.draw_rect_count, 1);
+                assert_eq!(view.draw_polygon_count, 1);
                 assert_eq!(view.command_bar_count, 2);
                 assert_eq!(view.instantiate_count, 1);
                 assert_eq!(view.open_cell_count, 1);

@@ -25,6 +25,11 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Argon examples
+        run: |
+          cargo build -p argon --bin arc
+          find examples -name Argon.toml -exec target/debug/arc fmt --check --manifest-path {} \;
+
   # Lint
   clippy:
     name: Clippy

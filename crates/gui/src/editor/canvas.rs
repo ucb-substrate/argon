@@ -4,7 +4,9 @@ use std::{
     ops::{Add, Sub},
 };
 
-use analyzer::rpc::{DimensionParams, InstancePreview, ValueEdit};
+use analyzer::rpc::{
+    DimensionParams, InitialConditionEdit, InstancePreview, PolygonParams, ValueEdit,
+};
 use argonc::{
     ast::Span,
     compile::{self, CellId, CompiledData, ObjectId, RectInitialCondition, SolvedValue, ifmatvec},
@@ -15,8 +17,8 @@ use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
     BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
     Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, Pixels, Point, Render, Rgba,
-    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, Pixels, Point, Render,
+    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
     pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
@@ -52,6 +54,58 @@ const HANDLE_BORDER: u32 = 0xffffff;
 struct SseDragTarget {
     expr: LinearExpr,
     normal: Point<f32>,
+    source: Option<SseSourceTarget>,
+}
+
+#[derive(Clone)]
+struct SseSourceTarget {
+    call_span: Span,
+    name: String,
+    value: f64,
+}
+
+type SseSourceCoordinates = HashMap<Span, Vec<(LinearExpr, String, f64)>>;
+
+fn sse_source_target(
+    coordinates: &SseSourceCoordinates,
+    call_span: &Span,
+    expr: &LinearExpr,
+) -> Option<SseSourceTarget> {
+    coordinates
+        .get(call_span)?
+        .iter()
+        .find_map(|(candidate, name, value)| {
+            (candidate == expr).then(|| SseSourceTarget {
+                call_span: call_span.clone(),
+                name: name.clone(),
+                value: *value,
+            })
+        })
+}
+
+fn sourced_sse_target(
+    expr: &LinearExpr,
+    normal: Point<f32>,
+    call_span: &Span,
+    coordinates: &SseSourceCoordinates,
+) -> SseDragTarget {
+    SseDragTarget {
+        expr: expr.clone(),
+        normal,
+        source: sse_source_target(coordinates, call_span, expr),
+    }
+}
+
+fn sourced_corner_sse_targets(
+    x: &LinearExpr,
+    y: &LinearExpr,
+    call_span: &Span,
+    coordinates: &SseSourceCoordinates,
+) -> Vec<SseDragTarget> {
+    vec![
+        sourced_sse_target(x, Point::new(1., 0.), call_span, coordinates),
+        sourced_sse_target(y, Point::new(0., 1.), call_span, coordinates),
+    ]
 }
 
 #[derive(Clone)]
@@ -75,15 +129,24 @@ struct LabeledBbox {
     origin: Option<Point<f32>>,
 }
 
+#[derive(Clone)]
+struct TextLabel {
+    text: SharedString,
+    position: Point<f32>,
+    layer: LayerState,
+}
+
 fn corner_sse_targets(x: &LinearExpr, y: &LinearExpr) -> Vec<SseDragTarget> {
     vec![
         SseDragTarget {
             expr: x.clone(),
             normal: Point::new(1., 0.),
+            source: None,
         },
         SseDragTarget {
             expr: y.clone(),
             normal: Point::new(0., 1.),
+            source: None,
         },
     ]
 }
@@ -96,15 +159,108 @@ enum SelectionLayer {
 }
 
 #[derive(Clone, Debug)]
+enum SelectionOutline {
+    Rect {
+        bounds: Bounds<Pixels>,
+        border_styles: Edges<BorderStyle>,
+    },
+    Polygon {
+        points: Vec<Point<Pixels>>,
+        edge_styles: Vec<BorderStyle>,
+    },
+}
+
+fn rect_selection_outline(
+    bounds: Bounds<Pixels>,
+    border_styles: Edges<BorderStyle>,
+) -> SelectionOutline {
+    SelectionOutline::Rect {
+        bounds,
+        border_styles,
+    }
+}
+
+#[derive(Clone, Debug)]
 struct SelectionHit {
     span: Span,
-    bounds: Bounds<Pixels>,
+    area: f32,
+    outline: SelectionOutline,
     layer: SelectionLayer,
     paint_order: usize,
 }
 
 fn selection_hit_area(hit: &SelectionHit) -> f32 {
-    f32::from(hit.bounds.size.width).abs() * f32::from(hit.bounds.size.height).abs()
+    hit.area
+}
+
+fn bounds_area(bounds: Bounds<Pixels>) -> f32 {
+    f32::from(bounds.size.width).abs() * f32::from(bounds.size.height).abs()
+}
+
+fn polygon_area(points: &[Point<Pixels>]) -> f32 {
+    points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+        .map(|(a, b)| f32::from(a.x) * f32::from(b.y) - f32::from(b.x) * f32::from(a.y))
+        .sum::<f32>()
+        .abs()
+        / 2.
+}
+
+fn point_in_polygon(point: Point<Pixels>, polygon: &[Point<Pixels>]) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+
+    let (px, py) = (f32::from(point.x), f32::from(point.y));
+    let mut inside = false;
+    for (a, b) in polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .take(polygon.len())
+    {
+        let (ax, ay) = (f32::from(a.x), f32::from(a.y));
+        let (bx, by) = (f32::from(b.x), f32::from(b.y));
+
+        // Treat the border as part of the polygon so its visible stroke remains
+        // selectable without extending the hit region to a bounding box.
+        let cross = (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+        let scale = (bx - ax).abs().max((by - ay).abs()).max(1.);
+        if cross.abs() <= f32::EPSILON * scale
+            && px >= ax.min(bx)
+            && px <= ax.max(bx)
+            && py >= ay.min(by)
+            && py <= ay.max(by)
+        {
+            return true;
+        }
+
+        if (ay > py) != (by > py) && px < (bx - ax) * (py - ay) / (by - ay) + ax {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn paint_polygon_border(
+    window: &mut Window,
+    points: &[Point<Pixels>],
+    edge_styles: &[BorderStyle],
+    width: Pixels,
+    color: Rgba,
+) {
+    for index in 0..points.len() {
+        let mut edge = PathBuilder::stroke(width);
+        if edge_styles.get(index) == Some(&BorderStyle::Dashed) {
+            edge = edge.dash_array(&[px(6.), px(5.)]);
+        }
+        edge.move_to(points[index]);
+        edge.line_to(points[(index + 1) % points.len()]);
+        if let Ok(path) = edge.build() {
+            window.paint_path(path, color);
+        }
+    }
 }
 
 fn ordered_selection_hits(mut hits: Vec<SelectionHit>) -> Vec<SelectionHit> {
@@ -204,6 +360,55 @@ pub struct Rect {
     pub border_widths: Edges<Pixels>,
     pub border_styles: Edges<BorderStyle>,
     pub cvars: Option<Edges<LinearExpr>>,
+}
+
+#[derive(Clone, Debug)]
+struct Polygon {
+    points: Vec<Point<f32>>,
+    edge_styles: Vec<BorderStyle>,
+    id: Option<Span>,
+    object_path: Vec<ObjectId>,
+    cvars: Option<Vec<(LinearExpr, LinearExpr)>>,
+}
+
+impl Polygon {
+    fn transform(&self, mat: TransformationMatrix, ofs: (f64, f64)) -> Self {
+        Self {
+            points: self
+                .points
+                .iter()
+                .map(|point| {
+                    let point = ifmatvec(mat, (point.x as f64, point.y as f64));
+                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                })
+                .collect(),
+            edge_styles: self.edge_styles.clone(),
+            id: self.id.clone(),
+            object_path: self.object_path.clone(),
+            cvars: self.cvars.clone(),
+        }
+    }
+}
+
+fn polygon_edge_styles(
+    point_count: usize,
+    mut is_unconstrained: impl FnMut(usize) -> bool,
+) -> Vec<BorderStyle> {
+    if point_count == 0 {
+        return Vec::new();
+    }
+    let unconstrained = (0..point_count)
+        .map(&mut is_unconstrained)
+        .collect::<Vec<_>>();
+    (0..point_count)
+        .map(|index| {
+            if unconstrained[index] || unconstrained[(index + 1) % point_count] {
+                BorderStyle::Dashed
+            } else {
+                BorderStyle::Solid
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -334,6 +539,11 @@ pub(crate) struct DrawRectToolState {
     p0: Option<Point<f32>>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DrawPolygonToolState {
+    points: Vec<Point<f32>>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum DimEdge<T> {
     /// y-axis
@@ -393,12 +603,14 @@ pub(crate) struct PlaceInstanceToolState {
     invocation: String,
     scope_span: Span,
     rects: Vec<Rect>,
+    polygons: Vec<Polygon>,
 }
 
 #[enumify]
 #[derive(Debug, Clone)]
 pub(crate) enum ToolState {
     DrawRect(DrawRectToolState),
+    DrawPolygon(DrawPolygonToolState),
     DrawDim(DrawDimToolState),
     EditDim(EditDimToolState),
     PlaceInstance(PlaceInstanceToolState),
@@ -441,6 +653,7 @@ pub struct LayoutCanvas {
     #[allow(unused)]
     subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
+    polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
     // True if waiting on render step to finish some initialization.
@@ -506,6 +719,102 @@ fn sort_initial_condition_pair(
         updates[high_index].value = high;
         updates[low_index].changed = true;
         updates[high_index].changed = true;
+    }
+}
+
+fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> Vec<ValueEdit> {
+    let mut updates = fallbacks
+        .iter()
+        .map(|fallback| {
+            let (value, changed) =
+                crate::sse::initial_condition_after_drag(&fallback.constraint, dv);
+            InitialConditionUpdate {
+                span: fallback.span.clone(),
+                value,
+                changed,
+                target: fallback.initial_condition,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Rectangle edges exchange their initial values when dragged across one
+    // another. Polygon coordinates remain attached to their vertex index.
+    let mut pairs: HashMap<ObjectId, [Option<usize>; 4]> = HashMap::new();
+    for (index, update) in updates.iter().enumerate() {
+        let Some(target) = update.target else {
+            continue;
+        };
+        let (id, edge) = match target {
+            RectInitialCondition::X0(id) => (id, 0),
+            RectInitialCondition::X1(id) => (id, 1),
+            RectInitialCondition::Y0(id) => (id, 2),
+            RectInitialCondition::Y1(id) => (id, 3),
+            RectInitialCondition::PolygonX(_, _)
+            | RectInitialCondition::PolygonY(_, _)
+            | RectInitialCondition::InstanceX(_)
+            | RectInitialCondition::InstanceY(_) => {
+                continue;
+            }
+        };
+        pairs.entry(id).or_insert([None; 4])[edge] = Some(index);
+    }
+    for pair in pairs.values() {
+        if let (Some(x0), Some(x1)) = (pair[0], pair[1]) {
+            sort_initial_condition_pair(&mut updates, x0, x1);
+        }
+        if let (Some(y0), Some(y1)) = (pair[2], pair[3]) {
+            sort_initial_condition_pair(&mut updates, y0, y1);
+        }
+    }
+
+    updates
+        .into_iter()
+        .filter(|update| update.changed)
+        .map(|update| ValueEdit {
+            span: update.span,
+            value: crate::sse::format_value(update.value),
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct DragPersistenceEdits {
+    values: Vec<ValueEdit>,
+    initial_conditions: Vec<InitialConditionEdit>,
+}
+
+fn drag_persistence_edits(
+    fallbacks: &[compile::UsedFallback],
+    targets: &[SseDragTarget],
+    dv: &SparseVec,
+) -> DragPersistenceEdits {
+    let values = fallback_value_edits(fallbacks, dv);
+    let mut initial_conditions = Vec::<InitialConditionEdit>::new();
+    for target in targets {
+        let delta = crate::sse::dot(&SparseVec::from(&target.expr), dv);
+        if delta.abs() < crate::sse::EPSILON {
+            continue;
+        }
+        let Some(source) = &target.source else {
+            continue;
+        };
+        let edit = InitialConditionEdit {
+            call_span: source.call_span.clone(),
+            name: source.name.clone(),
+            value: crate::sse::format_value(source.value + delta),
+        };
+        if let Some(existing) = initial_conditions
+            .iter_mut()
+            .find(|existing| existing.call_span == edit.call_span && existing.name == edit.name)
+        {
+            existing.value = edit.value;
+        } else {
+            initial_conditions.push(edit);
+        }
+    }
+    DragPersistenceEdits {
+        values,
+        initial_conditions,
     }
 }
 
@@ -582,11 +891,28 @@ fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
     }
 }
 
+fn fit_scale(viewport: Size<Pixels>, width: f32, height: f32) -> f32 {
+    let width_scale = (width > 0.).then(|| f32::from(viewport.width) / width);
+    let height_scale = (height > 0.).then(|| f32::from(viewport.height) / height);
+    let scale = match (width_scale, height_scale) {
+        (Some(width), Some(height)) => 0.9 * width.min(height),
+        (Some(width), None) => 0.9 * width,
+        (None, Some(height)) => 0.9 * height,
+        (None, None) => 1.,
+    };
+    if scale.is_finite() && scale > 0. {
+        scale
+    } else {
+        1.
+    }
+}
+
 /// Flatten the solved geometry of one compiled cell into rectangles relative
 /// to that cell's origin. Placement paints these as a single pointer-following
 /// outline without disturbing the layout currently open in the editor.
-fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
+fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>, Vec<Polygon>) {
     let mut rects = Vec::new();
+    let mut polygons = Vec::new();
     let mut queue = VecDeque::from_iter([(
         cell,
         output.cells[&cell].root,
@@ -618,6 +944,22 @@ fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
                         cvars: None,
                     });
                 }
+                SolvedValue::Polygon(polygon) => {
+                    polygons.push(Polygon {
+                        points: polygon
+                            .points
+                            .iter()
+                            .map(|(x, y)| {
+                                let point = ifmatvec(mat, (x.0, y.0));
+                                Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                            })
+                            .collect(),
+                        edge_styles: vec![BorderStyle::Dashed; polygon.points.len()],
+                        id: None,
+                        object_path: Vec::new(),
+                        cvars: None,
+                    });
+                }
                 SolvedValue::Instance(instance) if !instance.construction => {
                     let mut instance_mat = TransformationMatrix::identity();
                     if instance.reflect {
@@ -640,7 +982,7 @@ fn instance_preview_rects(output: &CompiledData, cell: CellId) -> Vec<Rect> {
             queue.push_back((cell, *child, mat, ofs));
         }
     }
-    rects
+    (rects, polygons)
 }
 
 fn get_paint_quad(
@@ -737,10 +1079,13 @@ impl Element for CanvasElement {
 
         // TODO: Clean up code.
         let mut rects = Vec::new();
+        let mut texts = Vec::new();
+        let mut polygons = Vec::new();
         let mut dims = Vec::new();
         let mut scope_rects = Vec::new();
         let mut instance_sse_candidates = Vec::new();
         let mut select_rects = Vec::new();
+        let mut source_coordinates = SseSourceCoordinates::new();
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
@@ -820,6 +1165,24 @@ impl Element for CanvasElement {
                     let value = &cell_info.objects[obj];
                     match value {
                         SolvedValue::Rect(rect) => {
+                            if depth == 0
+                                && let Some(span) = &rect.span
+                            {
+                                source_coordinates.insert(
+                                    span.clone(),
+                                    [
+                                        (&rect.x0, "x0i"),
+                                        (&rect.x1, "x1i"),
+                                        (&rect.y0, "y0i"),
+                                        (&rect.y1, "y1i"),
+                                    ]
+                                    .into_iter()
+                                    .map(|(coordinate, name)| {
+                                        (coordinate.1.clone(), name.to_owned(), coordinate.0)
+                                    })
+                                    .collect(),
+                                );
+                            }
                             let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
                             let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
                             let layer = rect
@@ -908,9 +1271,86 @@ impl Element for CanvasElement {
                                 }
                             }
                         }
+                        SolvedValue::Polygon(polygon) => {
+                            if depth == 0
+                                && let Some(span) = &polygon.span
+                            {
+                                source_coordinates.insert(
+                                    span.clone(),
+                                    polygon
+                                        .points
+                                        .iter()
+                                        .enumerate()
+                                        .flat_map(|(index, (x, y))| {
+                                            [
+                                                (x.1.clone(), format!("x{index}i"), x.0),
+                                                (y.1.clone(), format!("y{index}i"), y.0),
+                                            ]
+                                        })
+                                        .collect(),
+                                );
+                            }
+                            let Some(layer) = layers.layers.get(polygon.layer.as_str()) else {
+                                continue;
+                            };
+                            let edge_styles = if depth == 0 {
+                                polygon_edge_styles(polygon.points.len(), |index| {
+                                    let (x, y) = &polygon.points[index];
+                                    x.1.coeffs
+                                        .iter()
+                                        .chain(&y.1.coeffs)
+                                        .any(|(_, var)| cell_info.unsolved_vars.contains(var))
+                                })
+                            } else {
+                                vec![BorderStyle::Solid; polygon.points.len()]
+                            };
+                            let points = polygon
+                                .points
+                                .iter()
+                                .map(|(x, y)| {
+                                    let (dx, dy) = if depth == 0 {
+                                        sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
+                                            (
+                                                crate::sse::dot(&SparseVec::from(&x.1), sse_dv),
+                                                crate::sse::dot(&SparseVec::from(&y.1), sse_dv),
+                                            )
+                                        })
+                                    } else {
+                                        (0., 0.)
+                                    };
+                                    let point = ifmatvec(mat, (x.0 + dx, y.0 + dy));
+                                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                                })
+                                .collect();
+                            let polygon = Polygon {
+                                points,
+                                edge_styles,
+                                id: polygon.span.clone(),
+                                object_path,
+                                cvars: (depth == 0).then(|| {
+                                    polygon
+                                        .points
+                                        .iter()
+                                        .map(|(x, y)| (x.1.clone(), y.1.clone()))
+                                        .collect()
+                                }),
+                            };
+                            if show && layer.visible {
+                                polygons.push((polygon, layer.clone()));
+                            }
+                        }
                         SolvedValue::Instance(inst) => {
                             if inst.construction {
                                 continue;
+                            }
+                            if depth == 0 {
+                                source_coordinates.insert(
+                                    inst.span.clone(),
+                                    vec![
+                                        (inst.x_expr.clone(), "xi".to_owned(), inst.x),
+                                        (inst.y_expr.clone(), "yi".to_owned(), inst.y),
+                                    ],
+                                );
                             }
                             let mut inst_mat = TransformationMatrix::identity();
                             if inst.reflect {
@@ -1004,10 +1444,20 @@ impl Element for CanvasElement {
                                                     SseDragTarget {
                                                         expr: inst.x_expr.clone(),
                                                         normal: Point::new(1., 0.),
+                                                        source: Some(SseSourceTarget {
+                                                            call_span: inst.span.clone(),
+                                                            name: "xi".to_owned(),
+                                                            value: inst.x,
+                                                        }),
                                                     },
                                                     SseDragTarget {
                                                         expr: inst.y_expr.clone(),
                                                         normal: Point::new(0., 1.),
+                                                        source: Some(SseSourceTarget {
+                                                            call_span: inst.span.clone(),
+                                                            name: "yi".to_owned(),
+                                                            value: inst.y,
+                                                        }),
                                                     },
                                                 ],
                                             ));
@@ -1034,7 +1484,23 @@ impl Element for CanvasElement {
                             ));
                         }
                         SolvedValue::Dimension(_) => {}
-                        SolvedValue::Text(_) => {}
+                        SolvedValue::Text(text) => {
+                            let position = ifmatvec(mat, (text.x, text.y));
+                            let layer = layers.layers.get(text.layer.as_str());
+                            if let Some(layer) = layer
+                                && show
+                                && layer.visible
+                            {
+                                texts.push(TextLabel {
+                                    text: text.text.clone().into(),
+                                    position: Point::new(
+                                        (position.0 + ofs.0) as f32,
+                                        (position.1 + ofs.1) as f32,
+                                    ),
+                                    layer: layer.clone(),
+                                });
+                            }
+                        }
                     }
                 }
                 for child in &scope_info.children {
@@ -1068,10 +1534,15 @@ impl Element for CanvasElement {
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
             .collect_vec();
+        let polygons = polygons
+            .into_iter()
+            .sorted_by_key(|(_, layer)| layer.z)
+            .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
+        let mut polygon_handle_points = Vec::new();
         let mut sse_bodies: Vec<SseBody> = Vec::new();
         let sse_cell = solved_cell.as_ref().map(|solved| {
             let selected = &solved.state[&solved.selected_scope].address;
@@ -1096,22 +1567,10 @@ impl Element for CanvasElement {
                 }),
             );
             let targets = vec![
-                SseDragTarget {
-                    expr: cvars.left.clone(),
-                    normal: Point::new(1., 0.),
-                },
-                SseDragTarget {
-                    expr: cvars.right.clone(),
-                    normal: Point::new(1., 0.),
-                },
-                SseDragTarget {
-                    expr: cvars.bottom.clone(),
-                    normal: Point::new(0., 1.),
-                },
-                SseDragTarget {
-                    expr: cvars.top.clone(),
-                    normal: Point::new(0., 1.),
-                },
+                sourced_sse_target(&cvars.left, Point::new(1., 0.), span, &source_coordinates),
+                sourced_sse_target(&cvars.right, Point::new(1., 0.), span, &source_coordinates),
+                sourced_sse_target(&cvars.bottom, Point::new(0., 1.), span, &source_coordinates),
+                sourced_sse_target(&cvars.top, Point::new(0., 1.), span, &source_coordinates),
             ];
             if LayoutCanvas::sse_targets_support_2d(&targets, sse_cell) {
                 sse_bodies.push(SseBody {
@@ -1119,6 +1578,39 @@ impl Element for CanvasElement {
                     span: span.clone(),
                     targets,
                 });
+            }
+        }
+        if let Some(sse_cell) = sse_cell {
+            for (polygon, _) in &polygons {
+                let (Some(span), Some(cvars)) = (&polygon.id, &polygon.cvars) else {
+                    continue;
+                };
+                if !matches!(
+                    &tool,
+                    ToolState::Select(SelectToolState {
+                        selected_obj: Some(selected),
+                    }) if selected == span
+                ) {
+                    continue;
+                }
+                for (point, (x, y)) in polygon.points.iter().zip(cvars) {
+                    let targets = LayoutCanvas::draggable_point_targets(
+                        sourced_corner_sse_targets(x, y, span, &source_coordinates),
+                        sse_cell,
+                    );
+                    if !targets.is_empty() {
+                        let mid = inner.layout_to_px(*point);
+                        polygon_handle_points.push(mid);
+                        let hit_half = HANDLE_HIT.half();
+                        sse_handles.push(SseHandle {
+                            bounds: Bounds::new(
+                                Point::new(mid.x - hit_half, mid.y - hit_half),
+                                Size::new(HANDLE_HIT, HANDLE_HIT),
+                            ),
+                            targets,
+                        });
+                    }
+                }
             }
         }
         if let Some(sse_cell) = sse_cell {
@@ -1199,6 +1691,116 @@ impl Element for CanvasElement {
                             r.border_styles,
                         ));
                     }
+                    for (polygon, layer) in &polygons {
+                        let points = polygon
+                            .points
+                            .iter()
+                            .map(|point| self.inner.read(cx).layout_to_px(*point))
+                            .collect::<Vec<_>>();
+                        let mut fill = PathBuilder::fill();
+                        fill.add_polygon(&points, true);
+                        if let Ok(path) = fill.build() {
+                            let background = match layer.fill {
+                                ShapeFill::Solid => solid_background(layer.color),
+                                ShapeFill::Stippling => {
+                                    pattern_slash(layer.color.into(), 1., 9.)
+                                }
+                            };
+                            window.paint_path(path, background);
+                        }
+                        let selected = matches!(
+                            &tool,
+                            ToolState::Select(SelectToolState {
+                                selected_obj: Some(selected),
+                            }) if polygon.id.as_ref() == Some(selected)
+                        );
+                        let border_width = if selected {
+                            SELECT_WIDTH
+                        } else {
+                            DEFAULT_BORDER_WIDTH
+                        };
+                        let border_color = if selected {
+                            rgb(0xffff00)
+                        } else {
+                            layer.border_color
+                        };
+                        paint_polygon_border(
+                            window,
+                            &points,
+                            &polygon.edge_styles,
+                            border_width,
+                            border_color,
+                        );
+                    }
+                    for mid in &polygon_handle_points {
+                        let draw_half = HANDLE_SIZE.half();
+                        window.paint_quad(get_paint_quad(
+                            Bounds::new(
+                                Point::new(mid.x - draw_half, mid.y - draw_half),
+                                Size::new(HANDLE_SIZE, HANDLE_SIZE),
+                            ),
+                            ShapeFill::Solid,
+                            rgb(HANDLE_FILL),
+                            rgb(HANDLE_BORDER),
+                            Edges::all(px(1.5)),
+                            Edges::all(BorderStyle::Solid),
+                        ));
+                    }
+                    if let ToolState::DrawPolygon(polygon_tool) = &tool
+                        && !polygon_tool.points.is_empty()
+                    {
+                        let points = polygon_tool
+                            .points
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(layout_mouse_position))
+                            .map(|point| self.inner.read(cx).layout_to_px(point))
+                            .collect::<Vec<_>>();
+                        let mut preview = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
+                        preview.add_polygon(&points, false);
+                        if let Ok(path) = preview.build() {
+                            window.paint_path(path, rgb(0xffff00));
+                        }
+                        for point in points.iter().take(polygon_tool.points.len()) {
+                            let draw_half = HANDLE_SIZE.half();
+                            window.paint_quad(get_paint_quad(
+                                Bounds::new(
+                                    Point::new(point.x - draw_half, point.y - draw_half),
+                                    Size::new(HANDLE_SIZE, HANDLE_SIZE),
+                                ),
+                                ShapeFill::Solid,
+                                rgb(HANDLE_FILL),
+                                rgb(HANDLE_BORDER),
+                                Edges::all(px(1.5)),
+                                Edges::all(BorderStyle::Solid),
+                            ));
+                        }
+                    }
+                    for label in &texts {
+                        let font_size = px(16.);
+                        let runs = &[TextRun {
+                            len: label.text.len(),
+                            font: window.text_style().font(),
+                            color: label.layer.border_color.into(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }];
+                        window
+                            .text_system()
+                            .shape_line(label.text.clone(), font_size, runs, None)
+                            .paint(
+                                Point::new(
+                                    scale * px(label.position.x),
+                                    scale * px(-label.position.y),
+                                ) + offset
+                                    + bounds.origin,
+                                px(18.),
+                                window,
+                                cx,
+                            )
+                            .unwrap();
+                    }
                     for bbox in &scope_rects {
                         window.paint_quad(get_paint_quad(
                             get_rect_bounds(&bbox.rect, bounds, scale, offset),
@@ -1265,6 +1867,25 @@ impl Element for CanvasElement {
                                 rect.border_styles,
                             ));
                         }
+                        for polygon in &placement.polygons {
+                            let polygon = polygon.transform(
+                                TransformationMatrix::identity(),
+                                (
+                                    layout_mouse_position.x as f64,
+                                    layout_mouse_position.y as f64,
+                                ),
+                            );
+                            let points = polygon
+                                .points
+                                .iter()
+                                .map(|point| self.inner.read(cx).layout_to_px(*point))
+                                .collect::<Vec<_>>();
+                            let mut border = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
+                            border.add_polygon(&points, true);
+                            if let Ok(path) = border.build() {
+                                window.paint_path(path, rgb(0xffff00));
+                            }
+                        }
                     }
                     for r in &select_rects {
                         window.paint_quad(get_paint_quad(
@@ -1319,10 +1940,12 @@ impl Element for CanvasElement {
                                         Point::new(mid.x - hit_half, mid.y - hit_half),
                                         Size::new(HANDLE_HIT, HANDLE_HIT),
                                     ),
-                                    targets: vec![SseDragTarget {
-                                        expr: expr.clone(),
+                                    targets: vec![sourced_sse_target(
+                                        expr,
                                         normal,
-                                    }],
+                                        selected_obj,
+                                        &source_coordinates,
+                                    )],
                                 });
                             }
 
@@ -1353,7 +1976,12 @@ impl Element for CanvasElement {
                                 if !movable {
                                     continue;
                                 }
-                                let targets = corner_sse_targets(x_expr, y_expr);
+                                let targets = sourced_corner_sse_targets(
+                                    x_expr,
+                                    y_expr,
+                                    selected_obj,
+                                    &source_coordinates,
+                                );
                                 window.paint_quad(get_paint_quad(
                                     Bounds::new(
                                         Point::new(mid.x - draw_half, mid.y - draw_half),
@@ -1844,14 +2472,31 @@ impl Element for CanvasElement {
                                 .into_iter()
                                 .next()
                             {
-                                window.paint_quad(get_paint_quad(
-                                    hit.bounds,
-                                    ShapeFill::Solid,
-                                    Rgba { a: 0., ..rgb(0xffff00) },
-                                    rgb(0xffff00),
-                                    Edges::all(SELECT_WIDTH),
-                                    Edges::all(BorderStyle::Solid),
-                                ));
+                                match hit.outline {
+                                    SelectionOutline::Rect {
+                                        bounds,
+                                        border_styles,
+                                    } => {
+                                        window.paint_quad(get_paint_quad(
+                                            bounds,
+                                            ShapeFill::Solid,
+                                            Rgba { a: 0., ..rgb(0xffff00) },
+                                            rgb(0xffff00),
+                                            Edges::all(SELECT_WIDTH),
+                                            border_styles,
+                                        ));
+                                    }
+                                    SelectionOutline::Polygon {
+                                        points,
+                                        edge_styles,
+                                    } => paint_polygon_border(
+                                        window,
+                                        &points,
+                                        &edge_styles,
+                                        SELECT_WIDTH,
+                                        rgb(0xffff00),
+                                    ),
+                                }
                             }
                         }
                         _ => {}
@@ -1860,6 +2505,7 @@ impl Element for CanvasElement {
             });
         self.inner.update(cx, |inner, cx| {
             inner.rects = rects;
+            inner.polygons = polygons;
             inner.scope_rects = scope_rects;
             inner.dim_hitboxes = dim_hitboxes;
             inner.sse_handles = sse_handles;
@@ -1885,6 +2531,7 @@ impl Render for LayoutCanvas {
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_mouse_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
+            .on_action(cx.listener(Self::draw_polygon))
             .on_action(cx.listener(Self::select_mode))
             .on_action(cx.listener(Self::draw_dim))
             .on_action(cx.listener(Self::edit_action))
@@ -1893,6 +2540,7 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::one_hierarchy))
             .on_action(cx.listener(Self::all_hierarchy))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::finish_polygon))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
@@ -1947,6 +2595,7 @@ impl LayoutCanvas {
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
             state: state.clone(),
             rects: Vec::new(),
+            polygons: Vec::new(),
             scope_rects: Vec::new(),
             dim_hitboxes: Vec::new(),
             pending_init: true,
@@ -1954,13 +2603,14 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn place_instance(&mut self, preview: InstancePreview, cx: &mut Context<Self>) {
-        let rects = instance_preview_rects(&preview.output, preview.cell);
+        let (rects, polygons) = instance_preview_geometry(&preview.output, preview.cell);
         let tool = self.state.read(cx).tool.clone();
         tool.update(cx, |tool, cx| {
             *tool = ToolState::PlaceInstance(PlaceInstanceToolState {
                 invocation: preview.invocation,
                 scope_span: preview.scope_span,
                 rects,
+                polygons,
             });
             cx.notify();
         });
@@ -1995,12 +2645,27 @@ impl LayoutCanvas {
                 (target.normal.x * layout_delta.x + target.normal.y * layout_delta.y) as f64
             })
             .collect::<Vec<_>>();
-        let rowspace = cell
-            .rowspace_vecs
-            .iter()
-            .map(SparseVec::from)
-            .collect::<Vec<_>>();
-        crate::sse::drag_delta_multi(&edges, &rowspace, &cell.unsolved_vars, &deltas)
+        match &cell.sse_basis {
+            // An empty sparse basis means there are no remaining constraint
+            // rows. In that case the row-space representation is also empty,
+            // and every still-unsolved variable is free to move.
+            compile::SseBasis::Nullspace(vectors) if vectors.is_empty() => {
+                crate::sse::drag_delta_multi(&edges, &[], &cell.unsolved_vars, &deltas)
+            }
+            compile::SseBasis::Nullspace(vectors) => {
+                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+                crate::sse::drag_delta_multi_nullspace(
+                    &edges,
+                    &vectors,
+                    &cell.unsolved_vars,
+                    &deltas,
+                )
+            }
+            compile::SseBasis::Rowspace(vectors) => {
+                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+                crate::sse::drag_delta_multi(&edges, &vectors, &cell.unsolved_vars, &deltas)
+            }
+        }
     }
 
     fn sse_drag_delta(&self, cell: &compile::CompiledCell) -> Option<SparseVec> {
@@ -2029,6 +2694,24 @@ impl LayoutCanvas {
             .is_some()
     }
 
+    fn draggable_point_targets(
+        targets: Vec<SseDragTarget>,
+        cell: &compile::CompiledCell,
+    ) -> Vec<SseDragTarget> {
+        if Self::sse_targets_support_2d(&targets, cell) {
+            targets
+        } else {
+            // A point constrained in one axis (or to a one-dimensional path)
+            // remains draggable through whichever coordinate controls its
+            // remaining degree of freedom.
+            targets
+                .into_iter()
+                .find(|target| Self::sse_target_supported(target, cell))
+                .into_iter()
+                .collect()
+        }
+    }
+
     fn selection_hits_at(&self, position: Point<Pixels>) -> Vec<SelectionHit> {
         let mut hits = Vec::new();
 
@@ -2040,7 +2723,31 @@ impl LayoutCanvas {
             if bounds.contains(&position) {
                 hits.push(SelectionHit {
                     span: span.clone(),
-                    bounds,
+                    area: bounds_area(bounds),
+                    outline: rect_selection_outline(bounds, rect.border_styles),
+                    layer: SelectionLayer::Layout(layer.z),
+                    paint_order,
+                });
+            }
+        }
+
+        for (paint_order, (polygon, layer)) in self.polygons.iter().enumerate() {
+            let Some(span) = &polygon.id else {
+                continue;
+            };
+            let points = polygon
+                .points
+                .iter()
+                .map(|point| self.layout_to_px(*point))
+                .collect::<Vec<_>>();
+            if point_in_polygon(position, &points) {
+                hits.push(SelectionHit {
+                    span: span.clone(),
+                    area: polygon_area(&points),
+                    outline: SelectionOutline::Polygon {
+                        points,
+                        edge_styles: polygon.edge_styles.clone(),
+                    },
                     layer: SelectionLayer::Layout(layer.z),
                     paint_order,
                 });
@@ -2055,7 +2762,8 @@ impl LayoutCanvas {
             if bounds.contains(&position) {
                 hits.push(SelectionHit {
                     span: span.clone(),
-                    bounds,
+                    area: bounds_area(bounds),
+                    outline: rect_selection_outline(bounds, bbox.rect.border_styles),
                     layer: SelectionLayer::Scope,
                     paint_order,
                 });
@@ -2067,7 +2775,11 @@ impl LayoutCanvas {
                 if bounds.contains(&position) {
                     hits.push(SelectionHit {
                         span: span.clone(),
-                        bounds: *bounds,
+                        area: bounds_area(*bounds),
+                        outline: SelectionOutline::Rect {
+                            bounds: *bounds,
+                            border_styles: Edges::all(BorderStyle::Solid),
+                        },
                         layer: SelectionLayer::Overlay,
                         paint_order,
                     });
@@ -2090,9 +2802,11 @@ impl LayoutCanvas {
                     .as_ref()
             })
         {
-            let scalex = self.screen_bounds.size.width / (bbox.x1 - bbox.x0) as f32;
-            let scaley = self.screen_bounds.size.height / (bbox.y1 - bbox.y0) as f32;
-            self.scale = 0.9 * f32::from(scalex.min(scaley));
+            self.scale = fit_scale(
+                self.screen_bounds.size,
+                (bbox.x1 - bbox.x0) as f32,
+                (bbox.y1 - bbox.y0) as f32,
+            );
             self.offset = Point::new(
                 px((-(bbox.x0 + bbox.x1) as f32 * self.scale
                     + f32::from(self.screen_bounds.size.width))
@@ -2204,6 +2918,33 @@ impl LayoutCanvas {
                             } else {
                                 let p0 = self.px_to_layout(event.position);
                                 rect_tool.p0 = Some(p0);
+                            }
+                        } else {
+                            let _ = state.lang_server_client.show_message(
+                                MessageType::ERROR,
+                                "Cannot draw on an invisible layer.",
+                            );
+                        }
+                    } else {
+                        let _ = state
+                            .lang_server_client
+                            .show_message(MessageType::ERROR, "No layer has been selected.");
+                    }
+                }
+                ToolState::DrawPolygon(polygon_tool) => {
+                    let state = self.state.read(cx);
+                    let layers = state.layers.read(cx);
+                    if let Some(layer) = &layers.selected_layer
+                        && let Some(layer_info) = layers.layers.get(layer)
+                    {
+                        if layer_info.visible {
+                            let point = Point::new(
+                                (layout_mouse_position.x * 10.).round() / 10.,
+                                (layout_mouse_position.y * 10.).round() / 10.,
+                            );
+                            if polygon_tool.points.last() != Some(&point) {
+                                polygon_tool.points.push(point);
+                                cx.notify();
                             }
                         } else {
                             let _ = state.lang_server_client.show_message(
@@ -2713,6 +3454,105 @@ impl LayoutCanvas {
         });
     }
 
+    pub(crate) fn draw_polygon(
+        &mut self,
+        _: &DrawPolygon,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            if !tool.is_draw_polygon() {
+                *tool = ToolState::DrawPolygon(DrawPolygonToolState::default());
+                cx.notify();
+            }
+        });
+    }
+
+    pub(crate) fn finish_polygon(
+        &mut self,
+        _: &Enter,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            let ToolState::DrawPolygon(polygon_tool) = tool else {
+                return;
+            };
+            if polygon_tool.points.len() < 3 {
+                let _ = self.state.read(cx).lang_server_client.show_message(
+                    MessageType::ERROR,
+                    "A polygon requires at least three points before pressing Enter.",
+                );
+                return;
+            }
+            let points = polygon_tool
+                .points
+                .iter()
+                .map(|point| (f64::from(point.x), f64::from(point.y)))
+                .collect::<Vec<_>>();
+            let Some(layer) = self
+                .state
+                .read(cx)
+                .layers
+                .read(cx)
+                .selected_layer
+                .as_ref()
+                .map(ToString::to_string)
+            else {
+                let _ = self
+                    .state
+                    .read(cx)
+                    .lang_server_client
+                    .show_message(MessageType::ERROR, "No layer has been selected.");
+                return;
+            };
+
+            let mut inserted = false;
+            self.state.update(cx, |state, cx| {
+                let error = state.solved_cell.update(cx, |cell, _cx| {
+                    let Some(cell) = cell.as_mut() else {
+                        return Some("no cell to edit".into());
+                    };
+                    let scope_address = &cell.state[&cell.selected_scope].address;
+                    let reachable_objs = cell
+                        .output
+                        .reachable_objs(scope_address.cell, scope_address.scope);
+                    let names: IndexSet<_> = reachable_objs.values().collect();
+                    let polygon_name = (0..)
+                        .map(|index| format!("polygon{index}"))
+                        .find(|name| !names.contains(name))
+                        .unwrap();
+                    let scope_span = cell.output.cells[&scope_address.cell].scopes
+                        [&scope_address.scope]
+                        .span
+                        .clone();
+                    match state.lang_server_client.draw_polygon(
+                        scope_span,
+                        polygon_name,
+                        PolygonParams {
+                            layer: layer.clone(),
+                            points: points.clone(),
+                        },
+                    ) {
+                        Ok(Some(_)) => {
+                            inserted = true;
+                            None
+                        }
+                        Ok(None) => Some("inconsistent editor and GUI state".into()),
+                        Err(_) => None,
+                    }
+                });
+                if state.fatal_error.is_none() {
+                    state.fatal_error = error;
+                }
+            });
+            if inserted {
+                polygon_tool.points.clear();
+                cx.notify();
+            }
+        });
+    }
+
     pub(crate) fn select_mode(
         &mut self,
         _: &SelectMode,
@@ -2800,6 +3640,9 @@ impl LayoutCanvas {
                 ToolState::DrawRect(DrawRectToolState { p0: p0 @ Some(_) }) => {
                     *p0 = None;
                 }
+                ToolState::DrawPolygon(DrawPolygonToolState { points }) if !points.is_empty() => {
+                    points.clear();
+                }
                 ToolState::DrawDim(DrawDimToolState { edges }) if !edges.is_empty() => {
                     edges.clear();
                 }
@@ -2871,67 +3714,23 @@ impl LayoutCanvas {
         self.sse_targets.clear();
     }
 
-    /// Computes the source rewrites that persist the just-finished SSE drag:
-    /// for every initial condition whose value changed, a [`ValueEdit`] setting
-    /// it to the dragged value. Mirrors the paint-time `sse_dv` computation.
-    fn sse_value_edits(&self, cx: &mut Context<Self>) -> Vec<ValueEdit> {
+    /// Computes replacements for existing fallbacks plus AST-aware requests to
+    /// insert any missing geometry initial conditions on the first drag.
+    fn sse_source_edits(&self, cx: &mut Context<Self>) -> DragPersistenceEdits {
         let solved = self.state.read(cx).solved_cell.read(cx);
         let Some(solved) = solved.as_ref() else {
-            return Vec::new();
+            return DragPersistenceEdits::default();
         };
         let selected = &solved.state[&solved.selected_scope].address;
         let editable_cell = &solved.output.cells[&selected.cell];
         let Some(dv) = self.sse_drag_delta(editable_cell) else {
-            return Vec::new();
+            return DragPersistenceEdits::default();
         };
-        let mut updates = editable_cell
-            .fallback_constraints_used
-            .iter()
-            .map(|fb| {
-                let (value, changed) =
-                    crate::sse::initial_condition_after_drag(&fb.constraint, &dv);
-                InitialConditionUpdate {
-                    span: fb.span.clone(),
-                    value,
-                    changed,
-                    target: fb.initial_condition,
-                }
-            })
-            .collect::<Vec<_>>();
-
-        // A rectangle remains valid when an edge passes its opposite edge by
-        // exchanging the low/high initial-condition values in source. Include
-        // the unchanged partner in the rewrite when necessary.
-        let mut pairs: HashMap<ObjectId, [Option<usize>; 4]> = HashMap::new();
-        for (index, update) in updates.iter().enumerate() {
-            let Some(target) = update.target else {
-                continue;
-            };
-            let (id, edge) = match target {
-                RectInitialCondition::X0(id) => (id, 0),
-                RectInitialCondition::X1(id) => (id, 1),
-                RectInitialCondition::Y0(id) => (id, 2),
-                RectInitialCondition::Y1(id) => (id, 3),
-            };
-            pairs.entry(id).or_insert([None; 4])[edge] = Some(index);
-        }
-        for pair in pairs.values() {
-            if let (Some(x0), Some(x1)) = (pair[0], pair[1]) {
-                sort_initial_condition_pair(&mut updates, x0, x1);
-            }
-            if let (Some(y0), Some(y1)) = (pair[2], pair[3]) {
-                sort_initial_condition_pair(&mut updates, y0, y1);
-            }
-        }
-
-        updates
-            .into_iter()
-            .filter(|update| update.changed)
-            .map(|update| ValueEdit {
-                span: update.span,
-                value: crate::sse::format_value(update.value),
-            })
-            .collect()
+        drag_persistence_edits(
+            &editable_cell.fallback_constraints_used,
+            &self.sse_targets,
+            &dv,
+        )
     }
 
     pub(crate) fn on_left_mouse_up(
@@ -2942,31 +3741,38 @@ impl LayoutCanvas {
     ) {
         let was_sse_dragging = self.is_sse_dragging;
         self.is_dragging = false;
-        // Persist the drag: rewrite the affected initial conditions in the source
-        // and recompile, so the layout does not snap back on release.
+        // Persist the drag by replacing existing fallbacks and inserting any
+        // missing initial-condition kwargs before recompiling.
         if was_sse_dragging {
-            let edits = self.sse_value_edits(cx);
-            if edits.is_empty() {
+            let edits = self.sse_source_edits(cx);
+            if edits.values.is_empty() && edits.initial_conditions.is_empty() {
                 self.is_sse_dragging = false;
                 self.pending_sse_values.clear();
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
-                let pending_values = pending_sse_values(&edits);
-                let selected_after_edits = {
-                    let tool = self.state.read(cx).tool.read(cx);
-                    match tool {
-                        ToolState::Select(SelectToolState {
-                            selected_obj: Some(selected),
-                        }) => Some(remap_span_after_value_edits(selected, &edits)),
-                        _ => None,
-                    }
-                };
-                match self.state.read(cx).lang_server_client.update_values(edits) {
-                    Ok(true) => {
+                match self
+                    .state
+                    .read(cx)
+                    .lang_server_client
+                    .update_values(edits.values, edits.initial_conditions)
+                {
+                    Ok(Some(applied_edits)) => {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
-                        self.pending_sse_values = pending_values;
+                        self.pending_sse_values = pending_sse_values(&applied_edits);
+                        // Anything deferred before the workspace edit was
+                        // accepted belongs to the pre-drag source revision.
+                        self.deferred_compile_output = None;
+                        let selected_after_edits = {
+                            let tool = self.state.read(cx).tool.read(cx);
+                            match tool {
+                                ToolState::Select(SelectToolState {
+                                    selected_obj: Some(selected),
+                                }) => Some(remap_span_after_value_edits(selected, &applied_edits)),
+                                _ => None,
+                            }
+                        };
                         if let Some(selected) = selected_after_edits {
                             let tool = self.state.read(cx).tool.clone();
                             tool.update(cx, |tool, cx| {
@@ -2977,7 +3783,7 @@ impl LayoutCanvas {
                             });
                         }
                     }
-                    Ok(false) => {
+                    Ok(None) => {
                         self.is_sse_dragging = false;
                         self.pending_sse_values.clear();
                         self.sse_delta = Point::default();
@@ -3008,7 +3814,10 @@ impl LayoutCanvas {
                 None
             }
         };
-        data.is_some_and(|data| compiled_data_matches_pending_sse(data, &self.pending_sse_values))
+        self.pending_sse_values.is_empty()
+            || data.is_some_and(|data| {
+                compiled_data_matches_pending_sse(data, &self.pending_sse_values)
+            })
     }
 
     pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
@@ -3085,7 +3894,7 @@ pub(crate) fn find_obj_path(
         .reachable_objs(current_scope.cell, current_scope.scope);
     if let Some(name) = reachable_objs.swap_remove(obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
-            SolvedValue::Rect(_) => string_path.push(name),
+            SolvedValue::Rect(_) | SolvedValue::Polygon(_) => string_path.push(name),
             SolvedValue::Instance(_) => {
                 string_path.push(name);
                 string_path = vec![format!("bbox({})", string_path.join("."))];
@@ -3128,15 +3937,273 @@ mod tests {
     }
 
     fn selection_hit(name: &str, layer: SelectionLayer, size: f32) -> SelectionHit {
+        let bounds = Bounds::new(Point::default(), Size::new(px(size), px(size)));
         SelectionHit {
             span: Span {
                 path: std::path::PathBuf::from(format!("{name}.ar")),
                 span: cfgrammar::Span::new(0, 1),
             },
-            bounds: Bounds::new(Point::default(), Size::new(px(size), px(size))),
+            area: bounds_area(bounds),
+            outline: SelectionOutline::Rect {
+                bounds,
+                border_styles: Edges::all(BorderStyle::Solid),
+            },
             layer,
             paint_order: 0,
         }
+    }
+
+    #[test]
+    fn rectangle_selection_outline_preserves_unconstrained_edge_styles() {
+        let styles = Edges {
+            top: BorderStyle::Solid,
+            right: BorderStyle::Dashed,
+            bottom: BorderStyle::Dashed,
+            left: BorderStyle::Solid,
+        };
+        let SelectionOutline::Rect { border_styles, .. } = rect_selection_outline(
+            Bounds::new(Point::default(), Size::new(px(10.), px(10.))),
+            styles,
+        ) else {
+            panic!("rectangle should produce a rectangular selection outline");
+        };
+        assert_eq!(border_styles, styles);
+    }
+
+    #[test]
+    fn concave_polygon_hit_test_excludes_its_empty_bbox_region() {
+        let polygon = [
+            Point::new(px(0.), px(0.)),
+            Point::new(px(10.), px(0.)),
+            Point::new(px(10.), px(4.)),
+            Point::new(px(4.), px(4.)),
+            Point::new(px(4.), px(10.)),
+            Point::new(px(0.), px(10.)),
+        ];
+
+        assert!(point_in_polygon(Point::new(px(2.), px(8.)), &polygon));
+        assert!(point_in_polygon(Point::new(px(4.), px(8.)), &polygon));
+        assert!(!point_in_polygon(Point::new(px(8.), px(8.)), &polygon));
+        assert_eq!(polygon_area(&polygon), 64.);
+    }
+
+    #[test]
+    fn polygon_edges_touching_a_one_axis_free_point_are_dashed() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/polygon/lib.ar");
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["one_axis_point"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(output) => output.output.unwrap(),
+            output => panic!("one-axis polygon fixture should compile: {output:?}"),
+        };
+        let cell = &output.cells[&output.top];
+        let polygon = cell
+            .objects
+            .values()
+            .find_map(SolvedValue::get_polygon)
+            .expect("fixture should contain a polygon");
+        let styles = polygon_edge_styles(polygon.points.len(), |index| {
+            let (x, y) = &polygon.points[index];
+            x.1.coeffs
+                .iter()
+                .chain(&y.1.coeffs)
+                .any(|(_, var)| cell.unsolved_vars.contains(var))
+        });
+        assert_eq!(
+            styles,
+            [BorderStyle::Solid, BorderStyle::Dashed, BorderStyle::Dashed,]
+        );
+
+        let (x, y) = &polygon.points[2];
+        let targets = LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), cell);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].expr, x.1);
+        let drag = LayoutCanvas::sse_drag_delta_for_targets(&targets, cell, Point::new(12., 20.))
+            .expect("the free x coordinate should drag");
+        assert!((crate::sse::dot(&SparseVec::from(&x.1), &drag) - 12.).abs() < 1e-6);
+        assert!(crate::sse::dot(&SparseVec::from(&y.1), &drag).abs() < 1e-6);
+    }
+
+    #[test]
+    fn polygon_vertex_drag_moves_both_axes_and_produces_source_edits() {
+        let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/polygon/lib.ar");
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["initial_points"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(output) => output.output.unwrap(),
+            output => panic!("polygon fixture should compile: {output:?}"),
+        };
+        let cell = &output.cells[&output.top];
+        let polygon = cell
+            .objects
+            .values()
+            .find_map(SolvedValue::get_polygon)
+            .expect("fixture should contain a polygon");
+        let (x, y) = &polygon.points[2];
+        let call_span = polygon.span.clone().expect("polygon should have source");
+        let targets = vec![
+            SseDragTarget {
+                expr: x.1.clone(),
+                normal: Point::new(1., 0.),
+                source: Some(SseSourceTarget {
+                    call_span: call_span.clone(),
+                    name: "x2i".to_owned(),
+                    value: x.0,
+                }),
+            },
+            SseDragTarget {
+                expr: y.1.clone(),
+                normal: Point::new(0., 1.),
+                source: Some(SseSourceTarget {
+                    call_span,
+                    name: "y2i".to_owned(),
+                    value: y.0,
+                }),
+            },
+        ];
+        assert!(LayoutCanvas::sse_targets_support_2d(&targets, cell));
+
+        let drag = LayoutCanvas::sse_drag_delta_for_targets(&targets, cell, Point::new(12.3, -4.5))
+            .expect("both vertex axes should be draggable");
+        assert!((crate::sse::dot(&SparseVec::from(&x.1), &drag) - 12.3).abs() < 1e-6);
+        assert!((crate::sse::dot(&SparseVec::from(&y.1), &drag) + 4.5).abs() < 1e-6);
+
+        let edits = drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag);
+        let x_fallback = cell
+            .fallback_constraints_used
+            .iter()
+            .find(|fallback| {
+                matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PolygonX(_, 2))
+                )
+            })
+            .unwrap();
+        let y_fallback = cell
+            .fallback_constraints_used
+            .iter()
+            .find(|fallback| {
+                matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PolygonY(_, 2))
+                )
+            })
+            .unwrap();
+        assert_eq!(edits.values.len(), 2);
+        assert_eq!(edits.initial_conditions.len(), 2);
+        assert!(
+            edits
+                .values
+                .iter()
+                .any(|edit| edit.span == x_fallback.span && edit.value == "62.3")
+        );
+        assert!(
+            edits
+                .values
+                .iter()
+                .any(|edit| edit.span == y_fallback.span && edit.value == "70.5")
+        );
+
+        let inserted = drag_persistence_edits(&[], &targets, &drag);
+        assert!(inserted.values.is_empty());
+        assert!(inserted.initial_conditions.iter().any(|edit| {
+            edit.name == "x2i"
+                && edit.value == "62.3"
+                && edit.call_span == polygon.span.clone().unwrap()
+        }));
+        assert!(inserted.initial_conditions.iter().any(|edit| {
+            edit.name == "y2i"
+                && edit.value == "70.5"
+                && edit.call_span == polygon.span.clone().unwrap()
+        }));
+    }
+
+    #[test]
+    fn first_drag_requests_missing_rectangle_and_instance_initial_conditions() {
+        let mut solver = argonc::solver::Solver::new();
+        let rect_x0: LinearExpr = solver.new_var().into();
+        let rect_y1: LinearExpr = solver.new_var().into();
+        let inst_x: LinearExpr = solver.new_var().into();
+        let rect_span = Span {
+            path: std::path::PathBuf::from("/virtual/lib.ar"),
+            span: cfgrammar::Span::new(10, 24),
+        };
+        let inst_span = Span {
+            path: rect_span.path.clone(),
+            span: cfgrammar::Span::new(30, 40),
+        };
+        let targets = [
+            SseDragTarget {
+                expr: rect_x0.clone(),
+                normal: Point::new(1., 0.),
+                source: Some(SseSourceTarget {
+                    call_span: rect_span.clone(),
+                    name: "x0i".to_owned(),
+                    value: 10.,
+                }),
+            },
+            SseDragTarget {
+                expr: rect_y1.clone(),
+                normal: Point::new(0., 1.),
+                source: Some(SseSourceTarget {
+                    call_span: rect_span.clone(),
+                    name: "y1i".to_owned(),
+                    value: 20.,
+                }),
+            },
+            SseDragTarget {
+                expr: inst_x.clone(),
+                normal: Point::new(1., 0.),
+                source: Some(SseSourceTarget {
+                    call_span: inst_span.clone(),
+                    name: "xi".to_owned(),
+                    value: 100.,
+                }),
+            },
+        ];
+        let drag = SparseVec(
+            [
+                (rect_x0.coeffs[0].1, 5.),
+                (rect_y1.coeffs[0].1, -3.),
+                (inst_x.coeffs[0].1, 12.),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let edits = drag_persistence_edits(&[], &targets, &drag);
+        assert!(edits.values.is_empty());
+        assert!(edits.initial_conditions.iter().any(|edit| {
+            edit.call_span == rect_span && edit.name == "x0i" && edit.value == "15."
+        }));
+        assert!(edits.initial_conditions.iter().any(|edit| {
+            edit.call_span == rect_span && edit.name == "y1i" && edit.value == "17."
+        }));
+        assert!(edits.initial_conditions.iter().any(|edit| {
+            edit.call_span == inst_span && edit.name == "xi" && edit.value == "112."
+        }));
     }
 
     #[test]
@@ -3190,6 +4257,15 @@ mod tests {
         let below_old_floor = zoomed_scale(0.01, -20.);
         assert!(below_old_floor < 0.01);
         assert!(zoomed_scale(below_old_floor, -20.) < below_old_floor);
+    }
+
+    #[test]
+    fn fit_scale_handles_point_and_line_bounds() {
+        let viewport = Size::new(px(1000.), px(500.));
+        assert_eq!(fit_scale(viewport, 0., 0.), 1.);
+        assert_eq!(fit_scale(viewport, 100., 0.), 9.);
+        assert_eq!(fit_scale(viewport, 0., 100.), 4.5);
+        assert_eq!(fit_scale(viewport, 100., 100.), 4.5);
     }
 
     #[test]
@@ -3396,8 +4472,9 @@ cell top() {
             output => panic!("preview fixture should compile: {output:?}"),
         };
 
-        let rects = instance_preview_rects(&output, output.top);
+        let (rects, polygons) = instance_preview_geometry(&output, output.top);
         assert_eq!(rects.len(), 1);
+        assert!(polygons.is_empty());
         assert_eq!(
             (rects[0].x0, rects[0].y0, rects[0].x1, rects[0].y1),
             (3., 4., 13., 9.)

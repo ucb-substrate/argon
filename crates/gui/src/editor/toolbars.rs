@@ -8,7 +8,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 
 use crate::{
-    actions::{DrawDim, DrawRect, InstantiateCommand, OpenCellCommand, SelectMode},
+    actions::{DrawDim, DrawPolygon, DrawRect, InstantiateCommand, OpenCellCommand, SelectMode},
     editor::{
         CompileOutputState, Layers, ScopeAddress, ScopePath,
         canvas::{EditDimToolState, LayoutCanvas, ToolState},
@@ -147,6 +147,16 @@ impl Render for ToolBar {
                         Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&DrawRect);
+                            })
+                        }),
+                    )),
+                    Some((
+                        "btn_polygon",
+                        "icons/polygon.svg",
+                        Box::new(|tool| matches!(tool, ToolState::DrawPolygon(_))),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&DrawPolygon);
                             })
                         }),
                     )),

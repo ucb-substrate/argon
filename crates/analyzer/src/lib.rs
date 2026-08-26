@@ -1,8 +1,10 @@
 pub mod document;
 pub mod rpc;
 
+pub mod cli;
+
 use std::{
-    io,
+    env, fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
@@ -41,12 +43,106 @@ use tracing_subscriber::EnvFilter;
 
 use crate::document::{Document, DocumentChange};
 
-// TODO: Allow configuration via ARGON_HOME environment variable.
-pub fn default_argon_home() -> Option<PathBuf> {
-    homedir::my_home()
-        .ok()
-        .flatten()
-        .map(|home| home.join(".local/state/argon"))
+const DEFAULT_LOG_LEVEL: &str = "error";
+const LOG_FILE: &str = "argon.log";
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ArgonConfig {
+    log: LogConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LogConfig {
+    level: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: DEFAULT_LOG_LEVEL.to_owned(),
+        }
+    }
+}
+
+pub fn argon_config_path() -> Option<PathBuf> {
+    env::var_os("XDG_CONFIG_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            homedir::my_home()
+                .ok()
+                .flatten()
+                .map(|home| home.join(".config"))
+        })
+        .map(|directory| directory.join("argon/config.toml"))
+}
+
+pub fn argon_state_dir() -> Option<PathBuf> {
+    env::var_os("XDG_STATE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            homedir::my_home()
+                .ok()
+                .flatten()
+                .map(|home| home.join(".local/state"))
+        })
+        .map(|directory| directory.join("argon"))
+}
+
+pub fn argon_log_path() -> Option<PathBuf> {
+    argon_state_dir().map(|directory| directory.join(LOG_FILE))
+}
+
+fn read_config() -> std::result::Result<ArgonConfig, String> {
+    let Some(path) = argon_config_path() else {
+        return Ok(ArgonConfig::default());
+    };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ArgonConfig::default());
+        }
+        Err(error) => {
+            return Err(format!("could not read '{}': {error}", path.display()));
+        }
+    };
+    parse_config(&text).map_err(|error| format!("could not parse '{}': {error}", path.display()))
+}
+
+fn parse_config(text: &str) -> std::result::Result<ArgonConfig, toml::de::Error> {
+    toml::from_str(text)
+}
+
+pub fn init_logging() {
+    let config = read_config().unwrap_or_else(|error| {
+        eprintln!("argon: {error}; using log level '{DEFAULT_LOG_LEVEL}'");
+        ArgonConfig::default()
+    });
+    let filter = EnvFilter::try_new(&config.log.level).unwrap_or_else(|error| {
+        eprintln!(
+            "argon: invalid log level '{}': {error}; using '{DEFAULT_LOG_LEVEL}'",
+            config.log.level
+        );
+        EnvFilter::new(DEFAULT_LOG_LEVEL)
+    });
+    let Some(log_dir) = argon_state_dir() else {
+        return;
+    };
+    if let Err(error) = fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "argon: could not create log directory '{}': {error}",
+            log_dir.display()
+        );
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(tracing_appender::rolling::never(log_dir, LOG_FILE))
+        .with_ansi(false)
+        .try_init();
 }
 
 // TODO: finer-grained synchronization?
@@ -1222,14 +1318,7 @@ pub async fn main_with_io_on_listener<I, O>(
         )
         .await;
 
-    // TODO: Allow configuration via ARGON_HOME environment variable.
-    if let Some(log_dir) = default_argon_home() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
-            .with_writer(tracing_appender::rolling::never(log_dir, "analyzer.log"))
-            .with_ansi(false)
-            .try_init();
-    }
+    init_logging();
 
     // Start actual LSP server.
     Server::new(stdin, stdout, socket).serve(service).await;
@@ -1245,7 +1334,24 @@ mod tests {
         parse,
     };
 
-    use super::{parse_setting, preview_instance_cell, revision_is_stale, save_needs_compile};
+    use super::{
+        DEFAULT_LOG_LEVEL, parse_config, parse_setting, preview_instance_cell, revision_is_stale,
+        save_needs_compile,
+    };
+
+    #[test]
+    fn logging_config_defaults_to_errors() {
+        let config = parse_config("").expect("empty config should use defaults");
+        assert_eq!(config.log.level, DEFAULT_LOG_LEVEL);
+    }
+
+    #[test]
+    fn logging_config_reads_filter_and_rejects_unknown_keys() {
+        let config =
+            parse_config("[log]\nlevel = \"analyzer=debug,argone=trace\"\n").expect("valid config");
+        assert_eq!(config.log.level, "analyzer=debug,argone=trace");
+        assert!(parse_config("[log]\nunknown = true\n").is_err());
+    }
 
     #[test]
     fn open_cell_accepts_boolean_literals() {

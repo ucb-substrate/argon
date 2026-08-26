@@ -158,10 +158,6 @@ M.start = function(bufnr)
         )
         root_dir = vim.fs.dirname(bufname)
     end
-    local cmd_env = {}
-    if config.log.level then
-        cmd_env.ARGON_LOG = config.log.level
-    end
     local analyzer_cmd = config.cmd or { config.analyzer }
     if type(analyzer_cmd) == 'table' then
       analyzer_cmd = vim.deepcopy(analyzer_cmd)
@@ -181,7 +177,6 @@ M.start = function(bufnr)
     local lsp_start_config = { 
         name = 'argon',
         cmd = analyzer_cmd,
-        cmd_env = cmd_env,
         handlers = {
             ['custom/save'] = function(err, result, ctx)
                 if err then
