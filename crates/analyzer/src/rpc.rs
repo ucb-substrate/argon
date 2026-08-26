@@ -304,15 +304,15 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = Document::new(&ast.source_text, 0);
         let expression = format!(
-            "rect({}x0i = {:?}, y0i = {:?}, x1i = {:?}, y1i = {:?})",
+            "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
             rect.layer
                 .as_ref()
                 .map(|layer| format!("\"{layer}\", "))
                 .unwrap_or_default(),
-            rect.x0,
-            rect.y0,
-            rect.x1,
-            rect.y1,
+            argonc::compile::format_initial_condition(rect.x0),
+            argonc::compile::format_initial_condition(rect.y0),
+            argonc::compile::format_initial_condition(rect.x1),
+            argonc::compile::format_initial_condition(rect.y1),
         );
         let prefix = format!("let {var_name} = ");
         let insertion = insert_statement(

@@ -29,6 +29,7 @@ pub enum GuiEvent {
         scope: Option<Span>,
         rect_count: usize,
     },
+    WorkspaceModified(bool),
 }
 
 #[derive(Clone)]
@@ -55,7 +56,11 @@ impl Gui for HeadlessGui {
             .expect("full-stack test should still be receiving GUI events");
     }
 
-    async fn workspace_modified(self, _: context::Context, _: bool) {}
+    async fn workspace_modified(self, _: context::Context, modified: bool) {
+        self.events
+            .send(GuiEvent::WorkspaceModified(modified))
+            .expect("full-stack test should still be receiving GUI events");
+    }
 
     async fn selected_scope(self, _: context::Context) -> Option<Span> {
         None
@@ -272,7 +277,8 @@ mod tests {
 
             let mut drew_rect = false;
             let mut saw_editor_update = false;
-            while !saw_editor_update {
+            let mut saw_workspace_modified = false;
+            while !(saw_editor_update && saw_workspace_modified) {
                 match session.next_event().await {
                     GuiEvent::OpenCell {
                         kind: OutputKind::Data,
@@ -288,9 +294,9 @@ mod tests {
                                 "gui_rect".to_owned(),
                                 BasicRect {
                                     layer: Some("met1".to_owned()),
-                                    x0: 0.0,
-                                    y0: 0.0,
-                                    x1: 10.0,
+                                    x0: 1.2000000476837158,
+                                    y0: -0.04,
+                                    x1: 10.349,
                                     y1: 10.0,
                                     construction: false,
                                 },
@@ -317,6 +323,7 @@ mod tests {
                         rect_count,
                         ..
                     } if rect_count >= 2 => saw_editor_update = true,
+                    GuiEvent::WorkspaceModified(true) => saw_workspace_modified = true,
                     _ => {}
                 }
             }
@@ -326,6 +333,7 @@ mod tests {
             let source = std::fs::read_to_string(session.project.join("lib.ar"))
                 .expect("read round-tripped source");
             assert!(source.contains("let gui_rect = rect("));
+            assert!(source.contains("x0i = 1.2, y0i = 0., x1i = 10.3, y1i = 10."));
             assert!(source.contains("let editor_rect = rect("));
         })
         .await;

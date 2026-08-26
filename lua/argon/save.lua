@@ -1,4 +1,5 @@
 local M = {}
+local reported_workspace_modified = {}
 
 local function client_buffers(client_id)
     return vim.lsp.get_buffers_by_client_id
@@ -33,9 +34,24 @@ function M.notify_workspace_modified(client_id)
     if not lsp_client or lsp_client.name ~= 'argon' then
         return
     end
-    lsp_client:notify('custom/workspaceModified', {
-        modified = M.workspace_modified(client_id),
-    })
+    local modified = M.workspace_modified(client_id)
+    if reported_workspace_modified[client_id] == modified then
+        return
+    end
+    reported_workspace_modified[client_id] = modified
+    lsp_client:request(
+        'custom/workspaceModified',
+        { modified = modified },
+        function(err)
+            if err then
+                if reported_workspace_modified[client_id] == modified then
+                    reported_workspace_modified[client_id] = nil
+                end
+                vim.notify('argon: Could not update GUI save state: ' .. tostring(err), vim.log.levels.ERROR)
+            end
+        end,
+        0
+    )
 end
 
 ---Write every modified, file-backed Argon buffer attached to one LSP client.

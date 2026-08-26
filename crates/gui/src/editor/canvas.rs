@@ -186,6 +186,12 @@ struct InitialConditionUpdate {
     target: Option<RectInitialCondition>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingSseValue {
+    span: Span,
+    value: f64,
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rect {
     pub x0: f32,
@@ -416,6 +422,8 @@ pub struct LayoutCanvas {
     // Keep displaying the final drag preview after mouse-up until the analyzer
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
+    pending_sse_values: Vec<PendingSseValue>,
+    deferred_compile_output: Option<(compile::CompileOutput, bool)>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
@@ -531,6 +539,31 @@ fn remap_span_after_value_edits(selected: &Span, edits: &[ValueEdit]) -> Span {
         path: selected.path.clone(),
         span: cfgrammar::Span::new(shifted_start, shifted_end),
     }
+}
+
+fn pending_sse_values(edits: &[ValueEdit]) -> Vec<PendingSseValue> {
+    edits
+        .iter()
+        .filter_map(|edit| {
+            Some(PendingSseValue {
+                span: remap_span_after_value_edits(&edit.span, edits),
+                value: edit.value.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseValue]) -> bool {
+    !pending.is_empty()
+        && pending.iter().all(|expected| {
+            data.cells
+                .values()
+                .flat_map(|cell| &cell.fallback_constraints_used)
+                .any(|fallback| {
+                    fallback.span == expected.span
+                        && (-fallback.constraint.constant - expected.value).abs() < 1e-8
+                })
+        })
 }
 
 fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>) -> f64 {
@@ -1900,6 +1933,8 @@ impl LayoutCanvas {
             is_dragging: false,
             is_sse_dragging: false,
             is_sse_persisting: false,
+            pending_sse_values: Vec::new(),
+            deferred_compile_output: None,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
             sse_handles: Vec::new(),
@@ -1929,6 +1964,20 @@ impl LayoutCanvas {
             });
             cx.notify();
         });
+    }
+
+    pub(crate) fn is_sse_dragging(&self) -> bool {
+        self.is_sse_dragging
+    }
+
+    pub(crate) fn defer_compile_output(&mut self, output: compile::CompileOutput, update: bool) {
+        self.deferred_compile_output = Some((output, update));
+    }
+
+    pub(crate) fn take_deferred_compile_output(
+        &mut self,
+    ) -> Option<(compile::CompileOutput, bool)> {
+        self.deferred_compile_output.take()
     }
 
     fn sse_drag_delta_for_targets(
@@ -2588,6 +2637,8 @@ impl LayoutCanvas {
                         .cloned();
                     if let Some(handle) = handle {
                         self.is_sse_persisting = false;
+                        self.pending_sse_values.clear();
+                        self.deferred_compile_output = None;
                         self.is_sse_dragging = true;
                         self.drag_start = event.position;
                         self.sse_delta = Point::default();
@@ -2612,6 +2663,8 @@ impl LayoutCanvas {
                                 .cloned()
                             {
                                 self.is_sse_persisting = false;
+                                self.pending_sse_values.clear();
+                                self.deferred_compile_output = None;
                                 self.is_sse_dragging = true;
                                 self.drag_start = event.position;
                                 self.sse_delta = Point::default();
@@ -2895,9 +2948,11 @@ impl LayoutCanvas {
             let edits = self.sse_value_edits(cx);
             if edits.is_empty() {
                 self.is_sse_dragging = false;
+                self.pending_sse_values.clear();
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
+                let pending_values = pending_sse_values(&edits);
                 let selected_after_edits = {
                     let tool = self.state.read(cx).tool.read(cx);
                     match tool {
@@ -2911,6 +2966,7 @@ impl LayoutCanvas {
                     Ok(true) => {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
+                        self.pending_sse_values = pending_values;
                         if let Some(selected) = selected_after_edits {
                             let tool = self.state.read(cx).tool.clone();
                             tool.update(cx, |tool, cx| {
@@ -2923,11 +2979,13 @@ impl LayoutCanvas {
                     }
                     Ok(false) => {
                         self.is_sse_dragging = false;
+                        self.pending_sse_values.clear();
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
                     Err(_) => {
                         self.is_sse_dragging = false;
+                        self.pending_sse_values.clear();
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
@@ -2939,9 +2997,24 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
+    pub(crate) fn accepts_compile_output(&self, output: &compile::CompileOutput) -> bool {
+        if !self.is_sse_persisting {
+            return true;
+        }
+        let data = match output {
+            compile::CompileOutput::Valid(data) => Some(data),
+            compile::CompileOutput::ExecErrors(output) => output.output.as_ref(),
+            compile::CompileOutput::StaticErrors(_) | compile::CompileOutput::FatalParseErrors => {
+                None
+            }
+        };
+        data.is_some_and(|data| compiled_data_matches_pending_sse(data, &self.pending_sse_values))
+    }
+
     pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
         if self.is_sse_persisting {
             self.is_sse_persisting = false;
+            self.pending_sse_values.clear();
             self.sse_delta = Point::default();
             self.sse_targets.clear();
             cx.notify();
@@ -3145,6 +3218,76 @@ mod tests {
 
         let remapped = remap_span_after_value_edits(&selected, &edits);
         assert_eq!(remapped.span, cfgrammar::Span::new(12, 34));
+    }
+
+    #[test]
+    fn pending_drag_values_track_their_compiled_source_spans() {
+        let path = std::path::PathBuf::from("lib.ar");
+        let edits = [
+            ValueEdit {
+                span: Span {
+                    path: path.clone(),
+                    span: cfgrammar::Span::new(10, 19),
+                },
+                value: "1.2".to_owned(),
+            },
+            ValueEdit {
+                span: Span {
+                    path,
+                    span: cfgrammar::Span::new(30, 32),
+                },
+                value: "0.".to_owned(),
+            },
+        ];
+
+        let pending = pending_sse_values(&edits);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].span.span, cfgrammar::Span::new(10, 13));
+        assert_eq!(pending[0].value, 1.2);
+        assert_eq!(pending[1].span.span, cfgrammar::Span::new(24, 26));
+        assert_eq!(pending[1].value, 0.);
+    }
+
+    #[test]
+    fn stale_compile_output_does_not_finish_a_drag_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            "cell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(compile::ExecErrorCompileOutput {
+                output: Some(output),
+                ..
+            }) => output,
+            output => panic!("drag fixture should produce geometry: {output:?}"),
+        };
+        let fallback = output.cells[&output.top]
+            .fallback_constraints_used
+            .first()
+            .expect("rectangle should use its initial conditions");
+        let mut pending = vec![PendingSseValue {
+            span: fallback.span.clone(),
+            value: -fallback.constraint.constant,
+        }];
+
+        assert!(compiled_data_matches_pending_sse(&output, &pending));
+        pending[0].value += 1.;
+        assert!(!compiled_data_matches_pending_sse(&output, &pending));
     }
 
     #[test]

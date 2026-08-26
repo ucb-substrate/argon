@@ -2295,6 +2295,35 @@ pub struct BasicRect<T> {
     pub construction: bool,
 }
 
+/// Formats a GUI-created layout coordinate as an Argon float literal.
+///
+/// Coordinates are snapped to the solver's 0.1 grid, use at most one decimal
+/// place, and always contain a decimal point so they continue to parse as
+/// floats rather than integers.
+pub fn format_initial_condition(value: f64) -> String {
+    // Adding positive zero normalizes a rounded `-0.0` to `0.0`.
+    let snapped = (value * 10.0).round() / 10.0 + 0.0;
+    let value = format!("{snapped}");
+    if value.contains('.') {
+        value
+    } else {
+        format!("{value}.")
+    }
+}
+
+#[cfg(test)]
+mod initial_condition_format_tests {
+    use super::format_initial_condition;
+
+    #[test]
+    fn limits_gui_coordinates_to_one_decimal_place() {
+        assert_eq!(format_initial_condition(12.345678), "12.3");
+        assert_eq!(format_initial_condition(12.0), "12.");
+        assert_eq!(format_initial_condition(-0.04), "0.");
+        assert_eq!(format_initial_condition(1.2000000476837158), "1.2");
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Rect<T> {
     pub layer: Option<String>,

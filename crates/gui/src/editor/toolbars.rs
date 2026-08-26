@@ -38,18 +38,24 @@ impl Render for TitleBar {
     ) -> impl gpui::IntoElement {
         let state = self.state.read(cx);
         let theme = state.theme();
-        let title = if state.workspace_modified {
-            "Argon  •  Unsaved"
-        } else {
-            "Argon"
-        };
-        div()
+        let mut title = div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
             .p_1()
             .bg(theme.titlebar)
-            .text_center()
-            .child(title)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child("Argon");
+        if state.workspace_modified {
+            title = title.child(
+                div()
+                    .ml_2()
+                    .text_color(theme.error)
+                    .child("● UNSAVED CHANGES"),
+            );
+        }
+        title
     }
 }
 

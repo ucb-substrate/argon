@@ -37,7 +37,7 @@ vim.lsp.get_client_by_id = function(id)
   assert(id == client_id)
   return {
     name = 'argon',
-    notify = function(_, method, params)
+    request = function(_, method, params)
       notification = { method = method, params = params }
     end,
   }

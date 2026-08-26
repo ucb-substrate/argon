@@ -11,35 +11,64 @@ local function schedule_workspace_modified(client_id)
     end)
 end
 
+local modified_clients_by_buffer = {}
+
+local function schedule_buffer_clients(bufnr)
+    for client_id in pairs(modified_clients_by_buffer[bufnr] or {}) do
+        schedule_workspace_modified(client_id)
+    end
+end
+
+local function track_modified_buffer(bufnr, client_id)
+    local clients = modified_clients_by_buffer[bufnr]
+    if clients then
+        clients[client_id] = true
+        return
+    end
+    modified_clients_by_buffer[bufnr] = { [client_id] = true }
+    vim.api.nvim_buf_attach(bufnr, false, {
+        on_lines = function()
+            schedule_buffer_clients(bufnr)
+        end,
+        on_detach = function()
+            schedule_buffer_clients(bufnr)
+            modified_clients_by_buffer[bufnr] = nil
+        end,
+    })
+end
+
 local modified_group = vim.api.nvim_create_augroup('argon_workspace_modified', { clear = true })
 vim.api.nvim_create_autocmd('BufModifiedSet', {
     group = modified_group,
     callback = function(args)
-        for _, lsp_client in ipairs(client.get_active_argon_lsp_clients(args.buf)) do
-            schedule_workspace_modified(lsp_client.id)
-        end
+        schedule_buffer_clients(args.buf)
+    end,
+})
+vim.api.nvim_create_autocmd('BufWritePost', {
+    group = modified_group,
+    callback = function(args)
+        schedule_buffer_clients(args.buf)
     end,
 })
 vim.api.nvim_create_autocmd('LspAttach', {
     group = modified_group,
     callback = function(args)
+        local attached_client = vim.lsp.get_client_by_id(args.data.client_id)
+        if not attached_client or attached_client.name ~= 'argon' then
+            return
+        end
+        track_modified_buffer(args.buf, args.data.client_id)
         schedule_workspace_modified(args.data.client_id)
     end,
 })
-vim.api.nvim_create_autocmd({ 'LspDetach', 'BufDelete' }, {
+vim.api.nvim_create_autocmd('LspDetach', {
     group = modified_group,
     callback = function(args)
-        local client_ids = {}
-        if args.event == 'LspDetach' then
-            client_ids = { args.data.client_id }
-        else
-            for _, lsp_client in ipairs(client.get_active_argon_lsp_clients(args.buf)) do
-                table.insert(client_ids, lsp_client.id)
-            end
+        local clients = modified_clients_by_buffer[args.buf]
+        if clients then
+            clients[args.data.client_id] = nil
         end
-        for _, client_id in ipairs(client_ids) do
-            schedule_workspace_modified(client_id)
-        end
+        schedule_workspace_modified(args.data.client_id)
     end,
 })
 
@@ -233,7 +262,12 @@ M.start = function(bufnr)
         end
     end
 
-    vim.lsp.start(lsp_start_config, { bufnr = bufnr })
+    local client_id = vim.lsp.start(lsp_start_config, { bufnr = bufnr })
+    if client_id then
+        track_modified_buffer(bufnr, client_id)
+        schedule_workspace_modified(client_id)
+    end
+    return client_id
 end
 
 ---Stop the LSP client.

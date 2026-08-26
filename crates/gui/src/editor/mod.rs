@@ -400,6 +400,14 @@ impl Editor {
     }
 
     pub fn open_cell(&self, cx: &mut App, output: CompileOutput, update: bool) {
+        if self.canvas.read(cx).is_sse_dragging() {
+            self.canvas
+                .update(cx, |canvas, _| canvas.defer_compile_output(output, update));
+            return;
+        }
+        if update && !self.canvas.read(cx).accepts_compile_output(&output) {
+            return;
+        }
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
             state.update(cx, output);
@@ -477,6 +485,15 @@ impl Editor {
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
         cx.notify();
+    }
+
+    fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let deferred = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_compile_output());
+        if let Some((output, update)) = deferred {
+            self.open_cell(cx, output, update);
+        }
     }
 
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
@@ -589,6 +606,7 @@ impl Render for Editor {
             .overflow_hidden()
             .whitespace_nowrap()
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
             .child(self.title_bar.clone())
             .child(self.tool_bar.clone())
             .child(
