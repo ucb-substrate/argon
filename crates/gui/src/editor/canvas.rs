@@ -1946,16 +1946,20 @@ impl LayoutCanvas {
                 (target.normal.x * layout_delta.x + target.normal.y * layout_delta.y) as f64
             })
             .collect::<Vec<_>>();
-        if let Some(nullspace) = &cell.nullspace_vecs {
-            let nullspace = nullspace.iter().map(SparseVec::from).collect::<Vec<_>>();
-            crate::sse::drag_delta_multi_nullspace(&edges, &nullspace, &cell.unsolved_vars, &deltas)
-        } else {
-            let rowspace = cell
-                .rowspace_vecs
-                .iter()
-                .map(SparseVec::from)
-                .collect::<Vec<_>>();
-            crate::sse::drag_delta_multi(&edges, &rowspace, &cell.unsolved_vars, &deltas)
+        match &cell.sse_basis {
+            compile::SseBasis::Nullspace(vectors) => {
+                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+                crate::sse::drag_delta_multi_nullspace(
+                    &edges,
+                    &vectors,
+                    &cell.unsolved_vars,
+                    &deltas,
+                )
+            }
+            compile::SseBasis::Rowspace(vectors) => {
+                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+                crate::sse::drag_delta_multi(&edges, &vectors, &cell.unsolved_vars, &deltas)
+            }
         }
     }
 

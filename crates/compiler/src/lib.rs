@@ -1987,9 +1987,11 @@ mod tests {
 
         let cells = cells.unwrap_exec_errors().output.unwrap();
         let cell = &cells.cells[&cells.top];
-        println!("nullspace vecs = {:?}", cell.nullspace_vecs);
-        assert!(cell.rowspace_vecs.is_empty());
-        assert_eq!(cell.nullspace_vecs.as_ref().unwrap().len(), 1);
+        println!("SSE basis = {:?}", cell.sse_basis);
+        let crate::compile::SseBasis::Nullspace(vectors) = &cell.sse_basis else {
+            panic!("sparse SSE system should expose a null-space basis");
+        };
+        assert_eq!(vectors.len(), 1);
     }
 
     #[test]
