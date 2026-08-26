@@ -101,14 +101,14 @@ impl Session {
         std::fs::write(project.join("lib.ar"), source).expect("write test source");
         std::fs::write(
             project.join("Argon.toml"),
-            "name = \"full-stack-test\"\nlyp = \"layers.lyp\"\n",
+            "name = \"full-stack-test\"\ntech = \"tech.toml\"\n",
         )
         .expect("write test manifest");
         std::fs::copy(
-            repository_root().join("examples/lyp/basic.lyp"),
-            project.join("layers.lyp"),
+            repository_root().join("examples/tech/basic.tech.toml"),
+            project.join("tech.toml"),
         )
-        .expect("copy test layer properties");
+        .expect("copy test technology");
 
         let analyzer_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await

@@ -139,9 +139,9 @@ fn check(args: LibraryArgs) -> Result<()> {
 
 fn run_cell(args: RunArgs) -> Result<()> {
     let library = Library::load(&args.library.manifest_path)?;
-    let lyp = library.lyp.as_ref().ok_or_else(|| {
+    let tech = library.tech.as_ref().ok_or_else(|| {
         anyhow!(
-            "cannot run a cell because manifest `{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
+            "cannot run a cell because manifest `{}` does not set `tech`; add `tech = \"path/to/tech.toml\"`",
             library.manifest_path.display()
         )
     })?;
@@ -153,8 +153,8 @@ fn run_cell(args: RunArgs) -> Result<()> {
     command
         .arg("--cell")
         .arg(args.cell)
-        .arg("--lyp")
-        .arg(lyp)
+        .arg("--tech")
+        .arg(tech)
         .arg("--output")
         .arg(&output);
     if args.gds {

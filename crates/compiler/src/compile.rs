@@ -28,7 +28,6 @@ use crate::ast::{
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
-use crate::layer::LayerProperties;
 use crate::parse::{ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
 use crate::{
@@ -115,8 +114,8 @@ pub fn dynamic_compile_with_gds(
     input: CompileInput<'_>,
     gds_imports: &[(String, PathBuf)],
 ) -> CompileOutput {
-    let lyp_file = input.lyp_file;
-    let res = ExecPass::new(ast, lyp_file, gds_imports).execute(input);
+    let tech_file = input.tech_file;
+    let res = ExecPass::new(ast, tech_file, gds_imports).execute(input);
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -128,7 +127,7 @@ pub fn dynamic_compile_with_gds(
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, lyp_file, &mut errors);
+    check_layers(&data, tech_file, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -588,9 +587,9 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, tech_file: &Path, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
-    for layer in data.layers.layers.iter() {
+    for layer in &data.tech.layers {
         layers.insert(layer.name.clone());
     }
     for (cell_id, cell) in data.cells.iter() {
@@ -605,7 +604,7 @@ fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>)
                             cell: *cell_id,
                             kind: ExecErrorKind::IllegalLayer {
                                 layer: layer.clone(),
-                                lyp: lyp_file.display().to_string(),
+                                tech: tech_file.display().to_string(),
                             },
                         });
                     }
@@ -616,7 +615,7 @@ fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>)
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalLayer {
                             layer: polygon.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -626,7 +625,7 @@ fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>)
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalTextLayer {
                             layer: text.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -2367,7 +2366,7 @@ pub struct CompileInput<'a> {
     /// Full path to cell.
     pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
-    pub lyp_file: &'a Path,
+    pub tech_file: &'a Path,
 }
 
 pub type VarId = u64;
@@ -2555,7 +2554,7 @@ struct CellState {
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    lyp_file: &'a Path,
+    tech_file: &'a Path,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
@@ -2604,7 +2603,7 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 impl<'a> ExecPass<'a> {
     pub(crate) fn new(
         ast: &'a WorkspaceAst<VarIdTyMetadata>,
-        lyp_file: &'a Path,
+        tech_file: &'a Path,
         gds_imports: &[(String, PathBuf)],
     ) -> Self {
         let gds_imports = gds_imports
@@ -2630,7 +2629,7 @@ impl<'a> ExecPass<'a> {
             .collect();
         Self {
             ast,
-            lyp_file,
+            tech_file,
             gds_imports,
             cell_states: IndexMap::new(),
             values: IndexMap::from_iter([
@@ -2732,8 +2731,8 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = match crate::layer::read_lyp(input.lyp_file) {
-                Ok(layers) => layers,
+            let tech = match crate::tech::read_tech(input.tech_file) {
+                Ok(tech) => tech,
                 Err(error) => {
                     return CompileOutput::StaticErrors(StaticErrorCompileOutput {
                         errors: vec![StaticError {
@@ -2741,7 +2740,7 @@ impl<'a> ExecPass<'a> {
                                 path: self.ast[&vec![]].path.clone(),
                                 span: cfgrammar::Span::new(0, 0),
                             },
-                            kind: StaticErrorKind::InvalidLyp(error.to_string()),
+                            kind: StaticErrorKind::InvalidTech(error.to_string()),
                         }],
                     });
                 }
@@ -2750,7 +2749,7 @@ impl<'a> ExecPass<'a> {
                 CompileOutput::Valid(CompiledData {
                     cells: self.compiled_cells,
                     top: cell_id,
-                    layers,
+                    tech,
                 })
             } else {
                 CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -2758,7 +2757,7 @@ impl<'a> ExecPass<'a> {
                     output: Some(CompiledData {
                         cells: self.compiled_cells,
                         top: cell_id,
-                        layers,
+                        tech,
                     }),
                 })
             }
@@ -3044,7 +3043,7 @@ impl<'a> ExecPass<'a> {
         path: &Path,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
-        let imported = match import_gds(path, declared_name, self.lyp_file) {
+        let imported = match import_gds(path, declared_name, self.tech_file) {
             Ok(imported) => imported,
             Err(error) => {
                 self.errors.push(ExecError {
@@ -5950,7 +5949,7 @@ pub fn bbox_dim_union(
 pub struct CompiledData {
     pub cells: IndexMap<CellId, CompiledCell>,
     pub top: CellId,
-    pub layers: LayerProperties,
+    pub tech: crate::tech::Technology,
 }
 
 #[enumify(generics_only)]

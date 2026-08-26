@@ -34,12 +34,12 @@ cargo install --locked --path crates/argon
 ## Command-line compilation
 
 Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
-manifest names the library and can set its layer-properties file and path
+manifest names the library and can set its Argon technology file and path
 dependencies and GDS cell imports:
 
 ```toml
 name = "my-library"
-lyp = "layers.lyp"
+tech = "tech.toml"
 
 [dependencies]
 pdk = "../pdk"
@@ -65,8 +65,41 @@ GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
 `use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,
 and a leading `~/` is expanded to the user's home directory.
-When invoking `argonc` directly, pass the same mapping as
+When invoking `argonc` directly, pass the technology file with
+`--tech tech.toml` and the same mapping as
 `--gds-import 'macros::sram=layout/sram.gds'`.
+
+The technology file is TOML. Unit values are meters per unit and can instead
+use `"m"`, `"mm"`, `"um"`, `"nm"`, or `"pm"`. `grid` is expressed in entry
+units and controls snapping for rectangle and polygon drawing, instance
+placement, previews, and GUI-persisted geometry edits:
+
+```toml
+dbu = "nm"          # GDS database unit
+display_unit = "um" # GDS user/display unit
+entry_unit = "nm"   # one coordinate unit in Argon source
+grid = 0.1
+
+[[layers]]
+name = "met1.pin"
+gds = [68, 16]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.label"
+gds = [68, 5]
+fill = "#0000ff"
+border = "#0000ff"
+
+[pin_layers]
+"met1.pin" = "met1.label"
+```
+
+Each layer maps its Argon name to a GDS layer/datatype pair. A `pin_layers`
+entry maps a pin-shape layer to the text layer that names contained pins. GDS
+coordinates are transformed between database units and entry units during
+import/export; exported GDS libraries also use the configured display unit.
 
 Polygons normally take a layer and a point count. Each generated point has
 independent solver coordinates, addressable either as `polygon.x0`,
@@ -94,10 +127,11 @@ axis. Polygon fills use the layer's solid or stippled fill style just like
 rectangles.
 
 Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
-receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
-text from a contained `<layer>.label` as its field name. Repeated pin names are
-arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance is collapsed in the
-GUI, its displayed bounding-box edges are available through `bbox(inst)`.
+receive stable fields such as `gds_rect_12`; a shape on a configured pin layer
+uses text from the corresponding contained label layer as its field name.
+Repeated pin names are arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance
+is collapsed in the GUI, its displayed bounding-box edges are available through
+`bbox(inst)`.
 
 ### IDE
 
@@ -135,12 +169,12 @@ Your library directory should look like this:
 ```text
 tutorial
 ├── Argon.toml
-├── layers.lyp
+├── tech.toml
 └── lib.ar
 ```
 
 The generated `lib.ar` contains a `top()` cell with a “Hello world!”
-text label. The manifest points to the generated default layer-properties file,
+text label. The manifest points to the generated default technology file,
 so the workspace is ready to open immediately:
 
 ```bash

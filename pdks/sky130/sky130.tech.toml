@@ -1,0 +1,2588 @@
+dbu = 1e-9
+display_unit = "um"
+entry_unit = "nm"
+grid = 0.1
+
+[[layers]]
+name = "prBoundary.boundary"
+gds = [235, 4]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "pwell.drawing"
+gds = [64, 44]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "pwell.pin"
+gds = [122, 16]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "pwell.label"
+gds = [64, 59]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "pwell.res"
+gds = [64, 13]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "pwell.cut"
+gds = [64, 14]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "pwelliso.pin"
+gds = [44, 16]
+fill = "#96c8ff"
+border = "#ffffff"
+
+[[layers]]
+name = "pwelliso.label"
+gds = [44, 5]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "nwell.drawing"
+gds = [64, 20]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "nwell.net"
+gds = [84, 23]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "nwell.pin"
+gds = [64, 16]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "nwell.label"
+gds = [64, 5]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "dnwell.drawing"
+gds = [64, 18]
+fill = "#c8ffc8"
+border = "#c8ffc8"
+
+[[layers]]
+name = "vhvi.drawing"
+gds = [74, 21]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "diff.drawing"
+gds = [65, 20]
+fill = "#00ff00"
+border = "#00ff00"
+
+[[layers]]
+name = "diff.res"
+gds = [65, 13]
+fill = "#00ff00"
+border = "#00ff00"
+
+[[layers]]
+name = "diff.cut"
+gds = [65, 14]
+fill = "#00ff00"
+border = "#00ff00"
+
+[[layers]]
+name = "diff.pin"
+gds = [65, 16]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "diff.label"
+gds = [65, 6]
+fill = "#c8ffc8"
+border = "#c8ffc8"
+
+[[layers]]
+name = "diff.net"
+gds = [65, 23]
+fill = "#00ff00"
+border = "#00ff00"
+
+[[layers]]
+name = "diff.boundary"
+gds = [65, 4]
+fill = "#00ff00"
+border = "#00ff00"
+
+[[layers]]
+name = "diff.hv"
+gds = [65, 8]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "tap.drawing"
+gds = [65, 44]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "tap.pin"
+gds = [65, 48]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "tap.net"
+gds = [65, 41]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "tap.boundary"
+gds = [65, 60]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "tap.label"
+gds = [65, 5]
+fill = "#fff464"
+border = "#fff464"
+
+[[layers]]
+name = "psdm.drawing"
+gds = [94, 20]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "nsdm.drawing"
+gds = [93, 44]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "poly.drawing"
+gds = [66, 20]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.pin"
+gds = [66, 16]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "poly.res"
+gds = [66, 13]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.cut"
+gds = [66, 14]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.gate"
+gds = [66, 9]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.label"
+gds = [66, 5]
+fill = "#ffafaf"
+border = "#ffafaf"
+
+[[layers]]
+name = "poly.boundary"
+gds = [66, 4]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.probe"
+gds = [66, 25]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.short"
+gds = [66, 15]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.net"
+gds = [66, 23]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "poly.model"
+gds = [66, 83]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "ldntm.drawing"
+gds = [11, 44]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "lvtn.drawing"
+gds = [125, 44]
+fill = "#ffffff"
+border = "#96c8ff"
+
+[[layers]]
+name = "hvtp.drawing"
+gds = [78, 44]
+fill = "#ffffff"
+border = "#ff8000"
+
+[[layers]]
+name = "hvtr.drawing"
+gds = [18, 20]
+fill = "#e61f0d"
+border = "#ff0000"
+
+[[layers]]
+name = "tunm.drawing"
+gds = [80, 20]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "licon1.drawing"
+gds = [66, 44]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "licon1.boundary"
+gds = [66, 60]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "licon1.pin"
+gds = [66, 58]
+fill = "#c8ffff"
+border = "#ffe6bf"
+
+[[layers]]
+name = "licon1.net"
+gds = [66, 41]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "npc.drawing"
+gds = [95, 20]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "li1.drawing"
+gds = [67, 20]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "li1.pin"
+gds = [67, 16]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "li1.res"
+gds = [67, 13]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "li1.cut"
+gds = [67, 14]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "li1.label"
+gds = [67, 5]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "li1.net"
+gds = [67, 23]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "li1.boundary"
+gds = [67, 4]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "li1.blockage"
+gds = [67, 10]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "li1.short"
+gds = [67, 15]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "li1.probe"
+gds = [67, 25]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "mcon.drawing"
+gds = [67, 44]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "mcon.boundary"
+gds = [67, 60]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "mcon.pin"
+gds = [67, 48]
+fill = "#d9e6ff"
+border = "#ffffcc"
+
+[[layers]]
+name = "mcon.net"
+gds = [67, 41]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "met1.drawing"
+gds = [68, 20]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.res"
+gds = [68, 13]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.cut"
+gds = [68, 14]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.pin"
+gds = [68, 16]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met1.label"
+gds = [68, 5]
+fill = "#96c8ff"
+border = "#96c8ff"
+
+[[layers]]
+name = "met1.net"
+gds = [68, 23]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met1.boundary"
+gds = [68, 4]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.blockage"
+gds = [68, 10]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.short"
+gds = [68, 15]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.probe"
+gds = [68, 25]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option1"
+gds = [68, 32]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option2"
+gds = [68, 33]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option3"
+gds = [68, 34]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option4"
+gds = [68, 35]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option5"
+gds = [68, 36]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option6"
+gds = [68, 37]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option7"
+gds = [68, 38]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.option8"
+gds = [68, 39]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "via.drawing"
+gds = [68, 44]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "via.boundary"
+gds = [68, 60]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "via.net"
+gds = [68, 41]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "via.pin"
+gds = [68, 58]
+fill = "#ae7dff"
+border = "#ae7dff"
+
+[[layers]]
+name = "met2.drawing"
+gds = [69, 20]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.res"
+gds = [69, 13]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.cut"
+gds = [69, 14]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.pin"
+gds = [69, 16]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.label"
+gds = [69, 5]
+fill = "#ffc8ff"
+border = "#ffc8ff"
+
+[[layers]]
+name = "met2.net"
+gds = [69, 23]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.boundary"
+gds = [69, 4]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.blockage"
+gds = [69, 10]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.short"
+gds = [69, 15]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.probe"
+gds = [69, 25]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option1"
+gds = [69, 32]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option2"
+gds = [69, 33]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option3"
+gds = [69, 34]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option4"
+gds = [69, 35]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option5"
+gds = [69, 36]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option6"
+gds = [69, 37]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option7"
+gds = [69, 38]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "met2.option8"
+gds = [69, 39]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "via2.drawing"
+gds = [69, 44]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "via2.boundary"
+gds = [69, 60]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "via2.pin"
+gds = [69, 58]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "via2.net"
+gds = [69, 41]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "met3.drawing"
+gds = [70, 20]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.res"
+gds = [70, 13]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.cut"
+gds = [70, 14]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.pin"
+gds = [70, 16]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.label"
+gds = [70, 5]
+fill = "#c8ffff"
+border = "#c8ffff"
+
+[[layers]]
+name = "met3.net"
+gds = [70, 23]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.boundary"
+gds = [70, 4]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.blockage"
+gds = [70, 10]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.short"
+gds = [70, 15]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.fuse"
+gds = [70, 17]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.probe"
+gds = [70, 25]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option1"
+gds = [70, 32]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option2"
+gds = [70, 33]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option3"
+gds = [70, 34]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option4"
+gds = [70, 35]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option5"
+gds = [70, 36]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option6"
+gds = [70, 37]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option7"
+gds = [70, 38]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "met3.option8"
+gds = [70, 39]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "via3.drawing"
+gds = [70, 44]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "via3.boundary"
+gds = [70, 60]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "via3.pin"
+gds = [70, 48]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "via3.net"
+gds = [70, 41]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "met4.drawing"
+gds = [71, 20]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.res"
+gds = [71, 13]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.cut"
+gds = [71, 14]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.pin"
+gds = [71, 16]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.label"
+gds = [71, 5]
+fill = "#ae7dff"
+border = "#ae7dff"
+
+[[layers]]
+name = "met4.net"
+gds = [71, 23]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.boundary"
+gds = [71, 4]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.blockage"
+gds = [71, 10]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.short"
+gds = [71, 15]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.fuse"
+gds = [71, 17]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.probe"
+gds = [71, 25]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option1"
+gds = [71, 32]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option2"
+gds = [71, 33]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option3"
+gds = [71, 34]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option4"
+gds = [71, 35]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option5"
+gds = [71, 36]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option6"
+gds = [71, 37]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option7"
+gds = [71, 38]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met4.option8"
+gds = [71, 39]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "via4.drawing"
+gds = [71, 44]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "via4.boundary"
+gds = [71, 60]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "via4.pin"
+gds = [71, 48]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "via4.net"
+gds = [71, 41]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "met5.drawing"
+gds = [72, 20]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.res"
+gds = [72, 13]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.cut"
+gds = [72, 14]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.pin"
+gds = [72, 16]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.label"
+gds = [72, 5]
+fill = "#fff464"
+border = "#fff464"
+
+[[layers]]
+name = "met5.net"
+gds = [72, 23]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.boundary"
+gds = [72, 4]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.blockage"
+gds = [72, 10]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.short"
+gds = [72, 15]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.fuse"
+gds = [72, 17]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.probe"
+gds = [72, 25]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option1"
+gds = [72, 32]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option2"
+gds = [72, 33]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option3"
+gds = [72, 34]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option4"
+gds = [72, 35]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option5"
+gds = [72, 36]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option6"
+gds = [72, 37]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option7"
+gds = [72, 38]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "met5.option8"
+gds = [72, 39]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "nsm.drawing"
+gds = [61, 20]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "pad.drawing"
+gds = [76, 20]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "pad.label"
+gds = [76, 5]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "pad.pin"
+gds = [76, 16]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "pnp.drawing"
+gds = [82, 44]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "pnp.label"
+gds = [82, 59]
+fill = "#ffc8ff"
+border = "#ffc8ff"
+
+[[layers]]
+name = "npn.drawing"
+gds = [82, 20]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "npn.label"
+gds = [82, 5]
+fill = "#c8ffff"
+border = "#c8ffff"
+
+[[layers]]
+name = "rpm.drawing"
+gds = [86, 20]
+fill = "#96c8ff"
+border = "#ffffff"
+
+[[layers]]
+name = "hvi.drawing"
+gds = [75, 20]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "capacitor.drawing"
+gds = [82, 64]
+fill = "#ffb232"
+border = "#ffb232"
+
+[[layers]]
+name = "ncm.drawing"
+gds = [92, 44]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "cncm.drawing"
+gds = [96, 44]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cncm.mask"
+gds = [17, 0]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "pmm.drawing"
+gds = [85, 44]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "pmm2.drawing"
+gds = [77, 20]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "rdl.drawing"
+gds = [74, 20]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.pin"
+gds = [74, 16]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.label"
+gds = [74, 5]
+fill = "#ff6464"
+border = "#ff6464"
+
+[[layers]]
+name = "rdl.res"
+gds = [74, 13]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "rdl.cut"
+gds = [74, 14]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "rdl.short"
+gds = [74, 15]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option1"
+gds = [89, 32]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option2"
+gds = [89, 33]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option3"
+gds = [89, 34]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option4"
+gds = [89, 35]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option5"
+gds = [89, 36]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option6"
+gds = [89, 37]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option7"
+gds = [89, 38]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "rdl.option8"
+gds = [89, 39]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "ubm.drawing"
+gds = [127, 21]
+fill = "#333399"
+border = "#ccccd9"
+
+[[layers]]
+name = "bump.drawing"
+gds = [127, 22]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "inductor.drawing"
+gds = [82, 24]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "inductor.label"
+gds = [82, 25]
+fill = "#fff464"
+border = "#fff464"
+
+[[layers]]
+name = "inductor.term1"
+gds = [82, 26]
+fill = "#ffffff"
+border = "#333399"
+
+[[layers]]
+name = "inductor.term2"
+gds = [82, 27]
+fill = "#ffffff"
+border = "#333399"
+
+[[layers]]
+name = "inductor.term3"
+gds = [82, 28]
+fill = "#ffffff"
+border = "#333399"
+
+[[layers]]
+name = "capm.drawing"
+gds = [89, 44]
+fill = "#c3ccd9"
+border = "#c3ccd9"
+
+[[layers]]
+name = "capm2.drawing"
+gds = [97, 44]
+fill = "#c33cd9"
+border = "#c33cd9"
+
+[[layers]]
+name = "cfom.drawing"
+gds = [22, 20]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "cfom.mask"
+gds = [23, 0]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "cfom.maskAdd"
+gds = [22, 21]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "cfom.maskDrop"
+gds = [22, 22]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "cfom.fill"
+gds = [23, 28]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "cfom.waffleDrop"
+gds = [22, 24]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "fom.dummy"
+gds = [22, 23]
+fill = "#ccccd9"
+border = "#ccccd9"
+
+[[layers]]
+name = "cnwm.drawing"
+gds = [109, 44]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cnwm.mask"
+gds = [21, 0]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cnwm.maskAdd"
+gds = [109, 43]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cnwm.maskDrop"
+gds = [109, 42]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cdnm.drawing"
+gds = [110, 20]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "cdnm.mask"
+gds = [48, 0]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "cdnm.maskAdd"
+gds = [110, 21]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "cdnm.maskDrop"
+gds = [110, 22]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "clvtnm.drawing"
+gds = [25, 44]
+fill = "#ffffcc"
+border = "#96c8ff"
+
+[[layers]]
+name = "clvtnm.mask"
+gds = [25, 0]
+fill = "#ffffff"
+border = "#96c8ff"
+
+[[layers]]
+name = "clvtnm.maskAdd"
+gds = [25, 43]
+fill = "#ffffff"
+border = "#96c8ff"
+
+[[layers]]
+name = "clvtnm.maskDrop"
+gds = [25, 42]
+fill = "#0000ff"
+border = "#96c8ff"
+
+[[layers]]
+name = "chvtpm.drawing"
+gds = [88, 44]
+fill = "#ffffcc"
+border = "#ff8000"
+
+[[layers]]
+name = "chvtpm.mask"
+gds = [97, 0]
+fill = "#ffffff"
+border = "#ff8000"
+
+[[layers]]
+name = "chvtpm.maskAdd"
+gds = [97, 43]
+fill = "#ffffff"
+border = "#ff8000"
+
+[[layers]]
+name = "chvtpm.maskDrop"
+gds = [97, 42]
+fill = "#0000ff"
+border = "#ff8000"
+
+[[layers]]
+name = "chvtrm.drawing"
+gds = [98, 44]
+fill = "#d9e6ff"
+border = "#ff0000"
+
+[[layers]]
+name = "chvtrm.mask"
+gds = [98, 0]
+fill = "#e61f0d"
+border = "#ff0000"
+
+[[layers]]
+name = "chvtrm.maskAdd"
+gds = [98, 43]
+fill = "#e61f0d"
+border = "#ff0000"
+
+[[layers]]
+name = "chvtrm.maskDrop"
+gds = [98, 42]
+fill = "#d9e6ff"
+border = "#ff0000"
+
+[[layers]]
+name = "ctunm.drawing"
+gds = [96, 20]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "ctunm.mask"
+gds = [20, 0]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "ctunm.maskAdd"
+gds = [96, 21]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "ctunm.maskDrop"
+gds = [96, 22]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "conom.drawing"
+gds = [87, 44]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "conom.mask"
+gds = [88, 0]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "conom.maskAdd"
+gds = [87, 43]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "conom.maskDrop"
+gds = [87, 42]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "cnsdm.drawing"
+gds = [29, 20]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cnsdm.mask"
+gds = [30, 0]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cnsdm.maskAdd"
+gds = [29, 21]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cnsdm.maskDrop"
+gds = [29, 22]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cpsdm.drawing"
+gds = [31, 20]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "cpsdm.mask"
+gds = [32, 0]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "cpsdm.maskAdd"
+gds = [31, 21]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "cpsdm.maskDrop"
+gds = [31, 22]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "cntm.drawing"
+gds = [26, 20]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "cntm.mask"
+gds = [27, 0]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "cntm.maskAdd"
+gds = [26, 21]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "cntm.maskDrop"
+gds = [26, 22]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "hvntm.drawing"
+gds = [125, 20]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "chvntm.drawing"
+gds = [38, 20]
+fill = "#fff5e6"
+border = "#fff5e6"
+
+[[layers]]
+name = "chvntm.mask"
+gds = [39, 0]
+fill = "#fff5e6"
+border = "#fff5e6"
+
+[[layers]]
+name = "chvntm.maskAdd"
+gds = [38, 21]
+fill = "#fff5e6"
+border = "#fff5e6"
+
+[[layers]]
+name = "chvntm.maskDrop"
+gds = [38, 22]
+fill = "#fff5e6"
+border = "#fff5e6"
+
+[[layers]]
+name = "cldntm.drawing"
+gds = [11, 20]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cldntm.mask"
+gds = [11, 0]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "clvom.drawing"
+gds = [45, 20]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "clvom.mask"
+gds = [46, 0]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "clvom.maskAdd"
+gds = [45, 21]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "clvom.maskDrop"
+gds = [45, 22]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "cp1m.drawing"
+gds = [33, 44]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cp1m.mask"
+gds = [28, 0]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cp1m.maskAdd"
+gds = [33, 43]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cp1m.maskDrop"
+gds = [33, 42]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cp1m.fill"
+gds = [28, 28]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cp1m.waffleDrop"
+gds = [33, 24]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "cli1m.drawing"
+gds = [115, 44]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "cli1m.mask"
+gds = [56, 0]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cli1m.maskAdd"
+gds = [115, 43]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cli1m.maskDrop"
+gds = [115, 42]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cli1m.fill"
+gds = [56, 28]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "clicm1.drawing"
+gds = [106, 44]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "clicm1.mask"
+gds = [43, 0]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "clicm1.maskAdd"
+gds = [106, 43]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "clicm1.maskDrop"
+gds = [106, 42]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "cmm1.drawing"
+gds = [62, 20]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cmm1.mask"
+gds = [36, 0]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cmm1.maskAdd"
+gds = [62, 21]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cmm1.maskDrop"
+gds = [62, 22]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cmm1.fill"
+gds = [36, 28]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cmm1.waffleDrop"
+gds = [62, 24]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cviam.drawing"
+gds = [105, 20]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "cviam.mask"
+gds = [40, 0]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "cviam.maskAdd"
+gds = [105, 21]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "cviam.maskDrop"
+gds = [105, 22]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "cmm2.drawing"
+gds = [105, 44]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "cmm2.mask"
+gds = [41, 0]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "cmm2.maskAdd"
+gds = [105, 43]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "cmm2.maskDrop"
+gds = [105, 42]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "cmm2.fill"
+gds = [41, 28]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "cmm2.waffleDrop"
+gds = [105, 52]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "cviam2.drawing"
+gds = [108, 20]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "cviam2.mask"
+gds = [44, 0]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "cviam2.maskAdd"
+gds = [108, 21]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "cviam2.maskDrop"
+gds = [108, 22]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "cmm3.drawing"
+gds = [107, 20]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "cmm3.mask"
+gds = [34, 0]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "cmm3.maskAdd"
+gds = [107, 21]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "cmm3.maskDrop"
+gds = [107, 22]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "cmm3.fill"
+gds = [34, 28]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "cmm3.waffleDrop"
+gds = [107, 24]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "cnpc.drawing"
+gds = [44, 20]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "cnpc.mask"
+gds = [49, 0]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "cnpc.maskAdd"
+gds = [44, 43]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "cnpc.maskDrop"
+gds = [44, 42]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "cviam3.drawing"
+gds = [112, 20]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cviam3.mask"
+gds = [50, 0]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cviam3.maskAdd"
+gds = [112, 21]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cviam3.maskDrop"
+gds = [112, 22]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "cnsm.mask"
+gds = [22, 0]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cpdm.drawing"
+gds = [104, 44]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "cpdm.mask"
+gds = [37, 0]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "cpdm.maskAdd"
+gds = [104, 43]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "cpdm.maskDrop"
+gds = [104, 42]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "cpmm.drawing"
+gds = [91, 44]
+fill = "#0000ff"
+border = "#8c8ca6"
+
+[[layers]]
+name = "cpbo.mask"
+gds = [99, 0]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "cmm4.mask"
+gds = [51, 0]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cmm4.maskAdd"
+gds = [112, 43]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cmm4.maskDrop"
+gds = [112, 42]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cmm4.fill"
+gds = [51, 28]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cmm4.waffleDrop"
+gds = [112, 4]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "cviam4.drawing"
+gds = [117, 20]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cviam4.mask"
+gds = [58, 0]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cviam4.maskAdd"
+gds = [117, 21]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cviam4.maskDrop"
+gds = [117, 22]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "cmm5.mask"
+gds = [59, 0]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cmm5.fill"
+gds = [59, 28]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "cmm5.waffleDrop"
+gds = [117, 4]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "target.drawing"
+gds = [76, 44]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "cctm1.drawing"
+gds = [101, 44]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "cctm1.mask"
+gds = [35, 0]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "cctm1.maskAdd"
+gds = [101, 43]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "cctm1.maskDrop"
+gds = [101, 42]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "crpm.drawing"
+gds = [53, 44]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "crpm.mask"
+gds = [96, 0]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "crpm.maskAdd"
+gds = [53, 43]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "crpm.maskDrop"
+gds = [53, 42]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "ccu1m.mask"
+gds = [93, 0]
+fill = "#e61f0d"
+border = "#e61f0d"
+
+[[layers]]
+name = "cpmm2.mask"
+gds = [94, 0]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "cubm.mask"
+gds = [100, 0]
+fill = "#333399"
+border = "#ccccd9"
+
+[[layers]]
+name = "cbump.mask"
+gds = [101, 0]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "overlap.drawing"
+gds = [90, 20]
+fill = "#00bfff"
+border = "#00bfff"
+
+[[layers]]
+name = "overlap.boundary"
+gds = [90, 4]
+fill = "#ff7f50"
+border = "#ff7f50"
+
+[[layers]]
+name = "areaid.lowTapDensity"
+gds = [81, 14]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "areaid.notCritSide"
+gds = [81, 15]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "areaid.injection"
+gds = [81, 17]
+fill = "#adff2f"
+border = "#adff2f"
+
+[[layers]]
+name = "areaid.rfdiode"
+gds = [81, 125]
+fill = "#bebed8"
+border = "#bebed8"
+
+[[layers]]
+name = "areaid.seal"
+gds = [81, 1]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "areaid.core"
+gds = [81, 2]
+fill = "#d9e6ff"
+border = "#d9e6ff"
+
+[[layers]]
+name = "areaid.frame"
+gds = [81, 3]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "areaid.esd"
+gds = [81, 19]
+fill = "#d9cc00"
+border = "#d9cc00"
+
+[[layers]]
+name = "areaid.dieCut"
+gds = [81, 11]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "areaid.moduleCut"
+gds = [81, 10]
+fill = "#00ff00"
+border = "#00ff00"
+
+[[layers]]
+name = "areaid.frameRect"
+gds = [81, 12]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "areaid.substrateCut"
+gds = [81, 53]
+fill = "#ccccd9"
+border = "#333399"
+
+[[layers]]
+name = "areaid.diode"
+gds = [81, 23]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "areaid.standardc"
+gds = [81, 4]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "areaid.deadZon"
+gds = [81, 50]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "areaid.critCorner"
+gds = [81, 51]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "areaid.critSid"
+gds = [81, 52]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "areaid.opcDrop"
+gds = [81, 54]
+fill = "#c8ffc8"
+border = "#8c8ca6"
+
+[[layers]]
+name = "areaid.waffleWindow"
+gds = [81, 13]
+fill = "#00ffe7"
+border = "#00bfff"
+
+[[layers]]
+name = "areaid.extendedDrain"
+gds = [81, 57]
+fill = "#daa520"
+border = "#daa520"
+
+[[layers]]
+name = "areaid.lvNative"
+gds = [81, 60]
+fill = "#ffbff2"
+border = "#ffbff2"
+
+[[layers]]
+name = "areaid.photo"
+gds = [81, 81]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "areaid.etest"
+gds = [81, 101]
+fill = "#00ff00"
+border = "#ff00ff"
+
+[[layers]]
+name = "areaid.hvnwell"
+gds = [81, 63]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "areaid.rdlprobepad"
+gds = [81, 27]
+fill = "#9900e6"
+border = "#9900e6"
+
+[[layers]]
+name = "areaid.sigPadDiff"
+gds = [81, 6]
+fill = "#00bfff"
+border = "#00bfff"
+
+[[layers]]
+name = "areaid.sigPadWell"
+gds = [81, 7]
+fill = "#c8ffc8"
+border = "#c8ffc8"
+
+[[layers]]
+name = "areaid.sigPadMetNtr"
+gds = [81, 8]
+fill = "#ff7f50"
+border = "#ff7f50"
+
+[[layers]]
+name = "areaid.analog"
+gds = [81, 79]
+fill = "#ff6464"
+border = "#ff6464"
+
+[[layers]]
+name = "prune.drawing"
+gds = [84, 44]
+fill = "#ffffff"
+border = "#ffff00"
+
+[[layers]]
+name = "padCenter.drawing"
+gds = [81, 20]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met1.psa1"
+gds = [68, 88]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "met2.psa1"
+gds = [69, 88]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "met3.psa1"
+gds = [70, 88]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "met4.psa1"
+gds = [71, 88]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "met5.psa1"
+gds = [72, 88]
+fill = "#8c8ca6"
+border = "#8c8ca6"
+
+[[layers]]
+name = "met1.psa2"
+gds = [68, 89]
+fill = "#00ffe7"
+border = "#00ffe7"
+
+[[layers]]
+name = "met2.psa2"
+gds = [69, 89]
+fill = "#00ffe7"
+border = "#00ffe7"
+
+[[layers]]
+name = "met3.psa2"
+gds = [70, 89]
+fill = "#00ffe7"
+border = "#00ffe7"
+
+[[layers]]
+name = "met4.psa2"
+gds = [71, 89]
+fill = "#00ffe7"
+border = "#00ffe7"
+
+[[layers]]
+name = "met5.psa2"
+gds = [72, 89]
+fill = "#00ffe7"
+border = "#00ffe7"
+
+[[layers]]
+name = "met1.psa3"
+gds = [68, 90]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "met2.psa3"
+gds = [69, 90]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "met3.psa3"
+gds = [70, 90]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "met4.psa3"
+gds = [71, 90]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "met5.psa3"
+gds = [72, 90]
+fill = "#ffffcc"
+border = "#ffffcc"
+
+[[layers]]
+name = "met1.psa4"
+gds = [68, 91]
+fill = "#802626"
+border = "#802626"
+
+[[layers]]
+name = "met2.psa4"
+gds = [69, 91]
+fill = "#802626"
+border = "#802626"
+
+[[layers]]
+name = "met3.psa4"
+gds = [70, 91]
+fill = "#802626"
+border = "#802626"
+
+[[layers]]
+name = "met4.psa4"
+gds = [71, 91]
+fill = "#802626"
+border = "#802626"
+
+[[layers]]
+name = "met5.psa4"
+gds = [72, 91]
+fill = "#802626"
+border = "#802626"
+
+[[layers]]
+name = "met1.psa5"
+gds = [68, 92]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "met2.psa5"
+gds = [69, 92]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "met3.psa5"
+gds = [70, 92]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "met4.psa5"
+gds = [71, 92]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "met5.psa5"
+gds = [72, 92]
+fill = "#333399"
+border = "#333399"
+
+[[layers]]
+name = "met1.psa6"
+gds = [68, 93]
+fill = "#fa8072"
+border = "#fa8072"
+
+[[layers]]
+name = "met2.psa6"
+gds = [69, 93]
+fill = "#fa8072"
+border = "#fa8072"
+
+[[layers]]
+name = "met3.psa6"
+gds = [70, 93]
+fill = "#fa8072"
+border = "#fa8072"
+
+[[layers]]
+name = "met4.psa6"
+gds = [71, 93]
+fill = "#fa8072"
+border = "#fa8072"
+
+[[layers]]
+name = "met5.psa6"
+gds = [72, 93]
+fill = "#fa8072"
+border = "#fa8072"
+
+[[layers]]
+name = "rdl.psa1"
+gds = [74, 88]
+fill = "#ff0000"
+border = "#ff0000"
+
+[[layers]]
+name = "rdl.psa2"
+gds = [74, 89]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "rdl.psa3"
+gds = [74, 90]
+fill = "#00cc66"
+border = "#00cc66"
+
+[[layers]]
+name = "rdl.psa4"
+gds = [74, 91]
+fill = "#ffffff"
+border = "#ffffff"
+
+[[layers]]
+name = "rdl.psa5"
+gds = [74, 92]
+fill = "#ffff00"
+border = "#ffff00"
+
+[[layers]]
+name = "rdl.psa6"
+gds = [74, 93]
+fill = "#bf4026"
+border = "#bf4026"
+
+[[layers]]
+name = "blanking.drawing"
+gds = [124, 40]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "urpm"
+gds = [79, 20]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "text.drawing"
+gds = [83, 44]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "boundary"
+gds = [235, 250]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[[layers]]
+name = "r1c.drawing"
+gds = [201, 20]
+fill = "#610092"
+border = "#610092"
+
+[[layers]]
+name = "v20.drawing"
+gds = [74, 22]
+fill = "#4166d2"
+border = "#4166d2"
+
+[[layers]]
+name = "layout_boundary.boundary"
+gds = [236, 0]
+fill = "#ffe6bf"
+border = "#ffe6bf"
+
+[pin_layers]
+"pwell.pin" = "pwell.label"
+"pwelliso.pin" = "pwelliso.label"
+"nwell.pin" = "nwell.label"
+"diff.pin" = "diff.label"
+"tap.pin" = "tap.label"
+"poly.pin" = "poly.label"
+"licon1.pin" = "licon1.pin"
+"li1.pin" = "li1.label"
+"mcon.pin" = "mcon.pin"
+"met1.pin" = "met1.label"
+"via.pin" = "via.pin"
+"met2.pin" = "met2.label"
+"via2.pin" = "via2.pin"
+"met3.pin" = "met3.label"
+"via3.pin" = "via3.pin"
+"met4.pin" = "met4.label"
+"via4.pin" = "via4.pin"
+"met5.pin" = "met5.label"
+"pad.pin" = "pad.label"
+"rdl.pin" = "rdl.label"

@@ -1,0 +1,46 @@
+dbu = 1e-9
+display_unit = "um"
+entry_unit = "nm"
+grid = 0.1
+
+[[layers]]
+name = "met1"
+gds = [235, 4]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "via1"
+gds = [235, 4]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[[layers]]
+name = "met2"
+gds = [235, 4]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "via2"
+gds = [235, 4]
+fill = "#ff8000"
+border = "#ff8000"
+
+[[layers]]
+name = "met3"
+gds = [235, 4]
+fill = "#00ffff"
+border = "#00ffff"
+
+[[layers]]
+name = "via3"
+gds = [235, 4]
+fill = "#268c6b"
+border = "#268c6b"
+
+[[layers]]
+name = "met4"
+gds = [235, 4]
+fill = "#5e00e6"
+border = "#5e00e6"

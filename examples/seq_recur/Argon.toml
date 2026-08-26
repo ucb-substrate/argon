@@ -1,2 +1,2 @@
 name = "seq-recur"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

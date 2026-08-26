@@ -1,5 +1,5 @@
 name = "path-dependency-example"
-lyp = "../../lyp/basic.lyp"
+tech = "../../tech/basic.tech.toml"
 
 [dependencies]
 dependency = "../dependency_library"

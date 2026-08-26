@@ -291,7 +291,7 @@ impl EditorState {
             .clone();
         let mut state = ProcessScopeState::default();
         let old_layers = self.layers.read(cx);
-        for layer in &solved_cell.layers.layers {
+        for layer in &solved_cell.tech.layers {
             let name = SharedString::from(layer.name.clone());
             let visible = old_layers
                 .layers

@@ -189,11 +189,11 @@ fn parse_setting(input: &str) -> Option<(&str, &str)> {
 async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     cell: &str,
-    lyp: &Path,
+    tech: &Path,
     gds_imports: &[(String, PathBuf)],
     client: &Client,
 ) -> Option<CompileOutput> {
-    if let Err(error) = argonc::layer::read_lyp(lyp) {
+    if let Err(error) = argonc::tech::read_tech(tech) {
         client
             .show_message(MessageType::ERROR, format!("Could not open cell: {error}"))
             .await;
@@ -245,7 +245,7 @@ async fn compile_open_cell(
         CompileInput {
             cell: &cell_path,
             args,
-            lyp_file: lyp,
+            tech_file: tech,
         },
         gds_imports,
     ))
@@ -325,7 +325,7 @@ impl StateMut {
         } else {
             None
         };
-        let lyp = self.config.as_ref().and_then(|config| config.lyp.clone());
+        let tech = self.config.as_ref().and_then(|config| config.tech.clone());
         let dependencies = self
             .config
             .as_ref()
@@ -355,15 +355,15 @@ impl StateMut {
                     errors: analysis.errors,
                 }))
             } else if let Some(cell) = &self.cell {
-                let Some(lyp) = lyp.as_deref() else {
+                let Some(tech) = tech.as_deref() else {
                     let message = if manifest_path.is_file() {
                         format!(
-                            "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
+                            "`{}` does not set `tech`; add `tech = \"path/to/tech.toml\"`",
                             manifest_path.display()
                         )
                     } else {
                         format!(
-                            "no library manifest found at `{}`; create it and set `lyp = \"path/to/layers.lyp\"`",
+                            "no library manifest found at `{}`; create it and set `tech = \"path/to/tech.toml\"`",
                             manifest_path.display()
                         )
                     };
@@ -376,7 +376,7 @@ impl StateMut {
                     self.compile_output = None;
                     return;
                 };
-                compile_open_cell(&ast, cell, lyp, &gds_imports, client).await
+                compile_open_cell(&ast, cell, tech, &gds_imports, client).await
             } else {
                 None
             }
@@ -844,16 +844,16 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let Some(lyp) = state_mut
+        let Some(tech) = state_mut
             .config
             .as_ref()
-            .and_then(|config| config.lyp.clone())
+            .and_then(|config| config.tech.clone())
         else {
             self.state
                 .editor_client
                 .show_message(
                     MessageType::ERROR,
-                    "The Argon library does not configure an LYP file",
+                    "The Argon library does not configure a technology file",
                 )
                 .await;
             return Ok(());
@@ -872,7 +872,7 @@ impl Backend {
         let Some(compiled) = compile_open_cell(
             &typed_ast,
             &open_cell,
-            &lyp,
+            &tech,
             &gds_imports,
             &self.state.editor_client,
         )
@@ -1143,14 +1143,14 @@ mod tests {
         let ast = parse::parse_workspace_with_std(&source_path).ast();
         let (typed, errors) = compile::static_compile(&ast).unwrap();
         assert!(errors.errors.is_empty(), "{:?}", errors.errors);
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
         let output = compile::dynamic_compile(
             &typed,
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(42.)],
-                lyp_file: &lyp,
+                tech_file: &tech,
             },
         );
         let output = match output {

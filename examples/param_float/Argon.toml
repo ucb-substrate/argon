@@ -1,2 +1,2 @@
 name = "param-float"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

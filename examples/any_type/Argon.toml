@@ -1,2 +1,2 @@
 name = "any-type"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"
