@@ -107,7 +107,7 @@ pub struct StaticAnalysis {
 }
 
 /// Executes a cell using workspace-wide external inputs from `config`.
-pub fn dynamic_compile_with_config(
+pub fn execute_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
@@ -121,10 +121,10 @@ pub fn dynamic_compile_with_config(
     )
 }
 
-/// Compiles a cell invocation spliced into `ast` by
+/// Executes a cell invocation spliced into `ast` by
 /// [`crate::parse::add_cell_invocation`]. Its arguments are evaluated by the
 /// ordinary expression evaluator, so they may be any expression.
-pub fn dynamic_compile_invocation_with_config(
+pub fn execute_cell_invocation(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
@@ -172,7 +172,7 @@ fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
     }
 }
 
-pub fn compile_with_config(
+pub fn compile(
     ast: &WorkspaceParseAst,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
@@ -186,7 +186,7 @@ pub fn compile_with_config(
         return CompileOutput::StaticErrors(static_output);
     };
 
-    dynamic_compile_with_config(&ast, input, config)
+    execute_cell(&ast, input, config)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;

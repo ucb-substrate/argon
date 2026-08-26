@@ -4515,7 +4515,7 @@ mod tests {
     ) -> argonc::compile::CompileOutput {
         let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/lyp/basic.lyp");
-        argonc::compile::compile_with_config(
+        argonc::compile::compile(
             ast,
             input,
             &argonc::WorkspaceConfig::default().with_lyp(Some(lyp)),

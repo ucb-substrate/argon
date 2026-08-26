@@ -561,7 +561,7 @@ mod tests {
 
     use argonc::{
         WorkspaceConfig,
-        compile::{CompileInput, compile_with_config},
+        compile::{CompileInput, compile},
         parse::parse_workspace_with_std,
     };
 
@@ -688,7 +688,7 @@ cell top() {
             .expect("starter manifest should set lyp");
         let parsed = parse_workspace_with_std(&library.root);
         assert!(parsed.static_errors().is_empty());
-        let output = compile_with_config(
+        let output = compile(
             &parsed.ast(),
             CompileInput {
                 cell: &["top"],

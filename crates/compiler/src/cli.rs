@@ -159,8 +159,7 @@ fn execute(args: Args) -> Result<(), Failed> {
         return Ok(());
     };
 
-    let output =
-        compile::dynamic_compile_invocation_with_config(&typed_ast, &invocation, &workspace);
+    let output = compile::execute_cell_invocation(&typed_ast, &invocation, &workspace);
     if !matches!(output, CompileOutput::Valid(_)) {
         return Err(compile_failed(format, output, Some(&invocation)));
     }

@@ -388,7 +388,7 @@ fn compile_open_cell(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
-    compile::dynamic_compile_invocation_with_config(ast, invocation, config)
+    compile::execute_cell_invocation(ast, invocation, config)
 }
 
 fn diagnostics(
@@ -1728,7 +1728,7 @@ mod tests {
         let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/lyp/basic.lyp");
         let config = argonc::WorkspaceConfig::new(&source_path).with_lyp(Some(lyp));
-        let output = compile::dynamic_compile_invocation_with_config(&typed, &invocation, &config);
+        let output = compile::execute_cell_invocation(&typed, &invocation, &config);
         let CompileOutput::Valid(output) = output else {
             panic!("open cell should compile: {output:?}");
         };
@@ -1758,7 +1758,7 @@ mod tests {
         assert!(errors.errors.is_empty(), "{:?}", errors.errors);
         let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/lyp/basic.lyp");
-        let output = compile::dynamic_compile_with_config(
+        let output = compile::execute_cell(
             &typed,
             CompileInput {
                 cell: &["top"],

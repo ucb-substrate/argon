@@ -112,7 +112,7 @@ mod tests {
 
     use crate::{
         WorkspaceConfig,
-        compile::{CellArg, CompileInput, compile_with_config},
+        compile::{CellArg, CompileInput, compile as compile_workspace},
     };
     const EPSILON: f64 = 1e-10;
 
@@ -124,7 +124,7 @@ mod tests {
     const SKY130_LYP: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.lyp");
 
     fn compile(ast: &crate::parse::WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-        compile_with_config(
+        compile_workspace(
             ast,
             input,
             &WorkspaceConfig::default().with_lyp(Some(PathBuf::from(BASIC_LYP))),
@@ -135,7 +135,7 @@ mod tests {
         ast: &crate::parse::WorkspaceParseAst,
         input: CompileInput<'_>,
     ) -> CompileOutput {
-        compile_with_config(
+        compile_workspace(
             ast,
             input,
             &WorkspaceConfig::default().with_lyp(Some(PathBuf::from(SKY130_LYP))),

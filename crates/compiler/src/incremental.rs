@@ -237,7 +237,7 @@ impl IncrementalCompiler {
 
         self.stats.execution_cache_misses += 1;
         let cell_refs = cell.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = compile::dynamic_compile_with_config(
+        let output = compile::execute_cell(
             ast,
             CompileInput {
                 cell: &cell_refs,
@@ -292,7 +292,7 @@ impl IncrementalCompiler {
             return Ok(CompileOutput::FatalParseErrors);
         };
         let output = if static_output.errors.is_empty() {
-            compile::dynamic_compile_invocation_with_config(&typed_ast, &invocation, config)
+            compile::execute_cell_invocation(&typed_ast, &invocation, config)
         } else {
             CompileOutput::StaticErrors(static_output)
         };
@@ -519,7 +519,7 @@ mod tests {
         ));
         assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
         let typed = analysis.typed_ast.unwrap();
-        let fresh = compile::dynamic_compile_with_config(
+        let fresh = compile::execute_cell(
             &typed,
             CompileInput {
                 cell: &["immediate"],
