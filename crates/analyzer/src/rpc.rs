@@ -409,8 +409,10 @@ impl LangServer for State {
                     format!("Could not configure the GUI: {error}"),
                 )
                 .await;
-            self.clear_gui_connection(connection.id).await;
-            return;
+            if crate::is_gui_disconnected(&error) {
+                self.clear_gui_connection(connection.id).await;
+                return;
+            }
         }
         if !self.publish_workspace_path(Some(connection.clone())).await {
             return;

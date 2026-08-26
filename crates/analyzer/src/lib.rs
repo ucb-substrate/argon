@@ -330,6 +330,15 @@ struct GuiState {
     next_connection_id: u64,
 }
 
+fn is_gui_disconnected(error: &tarpc::client::RpcError) -> bool {
+    matches!(
+        error,
+        tarpc::client::RpcError::Shutdown
+            | tarpc::client::RpcError::Send(_)
+            | tarpc::client::RpcError::Channel(_)
+    )
+}
+
 /// Errors that actually prevent the GUI from displaying a compiled cell.
 /// Execution diagnostics may still contain usable output (most notably an
 /// underconstrained cell with initial-condition fallbacks), so those are
@@ -577,7 +586,9 @@ impl State {
             self.editor_client
                 .show_message(MessageType::ERROR, format!("{error}"))
                 .await;
-            self.clear_gui_connection(connection.id).await;
+            if is_gui_disconnected(&error) {
+                self.clear_gui_connection(connection.id).await;
+            }
         }
     }
 
@@ -596,8 +607,10 @@ impl State {
                     format!("Could not configure the GUI workspace: {error}"),
                 )
                 .await;
-            self.clear_gui_connection(connection.id).await;
-            return false;
+            if is_gui_disconnected(&error) {
+                self.clear_gui_connection(connection.id).await;
+                return false;
+            }
         }
         true
     }
@@ -637,7 +650,9 @@ impl Backend {
             .configure(context::current(), config)
             .await
         {
-            self.state.clear_gui_connection(connection.id).await;
+            if is_gui_disconnected(&error) {
+                self.state.clear_gui_connection(connection.id).await;
+            }
             return Err(format!("could not configure GUI: {error}"));
         }
         Ok(())
@@ -766,7 +781,9 @@ impl Backend {
                         format!("Could not contact the GUI: {error}"),
                     )
                     .await;
-                self.state.clear_gui_connection(connection.id).await;
+                if is_gui_disconnected(&error) {
+                    self.state.clear_gui_connection(connection.id).await;
+                }
                 None
             }
         }
@@ -789,7 +806,8 @@ impl Backend {
             return;
         }
         if self.state.is_latest_compile_request(&identity).await {
-            let _ = connection.client.activate(context::current()).await;
+            let result = connection.client.activate(context::current()).await;
+            self.handle_gui_result(&connection, result).await;
         }
     }
 
@@ -1032,18 +1050,32 @@ impl Backend {
                 .editor_client
                 .show_message(MessageType::LOG, "Attempting to contact existing GUI...")
                 .await;
-            if connection.client.activate(context::current()).await.is_ok() {
-                self.state
-                    .editor_client
-                    .show_message(MessageType::LOG, "Connected to existing GUI!")
-                    .await;
-                return Ok(());
+            match connection.client.activate(context::current()).await {
+                Ok(()) => {
+                    self.state
+                        .editor_client
+                        .show_message(MessageType::LOG, "Connected to existing GUI!")
+                        .await;
+                    return Ok(());
+                }
+                Err(error) if is_gui_disconnected(&error) => {
+                    self.state.clear_gui_connection(connection.id).await;
+                    self.state
+                        .editor_client
+                        .show_message(MessageType::LOG, "Failed to contact existing GUI.")
+                        .await;
+                }
+                Err(error) => {
+                    self.state
+                        .editor_client
+                        .show_message(
+                            MessageType::ERROR,
+                            format!("Could not activate the GUI: {error}"),
+                        )
+                        .await;
+                    return Ok(());
+                }
             }
-            self.state.clear_gui_connection(connection.id).await;
-            self.state
-                .editor_client
-                .show_message(MessageType::LOG, "Failed to contact existing GUI.")
-                .await;
         }
         let old_gui = self.state.take_gui_process().await;
         if let Some(mut gui) = old_gui {
@@ -1161,14 +1193,21 @@ impl Backend {
                 return Ok(());
             }
             Err(error) => {
-                self.state.clear_gui_connection(connection.id).await;
+                let disconnected = is_gui_disconnected(&error);
+                if disconnected {
+                    self.state.clear_gui_connection(connection.id).await;
+                }
                 self.state
                     .editor_client
                     .show_message(
                         MessageType::ERROR,
-                        format!(
-                            "The Argon GUI is not connected; start it before placing an instance ({error})"
-                        ),
+                        if disconnected {
+                            format!(
+                                "The Argon GUI is not connected; start it before placing an instance ({error})"
+                            )
+                        } else {
+                            format!("Could not query the selected GUI scope: {error}")
+                        },
                     )
                     .await;
                 return Ok(());
@@ -1341,19 +1380,11 @@ impl Backend {
             invocation: params.cell,
             scope_span,
         };
-        if let Err(error) = connection
+        let result = connection
             .client
             .place_instance(context::current(), preview)
-            .await
-        {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not contact the GUI: {error}"),
-                )
-                .await;
-        }
+            .await;
+        self.handle_gui_result(&connection, result).await;
         Ok(())
     }
 
@@ -1602,9 +1633,18 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, open_cell_input,
-        parse_config, preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
+        ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, is_gui_disconnected,
+        open_cell_input, parse_config, preview_instance_cell, read_unpoisoned, write_config,
+        write_unpoisoned,
     };
+
+    #[test]
+    fn only_transport_errors_disconnect_the_gui() {
+        assert!(is_gui_disconnected(&tarpc::client::RpcError::Shutdown));
+        assert!(!is_gui_disconnected(
+            &tarpc::client::RpcError::DeadlineExceeded
+        ));
+    }
 
     fn poison_rwlock(lock: &Arc<RwLock<i32>>) {
         let lock = lock.clone();

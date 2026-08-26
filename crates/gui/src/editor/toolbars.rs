@@ -33,11 +33,10 @@ impl TitleBar {
     }
 }
 
-fn workspace_title(path: Option<&Path>, modified: bool) -> String {
-    let modified = if modified { " [+]" } else { "" };
+fn workspace_title(path: Option<&Path>) -> String {
     path.map_or_else(
-        || format!("Argon{modified}"),
-        |path| format!("Argon — {}{modified}", path.display()),
+        || "Argon".to_owned(),
+        |path| format!("Argon — {}", path.display()),
     )
 }
 
@@ -49,6 +48,12 @@ impl Render for TitleBar {
     ) -> impl gpui::IntoElement {
         let state = self.state.read(cx);
         let theme = state.theme();
+        let mut centered_title = div()
+            .relative()
+            .child(workspace_title(state.workspace_path.as_deref()));
+        if state.workspace_modified {
+            centered_title = centered_title.child(div().absolute().left_full().ml_1().child("[+]"));
+        }
         div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
@@ -59,10 +64,7 @@ impl Render for TitleBar {
             .justify_center()
             .overflow_hidden()
             .whitespace_nowrap()
-            .child(workspace_title(
-                state.workspace_path.as_deref(),
-                state.workspace_modified,
-            ))
+            .child(centered_title)
     }
 }
 
@@ -73,16 +75,13 @@ mod title_bar_tests {
     use super::workspace_title;
 
     #[test]
-    fn title_shows_workspace_and_vim_modified_marker() {
+    fn title_shows_workspace() {
         let workspace = Path::new("/projects/inverter");
         assert_eq!(
-            workspace_title(Some(workspace), false),
+            workspace_title(Some(workspace)),
             "Argon — /projects/inverter"
         );
-        assert_eq!(
-            workspace_title(Some(workspace), true),
-            "Argon — /projects/inverter [+]"
-        );
+        assert_eq!(workspace_title(None), "Argon");
     }
 }
 
