@@ -3,6 +3,7 @@ name = "argonc"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+autobins = false
 
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
@@ -32,7 +33,3 @@ bincode = "1"
 const_format = "0.2"
 pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
-
-[[bin]]
-name = "argonc"
-path = "src/main.rs"

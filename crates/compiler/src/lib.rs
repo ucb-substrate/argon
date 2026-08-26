@@ -2085,3 +2085,4 @@ mod tests {
         assert!(data.rule_checks.is_empty());
     }
 }
+pub mod cli;

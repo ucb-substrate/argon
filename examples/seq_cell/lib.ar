@@ -1,11 +1,11 @@
 fn make_list(base: Float) -> [Rect] {
     cons(
-      rect("met1", x0=base, y0=0., w=100., h=100.),
-      cons(
-      rect("met1", x0=200.+base, y0=0., w=100., h=100.),
-      cons(
-      rect("met1", x0=400.+base, y0=0., w=100., h=100.),
-      [])))
+        rect("met1", x0=base, y0=0., w=100., h=100.),
+        cons(
+            rect("met1", x0=200.+base, y0=0., w=100., h=100.),
+            cons(
+                rect("met1", x0=400.+base, y0=0., w=100., h=100.),
+                [])))
 }
 
 fn make_array() -> [[Rect]] {

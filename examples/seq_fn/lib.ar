@@ -16,4 +16,3 @@ cell top() {
     let v = elem23(arr);
     eq(r.y1, v);
 }
-

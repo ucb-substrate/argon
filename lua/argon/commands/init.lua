@@ -40,9 +40,10 @@ local argon_command_tbl = {
     end,
   },
   log = {
-      impl = function(args, opts)
-          -- TODO: allow configuration of log file name.
-          vim.cmd('tabnew ~/.local/state/argon/analyzer.log')
+      impl = function()
+          local state_home = os.getenv('XDG_STATE_HOME') or vim.fn.expand('~/.local/state')
+          local log_path = state_home .. '/argon/argon.log'
+          vim.cmd('tabnew ' .. vim.fn.fnameescape(log_path))
       end
   }
 }

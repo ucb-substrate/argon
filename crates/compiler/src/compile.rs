@@ -595,22 +595,42 @@ fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>)
     }
     for (cell_id, cell) in data.cells.iter() {
         for (_, obj) in cell.objects.iter() {
-            let (layer, span) = match obj {
-                SolvedValue::Rect(r) => (r.layer.as_ref(), r.span.clone()),
-                SolvedValue::Polygon(p) => (Some(&p.layer), p.span.clone()),
-                _ => continue,
-            };
-            if let Some(layer) = layer
-                && !layers.contains(layer)
-            {
-                errs.push(ExecError {
-                    span,
-                    cell: *cell_id,
-                    kind: ExecErrorKind::IllegalLayer {
-                        layer: layer.clone(),
-                        lyp: lyp_file.display().to_string(),
-                    },
-                })
+            match obj {
+                SolvedValue::Rect(r) => {
+                    if let Some(layer) = &r.layer
+                        && !layers.contains(layer)
+                    {
+                        errs.push(ExecError {
+                            span: r.span.clone(),
+                            cell: *cell_id,
+                            kind: ExecErrorKind::IllegalLayer {
+                                layer: layer.clone(),
+                                lyp: lyp_file.display().to_string(),
+                            },
+                        });
+                    }
+                }
+                SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+                    errs.push(ExecError {
+                        span: polygon.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalLayer {
+                            layer: polygon.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                SolvedValue::Text(text) if !layers.contains(&text.layer) => {
+                    errs.push(ExecError {
+                        span: text.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalTextLayer {
+                            layer: text.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                _ => {}
             }
         }
     }
