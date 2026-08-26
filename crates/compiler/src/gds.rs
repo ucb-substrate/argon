@@ -636,13 +636,13 @@ impl CompiledData {
                         xtype: datatype,
                     } = exporter.map[&path.layer];
                     let width = exporter.coord_to_gds(path.width.0.abs());
-                    let begin_extension = exporter.coord_to_gds(path.begin_extension);
-                    let end_extension = exporter.coord_to_gds(path.end_extension);
+                    let begin_extension = exporter.coord_to_gds(path.begin_extension.0);
+                    let end_extension = exporter.coord_to_gds(path.end_extension.0);
                     let (path_type, begin_extn, end_extn) =
                         if begin_extension == 0 && end_extension == 0 {
                             (None, None, None)
-                        } else if (path.begin_extension - path.width.0.abs() / 2.).abs() < 1e-9
-                            && (path.end_extension - path.width.0.abs() / 2.).abs() < 1e-9
+                        } else if (path.begin_extension.0 - path.width.0.abs() / 2.).abs() < 1e-9
+                            && (path.end_extension.0 - path.width.0.abs() / 2.).abs() < 1e-9
                         {
                             (Some(2), None, None)
                         } else {

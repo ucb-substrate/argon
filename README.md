@@ -101,25 +101,6 @@ let outline = polygon("met1", 3,
 eq(outline.x2, 50.);
 ```
 
-Paths use the same count-based centerline syntax, with a solver-aware width.
-They require at least two points and export as native GDS PATH elements:
-
-```argon
-let route = path("met1", 3,
-    width=20.,
-    x0=0., y0=0.,
-    x1=100., y1=0.,
-    x2=100., y2=50.,
-);
-eq(route.width, 20.);
-eq(route.points[2].x, route.x2);
-```
-
-As with polygons, `widthi` and `x0i`/`y0i` coordinate kwargs are editable
-fallback values. GDS paths with flush, half-width-extended, or custom-extended
-ends (path types 0, 2, and 4) are imported and retain their end geometry when
-re-exported. Rounded GDS paths (path type 1) are currently rejected.
-
 The GUI polygon tool (toolbar button or `p`) places vertices in click order;
 press Enter after the final vertex to close and insert the polygon. It writes
 editable fallback coordinates (`x0i`, `y0i`, `x1i`, `y1i`, and so on), so

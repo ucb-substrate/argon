@@ -256,6 +256,26 @@ fn paint_polygon_border(
     }
 }
 
+fn paint_polyline(
+    window: &mut Window,
+    points: &[Point<Pixels>],
+    segment_styles: &[BorderStyle],
+    width: Pixels,
+    color: Rgba,
+) {
+    for (index, points) in points.windows(2).enumerate() {
+        let mut segment = PathBuilder::stroke(width);
+        if segment_styles.get(index) == Some(&BorderStyle::Dashed) {
+            segment = segment.dash_array(&[px(6.), px(5.)]);
+        }
+        segment.move_to(points[0]);
+        segment.line_to(points[1]);
+        if let Ok(path) = segment.build() {
+            window.paint_path(path, color);
+        }
+    }
+}
+
 fn ordered_selection_hits(mut hits: Vec<SelectionHit>) -> Vec<SelectionHit> {
     hits.sort_by(|a, b| {
         b.layer
@@ -356,6 +376,14 @@ struct Polygon {
     id: Option<Span>,
     object_path: Vec<ObjectId>,
     cvars: Option<Vec<(LinearExpr, LinearExpr)>>,
+    centerline: Option<PathCenterline>,
+}
+
+#[derive(Clone, Debug)]
+struct PathCenterline {
+    points: Vec<Point<f32>>,
+    segment_styles: Vec<BorderStyle>,
+    cvars: Option<Vec<(LinearExpr, LinearExpr)>>,
 }
 
 impl Polygon {
@@ -373,6 +401,18 @@ impl Polygon {
             id: self.id.clone(),
             object_path: self.object_path.clone(),
             cvars: self.cvars.clone(),
+            centerline: self.centerline.as_ref().map(|centerline| PathCenterline {
+                points: centerline
+                    .points
+                    .iter()
+                    .map(|point| {
+                        let point = ifmatvec(mat, (point.x as f64, point.y as f64));
+                        Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                    })
+                    .collect(),
+                segment_styles: centerline.segment_styles.clone(),
+                cvars: centerline.cvars.clone(),
+            }),
         }
     }
 }
@@ -390,6 +430,25 @@ fn polygon_edge_styles(
     (0..point_count)
         .map(|index| {
             if unconstrained[index] || unconstrained[(index + 1) % point_count] {
+                BorderStyle::Dashed
+            } else {
+                BorderStyle::Solid
+            }
+        })
+        .collect()
+}
+
+fn path_segment_styles(
+    point_count: usize,
+    mut is_unconstrained: impl FnMut(usize) -> bool,
+) -> Vec<BorderStyle> {
+    let unconstrained = (0..point_count)
+        .map(&mut is_unconstrained)
+        .collect::<Vec<_>>();
+    unconstrained
+        .windows(2)
+        .map(|points| {
+            if points[0] || points[1] {
                 BorderStyle::Dashed
             } else {
                 BorderStyle::Solid
@@ -739,6 +798,8 @@ fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> 
             | RectInitialCondition::PathX(_, _)
             | RectInitialCondition::PathY(_, _)
             | RectInitialCondition::PathWidth(_)
+            | RectInitialCondition::PathBeginExtension(_)
+            | RectInitialCondition::PathEndExtension(_)
             | RectInitialCondition::InstanceX(_)
             | RectInitialCondition::InstanceY(_) => {
                 continue;
@@ -905,6 +966,7 @@ fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>,
                         id: None,
                         object_path: Vec::new(),
                         cvars: None,
+                        centerline: None,
                     });
                 }
                 SolvedValue::Path(path) => {
@@ -922,6 +984,7 @@ fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>,
                             id: None,
                             object_path: Vec::new(),
                             cvars: None,
+                            centerline: None,
                         });
                     }
                 }
@@ -1298,6 +1361,7 @@ impl Element for CanvasElement {
                                         .map(|(x, y)| (x.1.clone(), y.1.clone()))
                                         .collect()
                                 }),
+                                centerline: None,
                             };
                             if show && layer.visible {
                                 polygons.push((polygon, layer.clone()));
@@ -1323,6 +1387,16 @@ impl Element for CanvasElement {
                                     "widthi".to_owned(),
                                     path.width.0,
                                 ));
+                                coordinates.push((
+                                    path.begin_extension.1.clone(),
+                                    "begin_extensioni".to_owned(),
+                                    path.begin_extension.0,
+                                ));
+                                coordinates.push((
+                                    path.end_extension.1.clone(),
+                                    "end_extensioni".to_owned(),
+                                    path.end_extension.0,
+                                ));
                                 source_coordinates.insert(span.clone(), coordinates);
                             }
                             let Some(layer) = layers.layers.get(path.layer.as_str()) else {
@@ -1334,6 +1408,14 @@ impl Element for CanvasElement {
                             {
                                 displayed.width.0 +=
                                     crate::sse::dot(&SparseVec::from(&path.width.1), sse_dv);
+                                displayed.begin_extension.0 += crate::sse::dot(
+                                    &SparseVec::from(&path.begin_extension.1),
+                                    sse_dv,
+                                );
+                                displayed.end_extension.0 += crate::sse::dot(
+                                    &SparseVec::from(&path.end_extension.1),
+                                    sse_dv,
+                                );
                                 for ((x, y), (display_x, display_y)) in
                                     path.points.iter().zip(&mut displayed.points)
                                 {
@@ -1344,20 +1426,39 @@ impl Element for CanvasElement {
                             let Some(outline) = displayed.outline() else {
                                 continue;
                             };
-                            let unconstrained = depth == 0
-                                && std::iter::once(&path.width.1)
-                                    .chain(path.points.iter().flat_map(|(x, y)| [&x.1, &y.1]))
-                                    .flat_map(|expr| &expr.coeffs)
-                                    .any(|(_, var)| cell_info.unsolved_vars.contains(var));
+                            let segment_styles = if depth == 0 {
+                                path_segment_styles(path.points.len(), |index| {
+                                    let (x, y) = &path.points[index];
+                                    x.1.coeffs
+                                        .iter()
+                                        .chain(&y.1.coeffs)
+                                        .any(|(_, var)| cell_info.unsolved_vars.contains(var))
+                                })
+                            } else {
+                                vec![BorderStyle::Solid; path.points.len().saturating_sub(1)]
+                            };
+                            let centerline = PathCenterline {
+                                points: displayed
+                                    .points
+                                    .iter()
+                                    .map(|(x, y)| {
+                                        let point = ifmatvec(mat, (x.0, y.0));
+                                        Point::new(
+                                            (point.0 + ofs.0) as f32,
+                                            (point.1 + ofs.1) as f32,
+                                        )
+                                    })
+                                    .collect(),
+                                segment_styles,
+                                cvars: (depth == 0).then(|| {
+                                    path.points
+                                        .iter()
+                                        .map(|(x, y)| (x.1.clone(), y.1.clone()))
+                                        .collect()
+                                }),
+                            };
                             let polygon = Polygon {
-                                edge_styles: vec![
-                                    if unconstrained {
-                                        BorderStyle::Dashed
-                                    } else {
-                                        BorderStyle::Solid
-                                    };
-                                    outline.len()
-                                ],
+                                edge_styles: vec![BorderStyle::Solid; outline.len()],
                                 points: outline
                                     .into_iter()
                                     .map(|point| {
@@ -1371,6 +1472,7 @@ impl Element for CanvasElement {
                                 id: path.span.clone(),
                                 object_path,
                                 cvars: None,
+                                centerline: Some(centerline),
                             };
                             if show && layer.visible {
                                 polygons.push((polygon, layer.clone()));
@@ -1563,7 +1665,7 @@ impl Element for CanvasElement {
         let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
-        let mut polygon_handle_points = Vec::new();
+        let mut vertex_handle_points = Vec::new();
         let mut sse_bodies: Vec<SseBody> = Vec::new();
         let sse_cell = solved_cell.as_ref().map(|solved| {
             let selected = &solved.state[&solved.selected_scope].address;
@@ -1603,7 +1705,7 @@ impl Element for CanvasElement {
         }
         if let Some(sse_cell) = sse_cell {
             for (polygon, _) in &polygons {
-                let (Some(span), Some(cvars)) = (&polygon.id, &polygon.cvars) else {
+                let Some(span) = &polygon.id else {
                     continue;
                 };
                 if !matches!(
@@ -1614,22 +1716,35 @@ impl Element for CanvasElement {
                 ) {
                     continue;
                 }
-                for (point, (x, y)) in polygon.points.iter().zip(cvars) {
-                    let targets = LayoutCanvas::draggable_point_targets(
-                        sourced_corner_sse_targets(x, y, span, &source_coordinates),
-                        sse_cell,
-                    );
-                    if !targets.is_empty() {
-                        let mid = inner.layout_to_px(*point);
-                        polygon_handle_points.push(mid);
-                        let hit_half = HANDLE_HIT.half();
-                        sse_handles.push(SseHandle {
-                            bounds: Bounds::new(
-                                Point::new(mid.x - hit_half, mid.y - hit_half),
-                                Size::new(HANDLE_HIT, HANDLE_HIT),
-                            ),
-                            targets,
-                        });
+                let point_sets = polygon
+                    .cvars
+                    .as_ref()
+                    .map(|cvars| (&polygon.points, cvars))
+                    .into_iter()
+                    .chain(polygon.centerline.as_ref().and_then(|centerline| {
+                        centerline
+                            .cvars
+                            .as_ref()
+                            .map(|cvars| (&centerline.points, cvars))
+                    }));
+                for (points, cvars) in point_sets {
+                    for (point, (x, y)) in points.iter().zip(cvars) {
+                        let targets = LayoutCanvas::draggable_point_targets(
+                            sourced_corner_sse_targets(x, y, span, &source_coordinates),
+                            sse_cell,
+                        );
+                        if !targets.is_empty() {
+                            let mid = inner.layout_to_px(*point);
+                            vertex_handle_points.push(mid);
+                            let hit_half = HANDLE_HIT.half();
+                            sse_handles.push(SseHandle {
+                                bounds: Bounds::new(
+                                    Point::new(mid.x - hit_half, mid.y - hit_half),
+                                    Size::new(HANDLE_HIT, HANDLE_HIT),
+                                ),
+                                targets,
+                            });
+                        }
                     }
                 }
             }
@@ -1752,8 +1867,24 @@ impl Element for CanvasElement {
                             border_width,
                             border_color,
                         );
+                        if selected
+                            && let Some(centerline) = &polygon.centerline
+                        {
+                            let points = centerline
+                                .points
+                                .iter()
+                                .map(|point| self.inner.read(cx).layout_to_px(*point))
+                                .collect::<Vec<_>>();
+                            paint_polyline(
+                                window,
+                                &points,
+                                &centerline.segment_styles,
+                                SELECT_WIDTH,
+                                rgb(0xffff00),
+                            );
+                        }
                     }
-                    for mid in &polygon_handle_points {
+                    for mid in &vertex_handle_points {
                         let draw_half = HANDLE_SIZE.half();
                         window.paint_quad(get_paint_quad(
                             Bounds::new(
@@ -3921,6 +4052,59 @@ mod tests {
         assert!(point_in_polygon(Point::new(px(4.), px(8.)), &polygon));
         assert!(!point_in_polygon(Point::new(px(8.), px(8.)), &polygon));
         assert_eq!(polygon_area(&polygon), 64.);
+    }
+
+    #[test]
+    fn path_segments_are_dashed_only_next_to_unconstrained_points() {
+        assert_eq!(
+            path_segment_styles(4, |index| index == 1),
+            [BorderStyle::Dashed, BorderStyle::Dashed, BorderStyle::Solid,]
+        );
+        assert_eq!(
+            path_segment_styles(3, |_| false),
+            [BorderStyle::Solid, BorderStyle::Solid]
+        );
+    }
+
+    #[test]
+    fn path_centerline_points_are_draggable() {
+        let source =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/path/lib.ar");
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/lyp/basic.lyp");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["initial_path"],
+                args: vec![],
+                lyp_file: &lyp,
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(output) => output.output.unwrap(),
+            output => panic!("path fixture should compile: {output:?}"),
+        };
+        let cell = &output.cells[&output.top];
+        let path = cell
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .expect("fixture should contain a path");
+        let styles = path_segment_styles(path.points.len(), |index| {
+            let (x, y) = &path.points[index];
+            x.1.coeffs
+                .iter()
+                .chain(&y.1.coeffs)
+                .any(|(_, var)| cell.unsolved_vars.contains(var))
+        });
+        assert_eq!(styles, [BorderStyle::Dashed, BorderStyle::Dashed]);
+
+        let (x, y) = &path.points[2];
+        let targets = LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), cell);
+        assert_eq!(targets.len(), 2);
+        assert!(LayoutCanvas::sse_targets_support_2d(&targets, cell));
     }
 
     #[test]

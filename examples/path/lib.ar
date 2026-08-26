@@ -1,0 +1,38 @@
+cell top() {
+    let route = path("met1", 4,
+        width=20.,
+        x0=0., y0=0.,
+        x1=100., y1=0.,
+        y2=75.,
+        x3i=0., y3i=75.,
+    );
+
+    // Width, extensions, and every centerline coordinate are independent
+    // linear expressions. Flush extensions default to zero.
+    eq(route.x2, route.points[1].x + 50.);
+    eq(route.begin_extension, 0.);
+    eq(route.end_extension, 0.);
+}
+
+// Editable initial conditions can be used for every path dimension.
+cell initial_path() {
+    let route = path("met1", 3,
+        widthi=20.,
+        begin_extensioni=5.,
+        end_extensioni=10.,
+        x0i=0., y0i=0.,
+        x1i=100., y1i=0.,
+        x2i=100., y2i=75.,
+    );
+}
+
+// Non-default extensions export as a GDS path type 4.
+cell custom_extensions() {
+    let route = path("met1", 2,
+        width=20.,
+        begin_extension=5.,
+        end_extension=10.,
+        x0=0., y0=0.,
+        x1=100., y1=0.,
+    );
+}

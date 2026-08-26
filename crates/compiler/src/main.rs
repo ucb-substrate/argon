@@ -531,6 +531,8 @@ mod tests {
             "cell top() {\n\
              let imported = inst(routes(), x=0., y=0.);\n\
              eq(imported.gds_path_0.width, 20.);\n\
+             eq(imported.gds_path_0.begin_extension, 10.);\n\
+             eq(imported.gds_path_0.end_extension, 10.);\n\
              eq(imported.gds_path_0.x1, 100.);\n\
              }\n",
         );
@@ -562,8 +564,8 @@ mod tests {
             .find_map(|object| object.get_path())
             .expect("imported cell should contain a path");
         assert_eq!(imported_path.width.0, 20.);
-        assert_eq!(imported_path.begin_extension, 10.);
-        assert_eq!(imported_path.end_extension, 10.);
+        assert_eq!(imported_path.begin_extension.0, 10.);
+        assert_eq!(imported_path.end_extension.0, 10.);
 
         let exported = GdsLibrary::load(exported_path).expect("round-trip GDS should load");
         let exported_path = exported

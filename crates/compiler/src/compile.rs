@@ -1793,7 +1793,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Path => match field.name.as_str() {
                 "points" => Ty::Seq(Box::new(Ty::Point)),
                 "layer" => Ty::String,
-                "width" => Ty::Float,
+                "width" | "begin_extension" | "end_extension" => Ty::Float,
                 name if polygon_coordinate(name).is_some_and(|coordinate| !coordinate.initial) => {
                     Ty::Float
                 }
@@ -1949,9 +1949,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         .iter()
                         .filter_map(|kwarg| {
                             let name = kwarg.name.name.as_str();
-                            (name == "width"
-                                || name == "widthi"
-                                || polygon_coordinate(name).is_some())
+                            (matches!(
+                                name,
+                                "width"
+                                    | "widthi"
+                                    | "begin_extension"
+                                    | "begin_extensioni"
+                                    | "end_extension"
+                                    | "end_extensioni"
+                            ) || polygon_coordinate(name).is_some())
                             .then_some((name, Ty::Float))
                         })
                         .collect();
@@ -2438,8 +2444,8 @@ pub struct Path<T> {
     pub points: Vec<(T, T)>,
     /// Distance by which the path extends before and after its centerline.
     /// These retain the geometry of imported GDS path types 0, 2, and 4.
-    pub begin_extension: f64,
-    pub end_extension: f64,
+    pub begin_extension: T,
+    pub end_extension: T,
     pub span: Option<Span>,
 }
 
@@ -3169,8 +3175,8 @@ impl<'a> ExecPass<'a> {
                                 .into_iter()
                                 .map(|(x, y)| ((x, LinearExpr::from(x)), (y, LinearExpr::from(y))))
                                 .collect(),
-                            begin_extension,
-                            end_extension,
+                            begin_extension: (begin_extension, LinearExpr::from(begin_extension)),
+                            end_extension: (end_extension, LinearExpr::from(end_extension)),
                             span: None,
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_path_{element_index}"))),
@@ -3352,8 +3358,20 @@ impl<'a> ExecPass<'a> {
                             )
                         })
                         .collect(),
-                    begin_extension: path.begin_extension,
-                    end_extension: path.end_extension,
+                    begin_extension: (
+                        state
+                            .solver
+                            .eval_expr(&path.begin_extension)
+                            .expect("path begin extension not solved"),
+                        path.begin_extension.clone(),
+                    ),
+                    end_extension: (
+                        state
+                            .solver
+                            .eval_expr(&path.end_extension)
+                            .expect("path end extension not solved"),
+                        path.end_extension.clone(),
+                    ),
                     span: path.span.clone(),
                 }),
                 Object::Text(text) => SolvedValue::Text(Text {
@@ -4303,8 +4321,27 @@ impl<'a> ExecPass<'a> {
 
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
+                        let has_begin_extension = c.expr.args.kwargs.iter().any(|kwarg| {
+                            matches!(
+                                kwarg.name.name.as_str(),
+                                "begin_extension" | "begin_extensioni"
+                            )
+                        });
+                        let has_end_extension = c.expr.args.kwargs.iter().any(|kwarg| {
+                            matches!(kwarg.name.name.as_str(), "end_extension" | "end_extensioni")
+                        });
                         let state = self.cell_state_mut(cell_id);
                         let width = state.solver.new_var().into();
+                        let begin_extension = if has_begin_extension {
+                            state.solver.new_var().into()
+                        } else {
+                            LinearExpr::from(0.)
+                        };
+                        let end_extension = if has_end_extension {
+                            state.solver.new_var().into()
+                        } else {
+                            LinearExpr::from(0.)
+                        };
                         let points = (0..count)
                             .map(|_| (state.solver.new_var().into(), state.solver.new_var().into()))
                             .collect();
@@ -4313,8 +4350,8 @@ impl<'a> ExecPass<'a> {
                             layer,
                             width,
                             points,
-                            begin_extension: 0.,
-                            end_extension: 0.,
+                            begin_extension,
+                            end_extension,
                             span: Some(span.clone()),
                         };
                         state.objects.insert(id, path.clone().into());
@@ -4327,42 +4364,58 @@ impl<'a> ExecPass<'a> {
                             .insert(vid, Defer::Ready(Value::Path(path.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let name = kwarg.name.name.as_str();
-                            let (expr, fallback, priority, initial_condition) = if name == "width"
-                                || name == "widthi"
-                            {
-                                (
+                            let (expr, fallback, priority, initial_condition) = match name {
+                                "width" | "widthi" => (
                                     path.width.clone(),
                                     name == "widthi",
                                     i32::MAX,
                                     (name == "widthi")
                                         .then_some(RectInitialCondition::PathWidth(path.id)),
-                                )
-                            } else {
-                                let coordinate = polygon_coordinate(name)
-                                    .expect("path kwargs were statically validated");
-                                let expr = match coordinate.axis {
-                                    PolygonAxis::X => path.points[coordinate.index].0.clone(),
-                                    PolygonAxis::Y => path.points[coordinate.index].1.clone(),
-                                };
-                                let initial_condition =
-                                    coordinate.initial.then_some(match coordinate.axis {
-                                        PolygonAxis::X => {
-                                            RectInitialCondition::PathX(path.id, coordinate.index)
-                                        }
-                                        PolygonAxis::Y => {
-                                            RectInitialCondition::PathY(path.id, coordinate.index)
-                                        }
-                                    });
-                                (
-                                    expr,
-                                    coordinate.initial,
-                                    i32::MAX
-                                        - 1
-                                        - i32::try_from(coordinate.index.saturating_mul(2))
-                                            .unwrap_or(i32::MAX)
-                                        - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
-                                    initial_condition,
-                                )
+                                ),
+                                "begin_extension" | "begin_extensioni" => (
+                                    path.begin_extension.clone(),
+                                    name == "begin_extensioni",
+                                    i32::MAX - 1,
+                                    (name == "begin_extensioni").then_some(
+                                        RectInitialCondition::PathBeginExtension(path.id),
+                                    ),
+                                ),
+                                "end_extension" | "end_extensioni" => (
+                                    path.end_extension.clone(),
+                                    name == "end_extensioni",
+                                    i32::MAX - 2,
+                                    (name == "end_extensioni")
+                                        .then_some(RectInitialCondition::PathEndExtension(path.id)),
+                                ),
+                                _ => {
+                                    let coordinate = polygon_coordinate(name)
+                                        .expect("path kwargs were statically validated");
+                                    let expr = match coordinate.axis {
+                                        PolygonAxis::X => path.points[coordinate.index].0.clone(),
+                                        PolygonAxis::Y => path.points[coordinate.index].1.clone(),
+                                    };
+                                    let initial_condition =
+                                        coordinate.initial.then_some(match coordinate.axis {
+                                            PolygonAxis::X => RectInitialCondition::PathX(
+                                                path.id,
+                                                coordinate.index,
+                                            ),
+                                            PolygonAxis::Y => RectInitialCondition::PathY(
+                                                path.id,
+                                                coordinate.index,
+                                            ),
+                                        });
+                                    (
+                                        expr,
+                                        coordinate.initial,
+                                        i32::MAX
+                                            - 3
+                                            - i32::try_from(coordinate.index.saturating_mul(2))
+                                                .unwrap_or(i32::MAX)
+                                            - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
+                                        initial_condition,
+                                    )
+                                }
                             };
                             let lhs = self.value_id();
                             self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
@@ -5391,6 +5444,8 @@ impl<'a> ExecPass<'a> {
                                 ),
                                 "layer" => Value::String(path.layer.clone()),
                                 "width" => Value::Linear(path.width.clone()),
+                                "begin_extension" => Value::Linear(path.begin_extension.clone()),
+                                "end_extension" => Value::Linear(path.end_extension.clone()),
                                 name if polygon_coordinate(name)
                                     .is_some_and(|coordinate| !coordinate.initial) =>
                                 {
@@ -5562,8 +5617,12 @@ impl<'a> ExecPass<'a> {
                                                                 )
                                                             })
                                                             .collect(),
-                                                        begin_extension: path.begin_extension,
-                                                        end_extension: path.end_extension,
+                                                        begin_extension: LinearExpr::from(
+                                                            path.begin_extension.0,
+                                                        ),
+                                                        end_extension: LinearExpr::from(
+                                                            path.end_extension.0,
+                                                        ),
                                                         span: path.span.clone(),
                                                     };
                                                     objects.insert(path.id, path.clone().into());
@@ -6101,6 +6160,8 @@ pub enum RectInitialCondition {
     PathX(ObjectId, usize),
     PathY(ObjectId, usize),
     PathWidth(ObjectId),
+    PathBeginExtension(ObjectId),
+    PathEndExtension(ObjectId),
     InstanceX(ObjectId),
     InstanceY(ObjectId),
 }
@@ -6504,8 +6565,8 @@ impl<T> Path<(f64, T)> {
         let normal = |direction: (f64, f64)| (-direction.1, direction.0);
         let start_direction = directions[0];
         let start = (
-            points[0].0 - start_direction.0 * self.begin_extension,
-            points[0].1 - start_direction.1 * self.begin_extension,
+            points[0].0 - start_direction.0 * self.begin_extension.0,
+            points[0].1 - start_direction.1 * self.begin_extension.0,
         );
         let start_normal = normal(start_direction);
         let mut left = vec![(
@@ -6532,8 +6593,8 @@ impl<T> Path<(f64, T)> {
         let end_direction = directions[directions.len() - 1];
         let end = points[points.len() - 1];
         let end = (
-            end.0 + end_direction.0 * self.end_extension,
-            end.1 + end_direction.1 * self.end_extension,
+            end.0 + end_direction.0 * self.end_extension.0,
+            end.1 + end_direction.1 * self.end_extension.0,
         );
         let end_normal = normal(end_direction);
         left.push((

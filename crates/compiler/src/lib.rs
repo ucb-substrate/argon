@@ -159,6 +159,7 @@ mod tests {
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
     const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
+    const ARGON_PATH: &str = concatcp!(EXAMPLES_DIR, "/path/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -1896,18 +1897,22 @@ mod tests {
     }
 
     #[test]
-    fn argon_path_points_and_width_are_constrained_and_exported() {
+    fn argon_path_dimensions_are_constrained_and_exported() {
         let root = parse_source_text(
             r#"
                 cell top() {
                     let route = path("met1", 3,
                         width=20.,
+                        begin_extension=5.,
+                        end_extension=7.,
                         x0=0., y0=0.,
                         x1=100., y1=0.,
                         y2=50.,
                     );
                     eq(route.x2, route.points[1].x);
                     eq(route.width, 20.);
+                    eq(route.begin_extension, 5.);
+                    eq(route.end_extension, 7.);
                 }
             "#,
             PathBuf::from("/virtual/lib.ar"),
@@ -1936,6 +1941,8 @@ mod tests {
             .find_map(SolvedValue::get_path)
             .expect("compiled path");
         assert_eq!(path.width.0, 20.);
+        assert_eq!(path.begin_extension.0, 5.);
+        assert_eq!(path.end_extension.0, 7.);
         assert_eq!(
             path.points
                 .iter()
@@ -1962,8 +1969,58 @@ mod tests {
             })
             .expect("GDS path element");
         assert_eq!(path.width, Some(20));
-        assert_eq!(path.path_type, None);
+        assert_eq!(path.path_type, Some(4));
+        assert_eq!(path.begin_extn, Some(5));
+        assert_eq!(path.end_extn, Some(7));
         assert_eq!(path.xy.len(), 3);
+    }
+
+    #[test]
+    fn argon_path_example_compiles() {
+        let parsed = parse_workspace_with_std(ARGON_PATH);
+        assert!(
+            parsed.static_errors().is_empty(),
+            "{:?}",
+            parsed.static_errors()
+        );
+        let ast = parsed.ast();
+        for cell_name in ["top", "initial_path", "custom_extensions"] {
+            let output = compile(
+                &ast,
+                CompileInput {
+                    cell: &[cell_name],
+                    args: Vec::new(),
+                    lyp_file: &PathBuf::from(BASIC_LYP),
+                },
+            );
+            let output = match output {
+                CompileOutput::Valid(output) => output,
+                CompileOutput::ExecErrors(output) => output
+                    .output
+                    .unwrap_or_else(|| panic!("path example cell `{cell_name}` needs output")),
+                output => panic!("path example cell `{cell_name}` should compile: {output:?}"),
+            };
+            let path = output.cells[&output.top]
+                .objects
+                .values()
+                .find_map(SolvedValue::get_path)
+                .expect("example cell should contain a path");
+            if cell_name == "custom_extensions" {
+                assert_eq!(path.begin_extension.0, 5.);
+                assert_eq!(path.end_extension.0, 10.);
+            }
+            if cell_name == "initial_path" {
+                let fallbacks = &output.cells[&output.top].fallback_constraints_used;
+                assert!(fallbacks.iter().any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PathBeginExtension(_))
+                )));
+                assert!(fallbacks.iter().any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PathEndExtension(_))
+                )));
+            }
+        }
     }
 
     #[test]
