@@ -3,7 +3,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools, multiunzip};
 use nalgebra::{CsMatrix, DMatrix, DVector};
 use serde::{Deserialize, Serialize};
-use sparse_linear_solver::System as SparseLinearSystem;
+use sparse_linear_solver::{analyze as analyze_sparse_system, nullspace as sparse_nullspace};
 use std::collections::VecDeque;
 
 const EPSILON: f64 = 1e-8;
@@ -33,6 +33,10 @@ pub struct Solver {
     // cleared at the start of each elimination pass, so they hold no state between solves.
     elim_worklist: VecDeque<ConstraintId>,
     substitutions: Vec<(Var, LinearExpr)>,
+    /// Null-space vectors produced while analyzing the current sparse
+    /// components. Kept only when no elimination substitution changed the
+    /// coordinate space, so SSE can reuse the factorization result.
+    sparse_nullspace_cache: Option<Vec<Vec<(f64, Var)>>>,
 }
 
 fn round(x: f64) -> f64 {
@@ -170,7 +174,7 @@ impl Solver {
         }
         // Sparsity-exploiting pre-pass: peel off variables that are uniquely defined
         // by a constraint of size <= 2 (generalizing 1-variable back-substitution),
-        // shrinking the system before the dense SVD below. Variables eliminated via a
+        // shrinking the system before sparse analysis or the dense fallback. Variables eliminated via a
         // 2-variable constraint are expressed in terms of another variable and recorded
         // in `self.substitutions`; their numeric values are recovered by
         // `resolve_substitutions` once the remaining (irreducible) core has been solved.
@@ -178,6 +182,8 @@ impl Solver {
         // `bench_constraints`) this resolves everything in O(n) and the SVD never runs;
         // for a genuinely dense block it is a no-op and behaviour is identical to before.
         self.eliminate_definitional();
+        let substitutions_changed_coordinates = !self.substitutions.is_empty();
+        self.sparse_nullspace_cache = Some(Vec::new());
 
         for component in self.constraint_components() {
             self.solve_component(&component.vars, &component.constraints);
@@ -194,6 +200,9 @@ impl Solver {
             .retain(|_, constraint| !constraint.coeffs.is_empty());
 
         self.resolve_substitutions();
+        if substitutions_changed_coordinates {
+            self.sparse_nullspace_cache = None;
+        }
     }
 
     /// Sparse elimination pre-pass. Repeatedly examines constraints with at most two
@@ -364,6 +373,49 @@ impl Solver {
             .collect()
     }
 
+    /// Computes an orthonormal null-space basis directly from sparse QR. A
+    /// `None` result lets callers retain the dense row-space fallback for inputs
+    /// outside the sparse solver's scope.
+    pub fn sparse_nullspace_vecs(&self) -> Option<Vec<Vec<(f64, Var)>>> {
+        if let Some(cached) = &self.sparse_nullspace_cache {
+            return Some(cached.clone());
+        }
+        if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
+            return Some(Vec::new());
+        }
+        let mut output = Vec::new();
+        for component in self.constraint_components() {
+            let var_indices: IndexMap<Var, usize> = IndexMap::from_iter(
+                component
+                    .vars
+                    .iter()
+                    .enumerate()
+                    .map(|(index, var)| (*var, index)),
+            );
+            let rows: Vec<Vec<(usize, f64)>> = component
+                .constraints
+                .iter()
+                .map(|id| {
+                    self.constraints[id]
+                        .coeffs
+                        .iter()
+                        .filter_map(|(value, var)| {
+                            var_indices.get(var).map(|&column| (column, *value))
+                        })
+                        .collect()
+                })
+                .collect();
+            let basis = sparse_nullspace(component.vars.len(), &rows)?;
+            output.extend(basis.into_iter().map(|vector| {
+                vector
+                    .into_iter()
+                    .map(|(column, value)| (value, component.vars[column]))
+                    .collect()
+            }));
+        }
+        Some(output)
+    }
+
     pub fn value_of(&self, var: Var) -> Option<f64> {
         self.solved_vars.get(&var).copied()
     }
@@ -390,6 +442,7 @@ impl Solver {
         if self.try_solve_sparse_component(vars, constraints) {
             return;
         }
+        self.sparse_nullspace_cache = None;
         let var_indices: IndexMap<Var, usize> =
             IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
@@ -436,15 +489,10 @@ impl Solver {
         }
     }
 
-    /// Attempts to solve a sparse, provably nonsingular component without ever
-    /// materializing a dense matrix.
-    ///
-    /// Each constraint must have a unique strictly dominant variable, and those
-    /// variables must form a permutation of the component variables. After rows
-    /// are put in that order, the Levy--Desplanques theorem proves that the matrix
-    /// is nonsingular. This lets the iterative solvers mark every variable as
-    /// determined without computing the dense SVD nullspace. A failed iteration
-    /// or backward-error check simply returns to the dense path.
+    /// Attempts to solve a sparse full-column-rank component without ever
+    /// materializing a dense matrix, using fill-reducing sparse QR. For a
+    /// rank-deficient component, its sparse null-space basis identifies which
+    /// variables are uniquely determined by the CGLS particular solution.
     fn try_solve_sparse_component(
         &mut self,
         vars: &IndexSet<Var>,
@@ -452,7 +500,7 @@ impl Solver {
     ) -> bool {
         let var_indices: IndexMap<Var, usize> =
             IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
-        let rows = constraints
+        let rows: Vec<Vec<(usize, f64)>> = constraints
             .iter()
             .map(|id| {
                 self.constraints[id]
@@ -462,19 +510,42 @@ impl Solver {
                     .collect()
             })
             .collect();
-        let rhs = constraints
+        let rhs: Vec<f64> = constraints
             .iter()
             .map(|id| -self.constraints[id].constant)
             .collect();
-        let Some(system) = SparseLinearSystem::new(rows, rhs) else {
-            return false;
-        };
-        let Some(solution) = system.solve() else {
+        let analysis = analyze_sparse_system(vars.len(), &rows, &rhs);
+        #[cfg(test)]
+        if std::env::var_os("ARGON_TRACE_SPARSE_FALLBACK").is_some() {
+            eprintln!(
+                "ARGON_SPARSE_COMPONENT outcome={} vars={} rows={} nnz={}",
+                if analysis.is_some() { "sparse" } else { "dense" },
+                vars.len(),
+                rows.len(),
+                rows.iter().map(Vec::len).sum::<usize>()
+            );
+        }
+        let Some(analysis) = analysis else {
             return false;
         };
 
-        for (&var, &value) in vars.iter().zip(&solution) {
-            self.assign_var(var, value);
+        if let Some(cache) = &mut self.sparse_nullspace_cache {
+            cache.extend(analysis.nullspace.iter().map(|vector| {
+                vector
+                    .iter()
+                    .map(|&(column, value)| (value, vars[column]))
+                    .collect()
+            }));
+        }
+
+        for (column, (&var, &value)) in vars.iter().zip(&analysis.solution).enumerate() {
+            let determined = analysis
+                .nullspace
+                .iter()
+                .all(|vector| vector.iter().all(|&(index, _)| index != column));
+            if determined {
+                self.assign_var(var, value);
+            }
         }
         true
     }
@@ -898,14 +969,18 @@ mod tests {
         assert_relative_eq!(s.value_of(d).unwrap(), 8., epsilon = EPSILON);
     }
 
-    fn coupled_ring_system(n: usize, left: f64, right: f64) -> (Solver, Vec<Var>, Vec<f64>) {
+    fn coupled_ring_system(
+        n: usize,
+        left: f64,
+        diagonal: f64,
+        right: f64,
+    ) -> (Solver, Vec<Var>, Vec<f64>) {
         let mut solver = Solver::new();
         let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
         let expected: Vec<_> = (0..n).map(|i| ((i % 11) as f64 - 5.) * 0.1).collect();
         for i in 0..n {
             let previous = (i + n - 1) % n;
             let next = (i + 1) % n;
-            let diagonal = left.abs() + right.abs() + 2.;
             let rhs = left * expected[previous] + diagonal * expected[i] + right * expected[next];
             solver.constrain_eq0(c(
                 vec![
@@ -921,13 +996,16 @@ mod tests {
 
     /// Every row has three unknowns, so neither insertion-time back-substitution
     /// nor the size-2 elimination pass can make progress. The symmetric sparse
-    /// component is solved by PCG and never materializes the dense SVD matrix.
+    /// component is solved by sparse QR and never materializes the dense SVD matrix.
     #[test]
-    fn sparse_symmetric_ring_uses_iterative_solver() {
-        let (mut solver, vars, expected) = coupled_ring_system(128, -1., -1.);
+    fn sparse_symmetric_ring_uses_sparse_qr() {
+        let (mut solver, vars, expected) = coupled_ring_system(128, -1., 1.9, -1.);
         assert!(vars.iter().all(|&var| !solver.is_solved(var)));
 
-        solver.solve();
+        let mut components = solver.constraint_components();
+        assert_eq!(components.len(), 1);
+        let component = components.pop().unwrap();
+        assert!(solver.try_solve_sparse_component(&component.vars, &component.constraints));
         assert!(solver.fully_solved());
         for (&var, &value) in vars.iter().zip(&expected) {
             assert_relative_eq!(solver.value_of(var).unwrap(), value, epsilon = EPSILON);
@@ -937,10 +1015,10 @@ mod tests {
     }
 
     /// The same irreducible shape with asymmetric neighbor coefficients exercises
-    /// the CGLS path.
+    /// general nonsymmetric sparse QR.
     #[test]
-    fn sparse_nonsymmetric_ring_uses_iterative_solver() {
-        let (mut solver, vars, expected) = coupled_ring_system(127, -1., -2.);
+    fn sparse_nonsymmetric_ring_uses_sparse_qr() {
+        let (mut solver, vars, expected) = coupled_ring_system(127, -1., 2., -1.1);
         assert!(vars.iter().all(|&var| !solver.is_solved(var)));
 
         solver.solve();
@@ -952,10 +1030,9 @@ mod tests {
         assert!(solver.invalid_rounding().is_empty());
     }
 
-    /// A fully-coupled 3x3 block has no size-<=2 pivot: the pre-pass is a no-op and the
-    /// dense SVD path solves it, exactly as before.
+    /// A fully-coupled full-rank block has no size-<=2 pivot, so sparse QR solves it.
     #[test]
-    fn dense_block_falls_back() {
+    fn full_rank_block_uses_sparse_qr() {
         let mut s = Solver::new();
         let a = s.new_var();
         let b = s.new_var();
@@ -968,5 +1045,26 @@ mod tests {
         assert_relative_eq!(s.value_of(b).unwrap(), 2., epsilon = EPSILON);
         assert_relative_eq!(s.value_of(d).unwrap(), 3., epsilon = EPSILON);
         assert!(s.inconsistent_constraints().is_empty());
+    }
+
+    #[test]
+    fn rank_deficient_sparse_component_preserves_nullspace_for_sse() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+        let z = solver.new_var();
+        solver.constrain_eq0(c(vec![(1., x), (1., y), (1., z)], -5.));
+        solver.constrain_eq0(c(vec![(1., x), (1., y), (-1., z)], -1.));
+
+        let mut components = solver.constraint_components();
+        let component = components.pop().unwrap();
+        assert!(solver.try_solve_sparse_component(&component.vars, &component.constraints));
+        assert_relative_eq!(solver.value_of(z).unwrap(), 2., epsilon = EPSILON);
+        assert!(solver.value_of(x).is_none());
+        assert!(solver.value_of(y).is_none());
+
+        let basis = solver.sparse_nullspace_vecs().unwrap();
+        assert_eq!(basis.len(), 1);
+        assert!(basis[0].iter().all(|&(_, var)| var != z));
     }
 }
