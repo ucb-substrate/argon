@@ -4,7 +4,7 @@ use std::{
     process::ExitCode,
 };
 
-use argonc::{
+use crate::{
     artifact,
     compile::{self, CellArg, CompileInput, CompileOutput},
     diagnostics::{self, Diagnostic},
@@ -60,7 +60,7 @@ struct Args {
     error_format: ErrorFormat,
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args = Args::parse();
     let format = args.error_format;
     let previous_hook = std::panic::take_hook();
@@ -139,7 +139,7 @@ fn run(args: Args) -> Result<(), Failed> {
             "--lyp is required when compiling a cell; pass the path to a KLayout layer-properties file",
         ));
     };
-    argonc::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
+    crate::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
     let cell_ast = parse::parse_cell(cell)
         .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?;
     if !cell_ast.args.kwargs.is_empty() {
@@ -256,7 +256,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use argonc::{artifact, compile::CompileOutput};
+    use crate::{artifact, compile::CompileOutput};
     use clap::{CommandFactory, Parser};
     use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
@@ -368,7 +368,7 @@ mod tests {
     fn render_failed(error: Failed) -> String {
         let mut output = Vec::new();
         for diagnostic in error.1 {
-            argonc::diagnostics::render(&mut output, &diagnostic, false)
+            crate::diagnostics::render(&mut output, &diagnostic, false)
                 .expect("diagnostic should render");
         }
         String::from_utf8(output).expect("diagnostics should be UTF-8")
@@ -646,6 +646,23 @@ mod tests {
         );
         assert!(
             diagnostic.contains(&malformed.display().to_string()),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn missing_text_layer_is_reported_cleanly() {
+        let source = temp_source(
+            "missing-text-layer",
+            "cell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
+        );
+        let lyp = basic_lyp();
+        let diagnostic = render_failed(failed(execution_args(source, "top()", lyp.clone())));
+        assert!(
+            diagnostic.contains(&format!(
+                "text uses layer `missing.label`, which is not defined in LYP file `{}`",
+                lyp.display()
+            )),
             "{diagnostic}"
         );
     }

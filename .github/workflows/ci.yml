@@ -25,6 +25,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Check Argon examples
+        run: cargo test -p arc examples_are_formatted
+
   # Lint
   clippy:
     name: Clippy

@@ -4,15 +4,17 @@ use std::{
     net::{SocketAddr, TcpListener},
 };
 
-use analyzer::default_argon_home;
 use editor::Editor;
 use gpui::*;
 use rust_embed::RustEmbed;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 use crate::actions::*;
 use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
+
+#[path = "main.rs"]
+mod cli;
+pub use cli::main as run;
 
 pub mod actions;
 pub mod assets;
@@ -47,7 +49,7 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn run(
+pub fn run_gui(
     lang_server_addr: SocketAddr,
     gui_listen_port: Option<u16>,
     gui_register_addr: Option<SocketAddr>,
@@ -76,14 +78,7 @@ fn run_inner(
 ) {
     focus::initialize_target();
 
-    // TODO: Allow configuration via ARGON_HOME environment variable.
-    if let Some(log_dir) = default_argon_home() {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_env("ARGON_LOG"))
-            .with_writer(tracing_appender::rolling::never(log_dir, "argone.log"))
-            .with_ansi(false)
-            .init();
-    }
+    analyzer::init_logging();
 
     Application::new()
         .with_assets(Assets)

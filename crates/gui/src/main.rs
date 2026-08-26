@@ -98,7 +98,7 @@ struct GuiArgs {
     ssh_control: bool,
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
@@ -112,11 +112,11 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitStatus> {
     match cli.command {
         None => {
-            let focus_target = argone::focus::capture_target();
+            let focus_target = crate::focus::capture_target();
             run_nvim(&cli.nvim, &cli.path, focus_target.as_deref())
         }
         Some(CommandKind::Ssh(args)) => {
-            let focus_target = argone::focus::capture_target();
+            let focus_target = crate::focus::capture_target();
             run_ssh(&cli.nvim, args, focus_target.as_deref())
         }
         Some(CommandKind::Gui(args)) => run_gui(args),
@@ -136,12 +136,12 @@ fn run_gui(args: GuiArgs) -> Result<ExitStatus> {
             .read_line(&mut forwarding)
             .context("failed to read SSH forwarding configuration")?;
         let (lang_server_addr, register_addr) = parse_address_pair(&forwarding)?;
-        argone::run_with_listener(lang_server_addr, listener, register_addr);
+        crate::run_with_listener(lang_server_addr, listener, register_addr);
     } else {
         let lang_server_addr = args.lang_server_addr.ok_or_else(|| {
             anyhow!("an analyzer address is required unless --ssh-control is used")
         })?;
-        argone::run(lang_server_addr, args.listen_port, args.register_addr);
+        crate::run_gui(lang_server_addr, args.listen_port, args.register_addr);
     }
     Ok(success_status())
 }
@@ -164,7 +164,7 @@ fn run_nvim(nvim: &OsStr, path: &Path, focus_target: Option<&str>) -> Result<Exi
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(focus_target) = focus_target {
-        command.env(argone::focus::TARGET_ENV, focus_target);
+        command.env(crate::focus::TARGET_ENV, focus_target);
     }
     command
         .status()
@@ -578,7 +578,7 @@ fn launch_forwarded_gui(gui_port: Option<u16>, focus_target: Option<&str>) -> Re
         command.arg("--listen-port").arg(port.to_string());
     }
     if let Some(focus_target) = focus_target {
-        command.env(argone::focus::TARGET_ENV, focus_target);
+        command.env(crate::focus::TARGET_ENV, focus_target);
     }
     let mut child = command
         .stdin(Stdio::piped())

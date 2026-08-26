@@ -185,6 +185,7 @@ dependencies = [
  "indexmap",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 1.1.4+spec-1.1.0",
 ]
 
@@ -215,6 +216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "argon"
+version = "0.1.0"
+dependencies = [
+ "arc",
+ "argon-analyzer",
+ "argonc",
+ "argone",
+]
+
+[[package]]
 name = "argon-analyzer"
 version = "0.1.0"
 dependencies = [
@@ -234,6 +245,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 1.1.4+spec-1.1.0",
  "tower-lsp-server",
  "tracing",
  "tracing-appender",
@@ -314,8 +326,6 @@ dependencies = [
  "tokio",
  "tower-lsp-server",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "unicode-segmentation",
 ]
 

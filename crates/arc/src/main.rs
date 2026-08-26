@@ -5,8 +5,8 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 
+use crate::{Library, create_workspace, find_manifest_path, format_workspace};
 use anyhow::{Context, Result, anyhow, bail};
-use arc::Library;
 use argonc::diagnostics::{self, Diagnostic};
 use clap::{Args, Parser, Subcommand};
 
@@ -19,10 +19,33 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandKind {
+    /// Create a new Argon workspace.
+    New(NewArgs),
+    /// Format Argon source files.
+    Fmt(FmtArgs),
     /// Parse, resolve, and type-check an Argon library.
     Check(LibraryArgs),
     /// Execute an Argon cell and write the compiler output.
     Run(RunArgs),
+}
+
+#[derive(Debug, Args)]
+struct FmtArgs {
+    /// Path to Argon.toml. Defaults to the nearest manifest in this directory or a parent.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+    /// Check formatting without writing files.
+    #[arg(long)]
+    check: bool,
+}
+
+#[derive(Debug, Args)]
+struct NewArgs {
+    /// Directory to create for the new workspace.
+    path: PathBuf,
+    /// Workspace name. Defaults to the directory name.
+    #[arg(long)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -50,8 +73,10 @@ struct RunArgs {
     gds: bool,
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let result = match Cli::parse().command {
+        CommandKind::New(args) => new(args),
+        CommandKind::Fmt(args) => fmt(args),
         CommandKind::Check(args) => check(args),
         CommandKind::Run(args) => run(args),
     };
@@ -62,6 +87,44 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn fmt(args: FmtArgs) -> Result<()> {
+    let manifest_path = match args.manifest_path {
+        Some(path) => path,
+        None => find_manifest_path(".")?,
+    };
+    let report = format_workspace(&manifest_path, args.check)?;
+    if args.check && !report.changed.is_empty() {
+        for path in &report.changed {
+            eprintln!("Diff in {}", path.display());
+        }
+        bail!(
+            "{} Argon source file{} not formatted; run 'arc fmt --manifest-path {}'",
+            report.changed.len(),
+            if report.changed.len() == 1 {
+                " is"
+            } else {
+                "s are"
+            },
+            manifest_path.display()
+        );
+    }
+    if !args.check {
+        for path in &report.changed {
+            status("Formatted", &path.display().to_string());
+        }
+    }
+    Ok(())
+}
+
+fn new(args: NewArgs) -> Result<()> {
+    let library = create_workspace(&args.path, args.name.as_deref())?;
+    status(
+        "Created",
+        &format!("{} at {}", library.name, args.path.display()),
+    );
+    Ok(())
 }
 
 fn check(args: LibraryArgs) -> Result<()> {

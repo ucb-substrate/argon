@@ -1,0 +1,27 @@
+[package]
+name = "argon"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "arc"
+path = "src/bin/arc.rs"
+
+[[bin]]
+name = "argonc"
+path = "src/bin/argonc.rs"
+
+[[bin]]
+name = "argon-analyzer"
+path = "src/bin/argon-analyzer.rs"
+
+[[bin]]
+name = "argone"
+path = "src/bin/argone.rs"
+
+[dependencies]
+analyzer = { package = "argon-analyzer", version = "0.1.0", path = "../analyzer" }
+arc = { version = "0.1.0", path = "../arc" }
+argonc = { version = "0.1.0", path = "../compiler" }
+argone = { version = "0.1.0", path = "../gui" }

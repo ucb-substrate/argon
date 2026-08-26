@@ -25,7 +25,7 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() {
+pub async fn main() {
     let args = Args::parse();
     if matches!(args.command, Some(Command::Relay)) {
         if let Err(error) = run_relay().await {
@@ -33,7 +33,7 @@ async fn main() {
             std::process::exit(1);
         }
     } else {
-        analyzer::main(args.rpc_port, args.relay_socket).await;
+        crate::main(args.rpc_port, args.relay_socket).await;
     }
 }
 

@@ -47,12 +47,6 @@ local Config = {
     --- analyzer transport, for example with |vim.lsp.rpc.connect()|.
     ---@type nil | string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
     cmd = nil,
-    log = {
-        --- Log level following [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
-        --- Defaults to `nil`.
-        ---@type nil | string
-        level = nil
-    },
 }
 
 ---@type argon.config.Config

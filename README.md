@@ -12,23 +12,6 @@ general-purpose programming language. The main goal of Argon is to allow interop
 enable the creation of most practical parametric cells, and allow for performance optimizations such
 as caching and incremental compilation.
 
-Currently, Argon supports the following features:
-- Drawing rectangles and dimension constraints in GUI
-- Live reload of GUI upon changes in code editor
-- Parametric cells
-- Hierarchy
-- Linear constraint solving: fast sparse elimination, with a general (dense) solver as fallback
-- Basic diagnostic reporting in the code editor
-- Basic detection of under/overconstrained systems
-
-Future versions of Argon will hopefully support:
-- Detection/reporting of under/overconstrained geometry and conflicting constraints
-- Faster linear constraint solving (not necessarily supporting general constraints) 
-- Additional editing capabilities in GUI (e.g. instantiating cells)
-- Incremental compilation/caching
-- More advanced data types (e.g. Rust-style enums)
-- Integration with Rust
-
 ## Installation
 
 To use Argon, you will need:
@@ -39,62 +22,14 @@ To use Argon, you will need:
 Install Argon from source:
 
 ```bash
-cargo install --git https://github.com/ucb-substrate/argon --locked \
-    argonc arc argon-analyzer argone
+cargo install --git https://github.com/ucb-substrate/argon --locked argon
 ```
 
 To install from a local clone, you can run:
 
 ```bash
-for crate in compiler gui arc analyzer; do
-    cargo install --locked --path crates/$crate;
-done
+cargo install --locked --path crates/argon
 ```
-
-## Command-line compilation
-
-Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
-manifest names the library and can set its layer-properties file and path
-dependencies and GDS cell imports:
-
-```toml
-name = "my-library"
-lyp = "layers.lyp"
-
-[dependencies]
-pdk = "../pdk"
-
-[gds]
-ring_osc = "~/Downloads/ring_osc.gds"
-"macros::sram" = "layout/sram.gds"
-```
-
-From the library directory, check the source or run a cell:
-
-```bash
-arc check
-arc run --cell 'top(10., 20.)'
-arc run --cell 'top()' --gds
-```
-
-`arc check` checks the library without executing a cell. `arc run` writes the
-result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
-Dependency cells use their dependency name, for example
-`arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
-GDS imports are zero-argument cells. A module-qualified entry such as
-`"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
-`use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,
-and a leading `~/` is expanded to the user's home directory.
-When invoking `argonc` directly, pass the same mapping as
-`--gds-import 'macros::sram=layout/sram.gds'`.
-
-Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
-receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
-text from a contained `<layer>.label` as its field name. Repeated pin names are
-arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance is collapsed in the
-GUI, its displayed bounding-box edges are available through `bbox(inst)`.
-
-### IDE
 
 Install the Neovim plugin with the built-in `vim.pack` package manager by
 adding this to your `init.lua`:
@@ -107,6 +42,23 @@ vim.pack.add({
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
+
+## Formatting
+
+From anywhere inside an Argon workspace, format its `.ar` source files:
+
+```bash
+arc fmt
+```
+
+`arc fmt` finds the nearest `Argon.toml` in the current directory or a parent.
+It does not format path dependencies or nested Argon workspaces. In CI, use
+`--check` to report unformatted files without changing them:
+
+```bash
+arc fmt --check
+arc fmt --check --manifest-path path/to/Argon.toml
+```
 
 From an Argon project directory, start Neovim and the GUI together:
 
@@ -122,25 +74,38 @@ open the `inv` cell. You should now be able to edit layouts in both Neovim and t
 Create a new Argon library with the following command:
 
 ```bash
-mkdir tutorial && touch tutorial/lib.ar
+arc new tutorial
 ```
 
 Your library directory should look like this:
 
-```
+```text
 tutorial
+├── Argon.toml
+├── layers.lyp
 └── lib.ar
 ```
 
-Inside `lib.ar`, define a new cell:
+The generated `lib.ar` contains a `top()` cell with a “Hello world!”
+text label. The manifest points to the generated default layer-properties file,
+so the workspace is ready to open immediately:
+
+```bash
+argone tutorial
+```
+
+With the layout canvas focused, press `o` and enter `top()` after the
+prefilled `:Argon openCell ` command to see the starter label.
+
+For the rest of the tutorial, replace the generated `top()` cell in `lib.ar`
+with:
 
 ```rust
 cell inset_rect() {
 }
 ```
 
-Start Argone for the tutorial library with `argone tutorial`. With the layout
-canvas focused, press `o`, type `inset_rect()` after the prefilled
+With the layout canvas focused, press `o`, type `inset_rect()` after the prefilled
 `:Argon openCell ` command, and press `Enter`. Click the `met2` layer in the
 right sidebar to select it. Press `r` to activate the Rectangle tool, then click
 two points on the canvas to draw your first rectangle.
@@ -218,30 +183,22 @@ you can click again to insert more copies; press `Esc` when finished.
 
 ## Logs
 
-<!-- TODO: Implement commands to open GUI log -->
-Argon writes log messages to `~/.local/state/argon/analyzer.log` (analyzer) and `~/.local/state/argon/argone.log` (Argone).
-Log level can be set using the `ARGON_LOG` environment variable
-or in the Neovim configuration. If no configuration is specified, only errors will be logged.
-Log level configuration follows [`RUST_LOG`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables) syntax.
+The analyzer and Argone write to one shared log at
+`~/.local/state/argon/argon.log`. If `XDG_STATE_HOME` is set, the log is
+written to `$XDG_STATE_HOME/argon/argon.log` instead. While the analyzer is
+running, open it with `:Argon log`.
 
-For performance, it is recommended to use `ARGON_LOG=warn` or `ARGON_LOG=error` unless you are troubleshooting an issue.
+Configure the log level in `~/.config/argon/config.toml` (or
+`$XDG_CONFIG_HOME/argon/config.toml`):
 
-### Analyzer logs
-
-While the analyzer is running, you can open its logs using the `:Argon log` command.
-
-To configure the log level, you can use the `vim.g.argon.log.level` key:
-
-```lua
-vim.g.argon = {
-    -- ...
-    log = {
-        level = "debug"
-    }
-}
+```toml
+[log]
+level = "debug"
 ```
 
-The Neovim plugin will then supply `ARGON_LOG=debug` when starting the analyzer and Argone.
+The level follows [`RUST_LOG` filter syntax](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html#filtering-events-with-environment-variables).
+It defaults to `error`; `warn` or `error` is recommended unless you are
+troubleshooting.
 
 ## Contributing
 

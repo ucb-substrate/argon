@@ -1916,3 +1916,6 @@ mod tests {
         assert!(data.rule_checks.is_empty());
     }
 }
+#[path = "main.rs"]
+mod cli;
+pub use cli::main as run;
