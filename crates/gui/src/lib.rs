@@ -12,9 +12,7 @@ use tracing::info;
 use crate::actions::*;
 use crate::assets::{ZED_PLEX_MONO, ZED_PLEX_SANS};
 
-#[path = "main.rs"]
-mod cli;
-pub use cli::main as run;
+pub mod cli;
 
 pub mod actions;
 pub mod assets;
@@ -111,6 +109,7 @@ fn run_inner(
                     name: "Tools".into(),
                     items: vec![
                         MenuItem::action("Rect", DrawRect),
+                        MenuItem::action("Polygon", DrawPolygon),
                         MenuItem::action("Dim", DrawDim),
                         MenuItem::action("Edit", Edit),
                     ],
@@ -150,6 +149,7 @@ fn key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("r", DrawRect, Some("LayoutCanvas")),
+        KeyBinding::new("p", DrawPolygon, Some("LayoutCanvas")),
         KeyBinding::new("s", SelectMode, Some("LayoutCanvas")),
         KeyBinding::new("d", DrawDim, Some("LayoutCanvas")),
         KeyBinding::new("i", InstantiateCommand, Some("LayoutCanvas")),
@@ -164,6 +164,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
         KeyBinding::new(":", FocusInvokerCommandBar, None),
         KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
+        KeyBinding::new("enter", Enter, Some("LayoutCanvas")),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
@@ -211,6 +212,7 @@ mod tests {
         input_focus: FocusHandle,
         undo_count: usize,
         draw_rect_count: usize,
+        draw_polygon_count: usize,
         command_bar_count: usize,
         instantiate_count: usize,
         open_cell_count: usize,
@@ -222,6 +224,7 @@ mod tests {
             div()
                 .on_action(cx.listener(|view, _: &Undo, _, _| view.undo_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
+                .on_action(cx.listener(|view, _: &DrawPolygon, _, _| view.draw_polygon_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
                         view.command_bar_count += 1
@@ -257,6 +260,7 @@ mod tests {
                     input_focus: cx.focus_handle(),
                     undo_count: 0,
                     draw_rect_count: 0,
+                    draw_polygon_count: 0,
                     command_bar_count: 0,
                     instantiate_count: 0,
                     open_cell_count: 0,
@@ -269,11 +273,12 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\");
+        cx.simulate_keystrokes(*window, "u r p i o : ctrl-\\");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
                 assert_eq!(view.draw_rect_count, 0);
+                assert_eq!(view.draw_polygon_count, 0);
                 assert_eq!(view.command_bar_count, 1);
                 assert_eq!(view.instantiate_count, 0);
                 assert_eq!(view.open_cell_count, 0);
@@ -284,11 +289,12 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r i o : ctrl-\\");
+        cx.simulate_keystrokes(*window, "u r p i o : ctrl-\\");
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
                 assert_eq!(view.draw_rect_count, 1);
+                assert_eq!(view.draw_polygon_count, 1);
                 assert_eq!(view.command_bar_count, 2);
                 assert_eq!(view.instantiate_count, 1);
                 assert_eq!(view.open_cell_count, 1);

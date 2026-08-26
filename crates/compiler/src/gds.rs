@@ -103,6 +103,11 @@ pub(crate) enum ImportedGdsElement {
         x1: f64,
         y1: f64,
     },
+    Polygon {
+        layer: String,
+        name: Option<String>,
+        points: Vec<(f64, f64)>,
+    },
     Text {
         layer: String,
         text: String,
@@ -123,11 +128,19 @@ pub(crate) fn import_gds(
     declared_name: &str,
     lyp_path: &Path,
 ) -> Result<ImportedGdsLibrary> {
+    let map = GdsMap::from_lyp(lyp_path)
+        .with_context(|| format!("could not map layers for GDS `{}`", path.display()))?;
+    import_gds_with_map(path, declared_name, &map)
+}
+
+fn import_gds_with_map(
+    path: &Path,
+    declared_name: &str,
+    map: &GdsMap,
+) -> Result<ImportedGdsLibrary> {
     let library = GdsLibrary::load(path)
         .map_err(|error| anyhow!("{error}"))
         .with_context(|| format!("could not read imported GDS `{}`", path.display()))?;
-    let map = GdsMap::from_lyp(lyp_path)
-        .with_context(|| format!("could not map layers for GDS `{}`", path.display()))?;
     let names = library
         .structs
         .iter()
@@ -172,8 +185,8 @@ pub(crate) fn import_gds(
         for element in &structure.elems {
             match element {
                 GdsElement::GdsBoundary(boundary) => {
-                    elements.push(import_rect(
-                        &map,
+                    elements.push(import_boundary(
+                        map,
                         path,
                         boundary.layer,
                         boundary.datatype,
@@ -182,8 +195,8 @@ pub(crate) fn import_gds(
                     )?);
                 }
                 GdsElement::GdsBox(gds_box) => {
-                    elements.push(import_rect(
-                        &map,
+                    elements.push(import_boundary(
+                        map,
                         path,
                         gds_box.layer,
                         gds_box.boxtype,
@@ -192,14 +205,9 @@ pub(crate) fn import_gds(
                     )?);
                 }
                 GdsElement::GdsTextElem(text) => {
-                    let (angle, reflect) = import_transform(path, text.strans.as_ref())?;
-                    if angle != 0. || reflect {
-                        bail!(
-                            "imported GDS `{}` contains transformed text, which is not supported",
-                            path.display()
-                        );
-                    }
-                    let layer = import_layer(&map, path, text.layer, text.texttype)?;
+                    // Text transforms affect glyph presentation, not the label's
+                    // anchor. Argon retains text as an annotation at that anchor.
+                    let layer = import_layer(map, path, text.layer, text.texttype)?;
                     elements.push(ImportedGdsElement::Text {
                         layer,
                         text: text.string.to_string(),
@@ -220,7 +228,7 @@ pub(crate) fn import_gds(
                     import_array(path, &names, array, scale, &mut elements)?;
                 }
                 GdsElement::GdsPath(_) => bail!(
-                    "imported GDS `{}` contains a path element; only rectangular boundaries, boxes, text, and cell references are supported",
+                    "imported GDS `{}` contains a path element; only boundaries, boxes, text, and cell references are supported",
                     path.display()
                 ),
                 GdsElement::GdsNode(_) => bail!(
@@ -229,7 +237,7 @@ pub(crate) fn import_gds(
                 ),
             }
         }
-        name_pin_rects(&mut elements);
+        name_pin_shapes(&mut elements);
         structs.push(ImportedGdsStruct {
             name: structure.name.to_string(),
             elements,
@@ -249,7 +257,7 @@ fn import_layer(map: &GdsMap, path: &Path, layer: i16, datatype: i16) -> Result<
         })
 }
 
-fn import_rect(
+fn import_boundary(
     map: &GdsMap,
     path: &Path,
     layer: i16,
@@ -266,31 +274,47 @@ fn import_rect(
     let x1 = points.iter().map(|point| point.x).max().unwrap();
     let y0 = points.iter().map(|point| point.y).min().unwrap();
     let y1 = points.iter().map(|point| point.y).max().unwrap();
-    if x0 == x1
-        || y0 == y1
-        || points
+    let layer = import_layer(map, path, layer, datatype)?;
+    if x0 != x1
+        && y0 != y1
+        && points
             .iter()
-            .any(|point| ![x0, x1].contains(&point.x) || ![y0, y1].contains(&point.y))
+            .all(|point| [x0, x1].contains(&point.x) && [y0, y1].contains(&point.y))
     {
+        return Ok(ImportedGdsElement::Rect {
+            layer,
+            name: None,
+            x0: f64::from(x0) * scale,
+            y0: f64::from(y0) * scale,
+            x1: f64::from(x1) * scale,
+            y1: f64::from(y1) * scale,
+        });
+    }
+
+    let mut polygon_points = points
+        .iter()
+        .map(|point| (f64::from(point.x) * scale, f64::from(point.y) * scale))
+        .collect::<Vec<_>>();
+    if polygon_points.first() == polygon_points.last() {
+        polygon_points.pop();
+    }
+    if polygon_points.len() < 3 {
         bail!(
-            "imported GDS `{}` contains a non-rectangular boundary, which is not supported",
+            "imported GDS `{}` contains a boundary with fewer than three points",
             path.display()
         );
     }
-    Ok(ImportedGdsElement::Rect {
-        layer: import_layer(map, path, layer, datatype)?,
+    Ok(ImportedGdsElement::Polygon {
+        layer,
         name: None,
-        x0: f64::from(x0) * scale,
-        y0: f64::from(y0) * scale,
-        x1: f64::from(x1) * scale,
-        y1: f64::from(y1) * scale,
+        points: polygon_points,
     })
 }
 
 /// Associate conventional `<material>.label` text with the `<material>.pin`
 /// rectangle containing its origin. The LYP names already carry the layer
 /// purpose, so this does not require a PDK-specific technology file.
-fn name_pin_rects(elements: &mut [ImportedGdsElement]) {
+fn name_pin_shapes(elements: &mut [ImportedGdsElement]) {
     let labels = elements
         .iter()
         .filter_map(|element| match element {
@@ -302,25 +326,55 @@ fn name_pin_rects(elements: &mut [ImportedGdsElement]) {
         .collect::<Vec<_>>();
 
     for element in elements {
-        let ImportedGdsElement::Rect {
-            layer,
-            name,
-            x0,
-            y0,
-            x1,
-            y1,
-        } = element
-        else {
-            continue;
-        };
-        let Some(material) = layer.strip_suffix(".pin") else {
-            continue;
-        };
-        *name = labels.iter().find_map(|(label_material, text, x, y)| {
-            (label_material == material && *x >= *x0 && *x <= *x1 && *y >= *y0 && *y <= *y1)
-                .then(|| argon_ident(text))
-        });
+        match element {
+            ImportedGdsElement::Rect {
+                layer,
+                name,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => {
+                let Some(material) = layer.strip_suffix(".pin") else {
+                    continue;
+                };
+                *name = labels.iter().find_map(|(label_material, text, x, y)| {
+                    (label_material == material && *x >= *x0 && *x <= *x1 && *y >= *y0 && *y <= *y1)
+                        .then(|| argon_ident(text))
+                });
+            }
+            ImportedGdsElement::Polygon {
+                layer,
+                name,
+                points,
+            } => {
+                let Some(material) = layer.strip_suffix(".pin") else {
+                    continue;
+                };
+                *name = labels.iter().find_map(|(label_material, text, x, y)| {
+                    (label_material == material && point_in_polygon((*x, *y), points))
+                        .then(|| argon_ident(text))
+                });
+            }
+            _ => {}
+        }
     }
+}
+
+fn point_in_polygon(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
+    let mut inside = false;
+    for ((x0, y0), (x1, y1)) in polygon
+        .iter()
+        .copied()
+        .zip(polygon.iter().copied().cycle().skip(1))
+        .take(polygon.len())
+    {
+        if (y0 > point.1) != (y1 > point.1) && point.0 < (x1 - x0) * (point.1 - y0) / (y1 - y0) + x0
+        {
+            inside = !inside;
+        }
+    }
+    inside
 }
 
 fn argon_ident(label: &str) -> String {
@@ -500,10 +554,31 @@ impl CompiledData {
                                 GdsPoint::new(x0, y1),
                                 GdsPoint::new(x1, y1),
                                 GdsPoint::new(x1, y0),
+                                GdsPoint::new(x0, y0),
                             ],
                             ..Default::default()
                         }));
                     }
+                }
+                SolvedValue::Polygon(polygon) => {
+                    let GdsLayerSpec {
+                        layer,
+                        xtype: datatype,
+                    } = exporter.map[&polygon.layer];
+                    let mut points = polygon
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            GdsPoint::new(exporter.coord_to_gds(x.0), exporter.coord_to_gds(y.0))
+                        })
+                        .collect::<Vec<_>>();
+                    points.push(points[0].clone());
+                    ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+                        layer,
+                        datatype,
+                        xy: points,
+                        ..Default::default()
+                    }));
                 }
                 SolvedValue::Text(text) => {
                     let GdsLayerSpec {
@@ -567,6 +642,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn non_rectangular_boundary_imports_as_polygon() {
+        let map = GdsMap::from_iter([("met1".to_owned(), GdsLayerSpec { layer: 1, xtype: 0 })]);
+        let element = import_boundary(
+            &map,
+            Path::new("polygon.gds"),
+            1,
+            0,
+            &[
+                GdsPoint::new(0, 0),
+                GdsPoint::new(100, 0),
+                GdsPoint::new(50, 75),
+                GdsPoint::new(0, 0),
+            ],
+            1.,
+        )
+        .expect("polygon boundary should import");
+
+        let ImportedGdsElement::Polygon { layer, points, .. } = element else {
+            panic!("non-rectangular boundary should remain a polygon");
+        };
+        assert_eq!(layer, "met1");
+        assert_eq!(points, [(0., 0.), (100., 0.), (50., 75.)]);
+    }
+
+    #[test]
     fn pin_shape_uses_contained_matching_layer_label() {
         let mut elements = vec![
             ImportedGdsElement::Rect {
@@ -591,7 +691,7 @@ mod tests {
             },
         ];
 
-        name_pin_rects(&mut elements);
+        name_pin_shapes(&mut elements);
 
         let ImportedGdsElement::Rect { name, .. } = &elements[0] else {
             unreachable!();

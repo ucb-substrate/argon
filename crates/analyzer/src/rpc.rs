@@ -25,6 +25,16 @@ pub struct ValueEdit {
     pub value: String,
 }
 
+/// Ensures that a geometry constructor has a named initial-condition kwarg.
+/// If the kwarg already exists, its value is replaced; otherwise the analyzer
+/// inserts it into the call using the current source layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitialConditionEdit {
+    pub call_span: Span,
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DimensionParams {
     pub p: String,
@@ -34,6 +44,12 @@ pub struct DimensionParams {
     pub pstop: String,
     pub nstop: String,
     pub horiz: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolygonParams {
+    pub layer: String,
+    pub points: Vec<(f64, f64)>,
 }
 
 /// A solved cell and the source location where placing it will insert an
@@ -58,10 +74,18 @@ pub trait LangServer {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Span);
     async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
+    async fn draw_polygon(
+        scope_span: Span,
+        var_name: String,
+        polygon: PolygonParams,
+    ) -> Option<Span>;
     async fn place_instance(scope_span: Span, invocation: String, x: f64, y: f64) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
-    async fn update_values(edits: Vec<ValueEdit>) -> bool;
+    async fn update_values(
+        edits: Vec<ValueEdit>,
+        initial_conditions: Vec<InitialConditionEdit>,
+    ) -> Option<Vec<ValueEdit>>;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
@@ -134,6 +158,64 @@ pub(crate) fn insert_statement(
         },
         tracked_span: cfgrammar::Span::new(tracked_start, offset + prefix.len() + tracked.end),
     }
+}
+
+fn polygon_expression(polygon: &PolygonParams) -> String {
+    let coordinates = polygon
+        .points
+        .iter()
+        .enumerate()
+        .map(|(index, (x, y))| format!("x{index}i = {x:?}, y{index}i = {y:?},"))
+        .collect::<Vec<_>>()
+        .join("\n        ");
+    format!(
+        "polygon({:?}, {},\n        {}\n    )",
+        polygon.layer,
+        polygon.points.len(),
+        coordinates
+    )
+}
+
+fn missing_initial_condition_edit(
+    source: &str,
+    call_span: &Span,
+    values: Vec<(String, String)>,
+) -> Option<ValueEdit> {
+    let insertion = call_span.span.end().checked_sub(1)?;
+    if source.as_bytes().get(insertion) != Some(&b')') {
+        return None;
+    }
+    let previous = source[..insertion]
+        .chars()
+        .rev()
+        .find(|character| !character.is_whitespace());
+    let line_start = source[..insertion]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let closing_indent = &source[line_start..insertion];
+    let closing_on_own_line = closing_indent.chars().all(char::is_whitespace);
+    let separator = match (previous, closing_on_own_line) {
+        (Some('('), _) | (Some(','), true) => "",
+        (Some(','), false) => " ",
+        _ => ", ",
+    };
+    let coordinates = values
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value = if closing_on_own_line {
+        format!("    {separator}{coordinates},\n{closing_indent}")
+    } else {
+        format!("{separator}{coordinates}")
+    };
+    Some(ValueEdit {
+        span: Span {
+            path: call_span.path.clone(),
+            span: cfgrammar::Span::new(insertion, insertion),
+        },
+        value,
+    })
 }
 
 fn instance_placement_expression(invocation: &str, x: f64, y: f64) -> String {
@@ -301,6 +383,51 @@ impl LangServer for State {
             .then_some(span)
     }
 
+    async fn draw_polygon(
+        self,
+        _: tarpc::context::Context,
+        scope_span: Span,
+        var_name: String,
+        polygon: PolygonParams,
+    ) -> Option<Span> {
+        if polygon.points.len() < 3 {
+            return None;
+        }
+        let state_mut = self.state_mut.lock().await;
+        if !editor_buffers_are_current(&state_mut) {
+            drop(state_mut);
+            self.editor_client
+                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                .await;
+            return None;
+        }
+        let url = Uri::from_file_path(&scope_span.path)?;
+        let ast = state_mut
+            .ast
+            .values()
+            .find(|ast| ast.path == scope_span.path)?;
+        let scope = ast.span2scope.get(&scope_span)?;
+        let document = Document::new(&ast.source_text, 0);
+        let expression = polygon_expression(&polygon);
+        let prefix = format!("let {var_name} = ");
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &format!("{prefix}{expression}!;"),
+            prefix.len()..prefix.len() + expression.len(),
+        );
+        let span = Span {
+            path: scope_span.path.clone(),
+            span: insertion.tracked_span,
+        };
+        drop(state_mut);
+
+        self.apply_source_edit(url, scope_span.path, insertion.edit)
+            .await
+            .then_some(span)
+    }
+
     async fn place_instance(
         self,
         _: tarpc::context::Context,
@@ -449,12 +576,16 @@ impl LangServer for State {
             .then_some(updated_span)
     }
 
-    /// Rewrites the value text at each given span in a single workspace edit,
-    /// then saves (triggering recompilation). Used to persist SSE drags so the
-    /// dragged layout survives recompilation instead of snapping back.
-    async fn update_values(self, _: tarpc::context::Context, edits: Vec<ValueEdit>) -> bool {
-        if edits.is_empty() {
-            return true;
+    /// Rewrites existing initial-condition values and inserts any missing
+    /// geometry kwargs in one workspace edit, then saves to trigger a compile.
+    async fn update_values(
+        self,
+        _: tarpc::context::Context,
+        mut edits: Vec<ValueEdit>,
+        initial_conditions: Vec<InitialConditionEdit>,
+    ) -> Option<Vec<ValueEdit>> {
+        if edits.is_empty() && initial_conditions.is_empty() {
+            return Some(Vec::new());
         }
         let state_mut = self.state_mut.lock().await;
         if !editor_buffers_are_current(&state_mut) {
@@ -462,15 +593,90 @@ impl LangServer for State {
             self.editor_client
                 .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
-            return false;
+            return None;
         }
+
+        // Resolve "ensure kwarg" requests against the current AST. Existing
+        // kwargs become ordinary value replacements. Missing kwargs sharing a
+        // call are collected into one insertion so edit ordering is defined.
+        let mut missing: HashMap<Span, Vec<(String, String)>> = HashMap::new();
+        for InitialConditionEdit {
+            call_span,
+            name,
+            value,
+        } in initial_conditions
+        {
+            let Some(ast) = state_mut
+                .ast
+                .values()
+                .find(|ast| ast.path == call_span.path)
+            else {
+                continue;
+            };
+            let Some(call) = ast.span2call.get(&call_span) else {
+                continue;
+            };
+            if let Some(kwarg) = call
+                .args
+                .kwargs
+                .iter()
+                .find(|kwarg| kwarg.name.name == name)
+            {
+                let span = Span {
+                    path: call_span.path.clone(),
+                    span: kwarg.value.span(),
+                };
+                if !edits.iter().any(|edit| edit.span == span) {
+                    edits.push(ValueEdit { span, value });
+                }
+            } else {
+                let values = missing.entry(call_span).or_default();
+                if let Some(existing) = values
+                    .iter_mut()
+                    .find(|(existing_name, _)| existing_name == &name)
+                {
+                    existing.1 = value;
+                } else {
+                    values.push((name, value));
+                }
+            }
+        }
+
+        for (call_span, values) in missing {
+            let Some(ast) = state_mut
+                .ast
+                .values()
+                .find(|ast| ast.path == call_span.path)
+            else {
+                continue;
+            };
+            if let Some(edit) = missing_initial_condition_edit(&ast.source_text, &call_span, values)
+            {
+                edits.push(edit);
+            }
+        }
+
+        // The same existing kwarg may be reached through dependent drag
+        // targets. Keep one deterministic replacement for each source span.
+        let mut deduplicated = Vec::<ValueEdit>::new();
+        for edit in edits {
+            if let Some(existing) = deduplicated
+                .iter_mut()
+                .find(|existing| existing.span == edit.span)
+            {
+                existing.value = edit.value;
+            } else {
+                deduplicated.push(edit);
+            }
+        }
+        let edits = deduplicated;
 
         // Build one WorkspaceEdit grouping all rewrites per file. Edits within a
         // file are sorted by descending start offset so they can be applied
         // back-to-front without invalidating each other's offsets.
         let mut pending: HashMap<Uri, Vec<(usize, TextEdit)>> = HashMap::new();
         let mut paths = Vec::new();
-        for ValueEdit { span, value } in edits {
+        for ValueEdit { span, value } in &edits {
             if let Some(ast) = state_mut.ast.values().find(|ast| ast.path == span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
             {
@@ -481,7 +687,7 @@ impl LangServer for State {
                     span.span.start(),
                     TextEdit {
                         range: Range::new(start, stop),
-                        new_text: value,
+                        new_text: value.clone(),
                     },
                 ));
                 if !paths.contains(&span.path) {
@@ -490,7 +696,7 @@ impl LangServer for State {
             }
         }
         if pending.is_empty() {
-            return false;
+            return None;
         }
         let changes = pending
             .into_iter()
@@ -501,7 +707,9 @@ impl LangServer for State {
             .collect();
         drop(state_mut);
 
-        self.apply_source_changes(changes, paths, None).await
+        self.apply_source_changes(changes, paths, None)
+            .await
+            .then_some(edits)
     }
 
     async fn add_eq_constraint(
@@ -598,7 +806,8 @@ mod tests {
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
-        Document, editor_buffers_are_current, insert_statement, instance_placement_expression,
+        Document, PolygonParams, editor_buffers_are_current, insert_statement,
+        instance_placement_expression, missing_initial_condition_edit, polygon_expression,
     };
     use crate::StateMut;
 
@@ -629,6 +838,74 @@ mod tests {
         assert_eq!(
             instance_placement_expression("child(10.)", 12.5, -4.0),
             "inst(child(10.), xi=12.5, yi=-4.0)"
+        );
+    }
+
+    #[test]
+    fn drawn_polygons_use_numbered_initial_conditions() {
+        assert_eq!(
+            polygon_expression(&PolygonParams {
+                layer: "met1".to_owned(),
+                points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+            }),
+            "polygon(\"met1\", 3,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+        );
+    }
+
+    #[test]
+    fn inserts_missing_initial_conditions_into_geometry_calls() {
+        fn insert(source: &str, call: &str, values: &[(&str, &str)]) -> String {
+            let start = source.find(call).unwrap();
+            let call_span = argonc::ast::Span {
+                path: std::path::PathBuf::from("/virtual/lib.ar"),
+                span: cfgrammar::Span::new(start, start + call.len()),
+            };
+            let edit = missing_initial_condition_edit(
+                source,
+                &call_span,
+                values
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+            )
+            .unwrap();
+            let mut updated = source.to_owned();
+            updated.replace_range(edit.span.span.start()..edit.span.span.end(), &edit.value);
+            parse::parse_source_text(updated.clone(), call_span.path).unwrap();
+            updated
+        }
+
+        assert_eq!(
+            insert(
+                "cell top() { let p = polygon(\"met1\", 3); }",
+                "polygon(\"met1\", 3)",
+                &[("x2i", "12.5"), ("y2i", "7.")],
+            ),
+            "cell top() { let p = polygon(\"met1\", 3, x2i=12.5, y2i=7.); }"
+        );
+        assert_eq!(
+            insert(
+                "cell top() { let r = crect(); }",
+                "crect()",
+                &[("x0i", "4."), ("y0i", "5.")],
+            ),
+            "cell top() { let r = crect(x0i=4., y0i=5.); }"
+        );
+        assert_eq!(
+            insert(
+                "cell top() { let i = inst(child()); }",
+                "inst(child())",
+                &[("xi", "40."), ("yi", "10.")],
+            ),
+            "cell top() { let i = inst(child(), xi=40., yi=10.); }"
+        );
+        assert_eq!(
+            insert(
+                "cell top() {\n    let r = rect(\"met1\",\n        x0=0.,\n    );\n}",
+                "rect(\"met1\",\n        x0=0.,\n    )",
+                &[("x1i", "20."), ("y1i", "30.")],
+            ),
+            "cell top() {\n    let r = rect(\"met1\",\n        x0=0.,\n        x1i=20., y1i=30.,\n    );\n}"
         );
     }
 

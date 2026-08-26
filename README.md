@@ -31,6 +31,76 @@ To install from a local clone, you can run:
 cargo install --locked --path crates/argon
 ```
 
+## Command-line compilation
+
+Use `arc` from an Argon library containing `lib.ar` and `Argon.toml`. The
+manifest names the library and can set its layer-properties file and path
+dependencies and GDS cell imports:
+
+```toml
+name = "my-library"
+lyp = "layers.lyp"
+
+[dependencies]
+pdk = "../pdk"
+
+[gds]
+ring_osc = "~/Downloads/ring_osc.gds"
+"macros::sram" = "layout/sram.gds"
+```
+
+From the library directory, check the source or run a cell:
+
+```bash
+arc check
+arc run --cell 'top(10., 20.)'
+arc run --cell 'top()' --gds
+```
+
+`arc check` checks the library without executing a cell. `arc run` writes the
+result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
+Dependency cells use their dependency name, for example
+`arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
+GDS imports are zero-argument cells. A module-qualified entry such as
+`"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
+`use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,
+and a leading `~/` is expanded to the user's home directory.
+When invoking `argonc` directly, pass the same mapping as
+`--gds-import 'macros::sram=layout/sram.gds'`.
+
+Polygons normally take a layer and a point count. Each generated point has
+independent solver coordinates, addressable either as `polygon.x0`,
+`polygon.y0`, and so on, or through `polygon.points[0].x` and `.y`:
+
+```argon
+let outline = polygon("met1", 3,
+    x0=0., y0=0.,
+    x1=100., y1=0.,
+    y2=100.,
+);
+eq(outline.x2, 50.);
+```
+
+The GUI polygon tool (toolbar button or `p`) places vertices in click order;
+press Enter after the final vertex to close and insert the polygon. It writes
+editable fallback coordinates (`x0i`, `y0i`, `x1i`, `y1i`, and so on), so
+vertex drags persist. Add hard `x0`/`y0` kwargs or `eq` constraints later when
+coordinates should become fixed. Handwritten geometry does not need fallback
+kwargs up front: the first drag inserts any missing `*i` coordinates into
+polygon, rectangle, or instance constructors. Escape clears an in-progress
+polygon. Polygon edges touching a point with any unconstrained coordinate are
+dashed; a point constrained in only one axis remains draggable along its free
+axis. Polygon fills use the layer's solid or stippled fill style just like
+rectangles.
+
+Imported rectangular geometry can be used by GUI dimensions. Unlabeled shapes
+receive stable fields such as `gds_rect_12`; a shape on `<layer>.pin` uses the
+text from a contained `<layer>.label` as its field name. Repeated pin names are
+arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance is collapsed in the
+GUI, its displayed bounding-box edges are available through `bbox(inst)`.
+
+### IDE
+
 Install the Neovim plugin with the built-in `vim.pack` package manager by
 adding this to your `init.lua`:
 
@@ -42,23 +112,6 @@ vim.pack.add({
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
-
-## Formatting
-
-From anywhere inside an Argon workspace, format its `.ar` source files:
-
-```bash
-arc fmt
-```
-
-`arc fmt` finds the nearest `Argon.toml` in the current directory or a parent.
-It does not format path dependencies or nested Argon workspaces. In CI, use
-`--check` to report unformatted files without changing them:
-
-```bash
-arc fmt --check
-arc fmt --check --manifest-path path/to/Argon.toml
-```
 
 From an Argon project directory, start Neovim and the GUI together:
 

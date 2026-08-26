@@ -25,7 +25,7 @@ enum Command {
 }
 
 #[tokio::main]
-pub async fn main() {
+pub async fn run() {
     let args = Args::parse();
     if matches!(args.command, Some(Command::Relay)) {
         if let Err(error) = run_relay().await {

@@ -26,7 +26,9 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check Argon examples
-        run: cargo test -p arc examples_are_formatted
+        run: |
+          cargo build -p argon --bin arc
+          find examples -name Argon.toml -exec target/debug/arc fmt --check --manifest-path {} \;
 
   # Lint
   clippy:

@@ -60,12 +60,12 @@ struct Args {
     error_format: ErrorFormat,
 }
 
-pub fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let args = Args::parse();
     let format = args.error_format;
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(args)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(args)));
     std::panic::set_hook(previous_hook);
     let result = match result {
         Ok(result) => result,
@@ -91,7 +91,7 @@ pub fn main() -> ExitCode {
 
 struct Failed(ErrorFormat, Vec<Diagnostic>);
 
-fn run(args: Args) -> Result<(), Failed> {
+fn execute(args: Args) -> Result<(), Failed> {
     let format = args.error_format;
     let root = source_root(&args.root);
     let mut names = HashSet::new();
@@ -260,7 +260,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
-    use super::{Args, ErrorFormat, Failed, run};
+    use super::{Args, ErrorFormat, Failed, execute};
 
     fn temp_source(name: &str, source: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -359,7 +359,7 @@ mod tests {
     }
 
     fn failed(args: Args) -> Failed {
-        match run(args) {
+        match execute(args) {
             Ok(()) => panic!("compilation should fail"),
             Err(error) => error,
         }
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn checks_a_source_file() {
         let source = temp_source("valid", "cell top() {}\n");
-        assert!(run(check_args(source)).is_ok());
+        assert!(execute(check_args(source)).is_ok());
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
             .parent()
             .expect("source should have a parent")
             .to_owned();
-        assert!(run(check_args(directory)).is_ok());
+        assert!(execute(check_args(directory)).is_ok());
     }
 
     #[test]
@@ -434,7 +434,7 @@ mod tests {
         let mut args = execution_args(source, "top()", basic_lyp());
         args.output = Some(artifact_path.clone());
 
-        assert!(run(args).is_ok());
+        assert!(execute(args).is_ok());
         assert!(matches!(
             artifact::read(artifact_path).expect("artifact should decode"),
             CompileOutput::Valid(_)
@@ -459,7 +459,7 @@ mod tests {
         let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_lyp());
         args.dependencies.push(("devices".to_owned(), dependency));
         args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
-        assert!(run(args).is_ok());
+        assert!(execute(args).is_ok());
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
             .push(("macros::sram".to_owned(), temp_gds("gds-import")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!("GDS import should compile: {}", render_failed(error));
         }
         let CompileOutput::Valid(output) =
@@ -517,7 +517,7 @@ mod tests {
             .push(("sram".to_owned(), temp_gds("gds-shape-field")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!(
                 "GDS shape constraint should compile: {}",
                 render_failed(error)
@@ -554,7 +554,7 @@ mod tests {
             .push(("sram".to_owned(), temp_nested_gds("nested-gds-shape-field")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!(
                 "nested GDS shape constraint should compile: {}",
                 render_failed(error)
@@ -587,7 +587,7 @@ mod tests {
             .push(("sram".to_owned(), temp_gds("gds-declaration-order-import")));
         args.output = Some(artifact_path.clone());
 
-        if let Err(error) = run(args) {
+        if let Err(error) = execute(args) {
             panic!("GDS import should compile: {}", render_failed(error));
         }
         assert!(matches!(

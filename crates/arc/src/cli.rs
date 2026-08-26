@@ -73,12 +73,12 @@ struct RunArgs {
     gds: bool,
 }
 
-pub fn main() -> ExitCode {
+pub fn run() -> ExitCode {
     let result = match Cli::parse().command {
         CommandKind::New(args) => new(args),
         CommandKind::Fmt(args) => fmt(args),
         CommandKind::Check(args) => check(args),
-        CommandKind::Run(args) => run(args),
+        CommandKind::Run(args) => run_cell(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -137,7 +137,7 @@ fn check(args: LibraryArgs) -> Result<()> {
     Ok(())
 }
 
-fn run(args: RunArgs) -> Result<()> {
+fn run_cell(args: RunArgs) -> Result<()> {
     let library = Library::load(&args.library.manifest_path)?;
     let lyp = library.lyp.as_ref().ok_or_else(|| {
         anyhow!(

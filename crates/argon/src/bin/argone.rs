@@ -1,3 +1,3 @@
 fn main() -> std::process::ExitCode {
-    argone::run()
+    argone::cli::run()
 }

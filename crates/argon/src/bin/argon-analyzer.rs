@@ -1,3 +1,3 @@
 fn main() {
-    analyzer::run();
+    analyzer::cli::run();
 }

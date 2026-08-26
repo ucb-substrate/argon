@@ -1,9 +1,7 @@
 pub mod document;
 pub mod rpc;
 
-#[path = "main.rs"]
-mod cli;
-pub use cli::main as run;
+pub mod cli;
 
 use std::{
     env, fs, io,

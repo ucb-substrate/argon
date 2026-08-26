@@ -1,4 +1,5 @@
 name = "path-dependency-example"
+lyp = "../../lyp/basic.lyp"
 
 [dependencies]
 dependency = "../dependency_library"

@@ -7,9 +7,7 @@ use anyhow::{Context, Result, bail};
 use indexmap::{IndexMap, IndexSet};
 use serde::Deserialize;
 
-#[path = "main.rs"]
-mod cli;
-pub use cli::main as run;
+pub mod cli;
 
 const MANIFEST_FILE: &str = "Argon.toml";
 const SOURCE_FILE: &str = "lib.ar";
@@ -669,18 +667,6 @@ cell top() {
     }
 
     #[test]
-    fn examples_are_formatted() {
-        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-        let report = format_path(&examples, true).expect("examples should be readable");
-        assert!(!report.files.is_empty());
-        assert!(
-            report.changed.is_empty(),
-            "Argon examples are unformatted: {:#?}",
-            report.changed
-        );
-    }
-
-    #[test]
     fn creates_runnable_starter_workspace() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let workspace = directory.path().join("hello-argon");
@@ -736,6 +722,37 @@ cell top() {
             fs::read_to_string(workspace.join("keep")).unwrap(),
             "user data"
         );
+    }
+
+    fn example_library_dirs(directory: &std::path::Path, output: &mut Vec<PathBuf>) {
+        if directory.join("lib.ar").is_file() {
+            output.push(directory.to_path_buf());
+        }
+        for entry in fs::read_dir(directory).expect("example directory should be readable") {
+            let path = entry.expect("example entry should be readable").path();
+            if path.is_dir() {
+                example_library_dirs(&path, output);
+            }
+        }
+    }
+
+    #[test]
+    fn every_example_library_has_a_gui_manifest() {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut libraries = Vec::new();
+        example_library_dirs(&examples, &mut libraries);
+        assert!(!libraries.is_empty());
+
+        for directory in libraries {
+            let manifest = directory.join("Argon.toml");
+            assert!(manifest.is_file(), "missing `{}`", manifest.display());
+            let library = Library::load(&manifest)
+                .unwrap_or_else(|error| panic!("invalid `{}`: {error:#}", manifest.display()));
+            let lyp = library
+                .lyp
+                .unwrap_or_else(|| panic!("`{}` does not set `lyp`", manifest.display()));
+            assert!(lyp.is_file(), "missing LYP `{}`", lyp.display());
+        }
     }
 
     #[test]

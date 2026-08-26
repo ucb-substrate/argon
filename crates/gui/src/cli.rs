@@ -98,8 +98,8 @@ struct GuiArgs {
     ssh_control: bool,
 }
 
-pub fn main() -> ExitCode {
-    match run(Cli::parse()) {
+pub fn run() -> ExitCode {
+    match execute(Cli::parse()) {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
@@ -109,7 +109,7 @@ pub fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<ExitStatus> {
+fn execute(cli: Cli) -> Result<ExitStatus> {
     match cli.command {
         None => {
             let focus_target = crate::focus::capture_target();
