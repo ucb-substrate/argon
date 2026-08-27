@@ -613,8 +613,11 @@ impl HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell_clone_2.update(cx, |state, cx| {
                                         if let Some(state) = state.as_mut() {
-                                            state.state.get_mut(&scope_path).unwrap().visible =
-                                                !state.state[&scope_path].visible;
+                                            let visible = state.state[&scope_path].visible;
+                                            Arc::make_mut(&mut state.state)
+                                                .get_mut(&scope_path)
+                                                .unwrap()
+                                                .visible = !visible;
                                             cx.notify();
                                         }
                                     })
@@ -737,7 +740,8 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
-                                            for state in cell.state.values_mut() {
+                                            for state in Arc::make_mut(&mut cell.state).values_mut()
+                                            {
                                                 state.visible = true;
                                             }
                                         }
@@ -762,7 +766,8 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
-                                            for state in cell.state.values_mut() {
+                                            for state in Arc::make_mut(&mut cell.state).values_mut()
+                                            {
                                                 state.visible = false;
                                             }
                                         }

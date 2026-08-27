@@ -1,6 +1,7 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
+    sync::Arc,
 };
 
 use analyzer::rpc::InstancePreview;
@@ -61,10 +62,10 @@ pub struct ScopeAddress {
 
 #[derive(Clone, Debug)]
 pub struct CompileOutputState {
-    pub output: CompiledData,
+    pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
-    pub state: IndexMap<ScopePath, ScopeState>,
-    pub scope_paths: IndexMap<ScopeAddress, ScopePath>,
+    pub state: Arc<IndexMap<ScopePath, ScopeState>>,
+    pub scope_paths: Arc<IndexMap<ScopeAddress, ScopePath>>,
 }
 
 pub struct Layers {
@@ -331,7 +332,7 @@ impl EditorState {
         });
         self.solved_cell.update(cx, |old_cell, cx| {
             *old_cell = Some(CompileOutputState {
-                output: solved_cell,
+                output: Arc::new(solved_cell),
                 selected_scope: old_cell
                     .as_ref()
                     .and_then(|cell| {
@@ -340,8 +341,8 @@ impl EditorState {
                             .then(|| cell.selected_scope.clone())
                     })
                     .unwrap_or_else(|| vec![root_scope_name.clone()]),
-                state,
-                scope_paths,
+                state: Arc::new(state),
+                scope_paths: Arc::new(scope_paths),
             });
             cx.notify();
         });
