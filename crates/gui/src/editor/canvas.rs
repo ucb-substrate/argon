@@ -42,11 +42,6 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
-/// Relative detail ranks for retained rasters. Hierarchy traversal is the same
-/// in both modes; the coarse pass only aggregates slightly larger sub-pixel
-/// shapes and omits text.
-const NORMAL_NAVIGATION_DETAIL_RANK: f32 = 64. * 64.;
-const INTERACTIVE_NAVIGATION_DETAIL_RANK: f32 = 256. * 256.;
 /// Above this size, retain a viewport raster for interactive redraws. GPUI can
 /// replay a clean retained view, but pan/zoom dirties this immediate element;
 /// transforming one sprite avoids rebuilding hundreds of thousands of quads.
@@ -62,16 +57,15 @@ const RASTER_CACHE_HISTORY_LIMIT: usize = 8;
 /// Geometry smaller than this in the interaction raster is accumulated into a
 /// compact per-layer occupancy mask. Hierarchy is still fully flattened; only
 /// the final sub-pixel representation becomes cheaper.
-const COARSE_GEOMETRY_LOD_SIZE_PX: f32 = 2.;
-const NORMAL_GEOMETRY_LOD_SIZE_PX: f32 = 1.;
+const GEOMETRY_LOD_SIZE_PX: f32 = 1.;
 /// Disabled: cell-local raster tiles can turn dense bitcells into opaque
 /// blocks at intermediate zoom levels. Keep the implementation isolated while
 /// the flattened per-layer occupancy path remains authoritative.
 const CELL_RASTER_TILES_ENABLED: bool = false;
 const CELL_RASTER_TILE_MAX_SIZE: u32 = 16;
 const CELL_RASTER_TILE_CACHE_LIMIT: usize = 256;
-const NAVIGATION_OVERSCAN: Pixels = px(192.);
-const NAVIGATION_OVERSCAN_GUARD: Pixels = px(48.);
+const NAVIGATION_OVERSCAN: Pixels = px(384.);
+const NAVIGATION_OVERSCAN_GUARD: Pixels = px(256.);
 const TEXT_LAYOUT_SIZE: f32 = 16.;
 const SCOPE_TEXT_LAYOUT_SIZE: f32 = 12.;
 const MIN_READABLE_TEXT_PX: f32 = 5.;
@@ -878,6 +872,10 @@ pub struct LayoutCanvas {
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
     raster_cache: Option<LayoutRasterCache>,
     raster_cache_history: VecDeque<LayoutRasterCache>,
+    /// Widest world-space raster seen for this layout. It sits beneath the
+    /// viewport atlas so a drag that outruns background rendering reveals a
+    /// coarse retained layout instead of an unrendered black hole.
+    raster_world_fallback: Option<LayoutRasterCache>,
     navigation_cache_active: bool,
     raster_refinement: Option<Task<()>>,
     /// Only one background raster worker runs at a time. Input events merely
@@ -910,10 +908,6 @@ struct LayoutRasterCache {
     screen_viewport: Size<Pixels>,
     scale: f32,
     offset: Point<Pixels>,
-    /// Smaller thresholds retain more hierarchy detail. This lets an older,
-    /// detailed image remain authoritative while a coarse navigation image
-    /// fills only newly exposed screen edges.
-    lod_area_px: f32,
     content_revision: u64,
 }
 
@@ -933,7 +927,6 @@ struct NavigationRasterInput {
     hide_external_geometry: bool,
     viewport: ViewportTransform,
     text_color: Rgba,
-    lod_area_px: f32,
     include_text: bool,
     content_revision: u64,
     cell_raster_tiles: Arc<Mutex<CellRasterTileCache>>,
@@ -1090,6 +1083,10 @@ fn raster_logical_size(width: u32, height: u32) -> Size<Pixels> {
         px(width as f32 / RASTER_CACHE_RESOLUTION),
         px(height as f32 / RASTER_CACHE_RESOLUTION),
     )
+}
+
+fn raster_stipple_phase(offset: Point<Pixels>) -> i64 {
+    (f32::from(offset.x) - f32::from(offset.y)).round() as i64
 }
 
 fn mark_raster_occupancy(
@@ -1454,6 +1451,7 @@ fn paint_raster_tile(
                     y,
                     ShapeFill::Stippling,
                     pixel_color,
+                    0,
                 );
             } else {
                 blend_raster_pixel(
@@ -1473,6 +1471,7 @@ fn fill_raster_rect(
     bounds: Bounds<Pixels>,
     fill: ShapeFill,
     color: Rgba,
+    stipple_phase: i64,
 ) {
     let Some((x0, x1)) = raster_pixel_range(
         f32::from(bounds.origin.x),
@@ -1490,7 +1489,7 @@ fn fill_raster_rect(
     };
     for y in y0..y1 {
         for x in x0..x1 {
-            blend_raster_fill_pixel(buffer, width, x, y, fill, color);
+            blend_raster_fill_pixel(buffer, width, x, y, fill, color, stipple_phase);
         }
     }
 }
@@ -1505,10 +1504,11 @@ fn blend_raster_fill_pixel(
     y: u32,
     fill: ShapeFill,
     mut color: Rgba,
+    stipple_phase: i64,
 ) {
     if fill == ShapeFill::Stippling {
         let period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.) as i64;
-        if (x as i64 - y as i64).rem_euclid(period) != 0 {
+        if (x as i64 - y as i64 - stipple_phase).rem_euclid(period) != 0 {
             return;
         }
         color.a *= RASTER_CACHE_RESOLUTION;
@@ -1531,6 +1531,7 @@ fn stroke_raster_rect(
         Bounds::new(bounds.origin, Size::new(bounds.size.width, one)),
         ShapeFill::Solid,
         color,
+        0,
     );
     fill_raster_rect(
         buffer,
@@ -1542,6 +1543,7 @@ fn stroke_raster_rect(
         ),
         ShapeFill::Solid,
         color,
+        0,
     );
     fill_raster_rect(
         buffer,
@@ -1550,6 +1552,7 @@ fn stroke_raster_rect(
         Bounds::new(bounds.origin, Size::new(one, bounds.size.height)),
         ShapeFill::Solid,
         color,
+        0,
     );
     fill_raster_rect(
         buffer,
@@ -1561,6 +1564,7 @@ fn stroke_raster_rect(
         ),
         ShapeFill::Solid,
         color,
+        0,
     );
 }
 
@@ -1571,6 +1575,7 @@ fn fill_raster_polygon(
     points: &[Point<f32>],
     fill: ShapeFill,
     color: Rgba,
+    stipple_phase: i64,
 ) {
     if points.len() < 3 {
         return;
@@ -1606,7 +1611,7 @@ fn fill_raster_polygon(
                 continue;
             };
             for x in x0..x1 {
-                blend_raster_fill_pixel(buffer, width, x, y, fill, color);
+                blend_raster_fill_pixel(buffer, width, x, y, fill, color, stipple_phase);
             }
         }
     }
@@ -1666,9 +1671,18 @@ fn build_layout_raster(
         viewport.offset.x * RASTER_CACHE_RESOLUTION,
         viewport.offset.y * RASTER_CACHE_RESOLUTION,
     );
+    let stipple_phase = raster_stipple_phase(raster_offset);
     for (rect, layer) in rects {
         let bounds = get_rect_bounds(rect, local_bounds, raster_scale, raster_offset);
-        fill_raster_rect(&mut buffer, width, height, bounds, layer.fill, layer.color);
+        fill_raster_rect(
+            &mut buffer,
+            width,
+            height,
+            bounds,
+            layer.fill,
+            layer.color,
+            stipple_phase,
+        );
         stroke_raster_rect(&mut buffer, width, height, bounds, layer.border_color);
     }
     for (polygon, layer) in polygons {
@@ -1682,7 +1696,15 @@ fn build_layout_raster(
                 )
             })
             .collect::<Vec<_>>();
-        fill_raster_polygon(&mut buffer, width, height, &points, layer.fill, layer.color);
+        fill_raster_polygon(
+            &mut buffer,
+            width,
+            height,
+            &points,
+            layer.fill,
+            layer.color,
+            stipple_phase,
+        );
         for (start, stop) in points
             .iter()
             .zip(points.iter().cycle().skip(1))
@@ -1714,7 +1736,6 @@ fn build_layout_raster(
         screen_viewport: viewport.screen_size,
         scale: viewport.scale,
         offset: viewport.offset,
-        lod_area_px: 0.,
         content_revision,
     })
 }
@@ -1740,6 +1761,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         viewport.offset.x * RASTER_CACHE_RESOLUTION,
         viewport.offset.y * RASTER_CACHE_RESOLUTION,
     );
+    let stipple_phase = raster_stipple_phase(raster_offset);
     let local_bounds = Bounds::new(
         Point::default(),
         Size::new(px(width as f32), px(height as f32)),
@@ -1763,11 +1785,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         .map(|_| Vec::<RasterTilePrimitive>::new())
         .collect::<Vec<_>>();
     let mut seen_tile_candidates = HashSet::<CellRasterTileKey>::new();
-    let geometry_lod_size = if input.lod_area_px > NORMAL_NAVIGATION_DETAIL_RANK {
-        COARSE_GEOMETRY_LOD_SIZE_PX
-    } else {
-        NORMAL_GEOMETRY_LOD_SIZE_PX
-    } * RASTER_CACHE_RESOLUTION;
+    let geometry_lod_size = GEOMETRY_LOD_SIZE_PX * RASTER_CACHE_RESOLUTION;
     let mut texts = Vec::new();
     let mut scope_rects = Vec::new();
 
@@ -2072,7 +2090,15 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 color,
                 border_color,
             } = primitive;
-            fill_raster_rect(&mut buffer, width, height, bounds, fill, color);
+            fill_raster_rect(
+                &mut buffer,
+                width,
+                height,
+                bounds,
+                fill,
+                color,
+                stipple_phase,
+            );
             stroke_raster_rect(&mut buffer, width, height, bounds, border_color);
         }
         for primitive in polygon_layer {
@@ -2082,7 +2108,15 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 color,
                 border_color,
             } = primitive;
-            fill_raster_polygon(&mut buffer, width, height, &points, fill, color);
+            fill_raster_polygon(
+                &mut buffer,
+                width,
+                height,
+                &points,
+                fill,
+                color,
+                stipple_phase,
+            );
             for (start, stop) in points
                 .iter()
                 .zip(points.iter().cycle().skip(1))
@@ -2106,7 +2140,6 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         screen_viewport: viewport.screen_size,
         scale: viewport.scale,
         offset: viewport.offset,
-        lod_area_px: input.lod_area_px,
         content_revision: input.content_revision,
     })
 }
@@ -2136,6 +2169,11 @@ fn same_raster_view(a: &LayoutRasterCache, b: &LayoutRasterCache) -> bool {
         && a.screen_viewport == b.screen_viewport
         && a.scale == b.scale
         && a.offset == b.offset
+}
+
+fn raster_world_coverage_area(viewport: Size<Pixels>, scale: f32) -> f32 {
+    let scale = scale.abs().max(f32::EPSILON);
+    f32::from(viewport.width) * f32::from(viewport.height) / scale.powi(2)
 }
 
 /// Subtract one axis-aligned cover from a region. The result contains at most
@@ -2605,18 +2643,20 @@ impl Element for CanvasElement {
             let mut completed_caches = inner
                 .raster_cache_history
                 .iter()
+                .chain(std::iter::once(&cache))
+                .rev()
                 .cloned()
                 .collect::<Vec<_>>();
-            completed_caches.push(cache.clone());
-            let mut completed_caches = completed_caches.into_iter().enumerate().collect::<Vec<_>>();
-            completed_caches.sort_by(|(a_index, a), (b_index, b)| {
-                a.lod_area_px
-                    .total_cmp(&b.lod_area_px)
-                    .then_with(|| b_index.cmp(a_index))
-            });
+            if let Some(fallback) = inner.raster_world_fallback.as_ref()
+                && !completed_caches
+                    .iter()
+                    .any(|completed| same_raster_view(completed, fallback))
+            {
+                completed_caches.push(fallback.clone());
+            }
             let mut higher_priority_bounds = Vec::with_capacity(completed_caches.len());
             let mut cache_paints = Vec::with_capacity(completed_caches.len());
-            for (_, completed) in completed_caches {
+            for completed in completed_caches {
                 let image_bounds = raster_bounds(&completed, bounds, scale, offset);
                 let regions =
                     uncovered_raster_regions(image_bounds, &higher_priority_bounds, bounds);
@@ -2643,10 +2683,9 @@ impl Element for CanvasElement {
                         theme.axes,
                         DEFAULT_BORDER_WIDTH,
                     ));
-                    // More detailed rasters win even if a coarse navigation
-                    // image is newer; the coarse image fills newly exposed
-                    // edges until refinement arrives. Masks keep translucent
-                    // and stippled pixels from accumulating at overlaps.
+                    // The newest complete viewport wins uniformly. Older
+                    // rasters only fill genuinely uncovered edges, and the
+                    // widest retained world view is the final emergency layer.
                     for (completed, image_bounds, regions) in cache_paints.iter().rev() {
                         for region in regions {
                             window.with_content_mask(
@@ -4605,6 +4644,7 @@ impl LayoutCanvas {
                     canvas.raster_generation = canvas.raster_generation.wrapping_add(1);
                     canvas.raster_cache = None;
                     canvas.raster_cache_history.clear();
+                    canvas.raster_world_fallback = None;
                     canvas.navigation_cache_active = false;
                     canvas.raster_refinement = None;
                     canvas.raster_worker_active = false;
@@ -4618,6 +4658,7 @@ impl LayoutCanvas {
             dim_hitboxes: Vec::new(),
             raster_cache: None,
             raster_cache_history: VecDeque::new(),
+            raster_world_fallback: None,
             navigation_cache_active: false,
             raster_refinement: None,
             raster_worker_active: false,
@@ -4636,6 +4677,12 @@ impl LayoutCanvas {
     }
 
     fn install_navigation_raster(&mut self, cache: LayoutRasterCache) {
+        let cache_coverage = raster_world_coverage_area(cache.viewport, cache.scale);
+        if self.raster_world_fallback.as_ref().is_none_or(|fallback| {
+            cache_coverage >= raster_world_coverage_area(fallback.viewport, fallback.scale)
+        }) {
+            self.raster_world_fallback = Some(cache.clone());
+        }
         if let Some(previous) = self.raster_cache.replace(cache) {
             let current = self.raster_cache.as_ref().unwrap();
             if previous.content_revision != current.content_revision {
@@ -4657,7 +4704,6 @@ impl LayoutCanvas {
     fn navigation_raster_input(
         &self,
         cx: &gpui::App,
-        lod_area_px: f32,
         include_text: bool,
     ) -> Option<NavigationRasterInput> {
         let state = self.state.read(cx);
@@ -4682,7 +4728,6 @@ impl LayoutCanvas {
                 ),
             },
             text_color: state.theme().text,
-            lod_area_px,
             include_text,
             content_revision: self.raster_content_revision,
             cell_raster_tiles: self.cell_raster_tiles.clone(),
@@ -4707,15 +4752,7 @@ impl LayoutCanvas {
                         let generation = canvas.raster_generation;
                         let is_refinement = refinement_generation == Some(generation);
                         canvas
-                            .navigation_raster_input(
-                                cx,
-                                if is_refinement {
-                                    NORMAL_NAVIGATION_DETAIL_RANK
-                                } else {
-                                    INTERACTIVE_NAVIGATION_DETAIL_RANK
-                                },
-                                is_refinement,
-                            )
+                            .navigation_raster_input(cx, is_refinement)
                             .map(|input| (generation, is_refinement, input))
                     })
                     .ok()
@@ -6301,12 +6338,28 @@ mod tests {
                 b: 0.,
                 a: 1.,
             },
+            0,
         );
         let alphas = pixels
             .chunks_exact(4)
             .map(|pixel| pixel[3])
             .collect::<Vec<_>>();
         assert_eq!(alphas, [128, 0, 0, 0, 0, 128, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn raster_stippling_is_anchored_to_layout_coordinates() {
+        let period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.) as i64;
+        let world = (13_i64, 3_i64);
+        for offset in [Point::new(px(0.), px(0.)), Point::new(px(7.), px(-4.))] {
+            let phase = raster_stipple_phase(offset);
+            let local_x = world.0 + f32::from(offset.x).round() as i64;
+            let local_y = world.1 + f32::from(offset.y).round() as i64;
+            assert_eq!(
+                (local_x - local_y - phase).rem_euclid(period),
+                (world.0 - world.1).rem_euclid(period)
+            );
+        }
     }
 
     #[test]
@@ -6334,6 +6387,26 @@ mod tests {
                 Point::new(px(0.), px(10.)),
                 Size::new(px(50.), px(40.)),
             )]
+        );
+    }
+
+    #[test]
+    fn world_fallback_covers_regions_the_current_atlas_misses() {
+        let canvas = Bounds::new(Point::default(), Size::new(px(100.), px(100.)));
+        let current = Bounds::new(Point::default(), Size::new(px(40.), px(100.)));
+        let fallback = canvas;
+        let current_regions = uncovered_raster_regions(current, &[], canvas);
+        let fallback_regions = uncovered_raster_regions(fallback, &[current], canvas);
+        let covered_area = current_regions
+            .iter()
+            .chain(&fallback_regions)
+            .map(|region| f32::from(region.size.width) * f32::from(region.size.height))
+            .sum::<f32>();
+
+        assert_eq!(covered_area, 10_000.);
+        assert!(
+            raster_world_coverage_area(Size::new(px(100.), px(100.)), 0.5)
+                > raster_world_coverage_area(Size::new(px(100.), px(100.)), 1.)
         );
     }
 

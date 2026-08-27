@@ -236,6 +236,7 @@ M.start = function(bufnr)
                 lsp_client:request('custom/startGui', nil, client.print_error, bufnr)
             end)
         end
+        schedule_workspace_modified(lsp_client.id)
     end
 
     local old_on_exit = lsp_start_config.on_exit
@@ -252,7 +253,6 @@ M.start = function(bufnr)
     local client_id = vim.lsp.start(lsp_start_config, { bufnr = bufnr })
     if client_id then
         track_modified_buffer(bufnr, client_id)
-        schedule_workspace_modified(client_id)
     end
     return client_id
 end
