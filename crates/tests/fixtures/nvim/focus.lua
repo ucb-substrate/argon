@@ -39,22 +39,22 @@ vim.api.nvim_create_autocmd('CmdlineLeave', {
       checked(function()
         if stage == 1 then
           assert(vim.g.argon_focus_executed == 1)
-          assert(gui_focus_count == 0, 'executing a GUI command should remain in Neovim')
+          assert(gui_focus_count == 1, 'executing a GUI command should focus the GUI')
           stage = 2
           focus.editor('let g:argon_focus_cancelled = 1')
         elseif stage == 2 then
           assert(vim.g.argon_focus_cancelled == nil)
-          assert(gui_focus_count == 1, 'cancelling a GUI command should focus the GUI')
+          assert(gui_focus_count == 2, 'cancelling a GUI command should focus the GUI')
           stage = 3
           focus.editor('let g:argon_focus_interrupted = 1')
         elseif stage == 3 then
           assert(vim.g.argon_focus_interrupted == nil)
-          assert(gui_focus_count == 2, 'interrupting a GUI command should focus the GUI')
+          assert(gui_focus_count == 3, 'interrupting a GUI command should focus the GUI')
           stage = 4
           vim.api.nvim_input(':let g:argon_ordinary_command = 1')
         else
           assert(vim.g.argon_ordinary_command == nil)
-          assert(gui_focus_count == 2, 'cancelling an ordinary command should remain in Neovim')
+          assert(gui_focus_count == 3, 'cancelling an ordinary command should remain in Neovim')
           vim.cmd('quitall!')
         end
       end)

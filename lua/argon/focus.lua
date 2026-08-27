@@ -5,17 +5,13 @@ local M = {}
 local client = require('argon.client')
 
 local gui_command_group = vim.api.nvim_create_augroup('argon_gui_command', { clear = true })
-local command_cancel_keys = {
-  ['\3'] = true, -- <C-C>
-  ['\27'] = true, -- <Esc>
-}
 
 ---Focus the Argon GUI.
 function M.gui()
   client.any_buf_request('custom/startGui', nil, client.print_error)
 end
 
-local function return_to_gui_if_command_is_cancelled()
+local function return_to_gui_after_command()
   vim.api.nvim_clear_autocmds({ group = gui_command_group })
   vim.api.nvim_create_autocmd('CmdlineEnter', {
     group = gui_command_group,
@@ -27,10 +23,7 @@ local function return_to_gui_if_command_is_cancelled()
         pattern = ':',
         once = true,
         callback = function()
-          local exit_key = vim.v.char
-          if vim.v.event.abort or command_cancel_keys[exit_key] then
-            vim.schedule(M.gui)
-          end
+          vim.schedule(M.gui)
         end,
       })
     end,
@@ -48,7 +41,7 @@ function M.editor(command)
 
   -- Wait for this command line to be entered before watching it leave. The
   -- leading <Esc> may itself leave a pre-existing command line or prompt.
-  return_to_gui_if_command_is_cancelled()
+  return_to_gui_after_command()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
 end
 
