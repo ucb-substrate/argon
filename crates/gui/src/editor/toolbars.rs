@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use analyzer::rpc::LangServerAction;
@@ -8,7 +9,9 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 
 use crate::{
-    actions::{DrawDim, DrawPolygon, DrawRect, InstantiateCommand, OpenCellCommand, SelectMode},
+    actions::{
+        DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, OpenCellCommand, SelectMode,
+    },
     editor::{
         CompileOutputState, Layers, ScopeAddress, ScopePath,
         canvas::{EditDimToolState, LayoutCanvas, ToolState},
@@ -30,20 +33,55 @@ impl TitleBar {
     }
 }
 
+fn workspace_title(path: Option<&Path>) -> String {
+    path.map_or_else(
+        || "Argon".to_owned(),
+        |path| format!("Argon — {}", path.display()),
+    )
+}
+
 impl Render for TitleBar {
     fn render(
         &mut self,
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let theme = self.state.read(cx).theme();
+        let state = self.state.read(cx);
+        let theme = state.theme();
+        let mut centered_title = div()
+            .relative()
+            .child(workspace_title(state.workspace_path.as_deref()));
+        if state.workspace_modified {
+            centered_title = centered_title.child(div().absolute().left_full().ml_1().child("[+]"));
+        }
         div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
             .p_1()
             .bg(theme.titlebar)
-            .text_center()
-            .child("Argon")
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(centered_title)
+    }
+}
+
+#[cfg(test)]
+mod title_bar_tests {
+    use std::path::Path;
+
+    use super::workspace_title;
+
+    #[test]
+    fn title_shows_workspace() {
+        let workspace = Path::new("/projects/inverter");
+        assert_eq!(
+            workspace_title(Some(workspace)),
+            "Argon — /projects/inverter"
+        );
+        assert_eq!(workspace_title(None), "Argon");
     }
 }
 
@@ -75,8 +113,13 @@ impl Render for ToolBar {
             .children({
                 type HighlightFn = Box<dyn Fn(&ToolState) -> bool>;
                 type OnClickFn = Arc<dyn Fn(Entity<EditorState>, &mut App)>;
-                let tools: [Option<(&'static str, &'static str, HighlightFn, OnClickFn)>; _] = [
-                    Some((
+                enum ToolbarItem {
+                    Button(&'static str, &'static str, HighlightFn, OnClickFn),
+                    Divider(&'static str),
+                    Spacer,
+                }
+                let tools: [ToolbarItem; _] = [
+                    ToolbarItem::Button(
                         "btn_undo",
                         "icons/arrow-rotate-left-solid-full.svg",
                         Box::new(|_| false),
@@ -86,8 +129,8 @@ impl Render for ToolBar {
                                 .lang_server_client
                                 .dispatch_action(LangServerAction::Undo);
                         }),
-                    )),
-                    Some((
+                    ),
+                    ToolbarItem::Button(
                         "btn_redo",
                         "icons/arrow-rotate-right-solid-full.svg",
                         Box::new(|_| false),
@@ -97,8 +140,8 @@ impl Render for ToolBar {
                                 .lang_server_client
                                 .dispatch_action(LangServerAction::Redo);
                         }),
-                    )),
-                    Some((
+                    ),
+                    ToolbarItem::Button(
                         "btn_open_cell",
                         "icons/folder-open.svg",
                         Box::new(|_| false),
@@ -107,9 +150,9 @@ impl Render for ToolBar {
                                 cx.dispatch_action(&OpenCellCommand);
                             });
                         }),
-                    )),
-                    None,
-                    Some((
+                    ),
+                    ToolbarItem::Divider("divider_history_select"),
+                    ToolbarItem::Button(
                         "btn_select",
                         "icons/arrow-pointer-solid-full.svg",
                         Box::new(|tool| {
@@ -127,8 +170,9 @@ impl Render for ToolBar {
                                 cx.dispatch_action(&SelectMode);
                             });
                         }),
-                    )),
-                    Some((
+                    ),
+                    ToolbarItem::Divider("divider_select_draw"),
+                    ToolbarItem::Button(
                         "btn_rect",
                         "icons/rect.svg",
                         Box::new(|tool| matches!(tool, ToolState::DrawRect(_))),
@@ -137,8 +181,8 @@ impl Render for ToolBar {
                                 cx.dispatch_action(&DrawRect);
                             })
                         }),
-                    )),
-                    Some((
+                    ),
+                    ToolbarItem::Button(
                         "btn_polygon",
                         "icons/polygon.svg",
                         Box::new(|tool| matches!(tool, ToolState::DrawPolygon(_))),
@@ -147,8 +191,29 @@ impl Render for ToolBar {
                                 cx.dispatch_action(&DrawPolygon);
                             })
                         }),
-                    )),
-                    Some((
+                    ),
+                    ToolbarItem::Button(
+                        "btn_path",
+                        "icons/path.svg",
+                        Box::new(|tool| matches!(tool, ToolState::DrawPath(_))),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&DrawPath);
+                            })
+                        }),
+                    ),
+                    ToolbarItem::Button(
+                        "btn_instance",
+                        "icons/instance.svg",
+                        Box::new(|tool| matches!(tool, ToolState::PlaceInstance(_))),
+                        Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&InstantiateCommand);
+                            });
+                        }),
+                    ),
+                    ToolbarItem::Divider("divider_draw_constraints"),
+                    ToolbarItem::Button(
                         "btn_dim",
                         "icons/arrows-left-right-to-line-solid-full.svg",
                         Box::new(|tool| {
@@ -163,23 +228,14 @@ impl Render for ToolBar {
                                 cx.dispatch_action(&DrawDim);
                             });
                         }),
-                    )),
-                    Some((
-                        "btn_instance",
-                        "icons/instance.svg",
-                        Box::new(|tool| matches!(tool, ToolState::PlaceInstance(_))),
-                        Arc::new(|_state, cx| {
-                            cx.defer(move |cx| {
-                                cx.dispatch_action(&InstantiateCommand);
-                            });
-                        }),
-                    )),
+                    ),
+                    ToolbarItem::Spacer,
                 ];
                 let wh = 20.;
                 tools
                     .iter()
-                    .map(|path| {
-                        if let Some((id, path, highlighted, on_click)) = path {
+                    .map(|item| match item {
+                        ToolbarItem::Button(id, path, highlighted, on_click) => {
                             let on_click = on_click.clone();
                             div()
                                 .w(px(wh + 8.))
@@ -202,24 +258,23 @@ impl Render for ToolBar {
                                         on_click(state.clone(), cx);
                                     }
                                 })
-                        } else {
-                            div()
-                                .flex()
-                                .flex_row()
-                                .child(
-                                    div()
-                                        .w_2()
-                                        .h(px(wh + 8.))
-                                        .border_r_1()
-                                        .border_color(theme.divider),
-                                )
-                                .child(div().w_2())
-                                .id("dummy") // TODO: fix?
                         }
+                        ToolbarItem::Divider(id) => div()
+                            .flex()
+                            .flex_row()
+                            .child(
+                                div()
+                                    .w_2()
+                                    .h(px(wh + 8.))
+                                    .border_r_1()
+                                    .border_color(theme.divider),
+                            )
+                            .child(div().w_2())
+                            .id(*id),
+                        ToolbarItem::Spacer => div().flex_1().id("toolbar_spacer"),
                     })
                     .collect_vec()
             })
-            .child(div().flex_1())
     }
 }
 

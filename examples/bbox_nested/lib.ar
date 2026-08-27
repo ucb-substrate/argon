@@ -1,0 +1,20 @@
+cell leaf() {
+    let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
+}
+
+cell mid() {
+    let leaf_inst = inst(leaf());
+    eq(leaf_inst.x, 1000.);
+    eq(leaf_inst.y, 0.);
+}
+
+cell top() {
+    let mid_cell = mid();
+    let r = bbox(mid_cell);
+    rect("met2", x0=r.x0, x1=r.x1, y0=r.y0, y1=r.y1);
+    let mid_inst = inst(mid_cell, angle=90);
+    eq(mid_inst.x, 500.);
+    eq(mid_inst.y, 0.);
+    let r2 = bbox(mid_inst);
+    rect("met3", x0=r2.x0, x1=r2.x1, y0=r2.y0, y1=r2.y1);
+}
