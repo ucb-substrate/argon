@@ -7,7 +7,8 @@ use indexmap::{IndexMap, IndexSet};
 use rgb::Rgb;
 use serde::{Deserialize, Serialize};
 
-/// All technology information needed by the compiler and layout editor.
+/// Validated, normalized technology information used by the compiler, GDS
+/// importer/exporter, solver, analyzer, and layout editor.
 ///
 /// [`Technology::dbu`] is the physical size of one GDS database unit in
 /// meters. All other length configuration is expressed as an integer number of
@@ -19,7 +20,11 @@ pub struct Technology {
     pub display_unit: u64,
     /// Snap-grid spacing in DBUs.
     pub grid: u64,
+    /// Optional name of the imported or authored layer-style collection.
+    pub style_name: Option<String>,
     pub layers: Vec<Layer>,
+    pub custom_dither_patterns: Vec<CustomDitherPattern>,
+    pub custom_line_styles: Vec<CustomLineStyle>,
     /// Pin-shape layer name to the text-label layer carrying the pin name.
     pub pin_layers: IndexMap<String, String>,
 }
@@ -31,6 +36,89 @@ pub struct Layer {
     pub gds_datatype: i16,
     pub fill_color: Rgb<u8>,
     pub border_color: Rgb<u8>,
+    pub style: LayerStyle,
+}
+
+/// The complete set of per-layer presentation properties carried by KLayout
+/// layer-properties files. Argon retains fields that its renderer does not yet
+/// implement so adding more patterns and line styles does not require another
+/// technology-file migration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LayerStyle {
+    /// Whether a group node starts expanded. Retained for compatibility even
+    /// though Argon's current layer list is flat.
+    pub expanded: bool,
+    /// Frame-color brightness adjustment: -100 is black, 0 leaves the color
+    /// unchanged, and 100 is white.
+    pub frame_brightness: i32,
+    /// Fill-color brightness adjustment, with the same scale as
+    /// [`LayerStyle::frame_brightness`].
+    pub fill_brightness: i32,
+    /// KLayout fill-pattern reference. `I0` is solid, `I1` is clear, other
+    /// `Ix` values are built-ins, and `Cx` selects a custom dither pattern.
+    pub dither_pattern: String,
+    /// KLayout frame-line reference. Empty or `I0` is solid, other `Ix`
+    /// values are built-ins, and `Cx` selects a custom line style.
+    pub line_style: String,
+    /// Invalid layers are displayed but their shapes are not selectable.
+    pub valid: bool,
+    /// Initial visibility in the layer list.
+    pub visible: bool,
+    /// Use KLayout's background-dependent transparent color composition.
+    pub transparent: bool,
+    /// Frame width in screen pixels.
+    pub width: i32,
+    /// Draw the layer with small cross markers.
+    pub marked: bool,
+    /// Draw a diagonal X through boxes on this layer.
+    pub xfill: bool,
+    /// KLayout animation mode: 0 none, 1 scrolling, 2 blinking, or 3 inverse
+    /// blinking.
+    pub animation: i32,
+}
+
+impl Default for LayerStyle {
+    fn default() -> Self {
+        Self {
+            expanded: false,
+            frame_brightness: 0,
+            fill_brightness: 0,
+            dither_pattern: "C7".to_owned(),
+            line_style: "C0".to_owned(),
+            valid: true,
+            visible: true,
+            transparent: false,
+            width: 1,
+            marked: false,
+            xfill: false,
+            animation: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomDitherPattern {
+    /// Bitmap rows where `*` is set and `.` is clear. KLayout supports row
+    /// widths of 8, 16, or 32 pixels.
+    pub lines: Vec<String>,
+    /// Position in the pattern chooser; references use array position, not
+    /// this display order.
+    pub order: i32,
+    /// Human-readable pattern name.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CustomLineStyle {
+    /// Repeating line bitmap where `*` is drawn and `.` is skipped.
+    pub pattern: String,
+    /// Position in the line-style chooser.
+    pub order: i32,
+    /// Human-readable style name.
+    pub name: String,
 }
 
 impl Technology {
@@ -78,19 +166,30 @@ pub fn snap(value: f64, grid: f64) -> f64 {
     }
 }
 
+/// TOML-facing representation used only during deserialization.
+///
+/// This accepts conveniences such as named DBU units, alternate pin mapping
+/// forms, and legacy field aliases. [`parse_tech`] converts it into the single
+/// validated [`Technology`] representation used by the rest of Argon.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TechnologyFile {
+struct ParsedTechnology {
     dbu: UnitValue,
     #[serde(alias = "display-unit")]
     display_unit: u64,
     #[serde(alias = "grid_size", alias = "grid-size", alias = "snap_grid")]
     grid: u64,
-    layers: LayerList,
-    #[serde(default, alias = "pin-layers")]
-    pin_layers: IndexMap<String, PinLayerValue>,
     #[serde(default)]
-    pins: Vec<PinMappingFile>,
+    style_name: Option<String>,
+    layers: Vec<ParsedLayer>,
+    #[serde(default)]
+    custom_dither_patterns: Vec<CustomDitherPattern>,
+    #[serde(default)]
+    custom_line_styles: Vec<CustomLineStyle>,
+    #[serde(default, alias = "pin-layers")]
+    pin_layers: IndexMap<String, ParsedPinLayer>,
+    #[serde(default)]
+    pins: Vec<ParsedPinMapping>,
 }
 
 /// Accept either an SI scale (`1e-9`) or a familiar unit name (`"nm"`).
@@ -121,16 +220,14 @@ impl UnitValue {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum LayerList {
-    List(Vec<LayerFile>),
-    Map(IndexMap<String, NamedLayerFile>),
-}
-
+/// Serialized layer fields that need normalization before runtime use.
+///
+/// The techfile combines the GDS layer/datatype in one pair and represents
+/// colors as hex strings. [`Layer`] keeps those as separate numeric fields and
+/// parsed RGB values.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct LayerFile {
+struct ParsedLayer {
     name: String,
     #[serde(alias = "source")]
     gds: [i16; 2],
@@ -138,37 +235,13 @@ struct LayerFile {
     fill: String,
     #[serde(alias = "border_color", alias = "border-color", alias = "frame")]
     border: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NamedLayerFile {
-    #[serde(alias = "source")]
-    gds: [i16; 2],
-    #[serde(alias = "fill_color", alias = "fill-color")]
-    fill: String,
-    #[serde(alias = "border_color", alias = "border-color", alias = "frame")]
-    border: String,
-}
-
-impl LayerList {
-    fn into_layers(self) -> Result<Vec<Layer>> {
-        match self {
-            Self::List(layers) => layers
-                .into_iter()
-                .map(|layer| make_layer(layer.name, layer.gds, layer.fill, layer.border))
-                .collect(),
-            Self::Map(layers) => layers
-                .into_iter()
-                .map(|(name, layer)| make_layer(name, layer.gds, layer.fill, layer.border))
-                .collect(),
-        }
-    }
+    #[serde(default)]
+    style: LayerStyle,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum PinLayerValue {
+enum ParsedPinLayer {
     Label(String),
     Mapping {
         #[serde(alias = "label_layer", alias = "label-layer")]
@@ -176,7 +249,7 @@ enum PinLayerValue {
     },
 }
 
-impl PinLayerValue {
+impl ParsedPinLayer {
     fn into_label(self) -> String {
         match self {
             Self::Label(label) | Self::Mapping { label } => label,
@@ -186,14 +259,20 @@ impl PinLayerValue {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PinMappingFile {
+struct ParsedPinMapping {
     #[serde(alias = "pin_layer", alias = "pin-layer")]
     pin: String,
     #[serde(alias = "label_layer", alias = "label-layer")]
     label: String,
 }
 
-fn make_layer(name: String, gds: [i16; 2], fill: String, border: String) -> Result<Layer> {
+fn make_layer(
+    name: String,
+    gds: [i16; 2],
+    fill: String,
+    border: String,
+    style: LayerStyle,
+) -> Result<Layer> {
     if name.is_empty() {
         bail!("layer names cannot be empty");
     }
@@ -203,6 +282,7 @@ fn make_layer(name: String, gds: [i16; 2], fill: String, border: String) -> Resu
         gds_datatype: gds[1],
         fill_color: parse_color(&fill)?,
         border_color: parse_color(&border)?,
+        style,
     })
 }
 
@@ -222,16 +302,20 @@ fn parse_color(color: &str) -> Result<Rgb<u8>> {
 
 /// Parse an Argon TOML technology file from a string.
 pub fn parse_tech(text: &str) -> Result<Technology> {
-    let file: TechnologyFile = toml::from_str(text)
+    let input: ParsedTechnology = toml::from_str(text)
         .map_err(|error| anyhow!("could not parse technology file: {error}"))?;
-    let dbu = file.dbu.scale("dbu")?;
-    if file.display_unit == 0 {
+    let dbu = input.dbu.scale("dbu")?;
+    if input.display_unit == 0 {
         bail!("display_unit must be greater than zero DBUs");
     }
-    if file.grid == 0 {
+    if input.grid == 0 {
         bail!("grid must be greater than zero DBUs");
     }
-    let layers = file.layers.into_layers()?;
+    let layers = input
+        .layers
+        .into_iter()
+        .map(|layer| make_layer(layer.name, layer.gds, layer.fill, layer.border, layer.style))
+        .collect::<Result<Vec<_>>>()?;
     if layers.is_empty() {
         bail!("technology file must define at least one layer");
     }
@@ -242,12 +326,12 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
         }
     }
 
-    let mut pin_layers = file
+    let mut pin_layers = input
         .pin_layers
         .into_iter()
         .map(|(pin, label)| (pin, label.into_label()))
         .collect::<IndexMap<_, _>>();
-    for mapping in file.pins {
+    for mapping in input.pins {
         if pin_layers
             .insert(mapping.pin.clone(), mapping.label)
             .is_some()
@@ -266,9 +350,12 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
 
     Ok(Technology {
         dbu,
-        display_unit: file.display_unit,
-        grid: file.grid,
+        display_unit: input.display_unit,
+        grid: input.grid,
+        style_name: input.style_name,
         layers,
+        custom_dither_patterns: input.custom_dither_patterns,
+        custom_line_styles: input.custom_line_styles,
         pin_layers,
     })
 }
@@ -295,12 +382,36 @@ mod tests {
 dbu = 1e-9
 display_unit = 1000
 grid = 250
+style_name = "Test styles"
+
+[[custom_dither_patterns]]
+lines = ["*.", ".*"]
+order = 1
+name = "diagonal"
+
+[[custom_line_styles]]
+pattern = "**.."
+order = 1
+name = "dashed"
 
 [[layers]]
 name = "met1.pin"
 gds = [68, 16]
 fill = "#112233"
 border = "#445566"
+
+[layers.style]
+frame_brightness = -10
+fill_brightness = 20
+dither_pattern = "C0"
+line_style = "C0"
+valid = true
+visible = false
+transparent = true
+width = 3
+marked = true
+xfill = true
+animation = 2
 
 [[layers]]
 name = "met1.label"
@@ -318,6 +429,14 @@ border = "#445566"
         assert_eq!(tech.layers.len(), 2);
         assert_eq!(tech.layers[0].gds_layer, 68);
         assert_eq!(tech.layers[0].fill_color, Rgb::new(0x11, 0x22, 0x33));
+        assert_eq!(tech.layers[0].style.frame_brightness, -10);
+        assert_eq!(tech.layers[0].style.dither_pattern, "C0");
+        assert!(!tech.layers[0].style.visible);
+        assert!(tech.layers[0].style.transparent);
+        assert_eq!(tech.layers[1].style, LayerStyle::default());
+        assert_eq!(tech.style_name.as_deref(), Some("Test styles"));
+        assert_eq!(tech.custom_dither_patterns[0].lines, ["*.", ".*"]);
+        assert_eq!(tech.custom_line_styles[0].pattern, "**..");
         assert_eq!(tech.pin_layers["met1.pin"], "met1.label");
         assert_eq!(tech.display_unit, 1000);
     }

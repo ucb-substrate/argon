@@ -21,6 +21,7 @@ const STARTER_SOURCE: &str = r#"cell top() {
 const DEFAULT_TECH: &str = r##"dbu = 1e-10
 display_unit = 10
 grid = 1
+style_name = "Default Layer Properties"
 
 [[layers]]
 name = "met1"

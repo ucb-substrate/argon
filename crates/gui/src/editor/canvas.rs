@@ -36,6 +36,7 @@ use crate::{
 pub enum ShapeFill {
     Stippling,
     Solid,
+    Hollow,
 }
 
 const SELECT_WIDTH: Pixels = px(3.);
@@ -307,6 +308,9 @@ fn paint_polygon_fill(
     layer: &LayerState,
     self_overlapping_path: bool,
 ) {
+    if layer.fill == ShapeFill::Hollow {
+        return;
+    }
     let mut fill = if self_overlapping_path {
         PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()))
     } else {
@@ -317,6 +321,7 @@ fn paint_polygon_fill(
         let background = match layer.fill {
             ShapeFill::Solid => solid_background(layer.color),
             ShapeFill::Stippling => pattern_slash(layer.color.into(), 1., 9.),
+            ShapeFill::Hollow => unreachable!(),
         };
         window.paint_path(path, background);
     }
@@ -1230,6 +1235,7 @@ fn get_paint_quad(
     let background = match fill {
         ShapeFill::Solid => solid_background(color),
         ShapeFill::Stippling => pattern_slash(color.into(), 1., 9.),
+        ShapeFill::Hollow => solid_background(Rgba { a: 0., ..color }),
     };
     PaintQuad {
         bounds,

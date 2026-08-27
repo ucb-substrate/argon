@@ -94,6 +94,20 @@ gds = [68, 16]
 fill = "#0000ff"
 border = "#0000ff"
 
+[layers.style]
+expanded = false       # whether a layer group starts expanded
+frame_brightness = 0   # -100 black, 0 unchanged, 100 white (border)
+fill_brightness = 0    # -100 black, 0 unchanged, 100 white (fill)
+dither_pattern = "I0" # I0 solid, I1 clear, other Ix built-in, Cx custom
+line_style = "I0"     # empty/I0 solid, other Ix built-in, Cx custom
+valid = true           # false: display shapes but do not allow selection
+visible = true         # initial visibility in the layer list
+transparent = false    # background-dependent transparent composition
+width = 1              # border width in screen pixels
+marked = false         # draw small crosses over the layer
+xfill = false          # draw a diagonal X through boxes
+animation = 0          # 0 none, 1 scrolling, 2 blinking, 3 inverse blinking
+
 [[layers]]
 name = "met1.label"
 gds = [68, 5]
