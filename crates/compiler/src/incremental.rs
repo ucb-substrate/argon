@@ -220,7 +220,7 @@ impl IncrementalCompiler {
         };
 
         let mut hasher = DefaultHasher::new();
-        let environment = execution_environment_key(config.lyp.as_deref(), &config.gds_imports);
+        let environment = execution_environment_key(config.tech.as_deref(), &config.gds_imports);
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
             self.execution_environment = Some(environment);
@@ -271,7 +271,7 @@ impl IncrementalCompiler {
         }
 
         let mut hasher = DefaultHasher::new();
-        let environment = execution_environment_key(config.lyp.as_deref(), &config.gds_imports);
+        let environment = execution_environment_key(config.tech.as_deref(), &config.gds_imports);
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
             self.execution_environment = Some(environment);
@@ -364,10 +364,10 @@ fn file_revision(path: &Path) -> Option<FileRevision> {
     Some((modified.as_secs(), modified.subsec_nanos(), metadata.len()))
 }
 
-fn execution_environment_key(lyp_file: Option<&Path>, gds_imports: &[(String, PathBuf)]) -> u64 {
+fn execution_environment_key(tech_file: Option<&Path>, gds_imports: &[(String, PathBuf)]) -> u64 {
     let mut hasher = DefaultHasher::new();
-    lyp_file.hash(&mut hasher);
-    lyp_file.and_then(file_revision).hash(&mut hasher);
+    tech_file.hash(&mut hasher);
+    tech_file.and_then(file_revision).hash(&mut hasher);
     for (name, path) in gds_imports {
         name.hash(&mut hasher);
         path.hash(&mut hasher);
@@ -481,8 +481,8 @@ mod tests {
     fn repeated_execution_uses_the_session_cache() {
         let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
         let root = examples.join("immediate/lib.ar");
-        let lyp = examples.join("lyp/basic.lyp");
-        let config = WorkspaceConfig::new(&root).with_lyp(Some(lyp));
+        let tech = examples.join("tech/basic.tech.toml");
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech));
         let mut compiler = IncrementalCompiler::new();
         let cell = vec!["immediate".to_owned()];
 
@@ -504,10 +504,10 @@ mod tests {
     fn edited_session_matches_a_fresh_compile() {
         let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
         let root = examples.join("immediate/lib.ar");
-        let lyp = examples.join("lyp/basic.lyp");
+        let tech = examples.join("tech/basic.tech.toml");
         let source = "cell immediate() {\n  let x0 = 31;\n  let y0 = 2;\n}\n";
         let cell = vec!["immediate".to_owned()];
-        let config = WorkspaceConfig::new(&root).with_lyp(Some(lyp));
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech));
 
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), source);
@@ -539,10 +539,10 @@ mod tests {
     fn bench_incremental_session() {
         let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
         let root = examples.join("immediate/lib.ar");
-        let lyp = examples.join("lyp/basic.lyp");
+        let tech = examples.join("tech/basic.tech.toml");
         let source = std::fs::read_to_string(&root).unwrap();
         let cell = vec!["immediate".to_owned()];
-        let config = WorkspaceConfig::new(&root).with_lyp(Some(lyp));
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech));
         let retained_before = crate::bench_alloc::live();
         let mut compiler = IncrementalCompiler::new();
 

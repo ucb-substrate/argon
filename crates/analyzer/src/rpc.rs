@@ -469,16 +469,17 @@ impl LangServer for State {
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
         let document = Document::new(&ast.source_text, 0);
+        let grid = self.technology_grid().await;
         let expression = format!(
             "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
             rect.layer
                 .as_ref()
                 .map(|layer| format!("\"{layer}\", "))
                 .unwrap_or_default(),
-            argonc::compile::format_initial_condition(rect.x0),
-            argonc::compile::format_initial_condition(rect.y0),
-            argonc::compile::format_initial_condition(rect.x1),
-            argonc::compile::format_initial_condition(rect.y1),
+            argonc::compile::format_initial_condition(rect.x0, grid),
+            argonc::compile::format_initial_condition(rect.y0, grid),
+            argonc::compile::format_initial_condition(rect.x1, grid),
+            argonc::compile::format_initial_condition(rect.y1, grid),
         );
         let prefix = format!("let {var_name} = ");
         let insertion = insert_statement(

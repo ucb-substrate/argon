@@ -1,2 +1,2 @@
 name = "if-inconsistent"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

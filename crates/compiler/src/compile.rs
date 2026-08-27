@@ -28,9 +28,9 @@ use crate::ast::{
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
-use crate::layer::LayerProperties;
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
+use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
@@ -112,12 +112,16 @@ pub fn execute_cell(
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
-    let Some(lyp_file) = config.lyp.as_deref() else {
-        return missing_lyp_output();
+    let Some(tech_file) = config.tech.as_deref() else {
+        return missing_tech_output();
+    };
+    let tech = match read_tech(tech_file) {
+        Ok(tech) => tech,
+        Err(error) => return invalid_tech_output(ast, error.to_string()),
     };
     check_output_layers(
-        ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input),
-        lyp_file,
+        ExecPass::new(ast, tech, &config.gds_imports).execute(input),
+        tech_file,
     )
 }
 
@@ -129,27 +133,43 @@ pub fn execute_cell_invocation(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
-    let Some(lyp_file) = config.lyp.as_deref() else {
-        return missing_lyp_output();
+    let Some(tech_file) = config.tech.as_deref() else {
+        return missing_tech_output();
+    };
+    let tech = match read_tech(tech_file) {
+        Ok(tech) => tech,
+        Err(error) => return invalid_tech_output(ast, error.to_string()),
     };
     check_output_layers(
-        ExecPass::new(ast, lyp_file, &config.gds_imports).execute_invocation(invocation),
-        lyp_file,
+        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation(invocation),
+        tech_file,
     )
 }
 
-fn missing_lyp_output() -> CompileOutput {
+fn missing_tech_output() -> CompileOutput {
     CompileOutput::ExecErrors(ExecErrorCompileOutput {
         errors: vec![ExecError {
             span: None,
             cell: 0,
-            kind: ExecErrorKind::MissingLyp,
+            kind: ExecErrorKind::MissingTech,
         }],
         output: None,
     })
 }
 
-fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
+fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> CompileOutput {
+    CompileOutput::StaticErrors(StaticErrorCompileOutput {
+        errors: vec![StaticError {
+            span: Span {
+                path: ast[&ModPath::new()].path.clone(),
+                span: cfgrammar::Span::new(0, 0),
+            },
+            kind: StaticErrorKind::InvalidTech(error),
+        }],
+    })
+}
+
+fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -161,7 +181,7 @@ fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, lyp_file, &mut errors);
+    check_layers(&data, tech_file, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -617,9 +637,9 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
-    for layer in data.layers.layers.iter() {
+    for layer in &data.tech.layers {
         layers.insert(layer.name.clone());
     }
     for (cell_id, cell) in data.cells.iter() {
@@ -634,7 +654,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                             cell: *cell_id,
                             kind: ExecErrorKind::IllegalLayer {
                                 layer: layer.clone(),
-                                lyp: lyp_file.display().to_string(),
+                                tech: tech_file.display().to_string(),
                             },
                         });
                     }
@@ -645,7 +665,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalLayer {
                             layer: polygon.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -655,7 +675,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalLayer {
                             layer: path.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -665,7 +685,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalTextLayer {
                             layer: text.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -2471,14 +2491,10 @@ pub struct BasicRect<T> {
     pub construction: bool,
 }
 
-/// Formats a GUI-created layout coordinate as an Argon float literal.
-///
-/// Coordinates are snapped to the solver's 0.1 grid, use at most one decimal
-/// place, and always contain a decimal point so they continue to parse as
-/// floats rather than integers.
-pub fn format_initial_condition(value: f64) -> String {
-    // Adding positive zero normalizes a rounded `-0.0` to `0.0`.
-    let snapped = (value * 10.0).round() / 10.0 + 0.0;
+/// Formats a GUI-created layout coordinate as an Argon float literal after
+/// snapping it to the technology grid.
+pub fn format_initial_condition(value: f64, grid: f64) -> String {
+    let snapped = crate::tech::snap(value, grid);
     let value = format!("{snapped}");
     if value.contains('.') {
         value
@@ -2492,11 +2508,12 @@ mod initial_condition_format_tests {
     use super::format_initial_condition;
 
     #[test]
-    fn limits_gui_coordinates_to_one_decimal_place() {
-        assert_eq!(format_initial_condition(12.345678), "12.3");
-        assert_eq!(format_initial_condition(12.0), "12.");
-        assert_eq!(format_initial_condition(-0.04), "0.");
-        assert_eq!(format_initial_condition(1.2000000476837158), "1.2");
+    fn snaps_gui_coordinates_to_the_technology_grid() {
+        assert_eq!(format_initial_condition(12.345678, 0.1), "12.3");
+        assert_eq!(format_initial_condition(12.0, 0.1), "12.");
+        assert_eq!(format_initial_condition(-0.04, 0.1), "0.");
+        assert_eq!(format_initial_condition(1.2000000476837158, 0.1), "1.2");
+        assert_eq!(format_initial_condition(12.37, 0.25), "12.25");
     }
 }
 
@@ -2685,12 +2702,21 @@ struct CellState {
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
+    var_span_map: IndexMap<Var, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
+}
+
+impl CellState {
+    fn new_solver_var(&mut self, span: &Span) -> Var {
+        let var = self.solver.new_var();
+        self.var_span_map.insert(var, span.clone());
+        var
+    }
 }
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    lyp_file: &'a FsPath,
+    tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
@@ -2745,7 +2771,7 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 impl<'a> ExecPass<'a> {
     pub(crate) fn new(
         ast: &'a WorkspaceAst<VarIdTyMetadata>,
-        lyp_file: &'a FsPath,
+        tech: Technology,
         gds_imports: &[(String, PathBuf)],
     ) -> Self {
         let gds_imports = gds_imports
@@ -2771,7 +2797,7 @@ impl<'a> ExecPass<'a> {
             .collect();
         Self {
             ast,
-            lyp_file,
+            tech,
             gds_imports,
             cell_states: IndexMap::new(),
             values: IndexMap::from_iter([
@@ -2974,24 +3000,10 @@ impl<'a> ExecPass<'a> {
 
     /// Packages the executed cells into a compile output rooted at `top`.
     fn finish(self, top: CellId) -> CompileOutput {
-        let layers = match crate::layer::read_lyp(self.lyp_file) {
-            Ok(layers) => layers,
-            Err(error) => {
-                return CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                    errors: vec![StaticError {
-                        span: Span {
-                            path: self.ast[&ModPath::new()].path.clone(),
-                            span: cfgrammar::Span::new(0, 0),
-                        },
-                        kind: StaticErrorKind::InvalidLyp(error.to_string()),
-                    }],
-                });
-            }
-        };
         let data = CompiledData {
             cells: self.compiled_cells,
             top,
-            layers,
+            tech: self.tech,
         };
         if self.errors.is_empty() {
             CompileOutput::Valid(data)
@@ -3095,7 +3107,7 @@ impl<'a> ExecPass<'a> {
                     cell_id,
                     CellState {
                         solve_iters: 0,
-                        solver: Solver::new(),
+                        solver: Solver::with_grid(self.tech.grid_step()),
                         fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
@@ -3108,6 +3120,7 @@ impl<'a> ExecPass<'a> {
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
                         constraint_span_map: IndexMap::new(),
+                        var_span_map: IndexMap::new(),
                         var_dependents: IndexMap::new(),
                     }
                 )
@@ -3191,13 +3204,17 @@ impl<'a> ExecPass<'a> {
             if !progress {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
-                    state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
+                    let unsolved_vars = state.solver.unsolved_vars().clone();
+                    let span = unsolved_vars
+                        .iter()
+                        .find_map(|var| state.var_span_map.get(var).cloned());
+                    state.unsolved_vars = Some(unsolved_vars);
                     state.sse_basis = match state.solver.sparse_nullspace_vecs() {
                         Some(vectors) => SseBasis::Nullspace(vectors),
                         None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
                     };
                     self.errors.push(ExecError {
-                        span: None,
+                        span,
                         cell: cell_id,
                         kind: ExecErrorKind::Underconstrained,
                     });
@@ -3247,16 +3264,12 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
-        for var in self
-            .cell_state_mut(cell_id)
-            .solver
-            .invalid_rounding()
-            .clone()
-        {
+        for var in self.cell_state(cell_id).solver.off_grid_vars().clone() {
+            let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
             self.errors.push(ExecError {
-                span: None,
+                span,
                 cell: cell_id,
-                kind: ExecErrorKind::InvalidRounding(var),
+                kind: ExecErrorKind::OffGrid(var),
             });
         }
 
@@ -3276,7 +3289,7 @@ impl<'a> ExecPass<'a> {
         path: &FsPath,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
-        let imported = match import_gds(path, declared_name, self.lyp_file) {
+        let imported = match import_gds(path, declared_name, &self.tech) {
             Ok(imported) => imported,
             Err(error) => {
                 self.errors.push(ExecError {
@@ -4269,10 +4282,10 @@ impl<'a> ExecPass<'a> {
                         let rect = Rect {
                             id,
                             layer,
-                            x0: state.solver.new_var().into(),
-                            y0: state.solver.new_var().into(),
-                            x1: state.solver.new_var().into(),
-                            y1: state.solver.new_var().into(),
+                            x0: state.new_solver_var(&span).into(),
+                            y0: state.new_solver_var(&span).into(),
+                            x1: state.new_solver_var(&span).into(),
+                            y1: state.new_solver_var(&span).into(),
                             construction: f == "crect",
                             span: Some(span.clone()),
                         };
@@ -4378,6 +4391,7 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let layer = layer.as_ref().unwrap_string().clone();
                         let point_spec = point_spec.clone();
+                        let span = self.span(&vref.loc, c.expr.span);
                         let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
                             Value::Int(count) => {
                                 let Ok(count) = usize::try_from(count) else {
@@ -4400,8 +4414,8 @@ impl<'a> ExecPass<'a> {
                                 (0..count)
                                     .map(|_| {
                                         (
-                                            state.solver.new_var().into(),
-                                            state.solver.new_var().into(),
+                                            state.new_solver_var(&span).into(),
+                                            state.new_solver_var(&span).into(),
                                         )
                                     })
                                     .collect()
@@ -4437,7 +4451,6 @@ impl<'a> ExecPass<'a> {
                         }
 
                         let id = self.object_id();
-                        let span = self.span(&vref.loc, c.expr.span);
                         let polygon = Polygon {
                             id,
                             layer,
@@ -4549,19 +4562,24 @@ impl<'a> ExecPass<'a> {
                             matches!(kwarg.name.name.as_str(), "end_extension" | "end_extensioni")
                         });
                         let state = self.cell_state_mut(cell_id);
-                        let width = state.solver.new_var().into();
+                        let width = state.new_solver_var(&span).into();
                         let begin_extension = if has_begin_extension {
-                            state.solver.new_var().into()
+                            state.new_solver_var(&span).into()
                         } else {
                             LinearExpr::from(0.)
                         };
                         let end_extension = if has_end_extension {
-                            state.solver.new_var().into()
+                            state.new_solver_var(&span).into()
                         } else {
                             LinearExpr::from(0.)
                         };
                         let points = (0..count)
-                            .map(|_| (state.solver.new_var().into(), state.solver.new_var().into()))
+                            .map(|_| {
+                                (
+                                    state.new_solver_var(&span).into(),
+                                    state.new_solver_var(&span).into(),
+                                )
+                            })
                             .collect();
                         let path = Path {
                             id,
@@ -4799,10 +4817,13 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "float" => {
-                    self.values.insert(
-                        vid,
-                        Defer::Ready(Value::Linear(LinearExpr::from(state.solver.new_var()))),
-                    );
+                    let span = Span {
+                        path: state.scopes[&vref.loc.scope].span.path.clone(),
+                        span: c.expr.span,
+                    };
+                    let var = state.new_solver_var(&span);
+                    self.values
+                        .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
                     true
                 }
                 "eq" => {
@@ -5154,8 +5175,8 @@ impl<'a> ExecPass<'a> {
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let inst = Instance {
                             id,
-                            x: state.solver.new_var().into(),
-                            y: state.solver.new_var().into(),
+                            x: state.new_solver_var(&span).into(),
+                            y: state.new_solver_var(&span).into(),
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
@@ -6553,7 +6574,7 @@ pub fn bbox_dim_union(
 pub struct CompiledData {
     pub cells: IndexMap<CellId, CompiledCell>,
     pub top: CellId,
-    pub layers: LayerProperties,
+    pub tech: crate::tech::Technology,
 }
 
 #[enumify(generics_only)]

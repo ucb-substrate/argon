@@ -1,4 +1,4 @@
-use std::{io::BufReader, ops::Deref, path::Path};
+use std::{ops::Deref, path::Path};
 
 use ::gds::{
     GdsArrayRef, GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPath, GdsPoint, GdsStrans,
@@ -10,7 +10,10 @@ use indexmap::IndexMap;
 use tracing::trace;
 use uniquify::Names;
 
-use crate::compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, SolvedValue};
+use crate::{
+    compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, SolvedValue},
+    tech::{Technology, read_tech},
+};
 
 pub struct GdsMap {
     layers: IndexMap<String, GdsLayerSpec>,
@@ -20,21 +23,25 @@ struct GdsExporter {
     lib: GdsLibrary,
     map: GdsMap,
     names: Names<CellId>,
+    display_unit: f64,
 }
 
 impl GdsExporter {
-    fn new(name: impl Into<ArcStr>, map: GdsMap, units: GdsUnits) -> Self {
+    fn new(name: impl Into<ArcStr>, tech: &Technology) -> Self {
         let mut lib = GdsLibrary::new(name);
-        lib.units = units;
+        // The first GDS unit is the DBU size in display (user) units; the
+        // second is the DBU size in meters.
+        lib.units = GdsUnits::new(1. / tech.display_unit as f64, tech.dbu);
         Self {
             lib,
-            map,
+            map: GdsMap::from_technology(tech),
             names: Names::new(),
+            display_unit: tech.display_unit as f64,
         }
     }
 
     fn coord_to_gds(&self, coord: f64) -> i32 {
-        (coord * 1e-9 / self.lib.units.db_unit()).round() as i32
+        (coord * self.display_unit).round() as i32
     }
 }
 
@@ -55,23 +62,20 @@ impl Deref for GdsMap {
 }
 
 impl GdsMap {
-    pub fn from_lyp(path: impl AsRef<Path>) -> Result<Self> {
-        let lyp = klayout_lyp::from_reader(BufReader::new(std::fs::File::open(path)?))?;
-        Ok(GdsMap::from_iter(
-            lyp.layers
-                .into_iter()
-                .map(|layer_prop| {
-                    let (layer, datatype) = parse_layer_source(&layer_prop.source)?;
-                    Ok((
-                        layer_prop.name,
-                        GdsLayerSpec {
-                            layer,
-                            xtype: datatype,
-                        },
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        ))
+    pub fn from_tech(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self::from_technology(&read_tech(path)?))
+    }
+
+    pub fn from_technology(tech: &Technology) -> Self {
+        GdsMap::from_iter(tech.layers.iter().map(|layer| {
+            (
+                layer.name.clone(),
+                GdsLayerSpec {
+                    layer: layer.gds_layer,
+                    xtype: layer.gds_datatype,
+                },
+            )
+        }))
     }
 
     fn layer_name(&self, layer: i16, datatype: i16) -> Option<&str> {
@@ -134,18 +138,17 @@ pub(crate) enum ImportedGdsElement {
 pub(crate) fn import_gds(
     path: &Path,
     declared_name: &str,
-    lyp_path: &Path,
+    tech: &Technology,
 ) -> Result<ImportedGdsLibrary> {
-    let map = GdsMap::from_lyp(lyp_path)
-        .with_context(|| format!("could not map layers for GDS `{}`", path.display()))?;
-    import_gds_with_map(path, declared_name, &map)
+    import_gds_with_tech(path, declared_name, tech)
 }
 
-fn import_gds_with_map(
+fn import_gds_with_tech(
     path: &Path,
     declared_name: &str,
-    map: &GdsMap,
+    tech: &Technology,
 ) -> Result<ImportedGdsLibrary> {
+    let map = GdsMap::from_technology(tech);
     let library = GdsLibrary::load(path)
         .map_err(|error| anyhow!("{error}"))
         .with_context(|| format!("could not read imported GDS `{}`", path.display()))?;
@@ -185,7 +188,10 @@ fn import_gds_with_map(
                 path.display()
             )
         })?;
-    let scale = library.units.db_unit() / 1e-9;
+    // Imported GDS coordinates use the library's DBU. Argon source and
+    // compiled geometry use the local technology's display unit, itself an
+    // integer number of local DBUs.
+    let scale = library.units.db_unit() / tech.dbu / tech.display_unit as f64;
     let coord = |value: i32| f64::from(value) * scale;
     let mut structs = Vec::with_capacity(library.structs.len());
     for structure in &library.structs {
@@ -194,7 +200,7 @@ fn import_gds_with_map(
             match element {
                 GdsElement::GdsBoundary(boundary) => {
                     elements.push(import_boundary(
-                        map,
+                        &map,
                         path,
                         boundary.layer,
                         boundary.datatype,
@@ -204,7 +210,7 @@ fn import_gds_with_map(
                 }
                 GdsElement::GdsBox(gds_box) => {
                     elements.push(import_boundary(
-                        map,
+                        &map,
                         path,
                         gds_box.layer,
                         gds_box.boxtype,
@@ -215,7 +221,7 @@ fn import_gds_with_map(
                 GdsElement::GdsTextElem(text) => {
                     // Text transforms affect glyph presentation, not the label's
                     // anchor. Argon retains text as an annotation at that anchor.
-                    let layer = import_layer(map, path, text.layer, text.texttype)?;
+                    let layer = import_layer(&map, path, text.layer, text.texttype)?;
                     elements.push(ImportedGdsElement::Text {
                         layer,
                         text: text.string.to_string(),
@@ -236,7 +242,7 @@ fn import_gds_with_map(
                     import_array(path, &names, array, scale, &mut elements)?;
                 }
                 GdsElement::GdsPath(gds_path) => {
-                    elements.push(import_path(map, path, gds_path, scale)?);
+                    elements.push(import_path(&map, path, gds_path, scale)?);
                 }
                 GdsElement::GdsNode(_) => bail!(
                     "imported GDS `{}` contains a node element, which is not supported",
@@ -244,7 +250,7 @@ fn import_gds_with_map(
                 ),
             }
         }
-        name_pin_shapes(&mut elements);
+        name_pin_shapes(&mut elements, &tech.pin_layers);
         structs.push(ImportedGdsStruct {
             name: structure.name.to_string(),
             elements,
@@ -258,7 +264,7 @@ fn import_layer(map: &GdsMap, path: &Path, layer: i16, datatype: i16) -> Result<
         .map(str::to_owned)
         .ok_or_else(|| {
             anyhow!(
-                "imported GDS `{}` uses layer {layer}/{datatype}, which is absent from the LYP file",
+                "imported GDS `{}` uses layer {layer}/{datatype}, which is absent from the technology file",
                 path.display()
             )
         })
@@ -361,16 +367,15 @@ fn import_path(
     })
 }
 
-/// Associate conventional `<material>.label` text with the `<material>.pin`
-/// rectangle containing its origin. The LYP names already carry the layer
-/// purpose, so this does not require a PDK-specific technology file.
-fn name_pin_shapes(elements: &mut [ImportedGdsElement]) {
+/// Associate label text with pin shapes using the technology's explicit
+/// pin-layer mappings.
+fn name_pin_shapes(elements: &mut [ImportedGdsElement], pin_layers: &IndexMap<String, String>) {
     let labels = elements
         .iter()
         .filter_map(|element| match element {
-            ImportedGdsElement::Text { layer, text, x, y } => layer
-                .strip_suffix(".label")
-                .map(|material| (material.to_owned(), text.clone(), *x, *y)),
+            ImportedGdsElement::Text { layer, text, x, y } => {
+                Some((layer.clone(), text.clone(), *x, *y))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -385,11 +390,11 @@ fn name_pin_shapes(elements: &mut [ImportedGdsElement]) {
                 x1,
                 y1,
             } => {
-                let Some(material) = layer.strip_suffix(".pin") else {
+                let Some(label_layer) = pin_layers.get(layer) else {
                     continue;
                 };
-                *name = labels.iter().find_map(|(label_material, text, x, y)| {
-                    (label_material == material && *x >= *x0 && *x <= *x1 && *y >= *y0 && *y <= *y1)
+                *name = labels.iter().find_map(|(layer, text, x, y)| {
+                    (layer == label_layer && *x >= *x0 && *x <= *x1 && *y >= *y0 && *y <= *y1)
                         .then(|| argon_ident(text))
                 });
             }
@@ -398,11 +403,11 @@ fn name_pin_shapes(elements: &mut [ImportedGdsElement]) {
                 name,
                 points,
             } => {
-                let Some(material) = layer.strip_suffix(".pin") else {
+                let Some(label_layer) = pin_layers.get(layer) else {
                     continue;
                 };
-                *name = labels.iter().find_map(|(label_material, text, x, y)| {
-                    (label_material == material && point_in_polygon((*x, *y), points))
+                *name = labels.iter().find_map(|(layer, text, x, y)| {
+                    (layer == label_layer && point_in_polygon((*x, *y), points))
                         .then(|| argon_ident(text))
                 });
             }
@@ -555,22 +560,22 @@ fn import_transform(path: &Path, transform: Option<&GdsStrans>) -> Result<(f64, 
 }
 
 impl CompileOutput {
-    pub fn to_gds(&self, map: GdsMap, units: GdsUnits, out_path: impl AsRef<Path>) -> Result<()> {
+    pub fn to_gds(&self, out_path: impl AsRef<Path>) -> Result<()> {
         let out_path = out_path.as_ref();
         trace!("Exporting to gds at {out_path:?}");
-        let mut exporter = GdsExporter::new("TOP", map, units);
         if let CompileOutput::Valid(output)
         | CompileOutput::ExecErrors(ExecErrorCompileOutput {
             errors: _,
             output: Some(output),
         }) = self
         {
+            let mut exporter = GdsExporter::new("TOP", &output.tech);
             output.cell_to_gds(&mut exporter, output.top)?;
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            exporter.lib.save(out_path).map_err(|e| anyhow!("{e}"))?;
         }
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        exporter.lib.save(out_path).map_err(|e| anyhow!("{e}"))?;
 
         Ok(())
     }
@@ -708,16 +713,6 @@ impl CompiledData {
     }
 }
 
-fn parse_layer_source(source: &str) -> Result<(i16, i16)> {
-    let (layer, datatype) = source
-        .split_once('/')
-        .ok_or_else(|| anyhow!("parse error"))?;
-    let datatype = datatype
-        .split_once('@')
-        .map_or(datatype, |(datatype, _)| datatype);
-    Ok((layer.parse()?, datatype.parse()?))
-}
-
 fn parse_cell_name(name: &str) -> Result<&str> {
     name.rsplit("cell ")
         .next()
@@ -822,7 +817,7 @@ mod tests {
     fn pin_shape_uses_contained_matching_layer_label() {
         let mut elements = vec![
             ImportedGdsElement::Rect {
-                layer: "met1.pin".to_owned(),
+                layer: "ports".to_owned(),
                 name: None,
                 x0: 0.,
                 y0: 0.,
@@ -830,7 +825,7 @@ mod tests {
                 y1: 100.,
             },
             ImportedGdsElement::Text {
-                layer: "met1.label".to_owned(),
+                layer: "port_names".to_owned(),
                 text: "VDD".to_owned(),
                 x: 50.,
                 y: 50.,
@@ -843,12 +838,86 @@ mod tests {
             },
         ];
 
-        name_pin_shapes(&mut elements);
+        name_pin_shapes(
+            &mut elements,
+            &IndexMap::from_iter([("ports".to_owned(), "port_names".to_owned())]),
+        );
 
         let ImportedGdsElement::Rect { name, .. } = &elements[0] else {
             unreachable!();
         };
         assert_eq!(name.as_deref(), Some("VDD"));
+    }
+
+    #[test]
+    fn exporter_transforms_display_units_to_configured_dbus() {
+        let tech = crate::tech::parse_tech(
+            r##"
+                dbu = "nm"
+                display_unit = 1000
+                grid = 1
+
+                [[layers]]
+                name = "met1"
+                gds = [1, 0]
+                fill = "#0000ff"
+                border = "#0000ff"
+            "##,
+        )
+        .unwrap();
+        let exporter = GdsExporter::new("test", &tech);
+        assert_eq!(exporter.coord_to_gds(1.25), 1250);
+        assert_eq!(exporter.lib.units.db_unit(), 1e-9);
+    }
+
+    #[test]
+    fn importer_transforms_gds_dbus_to_display_units() {
+        let tech = crate::tech::parse_tech(
+            r##"
+                dbu = "nm"
+                display_unit = 1000
+                grid = 1
+
+                [[layers]]
+                name = "met1"
+                gds = [1, 0]
+                fill = "#0000ff"
+                border = "#0000ff"
+            "##,
+        )
+        .unwrap();
+        let mut library = GdsLibrary::new("fixture");
+        let mut structure = GdsStruct::new("top");
+        structure.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+            layer: 1,
+            datatype: 0,
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(0, 2_000),
+                GdsPoint::new(1_000, 2_000),
+                GdsPoint::new(1_000, 0),
+                GdsPoint::new(0, 0),
+            ],
+            ..Default::default()
+        }));
+        library.structs.push(structure);
+        let path = std::env::temp_dir().join(format!(
+            "argon-dbu-transform-{}-{}.gds",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        library.save(&path).unwrap();
+
+        let imported = import_gds_with_tech(&path, "top", &tech).unwrap();
+        let ImportedGdsElement::Rect { x1, y1, .. } = imported.structs[0].elements[0] else {
+            panic!("fixture boundary should import as a rectangle");
+        };
+        assert_eq!(x1, 1.);
+        assert_eq!(y1, 2.);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
