@@ -17,7 +17,9 @@ wait_for('Argon language server', function()
     and vim.fn.exists(':Argon') == 2
 end)
 
-vim.cmd('Argon openCell top()')
+if vim.env.ARGON_TEST_MODE ~= 'rpc_errors' then
+  vim.cmd('Argon openCell top()')
+end
 
 if vim.env.ARGON_TEST_MODE == 'roundtrip' then
   wait_for('GUI source edit', function()
@@ -53,6 +55,9 @@ elseif vim.env.ARGON_TEST_MODE == 'diagnostics' then
   wait_for('diagnostics to clear', function()
     return #vim.diagnostic.get(bufnr) == 0
   end)
+elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
+  -- The Rust test drives the analyzer RPC directly and acknowledges the
+  -- mirrored GUI error after observing it.
 else
   error('unknown full-stack mode: ' .. tostring(vim.env.ARGON_TEST_MODE))
 end

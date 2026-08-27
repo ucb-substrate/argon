@@ -20,6 +20,7 @@ actions!(
         Redo,
         FocusInvoker,
         FocusInvokerCommandBar,
+        ShowMessages,
         InstantiateCommand,
         OpenCellCommand,
         Cancel,

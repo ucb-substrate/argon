@@ -156,6 +156,18 @@ impl SyncLangServerClient {
         }));
     }
 
+    fn report_message(&self, typ: MessageType, message: String) {
+        if typ == MessageType::LOG {
+            return;
+        }
+        let _ = self.to_exec.unbounded_send(Box::new(move |editor, cx| {
+            let _ = editor.state.update(cx, |state, cx| {
+                state.show_message(typ, message);
+                cx.notify();
+            });
+        }));
+    }
+
     pub fn register_server(
         &self,
         configured_port: Option<u16>,
@@ -380,6 +392,7 @@ impl SyncLangServerClient {
 
     pub fn show_message<M: Display>(&self, typ: MessageType, message: M) -> Result<()> {
         let message = message.to_string();
+        self.report_message(typ, message.clone());
         self.call(move |client| {
             let message = message.clone();
             async move { client.show_message(context::current(), typ, message).await }
@@ -421,6 +434,20 @@ impl Gui for GuiServer {
             }))
             .await
             .unwrap();
+    }
+
+    async fn show_message(mut self, _: context::Context, typ: MessageType, message: String) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.state.update(cx, |state, cx| {
+                        state.show_message(typ, message);
+                        cx.notify();
+                    });
+                });
+            }))
+            .await
+            .ok();
     }
 
     async fn selected_scope(mut self, _: context::Context) -> Option<Span> {

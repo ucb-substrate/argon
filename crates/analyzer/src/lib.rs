@@ -186,36 +186,63 @@ fn parse_setting(input: &str) -> Option<(&str, &str)> {
     (!key.is_empty() && !value.is_empty()).then_some((key, value))
 }
 
+async fn show_message_in_editor_and_gui(
+    client: &Client,
+    mut gui_client: Option<GuiClient>,
+    typ: MessageType,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    client.show_message(typ, message.clone()).await;
+    if typ != MessageType::LOG
+        && let Some(gui_client) = gui_client.as_mut()
+    {
+        let _ = gui_client
+            .show_message(context::current(), typ, message)
+            .await;
+    }
+}
+
 async fn compile_open_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     cell: &str,
     lyp: &Path,
     gds_imports: &[(String, PathBuf)],
     client: &Client,
+    gui_client: Option<GuiClient>,
 ) -> Option<CompileOutput> {
     if let Err(error) = argonc::layer::read_lyp(lyp) {
-        client
-            .show_message(MessageType::ERROR, format!("Could not open cell: {error}"))
-            .await;
+        show_message_in_editor_and_gui(
+            client,
+            gui_client,
+            MessageType::ERROR,
+            format!("Could not open cell: {error}"),
+        )
+        .await;
         return None;
     }
 
     let cell_ast = match parse::parse_cell(cell) {
         Ok(cell_ast) => cell_ast,
         Err(error) => {
-            client
-                .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
-                .await;
+            show_message_in_editor_and_gui(
+                client,
+                gui_client,
+                MessageType::ERROR,
+                format!("Open cell is invalid: {error}"),
+            )
+            .await;
             return None;
         }
     };
     if !cell_ast.args.kwargs.is_empty() {
-        client
-            .show_message(
-                MessageType::ERROR,
-                "Open cell does not support keyword arguments yet",
-            )
-            .await;
+        show_message_in_editor_and_gui(
+            client,
+            gui_client,
+            MessageType::ERROR,
+            "Open cell does not support keyword arguments yet",
+        )
+        .await;
         return None;
     }
     let Some(args) = cell_ast
@@ -225,12 +252,13 @@ async fn compile_open_cell(
         .map(CellArg::from_literal)
         .collect::<Option<Vec<_>>>()
     else {
-        client
-            .show_message(
-                MessageType::ERROR,
-                "Open cell arguments must be integer, float, boolean, or empty-list literals",
-            )
-            .await;
+        show_message_in_editor_and_gui(
+            client,
+            gui_client,
+            MessageType::ERROR,
+            "Open cell arguments must be integer, float, boolean, or empty-list literals",
+        )
+        .await;
         return None;
     };
     let cell_path = cell_ast
@@ -315,9 +343,13 @@ impl StateMut {
             match Library::load(&manifest_path) {
                 Ok(config) => Some(config),
                 Err(error) => {
-                    client
-                        .show_message(MessageType::ERROR, error.to_string())
-                        .await;
+                    show_message_in_editor_and_gui(
+                        client,
+                        self.gui_client.clone(),
+                        MessageType::ERROR,
+                        error.to_string(),
+                    )
+                    .await;
                     self.compile_output = None;
                     return;
                 }
@@ -367,16 +399,25 @@ impl StateMut {
                             manifest_path.display()
                         )
                     };
-                    client
-                        .show_message(
-                            MessageType::ERROR,
-                            format!("Could not open cell: {message}"),
-                        )
-                        .await;
+                    show_message_in_editor_and_gui(
+                        client,
+                        self.gui_client.clone(),
+                        MessageType::ERROR,
+                        format!("Could not open cell: {message}"),
+                    )
+                    .await;
                     self.compile_output = None;
                     return;
                 };
-                compile_open_cell(&ast, cell, lyp, &gds_imports, client).await
+                compile_open_cell(
+                    &ast,
+                    cell,
+                    lyp,
+                    &gds_imports,
+                    client,
+                    self.gui_client.clone(),
+                )
+                .await
             } else {
                 None
             }
@@ -386,12 +427,13 @@ impl StateMut {
         self.compile_output = o;
         if !update && let Some(output) = &self.compile_output {
             for message in blocking_compile_error_messages(output) {
-                client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not open cell: {message}"),
-                    )
-                    .await;
+                show_message_in_editor_and_gui(
+                    client,
+                    self.gui_client.clone(),
+                    MessageType::ERROR,
+                    format!("Could not open cell: {message}"),
+                )
+                .await;
             }
         }
         let mut diagnostics = self.diagnostics();
@@ -875,6 +917,7 @@ impl Backend {
             &lyp,
             &gds_imports,
             &self.state.editor_client,
+            state_mut.gui_client.clone(),
         )
         .await
         else {
