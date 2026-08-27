@@ -82,6 +82,13 @@ pub fn static_compile(
 pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
     let parse_errors = parse_output.static_errors();
     let ast = parse_output.ast();
+    analyze_workspace_ast(ast, parse_errors)
+}
+
+pub(crate) fn analyze_workspace_ast(
+    ast: WorkspaceParseAst,
+    parse_errors: Vec<StaticError>,
+) -> StaticAnalysis {
     let (typed_ast, errors) = match static_compile(&ast) {
         Some((typed_ast, mut output)) => {
             output.errors.extend(parse_errors);
@@ -112,17 +119,32 @@ pub fn execute_cell(
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
+    execute_cell_tracked(ast, input, config).output
+}
+
+/// Executes a cell while recording the declarations actually observed at
+/// runtime. The incremental compiler uses this to retain results across source
+/// revisions without making the public one-shot API stateful.
+pub(crate) fn execute_cell_tracked(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+    config: &WorkspaceConfig,
+) -> TrackedExecution {
     let Some(tech_file) = config.tech.as_deref() else {
-        return missing_tech_output();
+        return TrackedExecution::without_dependencies(missing_tech_output());
     };
     let tech = match read_tech(tech_file) {
         Ok(tech) => tech,
-        Err(error) => return invalid_tech_output(ast, error.to_string()),
+        Err(error) => {
+            return TrackedExecution::without_dependencies(invalid_tech_output(
+                ast,
+                error.to_string(),
+            ));
+        }
     };
-    check_output_layers(
-        ExecPass::new(ast, tech, &config.gds_imports).execute(input),
-        tech_file,
-    )
+    let mut execution = ExecPass::new(ast, tech, &config.gds_imports).execute_tracked(input);
+    execution.output = check_output_layers(execution.output, tech_file);
+    execution
 }
 
 /// Executes a cell invocation spliced into `ast` by
@@ -133,17 +155,44 @@ pub fn execute_cell_invocation(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
+    execute_cell_invocation_tracked(ast, invocation, config).output
+}
+
+pub(crate) fn execute_cell_invocation_tracked(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+) -> TrackedExecution {
     let Some(tech_file) = config.tech.as_deref() else {
-        return missing_tech_output();
+        return TrackedExecution::without_dependencies(missing_tech_output());
     };
     let tech = match read_tech(tech_file) {
         Ok(tech) => tech,
-        Err(error) => return invalid_tech_output(ast, error.to_string()),
+        Err(error) => {
+            return TrackedExecution::without_dependencies(invalid_tech_output(
+                ast,
+                error.to_string(),
+            ));
+        }
     };
-    check_output_layers(
-        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation(invocation),
-        tech_file,
-    )
+    let mut execution =
+        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation_tracked(invocation);
+    execution.output = check_output_layers(execution.output, tech_file);
+    execution
+}
+
+pub(crate) struct TrackedExecution {
+    pub(crate) output: CompileOutput,
+    pub(crate) dependencies: IndexSet<VarId>,
+}
+
+impl TrackedExecution {
+    fn without_dependencies(output: CompileOutput) -> Self {
+        Self {
+            output,
+            dependencies: IndexSet::new(),
+        }
+    }
 }
 
 fn missing_tech_output() -> CompileOutput {
@@ -1000,6 +1049,15 @@ impl<'a> VarIdTyPass<'a> {
 
     fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
         let id = self.alloc_id();
+        self.bind(name, id, ty)
+    }
+
+    fn alloc_declaration(&mut self, kind: &str, name: &Substr, ty: Ty) -> VarId {
+        let id = semantic_declaration_id(self.current_path, kind, name);
+        self.bind(name, id, ty)
+    }
+
+    fn bind(&mut self, name: &Substr, id: VarId, ty: Ty) -> VarId {
         self.bindings
             .last_mut()
             .unwrap()
@@ -1143,7 +1201,7 @@ impl<'a> VarIdTyPass<'a> {
                 Ty::Nil
             },
         }));
-        self.alloc(&input.name.name, ty);
+        self.alloc_declaration("fn", &input.name.name, ty);
     }
 
     fn declare_enum_decl(&mut self, input: &'a EnumDecl<Substr, ParseMetadata>) {
@@ -1165,10 +1223,10 @@ impl<'a> VarIdTyPass<'a> {
             variants.insert(variant.name.to_string());
         }
         let ty = Ty::Enum(EnumTy {
-            id: self.alloc_id(),
+            id: semantic_declaration_id(self.current_path, "enum-type", &input.name.name),
             variants,
         });
-        self.alloc(&input.name.name, ty);
+        self.alloc_declaration("enum", &input.name.name, ty);
     }
 
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
@@ -1626,7 +1684,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 dynamic_fields,
             }),
         }));
-        self.alloc(&input.name.name, ty);
+        self.alloc_declaration("cell", &input.name.name, ty);
         let name = self.transform_ident(&input.name);
         let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
@@ -2476,6 +2534,26 @@ pub struct CompileInput<'a> {
 pub type VarId = u64;
 pub type ConstraintVarId = u64;
 
+/// Stable process-independent identity for a top-level semantic declaration.
+/// Local bindings continue to use compact sequential IDs in the low half of
+/// the ID space.
+fn semantic_declaration_id(module: &ModPath, kind: &str, name: &str) -> VarId {
+    let mut hash = 0xcbf29ce484222325_u64;
+    let mut write = |bytes: &[u8]| {
+        for byte in bytes {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+        hash = (hash ^ 0xff).wrapping_mul(0x100000001b3);
+    };
+    write(b"argon-declaration");
+    for component in module {
+        write(component.as_bytes());
+    }
+    write(kind.as_bytes());
+    write(name.as_bytes());
+    hash | (1_u64 << 63)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledEmit {
     pub span: Span,
@@ -2741,6 +2819,8 @@ struct ExecPass<'a> {
     /// as if it were the entry point.
     entry_cell_var: Option<VarId>,
     entry_cell: Option<CellId>,
+    /// Global cell and function declarations observed by this execution.
+    dependencies: IndexSet<VarId>,
     errors: Vec<ExecError>,
 }
 
@@ -2825,6 +2905,7 @@ impl<'a> ExecPass<'a> {
             compiled_cell_cache: HashMap::new(),
             entry_cell_var: None,
             entry_cell: None,
+            dependencies: IndexSet::new(),
             errors: Vec::new(),
         }
     }
@@ -2851,10 +2932,10 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    pub(crate) fn execute(mut self, input: CompileInput<'a>) -> CompileOutput {
+    pub(crate) fn execute_tracked(mut self, input: CompileInput<'a>) -> TrackedExecution {
         self.declare_globals();
         if input.cell.is_empty() {
-            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            let output = CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
                     span: None,
                     cell: 0,
@@ -2862,6 +2943,7 @@ impl<'a> ExecPass<'a> {
                 }],
                 output: None,
             });
+            return self.complete(output);
         }
         let path = match input.cell[0] {
             "std" => {
@@ -2895,22 +2977,24 @@ impl<'a> ExecPass<'a> {
             let cell_id = match self.execute_cell(vid, input.args, None) {
                 Ok(cell_id) => cell_id,
                 Err(()) => {
-                    return CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                        errors: self.errors,
+                    let output = CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                        errors: std::mem::take(&mut self.errors),
                         output: None,
                     });
+                    return self.complete(output);
                 }
             };
             self.finish(cell_id)
         } else {
-            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            let output = CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
                     span: None,
                     cell: 0, // TODO: don't use dummy cell ID
                     kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
                 }],
                 output: None,
-            })
+            });
+            self.complete(output)
         }
     }
 
@@ -2918,7 +3002,10 @@ impl<'a> ExecPass<'a> {
     /// [`crate::parse::add_cell_invocation`]. The generated entry cell binds
     /// the invocation, so evaluating it runs the invocation through the
     /// ordinary expression evaluator; the cell it produced becomes the top.
-    pub(crate) fn execute_invocation(mut self, invocation: &CellInvocation) -> CompileOutput {
+    pub(crate) fn execute_invocation_tracked(
+        mut self,
+        invocation: &CellInvocation,
+    ) -> TrackedExecution {
         self.declare_globals();
         let ast = self.ast;
         let root = &ast[&ModPath::new()];
@@ -2946,7 +3033,7 @@ impl<'a> ExecPass<'a> {
         // the caller wrote rather than surfacing from the executor.
         let ty = value.ty();
         if !matches!(ty, Ty::Cell(_) | Ty::Any) {
-            return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+            let output = CompileOutput::StaticErrors(StaticErrorCompileOutput {
                 errors: vec![StaticError {
                     span: Span {
                         path: root.path.clone(),
@@ -2958,14 +3045,16 @@ impl<'a> ExecPass<'a> {
                     },
                 }],
             });
+            return self.complete(output);
         }
 
         self.entry_cell_var = Some(entry.metadata.1);
         let Ok(entry_id) = self.execute_cell(entry.metadata.1, Vec::new(), None) else {
-            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                errors: self.errors,
+            let output = CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: std::mem::take(&mut self.errors),
                 output: None,
             });
+            return self.complete(output);
         };
         // Arguments are evaluated inside the generated cell, so an unsolvable
         // system there means an argument did not reduce to a constant.
@@ -2987,10 +3076,11 @@ impl<'a> ExecPass<'a> {
                 cell: entry_id,
                 kind: ExecErrorKind::NotACell,
             });
-            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                errors: self.errors,
+            let output = CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: std::mem::take(&mut self.errors),
                 output: None,
             });
+            return self.complete(output);
         };
         let top = *top;
         // The entry cell is an implementation detail of the invocation.
@@ -2999,19 +3089,27 @@ impl<'a> ExecPass<'a> {
     }
 
     /// Packages the executed cells into a compile output rooted at `top`.
-    fn finish(self, top: CellId) -> CompileOutput {
+    fn finish(mut self, top: CellId) -> TrackedExecution {
         let data = CompiledData {
-            cells: self.compiled_cells,
+            cells: std::mem::take(&mut self.compiled_cells),
             top,
-            tech: self.tech,
+            tech: self.tech.clone(),
         };
-        if self.errors.is_empty() {
+        let output = if self.errors.is_empty() {
             CompileOutput::Valid(data)
         } else {
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                errors: self.errors,
+                errors: std::mem::take(&mut self.errors),
                 output: Some(data),
             })
+        };
+        self.complete(output)
+    }
+
+    fn complete(self, output: CompileOutput) -> TrackedExecution {
+        TrackedExecution {
+            output,
+            dependencies: self.dependencies,
         }
     }
 
@@ -3021,6 +3119,9 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        if self.entry_cell_var != Some(cell) {
+            self.dependencies.insert(cell);
+        }
         let cache_key = CellExecKey {
             cell,
             args: args.iter().map(CellArgKey::from).collect(),
@@ -3997,6 +4098,11 @@ impl<'a> ExecPass<'a> {
                         }))
                     })
                 } else {
+                    self.dependencies.insert(
+                        c.metadata
+                            .0
+                            .expect("no var ID assigned to function being called"),
+                    );
                     let arg_vals = c
                         .args
                         .posargs
