@@ -3107,7 +3107,7 @@ impl<'a> ExecPass<'a> {
                     cell_id,
                     CellState {
                         solve_iters: 0,
-                        solver: Solver::with_grid(self.tech.grid),
+                        solver: Solver::with_grid(self.tech.grid_step()),
                         fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),

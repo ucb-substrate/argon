@@ -701,7 +701,7 @@ mod tests {
                 _ => None,
             })
             .expect("round-trip GDS should contain a path");
-        assert_eq!(exported_path.width, Some(20));
+        assert_eq!(exported_path.width, Some(200));
         assert_eq!(exported_path.path_type, Some(2));
         assert_eq!(exported_path.xy.len(), 3);
     }

@@ -18,10 +18,9 @@ const STARTER_SOURCE: &str = r#"cell top() {
 }
 "#;
 
-const DEFAULT_TECH: &str = r##"dbu = 1e-9
-display_unit = "um"
-entry_unit = "nm"
-grid = 0.1
+const DEFAULT_TECH: &str = r##"dbu = 1e-10
+display_unit = 10
+grid = 1
 
 [[layers]]
 name = "met1"

@@ -1,7 +1,6 @@
-dbu = 1e-9
-display_unit = "um"
-entry_unit = "nm"
-grid = 0.1
+dbu = 1e-10
+display_unit = 10
+grid = 1
 
 [[layers]]
 name = "prBoundary.boundary"

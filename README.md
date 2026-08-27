@@ -78,16 +78,15 @@ When invoking `argonc` directly, pass the technology file with
 `--tech tech.toml` and the same mapping as
 `--gds-import 'macros::sram=layout/sram.gds'`.
 
-The technology file is TOML. Unit values are meters per unit and can instead
-use `"m"`, `"mm"`, `"um"`, `"nm"`, or `"pm"`. `grid` is expressed in entry
-units and controls snapping for rectangle and polygon drawing, instance
-placement, previews, and GUI-persisted geometry edits:
+The technology file is TOML. `dbu` is meters per GDS database unit and can
+instead use `"m"`, `"mm"`, `"um"`, `"nm"`, or `"pm"`. Every other length is
+an integer multiple of the DBU. `display_unit` is also the coordinate unit used
+in Argon source, while `grid` controls solver and GUI snapping:
 
 ```toml
-dbu = "nm"          # GDS database unit
-display_unit = "um" # GDS user/display unit
-entry_unit = "nm"   # one coordinate unit in Argon source
-grid = 0.1
+dbu = "nm"       # physical size of one GDS database unit
+display_unit = 1 # one source/display unit is one DBU
+grid = 1         # snap grid is one DBU
 
 [[layers]]
 name = "met1.pin"
@@ -105,10 +104,13 @@ border = "#0000ff"
 "met1.pin" = "met1.label"
 ```
 
+For example, with `dbu = "nm"`, `display_unit = 1000`, and `grid = 5`,
+Argon coordinates are expressed in microns and snap to a 5 nm grid.
+
 Each layer maps its Argon name to a GDS layer/datatype pair. A `pin_layers`
 entry maps a pin-shape layer to the text layer that names contained pins. GDS
-coordinates are transformed between database units and entry units during
-import/export; exported GDS libraries also use the configured display unit.
+coordinates are transformed between database and source/display units during
+import and export.
 
 Polygons normally take a layer and a point count. Each generated point has
 independent solver coordinates, addressable either as `polygon.x0`,

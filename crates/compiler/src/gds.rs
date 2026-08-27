@@ -23,7 +23,7 @@ struct GdsExporter {
     lib: GdsLibrary,
     map: GdsMap,
     names: Names<CellId>,
-    entry_unit: f64,
+    display_unit: f64,
 }
 
 impl GdsExporter {
@@ -31,17 +31,17 @@ impl GdsExporter {
         let mut lib = GdsLibrary::new(name);
         // The first GDS unit is the DBU size in display (user) units; the
         // second is the DBU size in meters.
-        lib.units = GdsUnits::new(tech.dbu / tech.display_unit, tech.dbu);
+        lib.units = GdsUnits::new(1. / tech.display_unit as f64, tech.dbu);
         Self {
             lib,
             map: GdsMap::from_technology(tech),
             names: Names::new(),
-            entry_unit: tech.entry_unit,
+            display_unit: tech.display_unit as f64,
         }
     }
 
     fn coord_to_gds(&self, coord: f64) -> i32 {
-        (coord * self.entry_unit / self.lib.units.db_unit()).round() as i32
+        (coord * self.display_unit).round() as i32
     }
 }
 
@@ -188,9 +188,10 @@ fn import_gds_with_tech(
                 path.display()
             )
         })?;
-    // GDS coordinates are integer DBUs. Argon source and compiled geometry
-    // use entry units, so imported coordinates must account for both scales.
-    let scale = library.units.db_unit() / tech.entry_unit;
+    // Imported GDS coordinates use the library's DBU. Argon source and
+    // compiled geometry use the local technology's display unit, itself an
+    // integer number of local DBUs.
+    let scale = library.units.db_unit() / tech.dbu / tech.display_unit as f64;
     let coord = |value: i32| f64::from(value) * scale;
     let mut structs = Vec::with_capacity(library.structs.len());
     for structure in &library.structs {
@@ -849,13 +850,12 @@ mod tests {
     }
 
     #[test]
-    fn exporter_transforms_entry_units_to_configured_dbus() {
+    fn exporter_transforms_display_units_to_configured_dbus() {
         let tech = crate::tech::parse_tech(
             r##"
                 dbu = "nm"
-                display_unit = "um"
-                entry_unit = "um"
-                grid = 0.001
+                display_unit = 1000
+                grid = 1
 
                 [[layers]]
                 name = "met1"
@@ -871,13 +871,12 @@ mod tests {
     }
 
     #[test]
-    fn importer_transforms_gds_dbus_to_entry_units() {
+    fn importer_transforms_gds_dbus_to_display_units() {
         let tech = crate::tech::parse_tech(
             r##"
                 dbu = "nm"
-                display_unit = "um"
-                entry_unit = "um"
-                grid = 0.001
+                display_unit = 1000
+                grid = 1
 
                 [[layers]]
                 name = "met1"

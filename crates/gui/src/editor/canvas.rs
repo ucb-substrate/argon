@@ -1313,7 +1313,7 @@ impl Element for CanvasElement {
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         let grid = solved_cell
             .as_ref()
-            .map(|cell| cell.output.tech.grid)
+            .map(|cell| cell.output.tech.grid_step())
             .unwrap_or(0.1);
         let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
         if let Some(solved_cell) = solved_cell {
@@ -3347,7 +3347,7 @@ impl LayoutCanvas {
             .solved_cell
             .read(cx)
             .as_ref()
-            .map(|cell| cell.output.tech.grid)
+            .map(|cell| cell.output.tech.grid_step())
             .unwrap_or(0.1);
         let layout_mouse_position = self.px_to_layout(event.position);
         let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
@@ -4065,7 +4065,7 @@ impl LayoutCanvas {
                 .solved_cell
                 .read(cx)
                 .as_ref()
-                .map(|cell| cell.output.tech.grid)
+                .map(|cell| cell.output.tech.grid_step())
                 .unwrap_or(0.1);
             let points = draw_points
                 .iter()
@@ -4346,7 +4346,7 @@ impl LayoutCanvas {
             &editable_cell.fallback_constraints_used,
             &self.sse_targets,
             &dv,
-            solved.output.tech.grid,
+            solved.output.tech.grid_step(),
         )
     }
 

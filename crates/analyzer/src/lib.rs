@@ -524,7 +524,7 @@ impl State {
     pub(crate) async fn technology_grid(&self) -> f64 {
         let tech = self.published_state.lock().await.config.tech.clone();
         tech.and_then(|path| argonc::tech::read_tech(path).ok())
-            .map(|tech| tech.grid)
+            .map(|tech| tech.grid_step())
             .unwrap_or(0.1)
     }
 

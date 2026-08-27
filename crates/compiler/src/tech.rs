@@ -9,16 +9,16 @@ use serde::{Deserialize, Serialize};
 
 /// All technology information needed by the compiler and layout editor.
 ///
-/// Length scales are expressed in meters per unit. Geometry values in Argon
-/// source are in [`Technology::entry_unit`]s; GDS integer coordinates are in
-/// [`Technology::dbu`]s.
+/// [`Technology::dbu`] is the physical size of one GDS database unit in
+/// meters. All other length configuration is expressed as an integer number of
+/// DBUs. Argon source coordinates use the configured display unit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Technology {
     pub dbu: f64,
-    pub display_unit: f64,
-    pub entry_unit: f64,
-    /// Snap-grid spacing, expressed in entry units.
-    pub grid: f64,
+    /// Number of DBUs in one Argon source/display coordinate unit.
+    pub display_unit: u64,
+    /// Snap-grid spacing in DBUs.
+    pub grid: u64,
     pub layers: Vec<Layer>,
     /// Pin-shape layer name to the text-label layer carrying the pin name.
     pub pin_layers: IndexMap<String, String>,
@@ -34,29 +34,24 @@ pub struct Layer {
 }
 
 impl Technology {
-    /// Convert an Argon/source coordinate to the configured display unit.
-    pub fn entry_to_display(&self, value: f64) -> f64 {
-        value * self.entry_unit / self.display_unit
+    /// Snap-grid spacing in Argon source/display coordinate units.
+    pub fn grid_step(&self) -> f64 {
+        self.grid as f64 / self.display_unit as f64
     }
 
-    /// Convert a value in display units to Argon/source entry units.
-    pub fn display_to_entry(&self, value: f64) -> f64 {
-        value * self.display_unit / self.entry_unit
+    /// Convert a coordinate in GDS database units to source/display units.
+    pub fn dbu_to_display(&self, value: i32) -> f64 {
+        f64::from(value) / self.display_unit as f64
     }
 
-    /// Convert a coordinate in GDS database units to Argon entry units.
-    pub fn dbu_to_entry(&self, value: i32) -> f64 {
-        f64::from(value) * self.dbu / self.entry_unit
+    /// Convert an Argon source/display coordinate to an integer GDS coordinate.
+    pub fn display_to_dbu(&self, value: f64) -> i32 {
+        (value * self.display_unit as f64).round() as i32
     }
 
-    /// Convert a coordinate in Argon entry units to an integer GDS coordinate.
-    pub fn entry_to_dbu(&self, value: f64) -> i32 {
-        (value * self.entry_unit / self.dbu).round() as i32
-    }
-
-    /// Snap an entry-unit coordinate to the nearest configured grid point.
+    /// Snap a source/display coordinate to the nearest configured grid point.
     pub fn snap(&self, value: f64) -> f64 {
-        snap(value, self.grid)
+        snap(value, self.grid_step())
     }
 }
 
@@ -88,11 +83,9 @@ pub fn snap(value: f64, grid: f64) -> f64 {
 struct TechnologyFile {
     dbu: UnitValue,
     #[serde(alias = "display-unit")]
-    display_unit: UnitValue,
-    #[serde(alias = "entry-unit")]
-    entry_unit: UnitValue,
+    display_unit: u64,
     #[serde(alias = "grid_size", alias = "grid-size", alias = "snap_grid")]
-    grid: f64,
+    grid: u64,
     layers: LayerList,
     #[serde(default, alias = "pin-layers")]
     pin_layers: IndexMap<String, PinLayerValue>,
@@ -232,10 +225,11 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
     let file: TechnologyFile = toml::from_str(text)
         .map_err(|error| anyhow!("could not parse technology file: {error}"))?;
     let dbu = file.dbu.scale("dbu")?;
-    let display_unit = file.display_unit.scale("display_unit")?;
-    let entry_unit = file.entry_unit.scale("entry_unit")?;
-    if !file.grid.is_finite() || file.grid <= 0. {
-        bail!("grid must be finite and greater than zero");
+    if file.display_unit == 0 {
+        bail!("display_unit must be greater than zero DBUs");
+    }
+    if file.grid == 0 {
+        bail!("grid must be greater than zero DBUs");
     }
     let layers = file.layers.into_layers()?;
     if layers.is_empty() {
@@ -272,8 +266,7 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
 
     Ok(Technology {
         dbu,
-        display_unit,
-        entry_unit,
+        display_unit: file.display_unit,
         grid: file.grid,
         layers,
         pin_layers,
@@ -300,9 +293,8 @@ mod tests {
 
     const TECH: &str = r##"
 dbu = 1e-9
-display_unit = "um"
-entry_unit = "nm"
-grid = 0.25
+display_unit = 1000
+grid = 250
 
 [[layers]]
 name = "met1.pin"
@@ -327,16 +319,15 @@ border = "#445566"
         assert_eq!(tech.layers[0].gds_layer, 68);
         assert_eq!(tech.layers[0].fill_color, Rgb::new(0x11, 0x22, 0x33));
         assert_eq!(tech.pin_layers["met1.pin"], "met1.label");
-        assert_eq!(tech.display_unit, 1e-6);
+        assert_eq!(tech.display_unit, 1000);
     }
 
     #[test]
-    fn transforms_between_entry_and_database_units() {
+    fn transforms_between_display_and_database_units() {
         let tech = parse_tech(TECH).unwrap();
-        assert_relative_eq!(tech.dbu_to_entry(1250), 1250., epsilon = 1e-12);
-        assert_eq!(tech.entry_to_dbu(1250.), 1250);
-        assert_relative_eq!(tech.entry_to_display(1250.), 1.25, epsilon = 1e-12);
-        assert_relative_eq!(tech.display_to_entry(2.5), 2500., epsilon = 1e-12);
+        assert_relative_eq!(tech.dbu_to_display(1250), 1.25, epsilon = 1e-12);
+        assert_eq!(tech.display_to_dbu(2.5), 2500);
+        assert_relative_eq!(tech.grid_step(), 0.25, epsilon = 1e-12);
     }
 
     #[test]
@@ -350,6 +341,9 @@ border = "#445566"
     #[test]
     fn rejects_invalid_references_and_scales() {
         assert!(parse_tech(&TECH.replace("1e-9", "0.")).is_err());
+        assert!(parse_tech(&TECH.replace("display_unit = 1000", "display_unit = 0")).is_err());
+        assert!(parse_tech(&TECH.replace("grid = 250", "grid = 0")).is_err());
+        assert!(parse_tech(&TECH.replace("grid = 250", "entry_unit = 1\ngrid = 250")).is_err());
         assert!(
             parse_tech(&TECH.replace(
                 "\"met1.pin\" = \"met1.label\"",

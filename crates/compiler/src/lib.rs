@@ -1514,7 +1514,7 @@ mod tests {
         ));
         let tech = std::fs::read_to_string(BASIC_TECH)
             .unwrap()
-            .replace("grid = 0.1", "grid = 0.0001");
+            .replace("display_unit = 10", "display_unit = 10000");
         std::fs::write(&tech_path, tech).unwrap();
         let cells = compile_workspace(
             &ast,
@@ -2158,10 +2158,10 @@ mod tests {
                 _ => None,
             })
             .expect("GDS path element");
-        assert_eq!(path.width, Some(20));
+        assert_eq!(path.width, Some(200));
         assert_eq!(path.path_type, Some(4));
-        assert_eq!(path.begin_extn, Some(5));
-        assert_eq!(path.end_extn, Some(7));
+        assert_eq!(path.begin_extn, Some(50));
+        assert_eq!(path.end_extn, Some(70));
         assert_eq!(path.xy.len(), 3);
     }
 
