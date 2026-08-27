@@ -58,6 +58,20 @@ RUSTFLAGS="-L/tools/B/rahulkumar/tools/install/lib64 -lxkbcommon-x11 -lxkbcommon
 
 The compiler-only benchmark commands below do not require these flags.
 
+### Incremental compiler smoke benchmark
+
+The process-local editor session has a focused benchmark that reports cold,
+warm no-op, and isolated-source-edit latency together with cache counters and
+retained heap bytes:
+
+```bash
+cargo test -p argonc --release -- --ignored --test-threads=1 \
+  --nocapture bench_incremental_session
+```
+
+It prints one comma-separated record to stderr and does not rewrite the scaling
+CSV files or figures.
+
 > **Note for AI agents.** Prefer this script over invoking `cargo test`
 > directly — it encodes the flags that are easy to get wrong (release,
 > `--test-threads=1`, the `bench_` name filter) and the figure regeneration.
@@ -93,6 +107,9 @@ filter keeps the run from also executing the other (`#[ignore]`'d) tests. Each
 test writes `bench/results/<axis>.csv` with columns
 `size,time_s,peak_bytes,n_objects`. `plot_scaling.py` needs only the standard
 library to print the summary table; `matplotlib` is required to draw the figure.
+The kernel-only `sparse_solver.csv` and `sparse_sse.csv` are retained as
+benchmark data but omitted from the figure, which covers end-to-end compiler
+scaling axes.
 The figure is drawn for the ACM `acmart` `sigconf` camera-ready format: it is
 sized to the full two-column text width (~7 in, i.e. a `figure*`), uses a
 colorblind-safe palette with distinct markers (legible in grayscale), and
@@ -114,6 +131,8 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
 | `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024,2048,4096,8192,16384` |
+| `ARGON_BENCH_SPARSE_SOLVER` | sparse solver variables | `256,512,1024,2048,4096,8192,16384` |
+| `ARGON_BENCH_SPARSE_SSE`    | sparse SSE variables | `256,512,1024,2048,4096,8192,16384` |
 | `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,64,128,256,512,1024,2048` |
 | `ARGON_BENCH_HIER_DOUBLE`   | hierarchy (2 refs)   | `4,8,16,32,64,128,256,512,1024,2048` |
 
@@ -130,10 +149,13 @@ on the current build; they are not claims about how any axis "should" scale.
 
 - **Time**: minimum wall-clock time over a few repetitions (`min` is robust to
   noise on a shared machine). Parsing/static analysis is done once per size and
-  excluded from the hierarchy timings; everything else is end-to-end `compile()`.
+  excluded from the hierarchy timings; everything else is end-to-end `compile()`,
+  except `bench_sparse_solver`, which times only `Solver::solve()`, and
+  `bench_sparse_sse`, which times the underdetermined solve plus null-space
+  extraction, after fixture construction.
 - **Memory**: a `#[global_allocator]` compiled only into the test binary
   (`bench_alloc::Tracking` in `lib.rs`) tracks live and peak heap bytes. We
-  report the peak heap *growth* during a single `compile()`.
+  report the peak heap *growth* during the timed region.
 - **Build**: release profile. Numbers below were collected on a Linux machine;
   absolute values are machine-dependent but the *scaling* is not.
 

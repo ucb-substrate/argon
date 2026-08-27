@@ -1,7 +1,15 @@
 [workspace]
 
 resolver = "2"
-members = ["crates/analyzer", "crates/arc", "crates/compiler", "crates/gui", "crates/tests"]
+members = [
+    "crates/analyzer",
+    "crates/arc",
+    "crates/argon",
+    "crates/compiler",
+    "crates/gui",
+    "crates/sparse-linear-solver",
+    "crates/tests",
+]
 
 [workspace.package]
 license = "BSD-3-Clause"

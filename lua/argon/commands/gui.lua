@@ -24,9 +24,23 @@ function M.instantiate(cell)
     end
 end
 
-function M.set(kv)
-    client.buf_request(0, "custom/set", {
-        kv = kv
+function M.reload_config()
+    client.buf_request(0, "custom/reloadConfig", nil, client.print_error)
+end
+
+function M.set_config(key, value)
+    client.buf_request(0, "custom/setConfig", {
+        key = key,
+        value = value,
+    }, client.print_error)
+end
+
+function M.save_config(path)
+    if path then
+        path = vim.fn.fnamemodify(vim.fn.expand(path), ':p')
+    end
+    client.buf_request(0, "custom/saveConfig", {
+        path = path,
     }, client.print_error)
 end
 

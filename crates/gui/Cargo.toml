@@ -3,13 +3,10 @@ name = "argone"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+autobins = false
 
 [lib]
 name = "argone"
-
-[[bin]]
-name = "argone"
-path = "src/main.rs"
 
 [dependencies]
 analyzer = { package = "argon-analyzer", path = "../analyzer" }
@@ -37,8 +34,6 @@ rgb = { version = "0.8", features = ["serde"] }
 unicode-segmentation = "1"
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-tracing-appender = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

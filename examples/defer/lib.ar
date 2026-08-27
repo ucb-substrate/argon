@@ -1,27 +1,27 @@
 let x = defer y {
-  if y > 2 {
-    1
-  } else {
-    2
-  }
+    if y > 2 {
+        1
+    } else {
+        2
+    }
 };
 dostuff(x);
 
 let s = defer y {
-  if y > 2 {
-    "hi"
-  } else {
-    "bye"
-  }
+    if y > 2 {
+        "hi"
+    } else {
+        "bye"
+    }
 };
 dostuff(s[0]);
 
 let r = defer y {
-  if y > 2 {
-    Struct(1, "hi")
-  } else {
-    Struct(2, "bye")
-  }
+    if y > 2 {
+        Struct(1, "hi")
+    } else {
+        Struct(2, "bye")
+    }
 };
 dostuff(r.0, r.1[0]);
 
@@ -30,22 +30,21 @@ dostuff(r.0, r.1[0]);
 // for all other types, defer on reference
 // partial struct construction?
 
-
 let y, z;
 let r = Rect(defer y {
-  if y == 1 { 1 } else { 2 }
+    if y == 1 { 1 } else { 2 }
 }, 2, 3, 4);
 eq(z, r.x0);
 myfn(r)
 
 fn myfn(r: Rect) {
-  eq(r.x0, 0);
+    eq(r.x0, 0);
 }
 
 // separate value id for a struct and each of its fields
 
 defer x {
-  defer y {
-    x // y
-  }
+    defer y {
+        x // y
+    }
 }

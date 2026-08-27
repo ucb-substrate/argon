@@ -138,15 +138,37 @@ mod tests {
     #[test]
     fn rejects_invalid_constructs() {
         let invalid = [
-            "let x = (a, b);",      // tuple requires a trailing comma per element
-            "let x = #old foo();",  // scope annotations are no longer syntax
-            "let x = foo(x=1, 2);", // positional after keyword
-            "let x = ;",            // missing expression
-            "let x = (a, b;",       // unterminated tuple
-            "let x = match k {};",  // empty match: `matchArms` requires >= 1 arm
+            "let x = (a, b);",                 // tuple requires a trailing comma per element
+            "let x = #old foo();",             // scope annotations are no longer syntax
+            "let x = foo(x=1, 2);",            // positional after keyword
+            "let x = ;",                       // missing expression
+            "let x = (a, b;",                  // unterminated tuple
+            "let x = match k {};",             // empty match: `matchArms` requires >= 1 arm
+            "let x = 99999999999999999999;",   // out of range for Int
+            "let x = 1 . 5;",                  // a float may not be split by trivia
+            "let x = t.99999999999999999999;", // out of range tuple index
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+    }
+
+    #[test]
+    fn unparsable_numeric_literals_are_reported() {
+        // These used to silently evaluate to 0, compiling to wrong geometry.
+        for (body, message) in [
+            (
+                "let x = 99999999999999999999;",
+                "invalid integer literal `99999999999999999999`",
+            ),
+            ("let x = 1 . 5;", "invalid float literal `1 . 5`"),
+        ] {
+            let errors = parse(&format!("cell c() {{ {body} }}"))
+                .expect_err("an unparsable literal should be rejected");
+            assert!(
+                errors.iter().any(|error| error.message == message),
+                "`{body}` should report `{message}`, got {errors:?}"
+            );
         }
     }
 

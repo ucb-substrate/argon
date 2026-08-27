@@ -3,13 +3,10 @@ name = "argon-analyzer"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
+autobins = false
 
 [lib]
 name = "analyzer"
-
-[[bin]]
-name = "argon-analyzer"
-path = "src/main.rs"
 
 [dependencies]
 argonc = { version = "0.1.0", path = "../compiler" }
@@ -33,3 +30,4 @@ tracing-appender = { workspace = true }
 homedir = "0.3"
 clap = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }

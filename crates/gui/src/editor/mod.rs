@@ -1,10 +1,10 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
     net::SocketAddr,
+    path::PathBuf,
 };
 
-use analyzer::rpc::InstancePreview;
-use analyzer::rpc::LangServerAction;
+use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
 use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
     bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
@@ -20,7 +20,7 @@ use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::{
-        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Undo,
+        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -75,6 +75,9 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub workspace_path: Option<PathBuf>,
+    pub workspace_modified: bool,
+    pub compilation_revision: Option<u64>,
     pub fatal_error: Option<SharedString>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
@@ -105,6 +108,30 @@ struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
     state: IndexMap<ScopePath, ScopeState>,
     scope_paths: IndexMap<ScopeAddress, ScopePath>,
+}
+
+fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
+    let layer = SharedString::from(layer.to_owned());
+    if let Some(layer_info) = state.layers.get_mut(&layer) {
+        layer_info.used = true;
+    } else {
+        let mut hasher = DefaultHasher::new();
+        layer.hash(&mut hasher);
+        let hash = hasher.finish() as usize;
+        let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+        state.layers.insert(
+            layer.clone(),
+            LayerState {
+                name: layer,
+                color,
+                fill: ShapeFill::Stippling,
+                border_color: color,
+                visible: true,
+                used: true,
+                z: state.layers.len(),
+            },
+        );
+    }
 }
 
 impl EditorState {
@@ -138,33 +165,37 @@ impl EditorState {
                 SolvedValue::Rect(rect) => {
                     bbox = bbox_union(bbox, Some(rect.to_float()));
                     if let Some(layer) = &rect.layer {
-                        let layer = SharedString::from(layer);
-                        if let Some(layer_info) = state.layers.get_mut(&layer) {
-                            layer_info.used = true;
-                        } else {
-                            let mut s = DefaultHasher::new();
-                            layer.hash(&mut s);
-                            let hash = s.finish() as usize;
-                            let color =
-                                rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-                            state.layers.insert(
-                                layer.clone(),
-                                LayerState {
-                                    name: layer,
-                                    color,
-                                    fill: ShapeFill::Stippling,
-                                    border_color: color,
-                                    visible: true,
-                                    used: true,
-                                    z: state.layers.len(),
-                                },
-                            );
-                        }
+                        mark_layer_used(state, layer);
                     }
                 }
                 SolvedValue::Polygon(polygon) => {
                     bbox = bbox_union(bbox, polygon.bbox());
                     let layer = SharedString::from(&polygon.layer);
+                    if let Some(layer_info) = state.layers.get_mut(&layer) {
+                        layer_info.used = true;
+                    } else {
+                        let mut s = DefaultHasher::new();
+                        layer.hash(&mut s);
+                        let hash = s.finish() as usize;
+                        let color =
+                            rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+                        state.layers.insert(
+                            layer.clone(),
+                            LayerState {
+                                name: layer,
+                                color,
+                                fill: ShapeFill::Stippling,
+                                border_color: color,
+                                visible: true,
+                                used: true,
+                                z: state.layers.len(),
+                            },
+                        );
+                    }
+                }
+                SolvedValue::Path(path) => {
+                    bbox = bbox_union(bbox, path.bbox());
+                    let layer = SharedString::from(&path.layer);
                     if let Some(layer_info) = state.layers.get_mut(&layer) {
                         layer_info.used = true;
                     } else {
@@ -224,6 +255,7 @@ impl EditorState {
                 }
                 SolvedValue::Text(t) => {
                     bbox = bbox_text_union(bbox, t);
+                    mark_layer_used(state, &t.layer);
                 }
             }
         }
@@ -370,6 +402,9 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                workspace_path: None,
+                workspace_modified: false,
+                compilation_revision: None,
                 fatal_error: None,
                 connection_error: None,
                 solved_cell,
@@ -422,43 +457,74 @@ impl Editor {
         editor
     }
 
-    pub fn open_cell(&self, cx: &mut App, output: CompileOutput, update: bool) {
+    fn apply_snapshot(&self, cx: &mut App, snapshot: CompilationSnapshot) -> bool {
+        if self
+            .state
+            .read(cx)
+            .compilation_revision
+            .is_some_and(|revision| snapshot.revision < revision)
+        {
+            return false;
+        }
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
-            state.update(cx, output);
+            state.compilation_revision = Some(snapshot.revision);
+            state.update(cx, snapshot.output);
             cx.notify();
         });
         self.canvas
             .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
-        if update {
-            let state = self.state.clone();
-            self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
-                let scope_paths: IndexSet<_> = state
-                    .read(cx)
-                    .solved_cell
-                    .read(cx)
-                    .as_ref()
-                    .map(|cell| cell.state.keys().cloned().collect())
-                    .unwrap_or_default();
-                sidebar.state.update(cx, |state, _cx| {
-                    state
-                        .expanded_scopes
-                        .retain(|path| scope_paths.contains(path));
-                });
-                cx.notify();
-            });
-        } else {
-            self.canvas.update(cx, |canvas, cx| {
-                canvas.fit_to_screen(cx);
-                cx.notify();
-            });
-            self.hierarchy_sidebar.update(cx, |sidebar, cx| {
-                sidebar.state.update(cx, |state, cx| {
-                    state.expanded_scopes.clear();
-                    cx.notify();
-                });
-            });
+        true
+    }
+
+    pub fn fit_to_screen(&self, cx: &mut App) {
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.fit_to_screen(cx);
+            cx.notify();
+        });
+    }
+
+    pub fn update_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
+        if self.canvas.read(cx).is_sse_dragging() {
+            self.canvas
+                .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
+            return;
         }
+        if !self.canvas.read(cx).accepts_snapshot(&snapshot) || !self.apply_snapshot(cx, snapshot) {
+            return;
+        }
+        let state = self.state.clone();
+        self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
+            let scope_paths: IndexSet<_> = state
+                .read(cx)
+                .solved_cell
+                .read(cx)
+                .as_ref()
+                .map(|cell| cell.state.keys().cloned().collect())
+                .unwrap_or_default();
+            sidebar.state.update(cx, |state, _cx| {
+                state
+                    .expanded_scopes
+                    .retain(|path| scope_paths.contains(path));
+            });
+            cx.notify();
+        });
+    }
+
+    pub fn set_workspace_modified(&self, cx: &mut App, modified: bool) {
+        self.state.update(cx, |state, cx| {
+            state.workspace_modified = modified;
+            cx.notify();
+        });
+        self.title_bar.update(cx, |_, cx| cx.notify());
+    }
+
+    pub fn set_workspace_path(&self, cx: &mut App, path: Option<PathBuf>) {
+        self.state.update(cx, |state, cx| {
+            state.workspace_path = path;
+            cx.notify();
+        });
+        self.title_bar.update(cx, |_, cx| cx.notify());
     }
 
     pub fn place_instance(&self, cx: &mut App, preview: InstancePreview) {
@@ -494,12 +560,29 @@ impl Editor {
         cx.notify();
     }
 
+    fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let deferred = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_snapshot());
+        if let Some(snapshot) = deferred {
+            self.update_cell(cx, snapshot);
+        }
+    }
+
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
         let _ = self
             .state
             .read(cx)
             .lang_server_client
             .dispatch_action(LangServerAction::Undo);
+    }
+
+    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+        let _ = self
+            .state
+            .read(cx)
+            .lang_server_client
+            .dispatch_action(LangServerAction::Save);
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
@@ -547,12 +630,14 @@ impl Editor {
     }
 
     fn open_invoking_command(&mut self, command: Option<&str>, cx: &mut Context<Self>) {
+        // Neovim may be blocked at a hit-enter or error prompt. Focus it
+        // before queuing the notification so the user can clear that prompt.
+        self.focus_invoker(cx);
         let _ = self
             .state
             .read(cx)
             .lang_server_client
             .open_command_bar(command.map(str::to_owned));
-        self.focus_invoker(cx);
     }
 
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
@@ -576,6 +661,7 @@ impl Render for Editor {
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
+            .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))
@@ -595,6 +681,7 @@ impl Render for Editor {
             .overflow_hidden()
             .whitespace_nowrap()
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
             .child(self.title_bar.clone())
             .child(self.tool_bar.clone())
             .child(

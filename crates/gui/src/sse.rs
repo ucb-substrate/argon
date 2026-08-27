@@ -36,6 +36,18 @@ pub(crate) fn remove_component(u: &SparseVec, vecs: &[SparseVec]) -> SparseVec {
     out
 }
 
+/// Projects `u` onto an orthonormal basis directly.
+pub(crate) fn component_in_basis(u: &SparseVec, vecs: &[SparseVec]) -> SparseVec {
+    let mut out = SparseVec(IndexMap::new());
+    for vector in vecs {
+        let weight = dot(u, vector);
+        for (var, coefficient) in vector.iter() {
+            *out.entry(*var).or_default() += weight * coefficient;
+        }
+    }
+    out
+}
+
 pub(crate) fn dot(a: &SparseVec, b: &SparseVec) -> f64 {
     a.iter()
         .map(|(var, &c)| c * *b.get(var).unwrap_or(&0.))
@@ -114,6 +126,39 @@ pub(crate) fn drag_delta_multi(
         .iter()
         .map(|edge| remove_component(edge, rowspace))
         .collect::<Vec<_>>();
+    combine_drag(&edges, &residuals, deltas)
+}
+
+/// Variant used when the compiler supplied the null-space basis directly from
+/// sparse QR, avoiding the dense-SVD row-space representation entirely.
+pub(crate) fn drag_delta_multi_nullspace(
+    edges: &[SparseVec],
+    nullspace: &[SparseVec],
+    unsolved: &IndexSet<Var>,
+    deltas: &[f64],
+) -> Option<SparseVec> {
+    if edges.is_empty() || edges.len() != deltas.len() {
+        return None;
+    }
+    let edges = edges
+        .iter()
+        .map(|edge| {
+            SparseVec(
+                edge.iter()
+                    .filter(|(var, _)| unsolved.contains(*var))
+                    .map(|(var, coeff)| (*var, *coeff))
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let residuals = edges
+        .iter()
+        .map(|edge| component_in_basis(edge, nullspace))
+        .collect::<Vec<_>>();
+    combine_drag(&edges, &residuals, deltas)
+}
+
+fn combine_drag(edges: &[SparseVec], residuals: &[SparseVec], deltas: &[f64]) -> Option<SparseVec> {
     let gram = edges
         .iter()
         .map(|edge| {
@@ -218,10 +263,7 @@ pub(crate) fn initial_condition_after_drag(constraint: &LinearExpr, dv: &SparseV
 /// snapped to the solver's 0.1 grid so the written code stays clean and matches
 /// what recompilation produces.
 pub(crate) fn format_value(v: f64) -> String {
-    // `+ 0.0` collapses a possible `-0.0` to `0.0`.
-    let snapped = (v * 10.0).round() / 10.0 + 0.0;
-    let s = format!("{snapped}");
-    if s.contains('.') { s } else { format!("{s}.") }
+    argonc::compile::format_initial_condition(v)
 }
 
 #[cfg(test)]
@@ -455,6 +497,20 @@ mod tests {
         let r = remove_component(&u, &[basis]);
         assert_relative_eq!(*r.get(&x).unwrap(), 0.5, epsilon = 1e-9);
         assert_relative_eq!(*r.get(&y).unwrap(), -0.5, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn direct_nullspace_basis_produces_the_same_drag() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+        let s = 1. / 2f64.sqrt();
+        let nullspace = vec![SparseVec([(x, s), (y, -s)].into_iter().collect())];
+        let unsolved = IndexSet::from([x, y]);
+
+        let delta = drag_delta_multi_nullspace(&[coeff(x)], &nullspace, &unsolved, &[2.]).unwrap();
+        assert_relative_eq!(*delta.get(&x).unwrap(), 2., epsilon = 1e-9);
+        assert_relative_eq!(*delta.get(&y).unwrap(), -2., epsilon = 1e-9);
     }
 
     #[test]

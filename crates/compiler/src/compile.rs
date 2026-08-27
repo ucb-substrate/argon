@@ -4,7 +4,7 @@
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use arcstr::Substr;
@@ -29,8 +29,9 @@ use crate::ast::{
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::layer::LayerProperties;
-use crate::parse::{ParseOutput, WorkspaceParseAst};
+use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
+use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -40,7 +41,7 @@ use crate::{
     solver::{LinearExpr, Solver},
 };
 
-pub const BUILTINS: [&str; 14] = [
+pub const BUILTINS: [&str; 15] = [
     "list",
     "cons",
     "head",
@@ -49,6 +50,7 @@ pub const BUILTINS: [&str; 14] = [
     "crect",
     "rect",
     "polygon",
+    "path",
     "text",
     "float",
     "eq",
@@ -94,6 +96,7 @@ pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
     }
 }
 
+#[derive(Clone)]
 pub struct StaticAnalysis {
     /// Parsed source AST used for source-aware tooling.
     pub ast: WorkspaceParseAst,
@@ -103,20 +106,50 @@ pub struct StaticAnalysis {
     pub errors: Vec<StaticError>,
 }
 
-pub fn dynamic_compile(
+/// Executes a cell using workspace-wide external inputs from `config`.
+pub fn execute_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
-    dynamic_compile_with_gds(ast, input, &[])
+    let Some(lyp_file) = config.lyp.as_deref() else {
+        return missing_lyp_output();
+    };
+    check_output_layers(
+        ExecPass::new(ast, lyp_file, &config.gds_imports).execute(input),
+        lyp_file,
+    )
 }
 
-pub fn dynamic_compile_with_gds(
+/// Executes a cell invocation spliced into `ast` by
+/// [`crate::parse::add_cell_invocation`]. Its arguments are evaluated by the
+/// ordinary expression evaluator, so they may be any expression.
+pub fn execute_cell_invocation(
     ast: &WorkspaceAst<VarIdTyMetadata>,
-    input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
-    let lyp_file = input.lyp_file;
-    let res = ExecPass::new(ast, lyp_file, gds_imports).execute(input);
+    let Some(lyp_file) = config.lyp.as_deref() else {
+        return missing_lyp_output();
+    };
+    check_output_layers(
+        ExecPass::new(ast, lyp_file, &config.gds_imports).execute_invocation(invocation),
+        lyp_file,
+    )
+}
+
+fn missing_lyp_output() -> CompileOutput {
+    CompileOutput::ExecErrors(ExecErrorCompileOutput {
+        errors: vec![ExecError {
+            span: None,
+            cell: 0,
+            kind: ExecErrorKind::MissingLyp,
+        }],
+        output: None,
+    })
+}
+
+fn check_output_layers(res: CompileOutput, lyp_file: &FsPath) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -139,14 +172,10 @@ pub fn dynamic_compile_with_gds(
     }
 }
 
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-    compile_with_gds(ast, input, &[])
-}
-
-pub fn compile_with_gds(
+pub fn compile(
     ast: &WorkspaceParseAst,
     input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
     let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
         static_output
@@ -157,7 +186,7 @@ pub fn compile_with_gds(
         return CompileOutput::StaticErrors(static_output);
     };
 
-    dynamic_compile_with_gds(&ast, input, gds_imports)
+    execute_cell(&ast, input, config)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -588,29 +617,59 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, lyp_file: &Path, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
     for layer in data.layers.layers.iter() {
         layers.insert(layer.name.clone());
     }
     for (cell_id, cell) in data.cells.iter() {
         for (_, obj) in cell.objects.iter() {
-            let (layer, span) = match obj {
-                SolvedValue::Rect(r) => (r.layer.as_ref(), r.span.clone()),
-                SolvedValue::Polygon(p) => (Some(&p.layer), p.span.clone()),
-                _ => continue,
-            };
-            if let Some(layer) = layer
-                && !layers.contains(layer)
-            {
-                errs.push(ExecError {
-                    span,
-                    cell: *cell_id,
-                    kind: ExecErrorKind::IllegalLayer {
-                        layer: layer.clone(),
-                        lyp: lyp_file.display().to_string(),
-                    },
-                })
+            match obj {
+                SolvedValue::Rect(r) => {
+                    if let Some(layer) = &r.layer
+                        && !layers.contains(layer)
+                    {
+                        errs.push(ExecError {
+                            span: r.span.clone(),
+                            cell: *cell_id,
+                            kind: ExecErrorKind::IllegalLayer {
+                                layer: layer.clone(),
+                                lyp: lyp_file.display().to_string(),
+                            },
+                        });
+                    }
+                }
+                SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+                    errs.push(ExecError {
+                        span: polygon.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalLayer {
+                            layer: polygon.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                SolvedValue::Path(path) if !layers.contains(&path.layer) => {
+                    errs.push(ExecError {
+                        span: path.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalLayer {
+                            layer: path.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                SolvedValue::Text(text) if !layers.contains(&text.layer) => {
+                    errs.push(ExecError {
+                        span: text.span.clone(),
+                        cell: *cell_id,
+                        kind: ExecErrorKind::IllegalTextLayer {
+                            layer: text.layer.clone(),
+                            lyp: lyp_file.display().to_string(),
+                        },
+                    });
+                }
+                _ => {}
             }
         }
     }
@@ -721,6 +780,7 @@ pub enum Ty {
     Int,
     Rect,
     Polygon,
+    Path,
     Point,
     String,
     Cell(Arc<CellTy>),
@@ -777,6 +837,7 @@ impl Ty {
             "Float" => Some(Ty::Float),
             "Rect" => Some(Ty::Rect),
             "Polygon" => Some(Ty::Polygon),
+            "Path" => Some(Ty::Path),
             "Point" => Some(Ty::Point),
             "Any" => Some(Ty::Any),
             "String" => Some(Ty::String),
@@ -1134,6 +1195,13 @@ impl<'a> VarIdTyPass<'a> {
 
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
         if *a == Ty::Any || *b == Ty::Any {
+            return true;
+        }
+
+        // An empty sequence belongs to every sequence type, as `Ty::lub` and the
+        // `cons` tail check already assume. The runtime check in
+        // `CellArg::matches_ty` still enforces emptiness where `[]` is declared.
+        if matches!((a, b), (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil)) {
             return true;
         }
 
@@ -1786,6 +1854,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
                 _ => self.no_field_on_ty(field, Ty::Polygon),
             },
+            Ty::Path => match field.name.as_str() {
+                "points" => Ty::Seq(Box::new(Ty::Point)),
+                "layer" => Ty::String,
+                "width" | "begin_extension" | "end_extension" => Ty::Float,
+                name if polygon_coordinate(name).is_some_and(|coordinate| !coordinate.initial) => {
+                    Ty::Float
+                }
+                _ => self.no_field_on_ty(field, Ty::Path),
+            },
             Ty::Point => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
@@ -1922,6 +1999,34 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         .collect();
                     self.typecheck_kwargs(&args.kwargs, kwarg_defs);
                     (None, Ty::Polygon)
+                }
+                "path" => {
+                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
+                    if let Some(layer) = args.posargs.first() {
+                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
+                    }
+                    if let Some(points) = args.posargs.get(1) {
+                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
+                    }
+                    let kwarg_defs = args
+                        .kwargs
+                        .iter()
+                        .filter_map(|kwarg| {
+                            let name = kwarg.name.name.as_str();
+                            (matches!(
+                                name,
+                                "width"
+                                    | "widthi"
+                                    | "begin_extension"
+                                    | "begin_extensioni"
+                                    | "end_extension"
+                                    | "end_extensioni"
+                            ) || polygon_coordinate(name).is_some())
+                            .then_some((name, Ty::Float))
+                        })
+                        .collect();
+                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    (None, Ty::Path)
                 }
                 "text" => {
                     // text, layer, x, y
@@ -2276,28 +2381,21 @@ pub enum CellArg {
     Float(f64),
     Int(i64),
     Bool(bool),
+    String(String),
+    /// An enum variant, identified by name like [`Value::EnumValue`].
+    Enum(String),
     Seq(Vec<CellArg>),
 }
 
 impl CellArg {
-    /// Converts a literal expression accepted at a compiler entry point into
-    /// its runtime representation.
-    pub fn from_literal(expr: &Expr<&str, ParseMetadata>) -> Option<Self> {
-        match expr {
-            Expr::FloatLiteral(value) => Some(Self::Float(value.value)),
-            Expr::IntLiteral(value) => Some(Self::Int(value.value)),
-            Expr::BoolLiteral(value) => Some(Self::Bool(value.value)),
-            Expr::SeqNil(_) => Some(Self::Seq(Vec::new())),
-            _ => None,
-        }
-    }
-
     fn matches_ty(&self, ty: &Ty) -> bool {
         match (self, ty) {
             (_, Ty::Any) => true,
-            (Self::Float(_), Ty::Float) | (Self::Int(_), Ty::Int) | (Self::Bool(_), Ty::Bool) => {
-                true
-            }
+            (Self::Float(_), Ty::Float)
+            | (Self::Int(_), Ty::Int)
+            | (Self::Bool(_), Ty::Bool)
+            | (Self::String(_), Ty::String) => true,
+            (Self::Enum(variant), Ty::Enum(ty)) => ty.variants.contains(variant),
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner))
             }
@@ -2311,6 +2409,8 @@ impl CellArg {
             Self::Float(_) => "Float",
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
+            Self::String(_) => "String",
+            Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
         }
     }
@@ -2328,6 +2428,8 @@ enum CellArgKey {
     Float(u64),
     Int(i64),
     Bool(bool),
+    String(String),
+    Enum(String),
     Seq(Vec<CellArgKey>),
 }
 
@@ -2337,6 +2439,8 @@ impl From<&CellArg> for CellArgKey {
             CellArg::Float(f) => Self::Float(f.to_bits()),
             CellArg::Int(i) => Self::Int(*i),
             CellArg::Bool(b) => Self::Bool(*b),
+            CellArg::String(s) => Self::String(s.clone()),
+            CellArg::Enum(v) => Self::Enum(v.clone()),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
         }
     }
@@ -2347,7 +2451,6 @@ pub struct CompileInput<'a> {
     /// Full path to cell.
     pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
-    pub lyp_file: &'a Path,
 }
 
 pub type VarId = u64;
@@ -2366,6 +2469,35 @@ pub struct BasicRect<T> {
     pub x1: T,
     pub y1: T,
     pub construction: bool,
+}
+
+/// Formats a GUI-created layout coordinate as an Argon float literal.
+///
+/// Coordinates are snapped to the solver's 0.1 grid, use at most one decimal
+/// place, and always contain a decimal point so they continue to parse as
+/// floats rather than integers.
+pub fn format_initial_condition(value: f64) -> String {
+    // Adding positive zero normalizes a rounded `-0.0` to `0.0`.
+    let snapped = (value * 10.0).round() / 10.0 + 0.0;
+    let value = format!("{snapped}");
+    if value.contains('.') {
+        value
+    } else {
+        format!("{value}.")
+    }
+}
+
+#[cfg(test)]
+mod initial_condition_format_tests {
+    use super::format_initial_condition;
+
+    #[test]
+    fn limits_gui_coordinates_to_one_decimal_place() {
+        assert_eq!(format_initial_condition(12.345678), "12.3");
+        assert_eq!(format_initial_condition(12.0), "12.");
+        assert_eq!(format_initial_condition(-0.04), "0.");
+        assert_eq!(format_initial_condition(1.2000000476837158), "1.2");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2390,6 +2522,21 @@ pub struct Polygon<T> {
     pub layer: String,
     pub id: ObjectId,
     pub points: Vec<(T, T)>,
+    pub span: Option<Span>,
+}
+
+/// A constant-width GDS-style path whose centerline coordinates are
+/// independent solver values.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Path<T> {
+    pub layer: String,
+    pub id: ObjectId,
+    pub width: T,
+    pub points: Vec<(T, T)>,
+    /// Distance by which the path extends before and after its centerline.
+    /// These retain the geometry of imported GDS path types 0, 2, and 4.
+    pub begin_extension: T,
+    pub end_extension: T,
     pub span: Option<Span>,
 }
 
@@ -2428,6 +2575,14 @@ pub struct SeqNum(u64);
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ObjectId(u64);
+
+impl ObjectId {
+    /// Monotonic allocation order used to preserve source creation order in
+    /// consumers that flatten objects for display.
+    pub fn creation_order(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 pub struct ScopeId(u64);
@@ -2527,7 +2682,7 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
-    rowspace_vecs: Vec<Vec<(f64, Var)>>,
+    sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
@@ -2535,7 +2690,7 @@ struct CellState {
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    lyp_file: &'a Path,
+    lyp_file: &'a FsPath,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
@@ -2554,6 +2709,12 @@ struct ExecPass<'a> {
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    /// Cell declaration generated for a compiler entry point's invocation, and
+    /// the cell it executed as. A call made directly by that cell is the
+    /// top-level invocation rather than a nested instantiation, so it is named
+    /// as if it were the entry point.
+    entry_cell_var: Option<VarId>,
+    entry_cell: Option<CellId>,
     errors: Vec<ExecError>,
 }
 
@@ -2584,7 +2745,7 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 impl<'a> ExecPass<'a> {
     pub(crate) fn new(
         ast: &'a WorkspaceAst<VarIdTyMetadata>,
-        lyp_file: &'a Path,
+        lyp_file: &'a FsPath,
         gds_imports: &[(String, PathBuf)],
     ) -> Self {
         let gds_imports = gds_imports
@@ -2636,6 +2797,8 @@ impl<'a> ExecPass<'a> {
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
             compiled_cell_cache: HashMap::new(),
+            entry_cell_var: None,
+            entry_cell: None,
             errors: Vec::new(),
         }
     }
@@ -2712,36 +2875,7 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = match crate::layer::read_lyp(input.lyp_file) {
-                Ok(layers) => layers,
-                Err(error) => {
-                    return CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                        errors: vec![StaticError {
-                            span: Span {
-                                path: self.ast[&vec![]].path.clone(),
-                                span: cfgrammar::Span::new(0, 0),
-                            },
-                            kind: StaticErrorKind::InvalidLyp(error.to_string()),
-                        }],
-                    });
-                }
-            };
-            if self.errors.is_empty() {
-                CompileOutput::Valid(CompiledData {
-                    cells: self.compiled_cells,
-                    top: cell_id,
-                    layers,
-                })
-            } else {
-                CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                    errors: self.errors,
-                    output: Some(CompiledData {
-                        cells: self.compiled_cells,
-                        top: cell_id,
-                        layers,
-                    }),
-                })
-            }
+            self.finish(cell_id)
         } else {
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
@@ -2750,6 +2884,121 @@ impl<'a> ExecPass<'a> {
                     kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
                 }],
                 output: None,
+            })
+        }
+    }
+
+    /// Executes a cell invocation spliced into the root module by
+    /// [`crate::parse::add_cell_invocation`]. The generated entry cell binds
+    /// the invocation, so evaluating it runs the invocation through the
+    /// ordinary expression evaluator; the cell it produced becomes the top.
+    pub(crate) fn execute_invocation(mut self, invocation: &CellInvocation) -> CompileOutput {
+        self.declare_globals();
+        let ast = self.ast;
+        let root = &ast[&ModPath::new()];
+        let entry = root
+            .ast
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Cell(cell) if cell.name.name == invocation.entry_cell => Some(cell),
+                _ => None,
+            })
+            .expect("generated entry cell should be declared");
+        let value = entry
+            .scope
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                Statement::LetBinding(binding) if binding.name.name == invocation.binding => {
+                    Some(&binding.value)
+                }
+                _ => None,
+            })
+            .expect("generated entry cell should bind the invocation");
+        // Reject a non-cell invocation statically, so the error lands on what
+        // the caller wrote rather than surfacing from the executor.
+        let ty = value.ty();
+        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+            return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                errors: vec![StaticError {
+                    span: Span {
+                        path: root.path.clone(),
+                        span: value.span(),
+                    },
+                    kind: StaticErrorKind::IncorrectTyCategory {
+                        found: ty,
+                        expected: "Cell".into(),
+                    },
+                }],
+            });
+        }
+
+        self.entry_cell_var = Some(entry.metadata.1);
+        let Ok(entry_id) = self.execute_cell(entry.metadata.1, Vec::new(), None) else {
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: None,
+            });
+        };
+        // Arguments are evaluated inside the generated cell, so an unsolvable
+        // system there means an argument did not reduce to a constant.
+        for error in &mut self.errors {
+            if error.cell == entry_id
+                && matches!(
+                    error.kind,
+                    ExecErrorKind::Underconstrained | ExecErrorKind::InconsistentConstraint(_)
+                )
+            {
+                error.kind = ExecErrorKind::UnevaluatedCellArgument;
+                error.span = Some(invocation.span());
+            }
+        }
+        let value_id = self.cell_states[&entry_id].fields[&invocation.binding];
+        let Some(DeferValue::Ready(Value::Cell(top))) = self.values.get(&value_id) else {
+            self.errors.push(ExecError {
+                span: Some(invocation.span()),
+                cell: entry_id,
+                kind: ExecErrorKind::NotACell,
+            });
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: None,
+            });
+        };
+        let top = *top;
+        // The entry cell is an implementation detail of the invocation.
+        self.compiled_cells.shift_remove(&entry_id);
+        self.finish(top)
+    }
+
+    /// Packages the executed cells into a compile output rooted at `top`.
+    fn finish(self, top: CellId) -> CompileOutput {
+        let layers = match crate::layer::read_lyp(self.lyp_file) {
+            Ok(layers) => layers,
+            Err(error) => {
+                return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                    errors: vec![StaticError {
+                        span: Span {
+                            path: self.ast[&ModPath::new()].path.clone(),
+                            span: cfgrammar::Span::new(0, 0),
+                        },
+                        kind: StaticErrorKind::InvalidLyp(error.to_string()),
+                    }],
+                });
+            }
+        };
+        let data = CompiledData {
+            cells: self.compiled_cells,
+            top,
+            layers,
+        };
+        if self.errors.is_empty() {
+            CompileOutput::Valid(data)
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: Some(data),
             })
         }
     }
@@ -2836,6 +3085,9 @@ impl<'a> ExecPass<'a> {
         };
 
         let cell_id = self.alloc_id();
+        if self.entry_cell_var == Some(cell) {
+            self.entry_cell = Some(cell_id);
+        }
         self.partial_cells.push_back(cell_id);
         assert!(
             self.cell_states
@@ -2851,7 +3103,7 @@ impl<'a> ExecPass<'a> {
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
-                        rowspace_vecs: Vec::new(),
+                        sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
@@ -2940,7 +3192,10 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
                     state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
-                    state.rowspace_vecs = state.solver.rowspace_vecs();
+                    state.sse_basis = match state.solver.sparse_nullspace_vecs() {
+                        Some(vectors) => SseBasis::Nullspace(vectors),
+                        None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+                    };
                     self.errors.push(ExecError {
                         span: None,
                         cell: cell_id,
@@ -3018,7 +3273,7 @@ impl<'a> ExecPass<'a> {
     fn execute_gds_cell(
         &mut self,
         declared_name: &str,
-        path: &Path,
+        path: &FsPath,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
         let imported = match import_gds(path, declared_name, self.lyp_file) {
@@ -3103,6 +3358,28 @@ impl<'a> ExecPass<'a> {
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_polygon_{element_index}"))),
                     ),
+                    ImportedGdsElement::Path {
+                        layer,
+                        name,
+                        width,
+                        points,
+                        begin_extension,
+                        end_extension,
+                    } => (
+                        SolvedValue::Path(Path {
+                            id,
+                            layer,
+                            width: (width, LinearExpr::from(width)),
+                            points: points
+                                .into_iter()
+                                .map(|(x, y)| ((x, LinearExpr::from(x)), (y, LinearExpr::from(y))))
+                                .collect(),
+                            begin_extension: (begin_extension, LinearExpr::from(begin_extension)),
+                            end_extension: (end_extension, LinearExpr::from(end_extension)),
+                            span: None,
+                        }),
+                        Some(name.unwrap_or_else(|| format!("gds_path_{element_index}"))),
+                    ),
                     ImportedGdsElement::Text { layer, text, x, y } => (
                         SolvedValue::Text(Text {
                             id,
@@ -3176,7 +3453,7 @@ impl<'a> ExecPass<'a> {
                     scopes,
                     root,
                     fields,
-                    rowspace_vecs: Vec::new(),
+                    sse_basis: SseBasis::Nullspace(Vec::new()),
                     objects,
                     fallback_constraints_used: Vec::new(),
                     unsolved_vars: IndexSet::new(),
@@ -3253,6 +3530,48 @@ impl<'a> ExecPass<'a> {
                         })
                         .collect(),
                     span: polygon.span.clone(),
+                }),
+                Object::Path(path) => SolvedValue::Path(Path {
+                    id: path.id,
+                    layer: path.layer.clone(),
+                    width: (
+                        state
+                            .solver
+                            .eval_expr(&path.width)
+                            .expect("path width not solved"),
+                        path.width.clone(),
+                    ),
+                    points: path
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            (
+                                (
+                                    state.solver.eval_expr(x).expect("path x not solved"),
+                                    x.clone(),
+                                ),
+                                (
+                                    state.solver.eval_expr(y).expect("path y not solved"),
+                                    y.clone(),
+                                ),
+                            )
+                        })
+                        .collect(),
+                    begin_extension: (
+                        state
+                            .solver
+                            .eval_expr(&path.begin_extension)
+                            .expect("path begin extension not solved"),
+                        path.begin_extension.clone(),
+                    ),
+                    end_extension: (
+                        state
+                            .solver
+                            .eval_expr(&path.end_extension)
+                            .expect("path end extension not solved"),
+                        path.end_extension.clone(),
+                    ),
+                    span: path.span.clone(),
                 }),
                 Object::Text(text) => SolvedValue::Text(Text {
                     id: text.id,
@@ -3338,7 +3657,7 @@ impl<'a> ExecPass<'a> {
             scopes: IndexMap::new(),
             root: state.root_scope,
             fields: IndexMap::new(),
-            rowspace_vecs: state.rowspace_vecs.clone(),
+            sse_basis: state.sse_basis.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
             inconsistent_constraints: state.solver.inconsistent_constraints().clone(),
@@ -3844,13 +4163,17 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
+    /// Converts an evaluated value into a cell argument. `Ok(None)` means the
+    /// value depends on solver variables that are not resolved yet, so the
+    /// conversion should be retried; `Err` means the value can never be passed
+    /// to a cell and an error has been recorded.
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
         dependent_vid: ValueId,
         val: &Value,
-    ) -> Option<CellArg> {
-        match val {
+    ) -> Result<Option<CellArg>, ()> {
+        Ok(match val {
             Value::Linear(v) => {
                 if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr(v) {
                     Some(CellArg::Float(f))
@@ -3863,13 +4186,28 @@ impl<'a> ExecPass<'a> {
             }
             Value::Int(i) => Some(CellArg::Int(*i)),
             Value::Bool(b) => Some(CellArg::Bool(*b)),
-            Value::Seq(s) => s
-                .iter()
-                .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
-                .collect::<Option<Vec<_>>>()
-                .map(CellArg::Seq),
-            v => unreachable!("invalid cell arg {v:?}"),
-        }
+            Value::String(s) => Some(CellArg::String(s.clone())),
+            Value::EnumValue(v) => Some(CellArg::Enum(v.clone())),
+            Value::SeqNil => Some(CellArg::Seq(Vec::new())),
+            Value::Seq(s) => {
+                let mut args = Vec::with_capacity(s.len());
+                for v in s.iter() {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => args.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Seq(args))
+            }
+            v => {
+                self.errors.push(ExecError {
+                    span: None,
+                    cell: cell_id,
+                    kind: ExecErrorKind::UnsupportedCellArgument(v.kind_name().to_owned()),
+                });
+                return Err(());
+            }
+        })
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -4147,6 +4485,167 @@ impl<'a> ExecPass<'a> {
                                             ),
                                         },
                                     ),
+                                })
+                            });
+                        }
+                        true
+                    } else {
+                        for arg in &c.state.posargs {
+                            if !self.values[arg].is_ready() {
+                                self.add_value_dependent(*arg, vid);
+                            }
+                        }
+                        false
+                    }
+                }
+                "path" => {
+                    if let (Defer::Ready(layer), Defer::Ready(point_spec)) = (
+                        &self.values[&c.state.posargs[0]],
+                        &self.values[&c.state.posargs[1]],
+                    ) {
+                        let layer = layer.as_ref().unwrap_string().clone();
+                        let count = match point_spec.as_ref() {
+                            ValueRef::Int(count) => usize::try_from(*count).ok(),
+                            _ => {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, c.expr.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidType,
+                                });
+                                return Err(());
+                            }
+                        };
+                        let Some(count) = count.filter(|count| *count >= 2) else {
+                            self.errors.push(ExecError {
+                                span: Some(self.span(&vref.loc, c.expr.span)),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidPath,
+                            });
+                            return Err(());
+                        };
+                        for kwarg in &c.expr.args.kwargs {
+                            let name = kwarg.name.name.as_str();
+                            if let Some(coordinate) = polygon_coordinate(name)
+                                && coordinate.index >= count
+                            {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, kwarg.name.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::IndexOutOfBounds,
+                                });
+                                return Err(());
+                            }
+                        }
+
+                        let id = self.object_id();
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let has_begin_extension = c.expr.args.kwargs.iter().any(|kwarg| {
+                            matches!(
+                                kwarg.name.name.as_str(),
+                                "begin_extension" | "begin_extensioni"
+                            )
+                        });
+                        let has_end_extension = c.expr.args.kwargs.iter().any(|kwarg| {
+                            matches!(kwarg.name.name.as_str(), "end_extension" | "end_extensioni")
+                        });
+                        let state = self.cell_state_mut(cell_id);
+                        let width = state.solver.new_var().into();
+                        let begin_extension = if has_begin_extension {
+                            state.solver.new_var().into()
+                        } else {
+                            LinearExpr::from(0.)
+                        };
+                        let end_extension = if has_end_extension {
+                            state.solver.new_var().into()
+                        } else {
+                            LinearExpr::from(0.)
+                        };
+                        let points = (0..count)
+                            .map(|_| (state.solver.new_var().into(), state.solver.new_var().into()))
+                            .collect();
+                        let path = Path {
+                            id,
+                            layer,
+                            width,
+                            points,
+                            begin_extension,
+                            end_extension,
+                            span: Some(span.clone()),
+                        };
+                        state.objects.insert(id, path.clone().into());
+                        state.emit.push(Emit {
+                            scope: vref.loc.scope,
+                            value: vid,
+                            span,
+                        });
+                        self.values
+                            .insert(vid, Defer::Ready(Value::Path(path.clone())));
+                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
+                            let name = kwarg.name.name.as_str();
+                            let (expr, fallback, priority, initial_condition) = match name {
+                                "width" | "widthi" => (
+                                    path.width.clone(),
+                                    name == "widthi",
+                                    i32::MAX,
+                                    (name == "widthi")
+                                        .then_some(RectInitialCondition::PathWidth(path.id)),
+                                ),
+                                "begin_extension" | "begin_extensioni" => (
+                                    path.begin_extension.clone(),
+                                    name == "begin_extensioni",
+                                    i32::MAX - 1,
+                                    (name == "begin_extensioni").then_some(
+                                        RectInitialCondition::PathBeginExtension(path.id),
+                                    ),
+                                ),
+                                "end_extension" | "end_extensioni" => (
+                                    path.end_extension.clone(),
+                                    name == "end_extensioni",
+                                    i32::MAX - 2,
+                                    (name == "end_extensioni")
+                                        .then_some(RectInitialCondition::PathEndExtension(path.id)),
+                                ),
+                                _ => {
+                                    let coordinate = polygon_coordinate(name)
+                                        .expect("path kwargs were statically validated");
+                                    let expr = match coordinate.axis {
+                                        PolygonAxis::X => path.points[coordinate.index].0.clone(),
+                                        PolygonAxis::Y => path.points[coordinate.index].1.clone(),
+                                    };
+                                    let initial_condition =
+                                        coordinate.initial.then_some(match coordinate.axis {
+                                            PolygonAxis::X => RectInitialCondition::PathX(
+                                                path.id,
+                                                coordinate.index,
+                                            ),
+                                            PolygonAxis::Y => RectInitialCondition::PathY(
+                                                path.id,
+                                                coordinate.index,
+                                            ),
+                                        });
+                                    (
+                                        expr,
+                                        coordinate.initial,
+                                        i32::MAX
+                                            - 3
+                                            - i32::try_from(coordinate.index.saturating_mul(2))
+                                                .unwrap_or(i32::MAX)
+                                            - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
+                                        initial_condition,
+                                    )
+                                }
+                            };
+                            let lhs = self.value_id();
+                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
+                            let span = self.span(&vref.loc, kwarg.value.span());
+                            self.new_deferred_value(vref.loc, |_| {
+                                PartialEvalState::Constraint(PartialConstraint {
+                                    lhs,
+                                    rhs: *rhs,
+                                    fallback,
+                                    priority,
+                                    span,
+                                    initial_condition,
                                 })
                             });
                         }
@@ -4719,29 +5218,29 @@ impl<'a> ExecPass<'a> {
                 _ => {
                     // Must be calling a cell generator.
                     // User functions are never deferred.
-                    let (arg_vals, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|arg_vid| {
-                            if let Defer::Ready(v) = self.values[arg_vid].clone() {
-                                if let Some(arg) = self.cell_arg_from_value(cell_id, *arg_vid, &v) {
-                                    Either::Left(arg)
-                                } else {
-                                    Either::Right(*arg_vid)
+                    let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
+                    let mut unready = Vec::new();
+                    for arg_vid in c.state.posargs.iter() {
+                        match self.values[arg_vid].clone() {
+                            Defer::Ready(v) => {
+                                match self.cell_arg_from_value(cell_id, *arg_vid, &v)? {
+                                    Some(arg) => arg_vals.push(arg),
+                                    None => unready.push(*arg_vid),
                                 }
-                            } else {
-                                Either::Right(*arg_vid)
                             }
-                        });
+                            _ => unready.push(*arg_vid),
+                        }
+                    }
                     if unready.is_empty() {
-                        let scope_name = format!(
-                            "{} cell {}",
-                            c.expr.scope_order,
-                            c.expr.func.path.iter().map(|ident| &ident.name).join("::")
-                        );
-                        let cell = self.execute_cell(
-                            c.expr.metadata.0.unwrap(),
-                            arg_vals,
-                            Some(scope_name),
-                        )?;
+                        let scope_name = (self.entry_cell != Some(cell_id)).then(|| {
+                            format!(
+                                "{} cell {}",
+                                c.expr.scope_order,
+                                c.expr.func.path.iter().map(|ident| &ident.name).join("::")
+                            )
+                        });
+                        let cell =
+                            self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {
@@ -5152,6 +5651,53 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
                         }
+                        ValueRef::Path(path) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            let val = match field {
+                                "points" => Value::Seq(
+                                    path.points
+                                        .iter()
+                                        .map(|(x, y)| Value::Point((x.clone(), y.clone())))
+                                        .collect(),
+                                ),
+                                "layer" => Value::String(path.layer.clone()),
+                                "width" => Value::Linear(path.width.clone()),
+                                "begin_extension" => Value::Linear(path.begin_extension.clone()),
+                                "end_extension" => Value::Linear(path.end_extension.clone()),
+                                name if polygon_coordinate(name)
+                                    .is_some_and(|coordinate| !coordinate.initial) =>
+                                {
+                                    let coordinate = polygon_coordinate(name).unwrap();
+                                    let Some(point) = path.points.get(coordinate.index) else {
+                                        self.errors.push(ExecError {
+                                            span: Some(self.span(
+                                                &vref.loc,
+                                                field_access_expr.expr.field.span,
+                                            )),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::IndexOutOfBounds,
+                                        });
+                                        return Err(());
+                                    };
+                                    Value::Linear(match coordinate.axis {
+                                        PolygonAxis::X => point.0.clone(),
+                                        PolygonAxis::Y => point.1.clone(),
+                                    })
+                                }
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(
+                                            self.span(&vref.loc, field_access_expr.expr.span),
+                                        ),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return Err(());
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
                         ValueRef::Point(point) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
                                 "x" => Value::Linear(point.0.clone()),
@@ -5263,6 +5809,42 @@ impl<'a> ExecPass<'a> {
                                                     objects
                                                         .insert(polygon.id, polygon.clone().into());
                                                     Value::Polygon(polygon)
+                                                }
+                                                SolvedValue::Path(path) => {
+                                                    let id = object_id(obj_id);
+                                                    let mat = tmat(inst.angle, inst.reflect);
+                                                    let path = Path {
+                                                        id,
+                                                        layer: path.layer.clone(),
+                                                        width: LinearExpr::from(path.width.0),
+                                                        points: path
+                                                            .points
+                                                            .iter()
+                                                            .map(|(x, y)| {
+                                                                let (x, y) =
+                                                                    ifmatvec(mat, (x.0, y.0));
+                                                                (
+                                                                    LinearExpr::add(
+                                                                        x,
+                                                                        inst.x.clone(),
+                                                                    ),
+                                                                    LinearExpr::add(
+                                                                        y,
+                                                                        inst.y.clone(),
+                                                                    ),
+                                                                )
+                                                            })
+                                                            .collect(),
+                                                        begin_extension: LinearExpr::from(
+                                                            path.begin_extension.0,
+                                                        ),
+                                                        end_extension: LinearExpr::from(
+                                                            path.end_extension.0,
+                                                        ),
+                                                        span: path.span.clone(),
+                                                    };
+                                                    objects.insert(path.id, path.clone().into());
+                                                    Value::Path(path)
                                                 }
                                                 SolvedValue::Instance(cinst) => {
                                                     let (angle, reflect, cx, cy) = cascade(
@@ -5540,6 +6122,7 @@ impl<'a> ExecPass<'a> {
         Ok(progress)
     }
 
+    /// The bounding box of `cell`'s geometry, in `cell`'s own coordinate frame.
     pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
         let mut bbox = None;
         let cell = &self.compiled_cells[&cell];
@@ -5547,8 +6130,11 @@ impl<'a> ExecPass<'a> {
             match o {
                 SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
                 SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
+                SolvedValue::Path(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Instance(i) => {
-                    let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
+                    let cell_bbox = self
+                        .bbox(i.cell)
+                        .map(|r| r.transform(i.reflect, i.angle).translate(i.x, i.y));
                     bbox = bbox_union(bbox, cell_bbox);
                 }
                 _ => (),
@@ -5577,6 +6163,7 @@ pub enum Value {
     Int(i64),
     Rect(Rect<LinearExpr>),
     Polygon(Polygon<LinearExpr>),
+    Path(Path<LinearExpr>),
     Point((LinearExpr, LinearExpr)),
     Bool(bool),
     Fn(FnDecl<Substr, VarIdTyMetadata>),
@@ -5628,6 +6215,7 @@ impl Value {
         match self {
             Self::Rect(r) => Some(Object::Rect(r.clone())),
             Self::Polygon(p) => Some(Object::Polygon(p.clone())),
+            Self::Path(p) => Some(Object::Path(p.clone())),
             Self::Inst(i) => Some(Object::Inst(i.clone())),
             _ => None,
         }
@@ -5638,7 +6226,31 @@ impl Value {
             CellArg::Int(i) => Value::Int(*i),
             CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            CellArg::String(s) => Value::String(s.clone()),
+            CellArg::Enum(v) => Value::EnumValue(v.clone()),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
+        }
+    }
+
+    /// Name of this value's kind, for diagnostics.
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::EnumValue(_) => "enum variant",
+            Self::String(_) => "String",
+            Self::Linear(_) => "Float",
+            Self::Int(_) => "Int",
+            Self::Rect(_) => "Rect",
+            Self::Polygon(_) => "Polygon",
+            Self::Path(_) => "Path",
+            Self::Point(_) => "Point",
+            Self::Bool(_) => "Bool",
+            Self::Fn(_) => "function",
+            Self::CellFn(_) => "cell generator",
+            Self::Cell(_) => "cell",
+            Self::Inst(_) => "instance",
+            Self::Seq(_) | Self::SeqNil => "sequence",
+            Self::Tuple(_) => "tuple",
+            Self::Nil => "nil",
         }
     }
 
@@ -5646,6 +6258,7 @@ impl Value {
         match self {
             Value::Rect(r) => Some(Arrayed::Elem(r.id)),
             Value::Polygon(p) => Some(Arrayed::Elem(p.id)),
+            Value::Path(p) => Some(Arrayed::Elem(p.id)),
             Value::Inst(i) => Some(Arrayed::Elem(i.id)),
             Value::Seq(s) => Some(Arrayed::Array(
                 s.iter().map(|v| v.obj_ids()).collect::<Option<Vec<_>>>()?,
@@ -5698,6 +6311,7 @@ pub struct SolvedInstance {
 pub enum SolvedValue {
     Rect(Rect<(f64, LinearExpr)>),
     Polygon(Polygon<(f64, LinearExpr)>),
+    Path(Path<(f64, LinearExpr)>),
     Text(Text<f64>),
     Dimension(Dimension<(f64, LinearExpr)>),
     Instance(SolvedInstance),
@@ -5708,6 +6322,7 @@ pub enum SolvedValue {
 pub enum Object {
     Rect(Rect<LinearExpr>),
     Polygon(Polygon<LinearExpr>),
+    Path(Path<LinearExpr>),
     Text(Text<LinearExpr>),
     Dimension(Dimension<LinearExpr>),
     Inst(Instance),
@@ -5722,6 +6337,12 @@ impl From<Rect<LinearExpr>> for Object {
 impl From<Polygon<LinearExpr>> for Object {
     fn from(value: Polygon<LinearExpr>) -> Self {
         Self::Polygon(value)
+    }
+}
+
+impl From<Path<LinearExpr>> for Object {
+    fn from(value: Path<LinearExpr>) -> Self {
+        Self::Path(value)
     }
 }
 
@@ -5781,8 +6402,23 @@ pub enum RectInitialCondition {
     Y1(ObjectId),
     PolygonX(ObjectId, usize),
     PolygonY(ObjectId, usize),
+    PathX(ObjectId, usize),
+    PathY(ObjectId, usize),
+    PathWidth(ObjectId),
+    PathBeginExtension(ObjectId),
+    PathEndExtension(ObjectId),
     InstanceX(ObjectId),
     InstanceY(ObjectId),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SseBasis {
+    /// An orthonormal constraint row-space basis. SSE obtains allowed motion
+    /// by subtracting the projection onto these vectors.
+    Rowspace(Vec<Vec<(f64, Var)>>),
+    /// An orthonormal constraint null-space basis. SSE projects allowed motion
+    /// directly onto these vectors.
+    Nullspace(Vec<Vec<(f64, Var)>>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5790,7 +6426,7 @@ pub struct CompiledCell {
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
     pub fields: IndexMap<String, Arrayed<ObjectId>>,
-    pub rowspace_vecs: Vec<Vec<(f64, Var)>>,
+    pub sse_basis: SseBasis,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<UsedFallback>,
     pub unsolved_vars: IndexSet<Var>,
@@ -6152,6 +6788,229 @@ impl<T> Polygon<(f64, T)> {
     }
 }
 
+const PATH_OUTLINE_EPSILON: f64 = 1e-12;
+
+fn path_real_points(points: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    let mut result = Vec::<(f64, f64)>::with_capacity(points.len());
+    for point in points {
+        if result.last() == Some(&point) {
+            continue;
+        }
+        while result.len() >= 2 {
+            let a = result[result.len() - 2];
+            let b = result[result.len() - 1];
+            let ab = (b.0 - a.0, b.1 - a.1);
+            let bc = (point.0 - b.0, point.1 - b.1);
+            if path_cross(ab, bc).abs() <= PATH_OUTLINE_EPSILON && path_dot(ab, bc) >= 0. {
+                result.pop();
+            } else {
+                break;
+            }
+        }
+        result.push(point);
+    }
+    result
+}
+
+fn path_shifted_side(
+    points: &[(f64, f64)],
+    half_width: f64,
+    begin_extension: f64,
+    end_extension: f64,
+) -> Option<Vec<(f64, f64)>> {
+    let directions = points
+        .windows(2)
+        .map(|points| path_unit(points[0], points[1]))
+        .collect::<Option<Vec<_>>>()?;
+    let mut shifted = Vec::with_capacity(points.len() * 2);
+
+    let first_direction = directions[0];
+    let first_normal = path_scale(path_normal(first_direction), half_width);
+    shifted.push(path_add(
+        points[0],
+        path_add(path_scale(first_direction, -begin_extension), first_normal),
+    ));
+
+    for index in 1..points.len() - 1 {
+        let point = points[index];
+        let previous_direction = directions[index - 1];
+        let next_direction = directions[index];
+        let previous_normal = path_scale(path_normal(previous_direction), half_width);
+        let next_normal = path_scale(path_normal(next_direction), half_width);
+        let turn = path_cross(previous_direction, next_direction);
+
+        if turn.abs() > PATH_OUTLINE_EPSILON {
+            let normal_delta = (
+                next_normal.0 - previous_normal.0,
+                next_normal.1 - previous_normal.1,
+            );
+            let previous_length = path_distance(points[index - 1], point);
+            let next_length = path_distance(points[index + 1], point);
+            let previous_offset = path_cross(normal_delta, next_direction) / turn;
+            let next_offset = path_cross(
+                (
+                    previous_normal.0 - next_normal.0,
+                    previous_normal.1 - next_normal.1,
+                ),
+                previous_direction,
+            ) / turn;
+            let previous_min = -previous_length - half_width;
+            let next_min = -next_length - half_width;
+
+            if previous_offset < previous_min - PATH_OUTLINE_EPSILON
+                || next_offset < next_min - PATH_OUTLINE_EPSILON
+            {
+                shifted.push(path_add(point, previous_normal));
+                shifted.push(point);
+                shifted.push(path_add(point, next_normal));
+            } else if previous_offset <= half_width + PATH_OUTLINE_EPSILON
+                && next_offset <= half_width + PATH_OUTLINE_EPSILON
+            {
+                shifted.push(path_add(
+                    point,
+                    path_add(
+                        previous_normal,
+                        path_scale(previous_direction, previous_offset),
+                    ),
+                ));
+            } else {
+                shifted.push(path_add(
+                    point,
+                    path_add(
+                        previous_normal,
+                        path_scale(previous_direction, previous_offset.min(half_width)),
+                    ),
+                ));
+                shifted.push(path_add(
+                    point,
+                    path_add(
+                        next_normal,
+                        path_scale(next_direction, -next_offset.min(half_width)),
+                    ),
+                ));
+            }
+        } else if path_dot(previous_direction, next_direction) < -PATH_OUTLINE_EPSILON {
+            shifted.push(path_add(
+                point,
+                path_add(previous_normal, path_scale(previous_direction, half_width)),
+            ));
+            shifted.push(path_add(
+                point,
+                path_add(next_normal, path_scale(next_direction, -half_width)),
+            ));
+        }
+    }
+
+    let last_direction = directions[directions.len() - 1];
+    let last_normal = path_scale(path_normal(last_direction), half_width);
+    shifted.push(path_add(
+        points[points.len() - 1],
+        path_add(path_scale(last_direction, end_extension), last_normal),
+    ));
+    Some(shifted)
+}
+
+fn path_unit(from: (f64, f64), to: (f64, f64)) -> Option<(f64, f64)> {
+    let vector = (to.0 - from.0, to.1 - from.1);
+    let length = vector.0.hypot(vector.1);
+    (length.is_finite() && length > 0.).then_some((vector.0 / length, vector.1 / length))
+}
+
+fn path_add(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 + b.0, a.1 + b.1)
+}
+
+fn path_scale(vector: (f64, f64), scale: f64) -> (f64, f64) {
+    (vector.0 * scale, vector.1 * scale)
+}
+
+fn path_normal(vector: (f64, f64)) -> (f64, f64) {
+    (-vector.1, vector.0)
+}
+
+fn path_cross(a: (f64, f64), b: (f64, f64)) -> f64 {
+    a.0 * b.1 - a.1 * b.0
+}
+
+fn path_dot(a: (f64, f64), b: (f64, f64)) -> f64 {
+    a.0 * b.0 + a.1 * b.1
+}
+
+fn path_distance(a: (f64, f64), b: (f64, f64)) -> f64 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+impl<T> Path<(f64, T)> {
+    /// Returns the non-rounded outline of this path, using bounded mitered
+    /// joins and the path's begin/end extensions.
+    pub fn outline(&self) -> Option<Vec<(f64, f64)>> {
+        let points = self
+            .points
+            .iter()
+            .map(|(x, y)| (x.0, y.0))
+            .collect::<Vec<_>>();
+        path_outline(
+            &points,
+            self.width.0,
+            self.begin_extension.0,
+            self.end_extension.0,
+        )
+    }
+
+    pub fn bbox(&self) -> Option<Rect<f64>> {
+        let outline = self.outline()?;
+        let mut points = outline.into_iter();
+        let (x, y) = points.next()?;
+        let (mut x0, mut y0, mut x1, mut y1) = (x, y, x, y);
+        for (x, y) in points {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x);
+            y1 = y1.max(y);
+        }
+        Some(Rect {
+            id: self.id,
+            layer: None,
+            x0,
+            y0,
+            x1,
+            y1,
+            construction: true,
+            span: self.span.clone(),
+        })
+    }
+}
+
+/// Returns the non-rounded outline for a path centerline and extensions.
+pub fn path_outline(
+    points: &[(f64, f64)],
+    width: f64,
+    begin_extension: f64,
+    end_extension: f64,
+) -> Option<Vec<(f64, f64)>> {
+    let points = path_real_points(points.to_vec());
+    if points.len() < 2 {
+        return None;
+    }
+    let half_width = width.abs() / 2.;
+    if !half_width.is_finite() || !begin_extension.is_finite() || !end_extension.is_finite() {
+        return None;
+    }
+
+    let mut outline = path_shifted_side(&points, half_width, begin_extension, end_extension)?;
+    let reversed = points.iter().rev().copied().collect::<Vec<_>>();
+    outline.extend(path_shifted_side(
+        &reversed,
+        half_width,
+        end_extension,
+        begin_extension,
+    )?);
+    outline
+        .iter()
+        .all(|(x, y)| x.is_finite() && y.is_finite())
+        .then_some(outline)
+}
+
 impl Rect<f64> {
     fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
         let mat = tmat(angle, reflect_vert);
@@ -6166,6 +7025,17 @@ impl Rect<f64> {
             y1: p0p.1.max(p1p.1),
             construction: self.construction,
             span: None,
+        }
+    }
+
+    /// Translates the rect by `(dx, dy)`.
+    fn translate(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            x0: self.x0 + dx,
+            y0: self.y0 + dy,
+            x1: self.x1 + dx,
+            y1: self.y1 + dy,
+            ..self.clone()
         }
     }
 }
@@ -6250,6 +7120,9 @@ impl CompiledData {
                     set.insert(r.id, name.to_owned());
                 }
                 SolvedValue::Polygon(p) => {
+                    set.insert(p.id, name.to_owned());
+                }
+                SolvedValue::Path(p) => {
                     set.insert(p.id, name.to_owned());
                 }
                 SolvedValue::Instance(inst) => {
