@@ -36,6 +36,7 @@ use crate::{
 pub enum ShapeFill {
     Stippling,
     Solid,
+    Hollow,
 }
 
 const SELECT_WIDTH: Pixels = px(3.);
@@ -307,6 +308,9 @@ fn paint_polygon_fill(
     layer: &LayerState,
     self_overlapping_path: bool,
 ) {
+    if layer.fill == ShapeFill::Hollow {
+        return;
+    }
     let mut fill = if self_overlapping_path {
         PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()))
     } else {
@@ -317,6 +321,7 @@ fn paint_polygon_fill(
         let background = match layer.fill {
             ShapeFill::Solid => solid_background(layer.color),
             ShapeFill::Stippling => pattern_slash(layer.color.into(), 1., 9.),
+            ShapeFill::Hollow => unreachable!(),
         };
         window.paint_path(path, background);
     }
@@ -580,8 +585,8 @@ fn segment_constraint_with_end(
     }
 }
 
-fn draw_source_coordinate(value: f32) -> f64 {
-    (f64::from(value) * 10.).round() / 10.
+fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
+    argonc::tech::snap(f64::from(value), grid)
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -905,7 +910,11 @@ fn sort_initial_condition_pair(
     }
 }
 
-fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> Vec<ValueEdit> {
+fn fallback_value_edits(
+    fallbacks: &[compile::UsedFallback],
+    dv: &SparseVec,
+    grid: f64,
+) -> Vec<ValueEdit> {
     let mut updates = fallbacks
         .iter()
         .map(|fallback| {
@@ -960,7 +969,7 @@ fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> 
         .filter(|update| update.changed)
         .map(|update| ValueEdit {
             span: update.span,
-            value: crate::sse::format_value(update.value),
+            value: crate::sse::format_value(update.value, grid),
         })
         .collect()
 }
@@ -975,8 +984,9 @@ fn drag_persistence_edits(
     fallbacks: &[compile::UsedFallback],
     targets: &[SseDragTarget],
     dv: &SparseVec,
+    grid: f64,
 ) -> DragPersistenceEdits {
-    let values = fallback_value_edits(fallbacks, dv);
+    let values = fallback_value_edits(fallbacks, dv, grid);
     let mut initial_conditions = Vec::<InitialConditionEdit>::new();
     for target in targets {
         let delta = crate::sse::dot(&SparseVec::from(&target.expr), dv);
@@ -989,7 +999,7 @@ fn drag_persistence_edits(
         let edit = InitialConditionEdit {
             call_span: source.call_span.clone(),
             name: source.name.clone(),
-            value: crate::sse::format_value(source.value + delta),
+            value: crate::sse::format_value(source.value + delta, grid),
         };
         if let Some(existing) = initial_conditions
             .iter_mut()
@@ -1081,6 +1091,13 @@ fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
     } else {
         100.
     }
+}
+
+fn snap_layout_point(point: Point<f32>, grid: f64) -> Point<f32> {
+    Point::new(
+        argonc::tech::snap(f64::from(point.x), grid) as f32,
+        argonc::tech::snap(f64::from(point.y), grid) as f32,
+    )
 }
 
 fn fit_scale(viewport: Size<Pixels>, width: f32, height: f32) -> f32 {
@@ -1218,6 +1235,7 @@ fn get_paint_quad(
     let background = match fill {
         ShapeFill::Solid => solid_background(color),
         ShapeFill::Stippling => pattern_slash(color.into(), 1., 9.),
+        ShapeFill::Hollow => solid_background(Rgba { a: 0., ..color }),
     };
     PaintQuad {
         bounds,
@@ -1299,6 +1317,11 @@ impl Element for CanvasElement {
         let mut select_rects = Vec::new();
         let mut source_coordinates = SseSourceCoordinates::new();
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
+        let grid = solved_cell
+            .as_ref()
+            .map(|cell| cell.output.tech.grid_step())
+            .unwrap_or(0.1);
+        let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let editable_cell = &solved_cell.output.cells[&scope_address.cell];
@@ -1842,10 +1865,10 @@ impl Element for CanvasElement {
                 rects.push((
                     Rect {
                         object_path: Vec::new(),
-                        x0: p0.x.min(layout_mouse_position.x),
-                        y0: p0.y.min(layout_mouse_position.y),
-                        x1: p0.x.max(layout_mouse_position.x),
-                        y1: p0.y.max(layout_mouse_position.y),
+                        x0: p0.x.min(snapped_layout_mouse_position.x),
+                        y0: p0.y.min(snapped_layout_mouse_position.y),
+                        x1: p0.x.max(snapped_layout_mouse_position.x),
+                        y1: p0.y.max(snapped_layout_mouse_position.y),
                         id: None,
                         border_widths: Edges::all(SELECT_WIDTH),
                         border_styles: Edges::all(BorderStyle::Dashed),
@@ -2062,11 +2085,11 @@ impl Element for CanvasElement {
                         let preview_position = if self.inner.read(cx).shift_down {
                             snap_draw_point(
                                 *polygon_tool.points.last().unwrap(),
-                                layout_mouse_position,
+                                snapped_layout_mouse_position,
                             )
                             .0
                         } else {
-                            layout_mouse_position
+                            snapped_layout_mouse_position
                         };
                         let points = polygon_tool
                             .points
@@ -2105,11 +2128,11 @@ impl Element for CanvasElement {
                         let preview_position = if self.inner.read(cx).shift_down {
                             snap_draw_point(
                                 *path_tool.points.last().unwrap(),
-                                layout_mouse_position,
+                                snapped_layout_mouse_position,
                             )
                             .0
                         } else {
-                            layout_mouse_position
+                            snapped_layout_mouse_position
                         };
                         let centerline = path_tool
                             .points
@@ -2248,8 +2271,8 @@ impl Element for CanvasElement {
                             let rect = rect.transform(
                                 TransformationMatrix::identity(),
                                 (
-                                    layout_mouse_position.x as f64,
-                                    layout_mouse_position.y as f64,
+                                    snapped_layout_mouse_position.x as f64,
+                                    snapped_layout_mouse_position.y as f64,
                                 ),
                             );
                             window.paint_quad(get_paint_quad(
@@ -2265,8 +2288,8 @@ impl Element for CanvasElement {
                             let polygon = polygon.transform(
                                 TransformationMatrix::identity(),
                                 (
-                                    layout_mouse_position.x as f64,
-                                    layout_mouse_position.y as f64,
+                                    snapped_layout_mouse_position.x as f64,
+                                    snapped_layout_mouse_position.y as f64,
                                 ),
                             );
                             let points = polygon
@@ -3324,7 +3347,16 @@ impl LayoutCanvas {
             start: self.screen_bounds.origin.x,
             stop: self.screen_bounds.origin.x + self.screen_bounds.size.width,
         };
+        let grid = self
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|cell| cell.output.tech.grid_step())
+            .unwrap_or(0.1);
         let layout_mouse_position = self.px_to_layout(event.position);
+        let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
         let edit_dim = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             let mut edit_dim = false;
             match tool {
@@ -3337,7 +3369,7 @@ impl LayoutCanvas {
                         if layer_info.visible {
                             if let Some(p0) = rect_tool.p0 {
                                 rect_tool.p0 = None;
-                                let p1 = layout_mouse_position;
+                                let p1 = snapped_layout_mouse_position;
                                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                                 self.state.update(cx, |state, cx| {
@@ -3377,10 +3409,10 @@ impl LayoutCanvas {
                                                             .selected_layer
                                                             .clone()
                                                             .map(|s| s.to_string()),
-                                                        x0: draw_source_coordinate(p0p.x),
-                                                        y0: draw_source_coordinate(p0p.y),
-                                                        x1: draw_source_coordinate(p1p.x),
-                                                        y1: draw_source_coordinate(p1p.y),
+                                                        x0: draw_source_coordinate(p0p.x, grid),
+                                                        y0: draw_source_coordinate(p0p.y, grid),
+                                                        x1: draw_source_coordinate(p1p.x, grid),
+                                                        y1: draw_source_coordinate(p1p.y, grid),
                                                         construction: false,
                                                     },
                                                 ) {
@@ -3400,8 +3432,7 @@ impl LayoutCanvas {
                                     }
                                 });
                             } else {
-                                let p0 = self.px_to_layout(event.position);
-                                rect_tool.p0 = Some(p0);
+                                rect_tool.p0 = Some(snapped_layout_mouse_position);
                             }
                         } else {
                             let _ = state.lang_server_client.show_message(
@@ -3422,10 +3453,7 @@ impl LayoutCanvas {
                         && let Some(layer_info) = layers.layers.get(layer)
                     {
                         if layer_info.visible {
-                            let cursor = Point::new(
-                                (layout_mouse_position.x * 10.).round() / 10.,
-                                (layout_mouse_position.y * 10.).round() / 10.,
-                            );
+                            let cursor = snapped_layout_mouse_position;
                             let (point, constraint) = if event.modifiers.shift
                                 && let Some(previous) = polygon_tool.points.last().copied()
                             {
@@ -3463,10 +3491,7 @@ impl LayoutCanvas {
                         && let Some(layer_info) = layers.layers.get(layer)
                     {
                         if layer_info.visible {
-                            let cursor = Point::new(
-                                (layout_mouse_position.x * 10.).round() / 10.,
-                                (layout_mouse_position.y * 10.).round() / 10.,
-                            );
+                            let cursor = snapped_layout_mouse_position;
                             let (point, constraint) = if event.modifiers.shift
                                 && let Some(previous) = path_tool.points.last().copied()
                             {
@@ -3498,8 +3523,8 @@ impl LayoutCanvas {
                     }
                 }
                 ToolState::PlaceInstance(placement) => {
-                    let x = ((layout_mouse_position.x as f64 * 10.).round() / 10.) + 0.;
-                    let y = ((layout_mouse_position.y as f64 * 10.).round() / 10.) + 0.;
+                    let x = argonc::tech::snap(f64::from(snapped_layout_mouse_position.x), grid);
+                    let y = argonc::tech::snap(f64::from(snapped_layout_mouse_position.y), grid);
                     let result = self.state.read(cx).lang_server_client.place_instance(
                         placement.scope_span.clone(),
                         placement.invocation.clone(),
@@ -4040,12 +4065,20 @@ impl LayoutCanvas {
                 );
                 return;
             }
+            let grid = self
+                .state
+                .read(cx)
+                .solved_cell
+                .read(cx)
+                .as_ref()
+                .map(|cell| cell.output.tech.grid_step())
+                .unwrap_or(0.1);
             let points = draw_points
                 .iter()
                 .map(|point| {
                     (
-                        draw_source_coordinate(point.x),
-                        draw_source_coordinate(point.y),
+                        draw_source_coordinate(point.x, grid),
+                        draw_source_coordinate(point.y, grid),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4319,6 +4352,7 @@ impl LayoutCanvas {
             &editable_cell.fallback_constraints_used,
             &self.sse_targets,
             &dv,
+            solved.output.tech.grid_step(),
         )
     }
 
@@ -4513,12 +4547,12 @@ mod tests {
         ast: &argonc::parse::WorkspaceParseAst,
         input: argonc::compile::CompileInput<'_>,
     ) -> argonc::compile::CompileOutput {
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
         argonc::compile::compile(
             ast,
             input,
-            &argonc::WorkspaceConfig::default().with_lyp(Some(lyp)),
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
         )
     }
 
@@ -4638,7 +4672,8 @@ mod tests {
 
     #[test]
     fn drawn_coordinates_discard_f32_representation_noise() {
-        assert_eq!(draw_source_coordinate(110.3_f32), 110.3);
+        assert_eq!(draw_source_coordinate(110.3_f32, 0.1), 110.3);
+        assert_eq!(draw_source_coordinate(110.37_f32, 0.25), 110.25);
     }
 
     #[test]
@@ -4791,7 +4826,7 @@ mod tests {
         assert!((crate::sse::dot(&SparseVec::from(&x.1), &drag) - 12.3).abs() < 1e-6);
         assert!((crate::sse::dot(&SparseVec::from(&y.1), &drag) + 4.5).abs() < 1e-6);
 
-        let edits = drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag);
+        let edits = drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag, 0.1);
         let x_fallback = cell
             .fallback_constraints_used
             .iter()
@@ -4827,7 +4862,7 @@ mod tests {
                 .any(|edit| edit.span == y_fallback.span && edit.value == "70.5")
         );
 
-        let inserted = drag_persistence_edits(&[], &targets, &drag);
+        let inserted = drag_persistence_edits(&[], &targets, &drag, 0.1);
         assert!(inserted.values.is_empty());
         assert!(inserted.initial_conditions.iter().any(|edit| {
             edit.name == "x2i"
@@ -4894,7 +4929,7 @@ mod tests {
             .collect(),
         );
 
-        let edits = drag_persistence_edits(&[], &targets, &drag);
+        let edits = drag_persistence_edits(&[], &targets, &drag, 0.1);
         assert!(edits.values.is_empty());
         assert!(edits.initial_conditions.iter().any(|edit| {
             edit.call_span == rect_span && edit.name == "x0i" && edit.value == "15."
@@ -4967,6 +5002,14 @@ mod tests {
         assert_eq!(fit_scale(viewport, 100., 0.), 9.);
         assert_eq!(fit_scale(viewport, 0., 100.), 4.5);
         assert_eq!(fit_scale(viewport, 100., 100.), 4.5);
+    }
+
+    #[test]
+    fn layout_points_snap_to_the_technology_grid() {
+        assert_eq!(
+            snap_layout_point(Point::new(1.12, -0.62), 0.25),
+            Point::new(1., -0.5)
+        );
     }
 
     #[test]

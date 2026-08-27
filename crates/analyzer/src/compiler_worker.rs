@@ -127,15 +127,15 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                 errors: analysis.errors,
             }))
         } else if let Some(cell) = identity.cell.as_deref() {
-            if workspace.lyp.is_none() {
+            if workspace.tech.is_none() {
                 let message = if manifest_path.is_file() {
                     format!(
-                        "`{}` does not set `lyp`; add `lyp = \"path/to/layers.lyp\"`",
+                        "`{}` does not set `tech`; add `tech = \"path/to/tech.toml\"`",
                         manifest_path.display()
                     )
                 } else {
                     format!(
-                        "no library manifest found at `{}`; create it and set `lyp = \"path/to/layers.lyp\"`",
+                        "no library manifest found at `{}`; create it and set `tech = \"path/to/tech.toml\"`",
                         manifest_path.display()
                     )
                 };
@@ -181,16 +181,16 @@ mod tests {
     async fn source_updates_and_compiles_are_processed_in_queue_order() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("lib.ar");
-        let lyp = directory.path().join("layers.lyp");
+        let tech = directory.path().join("tech.toml");
         std::fs::copy(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp"),
-            &lyp,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+            &tech,
         )
         .unwrap();
         std::fs::write(&root, "cell top() {}\n").unwrap();
         std::fs::write(
             directory.path().join("Argon.toml"),
-            "name = \"worker-test\"\nlyp = \"layers.lyp\"\n",
+            "name = \"worker-test\"\ntech = \"tech.toml\"\n",
         )
         .unwrap();
 

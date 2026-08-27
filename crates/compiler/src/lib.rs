@@ -4,10 +4,10 @@ pub mod compile;
 pub mod diagnostics;
 pub mod gds;
 pub mod incremental;
-pub mod layer;
 pub mod parse;
 mod parser;
 pub mod solver;
+pub mod tech;
 pub mod workspace;
 
 pub use workspace::WorkspaceConfig;
@@ -100,10 +100,9 @@ mod tests {
         compile::{
             ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
         },
-        gds::GdsMap,
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
-    use ::gds::{GdsElement, GdsLibrary, GdsUnits};
+    use ::gds::{GdsElement, GdsLibrary};
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
@@ -118,16 +117,16 @@ mod tests {
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     const ARGON_SCOPES: &str = concatcp!(EXAMPLES_DIR, "/scopes/lib.ar");
-    const BASIC_LYP: &str = concatcp!(EXAMPLES_DIR, "/lyp/basic.lyp");
+    const BASIC_TECH: &str = concatcp!(EXAMPLES_DIR, "/tech/basic.tech.toml");
     const ARGON_SKY130_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pdks/sky130");
     const ARGON_SKY130_LIB: &str = concatcp!(ARGON_SKY130_DIR, "/lib.ar");
-    const SKY130_LYP: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.lyp");
+    const SKY130_TECH: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.tech.toml");
 
     fn compile(ast: &crate::parse::WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
         compile_workspace(
             ast,
             input,
-            &WorkspaceConfig::default().with_lyp(Some(PathBuf::from(BASIC_LYP))),
+            &WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH))),
         )
     }
 
@@ -138,7 +137,7 @@ mod tests {
         compile_workspace(
             ast,
             input,
-            &WorkspaceConfig::default().with_lyp(Some(PathBuf::from(SKY130_LYP))),
+            &WorkspaceConfig::default().with_tech(Some(PathBuf::from(SKY130_TECH))),
         )
     }
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
@@ -868,7 +867,18 @@ mod tests {
             },
         );
         println!("{cell:?}");
-        cell.unwrap_exec_errors();
+        let errors = cell.unwrap_exec_errors();
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| matches!(error.kind, ExecErrorKind::InconsistentConstraint(_)))
+            .expect("expected an inconsistent constraint");
+        let span = error
+            .span
+            .as_ref()
+            .expect("inconsistent constraint should retain its source span");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(&source[span.span.start()..span.span.end()], "eq(a, 5.)");
     }
 
     #[test]
@@ -1373,11 +1383,7 @@ mod tests {
         let work_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_inverter");
         cells
-            .to_gds(
-                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                work_dir.join("layout.gds"),
-            )
+            .to_gds(work_dir.join("layout.gds"))
             .expect("Failed to write to GDS");
     }
 
@@ -1486,10 +1492,41 @@ mod tests {
         println!("{cells:#?}");
         let cells = cells.unwrap_exec_errors();
         assert_eq!(cells.errors.len(), 1);
-        assert!(matches!(
-            cells.errors.first().unwrap().kind,
-            ExecErrorKind::InvalidRounding(_)
+        let error = cells.errors.first().unwrap();
+        assert!(matches!(error.kind, ExecErrorKind::OffGrid(_)));
+        let span = error
+            .span
+            .as_ref()
+            .expect("off-grid error should point to its solver variable");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(&source[span.span.start()..span.span.end()], "float()");
+    }
+
+    #[test]
+    fn solver_uses_technology_grid() {
+        let o = parse_workspace_with_std(ARGON_ROUNDING);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+
+        let tech_path = std::env::temp_dir().join(format!(
+            "argon-solver-grid-{}.tech.toml",
+            std::process::id()
         ));
+        let tech = std::fs::read_to_string(BASIC_TECH)
+            .unwrap()
+            .replace("display_unit = 10", "display_unit = 10000");
+        std::fs::write(&tech_path, tech).unwrap();
+        let cells = compile_workspace(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+            &WorkspaceConfig::default().with_tech(Some(tech_path.clone())),
+        );
+        std::fs::remove_file(tech_path).unwrap();
+
+        assert!(cells.is_valid(), "{cells:#?}");
     }
 
     #[test]
@@ -1678,11 +1715,7 @@ mod tests {
 
         let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_text");
         cells
-            .to_gds(
-                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                work_dir.join("layout.gds"),
-            )
+            .to_gds(work_dir.join("layout.gds"))
             .expect("Failed to write to GDS");
 
         let cells = cells.unwrap_valid();
@@ -1830,11 +1863,19 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+            .expect("expected an underconstrained error");
+        let span = error
+            .span
+            .as_ref()
+            .expect("underconstrained error should point to an unsolved variable");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(
+            &source[span.span.start()..span.span.end()],
+            "inst(bot_cell, angle=90)"
         );
     }
 
@@ -1914,13 +1955,7 @@ mod tests {
         );
         let gds_path =
             std::env::temp_dir().join(format!("argon-polygon-{}.gds", std::process::id()));
-        output
-            .to_gds(
-                GdsMap::from_lyp(BASIC_LYP).expect("polygon GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                &gds_path,
-            )
-            .expect("export polygon GDS");
+        output.to_gds(&gds_path).expect("export polygon GDS");
         let gds = GdsLibrary::load(gds_path).expect("reload polygon GDS");
         let boundary = gds.structs[0]
             .elems
@@ -2113,13 +2148,7 @@ mod tests {
         );
 
         let gds_path = std::env::temp_dir().join(format!("argon-path-{}.gds", std::process::id()));
-        output
-            .to_gds(
-                GdsMap::from_lyp(BASIC_LYP).expect("path GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                &gds_path,
-            )
-            .expect("export path GDS");
+        output.to_gds(&gds_path).expect("export path GDS");
         let gds = GdsLibrary::load(gds_path).expect("reload path GDS");
         let path = gds.structs[0]
             .elems
@@ -2129,10 +2158,10 @@ mod tests {
                 _ => None,
             })
             .expect("GDS path element");
-        assert_eq!(path.width, Some(20));
+        assert_eq!(path.width, Some(200));
         assert_eq!(path.path_type, Some(4));
-        assert_eq!(path.begin_extn, Some(5));
-        assert_eq!(path.end_extn, Some(7));
+        assert_eq!(path.begin_extn, Some(50));
+        assert_eq!(path.end_extn, Some(70));
         assert_eq!(path.xy.len(), 3);
     }
 
@@ -2394,13 +2423,7 @@ mod tests {
 
         let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_vco");
         let gds_path = work_dir.join("layout.gds");
-        cells
-            .to_gds(
-                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                &gds_path,
-            )
-            .expect("Failed to write to GDS");
+        cells.to_gds(&gds_path).expect("Failed to write to GDS");
 
         use sky130::{sky130_drc, sky130_drc_rules_path};
 

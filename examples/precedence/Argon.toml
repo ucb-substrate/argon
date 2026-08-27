@@ -1,2 +1,2 @@
 name = "precedence"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

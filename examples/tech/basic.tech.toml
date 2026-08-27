@@ -1,0 +1,144 @@
+dbu = 1e-10
+display_unit = 10
+grid = 1
+style_name = "Basic Layer Properties"
+
+[[layers]]
+name = "met1"
+gds = [235, 4]
+fill = "#0000ff"
+border = "#0000ff"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0
+
+[[layers]]
+name = "via1"
+gds = [235, 4]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0
+
+[[layers]]
+name = "met2"
+gds = [235, 4]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0
+
+[[layers]]
+name = "via2"
+gds = [235, 4]
+fill = "#ff8000"
+border = "#ff8000"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0
+
+[[layers]]
+name = "met3"
+gds = [235, 4]
+fill = "#00ffff"
+border = "#00ffff"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0
+
+[[layers]]
+name = "via3"
+gds = [235, 4]
+fill = "#268c6b"
+border = "#268c6b"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0
+
+[[layers]]
+name = "met4"
+gds = [235, 4]
+fill = "#5e00e6"
+border = "#5e00e6"
+
+[layers.style]
+expanded = false
+frame_brightness = 0
+fill_brightness = 0
+dither_pattern = "C7"
+line_style = "C0"
+valid = true
+visible = true
+transparent = false
+width = 1
+marked = false
+xfill = false
+animation = 0

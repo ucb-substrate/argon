@@ -1,2 +1,2 @@
 name = "sse-basic"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

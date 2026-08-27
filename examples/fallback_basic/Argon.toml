@@ -1,2 +1,2 @@
 name = "fallback-basic"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

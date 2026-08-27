@@ -1,2 +1,2 @@
 name = "argon-library"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

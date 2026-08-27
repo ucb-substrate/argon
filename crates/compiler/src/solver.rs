@@ -7,14 +7,21 @@ use sparse_linear_solver::{analyze as analyze_sparse_system, nullspace as sparse
 use std::collections::VecDeque;
 
 const EPSILON: f64 = 1e-8;
-const ROUND_STEP: f64 = 0.1;
-const INV_ROUND_STEP: f64 = 1. / ROUND_STEP;
+const DEFAULT_GRID: f64 = 0.1;
+
+fn is_off_grid(value: f64, snapped: f64, grid: f64) -> bool {
+    // Keep solver and floating-point noise from becoming a diagnostic. The
+    // meaningful tolerance is a fraction of the grid, not of the coordinate.
+    let tolerance = EPSILON * grid.abs() + f64::EPSILON * value.abs() * 8.;
+    (value - snapped).abs() > tolerance
+}
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Solver {
+    grid: f64,
     next_var: u64,
     next_constraint: ConstraintId,
     constraints: IndexMap<ConstraintId, LinearExpr>,
@@ -25,27 +32,55 @@ pub struct Solver {
     updated_vars: IndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
-    invalid_rounding: IndexSet<Var>,
+    off_grid_vars: IndexSet<Var>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
     // constraint, resolved into numbers afterwards by `resolve_substitutions`. Both are
     // cleared at the start of each elimination pass, so they hold no state between solves.
     elim_worklist: VecDeque<ConstraintId>,
-    substitutions: Vec<(Var, LinearExpr)>,
+    substitutions: Vec<(ConstraintId, Var, LinearExpr)>,
     /// Null-space vectors produced while analyzing the current sparse
     /// components. Kept only when no elimination substitution changed the
     /// coordinate space, so SSE can reuse the factorization result.
     sparse_nullspace_cache: Option<Vec<Vec<(f64, Var)>>>,
 }
 
-fn round(x: f64) -> f64 {
-    (x * INV_ROUND_STEP).round() * ROUND_STEP
+impl Default for Solver {
+    fn default() -> Self {
+        Self {
+            grid: DEFAULT_GRID,
+            next_var: 0,
+            next_constraint: 0,
+            constraints: IndexMap::new(),
+            var_to_constraints: IndexMap::new(),
+            solved_vars: IndexMap::new(),
+            unsolved_vars: IndexSet::new(),
+            updated_vars: IndexSet::new(),
+            back_substitute_stack: Vec::new(),
+            inconsistent_constraints: IndexSet::new(),
+            off_grid_vars: IndexSet::new(),
+            elim_worklist: VecDeque::new(),
+            substitutions: Vec::new(),
+            sparse_nullspace_cache: None,
+        }
+    }
 }
 
 impl Solver {
     pub fn new() -> Self {
         Default::default()
+    }
+
+    pub fn with_grid(grid: f64) -> Self {
+        assert!(
+            grid.is_finite() && grid > 0.,
+            "solver grid must be positive and finite"
+        );
+        Self {
+            grid,
+            ..Self::default()
+        }
     }
 
     pub fn new_var(&mut self) -> Var {
@@ -85,8 +120,8 @@ impl Solver {
     }
 
     #[inline]
-    pub fn invalid_rounding(&self) -> &IndexSet<Var> {
-        &self.invalid_rounding
+    pub fn off_grid_vars(&self) -> &IndexSet<Var> {
+        &self.off_grid_vars
     }
 
     pub fn unsolved_vars(&self) -> &IndexSet<Var> {
@@ -144,9 +179,9 @@ impl Solver {
                     self.inconsistent_constraints.insert(id);
                 }
             } else {
-                let rounded_val = round(val);
-                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
-                    self.invalid_rounding.insert(var);
+                let rounded_val = crate::tech::snap(val, self.grid);
+                if is_off_grid(val, rounded_val, self.grid) {
+                    self.off_grid_vars.insert(var);
                 }
                 self.solve_var(var, rounded_val);
             }
@@ -311,7 +346,7 @@ impl Solver {
         }
         self.var_to_constraints.swap_remove(&v);
         self.unsolved_vars.swap_remove(&v);
-        self.substitutions.push((v, v_expr));
+        self.substitutions.push((id, v, v_expr));
     }
 
     /// Recovers numeric values for variables eliminated by `eliminate_binary`. Walks
@@ -322,14 +357,12 @@ impl Solver {
     /// defining constraint is restored (a row-equivalent of the pivot row that was
     /// removed) so the under-constrained diagnostics in `rowspace_vecs` are unchanged.
     fn resolve_substitutions(&mut self) {
-        while let Some((var, mut expr)) = self.substitutions.pop() {
+        while let Some((id, var, mut expr)) = self.substitutions.pop() {
             expr.simplify(&self.solved_vars);
             if expr.coeffs.is_empty() {
                 self.assign_var(var, expr.constant);
             } else {
                 self.unsolved_vars.insert(var);
-                let id = self.next_constraint;
-                self.next_constraint += 1;
                 let mut coeffs = Vec::with_capacity(expr.coeffs.len() + 1);
                 coeffs.push((1., var));
                 for (c, v) in expr.coeffs {
@@ -354,9 +387,9 @@ impl Solver {
         if self.solved_vars.contains_key(&var) {
             return;
         }
-        let rounded = round(val);
-        if relative_ne!(val, rounded, epsilon = EPSILON) {
-            self.invalid_rounding.insert(var);
+        let rounded = crate::tech::snap(val, self.grid);
+        if is_off_grid(val, rounded, self.grid) {
+            self.off_grid_vars.insert(var);
         }
         self.solve_var(var, rounded);
     }
@@ -440,12 +473,13 @@ impl Solver {
     }
 
     pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
-        Some(round(
+        Some(crate::tech::snap(
             expr.coeffs
                 .iter()
                 .map(|(coeff, var)| self.value_of(*var).map(|val| val * coeff))
                 .fold_options(0., |a, b| a + b)?
                 + expr.constant,
+            self.grid,
         ))
     }
 
@@ -495,9 +529,9 @@ impl Solver {
                 .sum::<f64>();
             if relative_eq!(recons, 1., epsilon = EPSILON) {
                 let val = sol[(i, 0)];
-                let rounded_val = round(val);
-                if relative_ne!(val, rounded_val, epsilon = EPSILON) {
-                    self.invalid_rounding.insert(*var);
+                let rounded_val = crate::tech::snap(val, self.grid);
+                if is_off_grid(val, rounded_val, self.grid) {
+                    self.off_grid_vars.insert(*var);
                 }
                 self.solve_var(*var, rounded_val);
             }
@@ -857,7 +891,7 @@ mod tests {
         assert_relative_eq!(s.value_of(b).unwrap(), 50., epsilon = EPSILON);
         assert_relative_eq!(s.value_of(d).unwrap(), 45., epsilon = EPSILON);
         assert!(s.inconsistent_constraints().is_empty());
-        assert!(s.invalid_rounding().is_empty());
+        assert!(s.off_grid_vars().is_empty());
     }
 
     /// A chain pinned at one end resolves transitively (reverse-topological order).
@@ -888,12 +922,13 @@ mod tests {
         let mut s = Solver::new();
         let a = s.new_var();
         let b = s.new_var();
-        s.constrain_eq0(c(vec![(1., a), (-1., b)], 0.)); // a - b = 0
+        let constraint = s.constrain_eq0(c(vec![(1., a), (-1., b)], 0.)); // a - b = 0
         s.solve();
         assert!(s.value_of(a).is_none());
         assert!(s.value_of(b).is_none());
         assert!(s.unsolved_vars().contains(&a));
         assert!(s.unsolved_vars().contains(&b));
+        assert!(s.constraints.contains_key(&constraint));
         assert_eq!(s.rowspace_vecs().len(), 1);
     }
 
@@ -940,7 +975,7 @@ mod tests {
     }
 
     /// A value reached only through elimination + resolution that lands off the 0.1
-    /// grid is flagged in `invalid_rounding`.
+    /// grid is flagged in `off_grid_vars`.
     #[test]
     fn off_grid_cycle() {
         let mut s = Solver::new();
@@ -951,7 +986,21 @@ mod tests {
         s.constrain_eq0(c(vec![(1., b), (-1., d)], 0.)); // b - c = 0
         s.constrain_eq0(c(vec![(1., a), (1., b), (1., d)], -1.)); // a + b + c = 1  => 1/3 each
         s.solve();
-        assert!(!s.invalid_rounding().is_empty());
+        assert!(!s.off_grid_vars().is_empty());
+    }
+
+    #[test]
+    fn configured_grid_controls_rounding_and_off_grid_detection() {
+        let mut s = Solver::with_grid(0.25);
+        let on_grid = s.new_var();
+        let off_grid = s.new_var();
+        s.constrain_eq0(c(vec![(1., on_grid)], -1.25));
+        s.constrain_eq0(c(vec![(1., off_grid)], -1.2));
+
+        assert_relative_eq!(s.value_of(on_grid).unwrap(), 1.25, epsilon = EPSILON);
+        assert_relative_eq!(s.value_of(off_grid).unwrap(), 1.25, epsilon = EPSILON);
+        assert!(!s.off_grid_vars().contains(&on_grid));
+        assert!(s.off_grid_vars().contains(&off_grid));
     }
 
     /// Variables eliminated in an earlier `solve()` (before the closing constraint
@@ -1015,7 +1064,7 @@ mod tests {
             assert_relative_eq!(solver.value_of(var).unwrap(), value, epsilon = EPSILON);
         }
         assert!(solver.inconsistent_constraints().is_empty());
-        assert!(solver.invalid_rounding().is_empty());
+        assert!(solver.off_grid_vars().is_empty());
     }
 
     /// The same irreducible shape with asymmetric neighbor coefficients exercises
@@ -1031,7 +1080,7 @@ mod tests {
             assert_relative_eq!(solver.value_of(var).unwrap(), value, epsilon = EPSILON);
         }
         assert!(solver.inconsistent_constraints().is_empty());
-        assert!(solver.invalid_rounding().is_empty());
+        assert!(solver.off_grid_vars().is_empty());
     }
 
     /// A fully-coupled full-rank block has no size-<=2 pivot, so sparse QR solves it.

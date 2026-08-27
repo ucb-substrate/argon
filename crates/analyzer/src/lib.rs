@@ -374,7 +374,7 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
                 .iter()
                 .map(|(name, path)| (name.clone(), path.clone())),
         )
-        .with_lyp(library.lyp.clone())
+        .with_tech(library.tech.clone())
         .with_gds_imports(
             library
                 .gds
@@ -519,6 +519,13 @@ impl State {
         let source = self.source_state.lock().await;
         let compiled = self.published_state.lock().await;
         rpc::editor_buffers_are_current(&source, &compiled).then(|| compiled.ast.clone())
+    }
+
+    pub(crate) async fn technology_grid(&self) -> f64 {
+        let tech = self.published_state.lock().await.config.tech.clone();
+        tech.and_then(|path| argonc::tech::read_tech(path).ok())
+            .map(|tech| tech.grid_step())
+            .unwrap_or(0.1)
     }
 
     async fn clear_gui_connection(&self, id: u64) {
@@ -1297,12 +1304,12 @@ impl Backend {
                 .await;
             return Ok(());
         }
-        if workspace.lyp.is_none() {
+        if workspace.tech.is_none() {
             self.state
                 .editor_client
                 .show_message(
                     MessageType::ERROR,
-                    "The Argon library does not configure an LYP file",
+                    "The Argon library does not configure a technology file",
                 )
                 .await;
             return Ok(());
@@ -1725,9 +1732,9 @@ mod tests {
             .expect("invocation should splice");
         let (typed, errors) = compile::static_compile(&ast).unwrap();
         assert!(errors.errors.is_empty(), "{:?}", errors.errors);
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let config = argonc::WorkspaceConfig::new(&source_path).with_lyp(Some(lyp));
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
+        let config = argonc::WorkspaceConfig::new(&source_path).with_tech(Some(tech));
         let output = compile::execute_cell_invocation(&typed, &invocation, &config);
         let CompileOutput::Valid(output) = output else {
             panic!("open cell should compile: {output:?}");
@@ -1756,15 +1763,15 @@ mod tests {
         let ast = parse::parse_workspace_with_std(&source_path).ast();
         let (typed, errors) = compile::static_compile(&ast).unwrap();
         assert!(errors.errors.is_empty(), "{:?}", errors.errors);
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
         let output = compile::execute_cell(
             &typed,
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(42.)],
             },
-            &argonc::WorkspaceConfig::default().with_lyp(Some(lyp)),
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
         );
         let output = match output {
             CompileOutput::Valid(output) => output,
