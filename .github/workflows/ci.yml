@@ -94,9 +94,6 @@ jobs:
           shared-key: ${{ runner.os }}-${{ matrix.rust }}
           cache-on-failure: true
       
-      - name: Build
-        run: cargo build --release
-      
       - name: Run tests
         run: cargo test --release --workspace
 
