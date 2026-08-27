@@ -115,6 +115,7 @@ mod tests {
     const ARGON_SKY130_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pdks/sky130");
     const ARGON_SKY130_LIB: &str = concatcp!(ARGON_SKY130_DIR, "/lib.ar");
     const SKY130_LYP: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.lyp");
+    const ARGON_SAR_ADC: &str = concatcp!(EXAMPLES_DIR, "/sar_adc/lib.ar");
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
@@ -1226,6 +1227,87 @@ mod tests {
 
         let work_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_inverter");
+        cells
+            .to_gds(
+                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
+                GdsUnits::new(1e-3, 1e-9),
+                work_dir.join("layout.gds"),
+            )
+            .expect("Failed to write to GDS");
+    }
+
+    /// The `sar_adc` example: an 8-bit, 25 MS/s differential SAR ADC built
+    /// on the sky130 primitives. Compiles the whole converter and each
+    /// block on its own, and runs the three `*_check` cells whose `eq`
+    /// assertions pin the geometry the design budget depends on -- an
+    /// over/underconstrained system or a drifted dimension fails
+    /// `is_valid()`.
+    #[test]
+    fn argon_sar_adc() {
+        let o = parse_workspace_with_std_and_deps(
+            ARGON_SAR_ADC,
+            [("sky130".to_string(), PathBuf::from(ARGON_SKY130_DIR))],
+        );
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+
+        for (cell, args) in [
+            ("spec_check", vec![]),
+            ("mom_unit_check", vec![]),
+            ("cdac_check", vec![]),
+            (
+                "cmp_latch_half",
+                vec![
+                    CellArg::Float(1_000.),
+                    CellArg::Float(1_600.),
+                    CellArg::Int(2),
+                ],
+            ),
+            (
+                "strongarm",
+                vec![
+                    CellArg::Float(1_000.),
+                    CellArg::Float(1_600.),
+                    CellArg::Int(8),
+                    CellArg::Int(4),
+                    CellArg::Int(2),
+                    CellArg::Int(2),
+                ],
+            ),
+            (
+                "sampler",
+                vec![
+                    CellArg::Float(1_000.),
+                    CellArg::Float(1_000.),
+                    CellArg::Int(8),
+                    CellArg::Int(16),
+                    CellArg::Int(4),
+                ],
+            ),
+            ("cdac_half_top", vec![]),
+        ] {
+            let out = compile(
+                &ast,
+                CompileInput {
+                    cell: &[cell],
+                    args,
+                    lyp_file: &PathBuf::from(SKY130_LYP),
+                },
+            );
+            assert!(out.is_valid(), "cell `{cell}` did not solve: {out:?}");
+        }
+
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["sar_adc_top"],
+                args: Vec::new(),
+                lyp_file: &PathBuf::from(SKY130_LYP),
+            },
+        );
+        assert!(cells.is_valid(), "{cells:?}");
+
+        let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sar_adc");
         cells
             .to_gds(
                 GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),

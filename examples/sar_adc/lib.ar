@@ -1,0 +1,1112 @@
+// =====================================================================
+// An 8-bit, 25 MS/s differential SAR ADC in Sky130.
+// =====================================================================
+//
+// Fully differential charge-redistribution SAR: a 16x16 binary-weighted
+// MOM capacitor array per side, a StrongARM latch comparator, CMOS
+// sampling switches, and the SAR register / bottom-plate drivers left as
+// an abstract block on a met4 pin interface.
+//
+// Every dimension below is in nanometres, matching sky130's 1 nm
+// database unit; every device comes from `sky130::fet1v8`, `::tap`, or
+// `::inv` in `pdks/sky130`.
+//
+// Entry point:
+//
+//   arc run --cell 'sar_adc_top()' --gds
+//
+// WHAT IS AND IS NOT ESTABLISHED HERE
+//
+// Argon is a layout language: it solves geometry, not circuits. What the
+// compiler proves is that the generator is fully constrained and that
+// the hierarchy resolves to legal GDS. It does NOT prove the layout is
+// DRC-clean, LVS-clean, or that the converter meets 25 MS/s -- there is
+// no extractor or simulator in this loop. The sizing below is derived
+// from a hand budget written out in full so the numbers can be checked,
+// and the geometry is dimensioned to sky130's rules as commented, but
+// signoff would need KLayout/Pegasus DRC and a Spectre/Xyce run over the
+// extracted netlist.
+//
+// The lateral-capacitance figure `c_lat_afnm` is the one number here
+// that is an estimate rather than a rule: it wants replacing with a
+// value from field solving or silicon before the array is trusted.
+//
+// =====================================================================
+// Process constants (Sky130, all lengths in nm).
+// =====================================================================
+
+fn m1_w()    -> Float { 140. }   // met1.1  min width
+fn m1_s()    -> Float { 140. }   // met1.2  min space
+fn v1_w()    -> Float { 150. }   // via.1a  exact via1 size
+fn v1_s()    -> Float { 170. }   // via.2   min via1 space
+fn v1_enc()  -> Float { 55.  }   // via.4a/5a met1/met2 enclosure of via1
+fn v1_pitch()-> Float { 320. }   // v1_w + v1_s
+
+// =====================================================================
+// Upper-metal rules (Sky130, nm).
+// =====================================================================
+
+fn m3_s()   -> Float { 300. }   // met3.2 min space (min width is 300 too)
+fn m4_s()   -> Float { 300. }   // met4.2 min space (min width is 300 too)
+fn v2_w()   -> Float { 200. }   // via2.1a exact size
+fn v2_s()   -> Float { 200. }
+fn v3_w()   -> Float { 200. }   // via3.1  exact size
+fn v3_s()   -> Float { 200. }
+
+// A met3 pad that lands both a via2 (met3 enclosure 65) and a via3
+// (met3 enclosure 65) needs 200 + 2*65 = 330; 400 leaves margin and
+// clears met3's 0.24 um^2 minimum-area rule on its own.
+fn pad_w()  -> Float { 400. }
+// met4 bus width and centre-to-centre pitch.
+fn bus_w()  -> Float { 400. }
+fn bus_p()  -> Float { 800. }
+
+// Device-level constants, matching what `sky130::fet1v8` draws.
+fn poly_p()  -> Float { 430. }   // poly / contact pitch in fet1v8
+fn poly_w()  -> Float { 150. }
+fn li_w()    -> Float { 170. }
+fn licon_w() -> Float { 170. }
+fn mcon_w()  -> Float { 170. }
+fn mcon_p()  -> Float { 360. }   // mcon.1 + mcon.2
+
+// Extend a device's gate fingers to span y0..y1 and land a poly / npc /
+// licon / li1 gate contact whose li1 bar sits at ty0. Returns that bar,
+// which is the gate terminal for further routing.
+fn gate_tap(fet: Any, nf: Int, y0: Float, y1: Float, ty0: Float) -> Rect {
+    let p = crect(layer="poly.drawing", w=poly_w(), y0=y0, y1=y1, x0=0.);
+    let pb = std::array(p, nf, poly_p(), 0.);
+    eq(pb.x0, fet.poly_bbox.x0);
+    eq(pb.y0, y0);
+
+    // Contact stack, concentric, using the same enclosures as sky130::inv.
+    let li = rect("li1.drawing", x0=fet.poly_bbox.x0 - 90., x1=fet.poly_bbox.x1 + 90.,
+                  y0=ty0, h=li_w())!;
+    let pbar = rect("poly.drawing", x0=li.x0, x1=li.x1, h=270.);
+    eq(pbar.y0 + pbar.y1, li.y0 + li.y1);
+    let npc = rect("npc.drawing", x0=fet.poly_bbox.x0 - 110., x1=fet.poly_bbox.x1 + 110., h=370.);
+    eq(npc.y0 + npc.y1, li.y0 + li.y1);
+
+    let licon = crect(layer="licon1.drawing", w=licon_w(), h=licon_w(), x0=0., y0=0.);
+    let lb = std::array(licon, nf, poly_p(), 0.);
+    eq(lb.x0, li.x0 + 80.);
+    eq(lb.y0, li.y0);
+    li
+}
+
+// met1 riser tying a li1 terminal to a met2 track, both spanning x0..x1.
+fn li_riser_m2(li: Rect, trk: Rect, x0: Float, x1: Float) -> Rect {
+    let p1 = rect("met1.drawing", x0=x0, x1=x1,
+                  y0=std::min(li.y0, trk.y0) - 60., y1=std::max(li.y1, trk.y1) + 60.);
+    m1_over_li(li, p1);
+    via1_array(p1, trk, v1_pitch());
+    p1
+}
+
+// li1 -> met1 -> met2 -> met3 pad stack, returning the met3 pad.
+fn li_to_m3(li: Rect, x0: Float, x1: Float) -> Rect {
+    let cy = (li.y0 + li.y1) / 2.;
+    let p1 = rect("met1.drawing", x0=x0, x1=x1, y0=cy - pad_w() / 2., y1=cy + pad_w() / 2.);
+    m1_over_li(li, p1);
+    let p2 = rect("met2.drawing", x0=x0, x1=x1, y0=p1.y0, y1=p1.y1);
+    via1_array(p1, p2, v1_pitch());
+    let p3 = rect("met3.drawing", x0=x0, x1=x1, y0=p1.y0, y1=p1.y1);
+    via2_array(p2, p3, v2_w() + v2_s());
+    p3
+}
+
+// Via-array helpers. Each fills the overlap of two metals with a
+// centred array, so the enclosure falls out of how much wider the
+// metals are than the array itself.
+// Fill the r1/r2 overlap with a centred via array at the given pitch.
+fn via_array(layer: String, size: Float, pitch: Float, r1: Rect, r2: Rect) {
+    let v = crect(layer=layer, w=size, h=size, x0=0., y0=0.);
+    let ovl = std::intersection(r1, r2);
+    let arr = std::max_array(v, ovl.w, ovl.h, pitch, pitch);
+    eq(arr.x0 - ovl.x0, ovl.x1 - arr.x1);
+    eq(arr.y0 - ovl.y0, ovl.y1 - arr.y1);
+}
+
+fn via2_array(r1: Rect, r2: Rect, pitch: Float) {
+    via_array("via2.drawing", v2_w(), pitch, r1, r2);
+}
+
+fn via3_array(r1: Rect, r2: Rect, pitch: Float) {
+    via_array("via3.drawing", v3_w(), pitch, r1, r2);
+}
+
+// Stack met3 and met4 pads on a met2 pad and return the met4 pad. The
+// met2 pad must be at least `pad_w()` on a side so every via lands with
+// its full enclosure.
+fn via1_array(r1: Rect, r2: Rect, pitch: Float) {
+    via_array("via.drawing", v1_w(), pitch, r1, r2);
+}
+
+// =====================================================================
+// Design budget.
+// =====================================================================
+//
+// SAMPLE RATE.  25 MS/s -> Ts = 40 ns, split
+//
+//     sampling    12 ns
+//     conversion  28 ns  = 8 bits x 3.5 ns
+//
+//   and each 3.5 ns bit cycle split
+//
+//     comparator  1.3 ns  regeneration, reset, and metastability tail
+//     SAR logic   0.8 ns  latch plus the asynchronous completion chain
+//     DAC settle  1.4 ns  bottom plate to within 0.5 LSB
+//
+// UNIT CAPACITOR: SET BY MATCHING, NOT NOISE.  At the MSB transition a
+// binary array switches 2^(N-1) units against 2^(N-1), so
+//
+//     sigma_DNL = sqrt(2^N) * (sigma_u / C_u)   LSB,
+//
+// doubled in variance across the two independent halves. Holding 3 sigma
+// under 0.5 LSB at N = 8 needs
+//
+//     sigma_u / C_u  <=  0.5 / (3 * sqrt(2) * 16)  =  0.74 %,
+//
+// which a ~4 fF MOM unit reaches and a 2 fF one (nearer 1 %) does not.
+// Hence C_u = 4 fF, C_total = 256 * 4 fF = 1.024 pF per side.
+//
+// Sampling noise is then far from binding: sqrt(kT/C) = 64 uV per side,
+// 90 uV differential, against an LSB of 1.8 V / 256 = 7.0 mV and a
+// quantisation noise of LSB/sqrt(12) = 2.0 mV. Matching sets the unit,
+// with ~22x of margin on noise.
+//
+// SAMPLING SWITCH.  Settling to 0.5 LSB is ln(2^9) = 6.2 time constants,
+// so 12 ns of sampling allows tau <= 1.9 ns and R_on <= 1.9 kohm into
+// 1.024 pF. A W_n = 8 um / W_p = 16 um CMOS gate runs 300-700 ohm across
+// the input range -- about 16 tau of settling. That margin is precisely
+// why an 8-bit converter at this rate needs no bootstrapped switch.
+//
+// COMPARATOR.  Regeneration tau = C_L/g_m; at g_m/I_D = 15 S/A and
+// I_D = 100 uA, g_m = 1.5 mS into C_L ~ 20 fF gives tau = 13 ps. Walking
+// a 1 mV overdrive to the rail is ln(900) = 6.8 tau = 92 ps, and with
+// ~200 ps of integration the typical decision lands near 300 ps, leaving
+// most of the 1.3 ns budget for the metastability tail. A 4 um input
+// pair puts input-referred noise well under LSB/2.
+//
+// BOTTOM-PLATE DRIVERS.  `drv_nf` below turns the 1.4 ns settling
+// budget into a finger count per bit; see the comment there.
+//
+// =====================================================================
+
+fn nbits_spec()   -> Int   { 8 }
+fn ts_ps()        -> Float { 40000. }   // 1 / 25 MS/s
+fn t_sample_ps()  -> Float { 12000. }
+fn t_cmp_ps()     -> Float { 1300. }
+fn t_logic_ps()   -> Float { 800. }
+fn t_dac_ps()     -> Float { 1400. }
+
+// Conversion has to fit in what sampling leaves.
+fn t_bit_ps()     -> Float { t_cmp_ps() + t_logic_ps() + t_dac_ps() }
+fn t_conv_ps()    -> Float { (nbits_spec() as Float) * t_bit_ps() }
+
+fn cu_af()        -> Float { 4000. }    // 4 fF unit capacitor
+// met1-to-met1 lateral coupling at 140 nm spacing, aF per nm of facing
+// edge. ESTIMATE -- see the header.
+fn c_lat_afnm()   -> Float { 0.1 }
+
+fn vdd_mv()       -> Float { 1800. }
+fn r_on_w()       -> Float { 4.5 }      // R_on * W, kohm*um, 1.8 V device
+fn fet_w()        -> Float { 1000. }    // per-finger device width
+
+// Snap to sky130's 5 nm manufacturing grid.
+fn snap5(x: Float) -> Float { ((x / 5.) as Int) as Float * 5. }
+
+// Number of time constants to settle an (nbits+1)-bit step: ln(2)*(N+1).
+fn settle_taus(nbits: Int) -> Float { ((nbits + 1) as Float) * 0.693 }
+
+// Finger length that makes a `mom_unit` come out at `cu_af`. The tile
+// presents 2*(na-1) A-to-B gaps per layer on two layers, each facing
+// over `lf - m1_s()`:
+//
+//     C = 4 * (na - 1) * (lf - m1_s()) * c_lat
+//
+fn cap_finger_len(na: Int, cu: Float, c_lat: Float) -> Float {
+    snap5(cu / (4. * ((na - 1) as Float) * c_lat) + m1_s())
+}
+
+// Bottom-plate driver for bit k drives 2^k units and has the same
+// settling budget as every other bit, so
+//
+//     tau  = t_dac / ln(2^(nbits+1))
+//     R_k  = tau / (2^k * C_u)
+//     W_k  = (R_on*W) / R_k
+//
+// Taking tau in ps, C in aF, and R_on*W in kohm*um makes the two factors
+// of 1e3 cancel, so W_k comes out directly in nm.
+//
+// For nbits = 8 this gives 11, 6, 3, 2, 1, 1, 1, 1 fingers for bits
+// 7..0 at 1 um per finger -- 26 fingers of drive in total.
+fn drv_nf(k: Int, nbits: Int) -> Int {
+    let tau_ps = t_dac_ps() / settle_taus(nbits);
+    let w_nm = r_on_w() * (pow2(k) as Float) * cu_af() / tau_ps;
+    let n = ((w_nm + fet_w() - 1.) / fet_w()) as Int;    // ceil
+    if n < 1 { 1 } else { n }
+}
+
+fn drv_nf_total(k: Int, nbits: Int) -> Int {
+    if k < 0 { 0 } else { drv_nf(k, nbits) + drv_nf_total(k - 1, nbits) }
+}
+
+// Abstract-block floorplan: a driver row wide enough for `drv_nf_total`
+// fingers of sky130::inv, plus ~550 um^2 of standard cells for the 8 bit
+// registers, the completion chain, and the clock generator (about 60
+// cells on a 2.72 um row at 60 % utilisation).
+fn logic_h()      -> Float { 9000. }
+fn logic_cells()  -> Float { 550000000. }   // nm^2 of standard cells
+fn logic_min_w(nbits: Int) -> Float {
+    // 710 nm is the fixed overhead of one sky130::inv either side of its
+    // poly array; there are nbits + 1 drivers counting the dummy.
+    (drv_nf_total(nbits - 1, nbits) as Float) * poly_p()
+        + ((nbits + 1) as Float) * 710.
+        + logic_cells() / logic_h()
+}
+
+// =====================================================================
+// MOM unit capacitor.
+// =====================================================================
+//
+// Interdigitated met1+met2 comb. `na` A-fingers alternate with `na-1`
+// B-fingers so that BOTH outermost fingers belong to A (the shared top
+// plate). Abutted units therefore present A to A across the tile
+// boundary, and because every top plate in the array is one electrical
+// node, inter-unit coupling contributes nothing to DAC error.
+//
+//   +-+---+---+---+---+---+---+-+   A spine, spans the full tile width
+//     |   |   |   |   |   |   |
+//     A   B   A   B   A   B   A     vertical fingers, met1 + met2
+//     |   |   |   |   |   |   |
+//       +-+---+---+---+---+-+       B spine, stops short of both edges
+//
+// `lf` sets the A/B facing length and therefore the capacitance:
+//
+//   C = 2 layers * 2*(na-1) gaps * (lf - gap) * c_lat
+//
+fn cap_spine() -> Float { 300. }  // spine height (>= v1_w + 2*v1_enc = 260)
+
+cell mom_unit(na: Int, lf: Float) {
+    let nf = 2 * na - 1;                       // total fingers
+    let p = m1_w() + m1_s();                   // finger pitch, 280
+    let w = (nf as Float) * p;                 // tile width
+    let sp = cap_spine();
+
+    // B spine: bottom of the tile. Stops short of the tile edge so that
+    // abutted tiles do NOT merge their bottom plates -- bottom-plate
+    // continuity is added explicitly, one rail at a time.
+    let bspine_m1 = rect("met1.drawing", x0=p, x1=w - p - m1_w(), y0=0., y1=sp);
+    let bspine_m2 = rect("met2.drawing", x0=p, x1=w - p - m1_w(), y0=0., y1=sp);
+
+    // A spine: top of the tile, full width, so abutted tiles merge into
+    // one continuous top plate.
+    let aspine_m1 = rect("met1.drawing", x0=0., x1=w, y0=sp + lf + m1_s(), y1=sp + lf + m1_s() + sp);
+    let aspine_m2 = rect("met2.drawing", x0=0., x1=w, y0=sp + lf + m1_s(), y1=sp + lf + m1_s() + sp);
+
+    // A fingers hang down from the A spine; B fingers rise from the B
+    // spine. Each pair overlaps over `lf - m1_s()`.
+    let af_m1 = crect(layer="met1.drawing", w=m1_w(), y0=sp + m1_s(), y1=sp + m1_s() + lf, x0=0.);
+    let af_m1_bbox = std::array(af_m1, na, 2. * p, 0.);
+    eq(af_m1_bbox.x0, 0.);
+    eq(af_m1_bbox.y0, af_m1.y0);
+    let af_m2 = crect(layer="met2.drawing", w=m1_w(), y0=sp + m1_s(), y1=sp + m1_s() + lf, x0=0.);
+    let af_m2_bbox = std::array(af_m2, na, 2. * p, 0.);
+    eq(af_m2_bbox.x0, 0.);
+    eq(af_m2_bbox.y0, af_m2.y0);
+
+    let bf_m1 = crect(layer="met1.drawing", w=m1_w(), y0=sp, y1=sp + lf, x0=0.);
+    let bf_m1_bbox = std::array(bf_m1, na - 1, 2. * p, 0.);
+    eq(bf_m1_bbox.x0, p);
+    eq(bf_m1_bbox.y0, bf_m1.y0);
+    let bf_m2 = crect(layer="met2.drawing", w=m1_w(), y0=sp, y1=sp + lf, x0=0.);
+    let bf_m2_bbox = std::array(bf_m2, na - 1, 2. * p, 0.);
+    eq(bf_m2_bbox.x0, p);
+    eq(bf_m2_bbox.y0, bf_m2.y0);
+
+    // Stitch met1 to met2 along both spines.
+    via1_array(aspine_m1, aspine_m2, v1_pitch());
+    via1_array(bspine_m1, bspine_m2, v1_pitch());
+}
+
+// =====================================================================
+// CDAC rows and pairs.
+// =====================================================================
+//
+// A `cdac_row` is `nu` cap tiles abutted in x. Their A spines merge on
+// contact, and one met1+met2 rail ties the `nu` bottom plates into a
+// single node. Because the rail lives inside the row cell, abutting two
+// row cells in x does NOT join their bottom plates -- that is how the
+// LSB weights get split out of one physical row.
+
+fn cap_tile_w(na: Int) -> Float {
+    ((2 * na - 1) as Float) * (m1_w() + m1_s())
+}
+
+fn cap_row_insts(cap: Any, n: Int, pitch: Float) -> [Any] {
+    if n == 0 {
+        []
+    } else {
+        let child = inst(cap);
+        if n == 1 {
+            cons(child, [])
+        } else {
+            let rest = cap_row_insts(cap, n - 1, pitch);
+            let next = head(rest);
+            eq(child.x, next.x + pitch);
+            eq(child.y, next.y);
+            cons(child, rest)
+        }
+    }
+}
+
+cell cdac_row(nu: Int, na: Int, lf: Float) {
+    let cap = mom_unit(na, lf);
+    let tiles = cap_row_insts(cap, nu, cap_tile_w(na));
+    let left = std::last(tiles);
+    let right = head(tiles);
+    eq(left.x, 0.);
+    eq(left.y, 0.);
+
+    // Bottom-plate rail: one node for the whole row.
+    let brail_m1 = rect("met1.drawing", x0=left.bspine_m1.x0, x1=right.bspine_m1.x1,
+                        y0=left.bspine_m1.y0, y1=left.bspine_m1.y1)!;
+    let brail_m2 = rect("met2.drawing", x0=left.bspine_m2.x0, x1=right.bspine_m2.x1,
+                        y0=left.bspine_m2.y0, y1=left.bspine_m2.y1)!;
+
+    // Top-plate rail handle (the tile A spines are already contiguous).
+    let arail_m1 = rect("met1.drawing", x0=left.aspine_m1.x0, x1=right.aspine_m1.x1,
+                        y0=left.aspine_m1.y0, y1=left.aspine_m1.y1)!;
+    let arail_m2 = rect("met2.drawing", x0=left.aspine_m2.x0, x1=right.aspine_m2.x1,
+                        y0=left.aspine_m2.y0, y1=left.aspine_m2.y1)!;
+}
+
+// A `cdac_pair` is two rows mirrored about their shared bottom-plate
+// rail, so one pair carries 2*nu units on a single node and presents a
+// top-plate rail at both its bottom and its top edge.
+cell cdac_pair(nu: Int, na: Int, lf: Float) {
+    let row = cdac_row(nu, na, lf);
+    // Both rows sit at x=0 so their spines line up column for column.
+    let bot = inst(row, x=0., reflect=true);
+    let top = inst(row, x=0.);
+    eq(bot.y, top.y);
+    eq(top.y, cap_row_h(na, lf));
+    eq(bot.brail_m1.y1, top.brail_m1.y0);
+}
+
+fn cap_row_h(na: Int, lf: Float) -> Float {
+    2. * cap_spine() + lf + m1_s()
+}
+
+fn stack_m2_m4(m2pad: Rect, pitch: Float) -> Rect {
+    // A met2 rail can be shorter than pad_w() in one axis (a 300 nm
+    // single-row rail, say). Grow the met3/met4 pads about the met2
+    // centre so via2's 65 nm met3 enclosure always fits, then let the
+    // via array centre itself in the met2 overlap.
+    let cx = (m2pad.x0 + m2pad.x1) / 2.;
+    let cy = (m2pad.y0 + m2pad.y1) / 2.;
+    let hw = std::max((m2pad.x1 - m2pad.x0) / 2., pad_w() / 2.);
+    let hh = std::max((m2pad.y1 - m2pad.y0) / 2., pad_w() / 2.);
+    let p3 = rect("met3.drawing", x0=cx - hw, x1=cx + hw, y0=cy - hh, y1=cy + hh);
+    via2_array(m2pad, p3, pitch);
+    let p4 = rect("met4.drawing", x0=cx - hw, x1=cx + hw, y0=cy - hh, y1=cy + hh);
+    via3_array(p3, p4, pitch);
+    p4
+}
+
+// =====================================================================
+// One half of the differential CDAC.
+// =====================================================================
+//
+// Stack, bottom to top:
+//
+//   pair (npairs-1)   32 units   \
+//        ...                      >  bits 5 .. nbits-1
+//   pair 0            32 units   /
+//   --- m1 space ---
+//   bit-4 row         16 units      bit 4      (rail on top)
+//   segment row       16 units      bits 3..0 + dummy, rail split
+//                                   8 / 4 / 2 / 1 / 1 by column
+//
+// Every A spine in the stack touches its neighbour, so the whole array
+// is one top plate. Each bottom-plate rail leaves on its own met4 bus:
+// bits 4..nbits-1 exit left through the side channel, bits 3..0 and the
+// dummy drop straight down out of the segment row.
+
+fn pow2(n: Int) -> Int {
+    if n <= 0 { 1 } else { 2 * pow2(n - 1) }
+}
+
+fn npairs(nbits: Int) -> Int {
+    // 2^(nbits-5) - 1 pairs of 32 units cover bits 5 .. nbits-1.
+    pow2(nbits - 5) - 1
+}
+
+fn pair_stack(pair: Any, n: Int, pitch: Float) -> [Any] {
+    if n == 0 {
+        []
+    } else {
+        let child = inst(pair);
+        if n == 1 {
+            cons(child, [])
+        } else {
+            let rest = pair_stack(pair, n - 1, pitch);
+            let next = head(rest);
+            eq(child.x, next.x);
+            eq(child.y, next.y - pitch);
+            cons(child, rest)
+        }
+    }
+}
+
+// Bring one bottom-plate rail out to its met4 bus.
+//
+//  * `pad`  met2 pad, >= pad_w() on a side, overlapping the rail.
+//  * `ybot` where the bus ends (the SAR-logic port line).
+//
+// Returns the met4 bus so the caller can constrain its port end.
+fn rail_to_bus(pad: Rect, ybot: Float) -> Rect {
+    let p4 = stack_m2_m4(pad, v2_w() + v2_s());
+    let bus = rect("met4.drawing", x0=p4.x0, x1=p4.x1, y0=ybot, y1=p4.y1);
+    bus
+}
+
+cell cdac_half(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
+    let w = cap_tile_w(na);
+    let h = cap_row_h(na, lf);
+    let np = npairs(nbits);
+    let aw = 16. * w;                      // array width: always 16 columns
+
+    // ---- segment row: bits 3..0 plus the dummy, split 8/4/2/1/1 ----
+    let s8 = inst(cdac_row(8, na, lf), x=0., y=0.);
+    let s4 = inst(cdac_row(4, na, lf), y=0.);
+    let s2 = inst(cdac_row(2, na, lf), y=0.);
+    let s1 = inst(cdac_row(1, na, lf), y=0.);
+    let sd = inst(cdac_row(1, na, lf), y=0.);
+    eq(s4.x, s8.x + 8. * w);
+    eq(s2.x, s4.x + 4. * w);
+    eq(s1.x, s2.x + 2. * w);
+    eq(sd.x, s1.x + 1. * w);
+
+    // ---- bit-4 row: mirrored, so its rail faces up ----
+    let r16 = cdac_row(16, na, lf);
+    let b4 = inst(r16, x=0., y=2. * h, reflect=true);
+
+    // ---- pair stack: bits 5 .. nbits-1, one m1 space above bit 4 ----
+    let pair = cdac_pair(16, na, lf);
+    let pairs = pair_stack(pair, np, 2. * h);
+    eq(head(pairs).x, 0.);
+    eq(head(pairs).y, 2. * h + m1_s());
+    let atop = 2. * h + m1_s() + (np as Float) * 2. * h;
+
+    // ---- top plate ----
+    // One met2/met3/met4 column on the right edge. Every A spine runs
+    // the full tile width so it reaches x = aw; every bottom-plate rail
+    // stops a tile pitch short of it, so the column picks up the top
+    // plate and nothing else.
+    let tp_m2 = rect("met2.drawing", x0=b4.brail_m2.x1 + m1_s(), x1=aw + 4. * pad_w(),
+                     y0=0., y1=atop)!;
+    let tp_m3 = rect("met3.drawing", x0=tp_m2.x0, x1=tp_m2.x1, y0=tp_m2.y0, y1=tp_m2.y1);
+    via2_array(tp_m2, tp_m3, 2. * pad_w());
+    let tp = rect("met4.drawing", x0=tp_m2.x0, x1=tp_m2.x1, y0=ytp, y1=tp_m2.y1)!;
+    via3_array(tp_m3, tp, 2. * pad_w());
+
+    // ---- bits 3..0 and the dummy: straight down out of the segments ----
+    let d3 = lsb_bus(s8.brail_m2, yport);
+    let d2 = lsb_bus(s4.brail_m2, yport);
+    let d1 = lsb_bus(s2.brail_m2, yport);
+    let d0 = lsb_bus(s1.brail_m2, yport);
+    let dd = lsb_bus(sd.brail_m2, yport);
+
+    // ---- bit 4: out through the left channel ----
+    let u4 = msb_bus(b4.brail_m2, 1, yport);
+
+    // ---- bits 5 .. nbits-1 ----
+    // Bit 5+j is 2^j pairs, taken in order from the bottom of the stack,
+    // so a bit's caps are contiguous. A production array would scramble
+    // this into a common-centroid pattern to trade routing for gradient
+    // rejection; the bus geometry below does not depend on the choice.
+    for j in std::range(nbits - 5) {
+        for k in std::range(pow2(j)) {
+            let p = pairs[pow2(j) - 1 + k];
+            let rail = rect("met2.drawing", x0=p.bot.brail_m2.x0, x1=p.bot.brail_m2.x1,
+                            y0=p.bot.brail_m2.y0, y1=p.top.brail_m2.y1);
+            msb_bus(rail, j + 2, yport);
+        }
+    }
+}
+
+// A segment rail exits downward on met4, centred on the rail.
+fn lsb_bus(rail: Rect, yport: Float) -> Rect {
+    let cx = (rail.x0 + rail.x1) / 2.;
+    let pad = rect("met2.drawing", x0=cx - pad_w() / 2., x1=cx + pad_w() / 2.,
+                   y0=rail.y1 - pad_w(), y1=rail.y1);
+    rail_to_bus(pad, yport)
+}
+
+// A rail in the stack exits left on met2 into side-channel column `col`
+// (1 = nearest the array), then down on met4.
+fn msb_bus(rail: Rect, col: Int, yport: Float) -> Rect {
+    let bx1 = -(col as Float) * bus_p() + bus_w();
+    let ext = rect("met2.drawing", x0=bx1 - pad_w(), x1=rail.x0, y0=rail.y0, y1=rail.y1);
+    let pad = rect("met2.drawing", x0=bx1 - pad_w(), x1=bx1, y0=rail.y0, y1=rail.y1);
+    rail_to_bus(pad, yport)
+}
+
+// =====================================================================
+// Device-level helpers.
+// =====================================================================
+//
+// `sky130::fet1v8` draws a multi-finger device and the bounding box of
+// its nf+1 li1 source/drain strips, but not the individual strips, so a
+// caller that needs source and drain separately re-draws them at 2x the
+// 430 nm contact pitch -- the same thing `sky130::inv` does internally.
+// Strip 0 is a source, strip 1 a drain, and so on.
+
+// Strips of one parity running up from a device onto `lane`.
+fn strips_up(fet: Any, nf: Int, drain: Bool, lane: Rect) -> Rect {
+    let n = if drain { (nf + 1) / 2 } else { nf + 1 - (nf + 1) / 2 };
+    let d = crect(layer="li1.drawing", w=li_w(), y0=fet.li1_bbox.y0, y1=lane.y1, x0=0.);
+    let bx = std::array(d, n, 2. * poly_p(), 0.);
+    if drain {
+        eq(bx.x0, fet.li1_bbox.x0 + poly_p());
+    } else {
+        eq(bx.x0, fet.li1_bbox.x0);
+    }
+    eq(bx.y1, lane.y1);
+    bx
+}
+
+// met1 over li1, stitched with a centred mcon array.
+fn m1_over_li(li: Rect, m1: Rect) {
+    via_array("mcon.drawing", mcon_w(), mcon_p(), li, m1);
+}
+
+// =====================================================================
+// Comparator: StrongARM latch.
+// =====================================================================
+//
+// `cmp_latch_half` is one side of the regenerative core: an inverter
+// whose NMOS source is brought out as a terminal instead of being tied
+// to VSS, so two of them mirrored about a shared ntap form the
+// cross-coupled pair sitting on top of the input pair.
+//
+// The lane structure is `sky130::inv`'s: a drain lane below the gate
+// lane, a drain lane above it, and a vertical li1 strap on the far side
+// of the gate bar joining the two. That strap is the output node.
+
+fn nw_enc()  -> Float { 180. }   // nwell enclosure of diff/tap sdm
+fn sd_gap()  -> Float { 380. }   // sdm-to-sdm space between devices
+
+cell cmp_latch_half(wn: Float, wp: Float, nf: Int) {
+    let nmos = inst(sky130::fet1v8(true, wn, nf), x=0., y=0.);
+    let pmos = inst(sky130::fet1v8(false, wp, nf), x=0.);
+    let ntap = inst(sky130::tap(1, pmos.sdm.w - 260., 800.));
+    eq(pmos.li1_bbox.y1 + 100., ntap.sdm.y0);
+    eq(ntap.sdm.x0, pmos.sdm.x0);
+    let nwell = rect("nwell.drawing", x0=pmos.sdm.x0 - nw_enc(), x1=pmos.sdm.x1 + nw_enc(),
+                     y0=pmos.sdm.y0 - nw_enc(), y1=ntap.sdm.y1 + nw_enc());
+
+    // Three li1 lanes between the devices.
+    let o_li_bot = rect("li1.drawing", x0=nmos.li1_bbox.x0 + poly_p(),
+                        y0=nmos.li1_bbox.y1 + li_w(), h=li_w());
+    let a_li_mid = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90.,
+                        y0=o_li_bot.y1 + li_w(), h=li_w())!;
+    let o_li_top = rect("li1.drawing", x0=o_li_bot.x0, y0=a_li_mid.y1 + li_w(), h=li_w())!;
+    eq(o_li_top.y1 + li_w(), pmos.li1_bbox.y0);
+
+    // Output strap, clear of the gate bar.
+    let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + li_w(), w=li_w(),
+                          y0=o_li_bot.y0, y1=o_li_top.y1)!;
+    eq(o_li_bot.x1, o_li_right.x1);
+    eq(o_li_top.x1, o_li_right.x1);
+
+    // Drains up from the NMOS and down from the PMOS onto their lanes.
+    let dn = crect(layer="li1.drawing", w=li_w(), y0=nmos.li1_bbox.y0, y1=o_li_bot.y1, x0=0.);
+    let dn_bbox = std::array(dn, (nf + 1) / 2, 2. * poly_p(), 0.);
+    eq(dn_bbox.x0, o_li_bot.x0);
+    eq(dn_bbox.y1, o_li_bot.y1);
+    let dp = crect(layer="li1.drawing", w=li_w(), y0=o_li_top.y0, y1=pmos.li1_bbox.y1, x0=0.);
+    let dp_bbox = std::array(dp, (nf + 1) / 2, 2. * poly_p(), 0.);
+    eq(dp_bbox.x0, o_li_top.x0);
+    eq(dp_bbox.y0, o_li_top.y0);
+
+    // PMOS sources up to the ntap.
+    let sp = crect(layer="li1.drawing", w=li_w(), y1=ntap.li1.y1, y0=pmos.li1_bbox.y0, x0=0.);
+    let sp_bbox = std::array(sp, nf + 1 - (nf + 1) / 2, 2. * poly_p(), 0.);
+    eq(sp_bbox.x0, pmos.li1_bbox.x0);
+    eq(sp_bbox.y1, ntap.li1.y1);
+
+    // NMOS sources down onto a lane of their own: this is the terminal
+    // that the input pair drives.
+    let s_bar = rect("li1.drawing", y1=nmos.li1_bbox.y0 - li_w(), h=li_w(),
+                     x0=nmos.li1_bbox.x0, x1=nmos.li1_bbox.x1)!;
+    let sn = crect(layer="li1.drawing", w=li_w(), y0=s_bar.y0, y1=nmos.li1_bbox.y1, x0=0.);
+    let sn_bbox = std::array(sn, nf + 1 - (nf + 1) / 2, 2. * poly_p(), 0.);
+    eq(sn_bbox.x0, nmos.li1_bbox.x0);
+    eq(sn_bbox.y0, s_bar.y0);
+
+    // Shared gate: one poly array across both devices, contacted in the
+    // middle lane.
+    let poly = crect(layer="poly.drawing", w=poly_w(), y0=nmos.poly_bbox.y0,
+                     y1=pmos.poly_bbox.y1, x0=0.);
+    let poly_bbox = std::array(poly, nf, poly_p(), 0.);
+    eq(poly_bbox.x0, nmos.poly_bbox.x0);
+    eq(poly_bbox.y0, nmos.poly_bbox.y0);
+    let a_poly = rect("poly.drawing", x0=a_li_mid.x0, x1=a_li_mid.x1, h=270.);
+    eq(a_poly.y0 + a_poly.y1, a_li_mid.y0 + a_li_mid.y1);
+    let a_npc = rect("npc.drawing", x0=nmos.poly_bbox.x0 - 110., x1=nmos.poly_bbox.x1 + 110., h=370.);
+    eq(a_npc.y0 + a_npc.y1, a_li_mid.y0 + a_li_mid.y1);
+    let licon = crect(layer="licon1.drawing", w=licon_w(), h=licon_w(), x0=0., y0=0.);
+    let licon_bbox = std::array(licon, nf, poly_p(), 0.);
+    eq(licon_bbox.x0, a_li_mid.x0 + 80.);
+    eq(licon_bbox.y0, a_li_mid.y0);
+}
+
+// Vertical li1 strap joining a lower lane to an upper lane, placed clear
+// of both the gate bar between them and the device's own contacts.
+fn lane_strap(lower: Rect, upper: Rect, gate: Rect, contacts: Rect) -> Rect {
+    let x0 = std::max(gate.x1 + li_w(), contacts.x1 + li_w());
+    rect("li1.drawing", x0=x0, w=li_w(), y0=lower.y0, y1=upper.y1)
+}
+
+// Source strips running down from a device onto `lane`.
+fn src_down(fet: Any, nf: Int, lane: Rect) -> Rect {
+    let s = crect(layer="li1.drawing", w=li_w(), y0=lane.y0, y1=fet.li1_bbox.y1, x0=0.);
+    let bx = std::array(s, nf + 1 - (nf + 1) / 2, 2. * poly_p(), 0.);
+    eq(bx.x0, fet.li1_bbox.x0);
+    eq(bx.y0, lane.y0);
+    bx
+}
+
+// StrongARM latch. Stack, bottom to top:
+//
+//   ntap  (VDD)                     reset PMOS pair, gates on CLK
+//   gate lane / drain lane
+//   reset PMOS row
+//   VDD lane
+//   cmp_latch_half  x2              cross-coupled core, outputs in the
+//                                   middle, gate bars on the outside
+//   gate lane (VIP / VIN)
+//   drain lane (DIN / DIP)
+//   input pair M1 | M2
+//   tail lane
+//   gate lane (CLK)
+//   drain lane
+//   tail device
+//   ptap  (VSS)
+cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_rst: Int) {
+    // ---- tail ----
+    let mclk = inst(sky130::fet1v8(true, wn, nf_tail), x=0., y=0.);
+    let ptap = inst(sky130::tap(0, mclk.sdm.w - 260., 800.));
+    eq(ptap.sdm.y1 + 100., mclk.sdm.y0);
+    eq(ptap.sdm.x0, mclk.sdm.x0);
+    let vss = src_down(mclk, nf_tail, ptap.li1);
+
+    let t_dn = rect("li1.drawing", y0=mclk.li1_bbox.y1 + li_w(), h=li_w(),
+                    x0=mclk.li1_bbox.x0 + poly_p(), x1=mclk.li1_bbox.x1)!;
+    strips_up(mclk, nf_tail, true, t_dn);
+    let clk_n = gate_tap(mclk, nf_tail, mclk.poly_bbox.y0, t_dn.y1 + li_w() + 250.,
+                         t_dn.y1 + li_w());
+
+    // ---- input pair ----
+    let tail = rect("li1.drawing", y0=clk_n.y1 + li_w(), h=li_w())!;
+    let m1 = inst(sky130::fet1v8(true, wn, nf_in));
+    let m2 = inst(sky130::fet1v8(true, wn, nf_in));
+    eq(m1.li1_bbox.y0, tail.y1 + li_w());
+    eq(m2.li1_bbox.y0, m1.li1_bbox.y0);
+    eq(m2.sdm.x0, m1.sdm.x1 + sd_gap());
+    // Centre the pair on the tail device.
+    eq(m1.sdm.x0 + m2.sdm.x1, mclk.sdm.x0 + mclk.sdm.x1);
+    eq(tail.x0, m1.li1_bbox.x0);
+    eq(tail.x1, m2.li1_bbox.x1);
+    src_down(m1, nf_in, tail);
+    src_down(m2, nf_in, tail);
+    lane_strap(t_dn, tail, clk_n, mclk.li1_bbox);
+
+    // ---- input drains and gates ----
+    let din = rect("li1.drawing", y0=m1.li1_bbox.y1 + li_w(), h=li_w(),
+                   x0=m1.li1_bbox.x0 + poly_p(), x1=m1.li1_bbox.x1)!;
+    let dip = rect("li1.drawing", y0=din.y0, y1=din.y1,
+                   x0=m2.li1_bbox.x0 + poly_p(), x1=m2.li1_bbox.x1)!;
+    strips_up(m1, nf_in, true, din);
+    strips_up(m2, nf_in, true, dip);
+    let vip = gate_tap(m1, nf_in, m1.poly_bbox.y0, din.y1 + li_w() + 250., din.y1 + li_w());
+    let vin = gate_tap(m2, nf_in, m2.poly_bbox.y0, din.y1 + li_w() + 250., din.y1 + li_w());
+
+    // ---- regenerative core ----
+    let lh = cmp_latch_half(wn, wp, nf_lat);
+    let ln = inst(lh);
+    let lp = inst(lh, reflect=true, angle=180);
+    eq(ln.s_bar.y0, vip.y1 + li_w());
+    eq(lp.s_bar.y0, ln.s_bar.y0);
+    eq(lp.o_li_right.x0, ln.o_li_right.x1 + li_w());
+    eq(ln.nmos.li1_bbox.x0, m1.li1_bbox.x0);
+    lane_strap(din, ln.s_bar, vip, m1.li1_bbox);
+    lane_strap(dip, lp.s_bar, vin, m2.li1_bbox);
+
+    // ---- reset PMOS pair ----
+    let vdd_lane = rect("li1.drawing", y0=ln.ntap.li1.y1 + li_w(), h=li_w(),
+                        x0=ln.ntap.li1.x0, x1=lp.ntap.li1.x1)!;
+    let r7 = inst(sky130::fet1v8(false, wp, nf_rst));
+    let r8 = inst(sky130::fet1v8(false, wp, nf_rst));
+    eq(r7.li1_bbox.y0, vdd_lane.y1 + li_w());
+    eq(r8.li1_bbox.y0, r7.li1_bbox.y0);
+    eq(r8.sdm.x0, r7.sdm.x1 + sd_gap());
+    eq(r7.sdm.x0 + r8.sdm.x1, ln.pmos.sdm.x0 + lp.pmos.sdm.x1);
+    src_down(r7, nf_rst, vdd_lane);
+    src_down(r8, nf_rst, vdd_lane);
+
+    let r7d = rect("li1.drawing", y0=r7.li1_bbox.y1 + li_w(), h=li_w(),
+                   x0=r7.li1_bbox.x0 + poly_p(), x1=r7.li1_bbox.x1)!;
+    let r8d = rect("li1.drawing", y0=r7d.y0, y1=r7d.y1,
+                   x0=r8.li1_bbox.x0 + poly_p(), x1=r8.li1_bbox.x1)!;
+    strips_up(r7, nf_rst, true, r7d);
+    strips_up(r8, nf_rst, true, r8d);
+    let clk_p7 = gate_tap(r7, nf_rst, r7.poly_bbox.y0, r7d.y1 + li_w() + 250., r7d.y1 + li_w());
+    let clk_p8 = gate_tap(r8, nf_rst, r8.poly_bbox.y0, r8d.y1 + li_w() + 250., r8d.y1 + li_w());
+
+    let ntap2 = inst(sky130::tap(1, r8.sdm.x1 - r7.sdm.x0 - 260., 800.));
+    eq(ntap2.sdm.y0, clk_p8.y1 + 300.);
+    eq(ntap2.sdm.x0, r7.sdm.x0);
+    let vdd2 = rect("li1.drawing", x0=ntap2.li1.x0, x1=ntap2.li1.x1,
+                    y0=ntap2.li1.y0, y1=ntap2.li1.y1)!;
+
+    // One nwell over both PMOS regions and the reset row.
+    let nwell = rect("nwell.drawing", x0=ln.nwell.x0, x1=lp.nwell.x1,
+                     y0=ln.nwell.y0, y1=ntap2.sdm.y1 + nw_enc());
+
+    // ---- cross-coupling ----
+    // Two met2 tracks in the gate-lane band, one per output. They run in
+    // opposite directions at different y, so they never cross each
+    // other; only the met1 risers at their ends cross the other track,
+    // and those are on a different layer.
+    // Each track also has to reach under its reset device's met3 drop,
+    // so its far end is the wider of the two demands.
+    let outn = rect("met2.drawing", x1=lp.a_li_mid.x1,
+                    x0=std::min(ln.o_li_right.x0, r7d.x1 - pad_w()),
+                    y0=ln.a_li_mid.y0 - 65., y1=ln.a_li_mid.y1 + 65.)!;
+    let outp = rect("met2.drawing", x0=ln.a_li_mid.x0,
+                    x1=std::max(lp.o_li_right.x1, r8d.x0 + pad_w()),
+                    y0=outn.y1 + m1_s(), y1=outn.y1 + m1_s() + 300.)!;
+
+    li_riser_m2(ln.o_li_right, outn, ln.o_li_right.x0 - 115., ln.o_li_right.x1 + 115.);
+    li_riser_m2(lp.a_li_mid, outn, lp.a_li_mid.x1 - pad_w(), lp.a_li_mid.x1);
+    li_riser_m2(lp.o_li_right, outp, lp.o_li_right.x0 - 115., lp.o_li_right.x1 + 115.);
+    li_riser_m2(ln.a_li_mid, outp, ln.a_li_mid.x0, ln.a_li_mid.x0 + pad_w());
+
+    // ---- reset drains down to the outputs ----
+    // met3 verticals: they cross both cross-coupling tracks and tap only
+    // the one they belong to.
+    let r7m3 = li_to_m3(r7d, r7d.x1 - pad_w(), r7d.x1);
+    let r8m3 = li_to_m3(r8d, r8d.x0, r8d.x0 + pad_w());
+    let r7col = rect("met3.drawing", x0=r7m3.x0, x1=r7m3.x1, y0=outn.y0, y1=r7m3.y1);
+    let r8col = rect("met3.drawing", x0=r8m3.x0, x1=r8m3.x1, y0=outp.y0, y1=r8m3.y1);
+    via2_array(outn, r7col, v2_w() + v2_s());
+    via2_array(outp, r8col, v2_w() + v2_s());
+
+    // ---- clock and supply taps for the top level ----
+    let clk_pad = li_to_m3(clk_n, clk_n.x1 - pad_w(), clk_n.x1)!;
+    let vip_pad = li_to_m3(vip, vip.x0, vip.x0 + pad_w())!;
+    let vin_pad = li_to_m3(vin, vin.x1 - pad_w(), vin.x1)!;
+}
+
+// =====================================================================
+// Sampling switch.
+// =====================================================================
+//
+// CMOS transmission gate plus a half-width NMOS dummy whose source and
+// drain both sit on the sampling node, so its channel charge cancels
+// most of the main switch's injection. The NMOS and PMOS sit side by
+// side rather than stacked so one source lane and one drain lane serve
+// both, and the nwell keeps well clear of the NMOS diff.
+//
+//   gate lane   CLKS (nmos) | CLKSB (pmos)        ntap (VDD)
+//   drain lane  ------------- sampling node -------------
+//   [dummy]  [ NMOS ]              [ PMOS ]
+//   source lane -------------- input --------------------
+//   ptap (VSS)
+fn nw_gap() -> Float { 1200. }   // nmos sdm to pmos sdm, keeps nwell clear
+
+cell sampler(wn: Float, wp: Float, nfn: Int, nfp: Int, nfd: Int) {
+    let nmos = inst(sky130::fet1v8(true, wn, nfn), x=0., y=0.);
+    let dmy = inst(sky130::fet1v8(true, wn, nfd));
+    let pmos = inst(sky130::fet1v8(false, wp, nfp));
+    eq(dmy.sdm.x1 + sd_gap(), nmos.sdm.x0);
+    eq(pmos.sdm.x0, nmos.sdm.x1 + nw_gap());
+    eq(dmy.li1_bbox.y0, nmos.li1_bbox.y0);
+    eq(pmos.li1_bbox.y0, nmos.li1_bbox.y0);
+
+    // Input lane below, sampling node above.
+    let inl = rect("li1.drawing", y1=nmos.li1_bbox.y0 - li_w(), h=li_w(),
+                   x0=nmos.li1_bbox.x0, x1=pmos.li1_bbox.x1)!;
+    src_down(nmos, nfn, inl);
+    src_down(pmos, nfp, inl);
+    let outl = rect("li1.drawing", y0=nmos.li1_bbox.y1 + li_w(), h=li_w(),
+                    x0=dmy.li1_bbox.x0, x1=pmos.li1_bbox.x1)!;
+    strips_up(nmos, nfn, true, outl);
+    strips_up(pmos, nfp, true, outl);
+    // Both parities of the dummy land on the sampling node.
+    strips_up(dmy, nfd, true, outl);
+    strips_up(dmy, nfd, false, outl);
+
+    let clks = gate_tap(nmos, nfn, nmos.poly_bbox.y0, outl.y1 + li_w() + 250., outl.y1 + li_w());
+    let clksb = gate_tap(pmos, nfp, pmos.poly_bbox.y0, outl.y1 + li_w() + 250., outl.y1 + li_w());
+    let clksd = gate_tap(dmy, nfd, dmy.poly_bbox.y0, outl.y1 + li_w() + 250., outl.y1 + li_w());
+
+    // Wells and taps.
+    let ptap = inst(sky130::tap(0, nmos.sdm.x1 - dmy.sdm.x0, 800.));
+    eq(ptap.sdm.y1 + 100., inl.y0 - li_w());
+    eq(ptap.sdm.x0, dmy.sdm.x0);
+    let ntap = inst(sky130::tap(1, pmos.sdm.w - 260., 800.));
+    eq(ntap.sdm.y0, clksb.y1 + 300.);
+    eq(ntap.sdm.x0, pmos.sdm.x0);
+    let nwell = rect("nwell.drawing", x0=pmos.sdm.x0 - nw_enc(), x1=pmos.sdm.x1 + nw_enc(),
+                     y0=pmos.sdm.y0 - nw_enc(), y1=ntap.sdm.y1 + nw_enc());
+
+    // Terminals.
+    let in_pad = li_to_m3(inl, inl.x0, inl.x0 + pad_w())!;
+    let out_pad = li_to_m3(outl, outl.x1 - pad_w(), outl.x1)!;
+}
+
+// =====================================================================
+// SAR logic: abstract block.
+// =====================================================================
+//
+// The digital half of the loop -- the 8 bit registers, the asynchronous
+// completion chain, and the CDAC bottom-plate drivers -- is left as a
+// boundary plus a met4 pin row on the CDAC bus pitch, so it can be
+// dropped in from a synthesised or hand-drawn implementation without
+// touching anything above it.
+//
+// Area comes from the driver sizing derived in the budget section plus a
+// standard-cell estimate for the register and completion logic:
+//
+//   drivers      sum(nf) = 24 fingers at 430 nm pitch, ~16 x 6 um
+//   registers    ~60 cells at 2.72 um row height, 60% utilisation
+//                 -> ~550 um^2
+//
+// A pin is drawn on met4 for every bus the CDAC brings down, plus the
+// comparator interface and the sampling clocks.
+
+// The CDAC bit buses are themselves the block's interface: they are
+// met4 and they stop on the block's top edge, so no separate pin shapes
+// are needed above what the buses already draw.
+cell sar_logic(w: Float, h: Float, core_w: Float) {
+    let outline = rect("prBoundary.boundary", x0=0., y0=0., w=w, h=h);
+    let vss = rect("met4.drawing", x0=0., x1=w, y0=0., y1=1200.)!;
+    let vdd = rect("met4.drawing", x0=0., x1=w, y0=h - 1200., y1=h)!;
+    // The area the drivers and registers actually need, so the estimate
+    // is visible against the outline the floorplan hands over.
+    let core = rect("areaid.standardc", x0=0., y0=vss.y1, w=core_w, y1=vdd.y0)!;
+    text("sar_logic", "met4.label", w / 2., h / 2.);
+}
+
+// Tie a li1 tap down to a met3 supply rail with a met2 riser, so the
+// riser can cross the other rail without shorting to it.
+fn tie_to_rail(li: Rect, rail: Rect, x0: Float, x1: Float) {
+    let cy = (li.y0 + li.y1) / 2.;
+    let p1 = rect("met1.drawing", x0=x0, x1=x1, y0=cy - pad_w() / 2., y1=cy + pad_w() / 2.);
+    m1_over_li(li, p1);
+    let col = rect("met2.drawing", x0=x0, x1=x1, y0=rail.y0, y1=p1.y1);
+    via1_array(p1, col, v1_pitch());
+    via2_array(col, rail, v2_w() + v2_s());
+}
+
+// =====================================================================
+// Top level.
+// =====================================================================
+//
+//   +--------------------------+--------------------------+
+//   |  CDAC half P             |  CDAC half N (mirrored)  |
+//   |  bit buses out the left  |  bit buses out the right |
+//   |        top plate ->|     |     |<- top plate        |
+//   +--------------------------+--------------------------+
+//   |  sampler P |     StrongARM comparator  | sampler N  |
+//   |  ---- met3 VDD / VSS rails --------------------------|
+//   +-----------------------------------------------------+
+//   |  SAR logic + bottom-plate drivers (abstract)        |
+//   +-----------------------------------------------------+
+//
+// Layer discipline outside the blocks: met3 horizontal, met4 vertical.
+// The 18 met4 bit buses run from their rails inside the arrays straight
+// down over the analogue row -- which uses nothing above met3 -- and
+// stop on the logic block's top edge.
+cell sar_adc(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
+    // ---- the two CDAC halves, top plates facing ----
+    let half = cdac_half(nbits, na, lf, ytp, yport);
+    let hp = inst(half, x=0., y=0.);
+    let hn = inst(half, y=0., reflect=true, angle=180);
+    eq(hn.tp.x0, hp.tp.x1 + 2. * m4_s());
+
+    // ---- comparator, centred between the two top plates ----
+    let cmp = inst(strongarm(1000., 1600., 8, 4, 2, 2));
+    eq(cmp.mclk.sdm.x0 + cmp.mclk.sdm.x1, hp.tp.x1 + hn.tp.x0);
+    eq(cmp.ntap2.sdm.y1, analog_top());
+
+    // Top plates onto the comparator inputs. Each met3 run reaches from
+    // its gate tap to under the corresponding met4 top-plate strap; the
+    // strap already extends past the gate lane, so a via3 array there
+    // closes the connection. The two runs share a y but never overlap in
+    // x as long as the input pair is wider than the top-plate gap.
+    let vipt = rect("met3.drawing", y0=cmp.vip_pad.y0, y1=cmp.vip_pad.y1,
+                    x0=std::min(hp.tp.x0, cmp.vip_pad.x0),
+                    x1=std::max(hp.tp.x1, cmp.vip_pad.x1))!;
+    let vint = rect("met3.drawing", y0=cmp.vin_pad.y0, y1=cmp.vin_pad.y1,
+                    x0=std::min(hn.tp.x0, cmp.vin_pad.x0),
+                    x1=std::max(hn.tp.x1, cmp.vin_pad.x1))!;
+    via3_array(vipt, hp.tp, v3_w() + v3_s());
+    via3_array(vint, hn.tp, v3_w() + v3_s());
+
+    // ---- samplers, one per half, outside the comparator ----
+    let smp = sampler(1000., 1000., 8, 16, 4);
+    let sp = inst(smp, reflect=true, angle=180);
+    let sn = inst(smp);
+    eq(sp.ntap.sdm.y1, cmp.ntap2.sdm.y1);
+    eq(sn.ntap.sdm.y1, cmp.ntap2.sdm.y1);
+    eq(sp.out_pad.x1, cmp.vip_pad.x0 - 4000.);
+    eq(sn.out_pad.x0, cmp.vin_pad.x1 + 4000.);
+
+    // Sampler outputs join the same met3 runs that feed the comparator.
+    let spo = rect("met3.drawing", y0=vipt.y0, y1=vipt.y1, x0=sp.out_pad.x0, x1=vipt.x0);
+    let sno = rect("met3.drawing", y0=vint.y0, y1=vint.y1, x0=vint.x1, x1=sn.out_pad.x1);
+    let spv = rect("met3.drawing", x0=sp.out_pad.x0, x1=sp.out_pad.x1, y0=spo.y0, y1=sp.out_pad.y1);
+    let snv = rect("met3.drawing", x0=sn.out_pad.x0, x1=sn.out_pad.x1, y0=sno.y0, y1=sn.out_pad.y1);
+
+    // ---- supply rails ----
+    // The outermost side-channel bus is column nbits-4, so the rails
+    // reach from there out to a 4 um margin on each side.
+    let chan = ((nbits - 5) as Float) * bus_p();
+    let vss = rect("met3.drawing", x0=hp.u4.x0 - chan - 4000., x1=hn.u4.x1 + chan + 4000.,
+                   y0=yport + 6000., y1=yport + 7600.)!;
+    let vdd = rect("met3.drawing", x0=vss.x0, x1=vss.x1,
+                   y0=vss.y1 + 2. * m3_s(), y1=vss.y1 + 2. * m3_s() + 1600.)!;
+    tie_to_rail(cmp.ptap.li1, vss, cmp.ptap.li1.x0, cmp.ptap.li1.x0 + pad_w());
+    tie_to_rail(cmp.vdd2, vdd, cmp.vdd2.x1 - pad_w(), cmp.vdd2.x1);
+    tie_to_rail(sp.ptap.li1, vss, sp.ptap.li1.x0, sp.ptap.li1.x0 + pad_w());
+    tie_to_rail(sn.ptap.li1, vss, sn.ptap.li1.x1 - pad_w(), sn.ptap.li1.x1);
+    tie_to_rail(sp.ntap.li1, vdd, sp.ntap.li1.x0, sp.ntap.li1.x0 + pad_w());
+    tie_to_rail(sn.ntap.li1, vdd, sn.ntap.li1.x1 - pad_w(), sn.ntap.li1.x1);
+
+    // ---- SAR logic ----
+    let logic = inst(sar_logic(vss.x1 - vss.x0, logic_h(), logic_min_w(nbits)));
+    eq(logic.outline.x0, vss.x0);
+    eq(logic.outline.y1, yport + 400.);
+
+    text("VIP", "met3.label", sp.in_pad.x0 + 200., sp.in_pad.y0 + 200.);
+    text("VIN", "met3.label", sn.in_pad.x0 + 200., sn.in_pad.y0 + 200.);
+}
+
+// 7 A-fingers makes the tile 3.64 x 2.545 um, so the 16 x 16 array comes
+// out close to square: 58.2 um across against 40.9 um tall.
+fn cap_na() -> Int { 7 }
+
+// Floorplan depths. The top-plate straps have to reach past the
+// comparator's input gate lane for the met3 runs to tap them, and the
+// bit buses have to clear the whole analogue row before they land on the
+// logic block.
+fn analog_top() -> Float { -8000. }
+fn y_tp()       -> Float { -24000. }
+fn y_port()     -> Float { -45000. }
+
+cell cdac_half_top() {
+    let h = inst(cdac_half(nbits_spec(), cap_na(),
+                           cap_finger_len(cap_na(), cu_af(), c_lat_afnm()),
+                           y_tp(), y_port()),
+                 x=0., y=0.);
+}
+
+cell sar_adc_top() {
+    let adc = inst(sar_adc(nbits_spec(), cap_na(),
+                           cap_finger_len(cap_na(), cu_af(), c_lat_afnm()),
+                           y_tp(), y_port()),
+                   x=0., y=0.);
+}
+
+// =====================================================================
+// Entry points and self-checks.
+// =====================================================================
+//
+// Each block is its own cell, so any of them can be opened on its own:
+//
+//   arc run --cell 'mom_unit(7, 1805.)' --gds
+//   arc run --cell 'cdac_half_top()' --gds
+//   arc run --cell 'strongarm(1000., 1600., 8, 4, 2, 2)' --gds
+//   arc run --cell 'sampler(1000., 1000., 8, 16, 4)' --gds
+//   arc run --cell 'sar_adc_top()' --gds
+//
+// `cdac_half` is wrapped because `--cell` takes only literal arguments,
+// and the two floorplan depths it needs are negative.
+//
+// The generator is parametric in resolution, tile shape, and unit
+// capacitance; 6 through 10 bits, `na` from 4 to 12, and a 2 fF unit all
+// solve. `nbits` must be at least 6, because the segment row and the
+// bit-4 row between them always carry the bottom five weights and the
+// dummy, leaving 2^(nbits-5) - 1 pairs above them.
+//
+// The `*_check` cells below assert dimensions as hard constraints, so
+// `arc run` reports `inconsistent constraint` the moment the geometry
+// drifts from what the budget assumes. Run them with:
+//
+//   arc run --cell 'spec_check()'
+//   arc run --cell 'mom_unit_check()'
+//   arc run --cell 'cdac_check()'
+
+// The budget has to close: sampling plus 8 bit cycles must be exactly
+// one 25 MS/s period, and the tile has to come out at 4 fF.
+cell spec_check() {
+    eq(t_sample_ps() + t_conv_ps(), ts_ps());
+    eq(t_bit_ps(), 3500.);
+    // Differential full scale is Vref, so one LSB is Vref / 2^nbits.
+    eq(vdd_mv() / (pow2(nbits_spec()) as Float), 7.03125);
+    eq(cap_finger_len(7, cu_af(), c_lat_afnm()), 1805.);
+    // 4 * (na-1) gaps * facing length * c_lat, within 0.1 % of 4 fF.
+    eq(4. * 6. * (1805. - m1_s()) * c_lat_afnm(), 3996.);
+    // Driver fingers for bits 7..0, and their total.
+    eq(drv_nf(7, 8) as Float, 11.);
+    eq(drv_nf(6, 8) as Float, 6.);
+    eq(drv_nf(5, 8) as Float, 3.);
+    eq(drv_nf(4, 8) as Float, 2.);
+    eq(drv_nf(0, 8) as Float, 1.);
+    eq(drv_nf_total(7, 8) as Float, 26.);
+    // 16 columns of 256 units per side: 7 pairs of 32 plus the 32-unit
+    // bit-4 row and split segment row.
+    eq(npairs(8) as Float, 7.);
+    eq((2 * 16 * npairs(8) + 32) as Float, 256.);
+}
+
+// Tile dimensions the capacitance estimate depends on.
+cell mom_unit_check() {
+    let lf = cap_finger_len(7, cu_af(), c_lat_afnm());
+    let c = inst(mom_unit(7, lf), x=0., y=0.);
+    eq(c.aspine_m1.x0, 0.);
+    eq(c.aspine_m1.x1, 3640.);              // 13 fingers on a 280 pitch
+    eq(c.aspine_m1.y0, 2245.);
+    eq(c.aspine_m1.y1, 2545.);
+    eq(c.bspine_m1.x0, 280.);               // clears the outer A fingers
+    eq(c.bspine_m1.x1, 3220.);
+    eq(c.bspine_m1.y1, 300.);
+    eq(c.af_m1_bbox.y0, 440.);              // A fingers: 140 off the B spine
+    eq(c.af_m1_bbox.y1, 2245.);
+    eq(c.af_m1_bbox.x1, 3500.);
+    eq(c.bf_m1_bbox.y0, 300.);              // B fingers: 140 under the A spine
+    eq(c.bf_m1_bbox.y1, 2105.);
+    eq(c.bf_m1_bbox.x1, 3220.);
+    // Facing length is what sets C, so pin it directly.
+    eq(c.bf_m1_bbox.y1 - c.af_m1_bbox.y0, lf - m1_s());
+}
+
+// Array stitching: A spines merge across every boundary, bottom-plate
+// rails merge only within a pair.
+cell cdac_check() {
+    let lf = cap_finger_len(7, cu_af(), c_lat_afnm());
+    let p = inst(cdac_pair(16, 7, lf), x=0., y=0.);
+    eq(p.bot.arail_m1.y0, 0.);                                  // pair floor
+    eq(p.top.arail_m1.y1, 2. * cap_row_h(7, lf));               // pair ceiling
+    eq(p.bot.brail_m1.y1, p.top.brail_m1.y0);                   // shared rail
+    eq(p.bot.brail_m1.y0, cap_row_h(7, lf) - cap_spine());
+    eq(p.bot.arail_m1.x1 - p.bot.arail_m1.x0, 16. * cap_tile_w(7));
+    // The rail stops a tile pitch short of the array edge, which is what
+    // lets the top-plate column pick up the A spines and nothing else.
+    eq(p.bot.arail_m1.x1 - p.bot.brail_m1.x1, 2. * m1_w() + m1_s());
+}

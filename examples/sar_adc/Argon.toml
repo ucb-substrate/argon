@@ -1,0 +1,5 @@
+name = "sar-adc"
+lyp = "../../pdks/sky130/sky130.lyp"
+
+[dependencies]
+sky130 = "../../pdks/sky130"
