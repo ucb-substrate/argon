@@ -376,10 +376,8 @@ fn update_delimiters(line: &str, delimiters: &mut Vec<char>, in_string: &mut boo
         match ch {
             '"' => *in_string = true,
             '{' | '(' | '[' => delimiters.push(ch),
-            '}' | ')' | ']' => {
-                if delimiters.last().is_some_and(|open| closes(*open, ch)) {
-                    delimiters.pop();
-                }
+            '}' | ')' | ']' if delimiters.last().is_some_and(|open| closes(*open, ch)) => {
+                delimiters.pop();
             }
             _ => {}
         }
@@ -529,6 +527,7 @@ mod tests {
     };
 
     use argonc::{
+        WorkspaceConfig,
         compile::{CompileInput, compile},
         parse::parse_workspace_with_std,
     };
@@ -661,8 +660,8 @@ cell top() {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: tech,
             },
+            &WorkspaceConfig::new(&library.root).with_tech(Some(tech.clone())),
         )
         .unwrap_valid();
         let label = output.cells[&output.top]

@@ -5,7 +5,8 @@ use std::{
 };
 
 use analyzer::rpc::{
-    DimensionParams, InitialConditionEdit, InstancePreview, PolygonParams, ValueEdit,
+    CompilationSnapshot, DimensionParams, DrawSegmentConstraint, InitialConditionEdit,
+    InstancePreview, PathParams, PolygonParams, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -15,11 +16,11 @@ use argonc::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FocusHandle,
-    Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, Pixels, Point, Render,
-    Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, TextRun, Window, div,
-    pattern_slash, px, rgb, size, solid_background,
+    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FillOptions,
+    FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, PathStyle,
+    Pixels, Point, Render, Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription,
+    TextRun, Window, div, pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::IndexSet;
 use itertools::Itertools;
@@ -39,6 +40,9 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
+const DEFAULT_DRAW_PATH_WIDTH: f32 = 20.;
+const DOT_DIAMETER: Pixels = px(3.);
+const DOT_SPACING: Pixels = px(7.);
 /// Side length of the square drag handles drawn on unconstrained edges.
 const HANDLE_SIZE: Pixels = px(12.);
 /// Side length of the (larger, invisible) clickable area around each handle, so
@@ -168,6 +172,10 @@ enum SelectionOutline {
         points: Vec<Point<Pixels>>,
         edge_styles: Vec<BorderStyle>,
     },
+    Polyline {
+        points: Vec<Point<Pixels>>,
+        segment_styles: Vec<BorderStyle>,
+    },
 }
 
 fn rect_selection_outline(
@@ -183,20 +191,12 @@ fn rect_selection_outline(
 #[derive(Clone, Debug)]
 struct SelectionHit {
     span: Span,
-    area: f32,
     outline: SelectionOutline,
     layer: SelectionLayer,
-    paint_order: usize,
+    creation_order: Vec<u64>,
 }
 
-fn selection_hit_area(hit: &SelectionHit) -> f32 {
-    hit.area
-}
-
-fn bounds_area(bounds: Bounds<Pixels>) -> f32 {
-    f32::from(bounds.size.width).abs() * f32::from(bounds.size.height).abs()
-}
-
+#[cfg(test)]
 fn polygon_area(points: &[Point<Pixels>]) -> f32 {
     points
         .iter()
@@ -251,13 +251,93 @@ fn paint_polygon_border(
     color: Rgba,
 ) {
     for index in 0..points.len() {
-        let mut edge = PathBuilder::stroke(width);
         if edge_styles.get(index) == Some(&BorderStyle::Dashed) {
-            edge = edge.dash_array(&[px(6.), px(5.)]);
+            paint_dotted_segment(
+                window,
+                points[index],
+                points[(index + 1) % points.len()],
+                color,
+            );
+            continue;
         }
+        let mut edge = PathBuilder::stroke(width);
         edge.move_to(points[index]);
         edge.line_to(points[(index + 1) % points.len()]);
         if let Ok(path) = edge.build() {
+            window.paint_path(path, color);
+        }
+    }
+}
+
+fn dotted_segment_centers(from: Point<Pixels>, to: Point<Pixels>) -> Vec<Point<Pixels>> {
+    let dx = f32::from(to.x - from.x);
+    let dy = f32::from(to.y - from.y);
+    let length = dx.hypot(dy);
+    let count = (length / f32::from(DOT_SPACING)).ceil().max(1.) as usize;
+    (0..count)
+        .map(|index| {
+            let t = (index as f32 + 0.5) / count as f32;
+            Point::new(from.x + px(dx * t), from.y + px(dy * t))
+        })
+        .collect()
+}
+
+fn paint_dotted_segment(window: &mut Window, from: Point<Pixels>, to: Point<Pixels>, color: Rgba) {
+    let radius = DOT_DIAMETER.half();
+    for center in dotted_segment_centers(from, to) {
+        let mut dot = get_paint_quad(
+            Bounds::new(
+                Point::new(center.x - radius, center.y - radius),
+                Size::new(DOT_DIAMETER, DOT_DIAMETER),
+            ),
+            ShapeFill::Solid,
+            color,
+            color,
+            Edges::all(px(0.)),
+            Edges::all(BorderStyle::Solid),
+        );
+        dot.corner_radii = Corners::all(radius);
+        window.paint_quad(dot);
+    }
+}
+
+fn paint_polygon_fill(
+    window: &mut Window,
+    points: &[Point<Pixels>],
+    layer: &LayerState,
+    self_overlapping_path: bool,
+) {
+    let mut fill = if self_overlapping_path {
+        PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()))
+    } else {
+        PathBuilder::fill()
+    };
+    fill.add_polygon(points, true);
+    if let Ok(path) = fill.build() {
+        let background = match layer.fill {
+            ShapeFill::Solid => solid_background(layer.color),
+            ShapeFill::Stippling => pattern_slash(layer.color.into(), 1., 9.),
+        };
+        window.paint_path(path, background);
+    }
+}
+
+fn paint_polyline(
+    window: &mut Window,
+    points: &[Point<Pixels>],
+    segment_styles: &[BorderStyle],
+    width: Pixels,
+    color: Rgba,
+) {
+    for (index, points) in points.windows(2).enumerate() {
+        if segment_styles.get(index) == Some(&BorderStyle::Dashed) {
+            paint_dotted_segment(window, points[0], points[1], color);
+            continue;
+        }
+        let mut segment = PathBuilder::stroke(width);
+        segment.move_to(points[0]);
+        segment.line_to(points[1]);
+        if let Ok(path) = segment.build() {
             window.paint_path(path, color);
         }
     }
@@ -267,8 +347,7 @@ fn ordered_selection_hits(mut hits: Vec<SelectionHit>) -> Vec<SelectionHit> {
     hits.sort_by(|a, b| {
         b.layer
             .cmp(&a.layer)
-            .then_with(|| selection_hit_area(a).total_cmp(&selection_hit_area(b)))
-            .then_with(|| b.paint_order.cmp(&a.paint_order))
+            .then_with(|| b.creation_order.cmp(&a.creation_order))
     });
 
     // An object can contribute more than one hit box (dimensions, in
@@ -296,7 +375,7 @@ fn choose_selection_hit(
 
 /// Rectangle order for dimension-edge hit testing, matching
 /// [`ordered_selection_hits`]. Scope bboxes sit below layout layers; within
-/// layout, higher-z layers win, then smaller shapes, then later paint order.
+/// layout, higher-z layers win, then later-created shapes.
 fn ordered_dimension_rects<'a>(
     rects: &'a [(Rect, LayerState)],
     scope_rects: &'a [LabeledBbox],
@@ -308,8 +387,14 @@ fn ordered_dimension_rects<'a>(
             (
                 rect,
                 SelectionLayer::Layout(layer.z),
-                (rect.x1 - rect.x0).abs() * (rect.y1 - rect.y0).abs(),
-                paint_order,
+                if rect.object_path.is_empty() {
+                    vec![paint_order as u64]
+                } else {
+                    rect.object_path
+                        .iter()
+                        .map(|id| id.creation_order())
+                        .collect()
+                },
             )
         })
         .chain(
@@ -321,18 +406,21 @@ fn ordered_dimension_rects<'a>(
                     (
                         &bbox.rect,
                         SelectionLayer::Scope,
-                        (bbox.rect.x1 - bbox.rect.x0).abs() * (bbox.rect.y1 - bbox.rect.y0).abs(),
-                        paint_order,
+                        if bbox.rect.object_path.is_empty() {
+                            vec![paint_order as u64]
+                        } else {
+                            bbox.rect
+                                .object_path
+                                .iter()
+                                .map(|id| id.creation_order())
+                                .collect()
+                        },
                     )
                 }),
         )
         .collect::<Vec<_>>();
-    candidates.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| b.3.cmp(&a.3))
-    });
-    candidates.into_iter().map(|(rect, _, _, _)| rect).collect()
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    candidates.into_iter().map(|(rect, _, _)| rect).collect()
 }
 
 struct InitialConditionUpdate {
@@ -340,6 +428,12 @@ struct InitialConditionUpdate {
     value: f64,
     changed: bool,
     target: Option<RectInitialCondition>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSseValue {
+    span: Span,
+    value: f64,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -363,6 +457,14 @@ struct Polygon {
     id: Option<Span>,
     object_path: Vec<ObjectId>,
     cvars: Option<Vec<(LinearExpr, LinearExpr)>>,
+    centerline: Option<PathCenterline>,
+}
+
+#[derive(Clone, Debug)]
+struct PathCenterline {
+    points: Vec<Point<f32>>,
+    segment_styles: Vec<BorderStyle>,
+    cvars: Option<Vec<(LinearExpr, LinearExpr)>>,
 }
 
 impl Polygon {
@@ -380,6 +482,18 @@ impl Polygon {
             id: self.id.clone(),
             object_path: self.object_path.clone(),
             cvars: self.cvars.clone(),
+            centerline: self.centerline.as_ref().map(|centerline| PathCenterline {
+                points: centerline
+                    .points
+                    .iter()
+                    .map(|point| {
+                        let point = ifmatvec(mat, (point.x as f64, point.y as f64));
+                        Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                    })
+                    .collect(),
+                segment_styles: centerline.segment_styles.clone(),
+                cvars: centerline.cvars.clone(),
+            }),
         }
     }
 }
@@ -403,6 +517,71 @@ fn polygon_edge_styles(
             }
         })
         .collect()
+}
+
+fn path_segment_styles(
+    point_count: usize,
+    mut is_unconstrained: impl FnMut(usize) -> bool,
+) -> Vec<BorderStyle> {
+    let unconstrained = (0..point_count)
+        .map(&mut is_unconstrained)
+        .collect::<Vec<_>>();
+    unconstrained
+        .windows(2)
+        .map(|points| {
+            if points[0] || points[1] {
+                BorderStyle::Dashed
+            } else {
+                BorderStyle::Solid
+            }
+        })
+        .collect()
+}
+
+fn snap_draw_point(origin: Point<f32>, cursor: Point<f32>) -> (Point<f32>, DrawSegmentConstraint) {
+    let dx = cursor.x - origin.x;
+    let dy = cursor.y - origin.y;
+    let octant = (dy.atan2(dx) / std::f32::consts::FRAC_PI_4).round() as i32;
+    match octant.rem_euclid(4) {
+        0 => (
+            Point::new(cursor.x, origin.y),
+            DrawSegmentConstraint::Horizontal(0),
+        ),
+        2 => (
+            Point::new(origin.x, cursor.y),
+            DrawSegmentConstraint::Vertical(0),
+        ),
+        diagonal => {
+            let distance = ((dx.abs() + dy.abs()) * 5.).round() / 10.;
+            let x_sign = if dx < 0. { -1. } else { 1. };
+            let y_sign = if diagonal == 1 { x_sign } else { -x_sign };
+            let constraint = if diagonal == 1 {
+                DrawSegmentConstraint::DiagonalPositive(0)
+            } else {
+                DrawSegmentConstraint::DiagonalNegative(0)
+            };
+            (
+                Point::new(origin.x + x_sign * distance, origin.y + y_sign * distance),
+                constraint,
+            )
+        }
+    }
+}
+
+fn segment_constraint_with_end(
+    constraint: DrawSegmentConstraint,
+    end: usize,
+) -> DrawSegmentConstraint {
+    match constraint {
+        DrawSegmentConstraint::Horizontal(_) => DrawSegmentConstraint::Horizontal(end),
+        DrawSegmentConstraint::Vertical(_) => DrawSegmentConstraint::Vertical(end),
+        DrawSegmentConstraint::DiagonalPositive(_) => DrawSegmentConstraint::DiagonalPositive(end),
+        DrawSegmentConstraint::DiagonalNegative(_) => DrawSegmentConstraint::DiagonalNegative(end),
+    }
+}
+
+fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
+    argonc::tech::snap(f64::from(value), grid)
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -536,6 +715,13 @@ pub(crate) struct DrawRectToolState {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DrawPolygonToolState {
     points: Vec<Point<f32>>,
+    constraints: Vec<DrawSegmentConstraint>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DrawPathToolState {
+    points: Vec<Point<f32>>,
+    constraints: Vec<DrawSegmentConstraint>,
 }
 
 #[derive(Debug, Clone)]
@@ -605,6 +791,7 @@ pub(crate) struct PlaceInstanceToolState {
 pub(crate) enum ToolState {
     DrawRect(DrawRectToolState),
     DrawPolygon(DrawPolygonToolState),
+    DrawPath(DrawPathToolState),
     DrawDim(DrawDimToolState),
     EditDim(EditDimToolState),
     PlaceInstance(PlaceInstanceToolState),
@@ -628,6 +815,9 @@ pub struct LayoutCanvas {
     // Keep displaying the final drag preview after mouse-up until the analyzer
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
+    pending_sse_values: Vec<PendingSseValue>,
+    deferred_snapshot: Option<CompilationSnapshot>,
+    sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
@@ -639,6 +829,7 @@ pub struct LayoutCanvas {
     // shared between SSE and dragging
     drag_start: Point<Pixels>,
     mouse_position: Point<Pixels>,
+    shift_down: bool,
     // zoom state
     scale: f32,
     screen_bounds: Bounds<Pixels>,
@@ -747,6 +938,11 @@ fn fallback_value_edits(
             RectInitialCondition::Y1(id) => (id, 3),
             RectInitialCondition::PolygonX(_, _)
             | RectInitialCondition::PolygonY(_, _)
+            | RectInitialCondition::PathX(_, _)
+            | RectInitialCondition::PathY(_, _)
+            | RectInitialCondition::PathWidth(_)
+            | RectInitialCondition::PathBeginExtension(_)
+            | RectInitialCondition::PathEndExtension(_)
             | RectInitialCondition::InstanceX(_)
             | RectInitialCondition::InstanceY(_) => {
                 continue;
@@ -847,6 +1043,35 @@ fn remap_span_after_value_edits(selected: &Span, edits: &[ValueEdit]) -> Span {
     }
 }
 
+fn pending_sse_values(edits: &[ValueEdit]) -> Vec<PendingSseValue> {
+    edits
+        .iter()
+        .filter_map(|edit| {
+            Some(PendingSseValue {
+                span: remap_span_after_value_edits(&edit.span, edits),
+                value: edit.value.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseValue]) -> bool {
+    !pending.is_empty()
+        && pending.iter().all(|expected| {
+            data.cells
+                .values()
+                .flat_map(|cell| &cell.fallback_constraints_used)
+                .any(|fallback| {
+                    fallback.span == expected.span
+                        && (-fallback.constraint.constant - expected.value).abs() < 1e-8
+                })
+        })
+}
+
+fn snapshot_follows_revision(snapshot_revision: u64, revision: Option<u64>) -> bool {
+    revision.is_none_or(|revision| snapshot_revision > revision)
+}
+
 fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>) -> f64 {
     field.0
         + drag
@@ -937,7 +1162,27 @@ fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>,
                         id: None,
                         object_path: Vec::new(),
                         cvars: None,
+                        centerline: None,
                     });
+                }
+                SolvedValue::Path(path) => {
+                    if let Some(outline) = path.outline() {
+                        let point_count = outline.len();
+                        polygons.push(Polygon {
+                            points: outline
+                                .into_iter()
+                                .map(|point| {
+                                    let point = ifmatvec(mat, point);
+                                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
+                                })
+                                .collect(),
+                            edge_styles: vec![BorderStyle::Dashed; point_count],
+                            id: None,
+                            object_path: Vec::new(),
+                            cvars: None,
+                            centerline: None,
+                        });
+                    }
                 }
                 SolvedValue::Instance(instance) if !instance.construction => {
                     let mut instance_mat = TransformationMatrix::identity();
@@ -1318,6 +1563,118 @@ impl Element for CanvasElement {
                                         .map(|(x, y)| (x.1.clone(), y.1.clone()))
                                         .collect()
                                 }),
+                                centerline: None,
+                            };
+                            if show && layer.visible {
+                                polygons.push((polygon, layer.clone()));
+                            }
+                        }
+                        SolvedValue::Path(path) => {
+                            if depth == 0
+                                && let Some(span) = &path.span
+                            {
+                                let mut coordinates = path
+                                    .points
+                                    .iter()
+                                    .enumerate()
+                                    .flat_map(|(index, (x, y))| {
+                                        [
+                                            (x.1.clone(), format!("x{index}i"), x.0),
+                                            (y.1.clone(), format!("y{index}i"), y.0),
+                                        ]
+                                    })
+                                    .collect::<Vec<_>>();
+                                coordinates.push((
+                                    path.width.1.clone(),
+                                    "widthi".to_owned(),
+                                    path.width.0,
+                                ));
+                                coordinates.push((
+                                    path.begin_extension.1.clone(),
+                                    "begin_extensioni".to_owned(),
+                                    path.begin_extension.0,
+                                ));
+                                coordinates.push((
+                                    path.end_extension.1.clone(),
+                                    "end_extensioni".to_owned(),
+                                    path.end_extension.0,
+                                ));
+                                source_coordinates.insert(span.clone(), coordinates);
+                            }
+                            let Some(layer) = layers.layers.get(path.layer.as_str()) else {
+                                continue;
+                            };
+                            let mut displayed = path.clone();
+                            if depth == 0
+                                && let Some(sse_dv) = &sse_dv
+                            {
+                                displayed.width.0 +=
+                                    crate::sse::dot(&SparseVec::from(&path.width.1), sse_dv);
+                                displayed.begin_extension.0 += crate::sse::dot(
+                                    &SparseVec::from(&path.begin_extension.1),
+                                    sse_dv,
+                                );
+                                displayed.end_extension.0 += crate::sse::dot(
+                                    &SparseVec::from(&path.end_extension.1),
+                                    sse_dv,
+                                );
+                                for ((x, y), (display_x, display_y)) in
+                                    path.points.iter().zip(&mut displayed.points)
+                                {
+                                    display_x.0 += crate::sse::dot(&SparseVec::from(&x.1), sse_dv);
+                                    display_y.0 += crate::sse::dot(&SparseVec::from(&y.1), sse_dv);
+                                }
+                            }
+                            let Some(outline) = displayed.outline() else {
+                                continue;
+                            };
+                            let segment_styles = if depth == 0 {
+                                path_segment_styles(path.points.len(), |index| {
+                                    let (x, y) = &path.points[index];
+                                    x.1.coeffs
+                                        .iter()
+                                        .chain(&y.1.coeffs)
+                                        .any(|(_, var)| cell_info.unsolved_vars.contains(var))
+                                })
+                            } else {
+                                vec![BorderStyle::Solid; path.points.len().saturating_sub(1)]
+                            };
+                            let centerline = PathCenterline {
+                                points: displayed
+                                    .points
+                                    .iter()
+                                    .map(|(x, y)| {
+                                        let point = ifmatvec(mat, (x.0, y.0));
+                                        Point::new(
+                                            (point.0 + ofs.0) as f32,
+                                            (point.1 + ofs.1) as f32,
+                                        )
+                                    })
+                                    .collect(),
+                                segment_styles,
+                                cvars: (depth == 0).then(|| {
+                                    path.points
+                                        .iter()
+                                        .map(|(x, y)| (x.1.clone(), y.1.clone()))
+                                        .collect()
+                                }),
+                            };
+                            let polygon = Polygon {
+                                edge_styles: vec![BorderStyle::Solid; outline.len()],
+                                points: outline
+                                    .into_iter()
+                                    .map(|point| {
+                                        let point = ifmatvec(mat, point);
+                                        Point::new(
+                                            (point.0 + ofs.0) as f32,
+                                            (point.1 + ofs.1) as f32,
+                                        )
+                                    })
+                                    .collect(),
+                                id: path.span.clone(),
+                                object_path,
+                                cvars: None,
+                                centerline: Some(centerline),
                             };
                             if show && layer.visible {
                                 polygons.push((polygon, layer.clone()));
@@ -1497,6 +1854,8 @@ impl Element for CanvasElement {
             }
 
             if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = tool {
+                let mut layer = layers.layers[layers.selected_layer.as_ref().unwrap()].clone();
+                layer.border_color = rgb(0xffff00);
                 rects.push((
                     Rect {
                         object_path: Vec::new(),
@@ -1505,11 +1864,11 @@ impl Element for CanvasElement {
                         x1: p0.x.max(snapped_layout_mouse_position.x),
                         y1: p0.y.max(snapped_layout_mouse_position.y),
                         id: None,
-                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                        border_widths: Edges::all(SELECT_WIDTH),
                         border_styles: Edges::all(BorderStyle::Dashed),
                         cvars: None,
                     },
-                    layers.layers[layers.selected_layer.as_ref().unwrap()].clone(),
+                    layer,
                 ));
             }
         }
@@ -1526,7 +1885,7 @@ impl Element for CanvasElement {
         let offset = inner.offset;
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
-        let mut polygon_handle_points = Vec::new();
+        let mut vertex_handle_points = Vec::new();
         let mut sse_bodies: Vec<SseBody> = Vec::new();
         let sse_cell = solved_cell.as_ref().map(|solved| {
             let selected = &solved.state[&solved.selected_scope].address;
@@ -1566,7 +1925,7 @@ impl Element for CanvasElement {
         }
         if let Some(sse_cell) = sse_cell {
             for (polygon, _) in &polygons {
-                let (Some(span), Some(cvars)) = (&polygon.id, &polygon.cvars) else {
+                let Some(span) = &polygon.id else {
                     continue;
                 };
                 if !matches!(
@@ -1577,22 +1936,35 @@ impl Element for CanvasElement {
                 ) {
                     continue;
                 }
-                for (point, (x, y)) in polygon.points.iter().zip(cvars) {
-                    let targets = LayoutCanvas::draggable_point_targets(
-                        sourced_corner_sse_targets(x, y, span, &source_coordinates),
-                        sse_cell,
-                    );
-                    if !targets.is_empty() {
-                        let mid = inner.layout_to_px(*point);
-                        polygon_handle_points.push(mid);
-                        let hit_half = HANDLE_HIT.half();
-                        sse_handles.push(SseHandle {
-                            bounds: Bounds::new(
-                                Point::new(mid.x - hit_half, mid.y - hit_half),
-                                Size::new(HANDLE_HIT, HANDLE_HIT),
-                            ),
-                            targets,
-                        });
+                let point_sets = polygon
+                    .cvars
+                    .as_ref()
+                    .map(|cvars| (&polygon.points, cvars))
+                    .into_iter()
+                    .chain(polygon.centerline.as_ref().and_then(|centerline| {
+                        centerline
+                            .cvars
+                            .as_ref()
+                            .map(|cvars| (&centerline.points, cvars))
+                    }));
+                for (points, cvars) in point_sets {
+                    for (point, (x, y)) in points.iter().zip(cvars) {
+                        let targets = LayoutCanvas::draggable_point_targets(
+                            sourced_corner_sse_targets(x, y, span, &source_coordinates),
+                            sse_cell,
+                        );
+                        if !targets.is_empty() {
+                            let mid = inner.layout_to_px(*point);
+                            vertex_handle_points.push(mid);
+                            let hit_half = HANDLE_HIT.half();
+                            sse_handles.push(SseHandle {
+                                bounds: Bounds::new(
+                                    Point::new(mid.x - hit_half, mid.y - hit_half),
+                                    Size::new(HANDLE_HIT, HANDLE_HIT),
+                                ),
+                                targets,
+                            });
+                        }
                     }
                 }
             }
@@ -1635,6 +2007,11 @@ impl Element for CanvasElement {
                 }
             }
         }
+        let draw_layer = layers
+            .selected_layer
+            .as_ref()
+            .and_then(|layer| layers.layers.get(layer))
+            .cloned();
         let theme = inner.state.read(cx).theme();
         inner
             .bg_style
@@ -1681,71 +2058,121 @@ impl Element for CanvasElement {
                             .iter()
                             .map(|point| self.inner.read(cx).layout_to_px(*point))
                             .collect::<Vec<_>>();
-                        let mut fill = PathBuilder::fill();
-                        fill.add_polygon(&points, true);
-                        if let Ok(path) = fill.build() {
-                            let background = match layer.fill {
-                                ShapeFill::Solid => solid_background(layer.color),
-                                ShapeFill::Stippling => {
-                                    pattern_slash(layer.color.into(), 1., 9.)
-                                }
-                            };
-                            window.paint_path(path, background);
-                        }
-                        let selected = matches!(
-                            &tool,
-                            ToolState::Select(SelectToolState {
-                                selected_obj: Some(selected),
-                            }) if polygon.id.as_ref() == Some(selected)
+                        paint_polygon_fill(
+                            window,
+                            &points,
+                            layer,
+                            polygon.centerline.is_some(),
                         );
-                        let border_width = if selected {
-                            SELECT_WIDTH
-                        } else {
-                            DEFAULT_BORDER_WIDTH
-                        };
-                        let border_color = if selected {
-                            rgb(0xffff00)
-                        } else {
-                            layer.border_color
-                        };
                         paint_polygon_border(
                             window,
                             &points,
                             &polygon.edge_styles,
-                            border_width,
-                            border_color,
+                            DEFAULT_BORDER_WIDTH,
+                            layer.border_color,
                         );
-                    }
-                    for mid in &polygon_handle_points {
-                        let draw_half = HANDLE_SIZE.half();
-                        window.paint_quad(get_paint_quad(
-                            Bounds::new(
-                                Point::new(mid.x - draw_half, mid.y - draw_half),
-                                Size::new(HANDLE_SIZE, HANDLE_SIZE),
-                            ),
-                            ShapeFill::Solid,
-                            rgb(HANDLE_FILL),
-                            rgb(HANDLE_BORDER),
-                            Edges::all(px(1.5)),
-                            Edges::all(BorderStyle::Solid),
-                        ));
                     }
                     if let ToolState::DrawPolygon(polygon_tool) = &tool
                         && !polygon_tool.points.is_empty()
+                        && let Some(layer) = &draw_layer
                     {
+                        let preview_position = if self.inner.read(cx).shift_down {
+                            snap_draw_point(
+                                *polygon_tool.points.last().unwrap(),
+                                snapped_layout_mouse_position,
+                            )
+                            .0
+                        } else {
+                            snapped_layout_mouse_position
+                        };
                         let points = polygon_tool
                             .points
                             .iter()
                             .copied()
-                            .chain(std::iter::once(snapped_layout_mouse_position))
+                            .chain(std::iter::once(preview_position))
                             .map(|point| self.inner.read(cx).layout_to_px(point))
                             .collect::<Vec<_>>();
-                        let mut preview = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
-                        preview.add_polygon(&points, false);
-                        if let Ok(path) = preview.build() {
-                            window.paint_path(path, rgb(0xffff00));
-                        }
+                        paint_polygon_fill(window, &points, layer, false);
+                        paint_polygon_border(
+                            window,
+                            &points,
+                            &vec![BorderStyle::Dashed; points.len()],
+                            SELECT_WIDTH,
+                            rgb(0xffff00),
+                        );
                         for point in points.iter().take(polygon_tool.points.len()) {
+                            let draw_half = HANDLE_SIZE.half();
+                            window.paint_quad(get_paint_quad(
+                                Bounds::new(
+                                    Point::new(point.x - draw_half, point.y - draw_half),
+                                    Size::new(HANDLE_SIZE, HANDLE_SIZE),
+                                ),
+                                ShapeFill::Solid,
+                                rgb(HANDLE_FILL),
+                                rgb(HANDLE_BORDER),
+                                Edges::all(px(1.5)),
+                                Edges::all(BorderStyle::Solid),
+                            ));
+                        }
+                    }
+                    if let ToolState::DrawPath(path_tool) = &tool
+                        && !path_tool.points.is_empty()
+                        && let Some(layer) = &draw_layer
+                    {
+                        let preview_position = if self.inner.read(cx).shift_down {
+                            snap_draw_point(
+                                *path_tool.points.last().unwrap(),
+                                snapped_layout_mouse_position,
+                            )
+                            .0
+                        } else {
+                            snapped_layout_mouse_position
+                        };
+                        let centerline = path_tool
+                            .points
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(preview_position))
+                            .collect::<Vec<_>>();
+                        let layout_points = centerline
+                            .iter()
+                            .map(|point| (f64::from(point.x), f64::from(point.y)))
+                            .collect::<Vec<_>>();
+                        if let Some(outline) = compile::path_outline(
+                            &layout_points,
+                            f64::from(DEFAULT_DRAW_PATH_WIDTH),
+                            0.,
+                            0.,
+                        ) {
+                            let outline = outline
+                                .into_iter()
+                                .map(|(x, y)| {
+                                    self.inner
+                                        .read(cx)
+                                        .layout_to_px(Point::new(x as f32, y as f32))
+                                })
+                                .collect::<Vec<_>>();
+                            paint_polygon_fill(window, &outline, layer, true);
+                            paint_polygon_border(
+                                window,
+                                &outline,
+                                &vec![BorderStyle::Solid; outline.len()],
+                                DEFAULT_BORDER_WIDTH,
+                                layer.border_color,
+                            );
+                        }
+                        let centerline = centerline
+                            .iter()
+                            .map(|point| self.inner.read(cx).layout_to_px(*point))
+                            .collect::<Vec<_>>();
+                        paint_polyline(
+                            window,
+                            &centerline,
+                            &vec![BorderStyle::Dashed; centerline.len().saturating_sub(1)],
+                            SELECT_WIDTH,
+                            rgb(0xffff00),
+                        );
+                        for point in centerline.iter().take(path_tool.points.len()) {
                             let draw_half = HANDLE_SIZE.half();
                             window.paint_quad(get_paint_quad(
                                 Bounds::new(
@@ -1871,14 +2298,18 @@ impl Element for CanvasElement {
                             }
                         }
                     }
-                    for r in &select_rects {
+                    for mid in &vertex_handle_points {
+                        let draw_half = HANDLE_SIZE.half();
                         window.paint_quad(get_paint_quad(
-                            get_rect_bounds(r, bounds, scale, offset),
+                            Bounds::new(
+                                Point::new(mid.x - draw_half, mid.y - draw_half),
+                                Size::new(HANDLE_SIZE, HANDLE_SIZE),
+                            ),
                             ShapeFill::Solid,
-                            Rgba { a: 0., ..rgb(0xffff00) },
-                            rgb(0xffff00),
-                            r.border_widths,
-                            r.border_styles,
+                            rgb(HANDLE_FILL),
+                            rgb(HANDLE_BORDER),
+                            Edges::all(px(1.5)),
+                            Edges::all(BorderStyle::Solid),
                         ));
                     }
                     // Draw edge handles and two-axis corner handles on the
@@ -2450,7 +2881,51 @@ impl Element for CanvasElement {
                                     _ => {}
                                 }
                         }
-                        ToolState::Select(_) => {
+                        ToolState::Select(select_tool) => {
+                            if let Some(selected) = &select_tool.selected_obj {
+                                for (polygon, _) in &polygons {
+                                    if polygon.id.as_ref() != Some(selected) {
+                                        continue;
+                                    }
+                                    if let Some(centerline) = &polygon.centerline {
+                                        let points = centerline
+                                            .points
+                                            .iter()
+                                            .map(|point| inner.layout_to_px(*point))
+                                            .collect::<Vec<_>>();
+                                        paint_polyline(
+                                            window,
+                                            &points,
+                                            &centerline.segment_styles,
+                                            SELECT_WIDTH,
+                                            rgb(0xffff00),
+                                        );
+                                    } else {
+                                        let points = polygon
+                                            .points
+                                            .iter()
+                                            .map(|point| inner.layout_to_px(*point))
+                                            .collect::<Vec<_>>();
+                                        paint_polygon_border(
+                                            window,
+                                            &points,
+                                            &polygon.edge_styles,
+                                            SELECT_WIDTH,
+                                            rgb(0xffff00),
+                                        );
+                                    }
+                                }
+                                for rect in &select_rects {
+                                    window.paint_quad(get_paint_quad(
+                                        get_rect_bounds(rect, bounds, scale, offset),
+                                        ShapeFill::Solid,
+                                        Rgba { a: 0., ..rgb(0xffff00) },
+                                        rgb(0xffff00),
+                                        rect.border_widths,
+                                        rect.border_styles,
+                                    ));
+                                }
+                            }
                             if let Some(hit) = inner
                                 .selection_hits_at(inner.mouse_position)
                                 .into_iter()
@@ -2477,6 +2952,16 @@ impl Element for CanvasElement {
                                         window,
                                         &points,
                                         &edge_styles,
+                                        SELECT_WIDTH,
+                                        rgb(0xffff00),
+                                    ),
+                                    SelectionOutline::Polyline {
+                                        points,
+                                        segment_styles,
+                                    } => paint_polyline(
+                                        window,
+                                        &points,
+                                        &segment_styles,
                                         SELECT_WIDTH,
                                         rgb(0xffff00),
                                     ),
@@ -2516,6 +3001,7 @@ impl Render for LayoutCanvas {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_polygon))
+            .on_action(cx.listener(Self::draw_path))
             .on_action(cx.listener(Self::select_mode))
             .on_action(cx.listener(Self::draw_dim))
             .on_action(cx.listener(Self::edit_action))
@@ -2524,7 +3010,7 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::one_hierarchy))
             .on_action(cx.listener(Self::all_hierarchy))
             .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::finish_polygon))
+            .on_action(cx.listener(Self::finish_draw_points))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
@@ -2565,6 +3051,9 @@ impl LayoutCanvas {
             is_dragging: false,
             is_sse_dragging: false,
             is_sse_persisting: false,
+            pending_sse_values: Vec::new(),
+            deferred_snapshot: None,
+            sse_persist_after_revision: None,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
             sse_handles: Vec::new(),
@@ -2572,6 +3061,7 @@ impl LayoutCanvas {
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
+            shift_down: false,
             scale: 1.0,
             screen_bounds: Bounds::default(),
             subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
@@ -2598,6 +3088,18 @@ impl LayoutCanvas {
         });
     }
 
+    pub(crate) fn is_sse_dragging(&self) -> bool {
+        self.is_sse_dragging
+    }
+
+    pub(crate) fn defer_snapshot(&mut self, snapshot: CompilationSnapshot) {
+        self.deferred_snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<CompilationSnapshot> {
+        self.deferred_snapshot.take()
+    }
+
     fn sse_drag_delta_for_targets(
         targets: &[SseDragTarget],
         cell: &compile::CompiledCell,
@@ -2614,6 +3116,12 @@ impl LayoutCanvas {
             })
             .collect::<Vec<_>>();
         match &cell.sse_basis {
+            // An empty sparse basis means there are no remaining constraint
+            // rows. In that case the row-space representation is also empty,
+            // and every still-unsolved variable is free to move.
+            compile::SseBasis::Nullspace(vectors) if vectors.is_empty() => {
+                crate::sse::drag_delta_multi(&edges, &[], &cell.unsolved_vars, &deltas)
+            }
             compile::SseBasis::Nullspace(vectors) => {
                 let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
                 crate::sse::drag_delta_multi_nullspace(
@@ -2685,10 +3193,16 @@ impl LayoutCanvas {
             if bounds.contains(&position) {
                 hits.push(SelectionHit {
                     span: span.clone(),
-                    area: bounds_area(bounds),
                     outline: rect_selection_outline(bounds, rect.border_styles),
                     layer: SelectionLayer::Layout(layer.z),
-                    paint_order,
+                    creation_order: if rect.object_path.is_empty() {
+                        vec![paint_order as u64]
+                    } else {
+                        rect.object_path
+                            .iter()
+                            .map(|id| id.creation_order())
+                            .collect()
+                    },
                 });
             }
         }
@@ -2703,15 +3217,34 @@ impl LayoutCanvas {
                 .map(|point| self.layout_to_px(*point))
                 .collect::<Vec<_>>();
             if point_in_polygon(position, &points) {
-                hits.push(SelectionHit {
-                    span: span.clone(),
-                    area: polygon_area(&points),
-                    outline: SelectionOutline::Polygon {
+                let outline = if let Some(centerline) = &polygon.centerline {
+                    SelectionOutline::Polyline {
+                        points: centerline
+                            .points
+                            .iter()
+                            .map(|point| self.layout_to_px(*point))
+                            .collect(),
+                        segment_styles: centerline.segment_styles.clone(),
+                    }
+                } else {
+                    SelectionOutline::Polygon {
                         points,
                         edge_styles: polygon.edge_styles.clone(),
-                    },
+                    }
+                };
+                hits.push(SelectionHit {
+                    span: span.clone(),
+                    outline,
                     layer: SelectionLayer::Layout(layer.z),
-                    paint_order,
+                    creation_order: if polygon.object_path.is_empty() {
+                        vec![paint_order as u64]
+                    } else {
+                        polygon
+                            .object_path
+                            .iter()
+                            .map(|id| id.creation_order())
+                            .collect()
+                    },
                 });
             }
         }
@@ -2724,10 +3257,17 @@ impl LayoutCanvas {
             if bounds.contains(&position) {
                 hits.push(SelectionHit {
                     span: span.clone(),
-                    area: bounds_area(bounds),
                     outline: rect_selection_outline(bounds, bbox.rect.border_styles),
                     layer: SelectionLayer::Scope,
-                    paint_order,
+                    creation_order: if bbox.rect.object_path.is_empty() {
+                        vec![paint_order as u64]
+                    } else {
+                        bbox.rect
+                            .object_path
+                            .iter()
+                            .map(|id| id.creation_order())
+                            .collect()
+                    },
                 });
             }
         }
@@ -2737,13 +3277,12 @@ impl LayoutCanvas {
                 if bounds.contains(&position) {
                     hits.push(SelectionHit {
                         span: span.clone(),
-                        area: bounds_area(*bounds),
                         outline: SelectionOutline::Rect {
                             bounds: *bounds,
                             border_styles: Edges::all(BorderStyle::Solid),
                         },
                         layer: SelectionLayer::Overlay,
-                        paint_order,
+                        creation_order: vec![paint_order as u64],
                     });
                 }
             }
@@ -2864,22 +3403,10 @@ impl LayoutCanvas {
                                                             .selected_layer
                                                             .clone()
                                                             .map(|s| s.to_string()),
-                                                        x0: argonc::tech::snap(
-                                                            f64::from(p0p.x),
-                                                            grid,
-                                                        ),
-                                                        y0: argonc::tech::snap(
-                                                            f64::from(p0p.y),
-                                                            grid,
-                                                        ),
-                                                        x1: argonc::tech::snap(
-                                                            f64::from(p1p.x),
-                                                            grid,
-                                                        ),
-                                                        y1: argonc::tech::snap(
-                                                            f64::from(p1p.y),
-                                                            grid,
-                                                        ),
+                                                        x0: draw_source_coordinate(p0p.x, grid),
+                                                        y0: draw_source_coordinate(p0p.y, grid),
+                                                        x1: draw_source_coordinate(p1p.x, grid),
+                                                        y1: draw_source_coordinate(p1p.y, grid),
                                                         construction: false,
                                                     },
                                                 ) {
@@ -2920,8 +3447,61 @@ impl LayoutCanvas {
                         && let Some(layer_info) = layers.layers.get(layer)
                     {
                         if layer_info.visible {
-                            if polygon_tool.points.last() != Some(&snapped_layout_mouse_position) {
-                                polygon_tool.points.push(snapped_layout_mouse_position);
+                            let cursor = snapped_layout_mouse_position;
+                            let (point, constraint) = if event.modifiers.shift
+                                && let Some(previous) = polygon_tool.points.last().copied()
+                            {
+                                let (point, constraint) = snap_draw_point(previous, cursor);
+                                (point, Some(constraint))
+                            } else {
+                                (cursor, None)
+                            };
+                            if polygon_tool.points.last() != Some(&point) {
+                                if let Some(constraint) = constraint {
+                                    polygon_tool.constraints.push(segment_constraint_with_end(
+                                        constraint,
+                                        polygon_tool.points.len(),
+                                    ));
+                                }
+                                polygon_tool.points.push(point);
+                                cx.notify();
+                            }
+                        } else {
+                            let _ = state.lang_server_client.show_message(
+                                MessageType::ERROR,
+                                "Cannot draw on an invisible layer.",
+                            );
+                        }
+                    } else {
+                        let _ = state
+                            .lang_server_client
+                            .show_message(MessageType::ERROR, "No layer has been selected.");
+                    }
+                }
+                ToolState::DrawPath(path_tool) => {
+                    let state = self.state.read(cx);
+                    let layers = state.layers.read(cx);
+                    if let Some(layer) = &layers.selected_layer
+                        && let Some(layer_info) = layers.layers.get(layer)
+                    {
+                        if layer_info.visible {
+                            let cursor = snapped_layout_mouse_position;
+                            let (point, constraint) = if event.modifiers.shift
+                                && let Some(previous) = path_tool.points.last().copied()
+                            {
+                                let (point, constraint) = snap_draw_point(previous, cursor);
+                                (point, Some(constraint))
+                            } else {
+                                (cursor, None)
+                            };
+                            if path_tool.points.last() != Some(&point) {
+                                if let Some(constraint) = constraint {
+                                    path_tool.constraints.push(segment_constraint_with_end(
+                                        constraint,
+                                        path_tool.points.len(),
+                                    ));
+                                }
+                                path_tool.points.push(point);
                                 cx.notify();
                             }
                         } else {
@@ -3356,6 +3936,9 @@ impl LayoutCanvas {
                         .cloned();
                     if let Some(handle) = handle {
                         self.is_sse_persisting = false;
+                        self.pending_sse_values.clear();
+                        self.deferred_snapshot = None;
+                        self.sse_persist_after_revision = None;
                         self.is_sse_dragging = true;
                         self.drag_start = event.position;
                         self.sse_delta = Point::default();
@@ -3380,6 +3963,9 @@ impl LayoutCanvas {
                                 .cloned()
                             {
                                 self.is_sse_persisting = false;
+                                self.pending_sse_values.clear();
+                                self.deferred_snapshot = None;
+                                self.sse_persist_after_revision = None;
                                 self.is_sse_dragging = true;
                                 self.drag_start = event.position;
                                 self.sse_delta = Point::default();
@@ -3442,20 +4028,34 @@ impl LayoutCanvas {
         });
     }
 
-    pub(crate) fn finish_polygon(
+    pub(crate) fn draw_path(&mut self, _: &DrawPath, _window: &mut Window, cx: &mut Context<Self>) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            if !tool.is_draw_path() {
+                *tool = ToolState::DrawPath(DrawPathToolState::default());
+                cx.notify();
+            }
+        });
+    }
+
+    pub(crate) fn finish_draw_points(
         &mut self,
         _: &Enter,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.state.read(cx).tool.clone().update(cx, |tool, cx| {
-            let ToolState::DrawPolygon(polygon_tool) = tool else {
-                return;
+            let (draw_points, constraints, is_path) = match tool {
+                ToolState::DrawPolygon(tool) => (&mut tool.points, &mut tool.constraints, false),
+                ToolState::DrawPath(tool) => (&mut tool.points, &mut tool.constraints, true),
+                _ => return,
             };
-            if polygon_tool.points.len() < 3 {
+            let minimum_points = if is_path { 2 } else { 3 };
+            if draw_points.len() < minimum_points {
+                let shape = if is_path { "path" } else { "polygon" };
+                let count = if is_path { "two" } else { "three" };
                 let _ = self.state.read(cx).lang_server_client.show_message(
                     MessageType::ERROR,
-                    "A polygon requires at least three points before pressing Enter.",
+                    format!("A {shape} requires at least {count} points before pressing Enter."),
                 );
                 return;
             }
@@ -3467,16 +4067,16 @@ impl LayoutCanvas {
                 .as_ref()
                 .map(|cell| cell.output.tech.grid)
                 .unwrap_or(0.1);
-            let points = polygon_tool
-                .points
+            let points = draw_points
                 .iter()
                 .map(|point| {
                     (
-                        argonc::tech::snap(f64::from(point.x), grid),
-                        argonc::tech::snap(f64::from(point.y), grid),
+                        draw_source_coordinate(point.x, grid),
+                        draw_source_coordinate(point.y, grid),
                     )
                 })
                 .collect::<Vec<_>>();
+            let source_constraints = constraints.clone();
             let Some(layer) = self
                 .state
                 .read(cx)
@@ -3505,22 +4105,38 @@ impl LayoutCanvas {
                         .output
                         .reachable_objs(scope_address.cell, scope_address.scope);
                     let names: IndexSet<_> = reachable_objs.values().collect();
-                    let polygon_name = (0..)
-                        .map(|index| format!("polygon{index}"))
+                    let name_prefix = if is_path { "path" } else { "polygon" };
+                    let object_name = (0..)
+                        .map(|index| format!("{name_prefix}{index}"))
                         .find(|name| !names.contains(name))
                         .unwrap();
                     let scope_span = cell.output.cells[&scope_address.cell].scopes
                         [&scope_address.scope]
                         .span
                         .clone();
-                    match state.lang_server_client.draw_polygon(
-                        scope_span,
-                        polygon_name,
-                        PolygonParams {
-                            layer: layer.clone(),
-                            points: points.clone(),
-                        },
-                    ) {
+                    let result = if is_path {
+                        state.lang_server_client.draw_path(
+                            scope_span,
+                            object_name,
+                            PathParams {
+                                layer: layer.clone(),
+                                width: f64::from(DEFAULT_DRAW_PATH_WIDTH),
+                                points: points.clone(),
+                                constraints: source_constraints.clone(),
+                            },
+                        )
+                    } else {
+                        state.lang_server_client.draw_polygon(
+                            scope_span,
+                            object_name,
+                            PolygonParams {
+                                layer: layer.clone(),
+                                points: points.clone(),
+                                constraints: source_constraints.clone(),
+                            },
+                        )
+                    };
+                    match result {
                         Ok(Some(_)) => {
                             inserted = true;
                             None
@@ -3534,7 +4150,8 @@ impl LayoutCanvas {
                 }
             });
             if inserted {
-                polygon_tool.points.clear();
+                draw_points.clear();
+                constraints.clear();
                 cx.notify();
             }
         });
@@ -3627,8 +4244,19 @@ impl LayoutCanvas {
                 ToolState::DrawRect(DrawRectToolState { p0: p0 @ Some(_) }) => {
                     *p0 = None;
                 }
-                ToolState::DrawPolygon(DrawPolygonToolState { points }) if !points.is_empty() => {
+                ToolState::DrawPolygon(DrawPolygonToolState {
+                    points,
+                    constraints,
+                }) if !points.is_empty() => {
                     points.clear();
+                    constraints.clear();
+                }
+                ToolState::DrawPath(DrawPathToolState {
+                    points,
+                    constraints,
+                }) if !points.is_empty() => {
+                    points.clear();
+                    constraints.clear();
                 }
                 ToolState::DrawDim(DrawDimToolState { edges }) if !edges.is_empty() => {
                     edges.clear();
@@ -3681,6 +4309,7 @@ impl LayoutCanvas {
         cx: &mut Context<Self>,
     ) {
         self.mouse_position = event.position;
+        self.shift_down = event.modifiers.shift;
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
         } else if self.is_sse_dragging {
@@ -3735,6 +4364,7 @@ impl LayoutCanvas {
             let edits = self.sse_source_edits(cx);
             if edits.values.is_empty() && edits.initial_conditions.is_empty() {
                 self.is_sse_dragging = false;
+                self.pending_sse_values.clear();
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
@@ -3747,6 +4377,11 @@ impl LayoutCanvas {
                     Ok(Some(applied_edits)) => {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
+                        self.pending_sse_values = pending_sse_values(&applied_edits);
+                        self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
+                        // Anything deferred before the workspace edit was
+                        // accepted belongs to the pre-drag source revision.
+                        self.deferred_snapshot = None;
                         let selected_after_edits = {
                             let tool = self.state.read(cx).tool.read(cx);
                             match tool {
@@ -3768,11 +4403,15 @@ impl LayoutCanvas {
                     }
                     Ok(None) => {
                         self.is_sse_dragging = false;
+                        self.pending_sse_values.clear();
+                        self.sse_persist_after_revision = None;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
                     Err(_) => {
                         self.is_sse_dragging = false;
+                        self.pending_sse_values.clear();
+                        self.sse_persist_after_revision = None;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
@@ -3784,9 +4423,31 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
+    pub(crate) fn accepts_snapshot(&self, snapshot: &CompilationSnapshot) -> bool {
+        if !self.is_sse_persisting {
+            return true;
+        }
+        if !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision) {
+            return false;
+        }
+        let data = match &snapshot.output {
+            compile::CompileOutput::Valid(data) => Some(data),
+            compile::CompileOutput::ExecErrors(output) => output.output.as_ref(),
+            compile::CompileOutput::StaticErrors(_) | compile::CompileOutput::FatalParseErrors => {
+                None
+            }
+        };
+        self.pending_sse_values.is_empty()
+            || data.is_some_and(|data| {
+                compiled_data_matches_pending_sse(data, &self.pending_sse_values)
+            })
+    }
+
     pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
         if self.is_sse_persisting {
             self.is_sse_persisting = false;
+            self.pending_sse_values.clear();
+            self.sse_persist_after_revision = None;
             self.sse_delta = Point::default();
             self.sse_targets.clear();
             cx.notify();
@@ -3857,7 +4518,9 @@ pub(crate) fn find_obj_path(
         .reachable_objs(current_scope.cell, current_scope.scope);
     if let Some(name) = reachable_objs.swap_remove(obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
-            SolvedValue::Rect(_) | SolvedValue::Polygon(_) => string_path.push(name),
+            SolvedValue::Rect(_) | SolvedValue::Polygon(_) | SolvedValue::Path(_) => {
+                string_path.push(name)
+            }
             SolvedValue::Instance(_) => {
                 string_path.push(name);
                 string_path = vec![format!("bbox({})", string_path.join("."))];
@@ -3873,6 +4536,19 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compile(
+        ast: &argonc::parse::WorkspaceParseAst,
+        input: argonc::compile::CompileInput<'_>,
+    ) -> argonc::compile::CompileOutput {
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
+        argonc::compile::compile(
+            ast,
+            input,
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
+        )
+    }
 
     fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
         (
@@ -3899,20 +4575,19 @@ mod tests {
         )
     }
 
-    fn selection_hit(name: &str, layer: SelectionLayer, size: f32) -> SelectionHit {
-        let bounds = Bounds::new(Point::default(), Size::new(px(size), px(size)));
+    fn selection_hit(name: &str, layer: SelectionLayer, creation_order: u64) -> SelectionHit {
+        let bounds = Bounds::new(Point::default(), Size::new(px(10.), px(10.)));
         SelectionHit {
             span: Span {
                 path: std::path::PathBuf::from(format!("{name}.ar")),
                 span: cfgrammar::Span::new(0, 1),
             },
-            area: bounds_area(bounds),
             outline: SelectionOutline::Rect {
                 bounds,
                 border_styles: Edges::all(BorderStyle::Solid),
             },
             layer,
-            paint_order: 0,
+            creation_order: vec![creation_order],
         }
     }
 
@@ -3951,18 +4626,113 @@ mod tests {
     }
 
     #[test]
+    fn path_segments_are_dashed_only_next_to_unconstrained_points() {
+        assert_eq!(
+            path_segment_styles(4, |index| index == 1),
+            [BorderStyle::Dashed, BorderStyle::Dashed, BorderStyle::Solid,]
+        );
+        assert_eq!(
+            path_segment_styles(3, |_| false),
+            [BorderStyle::Solid, BorderStyle::Solid]
+        );
+    }
+
+    #[test]
+    fn shift_snaps_draw_points_to_octants() {
+        let origin = Point::new(0., 0.);
+        assert_eq!(
+            snap_draw_point(origin, Point::new(8., 2.)),
+            (Point::new(8., 0.), DrawSegmentConstraint::Horizontal(0))
+        );
+        assert_eq!(
+            snap_draw_point(origin, Point::new(2., 8.)),
+            (Point::new(0., 8.), DrawSegmentConstraint::Vertical(0))
+        );
+        assert_eq!(
+            snap_draw_point(origin, Point::new(8., 5.)),
+            (
+                Point::new(6.5, 6.5),
+                DrawSegmentConstraint::DiagonalPositive(0)
+            )
+        );
+        assert_eq!(
+            snap_draw_point(origin, Point::new(-8., 5.)),
+            (
+                Point::new(-6.5, 6.5),
+                DrawSegmentConstraint::DiagonalNegative(0)
+            )
+        );
+    }
+
+    #[test]
+    fn drawn_coordinates_discard_f32_representation_noise() {
+        assert_eq!(draw_source_coordinate(110.3_f32, 0.1), 110.3);
+        assert_eq!(draw_source_coordinate(110.37_f32, 0.25), 110.25);
+    }
+
+    #[test]
+    fn dotted_segments_keep_screen_space_spacing_when_rotated() {
+        let horizontal = dotted_segment_centers(Point::default(), Point::new(px(70.), px(0.)));
+        let diagonal =
+            dotted_segment_centers(Point::default(), Point::new(px(49.497475), px(49.497475)));
+        assert_eq!(horizontal.len(), diagonal.len());
+        for centers in [&horizontal, &diagonal] {
+            for pair in centers.windows(2) {
+                let dx = f32::from(pair[1].x - pair[0].x);
+                let dy = f32::from(pair[1].y - pair[0].y);
+                assert!(dx.hypot(dy) > f32::from(DOT_DIAMETER));
+            }
+        }
+    }
+
+    #[test]
+    fn path_centerline_points_are_draggable() {
+        let source =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/path/lib.ar");
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["initial_path"],
+                args: vec![],
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(output) => output.output.unwrap(),
+            output => panic!("path fixture should compile: {output:?}"),
+        };
+        let cell = &output.cells[&output.top];
+        let path = cell
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .expect("fixture should contain a path");
+        let styles = path_segment_styles(path.points.len(), |index| {
+            let (x, y) = &path.points[index];
+            x.1.coeffs
+                .iter()
+                .chain(&y.1.coeffs)
+                .any(|(_, var)| cell.unsolved_vars.contains(var))
+        });
+        assert_eq!(styles, [BorderStyle::Dashed, BorderStyle::Dashed]);
+
+        let (x, y) = &path.points[2];
+        let targets = LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), cell);
+        assert_eq!(targets.len(), 2);
+        assert!(LayoutCanvas::sse_targets_support_2d(&targets, cell));
+    }
+
+    #[test]
     fn polygon_edges_touching_a_one_axis_free_point_are_dashed() {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/polygon/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/tech/basic.tech.toml");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["one_axis_point"],
                 args: vec![],
-                tech_file: &tech,
             },
         );
         let output = match output {
@@ -4003,14 +4773,11 @@ mod tests {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/polygon/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/tech/basic.tech.toml");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["initial_points"],
                 args: vec![],
-                tech_file: &tech,
             },
         );
         let output = match output {
@@ -4268,6 +5035,81 @@ mod tests {
     }
 
     #[test]
+    fn pending_drag_values_track_their_compiled_source_spans() {
+        let path = std::path::PathBuf::from("lib.ar");
+        let edits = [
+            ValueEdit {
+                span: Span {
+                    path: path.clone(),
+                    span: cfgrammar::Span::new(10, 19),
+                },
+                value: "1.2".to_owned(),
+            },
+            ValueEdit {
+                span: Span {
+                    path,
+                    span: cfgrammar::Span::new(30, 32),
+                },
+                value: "0.".to_owned(),
+            },
+        ];
+
+        let pending = pending_sse_values(&edits);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].span.span, cfgrammar::Span::new(10, 13));
+        assert_eq!(pending[0].value, 1.2);
+        assert_eq!(pending[1].span.span, cfgrammar::Span::new(24, 26));
+        assert_eq!(pending[1].value, 0.);
+    }
+
+    #[test]
+    fn stale_compile_output_does_not_finish_a_drag_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            "cell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(compile::ExecErrorCompileOutput {
+                output: Some(output),
+                ..
+            }) => output,
+            output => panic!("drag fixture should produce geometry: {output:?}"),
+        };
+        let fallback = output.cells[&output.top]
+            .fallback_constraints_used
+            .first()
+            .expect("rectangle should use its initial conditions");
+        let mut pending = vec![PendingSseValue {
+            span: fallback.span.clone(),
+            value: -fallback.constraint.constant,
+        }];
+
+        assert!(compiled_data_matches_pending_sse(&output, &pending));
+        pending[0].value += 1.;
+        assert!(!compiled_data_matches_pending_sse(&output, &pending));
+    }
+
+    #[test]
+    fn drag_preview_only_accepts_a_newer_compilation_revision() {
+        assert!(snapshot_follows_revision(4, None));
+        assert!(!snapshot_follows_revision(3, Some(3)));
+        assert!(!snapshot_follows_revision(2, Some(3)));
+        assert!(snapshot_follows_revision(4, Some(3)));
+    }
+
+    #[test]
     fn dimension_coordinate_follows_dragged_solver_expression() {
         let mut solver = argonc::solver::Solver::new();
         let edge = solver.new_var();
@@ -4279,28 +5121,25 @@ mod tests {
     }
 
     #[test]
-    fn selection_prefers_smallest_hit_box_on_the_same_layer() {
+    fn selection_prefers_last_created_object_on_the_same_layer() {
         let hits = vec![
-            selection_hit("large", SelectionLayer::Layout(3), 100.),
-            selection_hit("small", SelectionLayer::Layout(3), 10.),
+            selection_hit("first", SelectionLayer::Layout(3), 0),
+            selection_hit("last", SelectionLayer::Layout(3), 1),
         ];
 
         let selected = choose_selection_hit(hits, None, false).unwrap();
-        assert_eq!(selected.span.path, std::path::PathBuf::from("small.ar"));
+        assert_eq!(selected.span.path, std::path::PathBuf::from("last.ar"));
     }
 
     #[test]
-    fn selection_prefers_higher_layers_before_area() {
+    fn selection_prefers_higher_layers_before_creation_order() {
         let hits = vec![
-            selection_hit("small-low", SelectionLayer::Layout(2), 10.),
-            selection_hit("large-high", SelectionLayer::Layout(3), 100.),
+            selection_hit("new-low", SelectionLayer::Layout(2), 100),
+            selection_hit("old-high", SelectionLayer::Layout(3), 0),
         ];
 
         let selected = choose_selection_hit(hits, None, false).unwrap();
-        assert_eq!(
-            selected.span.path,
-            std::path::PathBuf::from("large-high.ar")
-        );
+        assert_eq!(selected.span.path, std::path::PathBuf::from("old-high.ar"));
     }
 
     #[test]
@@ -4313,7 +5152,7 @@ mod tests {
 
         let ordered = ordered_dimension_rects(&rects, &[]);
 
-        // Higher z wins even when larger; among equal-z shapes, smaller wins.
+        // Higher z wins; among equal-z shapes, the later-created one wins.
         assert_eq!(
             ordered.iter().map(|rect| rect.x0).collect::<Vec<_>>(),
             [30., 20., 10.]
@@ -4322,14 +5161,14 @@ mod tests {
 
     #[test]
     fn command_click_cycles_through_hits_and_wraps() {
-        let small = selection_hit("small", SelectionLayer::Layout(3), 10.);
-        let large = selection_hit("large", SelectionLayer::Layout(3), 100.);
-        let hits = vec![large.clone(), small.clone()];
+        let first = selection_hit("first", SelectionLayer::Layout(3), 0);
+        let last = selection_hit("last", SelectionLayer::Layout(3), 1);
+        let hits = vec![first.clone(), last.clone()];
 
-        let next = choose_selection_hit(hits.clone(), Some(&small.span), true).unwrap();
-        assert_eq!(next.span, large.span);
-        let wrapped = choose_selection_hit(hits, Some(&large.span), true).unwrap();
-        assert_eq!(wrapped.span, small.span);
+        let next = choose_selection_hit(hits.clone(), Some(&last.span), true).unwrap();
+        assert_eq!(next.span, first.span);
+        let wrapped = choose_selection_hit(hits, Some(&first.span), true).unwrap();
+        assert_eq!(wrapped.span, last.span);
     }
 
     #[test]
@@ -4352,14 +5191,11 @@ cell top() {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/tech/basic.tech.toml");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                tech_file: &tech,
             },
         );
         let output = match output {
@@ -4399,14 +5235,11 @@ cell top() {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/tech/basic.tech.toml");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                tech_file: &tech,
             },
         )
         .unwrap_valid();

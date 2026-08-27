@@ -517,8 +517,10 @@ floats from `IntLit DOT IntLit?`:
 - `1.0.2` → `IndexFieldAccess(FloatLiteral(1.0), 2)`: the first `.0` completes
   the float, the second `.2` is a tuple-index suffix.
 
-A literal's value is parsed from the raw source slice and defaults to `0` /
-`0.0` on overflow, matching the old behavior.
+A literal's value is parsed from the raw source slice. A slice that does not
+parse — an integer outside `i64`, or a float split by trivia (`1 . 5`) — is a
+parse error; the node keeps `0` / `0.0` so the parse can continue.
+The same check covers a tuple-index suffix (`t.0`).
 
 ### 9.4 The `lhs_start` span subtlety, and prefix vs suffix
 
@@ -570,8 +572,8 @@ an annotation, if present, has its own span and is excluded.)
 
 ## 11. The `parse_cell` contract
 
-`parse_cell_entry` parses a single cell invocation for the analyzer,
-which reads the target cell's name and literal arguments from it. The contract
+`parse_cell_entry` parses a single cell invocation supplied by a compiler entry
+point — `argonc --cell`, or the language server's open-cell command. The contract
 is *exactly one call expression followed by EOF*:
 
 ```rust
@@ -582,9 +584,20 @@ Some(call)
 
 So `top(1, 2)` is accepted, while trailing garbage (`top() junk`) and suffixed
 calls (`top()!`, `top().x`, `top()[0]` — whose root node is an `Emit` /
-`FieldAccess` / `Index`, not a `Call`) are all rejected. This is distinct from
-`format_cell_input` in `parse.rs`, which wraps a snippet into a whole `cell { … }`
-program for `parse_ast`; the two are not interchangeable.
+`FieldAccess` / `Index`, not a `Call`) are all rejected.
+
+This is only a syntax gate. The invocation is not interpreted here: its caller,
+`parse::splice_cell_invocation`, appends it to the root module as a generated
+entry cell (`cell __argon_entry_0__() { let __argon_top_0__ = top(1, 2); }`) and
+lets the ordinary resolution, type-checking, and evaluation passes handle it, so
+arguments may be any expression. Only the call expression's own span is spliced,
+which is what keeps a trailing line comment from swallowing the generated `;`.
+Spans landing in the generated text are mapped back onto the invocation by
+`CellInvocation::remap`, under the virtual path `<argon-cell>`.
+
+This is distinct from `format_cell_input` in `parse.rs`, which wraps a snippet
+into a whole `cell { … }` program for `parse_ast`; the two are not
+interchangeable.
 
 ---
 

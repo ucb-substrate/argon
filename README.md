@@ -61,6 +61,15 @@ arc run --cell 'top()' --gds
 result to `target/argon.bin`; pass `--gds` to also write `target/argon.gds`.
 Dependency cells use their dependency name, for example
 `arc run --cell 'pdk::fet1v8(true, 150., 5)'`.
+
+Cell arguments are ordinary Argon expressions, evaluated by the compiler in the
+library's scope, so they may call functions and build sequences:
+
+```bash
+arc run --cell 'top(pitch * 4., -width / 2.)'
+arc run --cell 'array(cons(250., cons(350., [])), Mode::Fast)'
+```
+
 GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
 `use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,

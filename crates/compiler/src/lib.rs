@@ -3,10 +3,14 @@ pub mod ast;
 pub mod compile;
 pub mod diagnostics;
 pub mod gds;
+pub mod incremental;
 pub mod parse;
 mod parser;
 pub mod solver;
 pub mod tech;
+pub mod workspace;
+
+pub use workspace::WorkspaceConfig;
 
 /// A global allocator that tracks live and peak heap usage so that the scaling
 /// benchmarks in the test module can report memory consumption alongside
@@ -105,7 +109,10 @@ mod tests {
     use indexmap::IndexMap;
     use pegasus::drc::{DrcParams, run_drc};
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::{
+        WorkspaceConfig,
+        compile::{CellArg, CompileInput, compile as compile_workspace},
+    };
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
@@ -114,6 +121,25 @@ mod tests {
     const ARGON_SKY130_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pdks/sky130");
     const ARGON_SKY130_LIB: &str = concatcp!(ARGON_SKY130_DIR, "/lib.ar");
     const SKY130_TECH: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.tech.toml");
+
+    fn compile(ast: &crate::parse::WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+        compile_workspace(
+            ast,
+            input,
+            &WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH))),
+        )
+    }
+
+    fn compile_sky130(
+        ast: &crate::parse::WorkspaceParseAst,
+        input: CompileInput<'_>,
+    ) -> CompileOutput {
+        compile_workspace(
+            ast,
+            input,
+            &WorkspaceConfig::default().with_tech(Some(PathBuf::from(SKY130_TECH))),
+        )
+    }
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
@@ -131,6 +157,7 @@ mod tests {
     const ARGON_PARAM_INT: &str = concatcp!(EXAMPLES_DIR, "/param_int/lib.ar");
     const ARGON_ENUMERATIONS: &str = concatcp!(EXAMPLES_DIR, "/enumerations/lib.ar");
     const ARGON_BBOX: &str = concatcp!(EXAMPLES_DIR, "/bbox/lib.ar");
+    const ARGON_BBOX_NESTED: &str = concatcp!(EXAMPLES_DIR, "/bbox_nested/lib.ar");
     const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
@@ -158,6 +185,7 @@ mod tests {
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
     const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
+    const ARGON_PATH: &str = concatcp!(EXAMPLES_DIR, "/path/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -465,7 +493,6 @@ mod tests {
                     CompileInput {
                         cell: &["shapes"],
                         args: vec![CellArg::Int(n)],
-                        tech_file: &PathBuf::from(BASIC_TECH),
                     },
                 )
             });
@@ -509,7 +536,6 @@ mod tests {
                     CompileInput {
                         cell: &["shapes_loop"],
                         args: vec![CellArg::Int(n)],
-                        tech_file: &PathBuf::from(BASIC_TECH),
                     },
                 )
             });
@@ -545,7 +571,6 @@ mod tests {
                     CompileInput {
                         cell: &["constraints"],
                         args: vec![CellArg::Int(n)],
-                        tech_file: &PathBuf::from(BASIC_TECH),
                     },
                 )
             });
@@ -579,7 +604,6 @@ mod tests {
                     CompileInput {
                         cell: &["instances"],
                         args: vec![CellArg::Int(n)],
-                        tech_file: &PathBuf::from(BASIC_TECH),
                     },
                 )
             });
@@ -642,7 +666,6 @@ mod tests {
                     CompileInput {
                         cell: &[&cellname],
                         args: vec![],
-                        tech_file: &PathBuf::from(BASIC_TECH),
                     },
                 )
             });
@@ -681,7 +704,6 @@ mod tests {
                     CompileInput {
                         cell: &[&cellname],
                         args: vec![],
-                        tech_file: &PathBuf::from(BASIC_TECH),
                     },
                 )
             });
@@ -709,7 +731,6 @@ mod tests {
                 CompileInput {
                     cell: &[cell],
                     args: vec![CellArg::Int(64)],
-                    tech_file: &PathBuf::from(BASIC_TECH),
                 },
             );
             let d = out.unwrap_valid();
@@ -733,7 +754,6 @@ mod tests {
             CompileInput {
                 cell: &["constraints"],
                 args: vec![CellArg::Int(32)],
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         assert!(
@@ -752,7 +772,6 @@ mod tests {
             CompileInput {
                 cell: &["instances"],
                 args: vec![CellArg::Int(64)],
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let d = out.unwrap_valid();
@@ -775,7 +794,6 @@ mod tests {
             CompileInput {
                 cell: &["h8"],
                 args: vec![],
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let d = out.unwrap_valid();
@@ -793,7 +811,6 @@ mod tests {
             CompileInput {
                 cell: &["scopes"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let data = cell.unwrap_valid();
@@ -817,7 +834,6 @@ mod tests {
             CompileInput {
                 cell: &["immediate"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cell:?}");
@@ -833,7 +849,6 @@ mod tests {
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cell:?}");
@@ -849,7 +864,6 @@ mod tests {
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cell:?}");
@@ -866,7 +880,6 @@ mod tests {
             CompileInput {
                 cell: &["via"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cell:?}");
@@ -882,7 +895,6 @@ mod tests {
             CompileInput {
                 cell: &["vias"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cell:?}");
@@ -912,7 +924,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cell:?}");
@@ -928,7 +939,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -944,7 +954,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let data = match cells {
@@ -977,7 +986,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let errors = cells.unwrap_static_errors();
@@ -1108,7 +1116,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         )
         .unwrap_exec_errors()
@@ -1128,7 +1135,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         )
         .unwrap_exec_errors()
@@ -1169,7 +1175,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         )
         .unwrap_exec_errors()
@@ -1204,7 +1209,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1238,7 +1242,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1272,7 +1275,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(50.), CellArg::Float(20.)],
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1289,7 +1291,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Int(50), CellArg::Int(20)],
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1306,7 +1307,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:?}");
@@ -1336,7 +1336,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:?}");
@@ -1355,7 +1354,7 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["inv"],
@@ -1364,7 +1363,6 @@ mod tests {
                     CellArg::Float(2_000.),
                     CellArg::Int(4),
                 ],
-                tech_file: &PathBuf::from(SKY130_TECH),
             },
         );
         println!("cells: {cells:?}");
@@ -1388,7 +1386,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:?}");
@@ -1413,7 +1410,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1433,6 +1429,44 @@ mod tests {
     }
 
     #[test]
+    fn argon_bbox_nested() {
+        let o = parse_workspace_with_std(ARGON_BBOX_NESTED);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let rect_on = |layer: &str| {
+            cell.objects
+                .values()
+                .filter_map(|object| object.get_rect())
+                .find(|rect| rect.layer.as_deref() == Some(layer))
+                .unwrap_or_else(|| panic!("{layer} should copy a bbox"))
+        };
+
+        // `mid` holds `leaf` at x=1000, so the cell bbox must include that offset.
+        let cell_bbox = rect_on("met2");
+        assert_eq!(cell_bbox.x0.0, 1000.);
+        assert_eq!(cell_bbox.y0.0, 0.);
+        assert_eq!(cell_bbox.x1.0, 1100.);
+        assert_eq!(cell_bbox.y1.0, 100.);
+
+        // Rotating by 90 maps (x, y) to (-y, x); the placement then adds x=500.
+        let inst_bbox = rect_on("met3");
+        assert_eq!(inst_bbox.x0.0, 400.);
+        assert_eq!(inst_bbox.y0.0, 1000.);
+        assert_eq!(inst_bbox.x1.0, 500.);
+        assert_eq!(inst_bbox.y1.0, 1100.);
+    }
+
+    #[test]
     fn argon_rounding() {
         let o = parse_workspace_with_std(ARGON_ROUNDING);
         assert!(o.static_errors().is_empty());
@@ -1442,7 +1476,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1464,7 +1497,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1490,7 +1522,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1515,7 +1546,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1540,7 +1570,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1565,7 +1594,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1590,7 +1618,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1615,7 +1642,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1636,12 +1662,11 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_TEXT);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(SKY130_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1671,7 +1696,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1698,7 +1722,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1725,7 +1748,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1752,7 +1774,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1773,7 +1794,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1796,7 +1816,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1820,7 +1839,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1844,7 +1862,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -1884,7 +1901,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let gds_path =
@@ -1946,7 +1962,6 @@ mod tests {
             CompileInput {
                 cell: &["initial_points"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let initial = match initial {
@@ -2029,6 +2044,171 @@ mod tests {
     }
 
     #[test]
+    fn argon_path_dimensions_are_constrained_and_exported() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    let route = path("met1", 3,
+                        width=20.,
+                        begin_extension=5.,
+                        end_extension=7.,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        y2=50.,
+                    );
+                    eq(route.x2, route.points[1].x);
+                    eq(route.width, 20.);
+                    eq(route.begin_extension, 5.);
+                    eq(route.end_extension, 7.);
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        let CompileOutput::Valid(cells) = &output else {
+            panic!("path should be fully constrained: {output:?}");
+        };
+        let path = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .expect("compiled path");
+        assert_eq!(path.width.0, 20.);
+        assert_eq!(path.begin_extension.0, 5.);
+        assert_eq!(path.end_extension.0, 7.);
+        assert_eq!(
+            path.points
+                .iter()
+                .map(|(x, y)| (x.0, y.0))
+                .collect::<Vec<_>>(),
+            [(0., 0.), (100., 0.), (100., 50.)]
+        );
+
+        let gds_path = std::env::temp_dir().join(format!("argon-path-{}.gds", std::process::id()));
+        output.to_gds(&gds_path).expect("export path GDS");
+        let gds = GdsLibrary::load(gds_path).expect("reload path GDS");
+        let path = gds.structs[0]
+            .elems
+            .iter()
+            .find_map(|element| match element {
+                GdsElement::GdsPath(path) => Some(path),
+                _ => None,
+            })
+            .expect("GDS path element");
+        assert_eq!(path.width, Some(20));
+        assert_eq!(path.path_type, Some(4));
+        assert_eq!(path.begin_extn, Some(5));
+        assert_eq!(path.end_extn, Some(7));
+        assert_eq!(path.xy.len(), 3);
+    }
+
+    #[test]
+    fn argon_path_example_compiles() {
+        let parsed = parse_workspace_with_std(ARGON_PATH);
+        assert!(
+            parsed.static_errors().is_empty(),
+            "{:?}",
+            parsed.static_errors()
+        );
+        let ast = parsed.ast();
+        for cell_name in ["top", "initial_path", "custom_extensions"] {
+            let output = compile(
+                &ast,
+                CompileInput {
+                    cell: &[cell_name],
+                    args: Vec::new(),
+                },
+            );
+            let output = match output {
+                CompileOutput::Valid(output) => output,
+                CompileOutput::ExecErrors(output) => output
+                    .output
+                    .unwrap_or_else(|| panic!("path example cell `{cell_name}` needs output")),
+                output => panic!("path example cell `{cell_name}` should compile: {output:?}"),
+            };
+            let path = output.cells[&output.top]
+                .objects
+                .values()
+                .find_map(SolvedValue::get_path)
+                .expect("example cell should contain a path");
+            if cell_name == "custom_extensions" {
+                assert_eq!(path.begin_extension.0, 5.);
+                assert_eq!(path.end_extension.0, 10.);
+            }
+            if cell_name == "initial_path" {
+                let fallbacks = &output.cells[&output.top].fallback_constraints_used;
+                assert!(fallbacks.iter().any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PathBeginExtension(_))
+                )));
+                assert!(fallbacks.iter().any(|fallback| matches!(
+                    fallback.initial_condition,
+                    Some(RectInitialCondition::PathEndExtension(_))
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn sharp_path_corner_matches_klayout_cutoff_outline() {
+        let root = parse_source_text(
+            r#"
+                cell top() {
+                    path("met1", 4,
+                        width=20.,
+                        x0=0., y0=0.,
+                        x1=100., y1=0.,
+                        x2=150., y2=75.,
+                        x3=110.3, y3=14.9,
+                    );
+                }
+            "#,
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let output = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let path = output.cells[&output.top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_path)
+            .unwrap();
+        let outline = path.outline().unwrap();
+        let bbox = path.bbox().unwrap();
+
+        assert_eq!(outline.len(), 11);
+        assert_relative_eq!(bbox.x0, 0., epsilon = EPSILON);
+        assert_relative_eq!(bbox.y0, -10., epsilon = EPSILON);
+        assert_relative_eq!(bbox.x1, 163.85563301818058, epsilon = EPSILON);
+        assert_relative_eq!(bbox.y1, 88.86750490563072, epsilon = EPSILON);
+    }
+
+    #[test]
     fn argon_tuple_any() {
         let o = parse_workspace_with_std(ARGON_TUPLE_ANY);
         assert!(o.static_errors().is_empty());
@@ -2038,7 +2218,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -2065,7 +2244,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -2110,7 +2288,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         let elapsed = start.elapsed();
@@ -2134,7 +2311,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -2158,7 +2334,6 @@ mod tests {
             CompileInput {
                 cell: &["precedence"],
                 args: Vec::new(),
-                tech_file: &PathBuf::from(BASIC_TECH),
             },
         );
         println!("{cells:#?}");
@@ -2185,12 +2360,11 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["diff_vco_top"],
                 args: vec![],
-                tech_file: &PathBuf::from(SKY130_TECH),
             },
         );
         println!("cells: {cells:?}");

@@ -160,6 +160,9 @@ pub struct ExecError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum ExecErrorKind {
+    /// Dynamic compilation requires a workspace technology file.
+    #[error("workspace does not configure a technology file")]
+    MissingTech,
     /// A transformation contains a non-Manhattan rotation.
     #[error("non-Manhattan rotation")]
     InvalidRotation,
@@ -179,6 +182,17 @@ pub enum ExecErrorKind {
         expected: Ty,
         found: String,
     },
+    /// A cell invocation supplied an argument whose value cannot be passed to a
+    /// cell, such as a rectangle or an instance.
+    #[error("invalid cell argument: a {0} value cannot be passed to a cell")]
+    UnsupportedCellArgument(String),
+    /// An argument in a cell invocation does not reduce to a constant, so it
+    /// cannot be bound to a cell parameter.
+    #[error("cell argument could not be evaluated to a constant")]
+    UnevaluatedCellArgument,
+    /// A cell invocation evaluated to something other than a cell.
+    #[error("cell invocation did not evaluate to a cell")]
+    NotACell,
     /// A cell does not have enough constraints for a unique solution.
     #[error("cell is underconstrained")]
     Underconstrained,
@@ -206,6 +220,9 @@ pub enum ExecErrorKind {
     /// A polygon does not contain enough vertices.
     #[error("a polygon requires at least three points")]
     InvalidPolygon,
+    /// A path does not contain enough centerline points.
+    #[error("a path requires at least two points")]
+    InvalidPath,
     /// An operation received an incompatible runtime value.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,
@@ -230,6 +247,9 @@ impl ExecErrorKind {
             Self::InvalidCell(_)
                 | Self::InvalidCellArity { .. }
                 | Self::InvalidCellArgumentType { .. }
+                | Self::UnsupportedCellArgument(_)
+                | Self::UnevaluatedCellArgument
+                | Self::NotACell
         )
     }
 }

@@ -262,9 +262,7 @@ pub(crate) fn initial_condition_after_drag(constraint: &LinearExpr, dv: &SparseV
 /// Formats a layout value as an Argon float literal (always containing a `.`),
 /// snapped to the technology grid so the written code matches the GUI preview.
 pub(crate) fn format_value(v: f64, grid: f64) -> String {
-    let snapped = argonc::tech::snap(v, grid);
-    let s = format!("{snapped}");
-    if s.contains('.') { s } else { format!("{s}.") }
+    argonc::compile::format_initial_condition(v, grid)
 }
 
 #[cfg(test)]

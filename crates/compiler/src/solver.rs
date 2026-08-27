@@ -378,9 +378,11 @@ impl Solver {
     /// outside the sparse solver's scope.
     pub fn sparse_nullspace_vecs(&self) -> Option<Vec<Vec<(f64, Var)>>> {
         if let Some(cached) = &self.sparse_nullspace_cache {
-            return Some(cached.clone());
+            let mut output = cached.clone();
+            self.append_unconstrained_nullspace_vectors(&mut output);
+            return Some(output);
         }
-        if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
+        if self.unsolved_vars.is_empty() {
             return Some(Vec::new());
         }
         let mut output = Vec::new();
@@ -413,7 +415,20 @@ impl Solver {
                     .collect()
             }));
         }
+        self.append_unconstrained_nullspace_vectors(&mut output);
         Some(output)
+    }
+
+    /// Variables absent from every active constraint are independent null-space
+    /// directions and therefore need explicit unit vectors for SSE dragging.
+    fn append_unconstrained_nullspace_vectors(&self, output: &mut Vec<Vec<(f64, Var)>>) {
+        output.extend(self.unsolved_vars.iter().filter_map(|var| {
+            let constrained = self
+                .var_to_constraints
+                .get(var)
+                .is_some_and(|ids| ids.iter().any(|id| self.constraints.contains_key(id)));
+            (!constrained).then_some(vec![(1., *var)])
+        }));
     }
 
     pub fn value_of(&self, var: Var) -> Option<f64> {
@@ -1055,5 +1070,17 @@ mod tests {
         let basis = solver.sparse_nullspace_vecs().unwrap();
         assert_eq!(basis.len(), 1);
         assert!(basis[0].iter().all(|&(_, var)| var != z));
+    }
+
+    #[test]
+    fn unconstrained_variables_are_nullspace_directions_for_sse() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+
+        solver.solve();
+
+        let basis = solver.sparse_nullspace_vecs().unwrap();
+        assert_eq!(basis, vec![vec![(1., x)], vec![(1., y)]]);
     }
 }

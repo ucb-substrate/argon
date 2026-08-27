@@ -5,8 +5,10 @@ actions!(
     Argon,
     [
         Quit,
+        Save,
         DrawRect,
         DrawPolygon,
+        DrawPath,
         SelectMode,
         DrawDim,
         Edit,
