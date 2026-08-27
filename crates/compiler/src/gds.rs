@@ -138,11 +138,9 @@ pub(crate) enum ImportedGdsElement {
 pub(crate) fn import_gds(
     path: &Path,
     declared_name: &str,
-    tech_path: &Path,
+    tech: &Technology,
 ) -> Result<ImportedGdsLibrary> {
-    let tech = read_tech(tech_path)
-        .with_context(|| format!("could not map layers for GDS `{}`", path.display()))?;
-    import_gds_with_tech(path, declared_name, &tech)
+    import_gds_with_tech(path, declared_name, tech)
 }
 
 fn import_gds_with_tech(

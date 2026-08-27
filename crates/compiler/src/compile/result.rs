@@ -205,9 +205,9 @@ pub enum ExecErrorKind {
     /// A constraint conflicts with the rest of the system.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
-    /// A value is not sufficiently close to its required rounding step.
-    #[error("invalid rounding")]
-    InvalidRounding(Var),
+    /// A solved value is not sufficiently close to the technology grid.
+    #[error("solved value is off grid")]
+    OffGrid(Var),
     /// A cell or instance has no bounding box.
     #[error("empty bbox")]
     EmptyBbox,

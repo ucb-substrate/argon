@@ -867,7 +867,18 @@ mod tests {
             },
         );
         println!("{cell:?}");
-        cell.unwrap_exec_errors();
+        let errors = cell.unwrap_exec_errors();
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| matches!(error.kind, ExecErrorKind::InconsistentConstraint(_)))
+            .expect("expected an inconsistent constraint");
+        let span = error
+            .span
+            .as_ref()
+            .expect("inconsistent constraint should retain its source span");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(&source[span.span.start()..span.span.end()], "eq(a, 5.)");
     }
 
     #[test]
@@ -1481,10 +1492,41 @@ mod tests {
         println!("{cells:#?}");
         let cells = cells.unwrap_exec_errors();
         assert_eq!(cells.errors.len(), 1);
-        assert!(matches!(
-            cells.errors.first().unwrap().kind,
-            ExecErrorKind::InvalidRounding(_)
+        let error = cells.errors.first().unwrap();
+        assert!(matches!(error.kind, ExecErrorKind::OffGrid(_)));
+        let span = error
+            .span
+            .as_ref()
+            .expect("off-grid error should point to its solver variable");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(&source[span.span.start()..span.span.end()], "float()");
+    }
+
+    #[test]
+    fn solver_uses_technology_grid() {
+        let o = parse_workspace_with_std(ARGON_ROUNDING);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+
+        let tech_path = std::env::temp_dir().join(format!(
+            "argon-solver-grid-{}.tech.toml",
+            std::process::id()
         ));
+        let tech = std::fs::read_to_string(BASIC_TECH)
+            .unwrap()
+            .replace("grid = 0.1", "grid = 0.0001");
+        std::fs::write(&tech_path, tech).unwrap();
+        let cells = compile_workspace(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+            &WorkspaceConfig::default().with_tech(Some(tech_path.clone())),
+        );
+        std::fs::remove_file(tech_path).unwrap();
+
+        assert!(cells.is_valid(), "{cells:#?}");
     }
 
     #[test]
@@ -1821,11 +1863,19 @@ mod tests {
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+            .expect("expected an underconstrained error");
+        let span = error
+            .span
+            .as_ref()
+            .expect("underconstrained error should point to an unsolved variable");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(
+            &source[span.span.start()..span.span.end()],
+            "inst(bot_cell, angle=90)"
         );
     }
 
