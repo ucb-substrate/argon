@@ -8,8 +8,8 @@ use std::{
 
 use analyzer::ArgonConfig;
 use analyzer::rpc::{
-    CompilationSnapshot, DimensionParams, Gui, InitialConditionEdit, InstancePreview,
-    LangServerAction, LangServerClient, PathParams, PolygonParams, ValueEdit,
+    CompilationSnapshot, DimensionParams, FocusEditorParams, Gui, InitialConditionEdit,
+    InstancePreview, LangServerAction, LangServerClient, PathParams, PolygonParams, ValueEdit,
 };
 use anyhow::{Result, anyhow};
 use argonc::{ast::Span, compile::BasicRect};
@@ -416,10 +416,13 @@ impl SyncLangServerClient {
         })
     }
 
-    pub fn open_command_bar(&self, command: Option<String>) -> Result<()> {
+    pub fn open_command_bar(&self, command: Option<String>, return_to_gui: bool) -> Result<()> {
         self.call(move |client| {
-            let command = command.clone();
-            async move { client.focus_editor(context::current(), command).await }
+            let params = FocusEditorParams {
+                command: command.clone(),
+                return_to_gui,
+            };
+            async move { client.focus_editor(context::current(), params).await }
         })
     }
 }

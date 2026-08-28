@@ -1384,6 +1384,19 @@ mod tests {
     }
 
     #[test]
+    fn argon_sky130_technology_uses_klayout_units() {
+        let tech = crate::tech::read_tech(SKY130_TECH).unwrap();
+
+        // SKY130.lyt uses a 0.001 micron DBU, while the technology LEF uses a
+        // 0.005 micron manufacturing grid. Argon keeps source coordinates in
+        // nm, so those become one DBU per display unit and five DBUs per grid.
+        assert_relative_eq!(tech.dbu, 1e-9, epsilon = f64::EPSILON);
+        assert_eq!(tech.display_unit, 1);
+        assert_eq!(tech.grid, 5);
+        assert_relative_eq!(tech.grid_step(), 5., epsilon = f64::EPSILON);
+    }
+
+    #[test]
     fn argon_sky130_inverter() {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
@@ -1900,6 +1913,52 @@ mod tests {
             &source[span.span.start()..span.span.end()],
             "inst(bot_cell, angle=90)"
         );
+    }
+
+    #[test]
+    fn underconstrained_errors_point_to_each_source_expression() {
+        let source = r#"
+            cell top() {
+                let first = rect("met1");
+                let second = rect("met1");
+            }
+        "#;
+        let path = PathBuf::from("/virtual/lib.ar");
+        let root = parse_source_text(source, path.clone()).unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+
+        let errors = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_exec_errors()
+        .errors
+        .into_iter()
+        .filter(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+        .collect::<Vec<_>>();
+
+        assert_eq!(errors.len(), 2);
+        let spans = errors
+            .iter()
+            .map(|error| error.span.as_ref().expect("error should point to a value"))
+            .collect::<Vec<_>>();
+        assert!(spans.iter().all(|span| span.path == path));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &source[span.span.start()..span.span.end()])
+                .collect::<Vec<_>>(),
+            vec!["rect(\"met1\")", "rect(\"met1\")"]
+        );
+        assert_ne!(spans[0], spans[1]);
     }
 
     #[test]

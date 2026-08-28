@@ -3470,22 +3470,35 @@ impl<'a> ExecPass<'a> {
             update_var_dependents(state);
 
             if !progress {
-                let state = self.cell_state_mut(cell_id);
-                if state.unsolved_vars.is_none() {
-                    let unsolved_vars = state.solver.unsolved_vars().clone();
-                    let span = unsolved_vars
-                        .iter()
-                        .find_map(|var| state.var_span_map.get(var).cloned());
-                    state.unsolved_vars = Some(unsolved_vars);
-                    state.sse_basis = match state.solver.sparse_nullspace_vecs() {
-                        Some(vectors) => SseBasis::Nullspace(vectors),
-                        None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+                let underconstrained_spans = {
+                    let state = self.cell_state_mut(cell_id);
+                    if state.unsolved_vars.is_some() {
+                        None
+                    } else {
+                        let unsolved_vars = state.solver.unsolved_vars().clone();
+                        let spans = unsolved_vars
+                            .iter()
+                            .filter_map(|var| state.var_span_map.get(var).cloned())
+                            .collect::<IndexSet<_>>();
+                        state.unsolved_vars = Some(unsolved_vars);
+                        state.sse_basis = match state.solver.sparse_nullspace_vecs() {
+                            Some(vectors) => SseBasis::Nullspace(vectors),
+                            None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+                        };
+                        Some(spans)
+                    }
+                };
+                if let Some(spans) = underconstrained_spans {
+                    let spans = if spans.is_empty() {
+                        vec![None]
+                    } else {
+                        spans.into_iter().map(Some).collect()
                     };
-                    self.errors.push(ExecError {
+                    self.errors.extend(spans.into_iter().map(|span| ExecError {
                         span,
                         cell: cell_id,
                         kind: ExecErrorKind::Underconstrained,
-                    });
+                    }));
                 }
                 let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);

@@ -2,9 +2,8 @@ local M = {}
 local reported_workspace_modified = {}
 
 local function client_buffers(client_id)
-    return vim.lsp.get_buffers_by_client_id
-        and vim.lsp.get_buffers_by_client_id(client_id)
-        or vim.api.nvim_list_bufs()
+    local client = vim.lsp.get_client_by_id(client_id)
+    return client and vim.tbl_keys(client.attached_buffers) or {}
 end
 
 local function is_file_backed_argon_buffer(bufnr, client_id)
