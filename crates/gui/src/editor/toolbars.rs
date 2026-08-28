@@ -29,6 +29,11 @@ const MAX_SIDEBAR_WIDTH: f32 = 600.;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.;
 const SIDEBAR_SCROLLBAR_MIN_THUMB: f32 = 24.;
+const DEFAULT_HIERARCHY_PREVIEW_HEIGHT: f32 = 220.;
+const MIN_HIERARCHY_PREVIEW_HEIGHT: f32 = 96.;
+const MIN_HIERARCHY_PANEL_HEIGHT: f32 = 144.;
+const HIERARCHY_PREVIEW_RESIZE_HANDLE_HEIGHT: f32 = 7.;
+const NAVIGATION_OVERVIEW_BOX_DRAG_THRESHOLD: f32 = 4.;
 
 fn small_font_size(font_size: f32) -> f32 {
     font_size * 6. / 7.
@@ -42,6 +47,15 @@ enum SidebarEdge {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SidebarResize(SidebarEdge);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HierarchyPreviewResize;
+
+#[derive(Clone, Copy)]
+struct NavigationOverviewDrag {
+    start: Point<Pixels>,
+    current: Point<Pixels>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarScrollAxis {
@@ -62,6 +76,36 @@ struct SidebarScrollState {
 
 fn clamp_sidebar_width(width: Pixels) -> Pixels {
     width.clamp(px(MIN_SIDEBAR_WIDTH), px(MAX_SIDEBAR_WIDTH))
+}
+
+fn clamp_hierarchy_preview_height(height: Pixels, sidebar_height: Pixels) -> Pixels {
+    let maximum = (sidebar_height - px(MIN_HIERARCHY_PANEL_HEIGHT)).max(px(0.));
+    height.clamp(px(MIN_HIERARCHY_PREVIEW_HEIGHT).min(maximum), maximum)
+}
+
+fn clamp_point_to_bounds(point: Point<Pixels>, bounds: Bounds<Pixels>) -> Point<Pixels> {
+    Point::new(
+        point.x.clamp(bounds.left(), bounds.right()),
+        point.y.clamp(bounds.top(), bounds.bottom()),
+    )
+}
+
+fn navigation_overview_drag_bounds(drag: NavigationOverviewDrag) -> Bounds<Pixels> {
+    Bounds::from_corners(
+        Point::new(
+            drag.start.x.min(drag.current.x),
+            drag.start.y.min(drag.current.y),
+        ),
+        Point::new(
+            drag.start.x.max(drag.current.x),
+            drag.start.y.max(drag.current.y),
+        ),
+    )
+}
+
+fn navigation_overview_drag_is_box(drag: NavigationOverviewDrag) -> bool {
+    let delta = drag.current - drag.start;
+    f32::from(delta.x).abs().max(f32::from(delta.y).abs()) >= NAVIGATION_OVERVIEW_BOX_DRAG_THRESHOLD
 }
 
 fn axis_size(size: Size<Pixels>, axis: SidebarScrollAxis) -> Pixels {
@@ -1043,6 +1087,8 @@ pub struct HierarchySideBarState {
     pub expanded_scopes: IndexSet<ScopePath>,
     rows_revision: u64,
     width: Pixels,
+    preview_height: Pixels,
+    preview_drag: Option<NavigationOverviewDrag>,
     pub(super) context_menu: Option<HierarchyContextMenu>,
 }
 
@@ -1052,6 +1098,8 @@ impl Default for HierarchySideBarState {
             expanded_scopes: IndexSet::new(),
             rows_revision: 0,
             width: px(DEFAULT_SIDEBAR_WIDTH),
+            preview_height: px(DEFAULT_HIERARCHY_PREVIEW_HEIGHT),
+            preview_drag: None,
             context_menu: None,
         }
     }
@@ -1102,7 +1150,10 @@ impl HierarchySideBar {
         let tool = editor_state.read(cx).tool.clone();
         let name_filter =
             cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
-        let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
+        let subscriptions = vec![
+            cx.observe(&solved_cell, |_, _, cx| cx.notify()),
+            cx.observe(canvas, |_, _, cx| cx.notify()),
+        ];
         let state = cx.new(|_cx| HierarchySideBarState::default());
         let scroll_state = cx.new(|_cx| SidebarScrollState::default());
         let list_scroll_handle = UniformListScrollHandle::new();
@@ -1527,6 +1578,167 @@ impl HierarchySideBar {
         }
         scroll_area
     }
+
+    fn render_navigation_overview(
+        &self,
+        theme: &'static Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let layout_canvas = self.canvas.clone();
+        let sidebar_state = self.state.clone();
+        let owner = cx.entity_id();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                let snapshot = layout_canvas.read(cx).navigation_overview_snapshot(bounds);
+                window.paint_layer(bounds, |window| {
+                    window.paint_quad(fill(bounds, theme.bg));
+                });
+                if let Some(snapshot) = &snapshot {
+                    window.paint_layer(bounds, |window| {
+                        window
+                            .paint_image(
+                                snapshot.image_bounds,
+                                Corners::all(px(0.)),
+                                snapshot.image.clone(),
+                                0,
+                                false,
+                            )
+                            .unwrap();
+                    });
+                }
+                window.paint_layer(bounds, |window| {
+                    window.paint_quad(quad(
+                        bounds,
+                        Corners::all(px(0.)),
+                        transparent_black(),
+                        Edges::all(px(1.)),
+                        theme.text,
+                        Edges::all(BorderStyle::Solid),
+                    ));
+                });
+                if let Some(snapshot) = &snapshot {
+                    window.paint_layer(bounds, |window| {
+                        window.paint_quad(quad(
+                            snapshot.viewport_bounds,
+                            Corners::all(px(0.)),
+                            transparent_black(),
+                            Edges::all(px(4.)),
+                            theme.bg,
+                            Edges::all(BorderStyle::Solid),
+                        ));
+                    });
+                    window.paint_layer(bounds, |window| {
+                        window.paint_quad(quad(
+                            snapshot.viewport_bounds,
+                            Corners::all(px(0.)),
+                            transparent_black(),
+                            Edges::all(px(2.)),
+                            theme.text,
+                            Edges::all(BorderStyle::Solid),
+                        ));
+                    });
+                }
+                if let Some(drag) = sidebar_state.read(cx).preview_drag
+                    && navigation_overview_drag_is_box(drag)
+                {
+                    window.paint_layer(bounds, |window| {
+                        window.paint_quad(quad(
+                            navigation_overview_drag_bounds(drag),
+                            Corners::all(px(0.)),
+                            theme.selection,
+                            Edges::all(px(2.)),
+                            theme.axes,
+                            Edges::all(BorderStyle::Solid),
+                        ));
+                    });
+                }
+
+                window.on_mouse_event({
+                    let sidebar_state = sidebar_state.clone();
+                    let snapshot = snapshot.clone();
+                    move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble
+                            || event.button != MouseButton::Left
+                            || !bounds.contains(&event.position)
+                        {
+                            return;
+                        }
+                        if snapshot.is_none() {
+                            return;
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        let position = clamp_point_to_bounds(event.position, bounds);
+                        sidebar_state.update(cx, |state, _cx| {
+                            state.preview_drag = Some(NavigationOverviewDrag {
+                                start: position,
+                                current: position,
+                            });
+                        });
+                        cx.notify(owner);
+                    }
+                });
+                window.on_mouse_event({
+                    let sidebar_state = sidebar_state.clone();
+                    move |event: &MouseMoveEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture || !event.dragging() {
+                            return;
+                        }
+                        if sidebar_state.read(cx).preview_drag.is_none() {
+                            return;
+                        }
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        let position = clamp_point_to_bounds(event.position, bounds);
+                        sidebar_state.update(cx, |state, _cx| {
+                            if let Some(drag) = &mut state.preview_drag {
+                                drag.current = position;
+                            }
+                        });
+                        cx.notify(owner);
+                    }
+                });
+                window.on_mouse_event({
+                    let layout_canvas = layout_canvas.clone();
+                    let sidebar_state = sidebar_state.clone();
+                    let snapshot = snapshot.clone();
+                    move |event: &MouseUpEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                            return;
+                        }
+                        let Some(mut drag) = sidebar_state.read(cx).preview_drag else {
+                            return;
+                        };
+                        drag.current = clamp_point_to_bounds(event.position, bounds);
+                        sidebar_state.update(cx, |state, _cx| {
+                            state.preview_drag = None;
+                        });
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify(owner);
+
+                        let Some(snapshot) = &snapshot else {
+                            return;
+                        };
+                        if navigation_overview_drag_is_box(drag) {
+                            let first = snapshot.world_at(drag.start);
+                            let second = snapshot.world_at(drag.current);
+                            layout_canvas.update(cx, |canvas, cx| {
+                                canvas.fit_viewport_to_world_bounds(first, second, cx);
+                            });
+                        } else {
+                            let world = snapshot.world_at(drag.current);
+                            layout_canvas.update(cx, |canvas, cx| {
+                                canvas.center_viewport_on(world, cx);
+                            });
+                        }
+                    }
+                });
+            },
+        )
+        .size_full()
+    }
 }
 
 impl Render for HierarchySideBar {
@@ -1538,6 +1750,7 @@ impl Render for HierarchySideBar {
         let editor_state = self.editor_state.read(cx);
         let theme = editor_state.theme();
         let width = self.state.read(cx).width;
+        let preview_height = self.state.read(cx).preview_height;
         let icon_wh = editor_state.icon_size.unwrap_or(16.);
         let icon_div = || {
             div()
@@ -1703,6 +1916,49 @@ impl Render for HierarchySideBar {
             .child(self.render_scopes(cx))
             .child(
                 div()
+                    .id("hierarchy_preview_resize_handle")
+                    .w_full()
+                    .h(px(HIERARCHY_PREVIEW_RESIZE_HANDLE_HEIGHT))
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme.divider)
+                    .cursor_row_resize()
+                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_drag(HierarchyPreviewResize, |_, _, _window, cx| {
+                        cx.new(|_cx| Empty)
+                    }),
+            )
+            .child(
+                div()
+                    .id("hierarchy_navigation_overview")
+                    .h(preview_height)
+                    .w_full()
+                    .flex_shrink_0()
+                    .flex()
+                    .flex_col()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w_full()
+                            .pb_1()
+                            .text_color(theme.subtext)
+                            .child("Overview"),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .cursor_pointer()
+                            .child(self.render_navigation_overview(theme, cx)),
+                    ),
+            )
+            .child(
+                div()
                     .id("hierarchy_resize_handle")
                     .absolute()
                     .top_0()
@@ -1743,15 +1999,33 @@ impl Render for HierarchySideBar {
                     });
                 }
             })
+            .on_drag_move::<HierarchyPreviewResize>({
+                let state = self.state.clone();
+                move |event, _window, cx| {
+                    let height = clamp_hierarchy_preview_height(
+                        event.bounds.bottom() - event.event.position.y,
+                        event.bounds.size.height,
+                    );
+                    state.update(cx, |state, cx| {
+                        if state.preview_height != height {
+                            state.preview_height = height;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
     }
 }
 
 #[cfg(test)]
 mod sidebar_layout_tests {
-    use gpui::px;
+    use gpui::{Point, px};
 
     use super::{
-        MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, clamp_sidebar_width, scrollbar_thumb_metrics,
+        MAX_SIDEBAR_WIDTH, MIN_HIERARCHY_PANEL_HEIGHT, MIN_HIERARCHY_PREVIEW_HEIGHT,
+        MIN_SIDEBAR_WIDTH, NavigationOverviewDrag, clamp_hierarchy_preview_height,
+        clamp_sidebar_width, navigation_overview_drag_bounds, navigation_overview_drag_is_box,
+        scrollbar_thumb_metrics,
     };
 
     #[test]
@@ -1759,6 +2033,39 @@ mod sidebar_layout_tests {
         assert_eq!(clamp_sidebar_width(px(80.)), px(MIN_SIDEBAR_WIDTH));
         assert_eq!(clamp_sidebar_width(px(320.)), px(320.));
         assert_eq!(clamp_sidebar_width(px(900.)), px(MAX_SIDEBAR_WIDTH));
+    }
+
+    #[test]
+    fn hierarchy_preview_height_preserves_space_for_the_tree() {
+        assert_eq!(
+            clamp_hierarchy_preview_height(px(40.), px(600.)),
+            px(MIN_HIERARCHY_PREVIEW_HEIGHT)
+        );
+        assert_eq!(clamp_hierarchy_preview_height(px(300.), px(600.)), px(300.));
+        assert_eq!(
+            clamp_hierarchy_preview_height(px(900.), px(600.)),
+            px(600. - MIN_HIERARCHY_PANEL_HEIGHT)
+        );
+        assert_eq!(clamp_hierarchy_preview_height(px(200.), px(100.)), px(0.));
+    }
+
+    #[test]
+    fn navigation_overview_distinguishes_clicks_from_box_drags() {
+        let click = NavigationOverviewDrag {
+            start: Point::new(px(20.), px(30.)),
+            current: Point::new(px(23.), px(33.)),
+        };
+        let box_drag = NavigationOverviewDrag {
+            start: Point::new(px(80.), px(90.)),
+            current: Point::new(px(20.), px(30.)),
+        };
+
+        assert!(!navigation_overview_drag_is_box(click));
+        assert!(navigation_overview_drag_is_box(box_drag));
+        let bounds = navigation_overview_drag_bounds(box_drag);
+        assert_eq!(bounds.origin, Point::new(px(20.), px(30.)));
+        assert_eq!(bounds.size.width, px(60.));
+        assert_eq!(bounds.size.height, px(60.));
     }
 
     #[test]
