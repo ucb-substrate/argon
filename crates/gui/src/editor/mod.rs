@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
@@ -22,7 +23,7 @@ use tower_lsp_server::ls_types::MessageType;
 use crate::{
     actions::{
         FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save,
-        ShowMessages, Undo,
+        ShowDiagnostics, ShowMessages, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -84,8 +85,13 @@ pub struct EditorState {
     pub font_size: Option<f32>,
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
+    pub compilation_activities: IndexSet<u64>,
+    snapshot_preparations: IndexSet<u64>,
+    latest_snapshot_preparation: Option<u64>,
+    pub rendering: bool,
     pub compilation_revision: Option<u64>,
-    pub fatal_error: Option<SharedString>,
+    pub compilation_error: Option<EditorMessage>,
+    pub fatal_error: Option<EditorMessage>,
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
@@ -100,21 +106,31 @@ pub struct EditorState {
 pub struct EditorMessage {
     pub typ: MessageType,
     pub text: SharedString,
+    pub details: MessageDetails,
 }
 
-fn compile_error_summary(output: &CompileOutput) -> Option<String> {
-    let diagnostics = argonc::diagnostics::from_compile_output(output);
-    let first = diagnostics.first()?;
-    let remaining = diagnostics.len() - 1;
-    Some(if remaining == 0 {
-        first.message.clone()
-    } else {
-        format!(
-            "{} (and {remaining} more error{})",
-            first.message,
-            if remaining == 1 { "" } else { "s" }
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageDetails {
+    Diagnostics,
+    Messages,
+}
+
+fn compilation_error_message(output: &CompileOutput) -> Option<EditorMessage> {
+    (!matches!(output, CompileOutput::Valid(_))).then(|| EditorMessage {
+        typ: MessageType::ERROR,
+        text: "Compilation errors".into(),
+        details: MessageDetails::Diagnostics,
     })
+}
+
+fn activity_status_label(is_compiling: bool, is_rendering: bool) -> Option<&'static str> {
+    if is_compiling {
+        Some("Compiling")
+    } else if is_rendering {
+        Some("Rendering")
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -125,7 +141,6 @@ pub struct Editor {
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
-    pub(crate) text_input: Entity<TextInput>,
 }
 
 fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
@@ -161,6 +176,26 @@ struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
     state: IndexMap<ScopePath, ScopeState>,
     scope_paths: IndexMap<ScopeAddress, ScopePath>,
+}
+
+pub(crate) struct CompilationPreparationContext {
+    layers: IndexMap<SharedString, LayerState>,
+    selected_scope: Option<ScopePath>,
+    scope_state: Option<Arc<IndexMap<ScopePath, ScopeState>>>,
+}
+
+struct PreparedCompileOutput {
+    layers: IndexMap<SharedString, LayerState>,
+    selected_scope: ScopePath,
+    state: IndexMap<ScopePath, ScopeState>,
+    scope_paths: IndexMap<ScopeAddress, ScopePath>,
+}
+
+pub(crate) struct PreparedCompilationSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) output: CompileOutput,
+    compilation_error: Option<EditorMessage>,
+    prepared_output: Option<PreparedCompileOutput>,
 }
 
 fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
@@ -201,16 +236,16 @@ impl EditorState {
             self.message = Some(EditorMessage {
                 typ,
                 text: message.into(),
+                details: MessageDetails::Messages,
             });
         }
     }
     fn process_scope(
-        &self,
-        cx: &App,
         solved_cell: &CompiledData,
         scope: ScopeAddress,
         state: &mut ProcessScopeState,
         parent: Option<ScopeAddress>,
+        old_scope_state: Option<&IndexMap<ScopePath, ScopeState>>,
     ) {
         let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
         let mut scope_path = if let Some(parent) = &parent {
@@ -285,7 +320,13 @@ impl EditorState {
                         scope: solved_cell.cells[&inst.cell].root,
                         cell: inst.cell,
                     };
-                    self.process_scope(cx, solved_cell, inst_address, state, Some(scope));
+                    Self::process_scope(
+                        solved_cell,
+                        inst_address,
+                        state,
+                        Some(scope),
+                        old_scope_state,
+                    );
                     bbox = bbox_union(
                         bbox,
                         state.state[&state.scope_paths[&inst_address]]
@@ -327,18 +368,21 @@ impl EditorState {
                 scope: *child,
                 cell: scope.cell,
             };
-            self.process_scope(cx, solved_cell, scope_address, state, Some(scope));
+            Self::process_scope(
+                solved_cell,
+                scope_address,
+                state,
+                Some(scope),
+                old_scope_state,
+            );
             bbox = bbox_union(
                 bbox,
                 state.state[&state.scope_paths[&scope_address]].bbox.clone(),
             );
         }
 
-        let visible = self
-            .solved_cell
-            .read(cx)
-            .as_ref()
-            .and_then(|cell| Some(cell.state.get(&scope_path)?.visible))
+        let visible = old_scope_state
+            .and_then(|state| state.get(&scope_path).map(|scope| scope.visible))
             .unwrap_or(true);
         state.state.insert(
             scope_path,
@@ -373,9 +417,38 @@ impl EditorState {
         true
     }
 
+    fn compilation_preparation_context(&self, cx: &App) -> CompilationPreparationContext {
+        let old_cell = self.solved_cell.read(cx);
+        CompilationPreparationContext {
+            layers: self.layers.read(cx).layers.clone(),
+            selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope.clone()),
+            scope_state: old_cell.as_ref().map(|cell| cell.state.clone()),
+        }
+    }
+
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
-        let error_summary = compile_error_summary(&output).map(SharedString::from);
-        let mut recoverable_error = None;
+        let context = self.compilation_preparation_context(cx);
+        let prepared = prepare_compilation_snapshot(
+            CompilationSnapshot {
+                revision: self.compilation_revision.unwrap_or_default(),
+                output,
+            },
+            context,
+        );
+        self.apply_prepared_output(cx, prepared);
+    }
+
+    fn apply_prepared_output(&mut self, cx: &mut App, prepared: PreparedCompilationSnapshot) {
+        let PreparedCompilationSnapshot {
+            output,
+            compilation_error,
+            prepared_output,
+            ..
+        } = prepared;
+        // Compilation status belongs to the accepted snapshot, rather than to
+        // the general message queue. In particular, a valid snapshot must
+        // always remove a banner left by an earlier failed compilation.
+        self.compilation_error = compilation_error;
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -383,29 +456,71 @@ impl EditorState {
                 errors,
             }) => {
                 if errors.iter().any(|error| error.kind.is_invalid_cell()) {
-                    self.fatal_error = error_summary;
                     return;
                 }
-                recoverable_error = error_summary;
                 d
             }
-            _ => {
-                self.fatal_error = error_summary;
-                return;
-            }
+            _ => return,
         };
+        let Some(PreparedCompileOutput {
+            layers,
+            selected_scope,
+            state,
+            scope_paths,
+        }) = prepared_output
+        else {
+            return;
+        };
+        self.layers.update(cx, |old_layers, cx| {
+            old_layers.layers = layers;
+            if old_layers
+                .selected_layer
+                .as_ref()
+                .map(|selected_layer| !old_layers.layers.contains_key(selected_layer))
+                .unwrap_or(true)
+            {
+                old_layers.selected_layer = None;
+            }
+            cx.notify();
+        });
+        self.solved_cell.update(cx, |old_cell, cx| {
+            *old_cell = Some(CompileOutputState {
+                output: Arc::new(solved_cell),
+                selected_scope,
+                state: Arc::new(state),
+                scope_paths: Arc::new(scope_paths),
+            });
+            cx.notify();
+        });
+        self.message = None;
+    }
+}
+
+pub(crate) fn prepare_compilation_snapshot(
+    snapshot: CompilationSnapshot,
+    context: CompilationPreparationContext,
+) -> PreparedCompilationSnapshot {
+    let compilation_error = compilation_error_message(&snapshot.output);
+    let solved_cell = match &snapshot.output {
+        CompileOutput::Valid(data) => Some(data),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            output: Some(data),
+            errors,
+        }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => Some(data),
+        _ => None,
+    };
+    let prepared_output = solved_cell.map(|solved_cell| {
         let root_scope = ScopeAddress {
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
         };
-        let root_scope_name = &solved_cell.cells[&root_scope.cell].scopes[&root_scope.scope]
+        let root_scope_name = solved_cell.cells[&root_scope.cell].scopes[&root_scope.scope]
             .name
             .clone();
         let mut state = ProcessScopeState::default();
-        let old_layers = self.layers.read(cx);
         for layer in &solved_cell.tech.layers {
             let name = SharedString::from(layer.name.clone());
-            let visible = old_layers
+            let visible = context
                 .layers
                 .get(&name)
                 .map(|layer| layer.visible)
@@ -426,45 +541,34 @@ impl EditorState {
                 },
             );
         }
-        self.process_scope(cx, &solved_cell, root_scope, &mut state, None);
+        EditorState::process_scope(
+            solved_cell,
+            root_scope,
+            &mut state,
+            None,
+            context.scope_state.as_deref(),
+        );
         let ProcessScopeState {
             layers,
             state,
             scope_paths,
         } = state;
-        self.layers.update(cx, |old_layers, cx| {
-            old_layers.layers = layers;
-            if old_layers
-                .selected_layer
-                .as_ref()
-                .map(|selected_layer| !old_layers.layers.contains_key(selected_layer))
-                .unwrap_or(true)
-            {
-                old_layers.selected_layer = None;
-            }
-            cx.notify();
-        });
-        self.solved_cell.update(cx, |old_cell, cx| {
-            *old_cell = Some(CompileOutputState {
-                output: Arc::new(solved_cell),
-                selected_scope: old_cell
-                    .as_ref()
-                    .and_then(|cell| {
-                        state
-                            .contains_key(&cell.selected_scope)
-                            .then(|| cell.selected_scope.clone())
-                    })
-                    .unwrap_or_else(|| vec![root_scope_name.clone()]),
-                state: Arc::new(state),
-                scope_paths: Arc::new(scope_paths),
-            });
-            cx.notify();
-        });
-        self.fatal_error = None;
-        self.message = recoverable_error.map(|text| EditorMessage {
-            typ: MessageType::ERROR,
-            text,
-        });
+        let selected_scope = context
+            .selected_scope
+            .filter(|selected_scope| state.contains_key(selected_scope))
+            .unwrap_or_else(|| vec![root_scope_name]);
+        PreparedCompileOutput {
+            layers,
+            selected_scope,
+            state,
+            scope_paths,
+        }
+    });
+    PreparedCompilationSnapshot {
+        revision: snapshot.revision,
+        output: snapshot.output,
+        compilation_error,
+        prepared_output,
     }
 }
 
@@ -497,7 +601,12 @@ impl Editor {
                 font_size: None,
                 workspace_path: None,
                 workspace_modified: false,
+                compilation_activities: IndexSet::new(),
+                snapshot_preparations: IndexSet::new(),
+                latest_snapshot_preparation: None,
+                rendering: false,
                 compilation_revision: None,
+                compilation_error: None,
                 fatal_error: None,
                 message: None,
                 connection_error: None,
@@ -514,16 +623,23 @@ impl Editor {
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
         window.focus(&canvas_focus_handle);
+        let text_input = cx.new(|cx| {
+            TextInput::new_dimension_input(
+                cx,
+                text_input_focus_handle.clone(),
+                canvas_focus_handle.clone(),
+                &state,
+            )
+        });
         let canvas = cx.new(|cx| {
             LayoutCanvas::new(
                 cx,
                 &state,
                 canvas_focus_handle.clone(),
                 text_input_focus_handle.clone(),
+                text_input.clone(),
             )
         });
-        let text_input = cx
-            .new(|cx| TextInput::new_dimension_input(cx, text_input_focus_handle, &state, &canvas));
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state, &canvas));
 
@@ -534,7 +650,6 @@ impl Editor {
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
-            text_input,
         };
         cx.to_async()
             .spawn({
@@ -551,7 +666,7 @@ impl Editor {
         editor
     }
 
-    fn apply_snapshot(&self, cx: &mut App, snapshot: CompilationSnapshot) -> bool {
+    fn apply_snapshot(&self, cx: &mut App, snapshot: PreparedCompilationSnapshot) -> bool {
         if self
             .state
             .read(cx)
@@ -563,7 +678,12 @@ impl Editor {
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
             state.compilation_revision = Some(snapshot.revision);
-            state.update(cx, snapshot.output);
+            if snapshot.prepared_output.is_some() {
+                // Keep the status animation alive between hierarchy preparation
+                // and the first raster worker started by the next paint.
+                state.rendering = true;
+            }
+            state.apply_prepared_output(cx, snapshot);
             cx.notify();
         });
         self.canvas
@@ -578,7 +698,58 @@ impl Editor {
         });
     }
 
-    pub fn update_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
+    pub fn set_compilation_active(&self, cx: &mut App, activity_id: u64, active: bool) {
+        self.state.update(cx, |state, cx| {
+            if active {
+                state.compilation_activities.insert(activity_id);
+            } else {
+                state.compilation_activities.shift_remove(&activity_id);
+            }
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn begin_snapshot_preparation(
+        &self,
+        cx: &mut App,
+        preparation_id: u64,
+    ) -> CompilationPreparationContext {
+        let context = self.state.read(cx).compilation_preparation_context(cx);
+        self.state.update(cx, |state, cx| {
+            state.snapshot_preparations.insert(preparation_id);
+            state.latest_snapshot_preparation = Some(
+                state
+                    .latest_snapshot_preparation
+                    .map_or(preparation_id, |latest| latest.max(preparation_id)),
+            );
+            cx.notify();
+        });
+        context
+    }
+
+    pub(crate) fn finish_snapshot_preparation(
+        &self,
+        cx: &mut App,
+        preparation_id: u64,
+        snapshot: PreparedCompilationSnapshot,
+    ) {
+        let is_latest = self.state.update(cx, |state, cx| {
+            state
+                .snapshot_preparations
+                .retain(|pending| *pending > preparation_id);
+            let is_latest = state.latest_snapshot_preparation == Some(preparation_id);
+            if is_latest {
+                state.latest_snapshot_preparation = None;
+            }
+            cx.notify();
+            is_latest
+        });
+        if is_latest {
+            self.update_cell(cx, snapshot);
+        }
+    }
+
+    fn update_cell(&self, cx: &mut App, snapshot: PreparedCompilationSnapshot) {
         if self.canvas.read(cx).is_sse_dragging() {
             self.canvas
                 .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
@@ -589,17 +760,18 @@ impl Editor {
         }
         let state = self.state.clone();
         self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
-            let scope_paths: IndexSet<_> = state
+            let scope_state = state
                 .read(cx)
                 .solved_cell
                 .read(cx)
                 .as_ref()
-                .map(|cell| cell.state.keys().cloned().collect())
-                .unwrap_or_default();
+                .map(|cell| cell.state.clone());
             sidebar.state.update(cx, |state, _cx| {
-                state
-                    .expanded_scopes
-                    .retain(|path| scope_paths.contains(path));
+                state.expanded_scopes.retain(|path| {
+                    scope_state
+                        .as_ref()
+                        .is_some_and(|scope_state| scope_state.contains_key(path))
+                });
                 state.context_menu = None;
             });
             cx.notify();
@@ -650,11 +822,13 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The canvas handles pointer motion inside its own bounds. The editor-level
-        // listener exists only so an in-progress drag can continue after leaving
-        // those bounds; forwarding ordinary toolbar/sidebar motion would run layout
-        // hit testing and invalidate the entire editor for every mouse event.
-        if !self.canvas.read(cx).has_active_pointer_drag() {
+        // This root listener keeps drags alive after the pointer leaves the
+        // canvas, but toolbar/sidebar motion must not enter layout hit testing.
+        if !self
+            .canvas
+            .read(cx)
+            .should_handle_pointer_move(event.position)
+        {
             return;
         }
         self.canvas
@@ -709,11 +883,20 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(None, cx);
+        self.open_invoking_command(None, true, cx);
     }
 
     fn show_messages(&mut self, _: &ShowMessages, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_invoking_command(Some("messages<CR>"), cx);
+        self.open_invoking_command(Some("messages<CR>"), false, cx);
+    }
+
+    fn show_diagnostics(
+        &mut self,
+        _: &ShowDiagnostics,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon diagnostics<CR>"), false, cx);
     }
 
     fn instantiate_command(
@@ -722,7 +905,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon inst "), cx);
+        self.open_invoking_command(Some("Argon inst "), true, cx);
     }
 
     fn open_cell_command(
@@ -731,25 +914,40 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon openCell "), cx);
+        self.open_invoking_command(Some("Argon openCell "), true, cx);
     }
 
-    fn open_invoking_command(&mut self, command: Option<&str>, cx: &mut Context<Self>) {
-        // Neovim may be blocked at a hit-enter or error prompt. Focus it
-        // before queuing the notification so the user can clear that prompt.
-        self.focus_invoker(cx);
+    fn open_invoking_command(
+        &mut self,
+        command: Option<&str>,
+        return_to_gui: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A returning workflow may be blocked at a hit-enter or error prompt.
+        // Focus Neovim first so the user can clear it before the notification.
+        if return_to_gui {
+            self.focus_invoker(cx);
+        }
         let _ = self
             .state
             .read(cx)
             .lang_server_client
-            .open_command_bar(command.map(str::to_owned));
+            .open_command_bar(command.map(str::to_owned), return_to_gui);
+        if !return_to_gui {
+            // Leave the final activation request pointed at Neovim. Commands
+            // configured this way intentionally do not bounce back to Argon.
+            self.focus_invoker(cx);
+        }
     }
 
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
         if !crate::focus::activate_invoker() {
             self.state.update(cx, |state, _cx| {
-                state.fatal_error =
-                    Some("could not identify the application that invoked Argone".into());
+                state.fatal_error = Some(EditorMessage {
+                    typ: MessageType::ERROR,
+                    text: "could not identify the application that invoked Argone".into(),
+                    details: MessageDetails::Messages,
+                });
             });
         }
     }
@@ -762,10 +960,139 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
-        let (font_size, icon_size) = {
+        let font_size = self.state.read(cx).font_size;
+        let (displayed_status, activity_label) = {
             let state = self.state.read(cx);
-            (state.font_size, state.icon_size)
+            (
+                state
+                    .connection_error
+                    .clone()
+                    .map(|error| {
+                        (
+                            EditorMessage {
+                                typ: MessageType::ERROR,
+                                text: error,
+                                details: MessageDetails::Messages,
+                            },
+                            true,
+                        )
+                    })
+                    .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
+                    .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                    .or_else(|| state.message.clone().map(|message| (message, false))),
+                activity_status_label(
+                    !state.compilation_activities.is_empty(),
+                    state.rendering || !state.snapshot_preparations.is_empty(),
+                ),
+            )
         };
+        let status_bar = (displayed_status.is_some() || activity_label.is_some()).then(|| {
+            let mut status_fills_space = false;
+            let mut bar = div()
+                .id("status_bar")
+                .border_t_1()
+                .border_color(theme.divider)
+                .bg(theme.bg)
+                .px_2()
+                .py_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2();
+            if let Some((message, is_connection_error)) = displayed_status {
+                let details = message.details;
+                let is_compilation_error = details == MessageDetails::Diagnostics;
+                let title = if is_compilation_error {
+                    "Compilation errors"
+                } else if is_connection_error {
+                    "Connection error"
+                } else if message.typ == MessageType::ERROR {
+                    "Error"
+                } else if message.typ == MessageType::WARNING {
+                    "Warning"
+                } else {
+                    "Message"
+                };
+                let status_text = if is_compilation_error {
+                    SharedString::from(title)
+                } else {
+                    SharedString::from(format!("{title}: {}", message.text))
+                };
+                let action_label = if is_compilation_error {
+                    "Open diagnostics (Ctrl-Shift-D)"
+                } else {
+                    "View messages (Ctrl-Shift-M)"
+                };
+                let mut status_message = div()
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .text_color(theme.error)
+                    .child(status_text);
+                if !is_compilation_error {
+                    status_message = status_message.flex_1();
+                    status_fills_space = true;
+                }
+                bar = bar
+                    .child(
+                        svg()
+                            .path("icons/circle-exclamation-solid-full.svg")
+                            .w(px(14.))
+                            .h_auto()
+                            .text_color(theme.error),
+                    )
+                    .child(status_message)
+                    .child(
+                        div()
+                            .id("show_status_details")
+                            .text_color(theme.text)
+                            .cursor_pointer()
+                            .child(action_label)
+                            .on_click(cx.listener(move |editor, _, _, cx| {
+                                if details == MessageDetails::Diagnostics {
+                                    editor.open_invoking_command(
+                                        Some("Argon diagnostics<CR>"),
+                                        false,
+                                        cx,
+                                    );
+                                } else {
+                                    editor.open_invoking_command(Some("messages<CR>"), false, cx);
+                                }
+                            })),
+                    );
+            }
+            if let Some(activity_label) = activity_label {
+                if !status_fills_space {
+                    bar = bar.child(div().flex_1());
+                }
+                bar = bar.child(
+                    div()
+                        .id("compilation_status")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_color(theme.subtext)
+                        .child(
+                            svg()
+                                .path("icons/arrow-rotate-right-solid-full.svg")
+                                .w(px(14.))
+                                .h_auto()
+                                .text_color(theme.subtext)
+                                .with_animation(
+                                    "compilation_spinner",
+                                    Animation::new(Duration::from_millis(800)).repeat(),
+                                    |icon, delta| {
+                                        icon.with_transformation(Transformation::rotate(
+                                            percentage(delta),
+                                        ))
+                                    },
+                                ),
+                        )
+                        .child(activity_label),
+                );
+            }
+            bar
+        });
         let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
@@ -774,6 +1101,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))
+            .on_action(cx.listener(Self::show_diagnostics))
             .on_action(cx.listener(Self::show_messages))
             .on_action(cx.listener(Self::instantiate_command))
             .on_action(cx.listener(Self::open_cell_command))
@@ -800,105 +1128,16 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child({
-                        let mut d = div()
+                    .child(
+                        div()
                             .flex_1()
                             .relative()
                             .overflow_hidden()
-                            .child(self.canvas.clone());
-
-                        let displayed_error = {
-                            let state = self.state.read(cx);
-                            state
-                                .connection_error
-                                .clone()
-                                .map(|error| ("Connection error", error, true, true))
-                                .or_else(|| {
-                                    state
-                                        .fatal_error
-                                        .clone()
-                                        .map(|error| ("Error", error, false, true))
-                                })
-                                .or_else(|| {
-                                    state.message.clone().map(|message| {
-                                        let title = if message.typ == MessageType::ERROR {
-                                            "Error"
-                                        } else if message.typ == MessageType::WARNING {
-                                            "Warning"
-                                        } else {
-                                            "Message"
-                                        };
-                                        (title, message.text, false, false)
-                                    })
-                                })
-                        };
-                        if let Some((title, error, is_connection_error, editing_disabled)) =
-                            displayed_error
-                        {
-                            let error_detail =
-                                div()
-                                    .text_color(theme.subtext)
-                                    .child(if is_connection_error {
-                                        "Editing is disabled until the connection recovers."
-                                    } else if editing_disabled {
-                                        "Editing is disabled until this error is fixed."
-                                    } else {
-                                        "The last operation was not completed."
-                                    });
-                            let error_detail = if let Some(font_size) = font_size {
-                                error_detail.text_size(px(font_size * 6. / 7.))
-                            } else {
-                                error_detail.text_xs()
-                            };
-                            let details_link = div()
-                                .id("show_error_details")
-                                .mt_1()
-                                .text_color(theme.text)
-                                .child("View details in Neovim (Ctrl-Shift-M)")
-                                .on_click(cx.listener(|editor, _, _, cx| {
-                                    editor.open_invoking_command(Some("messages<CR>"), cx);
-                                }));
-                            let details_link = if let Some(font_size) = font_size {
-                                details_link.text_size(px(font_size * 6. / 7.))
-                            } else {
-                                details_link.text_xs()
-                            };
-                            d = d.child(
-                                div()
-                                    .id("error_modal")
-                                    .bg(theme.bg)
-                                    .border_1()
-                                    .border_color(theme.divider)
-                                    .rounded_sm()
-                                    .absolute()
-                                    .p_2()
-                                    .child(
-                                        div().flex().flex_row().text_color(theme.error).child(
-                                            div().flex().flex_col().child(div().flex_1()).child(
-                                            svg()
-                                                .path("icons/circle-exclamation-solid-full.svg")
-                                                .w(px(icon_size.unwrap_or(20.)))
-                                                .h_auto()
-                                                .mr_1()
-                                                .text_color(theme.error)).child(div().flex_1())
-                                        )
-                                        .child(div().child(title))
-                                    )
-                                    .child(error)
-                                    .child(error_detail)
-                                    .child(details_link)
-                                    .whitespace_normal()
-                                    .top_2()
-                                    .left_2()
-                                    .right_2()
-                            );
-                        }
-
-                        d
-                    })
+                            .child(self.canvas.clone()),
+                    )
                     .child(self.layer_sidebar.clone()),
             )
-            .child(self.text_input.clone());
+            .children(status_bar);
         root = if let Some(font_size) = font_size {
             root.text_size(px(font_size))
         } else {
@@ -922,10 +1161,19 @@ mod tests {
 
     use argonc::tech::CustomDitherPattern;
 
-    use super::{ShapeFill, compile_error_summary, shape_fill};
+    use super::{
+        MessageDetails, ShapeFill, activity_status_label, compilation_error_message, shape_fill,
+    };
 
     #[test]
-    fn compile_error_summary_shows_the_first_error_and_remaining_count() {
+    fn compilation_status_hands_off_to_rendering_without_an_idle_state() {
+        assert_eq!(activity_status_label(true, true), Some("Compiling"));
+        assert_eq!(activity_status_label(false, true), Some("Rendering"));
+        assert_eq!(activity_status_label(false, false), None);
+    }
+
+    #[test]
+    fn compilation_error_message_does_not_embed_individual_diagnostics() {
         let span = Span {
             path: PathBuf::from("lib.ar"),
             span: cfgrammar::Span::new(0, 1),
@@ -945,14 +1193,31 @@ mod tests {
             ],
         });
 
-        assert_eq!(
-            compile_error_summary(&output).as_deref(),
-            Some("`missing` is not declared in this scope (and 1 more error)")
+        let message = compilation_error_message(&output).expect("compilation should have failed");
+        assert_eq!(message.text.as_ref(), "Compilation errors");
+        assert_eq!(message.details, MessageDetails::Diagnostics);
+
+        let message = compilation_error_message(&CompileOutput::FatalParseErrors)
+            .expect("compilation should have failed");
+        assert_eq!(message.text.as_ref(), "Compilation errors");
+        assert_eq!(message.details, MessageDetails::Diagnostics);
+
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(&source_path, "cell top() {}\n").unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let valid = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
         );
-        assert_eq!(
-            compile_error_summary(&CompileOutput::FatalParseErrors).as_deref(),
-            Some("fatal parse errors encountered")
-        );
+        assert!(matches!(&valid, CompileOutput::Valid(_)));
+        assert!(compilation_error_message(&valid).is_none());
     }
 
     #[test]

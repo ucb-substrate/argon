@@ -11,8 +11,8 @@ use std::{
 };
 
 use analyzer::rpc::{
-    CompilationSnapshot, DimensionParams, DrawSegmentConstraint, InitialConditionEdit,
-    InstancePreview, PathParams, PolygonParams, ValueEdit,
+    DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
+    PolygonParams, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -22,12 +22,12 @@ use argonc::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    AppContext, BorderStyle, Bounds, ContentMask, Context, Corners, DefiniteLength, Edges, Element,
-    Entity, FillOptions, FocusHandle, Focusable, Half, InteractiveElement, IntoElement, KeyUpEvent,
-    Length, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent,
-    SharedString, Size, Style, Styled, Subscription, Task, TextRun, Window, div, pattern_slash, px,
-    rgb, size, solid_background,
+    App, AppContext, BorderStyle, Bounds, ContentMask, Context, Corners, DefiniteLength, Edges,
+    Element, Entity, FillOptions, FocusHandle, Focusable, Half, InteractiveElement, IntoElement,
+    KeyUpEvent, Length, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    ParentElement, PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba,
+    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Task, TextRun, Window, div,
+    pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
@@ -36,8 +36,8 @@ use tower_lsp_server::ls_types::MessageType;
 use crate::{
     actions::*,
     editor::{
-        self, CompileOutputState, EditorState, LayerState, SOURCE_EDIT_REJECTED_MESSAGE,
-        ScopeAddress,
+        self, CompileOutputState, EditorState, LayerState, PreparedCompilationSnapshot,
+        SOURCE_EDIT_REJECTED_MESSAGE, ScopeAddress, input::TextInput,
     },
     sse::SparseVec,
 };
@@ -622,7 +622,7 @@ struct InitialConditionUpdate {
 
 #[derive(Clone, Debug)]
 struct PendingSseValue {
-    span: Span,
+    span: Option<Span>,
     value: f64,
 }
 
@@ -772,6 +772,23 @@ fn segment_constraint_with_end(
 
 fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
     argonc::tech::snap(f64::from(value), grid)
+}
+
+fn format_dimension_label(value: f64, grid: f64) -> String {
+    let value = compile::format_initial_condition(value, grid);
+    value.strip_suffix('.').unwrap_or(&value).to_owned()
+}
+
+fn format_dimension_offset(offset: f64, quantum: f64) -> String {
+    let (operator, magnitude) = if offset < 0. {
+        ('-', -offset)
+    } else {
+        ('+', offset)
+    };
+    format!(
+        "{operator} {}",
+        compile::format_initial_condition(magnitude, quantum)
+    )
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -924,9 +941,20 @@ pub(crate) enum DimEdge<T> {
     Edge(T),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DimensionEdge {
+    path: String,
+    name: String,
+    /// Canvas geometry is intentionally `f32`; it is only used for painting
+    /// and hit testing.
+    display: Edge<f32>,
+    /// Dimension defaults come from the compiler's grid-snapped `f64` output.
+    exact: Edge<f64>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DrawDimToolState {
-    pub(crate) edges: Vec<DimEdge<(String, String, Edge<f32>)>>,
+    pub(crate) edges: Vec<DimEdge<DimensionEdge>>,
 }
 
 #[derive(Debug, Clone)]
@@ -936,6 +964,19 @@ pub(crate) struct EditDimToolState {
     pub(crate) original_value: SharedString,
     /// `true` if entered from dimension tool
     pub(crate) dim_mode: bool,
+}
+
+impl EditDimToolState {
+    fn label_position(&self, dim_hitboxes: &[DimensionHitbox]) -> Option<Point<f32>> {
+        if let Some(pending) = &self.pending {
+            return Some(pending.preview.label_position());
+        }
+        let dim = self.dim.as_ref()?;
+        dim_hitboxes
+            .iter()
+            .find(|hitbox| &hitbox.span == dim)
+            .map(|hitbox| hitbox.label_position)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -954,6 +995,24 @@ struct PendingDimensionPreview {
     nstop: f32,
     horiz: bool,
     value: String,
+}
+
+impl PendingDimensionPreview {
+    fn label_position(&self) -> Point<f32> {
+        if self.horiz {
+            Point::new((self.p + self.n) / 2., self.coord)
+        } else {
+            Point::new(self.coord, (self.p + self.n) / 2.)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DimensionHitbox {
+    span: Span,
+    bounds: Vec<Bounds<Pixels>>,
+    value: SharedString,
+    label_position: Point<f32>,
 }
 
 // TODO: potentially re-use compiler provided object IDs
@@ -997,6 +1056,7 @@ impl Default for ToolState {
 pub struct LayoutCanvas {
     focus_handle: FocusHandle,
     text_input_focus_handle: FocusHandle,
+    text_input: Entity<TextInput>,
     pub offset: Point<Pixels>,
     pub bg_style: Style,
     pub state: Entity<EditorState>,
@@ -1006,7 +1066,7 @@ pub struct LayoutCanvas {
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
     pending_sse_values: Vec<PendingSseValue>,
-    deferred_snapshot: Option<CompilationSnapshot>,
+    deferred_snapshot: Option<PreparedCompilationSnapshot>,
     sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
@@ -1034,7 +1094,7 @@ pub struct LayoutCanvas {
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
-    dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
+    dim_hitboxes: Vec<DimensionHitbox>,
     raster_tiles: Option<LayoutRasterTileSet>,
     /// A different zoom level or disconnected pan is assembled here while
     /// the complete previous field remains visible. It is promoted atomically
@@ -5753,16 +5813,30 @@ fn remap_span_after_value_edits(selected: &Span, edits: &[ValueEdit]) -> Span {
     }
 }
 
-fn pending_sse_values(edits: &[ValueEdit]) -> Vec<PendingSseValue> {
-    edits
+fn pending_sse_values(
+    edits: &[ValueEdit],
+    initial_conditions: &[InitialConditionEdit],
+) -> Vec<PendingSseValue> {
+    let mut pending = edits
         .iter()
         .filter_map(|edit| {
             Some(PendingSseValue {
-                span: remap_span_after_value_edits(&edit.span, edits),
+                span: Some(remap_span_after_value_edits(&edit.span, edits)),
                 value: edit.value.parse().ok()?,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // Missing initial-condition kwargs are returned by the analyzer as one
+    // aggregate insertion edit, whose text is not itself a number. Retain the
+    // requested values without a source span so an unrelated newer compile
+    // cannot dismiss the optimistic drag preview before those kwargs compile.
+    pending.extend(
+        initial_conditions
+            .iter()
+            .filter_map(|condition| condition.value.parse().ok())
+            .map(|value| PendingSseValue { span: None, value }),
+    );
+    pending
 }
 
 fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseValue]) -> bool {
@@ -5772,7 +5846,10 @@ fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseV
                 .values()
                 .flat_map(|cell| &cell.fallback_constraints_used)
                 .any(|fallback| {
-                    fallback.span == expected.span
+                    expected
+                        .span
+                        .as_ref()
+                        .is_none_or(|span| &fallback.span == span)
                         && (-fallback.constraint.constant - expected.value).abs() < 1e-8
                 })
         })
@@ -6212,6 +6289,11 @@ impl Element for CanvasElement {
                 .then(|| inner.hover_hit.clone())
                 .flatten();
             let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
+            let grid = solved_cell
+                .as_ref()
+                .map(|cell| cell.output.tech.grid_step())
+                .unwrap_or(0.1);
+            let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
             let draw_rect_preview =
                 if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool {
                     let layers = state.layers.read(cx);
@@ -6224,10 +6306,10 @@ impl Element for CanvasElement {
                             (
                                 Rect {
                                     object_path: Vec::new(),
-                                    x0: p0.x.min(layout_mouse_position.x),
-                                    y0: p0.y.min(layout_mouse_position.y),
-                                    x1: p0.x.max(layout_mouse_position.x),
-                                    y1: p0.y.max(layout_mouse_position.y),
+                                    x0: p0.x.min(snapped_layout_mouse_position.x),
+                                    y0: p0.y.min(snapped_layout_mouse_position.y),
+                                    x1: p0.x.max(snapped_layout_mouse_position.x),
+                                    y1: p0.y.max(snapped_layout_mouse_position.y),
                                     id: None,
                                     border_widths: Edges::all(SELECT_WIDTH),
                                     border_styles: Edges::all(BorderStyle::Dashed),
@@ -6420,8 +6502,8 @@ impl Element for CanvasElement {
                     }
                     if let ToolState::PlaceInstance(placement) = &tool {
                         let translation = (
-                            layout_mouse_position.x as f64,
-                            layout_mouse_position.y as f64,
+                            snapped_layout_mouse_position.x as f64,
+                            snapped_layout_mouse_position.y as f64,
                         );
                         for rect in &placement.rects {
                             let rect =
@@ -7876,6 +7958,7 @@ impl Element for CanvasElement {
                          nstop: f32,
                          horiz: bool,
                          value: String,
+                         edit_value: Option<String>,
                          color: Rgba,
                          span: Option<&Span>| {
                             let (x0, y0, x1, y1) = if horiz {
@@ -7977,21 +8060,26 @@ impl Element for CanvasElement {
                             let run_len = value.len();
                             let font_size = px(14.);
                             let runs = &[window.text_style().to_run(run_len)];
+                            let label_position = Point::new((x0 + x1) / 2., (y0 + y1) / 2.);
                             let origin = self
                                 .inner
                                 .read(cx)
-                                .layout_to_px(Point::new((x0 + x1) / 2., (y0 + y1) / 2.));
+                                .layout_to_px(label_position);
                             let text = SharedString::from(value);
                             let layout =
                                 window
                                     .text_system()
                                     .layout_line(&text, font_size, runs, None);
                             if let Some(span) = span {
-                                dim_hitboxes.push((
-                                    span.clone(),
-                                    vec![Bounds::new(origin, size(layout.width, font_size))],
-                                    text.clone(),
-                                ));
+                                dim_hitboxes.push(DimensionHitbox {
+                                    span: span.clone(),
+                                    bounds: vec![Bounds::new(
+                                        origin,
+                                        size(layout.width, font_size),
+                                    )],
+                                    value: edit_value.map(SharedString::from).unwrap_or(text.clone()),
+                                    label_position,
+                                });
                             }
                             window
                                 .text_system()
@@ -8001,6 +8089,7 @@ impl Element for CanvasElement {
                         };
 
                     for dim in dims {
+                        let value = solved_linear_after_drag(&dim.value, sse_dv.as_ref());
                         draw_dim(
                             solved_linear_after_drag(&dim.p, sse_dv.as_ref()) as f32,
                             solved_linear_after_drag(&dim.n, sse_dv.as_ref()) as f32,
@@ -8008,10 +8097,8 @@ impl Element for CanvasElement {
                             solved_linear_after_drag(&dim.pstop, sse_dv.as_ref()) as f32,
                             solved_linear_after_drag(&dim.nstop, sse_dv.as_ref()) as f32,
                             dim.horiz,
-                            format!(
-                                "{:.3}",
-                                solved_linear_after_drag(&dim.value, sse_dv.as_ref())
-                            ),
+                            format_dimension_label(value, grid),
+                            Some(compile::format_initial_condition(value, grid)),
                             match &tool {
                                 ToolState::Select(SelectToolState {
                                     selected_obj: Some(selected),
@@ -8044,6 +8131,7 @@ impl Element for CanvasElement {
                             preview.nstop,
                             preview.horiz,
                             preview.value.clone(),
+                            None,
                             rgb(0xffff00),
                             None,
                         );
@@ -8052,19 +8140,24 @@ impl Element for CanvasElement {
                     if let ToolState::DrawDim(DrawDimToolState { edges }) = &tool {
                         // draw dimension lines
                         if edges.len() == 1 {
-                            if let DimEdge::Edge((_, _, edge)) = &edges[0] {
-                                let coord = match edge.dir {
-                                    Dir::Horiz => layout_mouse_position.y,
-                                    Dir::Vert => layout_mouse_position.x,
+                            if let DimEdge::Edge(edge) = &edges[0] {
+                                let display = &edge.display;
+                                let coord = match display.dir {
+                                    Dir::Horiz => snapped_layout_mouse_position.y,
+                                    Dir::Vert => snapped_layout_mouse_position.x,
                                 };
                                 draw_dim(
-                                    edge.start,
-                                    edge.stop,
+                                    display.start,
+                                    display.stop,
                                     coord,
-                                    edge.coord,
-                                    edge.coord,
-                                    edge.dir == Dir::Horiz,
-                                    format!("{:.3}", (edge.stop - edge.start).abs()),
+                                    display.coord,
+                                    display.coord,
+                                    display.dir == Dir::Horiz,
+                                    format_dimension_label(
+                                        (edge.exact.stop - edge.exact.start).abs(),
+                                        grid,
+                                    ),
+                                    None,
                                     rgb(0xff0000),
                                     None,
                                 );
@@ -8072,48 +8165,63 @@ impl Element for CanvasElement {
                         } else if edges.len() == 2 {
                             let (p, n, coord, pstop, nstop, horiz, value) =
                                 match (&edges[0], &edges[1]) {
-                                    (
-                                        DimEdge::Edge((_, _, edge0)),
-                                        DimEdge::Edge((_, _, edge1)),
-                                    ) => {
-                                        let coord = match edge0.dir {
-                                            Dir::Horiz => layout_mouse_position.x,
-                                            Dir::Vert => layout_mouse_position.y,
+                                    (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
+                                        let display0 = &edge0.display;
+                                        let display1 = &edge1.display;
+                                        let coord = match display0.dir {
+                                            Dir::Horiz => snapped_layout_mouse_position.x,
+                                            Dir::Vert => snapped_layout_mouse_position.y,
                                         };
                                         (
-                                            edge0.coord,
-                                            edge1.coord,
+                                            display0.coord,
+                                            display1.coord,
                                             coord,
-                                            (edge0.start + edge0.stop) / 2.,
-                                            (edge1.start + edge1.stop) / 2.,
-                                            edge0.dir == Dir::Vert,
-                                            format!("{:.3}", (edge1.coord - edge0.coord).abs()),
+                                            (display0.start + display0.stop) / 2.,
+                                            (display1.start + display1.stop) / 2.,
+                                            display0.dir == Dir::Vert,
+                                            format_dimension_label(
+                                                (edge1.exact.coord - edge0.exact.coord).abs(),
+                                                grid,
+                                            ),
                                         )
                                     }
-                                    (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge((_, _, edge)))
-                                    | (DimEdge::Edge((_, _, edge)), DimEdge::X0 | DimEdge::Y0) => {
-                                        let coord = match edge.dir {
-                                            Dir::Horiz => layout_mouse_position.x,
-                                            Dir::Vert => layout_mouse_position.y,
+                                    (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
+                                    | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
+                                        let display = &edge.display;
+                                        let coord = match display.dir {
+                                            Dir::Horiz => snapped_layout_mouse_position.x,
+                                            Dir::Vert => snapped_layout_mouse_position.y,
                                         };
                                         (
                                             0.,
-                                            edge.coord,
+                                            display.coord,
                                             coord,
                                             coord,
-                                            (edge.start + edge.stop) / 2.,
-                                            edge.dir == Dir::Vert,
-                                            format!("{:3}", edge.coord.abs()),
+                                            (display.start + display.stop) / 2.,
+                                            display.dir == Dir::Vert,
+                                            format_dimension_label(edge.exact.coord.abs(), grid),
                                         )
                                     }
                                     _ => unreachable!(),
                                 };
-                            draw_dim(p, n, coord, pstop, nstop, horiz, value, rgb(0xff0000), None);
+                            draw_dim(
+                                p,
+                                n,
+                                coord,
+                                pstop,
+                                nstop,
+                                horiz,
+                                value,
+                                None,
+                                rgb(0xff0000),
+                                None,
+                            );
                         }
                         // highlight selected edges
                         for edge in edges {
                             let bounds = match edge {
-                                DimEdge::Edge((_, _, edge)) => {
+                                DimEdge::Edge(edge) => {
+                                    let edge = &edge.display;
                                     let (x0, y0, x1, y1) = match edge.dir {
                                         Dir::Horiz => {
                                             (edge.start, edge.coord, edge.stop, edge.coord)
@@ -8279,7 +8387,7 @@ impl Element for CanvasElement {
                                                 .map(|old_edge| match old_edge {
                                                     DimEdge::X0 => Dir::Vert,
                                                     DimEdge::Y0 => Dir::Horiz,
-                                                    DimEdge::Edge((_, _, edge)) => edge.dir,
+                                                    DimEdge::Edge(edge) => edge.display.dir,
                                                 } == edge.dir)
                                                 .unwrap_or(true)
                                         {
@@ -8450,15 +8558,28 @@ impl Render for LayoutCanvas {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
+        let theme = self.state.read(cx).theme();
+        let dimension_input = self.dimension_input_position(cx).map(|position| {
+            div()
+                .absolute()
+                .left(position.x)
+                .top(position.y)
+                .w(px(140.))
+                .border_1()
+                .border_color(theme.divider)
+                .rounded_sm()
+                .overflow_hidden()
+                .child(self.text_input.clone())
+        });
         div()
             .flex()
             .flex_1()
+            .relative()
             .key_context("LayoutCanvas")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_polygon))
             .on_action(cx.listener(Self::draw_path))
@@ -8488,6 +8609,7 @@ impl Render for LayoutCanvas {
             .child(CanvasElement {
                 inner: cx.entity().clone(),
             })
+            .children(dimension_input)
     }
 }
 
@@ -8534,15 +8656,18 @@ impl LayoutCanvas {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         cx: &mut Context<Self>,
         state: &Entity<EditorState>,
         focus_handle: FocusHandle,
         text_input_focus_handle: FocusHandle,
+        text_input: Entity<TextInput>,
     ) -> Self {
+        let tool = state.read(cx).tool.clone();
         LayoutCanvas {
             focus_handle,
             text_input_focus_handle,
+            text_input,
             offset: Point::new(px(0.), px(0.)),
             bg_style: Style {
                 size: Size {
@@ -8572,85 +8697,88 @@ impl LayoutCanvas {
             keyboard_pan_last_frame: None,
             scale: 1.0,
             screen_bounds: Bounds::default(),
-            _subscriptions: vec![cx.observe(state, |canvas, _, cx| {
-                if !canvas.update_raster_presentation(cx) {
-                    return;
-                }
-                let initial_raster_decision = {
-                    let state = canvas.state.read(cx);
-                    let solved = state.solved_cell.read(cx);
-                    solved.as_ref().map_or(
-                        VisibleGeometryRenderDecision {
-                            use_raster: false,
-                            prefetch_raster: false,
-                        },
-                        |solved| VisibleGeometryRenderDecision {
-                            use_raster: solved_geometry_uses_raster_cache(
-                                solved,
-                                state.hierarchy_depth,
-                                state.hide_external_geometry,
-                            ),
-                            prefetch_raster: solved_geometry_reaches_threshold(
-                                solved,
-                                state.hierarchy_depth,
-                                state.hide_external_geometry,
-                                RASTER_PREFETCH_GEOMETRY_THRESHOLD,
-                            ),
-                        },
-                    )
-                };
-                canvas.raster_cache_enabled = initial_raster_decision.use_raster;
-                canvas.raster_prefetch_enabled = initial_raster_decision.prefetch_raster;
-                canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
-                canvas
-                    .raster_content_revision_signal
-                    .store(canvas.raster_content_revision, Ordering::Release);
-                canvas
-                    .cell_raster_tiles
-                    .lock()
-                    .expect("cell raster tile cache poisoned")
-                    .clear();
-                canvas.raster_spatial_index = Arc::new(RasterSpatialIndex::default());
-                // Presentation changes invalidate every old pixel immediately.
-                // In particular, a hidden layer must never survive in a
-                // transformed or retained navigation image.
-                if let Some(previous) = canvas.raster_tiles.take() {
+            _subscriptions: vec![
+                cx.observe(state, |canvas, _, cx| {
+                    if !canvas.update_raster_presentation(cx) {
+                        return;
+                    }
+                    let initial_raster_decision = {
+                        let state = canvas.state.read(cx);
+                        let solved = state.solved_cell.read(cx);
+                        solved.as_ref().map_or(
+                            VisibleGeometryRenderDecision {
+                                use_raster: false,
+                                prefetch_raster: false,
+                            },
+                            |solved| VisibleGeometryRenderDecision {
+                                use_raster: solved_geometry_uses_raster_cache(
+                                    solved,
+                                    state.hierarchy_depth,
+                                    state.hide_external_geometry,
+                                ),
+                                prefetch_raster: solved_geometry_reaches_threshold(
+                                    solved,
+                                    state.hierarchy_depth,
+                                    state.hide_external_geometry,
+                                    RASTER_PREFETCH_GEOMETRY_THRESHOLD,
+                                ),
+                            },
+                        )
+                    };
+                    canvas.raster_cache_enabled = initial_raster_decision.use_raster;
+                    canvas.raster_prefetch_enabled = initial_raster_decision.prefetch_raster;
+                    canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
                     canvas
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
-                }
-                if let Some(previous) = canvas.raster_staging_tiles.take() {
+                        .raster_content_revision_signal
+                        .store(canvas.raster_content_revision, Ordering::Release);
                     canvas
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
-                }
-                if let Some(previous) = canvas.raster_reprojection.take() {
-                    canvas.raster_images_to_drop.push(previous.image);
-                }
-                if let Some(previous) = canvas.raster_overview.take() {
-                    canvas.raster_images_to_drop.push(previous.image);
-                }
-                canvas.raster_overview_requested_revision = None;
-                canvas.raster_overview_refinement = None;
-                canvas.raster_display = None;
-                canvas.last_presented_raster.set(None);
-                canvas.raster_display_frozen = false;
-                canvas.raster_tile_target = None;
-                canvas.navigation_cache_active =
-                    canvas.raster_cache_enabled && canvas.raster_output.is_some();
-                let can_render = canvas.raster_output.is_some()
-                    && canvas.screen_bounds.size.width > px(0.)
-                    && canvas.screen_bounds.size.height > px(0.);
-                if can_render {
-                    canvas.request_navigation_overview(cx);
-                }
-                if canvas.raster_prefetch_enabled && can_render {
-                    canvas.request_navigation_raster(cx);
-                } else {
-                    canvas.advance_raster_generation();
-                }
-                cx.notify();
-            })],
+                        .cell_raster_tiles
+                        .lock()
+                        .expect("cell raster tile cache poisoned")
+                        .clear();
+                    canvas.raster_spatial_index = Arc::new(RasterSpatialIndex::default());
+                    // Presentation changes invalidate every old pixel immediately.
+                    // In particular, a hidden layer must never survive in a
+                    // transformed or retained navigation image.
+                    if let Some(previous) = canvas.raster_tiles.take() {
+                        canvas
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    if let Some(previous) = canvas.raster_staging_tiles.take() {
+                        canvas
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    if let Some(previous) = canvas.raster_reprojection.take() {
+                        canvas.raster_images_to_drop.push(previous.image);
+                    }
+                    if let Some(previous) = canvas.raster_overview.take() {
+                        canvas.raster_images_to_drop.push(previous.image);
+                    }
+                    canvas.raster_overview_requested_revision = None;
+                    canvas.raster_overview_refinement = None;
+                    canvas.raster_display = None;
+                    canvas.last_presented_raster.set(None);
+                    canvas.raster_display_frozen = false;
+                    canvas.raster_tile_target = None;
+                    canvas.navigation_cache_active =
+                        canvas.raster_cache_enabled && canvas.raster_output.is_some();
+                    let can_render = canvas.raster_output.is_some()
+                        && canvas.screen_bounds.size.width > px(0.)
+                        && canvas.screen_bounds.size.height > px(0.);
+                    if can_render {
+                        canvas.request_navigation_overview(cx);
+                    }
+                    if canvas.raster_prefetch_enabled && can_render {
+                        canvas.request_navigation_raster(cx);
+                    } else {
+                        canvas.advance_raster_generation();
+                    }
+                    cx.notify();
+                }),
+                cx.observe(&tool, |_, _, cx| cx.notify()),
+            ],
             state: state.clone(),
             rects: Vec::new(),
             polygons: Vec::new(),
@@ -8783,6 +8911,15 @@ impl LayoutCanvas {
         self.raster_generation = self.raster_generation.wrapping_add(1);
         self.raster_generation_signal
             .store(self.raster_generation, Ordering::Release);
+    }
+
+    fn set_rendering(&self, rendering: bool, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if state.rendering != rendering {
+                state.rendering = rendering;
+                cx.notify();
+            }
+        });
     }
 
     fn begin_navigation(&mut self) {
@@ -9391,6 +9528,7 @@ impl LayoutCanvas {
             return;
         }
         self.raster_worker_active = true;
+        self.set_rendering(true, cx);
         self.raster_refinement = Some(cx.spawn(async move |canvas, cx| {
             loop {
                 let Some((target, index, input)) = canvas
@@ -9403,6 +9541,7 @@ impl LayoutCanvas {
                         canvas.navigation_cache_active = canvas.raster_cache_enabled
                             || (canvas.raster_prefetch_enabled
                                 && (canvas.is_dragging || canvas.keyboard_pan_active));
+                        canvas.set_rendering(false, cx);
                         cx.notify();
                     });
                     return;
@@ -9483,15 +9622,15 @@ impl LayoutCanvas {
         self.is_sse_dragging
     }
 
-    pub(crate) fn has_active_pointer_drag(&self) -> bool {
-        self.is_dragging || self.is_sse_dragging
+    pub(crate) fn should_handle_pointer_move(&self, position: Point<Pixels>) -> bool {
+        self.screen_bounds.contains(&position) || self.is_dragging || self.is_sse_dragging
     }
 
-    pub(crate) fn defer_snapshot(&mut self, snapshot: CompilationSnapshot) {
+    pub(crate) fn defer_snapshot(&mut self, snapshot: PreparedCompilationSnapshot) {
         self.deferred_snapshot = Some(snapshot);
     }
 
-    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<CompilationSnapshot> {
+    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<PreparedCompilationSnapshot> {
         self.deferred_snapshot.take()
     }
 
@@ -9667,11 +9806,11 @@ impl LayoutCanvas {
             }
         }
 
-        for (paint_order, (span, hitboxes, _)) in self.dim_hitboxes.iter().enumerate() {
-            for bounds in hitboxes {
+        for (paint_order, hitbox) in self.dim_hitboxes.iter().enumerate() {
+            for bounds in &hitbox.bounds {
                 if bounds.contains(&position) {
                     hits.push(SelectionHit {
-                        span: span.clone(),
+                        span: hitbox.span.clone(),
                         outline: SelectionOutline::Rect {
                             bounds: *bounds,
                             border_styles: Edges::all(BorderStyle::Solid),
@@ -9706,6 +9845,11 @@ impl LayoutCanvas {
         self.navigation_cache_active = false;
         self.raster_refinement = None;
         self.raster_worker_active = false;
+        // Fitting invalidates the old worker but immediately schedules a
+        // replacement on the next paint. Keep the activity handoff continuous
+        // while a solved layout is still waiting to be rasterized.
+        let has_solved_layout = self.state.read(cx).solved_cell.read(cx).is_some();
+        self.set_rendering(has_solved_layout, cx);
         self.hover_hit = None;
         if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
@@ -10060,21 +10204,27 @@ impl LayoutCanvas {
                         let enter_entry_mode = !dim_tool.edges.is_empty();
                         match selected {
                             Some(DimEdge::Edge((r, name, edge))) => {
-                                let path = {
+                                let resolved = {
                                     let cell = self.state.read(cx).solved_cell.read(cx);
                                     if let Some(cell) = cell
                                         && let selected_scope_addr =
                                             cell.state[&cell.selected_scope].address
                                         && let (true, path) =
                                             find_obj_path(&r.object_path, cell, selected_scope_addr)
+                                        && let Some(exact) = exact_object_bounds(
+                                            &r.object_path,
+                                            cell,
+                                            selected_scope_addr,
+                                        )
+                                        .and_then(|bounds| bounds.edge(name))
                                     {
                                         let path = path.join(".");
-                                        Some(path)
+                                        Some((path, exact))
                                     } else {
                                         None
                                     }
                                 };
-                                if let Some(path) = path
+                                if let Some((path, exact)) = resolved
                                     && dim_tool
                                         .edges
                                         .first()
@@ -10082,17 +10232,18 @@ impl LayoutCanvas {
                                             let old_dir = match old_edge {
                                                 DimEdge::X0 => Dir::Vert,
                                                 DimEdge::Y0 => Dir::Horiz,
-                                                DimEdge::Edge((_, _, edge)) => edge.dir,
+                                                DimEdge::Edge(edge) => edge.display.dir,
                                             };
                                             old_dir == edge.dir
                                         })
                                         .unwrap_or(true)
                                 {
-                                    dim_tool.edges.push(DimEdge::Edge((
+                                    dim_tool.edges.push(DimEdge::Edge(DimensionEdge {
                                         path,
-                                        name.to_string(),
-                                        edge,
-                                    )));
+                                        name: name.to_string(),
+                                        display: edge,
+                                        exact,
+                                    }));
                                     false
                                 } else {
                                     enter_entry_mode
@@ -10106,7 +10257,7 @@ impl LayoutCanvas {
                                         let old_dir = match old_edge {
                                             DimEdge::X0 => return false,
                                             DimEdge::Y0 => return false,
-                                            DimEdge::Edge((_, _, edge)) => edge.dir,
+                                            DimEdge::Edge(edge) => edge.display.dir,
                                         };
                                         old_dir == Dir::Vert
                                     })
@@ -10124,7 +10275,7 @@ impl LayoutCanvas {
                                         let old_dir = match old_edge {
                                             DimEdge::X0 => return false,
                                             DimEdge::Y0 => return false,
-                                            DimEdge::Edge((_, _, edge)) => edge.dir,
+                                            DimEdge::Edge(edge) => edge.display.dir,
                                         };
                                         old_dir == Dir::Horiz
                                     })
@@ -10143,171 +10294,213 @@ impl LayoutCanvas {
 
                     if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
                         let selected_scope_addr = cell.state[&cell.selected_scope].address;
+                        let grid = cell.output.tech.grid_step();
 
                         let pending = if dim_tool.edges.len() == 1
                             && let DimEdge::Edge(edge) = &dim_tool.edges[0]
                         {
-                            let (left, right, coord, horiz) = match edge.2.dir {
-                                Dir::Horiz => ("x0", "x1", layout_mouse_position.y, "true"),
-                                Dir::Vert => ("y0", "y1", layout_mouse_position.x, "false"),
+                            let display = &edge.display;
+                            let (left, right, coord, source_coord, horiz) = match display.dir {
+                                Dir::Horiz => (
+                                    "x0",
+                                    "x1",
+                                    snapped_layout_mouse_position.y,
+                                    draw_source_coordinate(snapped_layout_mouse_position.y, grid),
+                                    "true",
+                                ),
+                                Dir::Vert => (
+                                    "y0",
+                                    "y1",
+                                    snapped_layout_mouse_position.x,
+                                    draw_source_coordinate(snapped_layout_mouse_position.x, grid),
+                                    "false",
+                                ),
                             };
 
-                            let distance = edge.2.stop - edge.2.start;
-                            let value = format!("{distance:?}");
+                            let distance = (edge.exact.stop - edge.exact.start).abs();
+                            let value = compile::format_initial_condition(distance, grid);
+                            let preview_value = format_dimension_label(distance, grid);
+                            let coord_offset =
+                                format_dimension_offset(source_coord - edge.exact.coord, grid);
                             Some((
                                 DimensionParams {
-                                    p: format!("{}.{}", edge.0, right),
-                                    n: format!("{}.{}", edge.0, left),
+                                    p: format!("{}.{}", edge.path, right),
+                                    n: format!("{}.{}", edge.path, left),
                                     value: value.clone(),
-                                    coord: if coord > edge.2.coord {
-                                        format!("{}.{} + {}", edge.0, edge.1, coord - edge.2.coord)
-                                    } else {
-                                        format!("{}.{} - {}", edge.0, edge.1, edge.2.coord - coord)
-                                    },
-                                    pstop: format!("{}.{}", edge.0, edge.1),
-                                    nstop: format!("{}.{}", edge.0, edge.1),
+                                    coord: format!("{}.{} {coord_offset}", edge.path, edge.name),
+                                    pstop: format!("{}.{}", edge.path, edge.name),
+                                    nstop: format!("{}.{}", edge.path, edge.name),
                                     horiz: horiz.to_string(),
                                 },
-                                value,
+                                value.clone(),
                                 PendingDimensionPreview {
-                                    p: edge.2.stop,
-                                    n: edge.2.start,
+                                    p: display.stop,
+                                    n: display.start,
                                     coord,
-                                    pstop: edge.2.coord,
-                                    nstop: edge.2.coord,
-                                    horiz: edge.2.dir == Dir::Horiz,
-                                    value: format!("{distance:.3}"),
+                                    pstop: display.coord,
+                                    nstop: display.coord,
+                                    horiz: display.dir == Dir::Horiz,
+                                    value: preview_value,
                                 },
                             ))
                         } else if dim_tool.edges.len() == 2 {
                             match (&dim_tool.edges[0], &dim_tool.edges[1]) {
                                 (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
-                                    let (left, right) = if edge0.2.coord < edge1.2.coord {
+                                    let (left, right) = if edge0.exact.coord < edge1.exact.coord {
                                         (edge0, edge1)
                                     } else {
                                         (edge1, edge0)
                                     };
-                                    let (start, stop, coord, horiz) = match left.2.dir {
-                                        Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
-                                        Dir::Horiz => {
-                                            ("x0", "x1", layout_mouse_position.x, "false")
-                                        }
-                                    };
+                                    let left_display = &left.display;
+                                    let right_display = &right.display;
+                                    let (start, stop, coord, source_coord, horiz) =
+                                        match left_display.dir {
+                                            Dir::Vert => (
+                                                "y0",
+                                                "y1",
+                                                snapped_layout_mouse_position.y,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.y,
+                                                    grid,
+                                                ),
+                                                "true",
+                                            ),
+                                            Dir::Horiz => (
+                                                "x0",
+                                                "x1",
+                                                snapped_layout_mouse_position.x,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.x,
+                                                    grid,
+                                                ),
+                                                "false",
+                                            ),
+                                        };
 
-                                    let intended_coord =
-                                        (right.2.start + right.2.stop + left.2.start + left.2.stop)
-                                            / 4.;
-                                    let coord_offset = if coord > intended_coord {
-                                        format!("+ {}", coord - intended_coord)
-                                    } else {
-                                        format!("- {}", intended_coord - coord)
-                                    };
-                                    let distance = right.2.coord - left.2.coord;
-                                    let value = format!("{distance:?}");
+                                    let intended_coord_exact = (right.exact.start
+                                        + right.exact.stop
+                                        + left.exact.start
+                                        + left.exact.stop)
+                                        / 4.;
+                                    let coord_offset = format_dimension_offset(
+                                        source_coord - intended_coord_exact,
+                                        grid / 4.,
+                                    );
+                                    let distance = (right.exact.coord - left.exact.coord).abs();
+                                    let value = compile::format_initial_condition(distance, grid);
+                                    let preview_value = format_dimension_label(distance, grid);
                                     Some((
                                         DimensionParams {
-                                            p: format!("{}.{}", right.0, right.1,),
-                                            n: format!("{}.{}", left.0, left.1),
+                                            p: format!("{}.{}", right.path, right.name),
+                                            n: format!("{}.{}", left.path, left.name),
                                             value: value.clone(),
                                             coord: format!(
                                                 "({}.{} + {}.{} + {}.{} + {}.{})/4. {coord_offset}",
-                                                right.0,
+                                                right.path,
                                                 start,
-                                                right.0,
+                                                right.path,
                                                 stop,
-                                                left.0,
+                                                left.path,
                                                 start,
-                                                left.0,
+                                                left.path,
                                                 stop,
                                             ),
                                             pstop: format!(
                                                 "({}.{} + {}.{}) / 2.",
-                                                right.0, start, right.0, stop,
+                                                right.path, start, right.path, stop,
                                             ),
                                             nstop: format!(
                                                 "({}.{} + {}.{}) / 2.",
-                                                left.0, start, left.0, stop,
+                                                left.path, start, left.path, stop,
                                             ),
                                             horiz: horiz.to_string(),
                                         },
-                                        value,
+                                        value.clone(),
                                         PendingDimensionPreview {
-                                            p: right.2.coord,
-                                            n: left.2.coord,
+                                            p: right_display.coord,
+                                            n: left_display.coord,
                                             coord,
-                                            pstop: (right.2.start + right.2.stop) / 2.,
-                                            nstop: (left.2.start + left.2.stop) / 2.,
-                                            horiz: left.2.dir == Dir::Vert,
-                                            value: format!("{distance:.3}"),
+                                            pstop: (right_display.start + right_display.stop) / 2.,
+                                            nstop: (left_display.start + left_display.stop) / 2.,
+                                            horiz: left_display.dir == Dir::Vert,
+                                            value: preview_value,
                                         },
                                     ))
                                 }
                                 (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                 | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
-                                    let (start, stop, coord, horiz) = match edge.2.dir {
-                                        Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
-                                        Dir::Horiz => {
-                                            ("x0", "x1", layout_mouse_position.x, "false")
-                                        }
-                                    };
+                                    let display = &edge.display;
+                                    let (start, stop, preview_coord, source_coord, horiz) =
+                                        match display.dir {
+                                            Dir::Vert => (
+                                                "y0",
+                                                "y1",
+                                                snapped_layout_mouse_position.y,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.y,
+                                                    grid,
+                                                ),
+                                                "true",
+                                            ),
+                                            Dir::Horiz => (
+                                                "x0",
+                                                "x1",
+                                                snapped_layout_mouse_position.x,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.x,
+                                                    grid,
+                                                ),
+                                                "false",
+                                            ),
+                                        };
 
-                                    let intended_coord = (edge.2.start + edge.2.stop) / 2.;
-                                    let coord_offset = if coord > intended_coord {
-                                        format!("+ {}", coord - intended_coord)
-                                    } else {
-                                        format!("- {}", intended_coord - coord)
-                                    };
+                                    let intended_coord_exact =
+                                        (edge.exact.start + edge.exact.stop) / 2.;
+                                    let coord_offset = format_dimension_offset(
+                                        source_coord - intended_coord_exact,
+                                        grid / 2.,
+                                    );
+                                    let intended_coord = (display.start + display.stop) / 2.;
 
                                     let pnstop = format!(
                                         "({}.{} + {}.{}) / 2.",
-                                        edge.0, start, edge.0, stop,
+                                        edge.path, start, edge.path, stop,
                                     );
-                                    let coord = format!("{pnstop} {coord_offset}");
-                                    let (p, n, value, pstop, nstop, preview) = if edge.2.coord < 0.
-                                    {
+                                    let coord_expr = format!("{pnstop} {coord_offset}");
+                                    let exact_value = edge.exact.coord.abs();
+                                    let value =
+                                        compile::format_initial_condition(exact_value, grid);
+                                    let preview_value = format_dimension_label(exact_value, grid);
+                                    let (p, n, pstop, nstop, preview) = if edge.exact.coord < 0. {
                                         (
                                             "0.".to_string(),
-                                            format!("{}.{}", edge.0, edge.1),
-                                            format!("{:?}", -edge.2.coord),
-                                            coord.clone(),
+                                            format!("{}.{}", edge.path, edge.name),
+                                            coord_expr.clone(),
                                             pnstop,
                                             PendingDimensionPreview {
                                                 p: 0.,
-                                                n: edge.2.coord,
-                                                coord: match edge.2.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
-                                                pstop: match edge.2.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
+                                                n: display.coord,
+                                                coord: preview_coord,
+                                                pstop: preview_coord,
                                                 nstop: intended_coord,
-                                                horiz: edge.2.dir == Dir::Vert,
-                                                value: format!("{:.3}", -edge.2.coord),
+                                                horiz: display.dir == Dir::Vert,
+                                                value: preview_value.clone(),
                                             },
                                         )
                                     } else {
                                         (
-                                            format!("{}.{}", edge.0, edge.1),
+                                            format!("{}.{}", edge.path, edge.name),
                                             "0.".to_string(),
-                                            format!("{:?}", edge.2.coord),
                                             pnstop,
-                                            coord.clone(),
+                                            coord_expr.clone(),
                                             PendingDimensionPreview {
-                                                p: edge.2.coord,
+                                                p: display.coord,
                                                 n: 0.,
-                                                coord: match edge.2.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
+                                                coord: preview_coord,
                                                 pstop: intended_coord,
-                                                nstop: match edge.2.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
-                                                horiz: edge.2.dir == Dir::Vert,
-                                                value: format!("{:.3}", edge.2.coord),
+                                                nstop: preview_coord,
+                                                horiz: display.dir == Dir::Vert,
+                                                value: preview_value,
                                             },
                                         )
                                     };
@@ -10316,7 +10509,7 @@ impl LayoutCanvas {
                                             p,
                                             n,
                                             value: value.clone(),
-                                            coord,
+                                            coord: coord_expr,
                                             pstop,
                                             nstop,
                                             horiz: horiz.to_string(),
@@ -10412,9 +10605,9 @@ impl LayoutCanvas {
             edit_dim
         });
         if edit_dim {
+            self.text_input
+                .update(cx, |input, cx| input.start_dimension_edit(cx));
             window.focus(&self.text_input_focus_handle);
-            self.text_input_focus_handle
-                .dispatch_action(&EditDim, window, cx);
             window.prevent_default();
         }
     }
@@ -10423,6 +10616,20 @@ impl LayoutCanvas {
         Point::new(self.scale * px(pt.x), self.scale * px(-pt.y))
             + self.offset
             + self.screen_bounds.origin
+    }
+
+    fn dimension_input_position(&self, cx: &App) -> Option<Point<Pixels>> {
+        let ToolState::EditDim(edit) = self.state.read(cx).tool.read(cx) else {
+            return None;
+        };
+        let global = self.layout_to_px(edit.label_position(&self.dim_hitboxes)?);
+        let local = global - self.screen_bounds.origin;
+        let max_x = f32::from(self.screen_bounds.size.width - px(140.)).max(0.);
+        let max_y = f32::from(self.screen_bounds.size.height - px(28.)).max(0.);
+        Some(Point::new(
+            px(f32::from(local.x).clamp(0., max_x)),
+            px(f32::from(local.y).clamp(0., max_y)),
+        ))
     }
 
     fn px_to_layout(&self, pt: Point<Pixels>) -> Point<f32> {
@@ -10620,20 +10827,21 @@ impl LayoutCanvas {
         if let ToolState::Select(SelectToolState {
             selected_obj: Some(obj),
         }) = self.state.read(cx).tool.clone().read(cx)
-            && let Some((_, _, value)) = self.dim_hitboxes.iter().find(|(span, _, _)| span == obj)
+            && let Some(hitbox) = self.dim_hitboxes.iter().find(|hitbox| &hitbox.span == obj)
         {
             let obj = obj.clone();
+            let value = hitbox.value.clone();
             self.state.read(cx).tool.clone().update(cx, |tool, _cx| {
                 *tool = ToolState::EditDim(EditDimToolState {
                     dim: Some(obj.clone()),
                     pending: None,
                     dim_mode: false,
-                    original_value: value.clone(),
+                    original_value: value,
                 })
             });
+            self.text_input
+                .update(cx, |input, cx| input.start_dimension_edit(cx));
             window.focus(&self.text_input_focus_handle);
-            self.text_input_focus_handle
-                .dispatch_action(&EditDim, window, cx);
             window.prevent_default();
             cx.notify();
         }
@@ -10900,10 +11108,6 @@ impl LayoutCanvas {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Do not let the editor-level drag fallback handle the same event a
-        // second time. That fallback is only for pointer motion outside the
-        // canvas while a drag is active.
-        cx.stop_propagation();
         self.mouse_position = event.position;
         let shift_changed = self.shift_down != event.modifiers.shift;
         self.shift_down = event.modifiers.shift;
@@ -11002,6 +11206,7 @@ impl LayoutCanvas {
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
+                let pending_initial_conditions = edits.initial_conditions.clone();
                 match self
                     .state
                     .read(cx)
@@ -11011,7 +11216,8 @@ impl LayoutCanvas {
                     Ok(Some(applied_edits)) => {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
-                        self.pending_sse_values = pending_sse_values(&applied_edits);
+                        self.pending_sse_values =
+                            pending_sse_values(&applied_edits, &pending_initial_conditions);
                         self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
                         // Anything deferred before the workspace edit was
                         // accepted belongs to the pre-drag source revision.
@@ -11057,7 +11263,7 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
-    pub(crate) fn accepts_snapshot(&self, snapshot: &CompilationSnapshot) -> bool {
+    pub(crate) fn accepts_snapshot(&self, snapshot: &PreparedCompilationSnapshot) -> bool {
         if !self.is_sse_persisting {
             return true;
         }
@@ -11100,6 +11306,116 @@ impl LayoutCanvas {
         };
         self.zoom_about(event.position, new_scale, cx);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExactLayoutBounds {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl ExactLayoutBounds {
+    fn transformed(
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        mat: TransformationMatrix,
+        ofs: (f64, f64),
+    ) -> Self {
+        let p0 = ifmatvec(mat, (x0, y0));
+        let p1 = ifmatvec(mat, (x1, y1));
+        Self {
+            x0: p0.0.min(p1.0) + ofs.0,
+            y0: p0.1.min(p1.1) + ofs.1,
+            x1: p0.0.max(p1.0) + ofs.0,
+            y1: p0.1.max(p1.1) + ofs.1,
+        }
+    }
+
+    fn edge(self, name: &str) -> Option<Edge<f64>> {
+        match name {
+            "x0" => Some(Edge {
+                dir: Dir::Vert,
+                coord: self.x0,
+                start: self.y0,
+                stop: self.y1,
+            }),
+            "x1" => Some(Edge {
+                dir: Dir::Vert,
+                coord: self.x1,
+                start: self.y0,
+                stop: self.y1,
+            }),
+            "y0" => Some(Edge {
+                dir: Dir::Horiz,
+                coord: self.y0,
+                start: self.x0,
+                stop: self.x1,
+            }),
+            "y1" => Some(Edge {
+                dir: Dir::Horiz,
+                coord: self.y1,
+                start: self.x0,
+                stop: self.x1,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the same rectangle or collapsed-instance bbox that the canvas
+/// displays, but retain the compiler's `f64` coordinates. This keeps source
+/// dimension defaults on the compiler grid without re-snapping a rounded GUI
+/// value.
+fn exact_object_bounds(
+    path: &[ObjectId],
+    cell: &CompileOutputState,
+    scope: ScopeAddress,
+) -> Option<ExactLayoutBounds> {
+    let mut current_scope = scope;
+    let mut mat = TransformationMatrix::identity();
+    let mut ofs = (0., 0.);
+
+    for (index, object_id) in path.iter().enumerate() {
+        let is_last = index + 1 == path.len();
+        let object = cell.output.cells[&current_scope.cell]
+            .objects
+            .get(object_id)?;
+        match object {
+            SolvedValue::Rect(rect) if is_last => {
+                return Some(ExactLayoutBounds::transformed(
+                    rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0, mat, ofs,
+                ));
+            }
+            SolvedValue::Instance(instance) => {
+                let mut instance_mat = TransformationMatrix::identity();
+                if instance.reflect {
+                    instance_mat = instance_mat.reflect_vert();
+                }
+                instance_mat = instance_mat.rotate(instance.angle);
+                let instance_ofs = ifmatvec(mat, (instance.x, instance.y));
+                mat = mat * instance_mat;
+                ofs = (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1);
+                current_scope = ScopeAddress {
+                    cell: instance.cell,
+                    scope: cell.output.cells[&instance.cell].root,
+                };
+
+                if is_last {
+                    let scope_path = cell.scope_paths.get(&current_scope)?;
+                    let bbox = cell.state.get(scope_path)?.bbox.as_ref()?;
+                    return Some(ExactLayoutBounds::transformed(
+                        bbox.x0, bbox.y0, bbox.x1, bbox.y1, mat, ofs,
+                    ));
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 pub(crate) fn find_obj_path(
@@ -11154,6 +11470,26 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dimension_input_uses_the_dimension_label_position() {
+        let horizontal = PendingDimensionPreview {
+            p: 4.,
+            n: 10.,
+            coord: 20.,
+            pstop: 0.,
+            nstop: 0.,
+            horiz: true,
+            value: "6.".to_owned(),
+        };
+        assert_eq!(horizontal.label_position(), Point::new(7., 20.));
+
+        let vertical = PendingDimensionPreview {
+            horiz: false,
+            ..horizontal
+        };
+        assert_eq!(vertical.label_position(), Point::new(20., 7.));
+    }
 
     #[test]
     fn raster_pixel_ranges_are_clipped_to_the_viewport() {
@@ -13377,6 +13713,19 @@ cell top() {
     }
 
     #[test]
+    fn dimension_labels_only_show_grid_relevant_decimals() {
+        assert_eq!(format_dimension_label(500., 5.), "500");
+        assert_eq!(format_dimension_label(502.5, 2.5), "502.5");
+        assert_eq!(format_dimension_label(0.9050000000001, 0.005), "0.905");
+    }
+
+    #[test]
+    fn dimension_offsets_are_clean_float_expressions() {
+        assert_eq!(format_dimension_offset(15.0000001, 5.), "+ 15.");
+        assert_eq!(format_dimension_offset(-2.5000001, 2.5), "- 2.5");
+    }
+
+    #[test]
     fn dotted_segments_keep_screen_space_spacing_when_rotated() {
         let horizontal = dotted_segment_centers(Point::default(), Point::new(px(70.), px(0.)));
         let diagonal =
@@ -13734,6 +14083,10 @@ cell top() {
             snap_layout_point(Point::new(1.12, -0.62), 0.25),
             Point::new(1., -0.5)
         );
+        assert_eq!(
+            snap_layout_point(Point::new(502.4, -507.6), 5.),
+            Point::new(500., -510.)
+        );
     }
 
     #[test]
@@ -13784,12 +14137,35 @@ cell top() {
             },
         ];
 
-        let pending = pending_sse_values(&edits);
+        let pending = pending_sse_values(&edits, &[]);
         assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].span.span, cfgrammar::Span::new(10, 13));
+        assert_eq!(
+            pending[0].span.as_ref().unwrap().span,
+            cfgrammar::Span::new(10, 13)
+        );
         assert_eq!(pending[0].value, 1.2);
-        assert_eq!(pending[1].span.span, cfgrammar::Span::new(24, 26));
+        assert_eq!(
+            pending[1].span.as_ref().unwrap().span,
+            cfgrammar::Span::new(24, 26)
+        );
         assert_eq!(pending[1].value, 0.);
+    }
+
+    #[test]
+    fn pending_drag_values_include_inserted_initial_conditions() {
+        let conditions = [InitialConditionEdit {
+            call_span: Span {
+                path: std::path::PathBuf::from("lib.ar"),
+                span: cfgrammar::Span::new(10, 30),
+            },
+            name: "x0i".to_owned(),
+            value: "12.5".to_owned(),
+        }];
+
+        let pending = pending_sse_values(&[], &conditions);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].span.is_none());
+        assert_eq!(pending[0].value, 12.5);
     }
 
     #[test]
@@ -13822,7 +14198,7 @@ cell top() {
             .first()
             .expect("rectangle should use its initial conditions");
         let mut pending = vec![PendingSseValue {
-            span: fallback.span.clone(),
+            span: Some(fallback.span.clone()),
             value: -fallback.constraint.constant,
         }];
 
@@ -13848,6 +14224,22 @@ cell top() {
 
         assert_eq!(solved_linear_after_drag(&field, Some(&drag)), 17.5);
         assert_eq!(solved_linear_after_drag(&field, None), 10.);
+    }
+
+    #[test]
+    fn dimension_defaults_keep_compiler_precision() {
+        let bounds = ExactLayoutBounds {
+            x0: 0.,
+            y0: 50_000.005,
+            x1: 10.,
+            y1: 50_000.910,
+        };
+        let edge = bounds.edge("x0").unwrap();
+        let value = compile::format_initial_condition(edge.stop - edge.start, 0.005);
+
+        // Reducing these coordinates to f32 first produces 0.90625, which was
+        // previously presented as the off-grid default `0.906`.
+        assert_eq!(value, "0.905");
     }
 
     #[test]
@@ -14006,6 +14398,15 @@ cell top() {
         assert_eq!(
             find_obj_path(&[instance_id, child_rect_id], &state, scope),
             (true, vec!["child_instance".to_owned(), "shape".to_owned()])
+        );
+        assert_eq!(
+            exact_object_bounds(&[instance_id, child_rect_id], &state, scope),
+            Some(ExactLayoutBounds {
+                x0: 3.,
+                y0: 4.,
+                x1: 13.,
+                y1: 9.,
+            })
         );
     }
 }

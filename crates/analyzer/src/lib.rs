@@ -9,7 +9,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -35,7 +38,9 @@ use tokio::{
 };
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{notification::Notification, request::Request, *};
-use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{
+    Client, LanguageServer, LspService, NotCancellable, OngoingProgress, Server, Unbounded,
+};
 use tracing::{error, info};
 use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
@@ -367,6 +372,12 @@ struct GuiState {
     next_connection_id: u64,
 }
 
+struct CompilationActivity {
+    id: u64,
+    gui_connection: Option<GuiConnection>,
+    editor_progress: OngoingProgress<Unbounded, NotCancellable>,
+}
+
 fn is_gui_disconnected(error: &tarpc::client::RpcError) -> bool {
     matches!(
         error,
@@ -495,6 +506,7 @@ pub struct State {
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
     gui: Arc<Mutex<GuiState>>,
+    next_compilation_activity_id: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
 }
 
@@ -512,6 +524,7 @@ impl State {
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
             gui: Default::default(),
+            next_compilation_activity_id: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
         }
     }
@@ -531,6 +544,62 @@ impl State {
 
     async fn gui_connection(&self) -> Option<GuiConnection> {
         self.gui.lock().await.connection.clone()
+    }
+
+    async fn begin_compilation(&self, identity: &CompileIdentity) -> CompilationActivity {
+        let id = self
+            .next_compilation_activity_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let gui_connection = self.gui_connection().await;
+        if let Some(connection) = &gui_connection
+            && let Err(error) = connection
+                .client
+                .compilation_started(context::current(), id)
+                .await
+            && is_gui_disconnected(&error)
+        {
+            self.clear_gui_connection(connection.id).await;
+        }
+
+        let token = ProgressToken::String(format!("argon-compilation-{id}"));
+        // This is server-initiated progress, so reserve the token before
+        // publishing its begin notification. Older clients may reject the
+        // request but can still consume the standard $/progress messages.
+        let _ = self
+            .editor_client
+            .create_work_done_progress(token.clone())
+            .await;
+        let message = identity.cell.as_deref().map_or_else(
+            || "Compiling workspace".to_owned(),
+            |cell| format!("Compiling {cell}"),
+        );
+        let editor_progress = self
+            .editor_client
+            .progress(token, "Argon compilation")
+            .with_message(message)
+            .begin()
+            .await;
+        CompilationActivity {
+            id,
+            gui_connection,
+            editor_progress,
+        }
+    }
+
+    async fn finish_compilation(&self, activity: CompilationActivity) {
+        activity.editor_progress.finish().await;
+        let Some(connection) = activity.gui_connection else {
+            return;
+        };
+        if let Err(error) = connection
+            .client
+            .compilation_finished(context::current(), activity.id)
+            .await
+            && is_gui_disconnected(&error)
+        {
+            self.clear_gui_connection(connection.id).await;
+        }
     }
 
     async fn install_gui_connection(&self, client: GuiClient) -> GuiConnection {
@@ -792,8 +861,14 @@ impl Backend {
     }
 
     async fn update_cell(&self, identity: CompileIdentity) -> Option<GuiConnection> {
-        let snapshot = self.compile_snapshot(identity.clone()).await?;
-        self.send_cell_update(&identity, snapshot).await
+        let activity = self.state.begin_compilation(&identity).await;
+        let result = async {
+            let snapshot = self.compile_snapshot(identity.clone()).await?;
+            self.send_cell_update(&identity, snapshot).await
+        }
+        .await;
+        self.state.finish_compilation(activity).await;
+        result
     }
 
     async fn open_cell_view(&self, identity: CompileIdentity) {
@@ -864,7 +939,7 @@ impl Request for Save {
 struct FocusEditor;
 
 impl Notification for FocusEditor {
-    type Params = Option<String>;
+    type Params = rpc::FocusEditorParams;
 
     const METHOD: &'static str = "custom/focusEditor";
 }
@@ -1056,13 +1131,13 @@ impl Backend {
         if let Some(connection) = self.state.gui_connection().await {
             self.state
                 .editor_client
-                .show_message(MessageType::LOG, "Attempting to contact existing GUI...")
+                .log_message(MessageType::INFO, "Attempting to contact existing GUI...")
                 .await;
             match connection.client.activate(context::current()).await {
                 Ok(()) => {
                     self.state
                         .editor_client
-                        .show_message(MessageType::LOG, "Connected to existing GUI!")
+                        .log_message(MessageType::INFO, "Connected to existing GUI!")
                         .await;
                     return Ok(());
                 }
@@ -1070,7 +1145,7 @@ impl Backend {
                     self.state.clear_gui_connection(connection.id).await;
                     self.state
                         .editor_client
-                        .show_message(MessageType::LOG, "Failed to contact existing GUI.")
+                        .log_message(MessageType::INFO, "Failed to contact existing GUI.")
                         .await;
                 }
                 Err(error) => {
@@ -1092,7 +1167,7 @@ impl Backend {
 
         self.state
             .editor_client
-            .show_message(MessageType::LOG, "Starting the GUI...")
+            .log_message(MessageType::INFO, "Starting the GUI...")
             .await;
         let state = self.state.clone();
 

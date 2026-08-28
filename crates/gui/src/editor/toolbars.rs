@@ -349,31 +349,6 @@ fn sidebar_scroll_frame(
         )
 }
 
-fn sidebar_scroll_area(
-    id: &'static str,
-    content: Div,
-    scroll_handle: &ScrollHandle,
-    scroll_state: &Entity<SidebarScrollState>,
-    owner: EntityId,
-    theme: &'static Theme,
-) -> Stateful<Div> {
-    sidebar_scroll_frame(
-        id,
-        content
-            .id(SharedString::from(format!("{id}_content")))
-            .size_full()
-            .min_h_0()
-            .min_w_0()
-            .overflow_scroll()
-            .scrollbar_width(px(SIDEBAR_SCROLLBAR_WIDTH))
-            .track_scroll(scroll_handle),
-        scroll_handle,
-        scroll_state,
-        owner,
-        theme,
-    )
-}
-
 pub struct TitleBar {
     state: Entity<EditorState>,
 }

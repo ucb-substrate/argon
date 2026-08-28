@@ -472,20 +472,46 @@ impl Solver {
         self.solved_vars.contains_key(&var)
     }
 
-    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
-        Some(crate::tech::snap(
+    /// Whether every constraint in a component is free of non-finite values.
+    fn component_is_finite(&self, constraints: &[ConstraintId]) -> bool {
+        constraints
+            .iter()
+            .all(|id| self.constraints[id].is_finite())
+    }
+
+    /// Evaluates `expr` against the solved variables, without snapping.
+    ///
+    /// Use this wherever the result is a plain scalar rather than a coordinate
+    /// that will be emitted -- notably the operands of `*` and `/`. The
+    /// manufacturing grid quantizes *positions*, so applying it to a scalar is
+    /// a category error: on a 5 DBU grid the literal `2.` snaps to `0.`, which
+    /// silently turns `(a + b)/2.` into a division by zero and poisons the
+    /// constraint with `inf` coefficients.
+    pub fn eval_expr_exact(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(
             expr.coeffs
                 .iter()
                 .map(|(coeff, var)| self.value_of(*var).map(|val| val * coeff))
                 .fold_options(0., |a, b| a + b)?
                 + expr.constant,
-            self.grid,
-        ))
+        )
+    }
+
+    /// Evaluates `expr` as a coordinate, snapped to the manufacturing grid.
+    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(crate::tech::snap(self.eval_expr_exact(expr)?, self.grid))
     }
 
     fn solve_component(&mut self, vars: &IndexSet<Var>, constraints: &[ConstraintId]) {
         let n_vars = vars.len();
         if n_vars == 0 || constraints.is_empty() {
+            return;
+        }
+        // The sparse solver rejects non-finite input, which is exactly what
+        // routes a component here; the dense fallback has no such guard and
+        // would never converge. Leave the component unsolved instead, so it
+        // surfaces as an ordinary diagnostic.
+        if !self.component_is_finite(constraints) {
             return;
         }
         if self.try_solve_sparse_component(vars, constraints) {
@@ -595,6 +621,10 @@ impl Solver {
     ) -> Vec<Vec<(f64, Var)>> {
         let n_vars = vars.len();
         if n_vars == 0 || constraints.is_empty() {
+            return Vec::new();
+        }
+        // See `solve_component`: a non-finite entry hangs the dense SVD.
+        if !self.component_is_finite(constraints) {
             return Vec::new();
         }
         let var_indices: IndexMap<Var, usize> =
@@ -727,6 +757,17 @@ pub struct LinearExpr {
 impl LinearExpr {
     pub fn add(lhs: impl Into<LinearExpr>, rhs: impl Into<LinearExpr>) -> Self {
         lhs.into() + rhs.into()
+    }
+
+    /// Whether every coefficient and the constant term are finite.
+    ///
+    /// A NaN or infinite coefficient reaching the dense `nalgebra` fallback
+    /// makes its Golub-Kahan iteration run forever: `Matrix::svd` passes
+    /// `max_niter = 0`, which that loop treats as *no* limit rather than as an
+    /// immediate stop. A hang is not catchable, so non-finite values must be
+    /// kept out of the linear algebra entirely.
+    pub fn is_finite(&self) -> bool {
+        self.constant.is_finite() && self.coeffs.iter().all(|(coeff, _)| coeff.is_finite())
     }
 
     /// Substitutes variables in `table` and removes entries with coefficient 0.

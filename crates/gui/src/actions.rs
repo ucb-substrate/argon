@@ -27,6 +27,7 @@ actions!(
         Redo,
         FocusInvoker,
         FocusInvokerCommandBar,
+        ShowDiagnostics,
         ShowMessages,
         InstantiateCommand,
         OpenCellCommand,

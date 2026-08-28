@@ -98,6 +98,12 @@ pub enum LangServerAction {
     Redo,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusEditorParams {
+    pub command: Option<String>,
+    pub return_to_gui: bool,
+}
+
 #[tarpc::service]
 pub trait LangServer {
     async fn register(addr: SocketAddr);
@@ -120,11 +126,13 @@ pub trait LangServer {
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
-    async fn focus_editor(command: Option<String>);
+    async fn focus_editor(params: FocusEditorParams);
 }
 
 #[tarpc::service]
 pub trait Gui {
+    async fn compilation_started(activity_id: u64);
+    async fn compilation_finished(activity_id: u64);
     async fn update_cell(snapshot: CompilationSnapshot);
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
@@ -961,9 +969,9 @@ impl LangServer for State {
         }
     }
 
-    async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
+    async fn focus_editor(self, _: tarpc::context::Context, params: FocusEditorParams) {
         self.editor_client
-            .send_notification::<crate::FocusEditor>(command)
+            .send_notification::<crate::FocusEditor>(params)
             .await;
     }
 }
