@@ -907,7 +907,7 @@ pub struct LayoutCanvas {
     /// destination pixels so its width and period remain stable during zoom.
     raster_reprojection: Option<LayoutRasterCache>,
     /// Low-resolution render of the complete displayed cell. This is shown
-    /// only while the main viewport is retaining its last exact LOD.
+    /// throughout zoom/pan interaction and briefly after it ends.
     raster_overview: Option<LayoutRasterCache>,
     raster_overview_requested_revision: Option<u64>,
     raster_overview_refinement: Option<Task<()>>,
@@ -3572,20 +3572,12 @@ fn navigation_overview_bounds(bounds: Bounds<Pixels>) -> Option<Bounds<Pixels>> 
 
 fn navigation_overview_layers(
     layers: &IndexMap<SharedString, LayerState>,
-    foreground: Rgba,
 ) -> IndexMap<SharedString, LayerState> {
-    let mut layers = layers.clone();
-    for layer in layers.values_mut() {
-        layer.color = Rgba {
-            a: layer.color.a,
-            ..foreground
-        };
-        layer.border_color = Rgba {
-            a: layer.border_color.a,
-            ..foreground
-        };
-    }
     layers
+        .iter()
+        .filter(|(_, layer)| layer.visible)
+        .map(|(name, layer)| (name.clone(), layer.clone()))
+        .collect()
 }
 
 fn navigation_overview_viewport(bbox: &compile::Rect<f64>) -> ViewportTransform {
@@ -4971,6 +4963,10 @@ impl Element for CanvasElement {
                 if let Some((overview, overview_bounds, image_bounds, viewport_bounds)) =
                     &navigation_overview
                 {
+                    // GPUI paint layers may batch and reorder overlapping
+                    // primitives within one layer. Keep the image and each
+                    // overlay in distinct layers so the viewport is always
+                    // composited above the macro.
                     window.paint_layer(*overview_bounds, |window| {
                         window.paint_quad(get_paint_quad(
                             *overview_bounds,
@@ -4980,6 +4976,8 @@ impl Element for CanvasElement {
                             Edges::all(px(0.)),
                             Edges::all(BorderStyle::Solid),
                         ));
+                    });
+                    window.paint_layer(*overview_bounds, |window| {
                         window
                             .paint_image(
                                 *image_bounds,
@@ -4989,17 +4987,8 @@ impl Element for CanvasElement {
                                 false,
                             )
                             .unwrap();
-                        window.paint_quad(get_paint_quad(
-                            *viewport_bounds,
-                            ShapeFill::Hollow,
-                            Rgba {
-                                a: 0.,
-                                ..theme.axes
-                            },
-                            theme.axes,
-                            Edges::all(px(1.5)),
-                            Edges::all(BorderStyle::Solid),
-                        ));
+                    });
+                    window.paint_layer(*overview_bounds, |window| {
                         window.paint_quad(get_paint_quad(
                             *overview_bounds,
                             ShapeFill::Hollow,
@@ -5009,6 +4998,31 @@ impl Element for CanvasElement {
                             },
                             theme.text,
                             Edges::all(px(1.)),
+                            Edges::all(BorderStyle::Solid),
+                        ));
+                    });
+                    window.paint_layer(*overview_bounds, |window| {
+                        // A background-colored halo separates the viewport
+                        // from both dark and light macro geometry.
+                        window.paint_quad(get_paint_quad(
+                            *viewport_bounds,
+                            ShapeFill::Hollow,
+                            Rgba { a: 0., ..theme.bg },
+                            theme.bg,
+                            Edges::all(px(4.)),
+                            Edges::all(BorderStyle::Solid),
+                        ));
+                    });
+                    window.paint_layer(*overview_bounds, |window| {
+                        window.paint_quad(get_paint_quad(
+                            *viewport_bounds,
+                            ShapeFill::Hollow,
+                            Rgba {
+                                a: 0.,
+                                ..theme.text
+                            },
+                            theme.text,
+                            Edges::all(px(2.)),
                             Edges::all(BorderStyle::Solid),
                         ));
                     });
@@ -7201,12 +7215,17 @@ impl LayoutCanvas {
                 .timer(NAVIGATION_OVERVIEW_HOLD)
                 .await;
             let _ = canvas.update(cx, |canvas, cx| {
-                if !canvas.raster_display_frozen {
+                if !canvas.raster_display_frozen && !canvas.is_dragging {
                     canvas.raster_overview_visible = false;
                     cx.notify();
                 }
             });
         }));
+    }
+
+    fn show_navigation_overview(&mut self, cx: &mut Context<Self>) {
+        self.keep_navigation_overview_visible(cx);
+        self.request_navigation_overview(cx);
     }
 
     fn resolve_raster_display_freeze(&mut self, cx: &mut Context<Self>) {
@@ -7234,13 +7253,7 @@ impl LayoutCanvas {
         let Some(solved_cell) = state.solved_cell.read(cx).clone() else {
             return;
         };
-        let overview_foreground = if state.dark_mode {
-            rgb(0xffffff)
-        } else {
-            rgb(0x000000)
-        };
-        let overview_layers =
-            navigation_overview_layers(&state.layers.read(cx).layers, overview_foreground);
+        let overview_layers = navigation_overview_layers(&state.layers.read(cx).layers);
         let content_revision = self.raster_content_revision;
         let input = NavigationRasterInput {
             solved_cell,
@@ -8851,12 +8864,13 @@ impl LayoutCanvas {
         &mut self,
         event: &MouseDownEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.begin_navigation();
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
+        self.show_navigation_overview(cx);
     }
 
     pub(crate) fn on_mouse_move(
@@ -8870,6 +8884,7 @@ impl LayoutCanvas {
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
             self.hover_hit = None;
+            self.show_navigation_overview(cx);
             self.update_raster_display_transform();
             if self.raster_reprojection.is_some() && self.refresh_raster_reprojection() {
                 self.resolve_raster_display_freeze(cx);
@@ -8896,6 +8911,7 @@ impl LayoutCanvas {
         self.sse_delta = Point::default();
         self.sse_targets.clear();
         if was_dragging {
+            self.show_navigation_overview(cx);
             self.request_navigation_raster(cx);
         }
     }
@@ -9061,7 +9077,7 @@ impl LayoutCanvas {
             has_safe_reprojection,
         );
         self.raster_display_frozen = !has_safe_reprojection;
-        self.keep_navigation_overview_visible(cx);
+        self.show_navigation_overview(cx);
         // Retarget the exact renderer on every wheel event. The worker cancels
         // obsolete generations and immediately continues with the newest LOD.
         self.request_navigation_raster(cx);
@@ -9155,34 +9171,22 @@ mod tests {
     }
 
     #[test]
-    fn navigation_overview_uses_one_monochrome_foreground() {
-        let (_, mut first) = dimension_rect(0., 10., 0);
-        first.color.a = 0.25;
-        first.border_color.a = 0.75;
-        let (_, second) = dimension_rect(0., 10., 1);
-        let layers =
-            IndexMap::from_iter([(first.name.clone(), first), (second.name.clone(), second)]);
-        let foreground = rgb(0xffffff);
-        let overview = navigation_overview_layers(&layers, foreground);
+    fn navigation_overview_uses_only_visible_layers_with_their_original_colors() {
+        let (_, mut visible) = dimension_rect(0., 10., 0);
+        visible.color = rgb(0xff2400);
+        visible.border_color = rgb(0x123456);
+        let (_, mut hidden) = dimension_rect(0., 10., 1);
+        hidden.visible = false;
+        let layers = IndexMap::from_iter([
+            (visible.name.clone(), visible.clone()),
+            (hidden.name.clone(), hidden),
+        ]);
 
-        for layer in overview.values() {
-            assert_eq!(
-                Rgba {
-                    a: 1.,
-                    ..layer.color
-                },
-                foreground
-            );
-            assert_eq!(
-                Rgba {
-                    a: 1.,
-                    ..layer.border_color
-                },
-                foreground
-            );
-        }
-        assert_eq!(overview.values().next().unwrap().color.a, 0.25);
-        assert_eq!(overview.values().next().unwrap().border_color.a, 0.75);
+        let overview = navigation_overview_layers(&layers);
+
+        assert_eq!(overview.len(), 1);
+        assert_eq!(overview[&visible.name].color, visible.color);
+        assert_eq!(overview[&visible.name].border_color, visible.border_color);
     }
 
     #[test]
