@@ -832,6 +832,15 @@ impl Notification for FocusEditor {
     const METHOD: &'static str = "custom/focusEditor";
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OpenDiagnostics;
+
+impl Notification for OpenDiagnostics {
+    type Params = ();
+
+    const METHOD: &'static str = "custom/openDiagnostics";
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         let root_uri = params

@@ -20,7 +20,7 @@ use argonc::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity,
+    App, AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity,
     FillOptions, FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
     PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent,
@@ -35,7 +35,7 @@ use crate::{
     actions::*,
     editor::{
         self, CompileOutputState, EditorState, LayerState, SOURCE_EDIT_REJECTED_MESSAGE,
-        ScopeAddress,
+        ScopeAddress, input::TextInput,
     },
     sse::SparseVec,
 };
@@ -787,6 +787,19 @@ pub(crate) struct EditDimToolState {
     pub(crate) dim_mode: bool,
 }
 
+impl EditDimToolState {
+    fn label_position(&self, dim_hitboxes: &[DimensionHitbox]) -> Option<Point<f32>> {
+        if let Some(pending) = &self.pending {
+            return Some(pending.preview.label_position());
+        }
+        let dim = self.dim.as_ref()?;
+        dim_hitboxes
+            .iter()
+            .find(|hitbox| &hitbox.span == dim)
+            .map(|hitbox| hitbox.label_position)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PendingDimension {
     pub(crate) scope_span: Span,
@@ -803,6 +816,24 @@ struct PendingDimensionPreview {
     nstop: f32,
     horiz: bool,
     value: String,
+}
+
+impl PendingDimensionPreview {
+    fn label_position(&self) -> Point<f32> {
+        if self.horiz {
+            Point::new((self.p + self.n) / 2., self.coord)
+        } else {
+            Point::new(self.coord, (self.p + self.n) / 2.)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DimensionHitbox {
+    span: Span,
+    bounds: Vec<Bounds<Pixels>>,
+    value: SharedString,
+    label_position: Point<f32>,
 }
 
 // TODO: potentially re-use compiler provided object IDs
@@ -846,6 +877,7 @@ impl Default for ToolState {
 pub struct LayoutCanvas {
     focus_handle: FocusHandle,
     text_input_focus_handle: FocusHandle,
+    text_input: Entity<TextInput>,
     pub offset: Point<Pixels>,
     pub bg_style: Style,
     pub state: Entity<EditorState>,
@@ -878,7 +910,7 @@ pub struct LayoutCanvas {
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
-    dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
+    dim_hitboxes: Vec<DimensionHitbox>,
     raster_tiles: Option<LayoutRasterTileSet>,
     /// A different zoom level or disconnected pan is assembled here while
     /// the complete previous field remains visible. It is promoted atomically
@@ -4951,21 +4983,26 @@ impl Element for CanvasElement {
                             let run_len = value.len();
                             let font_size = px(14.);
                             let runs = &[window.text_style().to_run(run_len)];
+                            let label_position = Point::new((x0 + x1) / 2., (y0 + y1) / 2.);
                             let origin = self
                                 .inner
                                 .read(cx)
-                                .layout_to_px(Point::new((x0 + x1) / 2., (y0 + y1) / 2.));
+                                .layout_to_px(label_position);
                             let text = SharedString::from(value);
                             let layout =
                                 window
                                     .text_system()
                                     .layout_line(&text, font_size, runs, None);
                             if let Some(span) = span {
-                                dim_hitboxes.push((
-                                    span.clone(),
-                                    vec![Bounds::new(origin, size(layout.width, font_size))],
-                                    text.clone(),
-                                ));
+                                dim_hitboxes.push(DimensionHitbox {
+                                    span: span.clone(),
+                                    bounds: vec![Bounds::new(
+                                        origin,
+                                        size(layout.width, font_size),
+                                    )],
+                                    value: text.clone(),
+                                    label_position,
+                                });
                             }
                             window
                                 .text_system()
@@ -5462,9 +5499,23 @@ impl Render for LayoutCanvas {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
+        let theme = self.state.read(cx).theme();
+        let dimension_input = self.dimension_input_position(cx).map(|position| {
+            div()
+                .absolute()
+                .left(position.x)
+                .top(position.y)
+                .w(px(140.))
+                .border_1()
+                .border_color(theme.divider)
+                .rounded_sm()
+                .overflow_hidden()
+                .child(self.text_input.clone())
+        });
         div()
             .flex()
             .flex_1()
+            .relative()
             .key_context("LayoutCanvas")
             .track_focus(&self.focus_handle(cx))
             .size_full()
@@ -5493,6 +5544,7 @@ impl Render for LayoutCanvas {
             .child(CanvasElement {
                 inner: cx.entity().clone(),
             })
+            .children(dimension_input)
     }
 }
 
@@ -5503,15 +5555,18 @@ impl Focusable for LayoutCanvas {
 }
 
 impl LayoutCanvas {
-    pub fn new(
+    pub(crate) fn new(
         cx: &mut Context<Self>,
         state: &Entity<EditorState>,
         focus_handle: FocusHandle,
         text_input_focus_handle: FocusHandle,
+        text_input: Entity<TextInput>,
     ) -> Self {
+        let tool = state.read(cx).tool.clone();
         LayoutCanvas {
             focus_handle,
             text_input_focus_handle,
+            text_input,
             offset: Point::new(px(0.), px(0.)),
             bg_style: Style {
                 size: Size {
@@ -5537,48 +5592,51 @@ impl LayoutCanvas {
             shift_down: false,
             scale: 1.0,
             screen_bounds: Bounds::default(),
-            _subscriptions: vec![cx.observe(state, |canvas, _, cx| {
-                if !canvas.update_raster_presentation(cx) {
-                    return;
-                }
-                canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
-                canvas
-                    .raster_content_revision_signal
-                    .store(canvas.raster_content_revision, Ordering::Release);
-                canvas
-                    .cell_raster_tiles
-                    .lock()
-                    .expect("cell raster tile cache poisoned")
-                    .clear();
-                // Presentation changes invalidate every old pixel immediately.
-                // In particular, a hidden layer must never survive in a
-                // transformed or retained navigation image.
-                if let Some(previous) = canvas.raster_tiles.take() {
+            _subscriptions: vec![
+                cx.observe(state, |canvas, _, cx| {
+                    if !canvas.update_raster_presentation(cx) {
+                        return;
+                    }
+                    canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
                     canvas
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
-                }
-                if let Some(previous) = canvas.raster_staging_tiles.take() {
+                        .raster_content_revision_signal
+                        .store(canvas.raster_content_revision, Ordering::Release);
                     canvas
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
-                }
-                if let Some(previous) = canvas.raster_reprojection.take() {
-                    canvas.raster_images_to_drop.push(previous.image);
-                }
-                canvas.raster_display = None;
-                canvas.raster_tile_target = None;
-                canvas.navigation_cache_active = canvas.raster_output.is_some();
-                if canvas.raster_output.is_some()
-                    && canvas.screen_bounds.size.width > px(0.)
-                    && canvas.screen_bounds.size.height > px(0.)
-                {
-                    canvas.request_navigation_raster(cx);
-                } else {
-                    canvas.advance_raster_generation();
-                }
-                cx.notify();
-            })],
+                        .cell_raster_tiles
+                        .lock()
+                        .expect("cell raster tile cache poisoned")
+                        .clear();
+                    // Presentation changes invalidate every old pixel immediately.
+                    // In particular, a hidden layer must never survive in a
+                    // transformed or retained navigation image.
+                    if let Some(previous) = canvas.raster_tiles.take() {
+                        canvas
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    if let Some(previous) = canvas.raster_staging_tiles.take() {
+                        canvas
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    if let Some(previous) = canvas.raster_reprojection.take() {
+                        canvas.raster_images_to_drop.push(previous.image);
+                    }
+                    canvas.raster_display = None;
+                    canvas.raster_tile_target = None;
+                    canvas.navigation_cache_active = canvas.raster_output.is_some();
+                    if canvas.raster_output.is_some()
+                        && canvas.screen_bounds.size.width > px(0.)
+                        && canvas.screen_bounds.size.height > px(0.)
+                    {
+                        canvas.request_navigation_raster(cx);
+                    } else {
+                        canvas.advance_raster_generation();
+                    }
+                    cx.notify();
+                }),
+                cx.observe(&tool, |_, _, cx| cx.notify()),
+            ],
             state: state.clone(),
             rects: Vec::new(),
             polygons: Vec::new(),
@@ -6339,11 +6397,11 @@ impl LayoutCanvas {
             }
         }
 
-        for (paint_order, (span, hitboxes, _)) in self.dim_hitboxes.iter().enumerate() {
-            for bounds in hitboxes {
+        for (paint_order, hitbox) in self.dim_hitboxes.iter().enumerate() {
+            for bounds in &hitbox.bounds {
                 if bounds.contains(&position) {
                     hits.push(SelectionHit {
-                        span: span.clone(),
+                        span: hitbox.span.clone(),
                         outline: SelectionOutline::Rect {
                             bounds: *bounds,
                             border_styles: Edges::all(BorderStyle::Solid),
@@ -7082,9 +7140,9 @@ impl LayoutCanvas {
             edit_dim
         });
         if edit_dim {
+            self.text_input
+                .update(cx, |input, cx| input.start_dimension_edit(cx));
             window.focus(&self.text_input_focus_handle);
-            self.text_input_focus_handle
-                .dispatch_action(&EditDim, window, cx);
             window.prevent_default();
         }
     }
@@ -7093,6 +7151,20 @@ impl LayoutCanvas {
         Point::new(self.scale * px(pt.x), self.scale * px(-pt.y))
             + self.offset
             + self.screen_bounds.origin
+    }
+
+    fn dimension_input_position(&self, cx: &App) -> Option<Point<Pixels>> {
+        let ToolState::EditDim(edit) = self.state.read(cx).tool.read(cx) else {
+            return None;
+        };
+        let global = self.layout_to_px(edit.label_position(&self.dim_hitboxes)?);
+        let local = global - self.screen_bounds.origin;
+        let max_x = f32::from(self.screen_bounds.size.width - px(140.)).max(0.);
+        let max_y = f32::from(self.screen_bounds.size.height - px(28.)).max(0.);
+        Some(Point::new(
+            px(f32::from(local.x).clamp(0., max_x)),
+            px(f32::from(local.y).clamp(0., max_y)),
+        ))
     }
 
     fn px_to_layout(&self, pt: Point<Pixels>) -> Point<f32> {
@@ -7290,20 +7362,21 @@ impl LayoutCanvas {
         if let ToolState::Select(SelectToolState {
             selected_obj: Some(obj),
         }) = self.state.read(cx).tool.clone().read(cx)
-            && let Some((_, _, value)) = self.dim_hitboxes.iter().find(|(span, _, _)| span == obj)
+            && let Some(hitbox) = self.dim_hitboxes.iter().find(|hitbox| &hitbox.span == obj)
         {
             let obj = obj.clone();
+            let value = hitbox.value.clone();
             self.state.read(cx).tool.clone().update(cx, |tool, _cx| {
                 *tool = ToolState::EditDim(EditDimToolState {
                     dim: Some(obj.clone()),
                     pending: None,
                     dim_mode: false,
-                    original_value: value.clone(),
+                    original_value: value,
                 })
             });
+            self.text_input
+                .update(cx, |input, cx| input.start_dimension_edit(cx));
             window.focus(&self.text_input_focus_handle);
-            self.text_input_focus_handle
-                .dispatch_action(&EditDim, window, cx);
             window.prevent_default();
             cx.notify();
         }
@@ -7653,6 +7726,26 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dimension_input_uses_the_dimension_label_position() {
+        let horizontal = PendingDimensionPreview {
+            p: 4.,
+            n: 10.,
+            coord: 20.,
+            pstop: 0.,
+            nstop: 0.,
+            horiz: true,
+            value: "6.".to_owned(),
+        };
+        assert_eq!(horizontal.label_position(), Point::new(7., 20.));
+
+        let vertical = PendingDimensionPreview {
+            horiz: false,
+            ..horizontal
+        };
+        assert_eq!(vertical.label_position(), Point::new(20., 7.));
+    }
 
     #[test]
     fn raster_pixel_ranges_are_clipped_to_the_viewport() {

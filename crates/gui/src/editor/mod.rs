@@ -123,7 +123,6 @@ pub struct Editor {
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
-    pub(crate) text_input: Entity<TextInput>,
 }
 
 fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
@@ -469,16 +468,23 @@ impl Editor {
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
         window.focus(&canvas_focus_handle);
+        let text_input = cx.new(|cx| {
+            TextInput::new_dimension_input(
+                cx,
+                text_input_focus_handle.clone(),
+                canvas_focus_handle.clone(),
+                &state,
+            )
+        });
         let canvas = cx.new(|cx| {
             LayoutCanvas::new(
                 cx,
                 &state,
                 canvas_focus_handle.clone(),
                 text_input_focus_handle.clone(),
+                text_input.clone(),
             )
         });
-        let text_input = cx
-            .new(|cx| TextInput::new_dimension_input(cx, text_input_focus_handle, &state, &canvas));
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state, &canvas));
 
@@ -489,7 +495,6 @@ impl Editor {
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
-            text_input,
         };
         cx.to_async()
             .spawn({
@@ -670,7 +675,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon diagnostics<CR>"), cx);
+        self.open_diagnostics(cx);
     }
 
     fn instantiate_command(
@@ -702,6 +707,13 @@ impl Editor {
             .open_command_bar(command.map(str::to_owned));
     }
 
+    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
+        let _ = self.state.read(cx).lang_server_client.open_diagnostics();
+        // The diagnostics notification does not use Neovim's command line, so
+        // make the OS activation request last and leave focus in the editor.
+        self.focus_invoker(cx);
+    }
+
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
         if !crate::focus::activate_invoker() {
             self.state.update(cx, |state, _cx| {
@@ -722,6 +734,90 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
+        let displayed_status = {
+            let state = self.state.read(cx);
+            state
+                .connection_error
+                .clone()
+                .map(|error| {
+                    (
+                        EditorMessage {
+                            typ: MessageType::ERROR,
+                            text: error,
+                            details: MessageDetails::Messages,
+                        },
+                        true,
+                    )
+                })
+                .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                .or_else(|| state.message.clone().map(|message| (message, false)))
+        };
+        let status_bar = displayed_status.map(|(message, is_connection_error)| {
+            let details = message.details;
+            let is_compilation_error = details == MessageDetails::Diagnostics;
+            let title = if is_compilation_error {
+                "Compilation errors"
+            } else if is_connection_error {
+                "Connection error"
+            } else if message.typ == MessageType::ERROR {
+                "Error"
+            } else if message.typ == MessageType::WARNING {
+                "Warning"
+            } else {
+                "Message"
+            };
+            let status_text = if is_compilation_error {
+                SharedString::from(title)
+            } else {
+                SharedString::from(format!("{title}: {}", message.text))
+            };
+            let action_label = if is_compilation_error {
+                "Open diagnostics (Ctrl-Shift-D)"
+            } else {
+                "View messages (Ctrl-Shift-M)"
+            };
+            div()
+                .id("status_bar")
+                .border_t_1()
+                .border_color(theme.divider)
+                .bg(theme.bg)
+                .px_2()
+                .py_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    svg()
+                        .path("icons/circle-exclamation-solid-full.svg")
+                        .w(px(14.))
+                        .h_auto()
+                        .text_color(theme.error),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .text_color(theme.error)
+                        .child(status_text),
+                )
+                .child(
+                    div()
+                        .id("show_status_details")
+                        .text_xs()
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .child(action_label)
+                        .on_click(cx.listener(move |editor, _, _, cx| {
+                            if details == MessageDetails::Diagnostics {
+                                editor.open_diagnostics(cx);
+                            } else {
+                                editor.open_invoking_command(Some("messages<CR>"), cx);
+                            }
+                        })),
+                )
+        });
         div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
@@ -758,130 +854,16 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child({
-                        let mut d = div()
+                    .child(
+                        div()
                             .flex_1()
                             .relative()
                             .overflow_hidden()
-                            .child(self.canvas.clone());
-
-                        let displayed_error = {
-                            let state = self.state.read(cx);
-                            state
-                                .connection_error
-                                .clone()
-                                .map(|error| {
-                                    (
-                                        EditorMessage {
-                                            typ: MessageType::ERROR,
-                                            text: error,
-                                            details: MessageDetails::Messages,
-                                        },
-                                        true,
-                                        true,
-                                    )
-                                })
-                                .or_else(|| {
-                                    state
-                                        .fatal_error
-                                        .clone()
-                                        .map(|error| (error, false, true))
-                                })
-                                .or_else(|| {
-                                    state.message.clone().map(|message| (message, false, false))
-                                })
-                        };
-                        if let Some((message, is_connection_error, editing_disabled)) =
-                            displayed_error
-                        {
-                            let is_compilation_error =
-                                message.details == MessageDetails::Diagnostics;
-                            let title = if is_compilation_error {
-                                "Compilation errors"
-                            } else if is_connection_error {
-                                "Connection error"
-                            } else if message.typ == MessageType::ERROR {
-                                "Error"
-                            } else if message.typ == MessageType::WARNING {
-                                "Warning"
-                            } else {
-                                "Message"
-                            };
-                            let details_label = if is_compilation_error {
-                                "Open Argon diagnostics (Ctrl-Shift-D)"
-                            } else {
-                                "View details in Neovim (Ctrl-Shift-M)"
-                            };
-                            let details_command = if is_compilation_error {
-                                "Argon diagnostics<CR>"
-                            } else {
-                                "messages<CR>"
-                            };
-                            d = d.child(
-                                div()
-                                    .id("error_modal")
-                                    .bg(theme.bg)
-                                    .border_1()
-                                    .border_color(theme.divider)
-                                    .rounded_sm()
-                                    .absolute()
-                                    .p_2()
-                                    .child(
-                                        div().flex().flex_row().text_color(theme.error).child(
-                                            div().flex().flex_col().child(div().flex_1()).child(
-                                            svg()
-                                                .path("icons/circle-exclamation-solid-full.svg")
-                                                .w(px(20.))
-                                                .h_auto()
-                                                .mr_1()
-                                                .text_color(theme.error)).child(div().flex_1())
-                                        )
-                                        .child(div().child(title))
-                                    )
-                                    .children(
-                                        (!is_compilation_error)
-                                            .then(|| div().child(message.text)),
-                                    )
-                                    .children(
-                                        (!is_compilation_error).then(|| {
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme.subtext)
-                                                .child(if is_connection_error {
-                                                    "Editing is disabled until the connection recovers."
-                                                } else if editing_disabled {
-                                                    "Editing is disabled until this error is fixed."
-                                                } else {
-                                                    "The last operation was not completed."
-                                                })
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("show_error_details")
-                                            .mt_1()
-                                            .text_xs()
-                                            .text_color(theme.text)
-                                            .child(details_label)
-                                            .on_click(cx.listener(move |editor, _, _, cx| {
-                                                editor.open_invoking_command(
-                                                    Some(details_command),
-                                                    cx,
-                                                );
-                                            })),
-                                    )
-                                    .whitespace_normal()
-                                    .top_2()
-                                    .left_2()
-                                    .right_2()
-                            );
-                        }
-
-                        d
-                    })
+                            .child(self.canvas.clone()),
+                    )
                     .child(self.layer_sidebar.clone()),
             )
-            .child(self.text_input.clone())
+            .children(status_bar)
     }
 }
 

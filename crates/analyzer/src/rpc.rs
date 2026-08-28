@@ -121,6 +121,7 @@ pub trait LangServer {
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
     async fn focus_editor(command: Option<String>);
+    async fn open_diagnostics();
 }
 
 #[tarpc::service]
@@ -964,6 +965,12 @@ impl LangServer for State {
     async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
         self.editor_client
             .send_notification::<crate::FocusEditor>(command)
+            .await;
+    }
+
+    async fn open_diagnostics(self, _: tarpc::context::Context) {
+        self.editor_client
+            .send_notification::<crate::OpenDiagnostics>(())
             .await;
     }
 }

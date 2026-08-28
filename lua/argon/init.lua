@@ -3,6 +3,7 @@ local M = {}
 local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
+local diagnostics = require('argon.diagnostics')
 local focus = require('argon.focus')
 local save = require('argon.save')
 
@@ -212,6 +213,9 @@ M.start = function(bufnr)
                 vim.schedule(function()
                     focus.editor(command)
                 end)
+            end,
+            ['custom/openDiagnostics'] = function()
+                vim.schedule(diagnostics.open)
             end,
         },
         root_dir = root_dir

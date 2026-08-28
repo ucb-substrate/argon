@@ -422,6 +422,10 @@ impl SyncLangServerClient {
             async move { client.focus_editor(context::current(), command).await }
         })
     }
+
+    pub fn open_diagnostics(&self) -> Result<()> {
+        self.call(move |client| async move { client.open_diagnostics(context::current()).await })
+    }
 }
 
 type EditorFn = Box<dyn FnOnce(&Editor, &mut AsyncApp) + Send>;

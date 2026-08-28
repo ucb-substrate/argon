@@ -36,15 +36,25 @@ pub(crate) struct TextInput {
 }
 
 impl TextInput {
+    pub(crate) fn start_dimension_edit(&mut self, cx: &mut Context<Self>) {
+        if let ToolState::EditDim(EditDimToolState { original_value, .. }) =
+            self.state.read(cx).tool.read(cx)
+        {
+            self.content = original_value.clone();
+            self.selected_range = 0..self.content.len();
+            cx.notify();
+        }
+    }
+
     pub(crate) fn new_dimension_input(
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
         focus_handle: FocusHandle,
+        canvas_focus_handle: FocusHandle,
         state: &Entity<EditorState>,
-        canvas: &Entity<LayoutCanvas>,
     ) -> Self {
         TextInput {
             focus_handle,
-            canvas_focus_handle: canvas.focus_handle(cx),
+            canvas_focus_handle,
             content: "".into(),
             placeholder: "Dimension value...".into(),
             selected_range: 0..0,
@@ -140,6 +150,7 @@ impl TextInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        cx.stop_propagation();
         self.is_selecting = true;
 
         if event.modifiers.shift {
@@ -149,11 +160,13 @@ impl TextInput {
         }
     }
 
-    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
         self.is_selecting = false;
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
@@ -245,7 +258,7 @@ impl TextInput {
     fn dimension_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.canvas_focus_handle);
         let tool = self.state.read(cx).tool.clone();
-        tool.update(cx, |tool, _cx| {
+        tool.update(cx, |tool, cx| {
             *tool = match tool {
                 ToolState::EditDim(EditDimToolState { dim_mode: true, .. }) => {
                     ToolState::DrawDim(DrawDimToolState::default())
@@ -253,6 +266,7 @@ impl TextInput {
                 ToolState::EditDim(_) => ToolState::default(),
                 _ => tool.clone(),
             };
+            cx.notify();
         });
         self.reset();
         cx.notify();
@@ -293,6 +307,7 @@ impl TextInput {
                         } else {
                             ToolState::default()
                         };
+                        cx.notify();
                         true
                     }
                     Err(_) => false,
@@ -686,12 +701,7 @@ impl Render for TextInput {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(move |input, _: &EditDim, _window, cx| {
-                if let ToolState::EditDim(EditDimToolState { original_value, .. }) =
-                    input.state.read(cx).tool.read(cx)
-                {
-                    input.content = original_value.clone();
-                    input.selected_range = 0..input.content.len();
-                }
+                input.start_dimension_edit(cx);
             }))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
