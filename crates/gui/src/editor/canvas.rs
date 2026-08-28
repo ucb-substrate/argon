@@ -623,6 +623,23 @@ fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
     argonc::tech::snap(f64::from(value), grid)
 }
 
+fn format_dimension_label(value: f64, grid: f64) -> String {
+    let value = compile::format_initial_condition(value, grid);
+    value.strip_suffix('.').unwrap_or(&value).to_owned()
+}
+
+fn format_dimension_offset(offset: f64, quantum: f64) -> String {
+    let (operator, magnitude) = if offset < 0. {
+        ('-', -offset)
+    } else {
+        ('+', offset)
+    };
+    format!(
+        "{operator} {}",
+        compile::format_initial_condition(magnitude, quantum)
+    )
+}
+
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Edge<T> {
     pub(crate) dir: Dir,
@@ -3528,6 +3545,11 @@ impl Element for CanvasElement {
                 .then(|| inner.hover_hit.clone())
                 .flatten();
             let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
+            let grid = solved_cell
+                .as_ref()
+                .map(|cell| cell.output.tech.grid_step())
+                .unwrap_or(0.1);
+            let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
             let draw_rect_preview =
                 if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool {
                     let layers = state.layers.read(cx);
@@ -3540,10 +3562,10 @@ impl Element for CanvasElement {
                             (
                                 Rect {
                                     object_path: Vec::new(),
-                                    x0: p0.x.min(layout_mouse_position.x),
-                                    y0: p0.y.min(layout_mouse_position.y),
-                                    x1: p0.x.max(layout_mouse_position.x),
-                                    y1: p0.y.max(layout_mouse_position.y),
+                                    x0: p0.x.min(snapped_layout_mouse_position.x),
+                                    y0: p0.y.min(snapped_layout_mouse_position.y),
+                                    x1: p0.x.max(snapped_layout_mouse_position.x),
+                                    y1: p0.y.max(snapped_layout_mouse_position.y),
                                     id: None,
                                     border_widths: Edges::all(SELECT_WIDTH),
                                     border_styles: Edges::all(BorderStyle::Dashed),
@@ -3677,8 +3699,8 @@ impl Element for CanvasElement {
                     }
                     if let ToolState::PlaceInstance(placement) = &tool {
                         let translation = (
-                            layout_mouse_position.x as f64,
-                            layout_mouse_position.y as f64,
+                            snapped_layout_mouse_position.x as f64,
+                            snapped_layout_mouse_position.y as f64,
                         );
                         for rect in &placement.rects {
                             let rect =
@@ -4910,6 +4932,7 @@ impl Element for CanvasElement {
                          nstop: f32,
                          horiz: bool,
                          value: String,
+                         edit_value: Option<String>,
                          color: Rgba,
                          span: Option<&Span>| {
                             let (x0, y0, x1, y1) = if horiz {
@@ -5028,7 +5051,7 @@ impl Element for CanvasElement {
                                         origin,
                                         size(layout.width, font_size),
                                     )],
-                                    value: text.clone(),
+                                    value: edit_value.map(SharedString::from).unwrap_or(text.clone()),
                                     label_position,
                                 });
                             }
@@ -5040,6 +5063,7 @@ impl Element for CanvasElement {
                         };
 
                     for dim in dims {
+                        let value = solved_linear_after_drag(&dim.value, sse_dv.as_ref());
                         draw_dim(
                             solved_linear_after_drag(&dim.p, sse_dv.as_ref()) as f32,
                             solved_linear_after_drag(&dim.n, sse_dv.as_ref()) as f32,
@@ -5047,10 +5071,8 @@ impl Element for CanvasElement {
                             solved_linear_after_drag(&dim.pstop, sse_dv.as_ref()) as f32,
                             solved_linear_after_drag(&dim.nstop, sse_dv.as_ref()) as f32,
                             dim.horiz,
-                            format!(
-                                "{:.3}",
-                                solved_linear_after_drag(&dim.value, sse_dv.as_ref())
-                            ),
+                            format_dimension_label(value, grid),
+                            Some(compile::format_initial_condition(value, grid)),
                             match &tool {
                                 ToolState::Select(SelectToolState {
                                     selected_obj: Some(selected),
@@ -5083,6 +5105,7 @@ impl Element for CanvasElement {
                             preview.nstop,
                             preview.horiz,
                             preview.value.clone(),
+                            None,
                             rgb(0xffff00),
                             None,
                         );
@@ -5092,19 +5115,23 @@ impl Element for CanvasElement {
                         // draw dimension lines
                         if edges.len() == 1 {
                             if let DimEdge::Edge(edge) = &edges[0] {
-                                let edge = &edge.display;
-                                let coord = match edge.dir {
-                                    Dir::Horiz => layout_mouse_position.y,
-                                    Dir::Vert => layout_mouse_position.x,
+                                let display = &edge.display;
+                                let coord = match display.dir {
+                                    Dir::Horiz => snapped_layout_mouse_position.y,
+                                    Dir::Vert => snapped_layout_mouse_position.x,
                                 };
                                 draw_dim(
-                                    edge.start,
-                                    edge.stop,
+                                    display.start,
+                                    display.stop,
                                     coord,
-                                    edge.coord,
-                                    edge.coord,
-                                    edge.dir == Dir::Horiz,
-                                    format!("{:.3}", (edge.stop - edge.start).abs()),
+                                    display.coord,
+                                    display.coord,
+                                    display.dir == Dir::Horiz,
+                                    format_dimension_label(
+                                        (edge.exact.stop - edge.exact.start).abs(),
+                                        grid,
+                                    ),
+                                    None,
                                     rgb(0xff0000),
                                     None,
                                 );
@@ -5113,42 +5140,56 @@ impl Element for CanvasElement {
                             let (p, n, coord, pstop, nstop, horiz, value) =
                                 match (&edges[0], &edges[1]) {
                                     (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
-                                        let edge0 = &edge0.display;
-                                        let edge1 = &edge1.display;
-                                        let coord = match edge0.dir {
-                                            Dir::Horiz => layout_mouse_position.x,
-                                            Dir::Vert => layout_mouse_position.y,
+                                        let display0 = &edge0.display;
+                                        let display1 = &edge1.display;
+                                        let coord = match display0.dir {
+                                            Dir::Horiz => snapped_layout_mouse_position.x,
+                                            Dir::Vert => snapped_layout_mouse_position.y,
                                         };
                                         (
-                                            edge0.coord,
-                                            edge1.coord,
+                                            display0.coord,
+                                            display1.coord,
                                             coord,
-                                            (edge0.start + edge0.stop) / 2.,
-                                            (edge1.start + edge1.stop) / 2.,
-                                            edge0.dir == Dir::Vert,
-                                            format!("{:.3}", (edge1.coord - edge0.coord).abs()),
+                                            (display0.start + display0.stop) / 2.,
+                                            (display1.start + display1.stop) / 2.,
+                                            display0.dir == Dir::Vert,
+                                            format_dimension_label(
+                                                (edge1.exact.coord - edge0.exact.coord).abs(),
+                                                grid,
+                                            ),
                                         )
                                     }
                                     (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                     | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
-                                        let edge = &edge.display;
-                                        let coord = match edge.dir {
-                                            Dir::Horiz => layout_mouse_position.x,
-                                            Dir::Vert => layout_mouse_position.y,
+                                        let display = &edge.display;
+                                        let coord = match display.dir {
+                                            Dir::Horiz => snapped_layout_mouse_position.x,
+                                            Dir::Vert => snapped_layout_mouse_position.y,
                                         };
                                         (
                                             0.,
-                                            edge.coord,
+                                            display.coord,
                                             coord,
                                             coord,
-                                            (edge.start + edge.stop) / 2.,
-                                            edge.dir == Dir::Vert,
-                                            format!("{:3}", edge.coord.abs()),
+                                            (display.start + display.stop) / 2.,
+                                            display.dir == Dir::Vert,
+                                            format_dimension_label(edge.exact.coord.abs(), grid),
                                         )
                                     }
                                     _ => unreachable!(),
                                 };
-                            draw_dim(p, n, coord, pstop, nstop, horiz, value, rgb(0xff0000), None);
+                            draw_dim(
+                                p,
+                                n,
+                                coord,
+                                pstop,
+                                nstop,
+                                horiz,
+                                value,
+                                None,
+                                rgb(0xff0000),
+                                None,
+                            );
                         }
                         // highlight selected edges
                         for edge in edges {
@@ -6913,33 +6954,34 @@ impl LayoutCanvas {
                             && let DimEdge::Edge(edge) = &dim_tool.edges[0]
                         {
                             let display = &edge.display;
-                            let (left, right, coord, horiz) = match display.dir {
-                                Dir::Horiz => ("x0", "x1", layout_mouse_position.y, "true"),
-                                Dir::Vert => ("y0", "y1", layout_mouse_position.x, "false"),
+                            let (left, right, coord, source_coord, horiz) = match display.dir {
+                                Dir::Horiz => (
+                                    "x0",
+                                    "x1",
+                                    snapped_layout_mouse_position.y,
+                                    draw_source_coordinate(snapped_layout_mouse_position.y, grid),
+                                    "true",
+                                ),
+                                Dir::Vert => (
+                                    "y0",
+                                    "y1",
+                                    snapped_layout_mouse_position.x,
+                                    draw_source_coordinate(snapped_layout_mouse_position.x, grid),
+                                    "false",
+                                ),
                             };
 
-                            let distance = edge.exact.stop - edge.exact.start;
+                            let distance = (edge.exact.stop - edge.exact.start).abs();
                             let value = compile::format_initial_condition(distance, grid);
+                            let preview_value = format_dimension_label(distance, grid);
+                            let coord_offset =
+                                format_dimension_offset(source_coord - edge.exact.coord, grid);
                             Some((
                                 DimensionParams {
                                     p: format!("{}.{}", edge.path, right),
                                     n: format!("{}.{}", edge.path, left),
                                     value: value.clone(),
-                                    coord: if coord > display.coord {
-                                        format!(
-                                            "{}.{} + {}",
-                                            edge.path,
-                                            edge.name,
-                                            coord - display.coord
-                                        )
-                                    } else {
-                                        format!(
-                                            "{}.{} - {}",
-                                            edge.path,
-                                            edge.name,
-                                            display.coord - coord
-                                        )
-                                    },
+                                    coord: format!("{}.{} {coord_offset}", edge.path, edge.name),
                                     pstop: format!("{}.{}", edge.path, edge.name),
                                     nstop: format!("{}.{}", edge.path, edge.name),
                                     horiz: horiz.to_string(),
@@ -6952,7 +6994,7 @@ impl LayoutCanvas {
                                     pstop: display.coord,
                                     nstop: display.coord,
                                     horiz: display.dir == Dir::Horiz,
-                                    value,
+                                    value: preview_value,
                                 },
                             ))
                         } else if dim_tool.edges.len() == 2 {
@@ -6965,25 +7007,42 @@ impl LayoutCanvas {
                                     };
                                     let left_display = &left.display;
                                     let right_display = &right.display;
-                                    let (start, stop, coord, horiz) = match left_display.dir {
-                                        Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
-                                        Dir::Horiz => {
-                                            ("x0", "x1", layout_mouse_position.x, "false")
-                                        }
-                                    };
+                                    let (start, stop, coord, source_coord, horiz) =
+                                        match left_display.dir {
+                                            Dir::Vert => (
+                                                "y0",
+                                                "y1",
+                                                snapped_layout_mouse_position.y,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.y,
+                                                    grid,
+                                                ),
+                                                "true",
+                                            ),
+                                            Dir::Horiz => (
+                                                "x0",
+                                                "x1",
+                                                snapped_layout_mouse_position.x,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.x,
+                                                    grid,
+                                                ),
+                                                "false",
+                                            ),
+                                        };
 
-                                    let intended_coord = (right_display.start
-                                        + right_display.stop
-                                        + left_display.start
-                                        + left_display.stop)
+                                    let intended_coord_exact = (right.exact.start
+                                        + right.exact.stop
+                                        + left.exact.start
+                                        + left.exact.stop)
                                         / 4.;
-                                    let coord_offset = if coord > intended_coord {
-                                        format!("+ {}", coord - intended_coord)
-                                    } else {
-                                        format!("- {}", intended_coord - coord)
-                                    };
-                                    let distance = right.exact.coord - left.exact.coord;
+                                    let coord_offset = format_dimension_offset(
+                                        source_coord - intended_coord_exact,
+                                        grid / 4.,
+                                    );
+                                    let distance = (right.exact.coord - left.exact.coord).abs();
                                     let value = compile::format_initial_condition(distance, grid);
+                                    let preview_value = format_dimension_label(distance, grid);
                                     Some((
                                         DimensionParams {
                                             p: format!("{}.{}", right.path, right.name),
@@ -7018,55 +7077,68 @@ impl LayoutCanvas {
                                             pstop: (right_display.start + right_display.stop) / 2.,
                                             nstop: (left_display.start + left_display.stop) / 2.,
                                             horiz: left_display.dir == Dir::Vert,
-                                            value,
+                                            value: preview_value,
                                         },
                                     ))
                                 }
                                 (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                 | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
                                     let display = &edge.display;
-                                    let (start, stop, coord, horiz) = match display.dir {
-                                        Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
-                                        Dir::Horiz => {
-                                            ("x0", "x1", layout_mouse_position.x, "false")
-                                        }
-                                    };
+                                    let (start, stop, preview_coord, source_coord, horiz) =
+                                        match display.dir {
+                                            Dir::Vert => (
+                                                "y0",
+                                                "y1",
+                                                snapped_layout_mouse_position.y,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.y,
+                                                    grid,
+                                                ),
+                                                "true",
+                                            ),
+                                            Dir::Horiz => (
+                                                "x0",
+                                                "x1",
+                                                snapped_layout_mouse_position.x,
+                                                draw_source_coordinate(
+                                                    snapped_layout_mouse_position.x,
+                                                    grid,
+                                                ),
+                                                "false",
+                                            ),
+                                        };
 
+                                    let intended_coord_exact =
+                                        (edge.exact.start + edge.exact.stop) / 2.;
+                                    let coord_offset = format_dimension_offset(
+                                        source_coord - intended_coord_exact,
+                                        grid / 2.,
+                                    );
                                     let intended_coord = (display.start + display.stop) / 2.;
-                                    let coord_offset = if coord > intended_coord {
-                                        format!("+ {}", coord - intended_coord)
-                                    } else {
-                                        format!("- {}", intended_coord - coord)
-                                    };
 
                                     let pnstop = format!(
                                         "({}.{} + {}.{}) / 2.",
                                         edge.path, start, edge.path, stop,
                                     );
-                                    let coord = format!("{pnstop} {coord_offset}");
+                                    let coord_expr = format!("{pnstop} {coord_offset}");
                                     let exact_value = edge.exact.coord.abs();
                                     let value =
                                         compile::format_initial_condition(exact_value, grid);
+                                    let preview_value = format_dimension_label(exact_value, grid);
                                     let (p, n, pstop, nstop, preview) = if edge.exact.coord < 0. {
                                         (
                                             "0.".to_string(),
                                             format!("{}.{}", edge.path, edge.name),
-                                            coord.clone(),
+                                            coord_expr.clone(),
                                             pnstop,
                                             PendingDimensionPreview {
                                                 p: 0.,
                                                 n: display.coord,
-                                                coord: match display.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
-                                                pstop: match display.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
+                                                coord: preview_coord,
+                                                pstop: preview_coord,
                                                 nstop: intended_coord,
                                                 horiz: display.dir == Dir::Vert,
-                                                value: value.clone(),
+                                                value: preview_value.clone(),
                                             },
                                         )
                                     } else {
@@ -7074,21 +7146,15 @@ impl LayoutCanvas {
                                             format!("{}.{}", edge.path, edge.name),
                                             "0.".to_string(),
                                             pnstop,
-                                            coord.clone(),
+                                            coord_expr.clone(),
                                             PendingDimensionPreview {
                                                 p: display.coord,
                                                 n: 0.,
-                                                coord: match display.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
+                                                coord: preview_coord,
                                                 pstop: intended_coord,
-                                                nstop: match display.dir {
-                                                    Dir::Vert => layout_mouse_position.y,
-                                                    Dir::Horiz => layout_mouse_position.x,
-                                                },
+                                                nstop: preview_coord,
                                                 horiz: display.dir == Dir::Vert,
-                                                value: value.clone(),
+                                                value: preview_value,
                                             },
                                         )
                                     };
@@ -7097,7 +7163,7 @@ impl LayoutCanvas {
                                             p,
                                             n,
                                             value: value.clone(),
-                                            coord,
+                                            coord: coord_expr,
                                             pstop,
                                             nstop,
                                             horiz: horiz.to_string(),
@@ -8613,6 +8679,19 @@ mod tests {
     }
 
     #[test]
+    fn dimension_labels_only_show_grid_relevant_decimals() {
+        assert_eq!(format_dimension_label(500., 5.), "500");
+        assert_eq!(format_dimension_label(502.5, 2.5), "502.5");
+        assert_eq!(format_dimension_label(0.9050000000001, 0.005), "0.905");
+    }
+
+    #[test]
+    fn dimension_offsets_are_clean_float_expressions() {
+        assert_eq!(format_dimension_offset(15.0000001, 5.), "+ 15.");
+        assert_eq!(format_dimension_offset(-2.5000001, 2.5), "- 2.5");
+    }
+
+    #[test]
     fn dotted_segments_keep_screen_space_spacing_when_rotated() {
         let horizontal = dotted_segment_centers(Point::default(), Point::new(px(70.), px(0.)));
         let diagonal =
@@ -8945,6 +9024,10 @@ mod tests {
         assert_eq!(
             snap_layout_point(Point::new(1.12, -0.62), 0.25),
             Point::new(1., -0.5)
+        );
+        assert_eq!(
+            snap_layout_point(Point::new(502.4, -507.6), 5.),
+            Point::new(500., -510.)
         );
     }
 
