@@ -368,6 +368,26 @@ fn workspace_title(path: Option<&Path>) -> String {
     )
 }
 
+fn workspace_title_contents(path: Option<&Path>, modified: bool) -> Div {
+    let mut contents = div().flex().min_w_0().max_w_full().items_center().child(
+        div()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .child(workspace_title(path)),
+    );
+    if modified {
+        contents = contents.child(
+            div()
+                .debug_selector(|| "workspace_modified_indicator".to_owned())
+                .ml_1()
+                .flex_none()
+                .child("[+]"),
+        );
+    }
+    contents
+}
+
 impl Render for TitleBar {
     fn render(
         &mut self,
@@ -376,12 +396,6 @@ impl Render for TitleBar {
     ) -> impl gpui::IntoElement {
         let state = self.state.read(cx);
         let theme = state.theme();
-        let mut centered_title = div()
-            .relative()
-            .child(workspace_title(state.workspace_path.as_deref()));
-        if state.workspace_modified {
-            centered_title = centered_title.child(div().absolute().left_full().ml_1().child("[+]"));
-        }
         div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
@@ -392,15 +406,37 @@ impl Render for TitleBar {
             .justify_center()
             .overflow_hidden()
             .whitespace_nowrap()
-            .child(centered_title)
+            .child(workspace_title_contents(
+                state.workspace_path.as_deref(),
+                state.workspace_modified,
+            ))
     }
 }
 
 #[cfg(test)]
 mod title_bar_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::workspace_title;
+    use gpui::{Context, Render, TestAppContext, Window, div, prelude::*, px};
+
+    use super::{workspace_title, workspace_title_contents};
+
+    struct TitleBarPreview {
+        path: PathBuf,
+    }
+
+    impl Render for TitleBarPreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "title_bar".to_owned())
+                .w(px(180.))
+                .overflow_hidden()
+                .flex()
+                .justify_center()
+                .whitespace_nowrap()
+                .child(workspace_title_contents(Some(&self.path), true))
+        }
+    }
 
     #[test]
     fn title_shows_workspace() {
@@ -410,6 +446,18 @@ mod title_bar_tests {
             "Argon — /projects/inverter"
         );
         assert_eq!(workspace_title(None), "Argon");
+    }
+
+    #[gpui::test]
+    fn modified_indicator_stays_inside_a_narrow_title_bar(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| TitleBarPreview {
+            path: PathBuf::from("/projects/a-workspace-name-that-is-much-wider-than-the-title-bar"),
+        });
+
+        let title_bar = cx.debug_bounds("title_bar").unwrap();
+        let indicator = cx.debug_bounds("workspace_modified_indicator").unwrap();
+        assert!(indicator.left() >= title_bar.left());
+        assert!(indicator.right() <= title_bar.right());
     }
 }
 
