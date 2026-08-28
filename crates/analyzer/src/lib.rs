@@ -1019,13 +1019,13 @@ impl Backend {
         if let Some(connection) = self.state.gui_connection().await {
             self.state
                 .editor_client
-                .show_message(MessageType::LOG, "Attempting to contact existing GUI...")
+                .log_message(MessageType::INFO, "Attempting to contact existing GUI...")
                 .await;
             match connection.client.activate(context::current()).await {
                 Ok(()) => {
                     self.state
                         .editor_client
-                        .show_message(MessageType::LOG, "Connected to existing GUI!")
+                        .log_message(MessageType::INFO, "Connected to existing GUI!")
                         .await;
                     return Ok(());
                 }
@@ -1033,7 +1033,7 @@ impl Backend {
                     self.state.clear_gui_connection(connection.id).await;
                     self.state
                         .editor_client
-                        .show_message(MessageType::LOG, "Failed to contact existing GUI.")
+                        .log_message(MessageType::INFO, "Failed to contact existing GUI.")
                         .await;
                 }
                 Err(error) => {
@@ -1055,7 +1055,7 @@ impl Backend {
 
         self.state
             .editor_client
-            .show_message(MessageType::LOG, "Starting the GUI...")
+            .log_message(MessageType::INFO, "Starting the GUI...")
             .await;
         let state = self.state.clone();
 

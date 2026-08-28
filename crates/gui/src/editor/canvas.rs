@@ -471,7 +471,7 @@ struct InitialConditionUpdate {
 
 #[derive(Clone, Debug)]
 struct PendingSseValue {
-    span: Span,
+    span: Option<Span>,
     value: f64,
 }
 
@@ -773,9 +773,20 @@ pub(crate) enum DimEdge<T> {
     Edge(T),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DimensionEdge {
+    path: String,
+    name: String,
+    /// Canvas geometry is intentionally `f32`; it is only used for painting
+    /// and hit testing.
+    display: Edge<f32>,
+    /// Dimension defaults come from the compiler's grid-snapped `f64` output.
+    exact: Edge<f64>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DrawDimToolState {
-    pub(crate) edges: Vec<DimEdge<(String, String, Edge<f32>)>>,
+    pub(crate) edges: Vec<DimEdge<DimensionEdge>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3177,16 +3188,30 @@ fn remap_span_after_value_edits(selected: &Span, edits: &[ValueEdit]) -> Span {
     }
 }
 
-fn pending_sse_values(edits: &[ValueEdit]) -> Vec<PendingSseValue> {
-    edits
+fn pending_sse_values(
+    edits: &[ValueEdit],
+    initial_conditions: &[InitialConditionEdit],
+) -> Vec<PendingSseValue> {
+    let mut pending = edits
         .iter()
         .filter_map(|edit| {
             Some(PendingSseValue {
-                span: remap_span_after_value_edits(&edit.span, edits),
+                span: Some(remap_span_after_value_edits(&edit.span, edits)),
                 value: edit.value.parse().ok()?,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // Missing initial-condition kwargs are returned by the analyzer as one
+    // aggregate insertion edit, whose text is not itself a number. Retain the
+    // requested values without a source span so an unrelated newer compile
+    // cannot dismiss the optimistic drag preview before those kwargs compile.
+    pending.extend(
+        initial_conditions
+            .iter()
+            .filter_map(|condition| condition.value.parse().ok())
+            .map(|value| PendingSseValue { span: None, value }),
+    );
+    pending
 }
 
 fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseValue]) -> bool {
@@ -3196,7 +3221,10 @@ fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseV
                 .values()
                 .flat_map(|cell| &cell.fallback_constraints_used)
                 .any(|fallback| {
-                    fallback.span == expected.span
+                    expected
+                        .span
+                        .as_ref()
+                        .is_none_or(|span| &fallback.span == span)
                         && (-fallback.constraint.constant - expected.value).abs() < 1e-8
                 })
         })
@@ -5063,7 +5091,8 @@ impl Element for CanvasElement {
                     if let ToolState::DrawDim(DrawDimToolState { edges }) = &tool {
                         // draw dimension lines
                         if edges.len() == 1 {
-                            if let DimEdge::Edge((_, _, edge)) = &edges[0] {
+                            if let DimEdge::Edge(edge) = &edges[0] {
+                                let edge = &edge.display;
                                 let coord = match edge.dir {
                                     Dir::Horiz => layout_mouse_position.y,
                                     Dir::Vert => layout_mouse_position.x,
@@ -5083,10 +5112,9 @@ impl Element for CanvasElement {
                         } else if edges.len() == 2 {
                             let (p, n, coord, pstop, nstop, horiz, value) =
                                 match (&edges[0], &edges[1]) {
-                                    (
-                                        DimEdge::Edge((_, _, edge0)),
-                                        DimEdge::Edge((_, _, edge1)),
-                                    ) => {
+                                    (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
+                                        let edge0 = &edge0.display;
+                                        let edge1 = &edge1.display;
                                         let coord = match edge0.dir {
                                             Dir::Horiz => layout_mouse_position.x,
                                             Dir::Vert => layout_mouse_position.y,
@@ -5101,8 +5129,9 @@ impl Element for CanvasElement {
                                             format!("{:.3}", (edge1.coord - edge0.coord).abs()),
                                         )
                                     }
-                                    (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge((_, _, edge)))
-                                    | (DimEdge::Edge((_, _, edge)), DimEdge::X0 | DimEdge::Y0) => {
+                                    (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
+                                    | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
+                                        let edge = &edge.display;
                                         let coord = match edge.dir {
                                             Dir::Horiz => layout_mouse_position.x,
                                             Dir::Vert => layout_mouse_position.y,
@@ -5124,7 +5153,8 @@ impl Element for CanvasElement {
                         // highlight selected edges
                         for edge in edges {
                             let bounds = match edge {
-                                DimEdge::Edge((_, _, edge)) => {
+                                DimEdge::Edge(edge) => {
+                                    let edge = &edge.display;
                                     let (x0, y0, x1, y1) = match edge.dir {
                                         Dir::Horiz => {
                                             (edge.start, edge.coord, edge.stop, edge.coord)
@@ -5290,7 +5320,7 @@ impl Element for CanvasElement {
                                                 .map(|old_edge| match old_edge {
                                                     DimEdge::X0 => Dir::Vert,
                                                     DimEdge::Y0 => Dir::Horiz,
-                                                    DimEdge::Edge((_, _, edge)) => edge.dir,
+                                                    DimEdge::Edge(edge) => edge.display.dir,
                                                 } == edge.dir)
                                                 .unwrap_or(true)
                                         {
@@ -5521,7 +5551,6 @@ impl Render for LayoutCanvas {
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
             .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_action(cx.listener(Self::draw_rect))
             .on_action(cx.listener(Self::draw_polygon))
             .on_action(cx.listener(Self::draw_path))
@@ -6788,21 +6817,27 @@ impl LayoutCanvas {
                         let enter_entry_mode = !dim_tool.edges.is_empty();
                         match selected {
                             Some(DimEdge::Edge((r, name, edge))) => {
-                                let path = {
+                                let resolved = {
                                     let cell = self.state.read(cx).solved_cell.read(cx);
                                     if let Some(cell) = cell
                                         && let selected_scope_addr =
                                             cell.state[&cell.selected_scope].address
                                         && let (true, path) =
                                             find_obj_path(&r.object_path, cell, selected_scope_addr)
+                                        && let Some(exact) = exact_object_bounds(
+                                            &r.object_path,
+                                            cell,
+                                            selected_scope_addr,
+                                        )
+                                        .and_then(|bounds| bounds.edge(name))
                                     {
                                         let path = path.join(".");
-                                        Some(path)
+                                        Some((path, exact))
                                     } else {
                                         None
                                     }
                                 };
-                                if let Some(path) = path
+                                if let Some((path, exact)) = resolved
                                     && dim_tool
                                         .edges
                                         .first()
@@ -6810,17 +6845,18 @@ impl LayoutCanvas {
                                             let old_dir = match old_edge {
                                                 DimEdge::X0 => Dir::Vert,
                                                 DimEdge::Y0 => Dir::Horiz,
-                                                DimEdge::Edge((_, _, edge)) => edge.dir,
+                                                DimEdge::Edge(edge) => edge.display.dir,
                                             };
                                             old_dir == edge.dir
                                         })
                                         .unwrap_or(true)
                                 {
-                                    dim_tool.edges.push(DimEdge::Edge((
+                                    dim_tool.edges.push(DimEdge::Edge(DimensionEdge {
                                         path,
-                                        name.to_string(),
-                                        edge,
-                                    )));
+                                        name: name.to_string(),
+                                        display: edge,
+                                        exact,
+                                    }));
                                     false
                                 } else {
                                     enter_entry_mode
@@ -6834,7 +6870,7 @@ impl LayoutCanvas {
                                         let old_dir = match old_edge {
                                             DimEdge::X0 => return false,
                                             DimEdge::Y0 => return false,
-                                            DimEdge::Edge((_, _, edge)) => edge.dir,
+                                            DimEdge::Edge(edge) => edge.display.dir,
                                         };
                                         old_dir == Dir::Vert
                                     })
@@ -6852,7 +6888,7 @@ impl LayoutCanvas {
                                         let old_dir = match old_edge {
                                             DimEdge::X0 => return false,
                                             DimEdge::Y0 => return false,
-                                            DimEdge::Edge((_, _, edge)) => edge.dir,
+                                            DimEdge::Edge(edge) => edge.display.dir,
                                         };
                                         old_dir == Dir::Horiz
                                     })
@@ -6871,115 +6907,132 @@ impl LayoutCanvas {
 
                     if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
                         let selected_scope_addr = cell.state[&cell.selected_scope].address;
+                        let grid = cell.output.tech.grid_step();
 
                         let pending = if dim_tool.edges.len() == 1
                             && let DimEdge::Edge(edge) = &dim_tool.edges[0]
                         {
-                            let (left, right, coord, horiz) = match edge.2.dir {
+                            let display = &edge.display;
+                            let (left, right, coord, horiz) = match display.dir {
                                 Dir::Horiz => ("x0", "x1", layout_mouse_position.y, "true"),
                                 Dir::Vert => ("y0", "y1", layout_mouse_position.x, "false"),
                             };
 
-                            let distance = edge.2.stop - edge.2.start;
-                            let value = format!("{distance:?}");
+                            let distance = edge.exact.stop - edge.exact.start;
+                            let value = compile::format_initial_condition(distance, grid);
                             Some((
                                 DimensionParams {
-                                    p: format!("{}.{}", edge.0, right),
-                                    n: format!("{}.{}", edge.0, left),
+                                    p: format!("{}.{}", edge.path, right),
+                                    n: format!("{}.{}", edge.path, left),
                                     value: value.clone(),
-                                    coord: if coord > edge.2.coord {
-                                        format!("{}.{} + {}", edge.0, edge.1, coord - edge.2.coord)
+                                    coord: if coord > display.coord {
+                                        format!(
+                                            "{}.{} + {}",
+                                            edge.path,
+                                            edge.name,
+                                            coord - display.coord
+                                        )
                                     } else {
-                                        format!("{}.{} - {}", edge.0, edge.1, edge.2.coord - coord)
+                                        format!(
+                                            "{}.{} - {}",
+                                            edge.path,
+                                            edge.name,
+                                            display.coord - coord
+                                        )
                                     },
-                                    pstop: format!("{}.{}", edge.0, edge.1),
-                                    nstop: format!("{}.{}", edge.0, edge.1),
+                                    pstop: format!("{}.{}", edge.path, edge.name),
+                                    nstop: format!("{}.{}", edge.path, edge.name),
                                     horiz: horiz.to_string(),
                                 },
-                                value,
+                                value.clone(),
                                 PendingDimensionPreview {
-                                    p: edge.2.stop,
-                                    n: edge.2.start,
+                                    p: display.stop,
+                                    n: display.start,
                                     coord,
-                                    pstop: edge.2.coord,
-                                    nstop: edge.2.coord,
-                                    horiz: edge.2.dir == Dir::Horiz,
-                                    value: format!("{distance:.3}"),
+                                    pstop: display.coord,
+                                    nstop: display.coord,
+                                    horiz: display.dir == Dir::Horiz,
+                                    value,
                                 },
                             ))
                         } else if dim_tool.edges.len() == 2 {
                             match (&dim_tool.edges[0], &dim_tool.edges[1]) {
                                 (DimEdge::Edge(edge0), DimEdge::Edge(edge1)) => {
-                                    let (left, right) = if edge0.2.coord < edge1.2.coord {
+                                    let (left, right) = if edge0.exact.coord < edge1.exact.coord {
                                         (edge0, edge1)
                                     } else {
                                         (edge1, edge0)
                                     };
-                                    let (start, stop, coord, horiz) = match left.2.dir {
+                                    let left_display = &left.display;
+                                    let right_display = &right.display;
+                                    let (start, stop, coord, horiz) = match left_display.dir {
                                         Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
                                         Dir::Horiz => {
                                             ("x0", "x1", layout_mouse_position.x, "false")
                                         }
                                     };
 
-                                    let intended_coord =
-                                        (right.2.start + right.2.stop + left.2.start + left.2.stop)
-                                            / 4.;
+                                    let intended_coord = (right_display.start
+                                        + right_display.stop
+                                        + left_display.start
+                                        + left_display.stop)
+                                        / 4.;
                                     let coord_offset = if coord > intended_coord {
                                         format!("+ {}", coord - intended_coord)
                                     } else {
                                         format!("- {}", intended_coord - coord)
                                     };
-                                    let distance = right.2.coord - left.2.coord;
-                                    let value = format!("{distance:?}");
+                                    let distance = right.exact.coord - left.exact.coord;
+                                    let value = compile::format_initial_condition(distance, grid);
                                     Some((
                                         DimensionParams {
-                                            p: format!("{}.{}", right.0, right.1,),
-                                            n: format!("{}.{}", left.0, left.1),
+                                            p: format!("{}.{}", right.path, right.name),
+                                            n: format!("{}.{}", left.path, left.name),
                                             value: value.clone(),
                                             coord: format!(
                                                 "({}.{} + {}.{} + {}.{} + {}.{})/4. {coord_offset}",
-                                                right.0,
+                                                right.path,
                                                 start,
-                                                right.0,
+                                                right.path,
                                                 stop,
-                                                left.0,
+                                                left.path,
                                                 start,
-                                                left.0,
+                                                left.path,
                                                 stop,
                                             ),
                                             pstop: format!(
                                                 "({}.{} + {}.{}) / 2.",
-                                                right.0, start, right.0, stop,
+                                                right.path, start, right.path, stop,
                                             ),
                                             nstop: format!(
                                                 "({}.{} + {}.{}) / 2.",
-                                                left.0, start, left.0, stop,
+                                                left.path, start, left.path, stop,
                                             ),
                                             horiz: horiz.to_string(),
                                         },
-                                        value,
+                                        value.clone(),
                                         PendingDimensionPreview {
-                                            p: right.2.coord,
-                                            n: left.2.coord,
+                                            p: right_display.coord,
+                                            n: left_display.coord,
                                             coord,
-                                            pstop: (right.2.start + right.2.stop) / 2.,
-                                            nstop: (left.2.start + left.2.stop) / 2.,
-                                            horiz: left.2.dir == Dir::Vert,
-                                            value: format!("{distance:.3}"),
+                                            pstop: (right_display.start + right_display.stop) / 2.,
+                                            nstop: (left_display.start + left_display.stop) / 2.,
+                                            horiz: left_display.dir == Dir::Vert,
+                                            value,
                                         },
                                     ))
                                 }
                                 (DimEdge::X0 | DimEdge::Y0, DimEdge::Edge(edge))
                                 | (DimEdge::Edge(edge), DimEdge::X0 | DimEdge::Y0) => {
-                                    let (start, stop, coord, horiz) = match edge.2.dir {
+                                    let display = &edge.display;
+                                    let (start, stop, coord, horiz) = match display.dir {
                                         Dir::Vert => ("y0", "y1", layout_mouse_position.y, "true"),
                                         Dir::Horiz => {
                                             ("x0", "x1", layout_mouse_position.x, "false")
                                         }
                                     };
 
-                                    let intended_coord = (edge.2.start + edge.2.stop) / 2.;
+                                    let intended_coord = (display.start + display.stop) / 2.;
                                     let coord_offset = if coord > intended_coord {
                                         format!("+ {}", coord - intended_coord)
                                     } else {
@@ -6988,54 +7041,54 @@ impl LayoutCanvas {
 
                                     let pnstop = format!(
                                         "({}.{} + {}.{}) / 2.",
-                                        edge.0, start, edge.0, stop,
+                                        edge.path, start, edge.path, stop,
                                     );
                                     let coord = format!("{pnstop} {coord_offset}");
-                                    let (p, n, value, pstop, nstop, preview) = if edge.2.coord < 0.
-                                    {
+                                    let exact_value = edge.exact.coord.abs();
+                                    let value =
+                                        compile::format_initial_condition(exact_value, grid);
+                                    let (p, n, pstop, nstop, preview) = if edge.exact.coord < 0. {
                                         (
                                             "0.".to_string(),
-                                            format!("{}.{}", edge.0, edge.1),
-                                            format!("{:?}", -edge.2.coord),
+                                            format!("{}.{}", edge.path, edge.name),
                                             coord.clone(),
                                             pnstop,
                                             PendingDimensionPreview {
                                                 p: 0.,
-                                                n: edge.2.coord,
-                                                coord: match edge.2.dir {
+                                                n: display.coord,
+                                                coord: match display.dir {
                                                     Dir::Vert => layout_mouse_position.y,
                                                     Dir::Horiz => layout_mouse_position.x,
                                                 },
-                                                pstop: match edge.2.dir {
+                                                pstop: match display.dir {
                                                     Dir::Vert => layout_mouse_position.y,
                                                     Dir::Horiz => layout_mouse_position.x,
                                                 },
                                                 nstop: intended_coord,
-                                                horiz: edge.2.dir == Dir::Vert,
-                                                value: format!("{:.3}", -edge.2.coord),
+                                                horiz: display.dir == Dir::Vert,
+                                                value: value.clone(),
                                             },
                                         )
                                     } else {
                                         (
-                                            format!("{}.{}", edge.0, edge.1),
+                                            format!("{}.{}", edge.path, edge.name),
                                             "0.".to_string(),
-                                            format!("{:?}", edge.2.coord),
                                             pnstop,
                                             coord.clone(),
                                             PendingDimensionPreview {
-                                                p: edge.2.coord,
+                                                p: display.coord,
                                                 n: 0.,
-                                                coord: match edge.2.dir {
+                                                coord: match display.dir {
                                                     Dir::Vert => layout_mouse_position.y,
                                                     Dir::Horiz => layout_mouse_position.x,
                                                 },
                                                 pstop: intended_coord,
-                                                nstop: match edge.2.dir {
+                                                nstop: match display.dir {
                                                     Dir::Vert => layout_mouse_position.y,
                                                     Dir::Horiz => layout_mouse_position.x,
                                                 },
-                                                horiz: edge.2.dir == Dir::Vert,
-                                                value: format!("{:.3}", edge.2.coord),
+                                                horiz: display.dir == Dir::Vert,
+                                                value: value.clone(),
                                             },
                                         )
                                     };
@@ -7552,6 +7605,7 @@ impl LayoutCanvas {
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
+                let pending_initial_conditions = edits.initial_conditions.clone();
                 match self
                     .state
                     .read(cx)
@@ -7561,7 +7615,8 @@ impl LayoutCanvas {
                     Ok(Some(applied_edits)) => {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
-                        self.pending_sse_values = pending_sse_values(&applied_edits);
+                        self.pending_sse_values =
+                            pending_sse_values(&applied_edits, &pending_initial_conditions);
                         self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
                         // Anything deferred before the workspace edit was
                         // accepted belongs to the pre-drag source revision.
@@ -7672,6 +7727,116 @@ impl LayoutCanvas {
 
         cx.notify();
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExactLayoutBounds {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+}
+
+impl ExactLayoutBounds {
+    fn transformed(
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        mat: TransformationMatrix,
+        ofs: (f64, f64),
+    ) -> Self {
+        let p0 = ifmatvec(mat, (x0, y0));
+        let p1 = ifmatvec(mat, (x1, y1));
+        Self {
+            x0: p0.0.min(p1.0) + ofs.0,
+            y0: p0.1.min(p1.1) + ofs.1,
+            x1: p0.0.max(p1.0) + ofs.0,
+            y1: p0.1.max(p1.1) + ofs.1,
+        }
+    }
+
+    fn edge(self, name: &str) -> Option<Edge<f64>> {
+        match name {
+            "x0" => Some(Edge {
+                dir: Dir::Vert,
+                coord: self.x0,
+                start: self.y0,
+                stop: self.y1,
+            }),
+            "x1" => Some(Edge {
+                dir: Dir::Vert,
+                coord: self.x1,
+                start: self.y0,
+                stop: self.y1,
+            }),
+            "y0" => Some(Edge {
+                dir: Dir::Horiz,
+                coord: self.y0,
+                start: self.x0,
+                stop: self.x1,
+            }),
+            "y1" => Some(Edge {
+                dir: Dir::Horiz,
+                coord: self.y1,
+                start: self.x0,
+                stop: self.x1,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the same rectangle or collapsed-instance bbox that the canvas
+/// displays, but retain the compiler's `f64` coordinates. This keeps source
+/// dimension defaults on the compiler grid without re-snapping a rounded GUI
+/// value.
+fn exact_object_bounds(
+    path: &[ObjectId],
+    cell: &CompileOutputState,
+    scope: ScopeAddress,
+) -> Option<ExactLayoutBounds> {
+    let mut current_scope = scope;
+    let mut mat = TransformationMatrix::identity();
+    let mut ofs = (0., 0.);
+
+    for (index, object_id) in path.iter().enumerate() {
+        let is_last = index + 1 == path.len();
+        let object = cell.output.cells[&current_scope.cell]
+            .objects
+            .get(object_id)?;
+        match object {
+            SolvedValue::Rect(rect) if is_last => {
+                return Some(ExactLayoutBounds::transformed(
+                    rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0, mat, ofs,
+                ));
+            }
+            SolvedValue::Instance(instance) => {
+                let mut instance_mat = TransformationMatrix::identity();
+                if instance.reflect {
+                    instance_mat = instance_mat.reflect_vert();
+                }
+                instance_mat = instance_mat.rotate(instance.angle);
+                let instance_ofs = ifmatvec(mat, (instance.x, instance.y));
+                mat = mat * instance_mat;
+                ofs = (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1);
+                current_scope = ScopeAddress {
+                    cell: instance.cell,
+                    scope: cell.output.cells[&instance.cell].root,
+                };
+
+                if is_last {
+                    let scope_path = cell.scope_paths.get(&current_scope)?;
+                    let bbox = cell.state.get(scope_path)?.bbox.as_ref()?;
+                    return Some(ExactLayoutBounds::transformed(
+                        bbox.x0, bbox.y0, bbox.x1, bbox.y1, mat, ofs,
+                    ));
+                }
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 pub(crate) fn find_obj_path(
@@ -8831,12 +8996,35 @@ mod tests {
             },
         ];
 
-        let pending = pending_sse_values(&edits);
+        let pending = pending_sse_values(&edits, &[]);
         assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].span.span, cfgrammar::Span::new(10, 13));
+        assert_eq!(
+            pending[0].span.as_ref().unwrap().span,
+            cfgrammar::Span::new(10, 13)
+        );
         assert_eq!(pending[0].value, 1.2);
-        assert_eq!(pending[1].span.span, cfgrammar::Span::new(24, 26));
+        assert_eq!(
+            pending[1].span.as_ref().unwrap().span,
+            cfgrammar::Span::new(24, 26)
+        );
         assert_eq!(pending[1].value, 0.);
+    }
+
+    #[test]
+    fn pending_drag_values_include_inserted_initial_conditions() {
+        let conditions = [InitialConditionEdit {
+            call_span: Span {
+                path: std::path::PathBuf::from("lib.ar"),
+                span: cfgrammar::Span::new(10, 30),
+            },
+            name: "x0i".to_owned(),
+            value: "12.5".to_owned(),
+        }];
+
+        let pending = pending_sse_values(&[], &conditions);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].span.is_none());
+        assert_eq!(pending[0].value, 12.5);
     }
 
     #[test]
@@ -8869,7 +9057,7 @@ mod tests {
             .first()
             .expect("rectangle should use its initial conditions");
         let mut pending = vec![PendingSseValue {
-            span: fallback.span.clone(),
+            span: Some(fallback.span.clone()),
             value: -fallback.constraint.constant,
         }];
 
@@ -8895,6 +9083,22 @@ mod tests {
 
         assert_eq!(solved_linear_after_drag(&field, Some(&drag)), 17.5);
         assert_eq!(solved_linear_after_drag(&field, None), 10.);
+    }
+
+    #[test]
+    fn dimension_defaults_keep_compiler_precision() {
+        let bounds = ExactLayoutBounds {
+            x0: 0.,
+            y0: 50_000.005,
+            x1: 10.,
+            y1: 50_000.910,
+        };
+        let edge = bounds.edge("x0").unwrap();
+        let value = compile::format_initial_condition(edge.stop - edge.start, 0.005);
+
+        // Reducing these coordinates to f32 first produces 0.90625, which was
+        // previously presented as the off-grid default `0.906`.
+        assert_eq!(value, "0.905");
     }
 
     #[test]
@@ -9053,6 +9257,15 @@ cell top() {
         assert_eq!(
             find_obj_path(&[instance_id, child_rect_id], &state, scope),
             (true, vec!["child_instance".to_owned(), "shape".to_owned()])
+        );
+        assert_eq!(
+            exact_object_bounds(&[instance_id, child_rect_id], &state, scope),
+            Some(ExactLayoutBounds {
+                x0: 3.,
+                y0: 4.,
+                x1: 13.,
+                y1: 9.,
+            })
         );
     }
 }

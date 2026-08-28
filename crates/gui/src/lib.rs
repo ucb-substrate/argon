@@ -151,28 +151,29 @@ fn run_inner(
 }
 
 fn key_bindings() -> Vec<KeyBinding> {
+    const CANVAS_CONTEXT: &str = "LayoutCanvas && !TextInput";
     vec![
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-s", Save, None),
-        KeyBinding::new("r", DrawRect, Some("LayoutCanvas")),
-        KeyBinding::new("p", DrawPolygon, Some("LayoutCanvas")),
-        KeyBinding::new("s", SelectMode, Some("LayoutCanvas")),
-        KeyBinding::new("d", DrawDim, Some("LayoutCanvas")),
-        KeyBinding::new("i", InstantiateCommand, Some("LayoutCanvas")),
-        KeyBinding::new("o", OpenCellCommand, Some("LayoutCanvas")),
-        KeyBinding::new("f", Fit, Some("LayoutCanvas")),
-        KeyBinding::new("q", Edit, Some("LayoutCanvas")),
-        KeyBinding::new("u", Undo, Some("LayoutCanvas")),
-        KeyBinding::new("ctrl-r", Redo, Some("LayoutCanvas")),
-        KeyBinding::new("0", Zero, Some("LayoutCanvas")),
-        KeyBinding::new("1", One, Some("LayoutCanvas")),
-        KeyBinding::new("*", All, Some("LayoutCanvas")),
+        KeyBinding::new("r", DrawRect, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("p", DrawPolygon, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("s", SelectMode, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("d", DrawDim, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("i", InstantiateCommand, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("o", OpenCellCommand, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("f", Fit, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("q", Edit, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("u", Undo, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("ctrl-r", Redo, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("0", Zero, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("1", One, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("*", All, Some(CANVAS_CONTEXT)),
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
         KeyBinding::new("ctrl-shift-d", ShowDiagnostics, None),
         KeyBinding::new("ctrl-shift-m", ShowMessages, None),
-        KeyBinding::new(":", FocusInvokerCommandBar, None),
-        KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
-        KeyBinding::new("enter", Enter, Some("LayoutCanvas")),
+        KeyBinding::new(":", FocusInvokerCommandBar, Some("!TextInput")),
+        KeyBinding::new("escape", Cancel, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("enter", Enter, Some(CANVAS_CONTEXT)),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
@@ -228,6 +229,9 @@ mod tests {
         show_diagnostics_count: usize,
         show_messages_count: usize,
         save_count: usize,
+        zero_count: usize,
+        one_count: usize,
+        all_count: usize,
     }
 
     impl Render for ShortcutTestView {
@@ -237,6 +241,9 @@ mod tests {
                 .on_action(cx.listener(|view, _: &Save, _, _| view.save_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
                 .on_action(cx.listener(|view, _: &DrawPolygon, _, _| view.draw_polygon_count += 1))
+                .on_action(cx.listener(|view, _: &Zero, _, _| view.zero_count += 1))
+                .on_action(cx.listener(|view, _: &One, _, _| view.one_count += 1))
+                .on_action(cx.listener(|view, _: &All, _, _| view.all_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
                         view.command_bar_count += 1
@@ -261,9 +268,11 @@ mod tests {
                         .track_focus(&self.canvas_focus),
                 )
                 .child(
-                    div()
-                        .key_context("TextInput")
-                        .track_focus(&self.input_focus),
+                    div().key_context("LayoutCanvas").child(
+                        div()
+                            .key_context("TextInput")
+                            .track_focus(&self.input_focus),
+                    ),
                 )
         }
     }
@@ -286,6 +295,9 @@ mod tests {
                     show_diagnostics_count: 0,
                     show_messages_count: 0,
                     save_count: 0,
+                    zero_count: 0,
+                    one_count: 0,
+                    all_count: 0,
                 })
             })
             .unwrap()
@@ -296,16 +308,19 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(
             *window,
-            "u r p i o ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+            "u r p i o 0 1 * ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
         );
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
                 assert_eq!(view.draw_rect_count, 0);
                 assert_eq!(view.draw_polygon_count, 0);
-                assert_eq!(view.command_bar_count, 1);
+                assert_eq!(view.command_bar_count, 0);
                 assert_eq!(view.instantiate_count, 0);
                 assert_eq!(view.open_cell_count, 0);
+                assert_eq!(view.zero_count, 0);
+                assert_eq!(view.one_count, 0);
+                assert_eq!(view.all_count, 0);
                 assert_eq!(view.focus_invoker_count, 1);
                 assert_eq!(view.show_diagnostics_count, 1);
                 assert_eq!(view.show_messages_count, 1);
@@ -318,16 +333,19 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(
             *window,
-            "u r p i o ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+            "u r p i o 0 1 * ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
         );
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
                 assert_eq!(view.draw_rect_count, 1);
                 assert_eq!(view.draw_polygon_count, 1);
-                assert_eq!(view.command_bar_count, 2);
+                assert_eq!(view.command_bar_count, 1);
                 assert_eq!(view.instantiate_count, 1);
                 assert_eq!(view.open_cell_count, 1);
+                assert_eq!(view.zero_count, 1);
+                assert_eq!(view.one_count, 1);
+                assert_eq!(view.all_count, 1);
                 assert_eq!(view.focus_invoker_count, 2);
                 assert_eq!(view.show_diagnostics_count, 2);
                 assert_eq!(view.show_messages_count, 2);

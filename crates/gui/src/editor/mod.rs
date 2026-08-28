@@ -83,6 +83,7 @@ pub struct EditorState {
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
+    pub compilation_error: Option<EditorMessage>,
     pub fatal_error: Option<EditorMessage>,
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
@@ -337,7 +338,10 @@ impl EditorState {
     }
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
         let compilation_error = compilation_error_message(&output);
-        let mut recoverable_error = None;
+        // Compilation status belongs to the accepted snapshot, rather than to
+        // the general message queue. In particular, a valid snapshot must
+        // always remove a banner left by an earlier failed compilation.
+        self.compilation_error = compilation_error;
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -345,16 +349,11 @@ impl EditorState {
                 errors,
             }) => {
                 if errors.iter().any(|error| error.kind.is_invalid_cell()) {
-                    self.fatal_error = compilation_error;
                     return;
                 }
-                recoverable_error = compilation_error;
                 d
             }
-            _ => {
-                self.fatal_error = compilation_error;
-                return;
-            }
+            _ => return,
         };
         let root_scope = ScopeAddress {
             scope: solved_cell.cells[&solved_cell.top].root,
@@ -419,8 +418,7 @@ impl EditorState {
             });
             cx.notify();
         });
-        self.fatal_error = None;
-        self.message = recoverable_error;
+        self.message = None;
     }
 }
 
@@ -452,6 +450,7 @@ impl Editor {
                 workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
+                compilation_error: None,
                 fatal_error: None,
                 message: None,
                 connection_error: None,
@@ -609,6 +608,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // This root listener also receives moves from the canvas itself and
+        // keeps drags alive when the pointer leaves its bounds. Registering the
+        // same handler on LayoutCanvas would process every in-canvas move twice.
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
         cx.notify();
@@ -754,6 +756,7 @@ impl Render for Editor {
                         true,
                     )
                 })
+                .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
                 .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
                 .or_else(|| state.message.clone().map(|message| (message, false)))
         };
@@ -781,6 +784,14 @@ impl Render for Editor {
             } else {
                 "View messages (Ctrl-Shift-M)"
             };
+            let mut status_message = div()
+                .overflow_x_hidden()
+                .text_ellipsis()
+                .text_color(theme.error)
+                .child(status_text);
+            if !is_compilation_error {
+                status_message = status_message.flex_1();
+            }
             div()
                 .id("status_bar")
                 .border_t_1()
@@ -799,18 +810,11 @@ impl Render for Editor {
                         .h_auto()
                         .text_color(theme.error),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_x_hidden()
-                        .text_ellipsis()
-                        .text_color(theme.error)
-                        .child(status_text),
-                )
+                .child(status_message)
                 .child(
                     div()
                         .id("show_status_details")
-                        .text_xs()
+                        .text_sm()
                         .text_color(theme.text)
                         .cursor_pointer()
                         .child(action_label)
@@ -919,5 +923,22 @@ mod tests {
             .expect("compilation should have failed");
         assert_eq!(message.text.as_ref(), "Compilation errors");
         assert_eq!(message.details, MessageDetails::Diagnostics);
+
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(&source_path, "cell top() {}\n").unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let valid = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
+        );
+        assert!(matches!(&valid, CompileOutput::Valid(_)));
+        assert!(compilation_error_message(&valid).is_none());
     }
 }

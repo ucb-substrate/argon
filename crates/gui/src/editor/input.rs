@@ -165,6 +165,17 @@ impl TextInput {
         self.is_selecting = false;
     }
 
+    fn on_mouse_up_out(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // GPUI invokes mouse-up-out listeners for releases that occur anywhere
+        // outside this input. Only consume the release when a selection drag
+        // actually began here; otherwise this would suppress unrelated clicks,
+        // including layer and hierarchy selections.
+        if self.is_selecting {
+            cx.stop_propagation();
+            self.is_selecting = false;
+        }
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         if self.is_selecting {
@@ -720,7 +731,7 @@ impl Render for TextInput {
             .on_action(cx.listener(self.enter_handler))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .bg(theme.input_bg)
             .text_color(theme.text)
