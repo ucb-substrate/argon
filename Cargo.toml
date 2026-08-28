@@ -11,6 +11,13 @@ members = [
     "crates/tests",
 ]
 
+[workspace.lints.rust]
+unfulfilled_lint_expectations = "forbid"
+
+[workspace.lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+
 [workspace.package]
 license = "BSD-3-Clause"
 

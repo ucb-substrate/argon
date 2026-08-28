@@ -834,10 +834,16 @@ impl Notification for FocusEditor {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        #[allow(deprecated)]
-        let root_dir = params
-            .root_uri
-            .and_then(|root| root.to_file_path().map(|path| path.into_owned()));
+        let root_uri = params
+            .workspace_folders
+            .and_then(|folders| folders.into_iter().next())
+            .map(|folder| folder.uri);
+        #[expect(
+            deprecated,
+            reason = "root_uri remains necessary for LSP clients without workspaceFolders support"
+        )]
+        let root_uri = root_uri.or(params.root_uri);
+        let root_dir = root_uri.and_then(|root| root.to_file_path().map(|path| path.into_owned()));
         if let Some(root_dir) = root_dir {
             let _ = self.state.root_dir.set(root_dir);
             let connection = self.state.gui_connection().await;

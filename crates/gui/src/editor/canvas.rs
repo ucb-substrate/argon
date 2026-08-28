@@ -838,8 +838,8 @@ pub struct LayoutCanvas {
     // zoom state
     scale: f32,
     screen_bounds: Bounds<Pixels>,
-    #[allow(unused)]
-    subscriptions: Vec<Subscription>,
+    // Retained to keep the canvas's observations active.
+    _subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
@@ -3070,7 +3070,7 @@ impl LayoutCanvas {
             shift_down: false,
             scale: 1.0,
             screen_bounds: Bounds::default(),
-            subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
+            _subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
             state: state.clone(),
             rects: Vec::new(),
             polygons: Vec::new(),
