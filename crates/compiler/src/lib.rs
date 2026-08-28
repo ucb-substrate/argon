@@ -2181,6 +2181,67 @@ mod tests {
         }
     }
 
+    fn fn_decl_source(decl: &str) -> String {
+        format!(
+            r#"
+                enum E {{ A, B }}
+                {decl}
+                cell top() {{
+                    let r = rect("met1", x0=0., y0=0., x1=1., y1=2.)!;
+                }}
+            "#
+        )
+    }
+
+    #[test]
+    fn fn_body_must_match_declared_return_ty() {
+        // Each of these used to pass `arc check`, then abort the evaluator: callers
+        // trust the declared return type, so the body's value reaches an `unwrap_*`
+        // expecting the declared representation.
+        for decl in [
+            "fn f() -> Float { }",
+            "fn f() -> Bool { 1 }",
+            "fn f() -> Float { 1 }",
+            "fn f() -> Int { 1. }",
+            "fn f() -> Int { E::A }",
+            "fn f() -> [Int] { 1 }",
+            "fn f() -> (Int, Int) { 1 }",
+            "fn f() -> [Int] { cons(1., []) }",
+            "fn f(x: Int) { x }",
+        ] {
+            let errors = static_errors(&fn_decl_source(decl));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error.kind, StaticErrorKind::IncorrectTy { .. })),
+                "`{decl}` should be rejected: its body does not return the declared type: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fn_body_matching_declared_return_ty_is_accepted() {
+        for decl in [
+            "fn f() { }",
+            "fn f() -> Float { 1. }",
+            "fn f() -> Int { 1 }",
+            "fn f() -> Bool { true }",
+            "fn f() -> E { E::A }",
+            "fn f(x: Int) -> Int { x }",
+            "fn f() -> [Int] { cons(1, []) }",
+            // An empty sequence inhabits every sequence type, as `is_eq_ty` allows.
+            "fn f() -> [Int] { [] }",
+            "fn f() -> (Int, Float) { (1, 2.,) }",
+            // A trailing semicolon makes the body's value `()`, matching no return type.
+            "fn f() { let x = 1; }",
+            "fn f() -> Any { 1 }",
+            "fn f(x: Any) -> Int { x }",
+        ] {
+            let errors = static_errors(&fn_decl_source(decl));
+            assert!(errors.is_empty(), "`{decl}` should type check: {errors:?}");
+        }
+    }
+
     #[test]
     fn argon_path_dimensions_are_constrained_and_exported() {
         let root = parse_source_text(

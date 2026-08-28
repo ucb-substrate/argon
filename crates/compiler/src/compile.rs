@@ -1532,13 +1532,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_fn_decl(
         &mut self,
-        _input: &FnDecl<Substr, Self::InputMetadata>,
+        input: &FnDecl<Substr, Self::InputMetadata>,
         name: &Ident<Substr, Self::OutputMetadata>,
         _args: &[ArgDecl<Substr, Self::OutputMetadata>],
-        _return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
-        _scope: &Scope<Substr, Self::OutputMetadata>,
+        return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
+        scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
-        (self.ast.path.clone(), self.lookup(&name.name).unwrap().0)
+        let (var_id, ty) = self.lookup(&name.name).unwrap();
+        if let Ty::Fn(fn_ty) = &ty {
+            let span = match (scope.tail.as_ref(), return_ty.as_ref()) {
+                (Some(tail), _) => tail.span(),
+                // Without a tail there is no expression to mark as the source of the error,
+                // so point at the declared return type.
+                (None, Some(spec)) => spec.span,
+                (None, None) => input.span,
+            };
+            self.assert_eq_ty(span, &scope.metadata, &fn_ty.ret);
+        }
+        (self.ast.path.clone(), var_id)
     }
 
     fn transform_fn_decl(
