@@ -479,15 +479,27 @@ impl Solver {
             .all(|id| self.constraints[id].is_finite())
     }
 
-    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
-        Some(crate::tech::snap(
+    /// Evaluates `expr` against the solved variables, without snapping.
+    ///
+    /// Use this wherever the result is a plain scalar rather than a coordinate
+    /// that will be emitted -- notably the operands of `*` and `/`. The
+    /// manufacturing grid quantizes *positions*, so applying it to a scalar is
+    /// a category error: on a 5 DBU grid the literal `2.` snaps to `0.`, which
+    /// silently turns `(a + b)/2.` into a division by zero and poisons the
+    /// constraint with `inf` coefficients.
+    pub fn eval_expr_exact(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(
             expr.coeffs
                 .iter()
                 .map(|(coeff, var)| self.value_of(*var).map(|val| val * coeff))
                 .fold_options(0., |a, b| a + b)?
                 + expr.constant,
-            self.grid,
-        ))
+        )
+    }
+
+    /// Evaluates `expr` as a coordinate, snapped to the manufacturing grid.
+    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(crate::tech::snap(self.eval_expr_exact(expr)?, self.grid))
     }
 
     fn solve_component(&mut self, vars: &IndexSet<Var>, constraints: &[ConstraintId]) {

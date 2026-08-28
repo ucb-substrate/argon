@@ -5705,8 +5705,8 @@ impl<'a> ExecPass<'a> {
                                 BinOp::Sub => Some(vl.clone() - vr.clone()),
                                 BinOp::Mul => {
                                     let res = match (
-                                        state.solver.eval_expr(vl),
-                                        state.solver.eval_expr(vr),
+                                        state.solver.eval_expr_exact(vl),
+                                        state.solver.eval_expr_exact(vr),
                                     ) {
                                         (Some(vl), Some(vr)) => Some((vl * vr).into()),
                                         (Some(vl), None) => Some(vr.clone() * vl),
@@ -5723,8 +5723,10 @@ impl<'a> ExecPass<'a> {
                                     res
                                 }
                                 BinOp::Div => {
-                                    let res =
-                                        state.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs);
+                                    let res = state
+                                        .solver
+                                        .eval_expr_exact(vr)
+                                        .map(|rhs| vl.clone() / rhs);
                                     if res.is_none() {
                                         for (_, var) in vr.coeffs.clone() {
                                             self.add_var_dependent(cell_id, var, vid);
