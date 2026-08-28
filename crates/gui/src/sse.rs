@@ -260,13 +260,9 @@ pub(crate) fn initial_condition_after_drag(constraint: &LinearExpr, dv: &SparseV
 }
 
 /// Formats a layout value as an Argon float literal (always containing a `.`),
-/// snapped to the solver's 0.1 grid so the written code stays clean and matches
-/// what recompilation produces.
-pub(crate) fn format_value(v: f64) -> String {
-    // `+ 0.0` collapses a possible `-0.0` to `0.0`.
-    let snapped = (v * 10.0).round() / 10.0 + 0.0;
-    let s = format!("{snapped}");
-    if s.contains('.') { s } else { format!("{s}.") }
+/// snapped to the technology grid so the written code matches the GUI preview.
+pub(crate) fn format_value(v: f64, grid: f64) -> String {
+    argonc::compile::format_initial_condition(v, grid)
 }
 
 #[cfg(test)]
@@ -548,10 +544,11 @@ mod tests {
 
     #[test]
     fn format_value_snaps_to_grid_and_is_float_literal() {
-        assert_eq!(format_value(100.0), "100.");
-        assert_eq!(format_value(0.0), "0.");
-        assert_eq!(format_value(150.37), "150.4"); // snapped to the 0.1 grid
-        assert_eq!(format_value(-0.04), "0."); // snaps to 0, never "-0"
-        assert_eq!(format_value(42.5), "42.5");
+        assert_eq!(format_value(100.0, 0.1), "100.");
+        assert_eq!(format_value(0.0, 0.1), "0.");
+        assert_eq!(format_value(150.37, 0.1), "150.4");
+        assert_eq!(format_value(-0.04, 0.1), "0.");
+        assert_eq!(format_value(42.5, 0.1), "42.5");
+        assert_eq!(format_value(42.37, 0.25), "42.25");
     }
 }

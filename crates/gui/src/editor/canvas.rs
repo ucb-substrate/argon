@@ -5,8 +5,8 @@ use std::{
 };
 
 use analyzer::rpc::{
-    DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, ValueEdit,
+    CompilationSnapshot, DimensionParams, DrawSegmentConstraint, InitialConditionEdit,
+    InstancePreview, PathParams, PolygonParams, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -39,6 +39,7 @@ use crate::{
 pub enum ShapeFill {
     Stippling,
     Solid,
+    Hollow,
 }
 
 const SELECT_WIDTH: Pixels = px(3.);
@@ -310,6 +311,9 @@ fn paint_polygon_fill(
     layer: &LayerState,
     self_overlapping_path: bool,
 ) {
+    if layer.fill == ShapeFill::Hollow {
+        return;
+    }
     let mut fill = if self_overlapping_path {
         PathBuilder::fill().with_style(PathStyle::Fill(FillOptions::non_zero()))
     } else {
@@ -320,6 +324,7 @@ fn paint_polygon_fill(
         let background = match layer.fill {
             ShapeFill::Solid => solid_background(layer.color),
             ShapeFill::Stippling => pattern_slash(layer.color.into(), 1., 9.),
+            ShapeFill::Hollow => unreachable!(),
         };
         window.paint_path(path, background);
     }
@@ -431,6 +436,12 @@ struct InitialConditionUpdate {
     value: f64,
     changed: bool,
     target: Option<RectInitialCondition>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingSseValue {
+    span: Span,
+    value: f64,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -577,8 +588,8 @@ fn segment_constraint_with_end(
     }
 }
 
-fn draw_source_coordinate(value: f32) -> f64 {
-    (f64::from(value) * 10.).round() / 10.
+fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
+    argonc::tech::snap(f64::from(value), grid)
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -812,6 +823,9 @@ pub struct LayoutCanvas {
     // Keep displaying the final drag preview after mouse-up until the analyzer
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
+    pending_sse_values: Vec<PendingSseValue>,
+    deferred_snapshot: Option<CompilationSnapshot>,
+    sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
@@ -899,7 +913,11 @@ fn sort_initial_condition_pair(
     }
 }
 
-fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> Vec<ValueEdit> {
+fn fallback_value_edits(
+    fallbacks: &[compile::UsedFallback],
+    dv: &SparseVec,
+    grid: f64,
+) -> Vec<ValueEdit> {
     let mut updates = fallbacks
         .iter()
         .map(|fallback| {
@@ -954,7 +972,7 @@ fn fallback_value_edits(fallbacks: &[compile::UsedFallback], dv: &SparseVec) -> 
         .filter(|update| update.changed)
         .map(|update| ValueEdit {
             span: update.span,
-            value: crate::sse::format_value(update.value),
+            value: crate::sse::format_value(update.value, grid),
         })
         .collect()
 }
@@ -969,8 +987,9 @@ fn drag_persistence_edits(
     fallbacks: &[compile::UsedFallback],
     targets: &[SseDragTarget],
     dv: &SparseVec,
+    grid: f64,
 ) -> DragPersistenceEdits {
-    let values = fallback_value_edits(fallbacks, dv);
+    let values = fallback_value_edits(fallbacks, dv, grid);
     let mut initial_conditions = Vec::<InitialConditionEdit>::new();
     for target in targets {
         let delta = crate::sse::dot(&SparseVec::from(&target.expr), dv);
@@ -983,7 +1002,7 @@ fn drag_persistence_edits(
         let edit = InitialConditionEdit {
             call_span: source.call_span.clone(),
             name: source.name.clone(),
-            value: crate::sse::format_value(source.value + delta),
+            value: crate::sse::format_value(source.value + delta, grid),
         };
         if let Some(existing) = initial_conditions
             .iter_mut()
@@ -1032,6 +1051,35 @@ fn remap_span_after_value_edits(selected: &Span, edits: &[ValueEdit]) -> Span {
     }
 }
 
+fn pending_sse_values(edits: &[ValueEdit]) -> Vec<PendingSseValue> {
+    edits
+        .iter()
+        .filter_map(|edit| {
+            Some(PendingSseValue {
+                span: remap_span_after_value_edits(&edit.span, edits),
+                value: edit.value.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseValue]) -> bool {
+    !pending.is_empty()
+        && pending.iter().all(|expected| {
+            data.cells
+                .values()
+                .flat_map(|cell| &cell.fallback_constraints_used)
+                .any(|fallback| {
+                    fallback.span == expected.span
+                        && (-fallback.constraint.constant - expected.value).abs() < 1e-8
+                })
+        })
+}
+
+fn snapshot_follows_revision(snapshot_revision: u64, revision: Option<u64>) -> bool {
+    revision.is_none_or(|revision| snapshot_revision > revision)
+}
+
 fn solved_linear_after_drag(field: &(f64, LinearExpr), drag: Option<&SparseVec>) -> f64 {
     field.0
         + drag
@@ -1046,6 +1094,13 @@ fn zoomed_scale(scale: f32, wheel_delta: f32) -> f32 {
     } else {
         100.
     }
+}
+
+fn snap_layout_point(point: Point<f32>, grid: f64) -> Point<f32> {
+    Point::new(
+        argonc::tech::snap(f64::from(point.x), grid) as f32,
+        argonc::tech::snap(f64::from(point.y), grid) as f32,
+    )
 }
 
 fn fit_scale(viewport: Size<Pixels>, width: f32, height: f32) -> f32 {
@@ -1183,6 +1238,7 @@ fn get_paint_quad(
     let background = match fill {
         ShapeFill::Solid => solid_background(color),
         ShapeFill::Stippling => pattern_slash(color.into(), 1., 9.),
+        ShapeFill::Hollow => solid_background(Rgba { a: 0., ..color }),
     };
     PaintQuad {
         bounds,
@@ -1264,6 +1320,11 @@ impl Element for CanvasElement {
         let mut select_rects = Vec::new();
         let mut source_coordinates = SseSourceCoordinates::new();
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
+        let grid = solved_cell
+            .as_ref()
+            .map(|cell| cell.output.tech.grid_step())
+            .unwrap_or(0.1);
+        let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
         if let Some(solved_cell) = solved_cell {
             let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
             let editable_cell = &solved_cell.output.cells[&scope_address.cell];
@@ -1807,10 +1868,10 @@ impl Element for CanvasElement {
                 rects.push((
                     Rect {
                         object_path: Vec::new(),
-                        x0: p0.x.min(layout_mouse_position.x),
-                        y0: p0.y.min(layout_mouse_position.y),
-                        x1: p0.x.max(layout_mouse_position.x),
-                        y1: p0.y.max(layout_mouse_position.y),
+                        x0: p0.x.min(snapped_layout_mouse_position.x),
+                        y0: p0.y.min(snapped_layout_mouse_position.y),
+                        x1: p0.x.max(snapped_layout_mouse_position.x),
+                        y1: p0.y.max(snapped_layout_mouse_position.y),
                         id: None,
                         border_widths: Edges::all(SELECT_WIDTH),
                         border_styles: Edges::all(BorderStyle::Dashed),
@@ -2027,11 +2088,11 @@ impl Element for CanvasElement {
                         let preview_position = if self.inner.read(cx).shift_down {
                             snap_draw_point(
                                 *polygon_tool.points.last().unwrap(),
-                                layout_mouse_position,
+                                snapped_layout_mouse_position,
                             )
                             .0
                         } else {
-                            layout_mouse_position
+                            snapped_layout_mouse_position
                         };
                         let points = polygon_tool
                             .points
@@ -2070,11 +2131,11 @@ impl Element for CanvasElement {
                         let preview_position = if self.inner.read(cx).shift_down {
                             snap_draw_point(
                                 *path_tool.points.last().unwrap(),
-                                layout_mouse_position,
+                                snapped_layout_mouse_position,
                             )
                             .0
                         } else {
-                            layout_mouse_position
+                            snapped_layout_mouse_position
                         };
                         let centerline = path_tool
                             .points
@@ -2213,8 +2274,8 @@ impl Element for CanvasElement {
                             let rect = rect.transform(
                                 TransformationMatrix::identity(),
                                 (
-                                    layout_mouse_position.x as f64,
-                                    layout_mouse_position.y as f64,
+                                    snapped_layout_mouse_position.x as f64,
+                                    snapped_layout_mouse_position.y as f64,
                                 ),
                             );
                             window.paint_quad(get_paint_quad(
@@ -2230,8 +2291,8 @@ impl Element for CanvasElement {
                             let polygon = polygon.transform(
                                 TransformationMatrix::identity(),
                                 (
-                                    layout_mouse_position.x as f64,
-                                    layout_mouse_position.y as f64,
+                                    snapped_layout_mouse_position.x as f64,
+                                    snapped_layout_mouse_position.y as f64,
                                 ),
                             );
                             let points = polygon
@@ -2999,6 +3060,9 @@ impl LayoutCanvas {
             is_dragging: false,
             is_sse_dragging: false,
             is_sse_persisting: false,
+            pending_sse_values: Vec::new(),
+            deferred_snapshot: None,
+            sse_persist_after_revision: None,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
             sse_handles: Vec::new(),
@@ -3033,6 +3097,18 @@ impl LayoutCanvas {
         });
     }
 
+    pub(crate) fn is_sse_dragging(&self) -> bool {
+        self.is_sse_dragging
+    }
+
+    pub(crate) fn defer_snapshot(&mut self, snapshot: CompilationSnapshot) {
+        self.deferred_snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<CompilationSnapshot> {
+        self.deferred_snapshot.take()
+    }
+
     fn sse_drag_delta_for_targets(
         targets: &[SseDragTarget],
         cell: &compile::CompiledCell,
@@ -3049,6 +3125,12 @@ impl LayoutCanvas {
             })
             .collect::<Vec<_>>();
         match &cell.sse_basis {
+            // An empty sparse basis means there are no remaining constraint
+            // rows. In that case the row-space representation is also empty,
+            // and every still-unsolved variable is free to move.
+            compile::SseBasis::Nullspace(vectors) if vectors.is_empty() => {
+                crate::sse::drag_delta_multi(&edges, &[], &cell.unsolved_vars, &deltas)
+            }
             compile::SseBasis::Nullspace(vectors) => {
                 let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
                 crate::sse::drag_delta_multi_nullspace(
@@ -3268,7 +3350,16 @@ impl LayoutCanvas {
             start: self.screen_bounds.origin.x,
             stop: self.screen_bounds.origin.x + self.screen_bounds.size.width,
         };
+        let grid = self
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|cell| cell.output.tech.grid_step())
+            .unwrap_or(0.1);
         let layout_mouse_position = self.px_to_layout(event.position);
+        let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
         let edit_dim = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             let mut edit_dim = false;
             match tool {
@@ -3281,7 +3372,7 @@ impl LayoutCanvas {
                         if layer_info.visible {
                             if let Some(p0) = rect_tool.p0 {
                                 rect_tool.p0 = None;
-                                let p1 = layout_mouse_position;
+                                let p1 = snapped_layout_mouse_position;
                                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                                 self.state.update(cx, |state, cx| {
@@ -3323,10 +3414,10 @@ impl LayoutCanvas {
                                                                 .selected_layer
                                                                 .clone()
                                                                 .map(|s| s.to_string()),
-                                                            x0: draw_source_coordinate(p0p.x),
-                                                            y0: draw_source_coordinate(p0p.y),
-                                                            x1: draw_source_coordinate(p1p.x),
-                                                            y1: draw_source_coordinate(p1p.y),
+                                                            x0: draw_source_coordinate(p0p.x, grid),
+                                                            y0: draw_source_coordinate(p0p.y, grid),
+                                                            x1: draw_source_coordinate(p1p.x, grid),
+                                                            y1: draw_source_coordinate(p1p.y, grid),
                                                             construction: false,
                                                         },
                                                     ) {
@@ -3348,8 +3439,7 @@ impl LayoutCanvas {
                                     }
                                 });
                             } else {
-                                let p0 = self.px_to_layout(event.position);
-                                rect_tool.p0 = Some(p0);
+                                rect_tool.p0 = Some(snapped_layout_mouse_position);
                             }
                         } else {
                             let _ = state.lang_server_client.show_message(
@@ -3370,10 +3460,7 @@ impl LayoutCanvas {
                         && let Some(layer_info) = layers.layers.get(layer)
                     {
                         if layer_info.visible {
-                            let cursor = Point::new(
-                                (layout_mouse_position.x * 10.).round() / 10.,
-                                (layout_mouse_position.y * 10.).round() / 10.,
-                            );
+                            let cursor = snapped_layout_mouse_position;
                             let (point, constraint) = if event.modifiers.shift
                                 && let Some(previous) = polygon_tool.points.last().copied()
                             {
@@ -3411,10 +3498,7 @@ impl LayoutCanvas {
                         && let Some(layer_info) = layers.layers.get(layer)
                     {
                         if layer_info.visible {
-                            let cursor = Point::new(
-                                (layout_mouse_position.x * 10.).round() / 10.,
-                                (layout_mouse_position.y * 10.).round() / 10.,
-                            );
+                            let cursor = snapped_layout_mouse_position;
                             let (point, constraint) = if event.modifiers.shift
                                 && let Some(previous) = path_tool.points.last().copied()
                             {
@@ -3446,8 +3530,8 @@ impl LayoutCanvas {
                     }
                 }
                 ToolState::PlaceInstance(placement) => {
-                    let x = ((layout_mouse_position.x as f64 * 10.).round() / 10.) + 0.;
-                    let y = ((layout_mouse_position.y as f64 * 10.).round() / 10.) + 0.;
+                    let x = argonc::tech::snap(f64::from(snapped_layout_mouse_position.x), grid);
+                    let y = argonc::tech::snap(f64::from(snapped_layout_mouse_position.y), grid);
                     let result = self.state.read(cx).lang_server_client.place_instance(
                         placement.scope_span.clone(),
                         placement.invocation.clone(),
@@ -3869,6 +3953,9 @@ impl LayoutCanvas {
                         .cloned();
                     if let Some(handle) = handle {
                         self.is_sse_persisting = false;
+                        self.pending_sse_values.clear();
+                        self.deferred_snapshot = None;
+                        self.sse_persist_after_revision = None;
                         self.is_sse_dragging = true;
                         self.drag_start = event.position;
                         self.sse_delta = Point::default();
@@ -3893,6 +3980,9 @@ impl LayoutCanvas {
                                 .cloned()
                             {
                                 self.is_sse_persisting = false;
+                                self.pending_sse_values.clear();
+                                self.deferred_snapshot = None;
+                                self.sse_persist_after_revision = None;
                                 self.is_sse_dragging = true;
                                 self.drag_start = event.position;
                                 self.sse_delta = Point::default();
@@ -3986,12 +4076,20 @@ impl LayoutCanvas {
                 );
                 return;
             }
+            let grid = self
+                .state
+                .read(cx)
+                .solved_cell
+                .read(cx)
+                .as_ref()
+                .map(|cell| cell.output.tech.grid_step())
+                .unwrap_or(0.1);
             let points = draw_points
                 .iter()
                 .map(|point| {
                     (
-                        draw_source_coordinate(point.x),
-                        draw_source_coordinate(point.y),
+                        draw_source_coordinate(point.x, grid),
+                        draw_source_coordinate(point.y, grid),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -4267,6 +4365,7 @@ impl LayoutCanvas {
             &editable_cell.fallback_constraints_used,
             &self.sse_targets,
             &dv,
+            solved.output.tech.grid_step(),
         )
     }
 
@@ -4284,6 +4383,7 @@ impl LayoutCanvas {
             let edits = self.sse_source_edits(cx);
             if edits.values.is_empty() && edits.initial_conditions.is_empty() {
                 self.is_sse_dragging = false;
+                self.pending_sse_values.clear();
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
@@ -4296,6 +4396,11 @@ impl LayoutCanvas {
                     Ok(Some(applied_edits)) => {
                         self.is_sse_dragging = false;
                         self.is_sse_persisting = true;
+                        self.pending_sse_values = pending_sse_values(&applied_edits);
+                        self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
+                        // Anything deferred before the workspace edit was
+                        // accepted belongs to the pre-drag source revision.
+                        self.deferred_snapshot = None;
                         let selected_after_edits = {
                             let tool = self.state.read(cx).tool.read(cx);
                             match tool {
@@ -4317,11 +4422,15 @@ impl LayoutCanvas {
                     }
                     Ok(None) => {
                         self.is_sse_dragging = false;
+                        self.pending_sse_values.clear();
+                        self.sse_persist_after_revision = None;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
                     Err(_) => {
                         self.is_sse_dragging = false;
+                        self.pending_sse_values.clear();
+                        self.sse_persist_after_revision = None;
                         self.sse_delta = Point::default();
                         self.sse_targets.clear();
                     }
@@ -4333,9 +4442,31 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
+    pub(crate) fn accepts_snapshot(&self, snapshot: &CompilationSnapshot) -> bool {
+        if !self.is_sse_persisting {
+            return true;
+        }
+        if !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision) {
+            return false;
+        }
+        let data = match &snapshot.output {
+            compile::CompileOutput::Valid(data) => Some(data),
+            compile::CompileOutput::ExecErrors(output) => output.output.as_ref(),
+            compile::CompileOutput::StaticErrors(_) | compile::CompileOutput::FatalParseErrors => {
+                None
+            }
+        };
+        self.pending_sse_values.is_empty()
+            || data.is_some_and(|data| {
+                compiled_data_matches_pending_sse(data, &self.pending_sse_values)
+            })
+    }
+
     pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
         if self.is_sse_persisting {
             self.is_sse_persisting = false;
+            self.pending_sse_values.clear();
+            self.sse_persist_after_revision = None;
             self.sse_delta = Point::default();
             self.sse_targets.clear();
             cx.notify();
@@ -4424,6 +4555,19 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compile(
+        ast: &argonc::parse::WorkspaceParseAst,
+        input: argonc::compile::CompileInput<'_>,
+    ) -> argonc::compile::CompileOutput {
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
+        argonc::compile::compile(
+            ast,
+            input,
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
+        )
+    }
 
     fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
         (
@@ -4541,7 +4685,8 @@ mod tests {
 
     #[test]
     fn drawn_coordinates_discard_f32_representation_noise() {
-        assert_eq!(draw_source_coordinate(110.3_f32), 110.3);
+        assert_eq!(draw_source_coordinate(110.3_f32, 0.1), 110.3);
+        assert_eq!(draw_source_coordinate(110.37_f32, 0.25), 110.25);
     }
 
     #[test]
@@ -4564,14 +4709,11 @@ mod tests {
         let source =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/path/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["initial_path"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -4605,14 +4747,11 @@ mod tests {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/polygon/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["one_axis_point"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -4653,14 +4792,11 @@ mod tests {
         let source = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/polygon/lib.ar");
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["initial_points"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -4703,7 +4839,7 @@ mod tests {
         assert!((crate::sse::dot(&SparseVec::from(&x.1), &drag) - 12.3).abs() < 1e-6);
         assert!((crate::sse::dot(&SparseVec::from(&y.1), &drag) + 4.5).abs() < 1e-6);
 
-        let edits = drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag);
+        let edits = drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag, 0.1);
         let x_fallback = cell
             .fallback_constraints_used
             .iter()
@@ -4739,7 +4875,7 @@ mod tests {
                 .any(|edit| edit.span == y_fallback.span && edit.value == "70.5")
         );
 
-        let inserted = drag_persistence_edits(&[], &targets, &drag);
+        let inserted = drag_persistence_edits(&[], &targets, &drag, 0.1);
         assert!(inserted.values.is_empty());
         assert!(inserted.initial_conditions.iter().any(|edit| {
             edit.name == "x2i"
@@ -4806,7 +4942,7 @@ mod tests {
             .collect(),
         );
 
-        let edits = drag_persistence_edits(&[], &targets, &drag);
+        let edits = drag_persistence_edits(&[], &targets, &drag, 0.1);
         assert!(edits.values.is_empty());
         assert!(edits.initial_conditions.iter().any(|edit| {
             edit.call_span == rect_span && edit.name == "x0i" && edit.value == "15."
@@ -4882,6 +5018,14 @@ mod tests {
     }
 
     #[test]
+    fn layout_points_snap_to_the_technology_grid() {
+        assert_eq!(
+            snap_layout_point(Point::new(1.12, -0.62), 0.25),
+            Point::new(1., -0.5)
+        );
+    }
+
+    #[test]
     fn selected_span_tracks_value_edits_before_and_inside_rect() {
         let path = std::path::PathBuf::from("lib.ar");
         let selected = Span {
@@ -4907,6 +5051,81 @@ mod tests {
 
         let remapped = remap_span_after_value_edits(&selected, &edits);
         assert_eq!(remapped.span, cfgrammar::Span::new(12, 34));
+    }
+
+    #[test]
+    fn pending_drag_values_track_their_compiled_source_spans() {
+        let path = std::path::PathBuf::from("lib.ar");
+        let edits = [
+            ValueEdit {
+                span: Span {
+                    path: path.clone(),
+                    span: cfgrammar::Span::new(10, 19),
+                },
+                value: "1.2".to_owned(),
+            },
+            ValueEdit {
+                span: Span {
+                    path,
+                    span: cfgrammar::Span::new(30, 32),
+                },
+                value: "0.".to_owned(),
+            },
+        ];
+
+        let pending = pending_sse_values(&edits);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].span.span, cfgrammar::Span::new(10, 13));
+        assert_eq!(pending[0].value, 1.2);
+        assert_eq!(pending[1].span.span, cfgrammar::Span::new(24, 26));
+        assert_eq!(pending[1].value, 0.);
+    }
+
+    #[test]
+    fn stale_compile_output_does_not_finish_a_drag_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            "cell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        );
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(compile::ExecErrorCompileOutput {
+                output: Some(output),
+                ..
+            }) => output,
+            output => panic!("drag fixture should produce geometry: {output:?}"),
+        };
+        let fallback = output.cells[&output.top]
+            .fallback_constraints_used
+            .first()
+            .expect("rectangle should use its initial conditions");
+        let mut pending = vec![PendingSseValue {
+            span: fallback.span.clone(),
+            value: -fallback.constraint.constant,
+        }];
+
+        assert!(compiled_data_matches_pending_sse(&output, &pending));
+        pending[0].value += 1.;
+        assert!(!compiled_data_matches_pending_sse(&output, &pending));
+    }
+
+    #[test]
+    fn drag_preview_only_accepts_a_newer_compilation_revision() {
+        assert!(snapshot_follows_revision(4, None));
+        assert!(!snapshot_follows_revision(3, Some(3)));
+        assert!(!snapshot_follows_revision(2, Some(3)));
+        assert!(snapshot_follows_revision(4, Some(3)));
     }
 
     #[test]
@@ -4991,14 +5210,11 @@ cell top() {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         );
         let output = match output {
@@ -5038,14 +5254,11 @@ cell top() {
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let lyp = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/lyp/basic.lyp");
-        let output = argonc::compile::compile(
+        let output = compile(
             &ast,
             argonc::compile::CompileInput {
                 cell: &["top"],
                 args: vec![],
-                lyp_file: &lyp,
             },
         )
         .unwrap_valid();

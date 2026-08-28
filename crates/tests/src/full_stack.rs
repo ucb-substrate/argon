@@ -2,7 +2,10 @@
 
 use std::{net::Ipv4Addr, path::PathBuf};
 
-use analyzer::rpc::{Gui, InstancePreview, LangServerClient};
+use analyzer::{
+    ArgonConfig,
+    rpc::{CompilationSnapshot, Gui, InstancePreview, LangServerClient},
+};
 use argonc::{
     ast::Span,
     compile::{CompileOutput, CompiledData},
@@ -23,9 +26,9 @@ pub enum OutputKind {
 
 #[derive(Debug)]
 pub enum GuiEvent {
-    OpenCell {
+    UpdateCell {
+        revision: u64,
         kind: OutputKind,
-        update: bool,
         scope: Option<Span>,
         rect_count: usize,
     },
@@ -33,6 +36,9 @@ pub enum GuiEvent {
         typ: tower_lsp_server::ls_types::MessageType,
         message: String,
     },
+    Fit,
+    WorkspacePath(Option<PathBuf>),
+    WorkspaceModified(bool),
 }
 
 #[derive(Clone)]
@@ -41,18 +47,12 @@ struct HeadlessGui {
 }
 
 impl Gui for HeadlessGui {
-    async fn open_cell(self, _: context::Context, output: CompileOutput, update: bool) {
-        let (kind, data) = match &output {
-            CompileOutput::Valid(data) => (OutputKind::Data, Some(data)),
-            CompileOutput::ExecErrors(output) => (OutputKind::Data, output.output.as_ref()),
-            CompileOutput::StaticErrors(_) => (OutputKind::StaticErrors, None),
-            CompileOutput::FatalParseErrors => (OutputKind::FatalParseErrors, None),
-        };
-        let (scope, rect_count) = data.map(gui_snapshot).unwrap_or((None, 0));
+    async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
+        let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
         self.events
-            .send(GuiEvent::OpenCell {
+            .send(GuiEvent::UpdateCell {
+                revision: snapshot.revision,
                 kind,
-                update,
                 scope,
                 rect_count,
             })
@@ -70,15 +70,44 @@ impl Gui for HeadlessGui {
             .expect("full-stack test should still be receiving GUI events");
     }
 
+    async fn fit(self, _: context::Context) {
+        self.events
+            .send(GuiEvent::Fit)
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn set_workspace_path(self, _: context::Context, path: Option<PathBuf>) {
+        self.events
+            .send(GuiEvent::WorkspacePath(path))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn workspace_modified(self, _: context::Context, modified: bool) {
+        self.events
+            .send(GuiEvent::WorkspaceModified(modified))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
     async fn selected_scope(self, _: context::Context) -> Option<Span> {
         None
     }
 
     async fn place_instance(self, _: context::Context, _: InstancePreview) {}
 
-    async fn set(self, _: context::Context, _: String, _: String) {}
+    async fn configure(self, _: context::Context, _: ArgonConfig) {}
 
     async fn activate(self, _: context::Context) {}
+}
+
+fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize) {
+    let (kind, data) = match output {
+        CompileOutput::Valid(data) => (OutputKind::Data, Some(data)),
+        CompileOutput::ExecErrors(output) => (OutputKind::Data, output.output.as_ref()),
+        CompileOutput::StaticErrors(_) => (OutputKind::StaticErrors, None),
+        CompileOutput::FatalParseErrors => (OutputKind::FatalParseErrors, None),
+    };
+    let (scope, rect_count) = data.map(gui_snapshot).unwrap_or((None, 0));
+    (kind, scope, rect_count)
 }
 
 fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize) {
@@ -116,14 +145,14 @@ impl Session {
         std::fs::write(project.join("lib.ar"), source).expect("write test source");
         std::fs::write(
             project.join("Argon.toml"),
-            "name = \"full-stack-test\"\nlyp = \"layers.lyp\"\n",
+            "name = \"full-stack-test\"\ntech = \"tech.toml\"\n",
         )
         .expect("write test manifest");
         std::fs::copy(
-            repository_root().join("examples/lyp/basic.lyp"),
-            project.join("layers.lyp"),
+            repository_root().join("examples/tech/basic.tech.toml"),
+            project.join("tech.toml"),
         )
-        .expect("copy test layer properties");
+        .expect("copy test technology");
 
         let analyzer_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -285,11 +314,15 @@ mod tests {
 
             let mut drew_rect = false;
             let mut saw_editor_update = false;
-            while !saw_editor_update {
+            let mut saw_workspace_modified = false;
+            let mut saw_workspace_path = false;
+            let mut saw_fit = false;
+            let mut opened_revision = None;
+            while !(saw_editor_update && saw_workspace_modified && saw_workspace_path && saw_fit) {
                 match session.next_event().await {
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
+                        revision,
                         kind: OutputKind::Data,
-                        update,
                         scope,
                         rect_count,
                     } if !drew_rect => {
@@ -301,9 +334,9 @@ mod tests {
                                 "gui_rect".to_owned(),
                                 BasicRect {
                                     layer: Some("met1".to_owned()),
-                                    x0: 0.0,
-                                    y0: 0.0,
-                                    x1: 10.0,
+                                    x0: 1.2000000476837158,
+                                    y0: -0.04,
+                                    x1: 10.349,
                                     y1: 10.0,
                                     construction: false,
                                 },
@@ -311,25 +344,38 @@ mod tests {
                             .await
                             .expect("GUI draw request should reach analyzer");
                         assert!(inserted.is_some(), "GUI draw should edit the source buffer");
-                        assert!(!update);
                         assert_eq!(rect_count, 0);
+                        opened_revision = Some(revision);
                         drew_rect = true;
                     }
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
+                        revision,
                         kind: OutputKind::Data,
-                        update: true,
                         rect_count: 1,
                         ..
                     } => {
+                        assert!(Some(revision) > opened_revision);
                         std::fs::write(&session.gui_edit_ack, "ok\n")
                             .expect("acknowledge compiled GUI edit");
                     }
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         kind: OutputKind::Data,
-                        update: true,
                         rect_count,
                         ..
                     } if rect_count >= 2 => saw_editor_update = true,
+                    GuiEvent::Fit => saw_fit = true,
+                    GuiEvent::WorkspacePath(Some(path)) => {
+                        assert_eq!(
+                            path.canonicalize()
+                                .expect("canonicalize GUI workspace path"),
+                            session
+                                .project
+                                .canonicalize()
+                                .expect("canonicalize test workspace path")
+                        );
+                        saw_workspace_path = true;
+                    }
+                    GuiEvent::WorkspaceModified(true) => saw_workspace_modified = true,
                     _ => {}
                 }
             }
@@ -339,6 +385,7 @@ mod tests {
             let source = std::fs::read_to_string(session.project.join("lib.ar"))
                 .expect("read round-tripped source");
             assert!(source.contains("let gui_rect = rect("));
+            assert!(source.contains("x0i = 1.2, y0i = 0., x1i = 10.3, y1i = 10."));
             assert!(source.contains("let editor_rect = rect("));
         })
         .await;
@@ -361,7 +408,7 @@ mod tests {
             let mut saw_recovery = false;
             while !saw_recovery {
                 match session.next_event().await {
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         kind: OutputKind::StaticErrors,
                         ..
                     } => {
@@ -369,7 +416,7 @@ mod tests {
                         std::fs::write(&session.diagnostic_ack, "ok\n")
                             .expect("acknowledge GUI diagnostics");
                     }
-                    GuiEvent::OpenCell {
+                    GuiEvent::UpdateCell {
                         kind: OutputKind::Data,
                         ..
                     } if saw_errors => saw_recovery = true,

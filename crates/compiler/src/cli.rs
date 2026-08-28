@@ -5,15 +5,12 @@ use std::{
 };
 
 use crate::{
-    artifact,
-    compile::{self, CellArg, CompileInput, CompileOutput},
+    WorkspaceConfig, artifact,
+    compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
-    gds::GdsMap,
-    parse::{self, parse_workspace_with_std_deps_and_gds},
+    parse::{self, CellInvocation, parse_workspace_with_config},
 };
 use clap::{Parser, ValueEnum};
-use gds::GdsUnits;
-use itertools::Itertools;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ErrorFormat {
@@ -31,9 +28,9 @@ struct Args {
     #[arg(long)]
     cell: Option<String>,
 
-    /// KLayout layer-properties file. Required when a cell is instantiated.
+    /// Argon TOML technology file. Required when a cell is instantiated.
     #[arg(long, requires = "cell")]
-    lyp: Option<PathBuf>,
+    tech: Option<PathBuf>,
 
     /// Path dependency in NAME=PATH form. PATH may be a directory or lib.ar.
     #[arg(long = "dependency", value_parser = parse_dependency)]
@@ -52,7 +49,7 @@ struct Args {
     gds: Option<PathBuf>,
 
     /// Run all non-executing compiler stages, then stop.
-    #[arg(long, conflicts_with_all = ["cell", "lyp", "output", "gds"])]
+    #[arg(long, conflicts_with_all = ["cell", "tech", "output", "gds"])]
     check: bool,
 
     /// Diagnostic output format.
@@ -107,11 +104,38 @@ fn execute(args: Args) -> Result<(), Failed> {
         }
     }
 
-    let analysis = compile::analyze_workspace(parse_workspace_with_std_deps_and_gds(
-        &root,
-        args.dependencies,
-        args.gds_imports.clone(),
-    ));
+    let workspace = WorkspaceConfig::new(&root)
+        .with_dependencies(args.dependencies.clone())
+        .with_tech(args.tech.clone())
+        .with_gds_imports(args.gds_imports.clone());
+    // The invocation is spliced into the workspace before analysis so that its
+    // arguments are resolved, type-checked, and evaluated like any source
+    // expression, which means the entry point must be resolved before parsing.
+    let entry = if args.check {
+        None
+    } else {
+        let Some(cell) = args.cell.as_deref() else {
+            return Err(fail(format, "either --check or --cell is required"));
+        };
+        let Some(tech) = args.tech.as_deref() else {
+            return Err(fail(
+                format,
+                "--tech is required when compiling a cell; pass the path to an Argon TOML technology file",
+            ));
+        };
+        crate::tech::read_tech(tech).map_err(|error| fail(format, error.to_string()))?;
+        Some(cell)
+    };
+
+    let mut parse_output = parse_workspace_with_config(&workspace);
+    let entry = match entry {
+        Some(cell) => Some(
+            parse::add_cell_invocation(&mut parse_output, cell)
+                .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?,
+        ),
+        None => None,
+    };
+    let analysis = compile::analyze_workspace(parse_output);
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(
             format,
@@ -124,59 +148,17 @@ fn execute(args: Args) -> Result<(), Failed> {
             CompileOutput::StaticErrors(compile::StaticErrorCompileOutput {
                 errors: analysis.errors,
             }),
+            entry.as_ref(),
         ));
     }
-    if args.check {
+    // Nothing left to do for a `--check` run.
+    let Some(invocation) = entry else {
         return Ok(());
-    }
+    };
 
-    let Some(cell) = args.cell.as_deref() else {
-        return Err(fail(format, "either --check or --cell is required"));
-    };
-    let Some(lyp) = args.lyp.as_deref() else {
-        return Err(fail(
-            format,
-            "--lyp is required when compiling a cell; pass the path to a KLayout layer-properties file",
-        ));
-    };
-    crate::layer::read_lyp(lyp).map_err(|error| fail(format, error.to_string()))?;
-    let cell_ast = parse::parse_cell(cell)
-        .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?;
-    if !cell_ast.args.kwargs.is_empty() {
-        return Err(fail(
-            format,
-            "keyword arguments are not supported in --cell yet",
-        ));
-    }
-    let cell_path = cell_ast
-        .func
-        .path
-        .iter()
-        .map(|ident| ident.name)
-        .collect_vec();
-    let cell_args = cell_ast
-        .args
-        .posargs
-        .iter()
-        .map(CellArg::from_literal)
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            fail(
-                format,
-                "--cell arguments must be integer, float, boolean, or empty-list literals",
-            )
-        })?;
-    let output = compile::dynamic_compile_with_gds(
-        &typed_ast,
-        CompileInput {
-            cell: &cell_path,
-            args: cell_args,
-            lyp_file: lyp,
-        },
-        &args.gds_imports,
-    );
+    let output = compile::execute_cell_invocation(&typed_ast, &invocation, &workspace);
     if !matches!(output, CompileOutput::Valid(_)) {
-        return Err(compile_failed(format, output));
+        return Err(compile_failed(format, output, Some(&invocation)));
     }
     let output_path = args.output.unwrap_or_else(|| root.with_extension("bin"));
     artifact::write(&output, &output_path).map_err(|error| {
@@ -187,20 +169,12 @@ fn execute(args: Args) -> Result<(), Failed> {
     })?;
 
     if let Some(gds_path) = args.gds {
-        let map = GdsMap::from_lyp(lyp).map_err(|error| {
+        output.to_gds(&gds_path).map_err(|error| {
             fail(
                 format,
-                format!("could not read `{}`: {error}", lyp.display()),
+                format!("could not write `{}`: {error}", gds_path.display()),
             )
         })?;
-        output
-            .to_gds(map, GdsUnits::new(1e-3, 1e-9), &gds_path)
-            .map_err(|error| {
-                fail(
-                    format,
-                    format!("could not write `{}`: {error}", gds_path.display()),
-                )
-            })?;
     }
     Ok(())
 }
@@ -244,8 +218,16 @@ fn fail(format: ErrorFormat, message: impl Into<String>) -> Failed {
     Failed(format, vec![Diagnostic::error(message)])
 }
 
-fn compile_failed(format: ErrorFormat, output: CompileOutput) -> Failed {
-    Failed(format, diagnostics::from_compile_output(&output))
+fn compile_failed(
+    format: ErrorFormat,
+    output: CompileOutput,
+    invocation: Option<&CellInvocation>,
+) -> Failed {
+    let mut diagnostics = diagnostics::from_compile_output(&output);
+    if let Some(invocation) = invocation {
+        diagnostics::remap_invocation(&mut diagnostics, invocation);
+    }
+    Failed(format, diagnostics)
 }
 
 #[cfg(test)]
@@ -256,7 +238,11 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use crate::{artifact, compile::CompileOutput};
+    use crate::{
+        artifact,
+        compile::{CompileOutput, Rect},
+        solver::LinearExpr,
+    };
     use clap::{CommandFactory, Parser};
     use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPath, GdsPoint, GdsStruct};
 
@@ -274,8 +260,8 @@ mod tests {
         path
     }
 
-    fn basic_lyp() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/lyp/basic.lyp")
+    fn basic_tech() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml")
     }
 
     fn temp_gds(name: &str) -> PathBuf {
@@ -358,7 +344,7 @@ mod tests {
         Args {
             root,
             cell: None,
-            lyp: None,
+            tech: None,
             dependencies: Vec::new(),
             gds_imports: Vec::new(),
             output: None,
@@ -368,11 +354,11 @@ mod tests {
         }
     }
 
-    fn execution_args(root: PathBuf, cell: &str, lyp: PathBuf) -> Args {
+    fn execution_args(root: PathBuf, cell: &str, tech: PathBuf) -> Args {
         Args {
             root,
             cell: Some(cell.to_owned()),
-            lyp: Some(lyp),
+            tech: Some(tech),
             dependencies: Vec::new(),
             gds_imports: Vec::new(),
             output: None,
@@ -455,7 +441,7 @@ mod tests {
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("top.bin");
         let implicit_gds_path = source.with_extension("gds");
-        let mut args = execution_args(source, "top()", basic_lyp());
+        let mut args = execution_args(source, "top()", basic_tech());
         args.output = Some(artifact_path.clone());
 
         assert!(execute(args).is_ok());
@@ -480,10 +466,148 @@ mod tests {
 }
 "#,
         );
-        let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_lyp());
+        let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
         args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
         assert!(execute(args).is_ok());
+    }
+
+    /// Reads the sole rect from an invocation-compiled artifact.
+    fn compiled_rect(name: &str, source: PathBuf, cell: &str) -> Rect<(f64, LinearExpr)> {
+        let artifact_path = source.with_file_name(format!("{name}.bin"));
+        let mut args = execution_args(source, cell, basic_tech());
+        args.output = Some(artifact_path.clone());
+        if let Err(error) = execute(args) {
+            panic!("`{cell}` should compile: {}", render_failed(error));
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("`{cell}` should compile successfully");
+        };
+        let top = &output.cells[&output.top];
+        // The generated entry cell is an implementation detail and must not
+        // reach the output, and the target keeps its own root scope name.
+        assert_eq!(output.cells.len(), 1, "entry cell should not be emitted");
+        assert_eq!(top.scopes[&top.root].name, "cell top");
+        top.objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top should emit a rect")
+            .clone()
+    }
+
+    #[test]
+    fn execution_evaluates_arithmetic_cell_arguments() {
+        let source = temp_source(
+            "arithmetic-args",
+            "cell top(x: Float, n: Int, flag: Bool) {\n\
+             let h = if flag { 10. } else { 20. };\n\
+             let r = rect(\"met1\", x0=x, y0=n as Float, x1=x + 10., y1=n as Float + h);\n\
+             }\n",
+        );
+        let rect = compiled_rect("arithmetic", source, "top(-2.5 * 2., 2 * -1, false)");
+        assert_eq!(rect.x0.0, -5.);
+        assert_eq!(rect.y0.0, -2.);
+        assert_eq!(rect.y1.0, 18.);
+    }
+
+    #[test]
+    fn execution_evaluates_a_function_call_and_string_cell_argument() {
+        let source = temp_source(
+            "call-args",
+            "fn double(x: Float) -> Float { 2. * x }\n\
+             cell top(layer: String, w: Float) {\n\
+             let r = rect(layer, x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("call", source, "top(\"met1\", double(25.))");
+        assert_eq!(rect.x1.0, 50.);
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+    }
+
+    #[test]
+    fn execution_evaluates_a_sequence_cell_argument() {
+        let source = temp_source(
+            "seq-args",
+            "cell top(items: [Float]) {\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=head(items), y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("seq", source, "top(cons(30., cons(40., [])))");
+        assert_eq!(rect.x1.0, 30.);
+    }
+
+    #[test]
+    fn execution_accepts_an_empty_sequence_cell_argument() {
+        let source = temp_source(
+            "empty-seq-args",
+            "cell top(items: [Float]) {\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("empty-seq", source, "top([])");
+        assert_eq!(rect.y1.0, 20.);
+    }
+
+    #[test]
+    fn execution_evaluates_an_enum_cell_argument() {
+        let source = temp_source(
+            "enum-args",
+            "enum Mode { Fast, Slow, }\n\
+             cell top(m: Mode) {\n\
+             let w = match m { Mode::Fast => 10., Mode::Slow => 20., };\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("enum", source, "top(Mode::Slow)");
+        assert_eq!(rect.x1.0, 20.);
+    }
+
+    #[test]
+    fn out_of_range_cell_argument_is_reported_cleanly() {
+        let source = temp_source("out-of-range-arg", "cell top(n: Int) {}\n");
+        let diagnostic = render_failed(failed(execution_args(
+            source,
+            "top(99999999999999999999)",
+            basic_tech(),
+        )));
+        assert!(
+            diagnostic.contains("invalid integer literal `99999999999999999999`"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn a_non_cell_invocation_is_reported_cleanly() {
+        let source = temp_source(
+            "not-a-cell",
+            "fn double(x: Float) -> Float { 2. * x }\ncell top() {}\n",
+        );
+        let diagnostic = render_failed(failed(execution_args(source, "double(2.)", basic_tech())));
+        assert!(
+            diagnostic.contains("expected type category Cell, found Float"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn an_error_in_a_cell_argument_points_at_the_invocation() {
+        let source = temp_source("arg-diagnostic", "cell top(x: Float, y: Float) {}\n");
+        let diagnostic = render_failed(failed(execution_args(
+            source,
+            "top(1 + 1, 20.)",
+            basic_tech(),
+        )));
+        assert!(
+            diagnostic.contains("expected type Float, found Int"),
+            "{diagnostic}"
+        );
+        // The caret must land on the argument the caller wrote, not on a
+        // position in the library source that it was spliced into.
+        assert!(diagnostic.contains("--> <argon-cell>:1:5"), "{diagnostic}");
+        assert!(diagnostic.contains("1 | top(1 + 1, 20.)"), "{diagnostic}");
+        assert!(diagnostic.contains("^^^^^"), "{diagnostic}");
     }
 
     #[test]
@@ -498,7 +622,7 @@ mod tests {
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
-        let mut args = execution_args(source, "top()", basic_lyp());
+        let mut args = execution_args(source, "top()", basic_tech());
         args.gds_imports
             .push(("macros::sram".to_owned(), temp_gds("gds-import")));
         args.output = Some(artifact_path.clone());
@@ -539,7 +663,7 @@ mod tests {
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
         let exported_path = directory.join("roundtrip.gds");
-        let mut args = execution_args(source, "top()", basic_lyp());
+        let mut args = execution_args(source, "top()", basic_tech());
         args.gds_imports
             .push(("routes".to_owned(), temp_path_gds("gds-path-import")));
         args.output = Some(artifact_path.clone());
@@ -577,7 +701,7 @@ mod tests {
                 _ => None,
             })
             .expect("round-trip GDS should contain a path");
-        assert_eq!(exported_path.width, Some(20));
+        assert_eq!(exported_path.width, Some(200));
         assert_eq!(exported_path.path_type, Some(2));
         assert_eq!(exported_path.xy.len(), 3);
     }
@@ -594,7 +718,7 @@ mod tests {
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
-        let mut args = execution_args(source, "top()", basic_lyp());
+        let mut args = execution_args(source, "top()", basic_tech());
         args.gds_imports
             .push(("sram".to_owned(), temp_gds("gds-shape-field")));
         args.output = Some(artifact_path.clone());
@@ -631,7 +755,7 @@ mod tests {
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
-        let mut args = execution_args(source, "top()", basic_lyp());
+        let mut args = execution_args(source, "top()", basic_tech());
         args.gds_imports
             .push(("sram".to_owned(), temp_nested_gds("nested-gds-shape-field")));
         args.output = Some(artifact_path.clone());
@@ -664,7 +788,7 @@ mod tests {
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
-        let mut args = execution_args(source, "top()", basic_lyp());
+        let mut args = execution_args(source, "top()", basic_tech());
         args.gds_imports
             .push(("sram".to_owned(), temp_gds("gds-declaration-order-import")));
         args.output = Some(artifact_path.clone());
@@ -685,26 +809,26 @@ mod tests {
             "invalid-argument-dependency",
             "cell device(enabled: Bool, w: Float, count: Int) {}\n",
         );
-        let mut args = execution_args(source, "devices::device(1, 150., 5)", basic_lyp());
+        let mut args = execution_args(source, "devices::device(1, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
         args.output = Some(std::env::temp_dir().join("argonc-invalid-argument.bin"));
         let diagnostic = render_failed(failed(args));
         assert!(
-            diagnostic.contains("invalid cell argument 1: expected Bool, found Int"),
+            diagnostic.contains("expected type Bool, found Int"),
             "{diagnostic}"
         );
     }
 
     #[test]
-    fn missing_lyp_is_reported_with_its_path() {
-        let source = temp_source("missing-lyp", "cell top() {}\n");
+    fn missing_tech_is_reported_with_its_path() {
+        let source = temp_source("missing-tech", "cell top() {}\n");
         let missing = source
             .parent()
             .expect("source should have a parent")
-            .join("missing.lyp");
+            .join("missing.tech.toml");
         let diagnostic = render_failed(failed(execution_args(source, "top()", missing.clone())));
         assert!(
-            diagnostic.contains("could not read LYP file"),
+            diagnostic.contains("could not read technology file"),
             "{diagnostic}"
         );
         assert!(
@@ -714,16 +838,17 @@ mod tests {
     }
 
     #[test]
-    fn malformed_lyp_is_reported_with_its_path() {
-        let source = temp_source("malformed-lyp", "cell top() {}\n");
+    fn malformed_tech_is_reported_with_its_path() {
+        let source = temp_source("malformed-tech", "cell top() {}\n");
         let malformed = source
             .parent()
             .expect("source should have a parent")
-            .join("malformed.lyp");
-        fs::write(&malformed, "not XML").expect("malformed LYP should be written");
+            .join("malformed.tech.toml");
+        fs::write(&malformed, "not valid TOML = [")
+            .expect("malformed technology should be written");
         let diagnostic = render_failed(failed(execution_args(source, "top()", malformed.clone())));
         assert!(
-            diagnostic.contains("could not parse LYP file"),
+            diagnostic.contains("could not parse technology file"),
             "{diagnostic}"
         );
         assert!(
@@ -738,12 +863,12 @@ mod tests {
             "missing-text-layer",
             "cell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
         );
-        let lyp = basic_lyp();
-        let diagnostic = render_failed(failed(execution_args(source, "top()", lyp.clone())));
+        let tech = basic_tech();
+        let diagnostic = render_failed(failed(execution_args(source, "top()", tech.clone())));
         assert!(
             diagnostic.contains(&format!(
-                "text uses layer `missing.label`, which is not defined in LYP file `{}`",
-                lyp.display()
+                "text uses layer `missing.label`, which is not defined in technology file `{}`",
+                tech.display()
             )),
             "{diagnostic}"
         );
@@ -759,12 +884,12 @@ mod tests {
 }
 "#,
         );
-        let lyp = basic_lyp();
-        let diagnostic = render_failed(failed(execution_args(source, "top()", lyp.clone())));
+        let tech = basic_tech();
+        let diagnostic = render_failed(failed(execution_args(source, "top()", tech.clone())));
         assert!(
             diagnostic.contains(&format!(
-                "rectangle uses layer `missing.drawing`, which is not defined in LYP file `{}`",
-                lyp.display()
+                "rectangle uses layer `missing.drawing`, which is not defined in technology file `{}`",
+                tech.display()
             )),
             "{diagnostic}"
         );

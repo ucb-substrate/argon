@@ -3,13 +3,78 @@ local M = {}
 local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
+local focus = require('argon.focus')
+local save = require('argon.save')
 
-local function focus_gui()
-    client.any_buf_request('custom/startGui', nil, client.print_error)
+local function schedule_workspace_modified(client_id)
+    vim.schedule(function()
+        save.notify_workspace_modified(client_id)
+    end)
 end
 
+local modified_clients_by_buffer = {}
+
+local function schedule_buffer_clients(bufnr)
+    for client_id in pairs(modified_clients_by_buffer[bufnr] or {}) do
+        schedule_workspace_modified(client_id)
+    end
+end
+
+local function track_modified_buffer(bufnr, client_id)
+    local clients = modified_clients_by_buffer[bufnr]
+    if clients then
+        clients[client_id] = true
+        return
+    end
+    modified_clients_by_buffer[bufnr] = { [client_id] = true }
+    vim.api.nvim_buf_attach(bufnr, false, {
+        on_lines = function()
+            schedule_buffer_clients(bufnr)
+        end,
+        on_detach = function()
+            schedule_buffer_clients(bufnr)
+            modified_clients_by_buffer[bufnr] = nil
+        end,
+    })
+end
+
+local modified_group = vim.api.nvim_create_augroup('argon_workspace_modified', { clear = true })
+vim.api.nvim_create_autocmd('BufModifiedSet', {
+    group = modified_group,
+    callback = function(args)
+        schedule_buffer_clients(args.buf)
+    end,
+})
+vim.api.nvim_create_autocmd('BufWritePost', {
+    group = modified_group,
+    callback = function(args)
+        schedule_buffer_clients(args.buf)
+    end,
+})
+vim.api.nvim_create_autocmd('LspAttach', {
+    group = modified_group,
+    callback = function(args)
+        local attached_client = vim.lsp.get_client_by_id(args.data.client_id)
+        if not attached_client or attached_client.name ~= 'argon' then
+            return
+        end
+        track_modified_buffer(args.buf, args.data.client_id)
+        schedule_workspace_modified(args.data.client_id)
+    end,
+})
+vim.api.nvim_create_autocmd('LspDetach', {
+    group = modified_group,
+    callback = function(args)
+        local clients = modified_clients_by_buffer[args.buf]
+        if clients then
+            clients[args.data.client_id] = nil
+        end
+        schedule_workspace_modified(args.data.client_id)
+    end,
+})
+
 for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
-    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus_gui, {
+    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus.gui, {
         desc = 'Focus Argon GUI',
         silent = true,
         nowait = true,
@@ -110,15 +175,15 @@ M.start = function(bufnr)
         name = 'argon',
         cmd = analyzer_cmd,
         handlers = {
-            ['custom/forceSave'] = function(err, result, ctx)
-                local bufnr = vim.fn.bufnr(result)
-
-                if bufnr ~= -1 then
-                    vim.api.nvim_buf_call(bufnr, function()
-                        vim.cmd('write')
-                    end)
+            ['custom/save'] = function(err, result, ctx)
+                if err then
+                    client.print_error(err)
+                    return vim.NIL
                 end
 
+                vim.schedule(function()
+                    save.save_modified_buffers(ctx.client_id)
+                end)
                 return vim.NIL
             end,
             ['custom/undo'] = function(err, result, ctx)
@@ -127,7 +192,6 @@ M.start = function(bufnr)
                 if bufnr ~= -1 then
                     vim.api.nvim_buf_call(bufnr, function()
                         vim.cmd('undo')
-                        vim.cmd('write')
                     end)
                 end
 
@@ -139,26 +203,15 @@ M.start = function(bufnr)
                 if bufnr ~= -1 then
                     vim.api.nvim_buf_call(bufnr, function()
                         vim.cmd('redo')
-                        vim.cmd('write')
                     end)
                 end
 
                 return vim.NIL
             end,
-            ['custom/focusEditor'] = function(err, command, ctx)
-                if err then
-                    client.print_error(err)
-                    return vim.NIL
-                end
+            ['custom/focusEditor'] = function(_, command, _)
                 vim.schedule(function()
-                    local mode = vim.api.nvim_get_mode().mode
-                    local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
-                    if type(command) == 'string' then
-                        keys = keys .. command
-                    end
-                    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
+                    focus.editor(command)
                 end)
-                return vim.NIL
             end,
         },
         root_dir = root_dir
@@ -188,7 +241,12 @@ M.start = function(bufnr)
         end
     end
 
-    vim.lsp.start(lsp_start_config, { bufnr = bufnr })
+    local client_id = vim.lsp.start(lsp_start_config, { bufnr = bufnr })
+    if client_id then
+        track_modified_buffer(bufnr, client_id)
+        schedule_workspace_modified(client_id)
+    end
+    return client_id
 end
 
 ---Stop the LSP client.

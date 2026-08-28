@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ast::Span,
     compile::{CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput},
-    parse::{STD_PATH, STD_SOURCE},
+    parse::{CellInvocation, STD_PATH, STD_SOURCE},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -38,6 +38,10 @@ pub struct Diagnostic {
     pub start: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end: Option<usize>,
+    /// Source text for `path` when it does not name a file on disk, so that a
+    /// renderer on the far side of the JSON boundary can still show the line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 impl Diagnostic {
@@ -48,6 +52,7 @@ impl Diagnostic {
             path: None,
             start: None,
             end: None,
+            source: None,
         }
     }
 
@@ -58,6 +63,30 @@ impl Diagnostic {
             path: Some(span.path.clone()),
             start: Some(span.span.start()),
             end: Some(span.span.end()),
+            source: None,
+        }
+    }
+}
+
+/// Rewrites diagnostics that land inside a spliced cell invocation so they point
+/// at the invocation the caller supplied, and carries its text along for
+/// rendering.
+pub fn remap_invocation(diagnostics: &mut Vec<Diagnostic>, invocation: &CellInvocation) {
+    for diagnostic in diagnostics {
+        let (Some(path), Some(start), Some(end)) =
+            (&diagnostic.path, diagnostic.start, diagnostic.end)
+        else {
+            continue;
+        };
+        let span = Span {
+            path: path.clone(),
+            span: cfgrammar::Span::new(start, end),
+        };
+        if let Some(remapped) = invocation.remap(&span) {
+            diagnostic.path = Some(remapped.path);
+            diagnostic.start = Some(remapped.span.start());
+            diagnostic.end = Some(remapped.span.end());
+            diagnostic.source = Some(invocation.source.clone());
         }
     }
 }
@@ -113,10 +142,10 @@ pub fn render(writer: &mut impl Write, diagnostic: &Diagnostic, color: bool) -> 
         return Ok(());
     };
     let file_source = fs::read_to_string(path).ok();
-    let source = if path == Path::new(STD_PATH) {
-        Some(STD_SOURCE)
-    } else {
-        file_source.as_deref()
+    let source = match (&diagnostic.source, path == Path::new(STD_PATH)) {
+        (Some(source), _) => Some(source.as_str()),
+        (None, true) => Some(STD_SOURCE),
+        (None, false) => file_source.as_deref(),
     };
     let (line, column, line_text, underline) = source
         .map(|source| source_location(source, start, diagnostic.end.unwrap_or(start)))

@@ -1,2 +1,2 @@
 name = "func-bad-arg-reuse"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

@@ -3,10 +3,14 @@ pub mod ast;
 pub mod compile;
 pub mod diagnostics;
 pub mod gds;
-pub mod layer;
+pub mod incremental;
 pub mod parse;
 mod parser;
 pub mod solver;
+pub mod tech;
+pub mod workspace;
+
+pub use workspace::WorkspaceConfig;
 
 /// A global allocator that tracks live and peak heap usage so that the scaling
 /// benchmarks in the test module can report memory consumption alongside
@@ -96,25 +100,46 @@ mod tests {
         compile::{
             ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
         },
-        gds::GdsMap,
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
-    use ::gds::{GdsElement, GdsLibrary, GdsUnits};
+    use ::gds::{GdsElement, GdsLibrary};
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
     use indexmap::IndexMap;
     use pegasus::drc::{DrcParams, run_drc};
 
-    use crate::compile::{CellArg, CompileInput, compile};
+    use crate::{
+        WorkspaceConfig,
+        compile::{CellArg, CompileInput, compile as compile_workspace},
+    };
     const EPSILON: f64 = 1e-10;
 
     const EXAMPLES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples");
     const ARGON_SCOPES: &str = concatcp!(EXAMPLES_DIR, "/scopes/lib.ar");
-    const BASIC_LYP: &str = concatcp!(EXAMPLES_DIR, "/lyp/basic.lyp");
+    const BASIC_TECH: &str = concatcp!(EXAMPLES_DIR, "/tech/basic.tech.toml");
     const ARGON_SKY130_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pdks/sky130");
     const ARGON_SKY130_LIB: &str = concatcp!(ARGON_SKY130_DIR, "/lib.ar");
-    const SKY130_LYP: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.lyp");
+    const SKY130_TECH: &str = concatcp!(ARGON_SKY130_DIR, "/sky130.tech.toml");
+
+    fn compile(ast: &crate::parse::WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
+        compile_workspace(
+            ast,
+            input,
+            &WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH))),
+        )
+    }
+
+    fn compile_sky130(
+        ast: &crate::parse::WorkspaceParseAst,
+        input: CompileInput<'_>,
+    ) -> CompileOutput {
+        compile_workspace(
+            ast,
+            input,
+            &WorkspaceConfig::default().with_tech(Some(PathBuf::from(SKY130_TECH))),
+        )
+    }
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
@@ -132,6 +157,7 @@ mod tests {
     const ARGON_PARAM_INT: &str = concatcp!(EXAMPLES_DIR, "/param_int/lib.ar");
     const ARGON_ENUMERATIONS: &str = concatcp!(EXAMPLES_DIR, "/enumerations/lib.ar");
     const ARGON_BBOX: &str = concatcp!(EXAMPLES_DIR, "/bbox/lib.ar");
+    const ARGON_BBOX_NESTED: &str = concatcp!(EXAMPLES_DIR, "/bbox_nested/lib.ar");
     const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
@@ -467,7 +493,6 @@ mod tests {
                     CompileInput {
                         cell: &["shapes"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -511,7 +536,6 @@ mod tests {
                     CompileInput {
                         cell: &["shapes_loop"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -547,7 +571,6 @@ mod tests {
                     CompileInput {
                         cell: &["constraints"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -581,7 +604,6 @@ mod tests {
                     CompileInput {
                         cell: &["instances"],
                         args: vec![CellArg::Int(n)],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -644,7 +666,6 @@ mod tests {
                     CompileInput {
                         cell: &[&cellname],
                         args: vec![],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -683,7 +704,6 @@ mod tests {
                     CompileInput {
                         cell: &[&cellname],
                         args: vec![],
-                        lyp_file: &PathBuf::from(BASIC_LYP),
                     },
                 )
             });
@@ -711,7 +731,6 @@ mod tests {
                 CompileInput {
                     cell: &[cell],
                     args: vec![CellArg::Int(64)],
-                    lyp_file: &PathBuf::from(BASIC_LYP),
                 },
             );
             let d = out.unwrap_valid();
@@ -735,7 +754,6 @@ mod tests {
             CompileInput {
                 cell: &["constraints"],
                 args: vec![CellArg::Int(32)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         assert!(
@@ -754,7 +772,6 @@ mod tests {
             CompileInput {
                 cell: &["instances"],
                 args: vec![CellArg::Int(64)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let d = out.unwrap_valid();
@@ -777,7 +794,6 @@ mod tests {
             CompileInput {
                 cell: &["h8"],
                 args: vec![],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let d = out.unwrap_valid();
@@ -795,7 +811,6 @@ mod tests {
             CompileInput {
                 cell: &["scopes"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let data = cell.unwrap_valid();
@@ -819,7 +834,6 @@ mod tests {
             CompileInput {
                 cell: &["immediate"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -835,7 +849,6 @@ mod tests {
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -851,11 +864,21 @@ mod tests {
             CompileInput {
                 cell: &["if_test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
-        cell.unwrap_exec_errors();
+        let errors = cell.unwrap_exec_errors();
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| matches!(error.kind, ExecErrorKind::InconsistentConstraint(_)))
+            .expect("expected an inconsistent constraint");
+        let span = error
+            .span
+            .as_ref()
+            .expect("inconsistent constraint should retain its source span");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(&source[span.span.start()..span.span.end()], "eq(a, 5.)");
     }
 
     #[test]
@@ -868,7 +891,6 @@ mod tests {
             CompileInput {
                 cell: &["via"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -884,7 +906,6 @@ mod tests {
             CompileInput {
                 cell: &["vias"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -914,7 +935,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cell:?}");
@@ -930,7 +950,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -946,7 +965,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let data = match cells {
@@ -979,7 +997,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let errors = cells.unwrap_static_errors();
@@ -1110,7 +1127,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_exec_errors()
@@ -1130,7 +1146,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_exec_errors()
@@ -1171,7 +1186,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_exec_errors()
@@ -1206,7 +1220,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1240,7 +1253,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1274,7 +1286,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Float(50.), CellArg::Float(20.)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1291,7 +1302,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: vec![CellArg::Int(50), CellArg::Int(20)],
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1308,7 +1318,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:?}");
@@ -1338,7 +1347,6 @@ mod tests {
             CompileInput {
                 cell: &["test"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:?}");
@@ -1357,7 +1365,7 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["inv"],
@@ -1366,7 +1374,6 @@ mod tests {
                     CellArg::Float(2_000.),
                     CellArg::Int(4),
                 ],
-                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("cells: {cells:?}");
@@ -1376,11 +1383,7 @@ mod tests {
         let work_dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_inverter");
         cells
-            .to_gds(
-                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                work_dir.join("layout.gds"),
-            )
+            .to_gds(work_dir.join("layout.gds"))
             .expect("Failed to write to GDS");
     }
 
@@ -1394,7 +1397,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:?}");
@@ -1419,7 +1421,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1439,6 +1440,44 @@ mod tests {
     }
 
     #[test]
+    fn argon_bbox_nested() {
+        let o = parse_workspace_with_std(ARGON_BBOX_NESTED);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        println!("{cells:#?}");
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let rect_on = |layer: &str| {
+            cell.objects
+                .values()
+                .filter_map(|object| object.get_rect())
+                .find(|rect| rect.layer.as_deref() == Some(layer))
+                .unwrap_or_else(|| panic!("{layer} should copy a bbox"))
+        };
+
+        // `mid` holds `leaf` at x=1000, so the cell bbox must include that offset.
+        let cell_bbox = rect_on("met2");
+        assert_eq!(cell_bbox.x0.0, 1000.);
+        assert_eq!(cell_bbox.y0.0, 0.);
+        assert_eq!(cell_bbox.x1.0, 1100.);
+        assert_eq!(cell_bbox.y1.0, 100.);
+
+        // Rotating by 90 maps (x, y) to (-y, x); the placement then adds x=500.
+        let inst_bbox = rect_on("met3");
+        assert_eq!(inst_bbox.x0.0, 400.);
+        assert_eq!(inst_bbox.y0.0, 1000.);
+        assert_eq!(inst_bbox.x1.0, 500.);
+        assert_eq!(inst_bbox.y1.0, 1100.);
+    }
+
+    #[test]
     fn argon_rounding() {
         let o = parse_workspace_with_std(ARGON_ROUNDING);
         assert!(o.static_errors().is_empty());
@@ -1448,16 +1487,46 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
         let cells = cells.unwrap_exec_errors();
         assert_eq!(cells.errors.len(), 1);
-        assert!(matches!(
-            cells.errors.first().unwrap().kind,
-            ExecErrorKind::InvalidRounding(_)
+        let error = cells.errors.first().unwrap();
+        assert!(matches!(error.kind, ExecErrorKind::OffGrid(_)));
+        let span = error
+            .span
+            .as_ref()
+            .expect("off-grid error should point to its solver variable");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(&source[span.span.start()..span.span.end()], "float()");
+    }
+
+    #[test]
+    fn solver_uses_technology_grid() {
+        let o = parse_workspace_with_std(ARGON_ROUNDING);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+
+        let tech_path = std::env::temp_dir().join(format!(
+            "argon-solver-grid-{}.tech.toml",
+            std::process::id()
         ));
+        let tech = std::fs::read_to_string(BASIC_TECH)
+            .unwrap()
+            .replace("display_unit = 10", "display_unit = 10000");
+        std::fs::write(&tech_path, tech).unwrap();
+        let cells = compile_workspace(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+            &WorkspaceConfig::default().with_tech(Some(tech_path.clone())),
+        );
+        std::fs::remove_file(tech_path).unwrap();
+
+        assert!(cells.is_valid(), "{cells:#?}");
     }
 
     #[test]
@@ -1470,7 +1539,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1496,7 +1564,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1521,7 +1588,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1546,7 +1612,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1571,7 +1636,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1596,7 +1660,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1621,7 +1684,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1642,23 +1704,18 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_TEXT);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("{cells:#?}");
 
         let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_text");
         cells
-            .to_gds(
-                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                work_dir.join("layout.gds"),
-            )
+            .to_gds(work_dir.join("layout.gds"))
             .expect("Failed to write to GDS");
 
         let cells = cells.unwrap_valid();
@@ -1681,7 +1738,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1708,7 +1764,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1735,7 +1790,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1762,7 +1816,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1783,7 +1836,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1806,17 +1858,24 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
 
         let errors = cells.unwrap_exec_errors();
-        assert!(
-            errors
-                .errors
-                .iter()
-                .any(|e| matches!(e.kind, ExecErrorKind::Underconstrained))
+        let error = errors
+            .errors
+            .iter()
+            .find(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+            .expect("expected an underconstrained error");
+        let span = error
+            .span
+            .as_ref()
+            .expect("underconstrained error should point to an unsolved variable");
+        let source = std::fs::read_to_string(&span.path).unwrap();
+        assert_eq!(
+            &source[span.span.start()..span.span.end()],
+            "inst(bot_cell, angle=90)"
         );
     }
 
@@ -1830,7 +1889,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1854,7 +1912,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -1894,18 +1951,11 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let gds_path =
             std::env::temp_dir().join(format!("argon-polygon-{}.gds", std::process::id()));
-        output
-            .to_gds(
-                GdsMap::from_lyp(BASIC_LYP).expect("polygon GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                &gds_path,
-            )
-            .expect("export polygon GDS");
+        output.to_gds(&gds_path).expect("export polygon GDS");
         let gds = GdsLibrary::load(gds_path).expect("reload polygon GDS");
         let boundary = gds.structs[0]
             .elems
@@ -1962,7 +2012,6 @@ mod tests {
             CompileInput {
                 cell: &["initial_points"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let initial = match initial {
@@ -2077,7 +2126,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let CompileOutput::Valid(cells) = &output else {
@@ -2100,13 +2148,7 @@ mod tests {
         );
 
         let gds_path = std::env::temp_dir().join(format!("argon-path-{}.gds", std::process::id()));
-        output
-            .to_gds(
-                GdsMap::from_lyp(BASIC_LYP).expect("path GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                &gds_path,
-            )
-            .expect("export path GDS");
+        output.to_gds(&gds_path).expect("export path GDS");
         let gds = GdsLibrary::load(gds_path).expect("reload path GDS");
         let path = gds.structs[0]
             .elems
@@ -2116,10 +2158,10 @@ mod tests {
                 _ => None,
             })
             .expect("GDS path element");
-        assert_eq!(path.width, Some(20));
+        assert_eq!(path.width, Some(200));
         assert_eq!(path.path_type, Some(4));
-        assert_eq!(path.begin_extn, Some(5));
-        assert_eq!(path.end_extn, Some(7));
+        assert_eq!(path.begin_extn, Some(50));
+        assert_eq!(path.end_extn, Some(70));
         assert_eq!(path.xy.len(), 3);
     }
 
@@ -2138,7 +2180,6 @@ mod tests {
                 CompileInput {
                     cell: &[cell_name],
                     args: Vec::new(),
-                    lyp_file: &PathBuf::from(BASIC_LYP),
                 },
             );
             let output = match output {
@@ -2199,7 +2240,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         )
         .unwrap_valid();
@@ -2228,7 +2268,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2255,7 +2294,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2300,7 +2338,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         let elapsed = start.elapsed();
@@ -2324,7 +2361,6 @@ mod tests {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2348,7 +2384,6 @@ mod tests {
             CompileInput {
                 cell: &["precedence"],
                 args: Vec::new(),
-                lyp_file: &PathBuf::from(BASIC_LYP),
             },
         );
         println!("{cells:#?}");
@@ -2375,12 +2410,11 @@ mod tests {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let cells = compile_sky130(
             &ast,
             CompileInput {
                 cell: &["diff_vco_top"],
                 args: vec![],
-                lyp_file: &PathBuf::from(SKY130_LYP),
             },
         );
         println!("cells: {cells:?}");
@@ -2389,13 +2423,7 @@ mod tests {
 
         let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_vco");
         let gds_path = work_dir.join("layout.gds");
-        cells
-            .to_gds(
-                GdsMap::from_lyp(SKY130_LYP).expect("failed to create GDS map"),
-                GdsUnits::new(1e-3, 1e-9),
-                &gds_path,
-            )
-            .expect("Failed to write to GDS");
+        cells.to_gds(&gds_path).expect("Failed to write to GDS");
 
         use sky130::{sky130_drc, sky130_drc_rules_path};
 

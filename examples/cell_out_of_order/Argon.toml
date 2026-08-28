@@ -1,2 +1,2 @@
 name = "cell-out-of-order"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

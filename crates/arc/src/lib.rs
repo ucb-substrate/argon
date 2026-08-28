@@ -11,78 +11,45 @@ pub mod cli;
 
 const MANIFEST_FILE: &str = "Argon.toml";
 const SOURCE_FILE: &str = "lib.ar";
-const LYP_FILE: &str = "layers.lyp";
+const TECH_FILE: &str = "tech.toml";
 
 const STARTER_SOURCE: &str = r#"cell top() {
     text("Hello world!", "text.label", 0., 0.);
 }
 "#;
 
-const DEFAULT_LYP: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-<layer-properties>
- <name>Default Layer Properties</name>
- <properties>
-  <frame-color>#0000ff</frame-color>
-  <fill-color>#0000ff</fill-color>
-  <frame-brightness>0</frame-brightness>
-  <fill-brightness>0</fill-brightness>
-  <dither-pattern>C7</dither-pattern>
-  <line-style>C0</line-style>
-  <valid>true</valid>
-  <visible>true</visible>
-  <transparent>false</transparent>
-  <width>1</width>
-  <marked>false</marked>
-  <xfill>false</xfill>
-  <animation>0</animation>
-  <name>met1</name>
-  <source>1/0@1</source>
- </properties>
- <properties>
-  <frame-color>#ff00ff</frame-color>
-  <fill-color>#ff00ff</fill-color>
-  <frame-brightness>0</frame-brightness>
-  <fill-brightness>0</fill-brightness>
-  <dither-pattern>C7</dither-pattern>
-  <line-style>C0</line-style>
-  <valid>true</valid>
-  <visible>true</visible>
-  <transparent>false</transparent>
-  <width>1</width>
-  <marked>false</marked>
-  <xfill>false</xfill>
-  <animation>0</animation>
-  <name>met2</name>
-  <source>2/0@1</source>
- </properties>
- <properties>
-  <frame-color>#0080ff</frame-color>
-  <fill-color>#0080ff</fill-color>
-  <frame-brightness>0</frame-brightness>
-  <fill-brightness>0</fill-brightness>
-  <dither-pattern>C7</dither-pattern>
-  <line-style>C0</line-style>
-  <valid>true</valid>
-  <visible>true</visible>
-  <transparent>false</transparent>
-  <width>1</width>
-  <marked>false</marked>
-  <xfill>false</xfill>
-  <animation>0</animation>
-  <name>text.label</name>
-  <source>10/0@1</source>
- </properties>
-</layer-properties>
-"#;
+const DEFAULT_TECH: &str = r##"dbu = 1e-10
+display_unit = 10
+grid = 1
+style_name = "Default Layer Properties"
+
+[[layers]]
+name = "met1"
+gds = [1, 0]
+fill = "#0000ff"
+border = "#0000ff"
+
+[[layers]]
+name = "met2"
+gds = [2, 0]
+fill = "#ff00ff"
+border = "#ff00ff"
+
+[[layers]]
+name = "text.label"
+gds = [10, 0]
+fill = "#0080ff"
+border = "#0080ff"
+"##;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Human-readable library name shown by `arc`.
     pub name: String,
-    /// KLayout layer-properties file, relative to the manifest directory.
+    /// Argon TOML technology file, relative to the manifest directory.
     #[serde(default)]
-    pub lyp: Option<PathBuf>,
+    pub tech: Option<PathBuf>,
     /// Path library dependencies.
     #[serde(default)]
     pub dependencies: IndexMap<String, PathBuf>,
@@ -96,7 +63,7 @@ pub struct Library {
     pub name: String,
     pub manifest_path: PathBuf,
     pub root: PathBuf,
-    pub lyp: Option<PathBuf>,
+    pub tech: Option<PathBuf>,
     pub dependencies: IndexMap<String, PathBuf>,
     pub gds: IndexMap<String, PathBuf>,
 }
@@ -122,7 +89,7 @@ impl Library {
             name: manifest.name,
             manifest_path: manifest_path.to_path_buf(),
             root: directory.join("lib.ar"),
-            lyp: manifest.lyp.map(|path| resolve_path(directory, path)),
+            tech: manifest.tech.map(|path| resolve_path(directory, path)),
             dependencies,
             gds,
         })
@@ -166,13 +133,13 @@ pub fn create_workspace(path: impl AsRef<Path>, name: Option<&str>) -> Result<Li
     let manifest_path = path.join(MANIFEST_FILE);
     fs::write(
         &manifest_path,
-        format!("name = {name:?}\nlyp = {LYP_FILE:?}\n"),
+        format!("name = {name:?}\ntech = {TECH_FILE:?}\n"),
     )
     .with_context(|| format!("could not write '{}'", manifest_path.display()))?;
     fs::write(path.join(SOURCE_FILE), STARTER_SOURCE)
         .with_context(|| format!("could not write '{}'", path.join(SOURCE_FILE).display()))?;
-    fs::write(path.join(LYP_FILE), DEFAULT_LYP)
-        .with_context(|| format!("could not write '{}'", path.join(LYP_FILE).display()))?;
+    fs::write(path.join(TECH_FILE), DEFAULT_TECH)
+        .with_context(|| format!("could not write '{}'", path.join(TECH_FILE).display()))?;
 
     Library::load(manifest_path)
 }
@@ -560,6 +527,7 @@ mod tests {
     };
 
     use argonc::{
+        WorkspaceConfig,
         compile::{CompileInput, compile},
         parse::parse_workspace_with_std,
     };
@@ -674,17 +642,17 @@ cell top() {
         assert_eq!(library.name, "hello-argon");
         assert_eq!(
             fs::read_to_string(workspace.join("Argon.toml")).unwrap(),
-            "name = \"hello-argon\"\nlyp = \"layers.lyp\"\n"
+            "name = \"hello-argon\"\ntech = \"tech.toml\"\n"
         );
         assert_eq!(
             fs::read_to_string(&library.root).unwrap(),
             "cell top() {\n    text(\"Hello world!\", \"text.label\", 0., 0.);\n}\n"
         );
 
-        let lyp = library
-            .lyp
+        let tech = library
+            .tech
             .as_ref()
-            .expect("starter manifest should set lyp");
+            .expect("starter manifest should set tech");
         let parsed = parse_workspace_with_std(&library.root);
         assert!(parsed.static_errors().is_empty());
         let output = compile(
@@ -692,8 +660,8 @@ cell top() {
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
-                lyp_file: lyp,
             },
+            &WorkspaceConfig::new(&library.root).with_tech(Some(tech.clone())),
         )
         .unwrap_valid();
         let label = output.cells[&output.top]
@@ -746,10 +714,10 @@ cell top() {
             assert!(manifest.is_file(), "missing `{}`", manifest.display());
             let library = Library::load(&manifest)
                 .unwrap_or_else(|error| panic!("invalid `{}`: {error:#}", manifest.display()));
-            let lyp = library
-                .lyp
-                .unwrap_or_else(|| panic!("`{}` does not set `lyp`", manifest.display()));
-            assert!(lyp.is_file(), "missing LYP `{}`", lyp.display());
+            let tech = library
+                .tech
+                .unwrap_or_else(|| panic!("`{}` does not set `tech`", manifest.display()));
+            assert!(tech.is_file(), "missing technology `{}`", tech.display());
         }
     }
 
@@ -758,7 +726,7 @@ cell top() {
         let manifest: Manifest = toml::from_str(
             r#"
                 name = "test-library"
-                lyp = "layers.lyp"
+                tech = "tech.toml"
                 [dependencies]
                 dependency = "../dependency"
                 [gds]

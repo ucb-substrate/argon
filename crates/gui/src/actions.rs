@@ -5,6 +5,7 @@ actions!(
     Argon,
     [
         Quit,
+        Save,
         DrawRect,
         DrawPolygon,
         DrawPath,

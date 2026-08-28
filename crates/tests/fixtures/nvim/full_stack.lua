@@ -29,6 +29,7 @@ if vim.env.ARGON_TEST_MODE == 'roundtrip' then
   wait_for('GUI edit to recompile', function()
     return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
   end)
+  assert(vim.bo[bufnr].modified, 'GUI source edit should leave the buffer modified')
 
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local closing_line

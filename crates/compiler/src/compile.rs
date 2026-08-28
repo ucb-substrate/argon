@@ -28,9 +28,10 @@ use crate::ast::{
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
-use crate::layer::LayerProperties;
-use crate::parse::{ParseOutput, WorkspaceParseAst};
+use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
+use crate::tech::{Technology, read_tech};
+use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
@@ -95,6 +96,7 @@ pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
     }
 }
 
+#[derive(Clone)]
 pub struct StaticAnalysis {
     /// Parsed source AST used for source-aware tooling.
     pub ast: WorkspaceParseAst,
@@ -104,20 +106,70 @@ pub struct StaticAnalysis {
     pub errors: Vec<StaticError>,
 }
 
-pub fn dynamic_compile(
+/// Executes a cell using workspace-wide external inputs from `config`.
+pub fn execute_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
-    dynamic_compile_with_gds(ast, input, &[])
+    let Some(tech_file) = config.tech.as_deref() else {
+        return missing_tech_output();
+    };
+    let tech = match read_tech(tech_file) {
+        Ok(tech) => tech,
+        Err(error) => return invalid_tech_output(ast, error.to_string()),
+    };
+    check_output_layers(
+        ExecPass::new(ast, tech, &config.gds_imports).execute(input),
+        tech_file,
+    )
 }
 
-pub fn dynamic_compile_with_gds(
+/// Executes a cell invocation spliced into `ast` by
+/// [`crate::parse::add_cell_invocation`]. Its arguments are evaluated by the
+/// ordinary expression evaluator, so they may be any expression.
+pub fn execute_cell_invocation(
     ast: &WorkspaceAst<VarIdTyMetadata>,
-    input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
-    let lyp_file = input.lyp_file;
-    let res = ExecPass::new(ast, lyp_file, gds_imports).execute(input);
+    let Some(tech_file) = config.tech.as_deref() else {
+        return missing_tech_output();
+    };
+    let tech = match read_tech(tech_file) {
+        Ok(tech) => tech,
+        Err(error) => return invalid_tech_output(ast, error.to_string()),
+    };
+    check_output_layers(
+        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation(invocation),
+        tech_file,
+    )
+}
+
+fn missing_tech_output() -> CompileOutput {
+    CompileOutput::ExecErrors(ExecErrorCompileOutput {
+        errors: vec![ExecError {
+            span: None,
+            cell: 0,
+            kind: ExecErrorKind::MissingTech,
+        }],
+        output: None,
+    })
+}
+
+fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> CompileOutput {
+    CompileOutput::StaticErrors(StaticErrorCompileOutput {
+        errors: vec![StaticError {
+            span: Span {
+                path: ast[&ModPath::new()].path.clone(),
+                span: cfgrammar::Span::new(0, 0),
+            },
+            kind: StaticErrorKind::InvalidTech(error),
+        }],
+    })
+}
+
+fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -129,7 +181,7 @@ pub fn dynamic_compile_with_gds(
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, lyp_file, &mut errors);
+    check_layers(&data, tech_file, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -140,14 +192,10 @@ pub fn dynamic_compile_with_gds(
     }
 }
 
-pub fn compile(ast: &WorkspaceParseAst, input: CompileInput<'_>) -> CompileOutput {
-    compile_with_gds(ast, input, &[])
-}
-
-pub fn compile_with_gds(
+pub fn compile(
     ast: &WorkspaceParseAst,
     input: CompileInput<'_>,
-    gds_imports: &[(String, PathBuf)],
+    config: &WorkspaceConfig,
 ) -> CompileOutput {
     let (ast, static_output) = if let Some(static_output) = static_compile(ast) {
         static_output
@@ -158,7 +206,7 @@ pub fn compile_with_gds(
         return CompileOutput::StaticErrors(static_output);
     };
 
-    dynamic_compile_with_gds(&ast, input, gds_imports)
+    execute_cell(&ast, input, config)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -589,9 +637,9 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError>) {
+fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecError>) {
     let mut layers = IndexSet::new();
-    for layer in data.layers.layers.iter() {
+    for layer in &data.tech.layers {
         layers.insert(layer.name.clone());
     }
     for (cell_id, cell) in data.cells.iter() {
@@ -606,7 +654,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                             cell: *cell_id,
                             kind: ExecErrorKind::IllegalLayer {
                                 layer: layer.clone(),
-                                lyp: lyp_file.display().to_string(),
+                                tech: tech_file.display().to_string(),
                             },
                         });
                     }
@@ -617,7 +665,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalLayer {
                             layer: polygon.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -627,7 +675,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalLayer {
                             layer: path.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -637,7 +685,7 @@ fn check_layers(data: &CompiledData, lyp_file: &FsPath, errs: &mut Vec<ExecError
                         cell: *cell_id,
                         kind: ExecErrorKind::IllegalTextLayer {
                             layer: text.layer.clone(),
-                            lyp: lyp_file.display().to_string(),
+                            tech: tech_file.display().to_string(),
                         },
                     });
                 }
@@ -1167,6 +1215,13 @@ impl<'a> VarIdTyPass<'a> {
 
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
         if *a == Ty::Any || *b == Ty::Any {
+            return true;
+        }
+
+        // An empty sequence belongs to every sequence type, as `Ty::lub` and the
+        // `cons` tail check already assume. The runtime check in
+        // `CellArg::matches_ty` still enforces emptiness where `[]` is declared.
+        if matches!((a, b), (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil)) {
             return true;
         }
 
@@ -2346,28 +2401,21 @@ pub enum CellArg {
     Float(f64),
     Int(i64),
     Bool(bool),
+    String(String),
+    /// An enum variant, identified by name like [`Value::EnumValue`].
+    Enum(String),
     Seq(Vec<CellArg>),
 }
 
 impl CellArg {
-    /// Converts a literal expression accepted at a compiler entry point into
-    /// its runtime representation.
-    pub fn from_literal(expr: &Expr<&str, ParseMetadata>) -> Option<Self> {
-        match expr {
-            Expr::FloatLiteral(value) => Some(Self::Float(value.value)),
-            Expr::IntLiteral(value) => Some(Self::Int(value.value)),
-            Expr::BoolLiteral(value) => Some(Self::Bool(value.value)),
-            Expr::SeqNil(_) => Some(Self::Seq(Vec::new())),
-            _ => None,
-        }
-    }
-
     fn matches_ty(&self, ty: &Ty) -> bool {
         match (self, ty) {
             (_, Ty::Any) => true,
-            (Self::Float(_), Ty::Float) | (Self::Int(_), Ty::Int) | (Self::Bool(_), Ty::Bool) => {
-                true
-            }
+            (Self::Float(_), Ty::Float)
+            | (Self::Int(_), Ty::Int)
+            | (Self::Bool(_), Ty::Bool)
+            | (Self::String(_), Ty::String) => true,
+            (Self::Enum(variant), Ty::Enum(ty)) => ty.variants.contains(variant),
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner))
             }
@@ -2381,6 +2429,8 @@ impl CellArg {
             Self::Float(_) => "Float",
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
+            Self::String(_) => "String",
+            Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
         }
     }
@@ -2398,6 +2448,8 @@ enum CellArgKey {
     Float(u64),
     Int(i64),
     Bool(bool),
+    String(String),
+    Enum(String),
     Seq(Vec<CellArgKey>),
 }
 
@@ -2407,6 +2459,8 @@ impl From<&CellArg> for CellArgKey {
             CellArg::Float(f) => Self::Float(f.to_bits()),
             CellArg::Int(i) => Self::Int(*i),
             CellArg::Bool(b) => Self::Bool(*b),
+            CellArg::String(s) => Self::String(s.clone()),
+            CellArg::Enum(v) => Self::Enum(v.clone()),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
         }
     }
@@ -2417,7 +2471,6 @@ pub struct CompileInput<'a> {
     /// Full path to cell.
     pub cell: &'a [&'a str],
     pub args: Vec<CellArg>,
-    pub lyp_file: &'a FsPath,
 }
 
 pub type VarId = u64;
@@ -2436,6 +2489,32 @@ pub struct BasicRect<T> {
     pub x1: T,
     pub y1: T,
     pub construction: bool,
+}
+
+/// Formats a GUI-created layout coordinate as an Argon float literal after
+/// snapping it to the technology grid.
+pub fn format_initial_condition(value: f64, grid: f64) -> String {
+    let snapped = crate::tech::snap(value, grid);
+    let value = format!("{snapped}");
+    if value.contains('.') {
+        value
+    } else {
+        format!("{value}.")
+    }
+}
+
+#[cfg(test)]
+mod initial_condition_format_tests {
+    use super::format_initial_condition;
+
+    #[test]
+    fn snaps_gui_coordinates_to_the_technology_grid() {
+        assert_eq!(format_initial_condition(12.345678, 0.1), "12.3");
+        assert_eq!(format_initial_condition(12.0, 0.1), "12.");
+        assert_eq!(format_initial_condition(-0.04, 0.1), "0.");
+        assert_eq!(format_initial_condition(1.2000000476837158, 0.1), "1.2");
+        assert_eq!(format_initial_condition(12.37, 0.25), "12.25");
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2623,12 +2702,21 @@ struct CellState {
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
+    var_span_map: IndexMap<Var, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
+}
+
+impl CellState {
+    fn new_solver_var(&mut self, span: &Span) -> Var {
+        let var = self.solver.new_var();
+        self.var_span_map.insert(var, span.clone());
+        var
+    }
 }
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    lyp_file: &'a FsPath,
+    tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
     values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
@@ -2647,6 +2735,12 @@ struct ExecPass<'a> {
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    /// Cell declaration generated for a compiler entry point's invocation, and
+    /// the cell it executed as. A call made directly by that cell is the
+    /// top-level invocation rather than a nested instantiation, so it is named
+    /// as if it were the entry point.
+    entry_cell_var: Option<VarId>,
+    entry_cell: Option<CellId>,
     errors: Vec<ExecError>,
 }
 
@@ -2677,7 +2771,7 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 impl<'a> ExecPass<'a> {
     pub(crate) fn new(
         ast: &'a WorkspaceAst<VarIdTyMetadata>,
-        lyp_file: &'a FsPath,
+        tech: Technology,
         gds_imports: &[(String, PathBuf)],
     ) -> Self {
         let gds_imports = gds_imports
@@ -2703,7 +2797,7 @@ impl<'a> ExecPass<'a> {
             .collect();
         Self {
             ast,
-            lyp_file,
+            tech,
             gds_imports,
             cell_states: IndexMap::new(),
             values: IndexMap::from_iter([
@@ -2729,6 +2823,8 @@ impl<'a> ExecPass<'a> {
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
             compiled_cell_cache: HashMap::new(),
+            entry_cell_var: None,
+            entry_cell: None,
             errors: Vec::new(),
         }
     }
@@ -2805,36 +2901,7 @@ impl<'a> ExecPass<'a> {
                     });
                 }
             };
-            let layers = match crate::layer::read_lyp(input.lyp_file) {
-                Ok(layers) => layers,
-                Err(error) => {
-                    return CompileOutput::StaticErrors(StaticErrorCompileOutput {
-                        errors: vec![StaticError {
-                            span: Span {
-                                path: self.ast[&vec![]].path.clone(),
-                                span: cfgrammar::Span::new(0, 0),
-                            },
-                            kind: StaticErrorKind::InvalidLyp(error.to_string()),
-                        }],
-                    });
-                }
-            };
-            if self.errors.is_empty() {
-                CompileOutput::Valid(CompiledData {
-                    cells: self.compiled_cells,
-                    top: cell_id,
-                    layers,
-                })
-            } else {
-                CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                    errors: self.errors,
-                    output: Some(CompiledData {
-                        cells: self.compiled_cells,
-                        top: cell_id,
-                        layers,
-                    }),
-                })
-            }
+            self.finish(cell_id)
         } else {
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
@@ -2843,6 +2910,107 @@ impl<'a> ExecPass<'a> {
                     kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
                 }],
                 output: None,
+            })
+        }
+    }
+
+    /// Executes a cell invocation spliced into the root module by
+    /// [`crate::parse::add_cell_invocation`]. The generated entry cell binds
+    /// the invocation, so evaluating it runs the invocation through the
+    /// ordinary expression evaluator; the cell it produced becomes the top.
+    pub(crate) fn execute_invocation(mut self, invocation: &CellInvocation) -> CompileOutput {
+        self.declare_globals();
+        let ast = self.ast;
+        let root = &ast[&ModPath::new()];
+        let entry = root
+            .ast
+            .decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Cell(cell) if cell.name.name == invocation.entry_cell => Some(cell),
+                _ => None,
+            })
+            .expect("generated entry cell should be declared");
+        let value = entry
+            .scope
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt {
+                Statement::LetBinding(binding) if binding.name.name == invocation.binding => {
+                    Some(&binding.value)
+                }
+                _ => None,
+            })
+            .expect("generated entry cell should bind the invocation");
+        // Reject a non-cell invocation statically, so the error lands on what
+        // the caller wrote rather than surfacing from the executor.
+        let ty = value.ty();
+        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+            return CompileOutput::StaticErrors(StaticErrorCompileOutput {
+                errors: vec![StaticError {
+                    span: Span {
+                        path: root.path.clone(),
+                        span: value.span(),
+                    },
+                    kind: StaticErrorKind::IncorrectTyCategory {
+                        found: ty,
+                        expected: "Cell".into(),
+                    },
+                }],
+            });
+        }
+
+        self.entry_cell_var = Some(entry.metadata.1);
+        let Ok(entry_id) = self.execute_cell(entry.metadata.1, Vec::new(), None) else {
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: None,
+            });
+        };
+        // Arguments are evaluated inside the generated cell, so an unsolvable
+        // system there means an argument did not reduce to a constant.
+        for error in &mut self.errors {
+            if error.cell == entry_id
+                && matches!(
+                    error.kind,
+                    ExecErrorKind::Underconstrained | ExecErrorKind::InconsistentConstraint(_)
+                )
+            {
+                error.kind = ExecErrorKind::UnevaluatedCellArgument;
+                error.span = Some(invocation.span());
+            }
+        }
+        let value_id = self.cell_states[&entry_id].fields[&invocation.binding];
+        let Some(DeferValue::Ready(Value::Cell(top))) = self.values.get(&value_id) else {
+            self.errors.push(ExecError {
+                span: Some(invocation.span()),
+                cell: entry_id,
+                kind: ExecErrorKind::NotACell,
+            });
+            return CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: None,
+            });
+        };
+        let top = *top;
+        // The entry cell is an implementation detail of the invocation.
+        self.compiled_cells.shift_remove(&entry_id);
+        self.finish(top)
+    }
+
+    /// Packages the executed cells into a compile output rooted at `top`.
+    fn finish(self, top: CellId) -> CompileOutput {
+        let data = CompiledData {
+            cells: self.compiled_cells,
+            top,
+            tech: self.tech,
+        };
+        if self.errors.is_empty() {
+            CompileOutput::Valid(data)
+        } else {
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                errors: self.errors,
+                output: Some(data),
             })
         }
     }
@@ -2929,6 +3097,9 @@ impl<'a> ExecPass<'a> {
         };
 
         let cell_id = self.alloc_id();
+        if self.entry_cell_var == Some(cell) {
+            self.entry_cell = Some(cell_id);
+        }
         self.partial_cells.push_back(cell_id);
         assert!(
             self.cell_states
@@ -2936,7 +3107,7 @@ impl<'a> ExecPass<'a> {
                     cell_id,
                     CellState {
                         solve_iters: 0,
-                        solver: Solver::new(),
+                        solver: Solver::with_grid(self.tech.grid_step()),
                         fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
@@ -2949,6 +3120,7 @@ impl<'a> ExecPass<'a> {
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
                         constraint_span_map: IndexMap::new(),
+                        var_span_map: IndexMap::new(),
                         var_dependents: IndexMap::new(),
                     }
                 )
@@ -3032,13 +3204,17 @@ impl<'a> ExecPass<'a> {
             if !progress {
                 let state = self.cell_state_mut(cell_id);
                 if state.unsolved_vars.is_none() {
-                    state.unsolved_vars = Some(state.solver.unsolved_vars().clone());
+                    let unsolved_vars = state.solver.unsolved_vars().clone();
+                    let span = unsolved_vars
+                        .iter()
+                        .find_map(|var| state.var_span_map.get(var).cloned());
+                    state.unsolved_vars = Some(unsolved_vars);
                     state.sse_basis = match state.solver.sparse_nullspace_vecs() {
                         Some(vectors) => SseBasis::Nullspace(vectors),
                         None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
                     };
                     self.errors.push(ExecError {
-                        span: None,
+                        span,
                         cell: cell_id,
                         kind: ExecErrorKind::Underconstrained,
                     });
@@ -3088,16 +3264,12 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
-        for var in self
-            .cell_state_mut(cell_id)
-            .solver
-            .invalid_rounding()
-            .clone()
-        {
+        for var in self.cell_state(cell_id).solver.off_grid_vars().clone() {
+            let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
             self.errors.push(ExecError {
-                span: None,
+                span,
                 cell: cell_id,
-                kind: ExecErrorKind::InvalidRounding(var),
+                kind: ExecErrorKind::OffGrid(var),
             });
         }
 
@@ -3117,7 +3289,7 @@ impl<'a> ExecPass<'a> {
         path: &FsPath,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
-        let imported = match import_gds(path, declared_name, self.lyp_file) {
+        let imported = match import_gds(path, declared_name, &self.tech) {
             Ok(imported) => imported,
             Err(error) => {
                 self.errors.push(ExecError {
@@ -4004,13 +4176,17 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
+    /// Converts an evaluated value into a cell argument. `Ok(None)` means the
+    /// value depends on solver variables that are not resolved yet, so the
+    /// conversion should be retried; `Err` means the value can never be passed
+    /// to a cell and an error has been recorded.
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
         dependent_vid: ValueId,
         val: &Value,
-    ) -> Option<CellArg> {
-        match val {
+    ) -> Result<Option<CellArg>, ()> {
+        Ok(match val {
             Value::Linear(v) => {
                 if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr(v) {
                     Some(CellArg::Float(f))
@@ -4023,13 +4199,28 @@ impl<'a> ExecPass<'a> {
             }
             Value::Int(i) => Some(CellArg::Int(*i)),
             Value::Bool(b) => Some(CellArg::Bool(*b)),
-            Value::Seq(s) => s
-                .iter()
-                .map(|v| self.cell_arg_from_value(cell_id, dependent_vid, v))
-                .collect::<Option<Vec<_>>>()
-                .map(CellArg::Seq),
-            v => unreachable!("invalid cell arg {v:?}"),
-        }
+            Value::String(s) => Some(CellArg::String(s.clone())),
+            Value::EnumValue(v) => Some(CellArg::Enum(v.clone())),
+            Value::SeqNil => Some(CellArg::Seq(Vec::new())),
+            Value::Seq(s) => {
+                let mut args = Vec::with_capacity(s.len());
+                for v in s.iter() {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => args.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Seq(args))
+            }
+            v => {
+                self.errors.push(ExecError {
+                    span: None,
+                    cell: cell_id,
+                    kind: ExecErrorKind::UnsupportedCellArgument(v.kind_name().to_owned()),
+                });
+                return Err(());
+            }
+        })
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -4091,10 +4282,10 @@ impl<'a> ExecPass<'a> {
                         let rect = Rect {
                             id,
                             layer,
-                            x0: state.solver.new_var().into(),
-                            y0: state.solver.new_var().into(),
-                            x1: state.solver.new_var().into(),
-                            y1: state.solver.new_var().into(),
+                            x0: state.new_solver_var(&span).into(),
+                            y0: state.new_solver_var(&span).into(),
+                            x1: state.new_solver_var(&span).into(),
+                            y1: state.new_solver_var(&span).into(),
                             construction: f == "crect",
                             span: Some(span.clone()),
                         };
@@ -4200,6 +4391,7 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let layer = layer.as_ref().unwrap_string().clone();
                         let point_spec = point_spec.clone();
+                        let span = self.span(&vref.loc, c.expr.span);
                         let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
                             Value::Int(count) => {
                                 let Ok(count) = usize::try_from(count) else {
@@ -4222,8 +4414,8 @@ impl<'a> ExecPass<'a> {
                                 (0..count)
                                     .map(|_| {
                                         (
-                                            state.solver.new_var().into(),
-                                            state.solver.new_var().into(),
+                                            state.new_solver_var(&span).into(),
+                                            state.new_solver_var(&span).into(),
                                         )
                                     })
                                     .collect()
@@ -4259,7 +4451,6 @@ impl<'a> ExecPass<'a> {
                         }
 
                         let id = self.object_id();
-                        let span = self.span(&vref.loc, c.expr.span);
                         let polygon = Polygon {
                             id,
                             layer,
@@ -4371,19 +4562,24 @@ impl<'a> ExecPass<'a> {
                             matches!(kwarg.name.name.as_str(), "end_extension" | "end_extensioni")
                         });
                         let state = self.cell_state_mut(cell_id);
-                        let width = state.solver.new_var().into();
+                        let width = state.new_solver_var(&span).into();
                         let begin_extension = if has_begin_extension {
-                            state.solver.new_var().into()
+                            state.new_solver_var(&span).into()
                         } else {
                             LinearExpr::from(0.)
                         };
                         let end_extension = if has_end_extension {
-                            state.solver.new_var().into()
+                            state.new_solver_var(&span).into()
                         } else {
                             LinearExpr::from(0.)
                         };
                         let points = (0..count)
-                            .map(|_| (state.solver.new_var().into(), state.solver.new_var().into()))
+                            .map(|_| {
+                                (
+                                    state.new_solver_var(&span).into(),
+                                    state.new_solver_var(&span).into(),
+                                )
+                            })
                             .collect();
                         let path = Path {
                             id,
@@ -4621,10 +4817,13 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "float" => {
-                    self.values.insert(
-                        vid,
-                        Defer::Ready(Value::Linear(LinearExpr::from(state.solver.new_var()))),
-                    );
+                    let span = Span {
+                        path: state.scopes[&vref.loc.scope].span.path.clone(),
+                        span: c.expr.span,
+                    };
+                    let var = state.new_solver_var(&span);
+                    self.values
+                        .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
                     true
                 }
                 "eq" => {
@@ -4976,8 +5175,8 @@ impl<'a> ExecPass<'a> {
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let inst = Instance {
                             id,
-                            x: state.solver.new_var().into(),
-                            y: state.solver.new_var().into(),
+                            x: state.new_solver_var(&span).into(),
+                            y: state.new_solver_var(&span).into(),
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
@@ -5040,29 +5239,29 @@ impl<'a> ExecPass<'a> {
                 _ => {
                     // Must be calling a cell generator.
                     // User functions are never deferred.
-                    let (arg_vals, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|arg_vid| {
-                            if let Defer::Ready(v) = self.values[arg_vid].clone() {
-                                if let Some(arg) = self.cell_arg_from_value(cell_id, *arg_vid, &v) {
-                                    Either::Left(arg)
-                                } else {
-                                    Either::Right(*arg_vid)
+                    let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
+                    let mut unready = Vec::new();
+                    for arg_vid in c.state.posargs.iter() {
+                        match self.values[arg_vid].clone() {
+                            Defer::Ready(v) => {
+                                match self.cell_arg_from_value(cell_id, *arg_vid, &v)? {
+                                    Some(arg) => arg_vals.push(arg),
+                                    None => unready.push(*arg_vid),
                                 }
-                            } else {
-                                Either::Right(*arg_vid)
                             }
-                        });
+                            _ => unready.push(*arg_vid),
+                        }
+                    }
                     if unready.is_empty() {
-                        let scope_name = format!(
-                            "{} cell {}",
-                            c.expr.scope_order,
-                            c.expr.func.path.iter().map(|ident| &ident.name).join("::")
-                        );
-                        let cell = self.execute_cell(
-                            c.expr.metadata.0.unwrap(),
-                            arg_vals,
-                            Some(scope_name),
-                        )?;
+                        let scope_name = (self.entry_cell != Some(cell_id)).then(|| {
+                            format!(
+                                "{} cell {}",
+                                c.expr.scope_order,
+                                c.expr.func.path.iter().map(|ident| &ident.name).join("::")
+                            )
+                        });
+                        let cell =
+                            self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {
@@ -5944,6 +6143,7 @@ impl<'a> ExecPass<'a> {
         Ok(progress)
     }
 
+    /// The bounding box of `cell`'s geometry, in `cell`'s own coordinate frame.
     pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
         let mut bbox = None;
         let cell = &self.compiled_cells[&cell];
@@ -5953,7 +6153,9 @@ impl<'a> ExecPass<'a> {
                 SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Path(p) => bbox = bbox_union(bbox, p.bbox()),
                 SolvedValue::Instance(i) => {
-                    let cell_bbox = self.bbox(i.cell).map(|r| r.transform(i.reflect, i.angle));
+                    let cell_bbox = self
+                        .bbox(i.cell)
+                        .map(|r| r.transform(i.reflect, i.angle).translate(i.x, i.y));
                     bbox = bbox_union(bbox, cell_bbox);
                 }
                 _ => (),
@@ -6045,7 +6247,31 @@ impl Value {
             CellArg::Int(i) => Value::Int(*i),
             CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            CellArg::String(s) => Value::String(s.clone()),
+            CellArg::Enum(v) => Value::EnumValue(v.clone()),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
+        }
+    }
+
+    /// Name of this value's kind, for diagnostics.
+    fn kind_name(&self) -> &'static str {
+        match self {
+            Self::EnumValue(_) => "enum variant",
+            Self::String(_) => "String",
+            Self::Linear(_) => "Float",
+            Self::Int(_) => "Int",
+            Self::Rect(_) => "Rect",
+            Self::Polygon(_) => "Polygon",
+            Self::Path(_) => "Path",
+            Self::Point(_) => "Point",
+            Self::Bool(_) => "Bool",
+            Self::Fn(_) => "function",
+            Self::CellFn(_) => "cell generator",
+            Self::Cell(_) => "cell",
+            Self::Inst(_) => "instance",
+            Self::Seq(_) | Self::SeqNil => "sequence",
+            Self::Tuple(_) => "tuple",
+            Self::Nil => "nil",
         }
     }
 
@@ -6348,7 +6574,7 @@ pub fn bbox_dim_union(
 pub struct CompiledData {
     pub cells: IndexMap<CellId, CompiledCell>,
     pub top: CellId,
-    pub layers: LayerProperties,
+    pub tech: crate::tech::Technology,
 }
 
 #[enumify(generics_only)]
@@ -6820,6 +7046,17 @@ impl Rect<f64> {
             y1: p0p.1.max(p1p.1),
             construction: self.construction,
             span: None,
+        }
+    }
+
+    /// Translates the rect by `(dx, dy)`.
+    fn translate(&self, dx: f64, dy: f64) -> Self {
+        Self {
+            x0: self.x0 + dx,
+            y0: self.y0 + dy,
+            x1: self.x1 + dx,
+            y1: self.y1 + dy,
+            ..self.clone()
         }
     }
 }
