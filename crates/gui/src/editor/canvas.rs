@@ -9561,7 +9561,9 @@ cell top() {
         assert!(
             planes
                 .stipple_on
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel == [255, 0, 0, 255]),
             "the unresolved pair is retained as one opaque border-colored strip"
         );
