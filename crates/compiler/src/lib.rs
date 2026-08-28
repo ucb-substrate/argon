@@ -1361,6 +1361,19 @@ mod tests {
     }
 
     #[test]
+    fn argon_sky130_technology_uses_klayout_units() {
+        let tech = crate::tech::read_tech(SKY130_TECH).unwrap();
+
+        // SKY130.lyt uses a 0.001 micron DBU, while the technology LEF uses a
+        // 0.005 micron manufacturing grid. Argon keeps source coordinates in
+        // nm, so those become one DBU per display unit and five DBUs per grid.
+        assert_relative_eq!(tech.dbu, 1e-9, epsilon = f64::EPSILON);
+        assert_eq!(tech.display_unit, 1);
+        assert_eq!(tech.grid, 5);
+        assert_relative_eq!(tech.grid_step(), 5., epsilon = f64::EPSILON);
+    }
+
+    #[test]
     fn argon_sky130_inverter() {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
