@@ -2,10 +2,7 @@ use enumify::enumify;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{
-    ast::Span,
-    solver::{ConstraintId, Var},
-};
+use crate::{ast::Span, solver::ConstraintId};
 
 use super::{CellId, CompiledData, Ty};
 
@@ -212,8 +209,37 @@ pub enum ExecErrorKind {
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
     /// A solved value is not sufficiently close to the technology grid.
-    #[error("solved value is off grid")]
-    OffGrid(Var),
+    ///
+    /// Carries the value and where it would snap to: rounding each variable
+    /// independently can break a constraint that couples them, so the numbers
+    /// are what tells an author whether the miss is floating-point noise or a
+    /// genuinely unrepresentable layout.
+    #[error("solved value {value} is off the {grid} grid (nearest grid point is {snapped})")]
+    OffGrid { value: f64, snapped: f64, grid: f64 },
+    /// A coordinate cannot be represented in the technology's database units.
+    ///
+    /// `f64 as i32` saturates in Rust, so without this check an out-of-range
+    /// coordinate becomes `i32::MAX` in the GDS and the run still reports
+    /// success -- two edges of a shape can collapse onto the same point.
+    #[error(
+        "coordinate {value} is outside the range representable in this technology's database units ({min} to {max})"
+    )]
+    CoordinateOutOfRange { value: f64, min: f64, max: f64 },
+    /// A path was given a negative width.
+    #[error("path width must not be negative, found {0}")]
+    NegativePathWidth(f64),
+    /// A path was given a negative begin or end extension.
+    #[error("path {end} extension must not be negative, found {value}")]
+    NegativePathExtension { end: String, value: f64 },
+    /// A text label contains a character a GDS `STRING` record cannot carry.
+    #[error("text label contains non-ASCII character `{character}`; GDS text is ASCII only")]
+    NonAsciiText { character: char },
+    /// A text label is longer than a GDS `STRING` record allows.
+    #[error("text label is {len} bytes, which exceeds the GDS limit of {limit}")]
+    TextTooLong { len: usize, limit: usize },
+    /// A range was given a zero step, which can never terminate.
+    #[error("range step must not be zero")]
+    ZeroRangeStep,
     /// A cell or instance has no bounding box.
     #[error("empty bbox")]
     EmptyBbox,

@@ -32,7 +32,11 @@ pub struct Solver {
     updated_vars: IndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
-    off_grid_vars: IndexSet<Var>,
+    /// Variables whose solved value missed the grid, with the value the
+    /// solver computed. Rounding each variable in isolation can break a
+    /// constraint that couples several of them, so the diagnostic needs the
+    /// number, not just the fact that a miss happened.
+    off_grid_vars: IndexMap<Var, f64>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
@@ -59,7 +63,7 @@ impl Default for Solver {
             updated_vars: IndexSet::new(),
             back_substitute_stack: Vec::new(),
             inconsistent_constraints: IndexSet::new(),
-            off_grid_vars: IndexSet::new(),
+            off_grid_vars: IndexMap::new(),
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
@@ -120,8 +124,15 @@ impl Solver {
     }
 
     #[inline]
-    pub fn off_grid_vars(&self) -> &IndexSet<Var> {
+    pub fn off_grid_vars(&self) -> &IndexMap<Var, f64> {
         &self.off_grid_vars
+    }
+
+    /// The snap-grid spacing this solver rounds solved values to, in source
+    /// coordinate units.
+    #[inline]
+    pub fn grid(&self) -> f64 {
+        self.grid
     }
 
     pub fn unsolved_vars(&self) -> &IndexSet<Var> {
@@ -181,7 +192,7 @@ impl Solver {
             } else {
                 let rounded_val = crate::tech::snap(val, self.grid);
                 if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(var);
+                    self.off_grid_vars.insert(var, val);
                 }
                 self.solve_var(var, rounded_val);
             }
@@ -389,7 +400,7 @@ impl Solver {
         }
         let rounded = crate::tech::snap(val, self.grid);
         if is_off_grid(val, rounded, self.grid) {
-            self.off_grid_vars.insert(var);
+            self.off_grid_vars.insert(var, val);
         }
         self.solve_var(var, rounded);
     }
@@ -557,7 +568,7 @@ impl Solver {
                 let val = sol[(i, 0)];
                 let rounded_val = crate::tech::snap(val, self.grid);
                 if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(*var);
+                    self.off_grid_vars.insert(*var, val);
                 }
                 self.solve_var(*var, rounded_val);
             }
@@ -1040,8 +1051,8 @@ mod tests {
 
         assert_relative_eq!(s.value_of(on_grid).unwrap(), 1.25, epsilon = EPSILON);
         assert_relative_eq!(s.value_of(off_grid).unwrap(), 1.25, epsilon = EPSILON);
-        assert!(!s.off_grid_vars().contains(&on_grid));
-        assert!(s.off_grid_vars().contains(&off_grid));
+        assert!(!s.off_grid_vars().contains_key(&on_grid));
+        assert!(s.off_grid_vars().contains_key(&off_grid));
     }
 
     /// Variables eliminated in an earlier `solve()` (before the closing constraint
