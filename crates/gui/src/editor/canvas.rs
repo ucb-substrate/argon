@@ -1398,7 +1398,7 @@ fn mark_tile_polygon(coverage: &mut [u8], width: u32, height: u32, points: &[Poi
             }
         }
         intersections.sort_by(f32::total_cmp);
-        for pair in intersections.chunks_exact(2) {
+        for pair in intersections.as_chunks::<2>().0 {
             let Some((x0, x1)) = raster_pixel_range(pair[0], pair[1], width) else {
                 continue;
             };
@@ -1815,7 +1815,7 @@ fn fill_raster_polygon(
             }
         }
         intersections.sort_by(f32::total_cmp);
-        for pair in intersections.chunks_exact(2) {
+        for pair in intersections.as_chunks::<2>().0 {
             let Some((x0, x1)) = raster_pixel_range(pair[0], pair[1], width) else {
                 continue;
             };
@@ -7833,7 +7833,9 @@ mod tests {
             );
         }
         let alphas = pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| pixel[3])
             .collect::<Vec<_>>();
         assert_eq!(alphas, [255, 0, 0, 0, 0, 255, 0, 0, 0, 0]);
@@ -8013,12 +8015,19 @@ mod tests {
         }
 
         assert_eq!(
-            buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0).count(),
+            buffer
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] != 0)
+                .count(),
             16
         );
         assert!(
             buffer
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| pixel[3] != 0)
                 .all(|pixel| pixel[3] == 128),
             "corners and straight edges must have identical alpha"
@@ -8142,7 +8151,12 @@ mod tests {
 
         assert_eq!(buffer[5 * 4 + 3], 64);
         assert_eq!(
-            buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0).count(),
+            buffer
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] != 0)
+                .count(),
             1
         );
     }
@@ -8177,7 +8191,7 @@ mod tests {
         };
         paint_raster_tile(&mut target, 2, 2, &primitive, &layer);
 
-        assert!(buffer.chunks_exact(4).all(|pixel| pixel[3] == 64));
+        assert!(buffer.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 64));
     }
 
     #[test]
@@ -8216,7 +8230,12 @@ mod tests {
         paint_raster_tile(&mut target, 5, 5, &primitive, &layer);
 
         assert_eq!(
-            buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0).count(),
+            buffer
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] != 0)
+                .count(),
             5
         );
     }
