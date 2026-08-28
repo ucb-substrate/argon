@@ -3006,7 +3006,10 @@ impl<'a> ExecPass<'a> {
         cell_id: CellId,
         span: &Span,
     ) -> Typed<String> {
-        let Some(value) = self.values[&arg].get_ready().map(|v| v.get_string().cloned()) else {
+        let Some(value) = self.values[&arg]
+            .get_ready()
+            .map(|v| v.get_string().cloned())
+        else {
             self.add_value_dependent(arg, dependent);
             return Typed::Pending;
         };
@@ -3571,7 +3574,11 @@ impl<'a> ExecPass<'a> {
                 .objects
                 .values()
                 .filter_map(|object| object.get_inst())
-                .filter(|inst| !self.values[&inst.cell].get_ready().is_some_and(Value::is_cell))
+                .filter(|inst| {
+                    !self.values[&inst.cell]
+                        .get_ready()
+                        .is_some_and(Value::is_cell)
+                })
                 .map(|inst| (inst.span.clone(), ExecErrorKind::InvalidType)),
         );
         // ...and `!` on an `Any` value is likewise unproven, as is `!` on a
@@ -4125,10 +4132,7 @@ impl<'a> ExecPass<'a> {
                         self.cell_names.insert(c.metadata.1, qualified);
                         assert!(
                             self.values
-                                .insert(
-                                    vid,
-                                    DeferValue::Ready(Value::CellFn(Box::new(c.clone()))),
-                                )
+                                .insert(vid, DeferValue::Ready(Value::CellFn(Box::new(c.clone()))),)
                                 .is_none()
                         );
                         assert!(
@@ -4743,12 +4747,8 @@ impl<'a> ExecPass<'a> {
                     ) {
                         let point_spec = point_spec.clone();
                         let span = self.span(&vref.loc, c.expr.span);
-                        let layer = match self.typed_string(
-                            c.state.posargs[0],
-                            vid,
-                            cell_id,
-                            &span,
-                        ) {
+                        let layer = match self.typed_string(c.state.posargs[0], vid, cell_id, &span)
+                        {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => return Ok(false),
                             Typed::Invalid => return Err(()),
@@ -5487,10 +5487,9 @@ impl<'a> ExecPass<'a> {
                             return Err(());
                         };
                         // Positional order is (p, n, value, coord, pstop, nstop).
-                        let [p, n, value, coord, pstop, nstop] = <[LinearExpr; 6]>::try_from(
-                            linears,
-                        )
-                        .expect("dimension takes six solver expressions");
+                        let [p, n, value, coord, pstop, nstop] =
+                            <[LinearExpr; 6]>::try_from(linears)
+                                .expect("dimension takes six solver expressions");
                         let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let expr = p.clone() - n.clone() - value.clone();
@@ -6224,8 +6223,8 @@ impl<'a> ExecPass<'a> {
                                         // `inst` on an `Any` argument, so its
                                         // parent is not known to be a cell.
                                         let Some(inst_cell_id) = cell.get_cell().copied() else {
-                                            let span = self
-                                                .span(&vref.loc, field_access_expr.expr.span);
+                                            let span =
+                                                self.span(&vref.loc, field_access_expr.expr.span);
                                             self.invalid_type(cell_id, &span);
                                             return Err(());
                                         };

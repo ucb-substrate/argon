@@ -2680,7 +2680,10 @@ mod tests {
 
     /// Writes `source` to a scratch library and parses it with the standard
     /// library, as the CLI does.
-    fn scratch_workspace(name: &str, source: &str) -> (tempfile::TempDir, crate::parse::ParseOutput) {
+    fn scratch_workspace(
+        name: &str,
+        source: &str,
+    ) -> (tempfile::TempDir, crate::parse::ParseOutput) {
         let dir = tempfile::tempdir().expect("create scratch workspace");
         let lib = dir.path().join("lib.ar");
         std::fs::write(&lib, source).expect("write scratch library");
@@ -2743,7 +2746,10 @@ mod tests {
         assert!(
             errors.iter().any(|error| matches!(
                 error,
-                StaticErrorKind::CallIncorrectPositionalArity { expected: 1, found: 0 }
+                StaticErrorKind::CallIncorrectPositionalArity {
+                    expected: 1,
+                    found: 0
+                }
             )),
             "{errors:#?}"
         );
@@ -2836,14 +2842,12 @@ mod tests {
     fn integer_arithmetic_is_checked() {
         // Raw operators panicked on a zero divisor in every profile and, on
         // overflow, panicked in debug but wrapped silently in release.
-        assert_reports(
-            &run_source("cell top() { let n = 1 / 0; }"),
-            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
-        );
-        assert_reports(
-            &run_source("cell top() { let n = 5 % 0; }"),
-            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
-        );
+        assert_reports(&run_source("cell top() { let n = 1 / 0; }"), |error| {
+            matches!(error, ExecErrorKind::DivideByZero(_))
+        });
+        assert_reports(&run_source("cell top() { let n = 5 % 0; }"), |error| {
+            matches!(error, ExecErrorKind::DivideByZero(_))
+        });
         assert_reports(
             &run_source("cell top() { let n = 9223372036854775807 + 1; }"),
             |error| matches!(error, ExecErrorKind::IntegerOverflow(_)),
@@ -2876,7 +2880,9 @@ mod tests {
         // The count had only a lower bound, so a large one aborted the process
         // on allocation failure, bypassing diagnostics entirely.
         assert_reports(
-            &run_source("cell top() { let p = polygon(\"met1\", 1000000000000000, x0=0., y0=0.)!; }"),
+            &run_source(
+                "cell top() { let p = polygon(\"met1\", 1000000000000000, x0=0., y0=0.)!; }",
+            ),
             |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
         );
         assert_reports(

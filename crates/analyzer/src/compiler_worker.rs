@@ -130,27 +130,27 @@ fn run(commands: mpsc::Receiver<Command>) {
                 // and the worker keeps its incremental state.
                 let identity = request.identity.clone();
                 let root_dir = request.root_dir.clone();
-                let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    compile(&mut compiler, request)
-                }))
-                .unwrap_or_else(|_| {
-                    error!("internal compiler error while compiling {root_dir:?}");
-                    // The panic may have left the incremental session
-                    // half-updated, so start a fresh one: losing the caches
-                    // costs a rebuild, keeping poisoned state costs
-                    // correctness.
-                    compiler = IncrementalCompiler::new();
-                    CompileResult {
-                        identity,
-                        config: WorkspaceConfig::new(root_dir.join("lib.ar")),
-                        root_dir,
-                        ast: WorkspaceParseAst::default(),
-                        output: None,
-                        messages: vec![
-                            "internal compiler error; see the Argon log for details".to_owned(),
-                        ],
-                    }
-                });
+                let result =
+                    panic::catch_unwind(AssertUnwindSafe(|| compile(&mut compiler, request)))
+                        .unwrap_or_else(|_| {
+                            error!("internal compiler error while compiling {root_dir:?}");
+                            // The panic may have left the incremental session
+                            // half-updated, so start a fresh one: losing the caches
+                            // costs a rebuild, keeping poisoned state costs
+                            // correctness.
+                            compiler = IncrementalCompiler::new();
+                            CompileResult {
+                                identity,
+                                config: WorkspaceConfig::new(root_dir.join("lib.ar")),
+                                root_dir,
+                                ast: WorkspaceParseAst::default(),
+                                output: None,
+                                messages: vec![
+                                    "internal compiler error; see the Argon log for details"
+                                        .to_owned(),
+                                ],
+                            }
+                        });
                 let _ = response.send(result);
             }
         }
