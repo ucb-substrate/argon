@@ -31,10 +31,10 @@ tracing = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+tempfile = { workspace = true }
 bincode = "1"
 
 [dev-dependencies]
 const_format = "0.2"
-tempfile.workspace = true
 pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }

@@ -121,7 +121,8 @@ mod tests {
 
     use crate::{
         compile::{
-            ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
+            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RectInitialCondition, SolvedValue,
+            StaticErrorKind, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -1529,7 +1530,7 @@ mod tests {
         let cells = cells.unwrap_exec_errors();
         assert_eq!(cells.errors.len(), 1);
         let error = cells.errors.first().unwrap();
-        assert!(matches!(error.kind, ExecErrorKind::OffGrid(_)));
+        assert!(matches!(error.kind, ExecErrorKind::OffGrid { .. }));
         let span = error
             .span
             .as_ref()
@@ -2997,6 +2998,274 @@ mod tests {
         assert_relative_eq!(drawn.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
         assert_relative_eq!(drawn.y1.0, 10., epsilon = EPSILON);
+    }
+
+    /// Every layout object in `cell`, in the order the exporter would walk it.
+    fn layout_objects(data: &CompiledData, cell: CellId) -> Vec<&SolvedValue> {
+        data.cells[&cell]
+            .objects
+            .values()
+            .filter(|object| object.is_layout())
+            .collect()
+    }
+
+    fn compile_top(source: &str) -> CompiledData {
+        let (_dir, output) = scratch_workspace("layout", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:#?}",
+            output.static_errors()
+        );
+        compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid()
+    }
+
+    #[test]
+    fn reading_a_coordinate_through_an_instance_does_not_duplicate_geometry() {
+        // `inst.member` builds a transformed proxy of the child's shape in the
+        // parent so the coordinate has something to name. The proxy landed in
+        // the parent's object map but never in its emission list, so the GUI
+        // (which walks emissions) looked right while the exporter (which walks
+        // objects) drew a phantom shape on top of every SREF -- once per
+        // field-access expression, so the multiplicity grew with coding style
+        // rather than with the design.
+        let data = compile_top(
+            "cell bot() {
+                 let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
+                 let p = polygon(\"met2\", 3, x0=0., y0=0., x1=10., y1=0., x2=5., y2=10.);
+                 let q = path(\"met3\", 2, width=10., begin_extension=0., end_extension=0.,
+                              x0=0., y0=0., x1=50., y1=0.);
+             }
+             cell top() {
+                 let i = inst(bot(), x=0., y=0.);
+                 let r0 = rect(\"met4\", x0=i.m.x0, y0=200., x1=i.m.x1, y1=250.);
+                 let r1 = rect(\"met4\", x0=i.p.points[0].x, y0=300., x1=i.p.points[1].x, y1=350.);
+                 let r2 = rect(\"met4\", x0=i.q.points[0].x, y0=400., x1=i.q.points[1].x, y1=450.);
+             }",
+        );
+        let objects = layout_objects(&data, data.top);
+        let rects = objects
+            .iter()
+            .filter(|object| matches!(object, SolvedValue::Rect(_)))
+            .count();
+        let instances = objects
+            .iter()
+            .filter(|object| matches!(object, SolvedValue::Instance(_)))
+            .count();
+        assert_eq!(rects, 3, "only the three declared rects are layout");
+        assert_eq!(instances, 1);
+        assert_eq!(
+            objects.len(),
+            4,
+            "no proxy polygon or path is drawn in the parent: {objects:#?}"
+        );
+    }
+
+    #[test]
+    fn a_construction_instance_contributes_no_geometry_through_a_projection() {
+        // The strictly worse variant: the instance itself is suppressed, so a
+        // proxy of its geometry appeared in the parent with no corresponding
+        // struct anywhere in the file.
+        let data = compile_top(
+            "cell bot() { let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=50.); }
+             cell top() {
+                 let i = inst(bot(), x=1000., y=0., construction=true);
+                 let r = rect(\"met2\", x0=i.m.x0, y0=0., x1=i.m.x1, y1=1.);
+             }",
+        );
+        assert_eq!(layout_objects(&data, data.top).len(), 1);
+    }
+
+    #[test]
+    fn emitting_a_projection_flattens_that_one_shape_into_the_parent() {
+        // `!` on a projection is an explicit request to draw the child's shape
+        // in the parent as well, so it opts back out of construction. The
+        // second case goes through a function that *selects* a proxy built
+        // earlier rather than building one, which is why the decision is made
+        // from the resolved emission list rather than where the proxy is
+        // constructed.
+        let data = compile_top(
+            "fn second(lst: [Any]) -> Any { head(tail(lst)) }
+             cell bot() {
+                 let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
+                 let n = rect(\"met1\", x0=200., y0=0., x1=300., y1=100.);
+                 let both = list(m, n);
+             }
+             cell top() {
+                 let i = inst(bot(), x=1000., y=0.);
+                 i.m!;
+                 second(i.both)!;
+                 let unused = i.n.x0;
+             }",
+        );
+        let drawn = layout_objects(&data, data.top)
+            .iter()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x0.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // `i.m!` and `second(i.both)!` are drawn; the bare `i.n.x0` read is not.
+        assert_eq!(drawn.len(), 2, "{drawn:?}");
+        assert!(drawn.contains(&1000.), "{drawn:?}");
+        assert!(drawn.contains(&1200.), "{drawn:?}");
+    }
+
+    #[test]
+    fn out_of_range_coordinates_are_rejected_rather_than_saturated() {
+        // `f64 as i32` saturates, so an unchecked coordinate became
+        // `2147483647` in the GDS -- collapsing both edges of this rect onto
+        // one point -- while the run still reported success.
+        let errors = run_source(
+            "cell top() { let a = rect(\"met1\", x0=3000000000., y0=0., x1=4000000000., y1=10.); }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::CoordinateOutOfRange { .. })
+        });
+    }
+
+    #[test]
+    fn text_coordinates_are_checked_against_the_grid() {
+        // A text position can be built entirely from constants, so it is the
+        // one coordinate that never becomes a solver variable -- and the
+        // solver's grid check only looks at variables. The label used to be
+        // snapped silently on export.
+        let errors = run_source(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 text(\"t\", \"met1\", 0.04, 0.06);
+             }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::OffGrid { .. })
+        });
+        assert!(
+            run_source(
+                "cell top() {
+                     let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                     text(\"t\", \"met1\", 0.1, 5.);
+                 }"
+            )
+            .is_empty(),
+            "an on-grid label still compiles"
+        );
+    }
+
+    #[test]
+    fn off_grid_diagnostics_carry_the_value_and_where_it_snapped_to() {
+        // Rounding each variable in isolation can break a constraint coupling
+        // them; the bare "invalid rounding" text gave an author no way to tell
+        // floating-point noise from an unrepresentable layout.
+        let errors = run_source(
+            "cell top() {
+                 let a = rect(\"met1\", y0=0., y1=10., x0=0.);
+                 let b = rect(\"met2\", y0=0., y1=10., x0=0.);
+                 eq(a.x1 + b.x1, 1.);
+                 eq(a.x1 - b.x1, 0.9);
+             }",
+        );
+        let reported = errors
+            .iter()
+            .find_map(|error| match error {
+                ExecErrorKind::OffGrid {
+                    value,
+                    snapped,
+                    grid,
+                } => Some((*value, *snapped, *grid)),
+                _ => None,
+            })
+            .expect("the coupled solution rounds off grid");
+        let (value, snapped, grid) = reported;
+        assert_relative_eq!(grid, 0.1, epsilon = EPSILON);
+        assert_relative_eq!(value, 0.05, epsilon = 1e-9);
+        assert_relative_eq!(snapped, 0., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn negative_path_dimensions_are_rejected() {
+        // The width was silently absolutized and the extensions passed
+        // straight through as a negative BGNEXTN/ENDEXTN.
+        let errors = run_source(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=-10., begin_extension=0., end_extension=0.,
+                              x0=0., y0=0., x1=100., y1=0.);
+             }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::NegativePathWidth(_))
+        });
+        let errors = run_source(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=10., begin_extension=-5., end_extension=-5.,
+                              x0=0., y0=0., x1=100., y1=0.);
+             }",
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| matches!(error, ExecErrorKind::NegativePathExtension { .. }))
+                .count(),
+            2,
+            "both ends are reported: {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn text_outside_the_gds_character_set_or_length_is_rejected() {
+        // A GDS STRING record is a byte string with no encoding negotiation,
+        // and its length limit is counted in bytes, not characters.
+        let errors = run_source(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 text(\"héllo\", \"met1\", 0., 5.);
+             }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::NonAsciiText { character: 'é' })
+        });
+        let long = "a".repeat(MAX_TEXT_LEN + 1);
+        let errors = run_source(&format!(
+            "cell top() {{
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 text(\"{long}\", \"met1\", 0., 5.);
+             }}"
+        ));
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::TextTooLong { .. })
+        });
+    }
+
+    #[test]
+    fn a_descending_range_counts_down_and_a_zero_step_is_rejected() {
+        // `range_full`'s loop was guarded by `if step > 0` with no `else`, so
+        // the natural descending range silently produced an empty sequence.
+        let data = compile_top(
+            "cell top() {
+                 for i in range_full(3, 0, -1) {
+                     rect(\"met1\", x0=(i as Float) * 10., y0=0., x1=(i as Float) * 10. + 5., y1=5.);
+                 }
+             }",
+        );
+        let mut lefts = layout_objects(&data, data.top)
+            .iter()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x0.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        lefts.sort_by(f64::total_cmp);
+        assert_eq!(lefts, vec![10., 20., 30.]);
+
+        assert_reports(
+            &run_source("cell top() { for i in range_full(0, 3, 0) { float(); } }"),
+            |error| matches!(error, ExecErrorKind::ZeroRangeStep),
+        );
     }
 }
 pub mod cli;
