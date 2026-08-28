@@ -20,7 +20,8 @@ use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::{
-        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save, Undo,
+        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save,
+        ShowMessages, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -30,6 +31,9 @@ use crate::{
 pub mod canvas;
 pub mod input;
 pub mod toolbars;
+
+pub(crate) const SOURCE_EDIT_REJECTED_MESSAGE: &str =
+    "Could not apply the source edit. Press Ctrl-Shift-M to view the detailed error in Neovim.";
 
 #[derive(Clone)]
 pub struct LayerState {
@@ -79,6 +83,7 @@ pub struct EditorState {
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
     pub fatal_error: Option<SharedString>,
+    pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
     pub hide_external_geometry: bool,
@@ -86,6 +91,27 @@ pub struct EditorState {
     pub lang_server_client: SyncLangServerClient,
     pub subscriptions: Vec<Subscription>,
     pub(crate) tool: Entity<ToolState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EditorMessage {
+    pub typ: MessageType,
+    pub text: SharedString,
+}
+
+fn compile_error_summary(output: &CompileOutput) -> Option<String> {
+    let diagnostics = argonc::diagnostics::from_compile_output(output);
+    let first = diagnostics.first()?;
+    let remaining = diagnostics.len() - 1;
+    Some(if remaining == 0 {
+        first.message.clone()
+    } else {
+        format!(
+            "{} (and {remaining} more error{})",
+            first.message,
+            if remaining == 1 { "" } else { "s" }
+        )
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +176,15 @@ impl EditorState {
             &DARK_THEME
         } else {
             &LIGHT_THEME
+        }
+    }
+
+    pub fn show_message(&mut self, typ: MessageType, message: impl Into<SharedString>) {
+        if typ != MessageType::LOG {
+            self.message = Some(EditorMessage {
+                typ,
+                text: message.into(),
+            });
         }
     }
     fn process_scope(
@@ -300,6 +335,8 @@ impl EditorState {
         );
     }
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
+        let error_summary = compile_error_summary(&output).map(SharedString::from);
+        let mut recoverable_error = None;
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -307,16 +344,14 @@ impl EditorState {
                 errors,
             }) => {
                 if errors.iter().any(|error| error.kind.is_invalid_cell()) {
-                    let _ = self
-                        .lang_server_client
-                        .show_message(MessageType::ERROR, "Open cell is invalid");
-                    self.fatal_error = Some(SharedString::from("open cell is invalid"));
+                    self.fatal_error = error_summary;
                     return;
                 }
+                recoverable_error = error_summary;
                 d
             }
             _ => {
-                self.fatal_error = Some(SharedString::from("static compile errors encountered"));
+                self.fatal_error = error_summary;
                 return;
             }
         };
@@ -384,6 +419,10 @@ impl EditorState {
             cx.notify();
         });
         self.fatal_error = None;
+        self.message = recoverable_error.map(|text| EditorMessage {
+            typ: MessageType::ERROR,
+            text,
+        });
     }
 }
 
@@ -416,6 +455,7 @@ impl Editor {
                 workspace_modified: false,
                 compilation_revision: None,
                 fatal_error: None,
+                message: None,
                 connection_error: None,
                 solved_cell,
                 hide_external_geometry: false,
@@ -621,6 +661,10 @@ impl Editor {
         self.open_invoking_command(None, cx);
     }
 
+    fn show_messages(&mut self, _: &ShowMessages, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_invoking_command(Some("messages<CR>"), cx);
+    }
+
     fn instantiate_command(
         &mut self,
         _: &InstantiateCommand,
@@ -675,6 +719,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))
+            .on_action(cx.listener(Self::show_messages))
             .on_action(cx.listener(Self::instantiate_command))
             .on_action(cx.listener(Self::open_cell_command))
             .font_family("Zed Plex Sans")
@@ -713,10 +758,29 @@ impl Render for Editor {
                             state
                                 .connection_error
                                 .clone()
-                                .map(|error| (error, true))
-                                .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                                .map(|error| ("Connection error", error, true, true))
+                                .or_else(|| {
+                                    state
+                                        .fatal_error
+                                        .clone()
+                                        .map(|error| ("Error", error, false, true))
+                                })
+                                .or_else(|| {
+                                    state.message.clone().map(|message| {
+                                        let title = if message.typ == MessageType::ERROR {
+                                            "Error"
+                                        } else if message.typ == MessageType::WARNING {
+                                            "Warning"
+                                        } else {
+                                            "Message"
+                                        };
+                                        (title, message.text, false, false)
+                                    })
+                                })
                         };
-                        if let Some((error, is_connection_error)) = displayed_error {
+                        if let Some((title, error, is_connection_error, editing_disabled)) =
+                            displayed_error
+                        {
                             d = d.child(
                                 div()
                                     .id("error_modal")
@@ -736,16 +800,35 @@ impl Render for Editor {
                                                 .mr_1()
                                                 .text_color(theme.error)).child(div().flex_1())
                                         )
-                                        .child(div().child("Error"))
+                                        .child(div().child(title))
                                     )
-                                    .child(format!("Editing may be disabled due to error: {error}."))
-                                    .child(div().text_xs().text_color(theme.subtext).child(
-                                        if is_connection_error {
-                                            "This message will disappear when the connection recovers."
-                                        } else {
-                                            "Fix the error and save in the editor to dismiss."
-                                        }
-                                    ))
+                                    .child(error)
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme.subtext)
+                                            .child(if is_connection_error {
+                                                "Editing is disabled until the connection recovers."
+                                            } else if editing_disabled {
+                                                "Editing is disabled until this error is fixed."
+                                            } else {
+                                                "The last operation was not completed."
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("show_error_details")
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(theme.text)
+                                            .child("View details in Neovim (Ctrl-Shift-M)")
+                                            .on_click(cx.listener(|editor, _, _, cx| {
+                                                editor.open_invoking_command(
+                                                    Some("messages<CR>"),
+                                                    cx,
+                                                );
+                                            })),
+                                    )
                                     .whitespace_normal()
                                     .top_2()
                                     .left_2()
@@ -763,3 +846,46 @@ impl Render for Editor {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use argonc::{
+        ast::Span,
+        compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
+    };
+
+    use super::compile_error_summary;
+
+    #[test]
+    fn compile_error_summary_shows_the_first_error_and_remaining_count() {
+        let span = Span {
+            path: PathBuf::from("lib.ar"),
+            span: cfgrammar::Span::new(0, 1),
+        };
+        let output = CompileOutput::StaticErrors(StaticErrorCompileOutput {
+            errors: vec![
+                StaticError {
+                    span: span.clone(),
+                    kind: StaticErrorKind::UndeclaredVar {
+                        name: "missing".to_owned(),
+                    },
+                },
+                StaticError {
+                    span,
+                    kind: StaticErrorKind::InvalidKwArg,
+                },
+            ],
+        });
+
+        assert_eq!(
+            compile_error_summary(&output).as_deref(),
+            Some("`missing` is not declared in this scope (and 1 more error)")
+        );
+        assert_eq!(
+            compile_error_summary(&CompileOutput::FatalParseErrors).as_deref(),
+            Some("fatal parse errors encountered")
+        );
+    }
+}

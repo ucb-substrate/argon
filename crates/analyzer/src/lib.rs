@@ -690,10 +690,7 @@ impl Backend {
             if !self.state.is_latest_compile_request(&identity).await {
                 return None;
             }
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, message)
-                .await;
+            self.state.report_message(MessageType::ERROR, message).await;
         }
         for (uri, diagnostics) in current_diagnostics {
             if !self.state.is_latest_compile_request(&identity).await {
