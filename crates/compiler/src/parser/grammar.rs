@@ -823,32 +823,45 @@ impl<'a> Parser<'a> {
         let lhs_start = self.cur.start;
         let mut lhs = self.parse_prefix();
 
+        // The loop folds each suffix/infix operator into `lhs`, so it deepens
+        // the tree by one level per iteration *without* recursing. Charging
+        // each fold to the same depth budget is what makes the guard measure
+        // the AST that later passes recurse over, rather than only the
+        // parser's own stack: `1+1+1+...` and `a.f.f.f...` are as deep as
+        // `f(f(f(...)))`, and the post-parse walks overflow on them alike.
+        let mut folds = 0u32;
         loop {
             let k = self.cur.kind;
-            // Suffix cluster (binds tightest).
-            if SUFFIX_BP >= min_bp
+            let is_suffix = SUFFIX_BP >= min_bp
                 && matches!(
                     k,
                     TokenKind::Dot | TokenKind::LBrack | TokenKind::Bang | TokenKind::KwAs
-                )
-            {
+                );
+            let infix = infix_op(k).filter(|(_, l_bp, _)| *l_bp >= min_bp);
+            if !is_suffix && infix.is_none() {
+                break;
+            }
+            if !self.enter_depth() {
+                self.error_at(
+                    self.span(self.cur),
+                    "expression nesting too deep".to_string(),
+                );
+                break;
+            }
+            folds += 1;
+            if is_suffix {
                 lhs = self.parse_suffix(lhs, lhs_start);
                 continue;
             }
-            // Infix binary / comparison.
-            if let Some((op, l_bp, r_bp)) = infix_op(k) {
-                if l_bp < min_bp {
-                    break;
-                }
-                self.bump();
-                let rhs = self.parse_expr(r_bp);
-                lhs = self.make_infix(op, lhs, rhs, lhs_start);
-                continue;
-            }
-            break;
+            let (op, _, r_bp) = infix.expect("not a suffix, so an infix operator");
+            self.bump();
+            let rhs = self.parse_expr(r_bp);
+            lhs = self.make_infix(op, lhs, rhs, lhs_start);
         }
 
-        self.exit_depth();
+        for _ in 0..=folds {
+            self.exit_depth();
+        }
         lhs
     }
 

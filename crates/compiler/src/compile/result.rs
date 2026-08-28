@@ -128,6 +128,9 @@ pub enum StaticErrorKind {
     /// The requested type cast is invalid.
     #[error("invalid type cast")]
     InvalidCast,
+    /// A value that is not a layout element was emitted with `!`.
+    #[error("type {0:?} cannot be emitted; `!` requires a rect, polygon, path, or instance")]
+    CannotEmit(Ty),
     /// A referenced module does not exist in the loaded workspace.
     #[error("module `{module}` does not exist or could not be loaded")]
     InvalidMod { module: String },
@@ -226,6 +229,24 @@ pub enum ExecErrorKind {
     /// A path does not contain enough centerline points.
     #[error("a path requires at least two points")]
     InvalidPath,
+    /// A value that is not a layout element was emitted with `!`.
+    #[error("emitted value is not a rect, polygon, path, or instance")]
+    CannotEmit,
+    /// Function inlining or cell instantiation nested too deeply.
+    #[error("recursion limit of {limit} exceeded")]
+    RecursionLimitExceeded { limit: u32 },
+    /// A shape, sequence, or iteration count exceeded a compiler limit.
+    #[error("{what} exceeds the maximum of {limit}")]
+    LimitExceeded { what: String, limit: usize },
+    /// A float computation produced a NaN or an infinity.
+    #[error("expression is not a finite number (check for division by zero)")]
+    NonFiniteValue,
+    /// An integer division or remainder had a zero divisor.
+    #[error("integer {0} by zero")]
+    DivideByZero(String),
+    /// An integer operation overflowed `Int` (`i64`).
+    #[error("integer overflow in `{0}`")]
+    IntegerOverflow(String),
     /// An operation received an incompatible runtime value.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,

@@ -12,6 +12,29 @@ pub mod workspace;
 
 pub use workspace::WorkspaceConfig;
 
+/// Native stack reserved for compilation.
+///
+/// The evaluator recurses natively for inlined `fn` calls and for nested cell
+/// instantiation, and both overflow the default stack well before
+/// `compile::MAX_EVAL_DEPTH`. A stack overflow aborts the process rather than
+/// unwinding, so no `catch_unwind` can turn it into a diagnostic: the stack
+/// has to be large enough that the depth limit is what stops the descent.
+pub const COMPILE_STACK_SIZE: usize = 1024 * 1024 * 1024;
+
+/// Runs `f` on a thread with [`COMPILE_STACK_SIZE`] of stack, propagating a
+/// panic to the caller so `catch_unwind` still sees it.
+pub fn run_with_stack<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let handle = std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(COMPILE_STACK_SIZE)
+        .spawn(f)
+        .expect("spawn compilation thread");
+    match handle.join() {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// A global allocator that tracks live and peak heap usage so that the scaling
 /// benchmarks in the test module can report memory consumption alongside
 /// runtime. It forwards every request to the system allocator and only adds
@@ -2645,6 +2668,335 @@ mod tests {
         })
         .expect("failed to run drc");
         assert!(data.rule_checks.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for inputs that used to abort the compiler.
+    //
+    // Every case below reached a panic, a stack overflow, an allocation abort,
+    // or a non-terminating solve from source that `--check` accepted. They are
+    // grouped here because the invariant they share is the point: a user's
+    // source must never take down the compiler, only produce a diagnostic.
+
+    /// Writes `source` to a scratch library and parses it with the standard
+    /// library, as the CLI does.
+    fn scratch_workspace(
+        name: &str,
+        source: &str,
+    ) -> (tempfile::TempDir, crate::parse::ParseOutput) {
+        let dir = tempfile::tempdir().expect("create scratch workspace");
+        let lib = dir.path().join("lib.ar");
+        std::fs::write(&lib, source).expect("write scratch library");
+        let _ = name;
+        let output = parse_workspace_with_std(&lib);
+        (dir, output)
+    }
+
+    /// The static errors `--check` would report for `source`.
+    fn check_source(source: &str) -> Vec<StaticErrorKind> {
+        let (_dir, output) = scratch_workspace("check", source);
+        let parse_errors = output.static_errors();
+        if !parse_errors.is_empty() {
+            return parse_errors.into_iter().map(|error| error.kind).collect();
+        }
+        let (_, errors) = static_compile(&output.ast()).expect("source must parse");
+        errors.errors.into_iter().map(|error| error.kind).collect()
+    }
+
+    /// Executes `top()` in `source` and returns the execution errors, which is
+    /// empty when the cell compiles cleanly.
+    fn run_source(source: &str) -> Vec<ExecErrorKind> {
+        let (_dir, output) = scratch_workspace("run", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "source must parse to exercise the evaluator: {:#?}",
+            output.static_errors()
+        );
+        let compiled = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        match compiled {
+            CompileOutput::ExecErrors(errors) => {
+                errors.errors.into_iter().map(|error| error.kind).collect()
+            }
+            CompileOutput::StaticErrors(errors) => {
+                panic!("source must check cleanly to exercise the evaluator: {errors:#?}")
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn assert_reports(errors: &[ExecErrorKind], predicate: impl Fn(&ExecErrorKind) -> bool) {
+        assert!(
+            errors.iter().any(predicate),
+            "expected a diagnostic, got {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn bbox_without_arguments_reports_arity_instead_of_panicking() {
+        // Indexing the argument slice after `assert_eq_arity` merely records a
+        // diagnostic made a one-token typo crash `--check`, the path the
+        // language server runs on every keystroke.
+        let errors = check_source("cell top() { let b = bbox(); }");
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::CallIncorrectPositionalArity {
+                    expected: 1,
+                    found: 0
+                }
+            )),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_branch_types_are_rejected() {
+        // `Ty::lub` used to widen a mismatch to `Ty::Any`, which satisfies
+        // every later check and deferred the failure to an evaluator `unwrap`.
+        for source in [
+            "cell top() { let a = float(); let n = if a < 1. { 1 } else { 2. }; eq(a, n); }",
+            "enum E { A, B }
+             cell top() { let v = E::A; let n = match v { E::A => 1, E::B => 2., }; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BranchesDifferentTypes)),
+                "{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heterogeneous_list_elements_are_rejected() {
+        let errors = check_source("cell top() { let a = list(1., 2); }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::IncorrectTy { .. })),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn match_on_any_still_checks_its_arms() {
+        // The arm checks used to be conditional on a statically known enum
+        // scrutinee, which `Any` never is -- and `Any` is the common case,
+        // because cell and instance types cannot be named.
+        let non_exhaustive = check_source(
+            "enum E { A, B }
+             cell top(v: Any) { let n = match v { E::A => 1, }; }",
+        );
+        assert!(
+            non_exhaustive
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::MatchArmsNotComprehensive)),
+            "{non_exhaustive:#?}"
+        );
+
+        let duplicated = check_source(
+            "enum E { A, B }
+             cell top(v: Any) { let n = match v { E::A => 1, E::A => 2, E::B => 3, }; }",
+        );
+        assert!(
+            duplicated
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::DuplicateMatchArm)),
+            "{duplicated:#?}"
+        );
+    }
+
+    #[test]
+    fn only_layout_elements_can_be_emitted() {
+        // `!` imposed no type restriction, while the evaluator asserted the
+        // value was a single element.
+        for source in [
+            "cell top() { let v = 1!; }",
+            "cell top() { let v = \"hi\"!; }",
+            "cell bot() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+             cell top() { let v = bot()!; }",
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
+                 let b = rect(\"met2\", x0=0., y0=0., x1=1., y1=1.);
+                 let s = list(a, b)!;
+             }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::CannotEmit(_))),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_arithmetic_is_checked() {
+        // Raw operators panicked on a zero divisor in every profile and, on
+        // overflow, panicked in debug but wrapped silently in release.
+        assert_reports(&run_source("cell top() { let n = 1 / 0; }"), |error| {
+            matches!(error, ExecErrorKind::DivideByZero(_))
+        });
+        assert_reports(&run_source("cell top() { let n = 5 % 0; }"), |error| {
+            matches!(error, ExecErrorKind::DivideByZero(_))
+        });
+        assert_reports(
+            &run_source("cell top() { let n = 9223372036854775807 + 1; }"),
+            |error| matches!(error, ExecErrorKind::IntegerOverflow(_)),
+        );
+        assert_reports(
+            &run_source("cell top() { let n = -(-9223372036854775807 - 1); }"),
+            |error| matches!(error, ExecErrorKind::IntegerOverflow(_)),
+        );
+    }
+
+    #[test]
+    fn non_finite_values_are_rejected_before_the_solver() {
+        // A non-finite coefficient reaching the dense SVD fallback never
+        // converges: `Matrix::svd` passes `max_niter = 0`, which that loop
+        // treats as no limit at all. A hang is not catchable, so the value has
+        // to be rejected where it is created.
+        assert_reports(
+            &run_source(
+                "cell top() {
+                     let a = rect(\"met1\", x0=0., y0=0., y1=1.);
+                     eq(a.x1, 1. / 0.);
+                 }",
+            ),
+            |error| matches!(error, ExecErrorKind::NonFiniteValue),
+        );
+    }
+
+    #[test]
+    fn shape_point_counts_are_bounded() {
+        // The count had only a lower bound, so a large one aborted the process
+        // on allocation failure, bypassing diagnostics entirely.
+        assert_reports(
+            &run_source(
+                "cell top() { let p = polygon(\"met1\", 1000000000000000, x0=0., y0=0.)!; }",
+            ),
+            |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
+        );
+        assert_reports(
+            &run_source(
+                "cell top() { let p = path(\"met1\", 1000000000000000, width=1., x0=0., y0=0.)!; }",
+            ),
+            |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
+        );
+    }
+
+    #[test]
+    fn eager_function_recursion_reports_a_limit() {
+        // `if`/`match` branches are deferred onto the worklist, but a `fn` call
+        // is inlined eagerly, so a recursive call outside a branch has no
+        // terminating case and used to abort the process.
+        //
+        // Run on a compilation-sized stack, as the CLI and the analyzer worker
+        // do: the depth limit is what must stop the descent, and the default
+        // test-thread stack is too small to reach it.
+        let errors = crate::run_with_stack("argon-compile", || {
+            run_source(
+                "fn f(n: Int) -> Int { let m = f(n-1); if n <= 0 { 0 } else { m } }
+                 cell top() { let k = f(3); }",
+            )
+        });
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::RecursionLimitExceeded { .. })
+        });
+    }
+
+    #[test]
+    fn any_typed_arguments_report_a_type_error_rather_than_panicking() {
+        // `Ty::Any` satisfies every static check, so each builtin has to test
+        // the runtime type itself.
+        for source in [
+            "fn mk() -> Any { 3 }
+             cell top() { text(mk(), \"met1.label\", 0., 0.); }",
+            "fn e(a: Any, b: Any) { eq(a, b); }
+             cell top() { e(1, 2); }",
+            "fn mk() -> Any { 3 }
+             cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=mk(), y1=1.)!; }",
+            "fn f(c: Any) -> Any { inst(c) }
+             cell top() { let i = f(5.); }",
+            "fn f(c: Any) -> Any { inst(c) }
+             cell top() { let i = f(5.); let v = i.foo; }",
+        ] {
+            assert_reports(&run_source(source), |error| {
+                matches!(error, ExecErrorKind::InvalidType)
+            });
+        }
+    }
+
+    #[test]
+    fn flat_operator_chains_are_depth_limited() {
+        // The parser's depth guard only covered *nested* input. A flat chain is
+        // folded iteratively, so it kept `self.depth` at 1 while building an
+        // arbitrarily deep tree that the post-parse AST walks then recursed
+        // over -- an uncatchable stack overflow at around 900 terms.
+        for source in [
+            format!("cell top() {{ let v = {}; }}", vec!["1"; 2000].join("+")),
+            format!("cell top() {{ let v = {}; }}", vec!["1"; 2000].join("*")),
+            format!(
+                "cell top() {{ let a = rect(\"met1\"); let v = a{}; }}",
+                ".f".repeat(2000)
+            ),
+        ] {
+            let (_dir, output) = scratch_workspace("chain", &source);
+            assert!(
+                output
+                    .static_errors()
+                    .iter()
+                    .any(|error| error.kind.to_string().contains("nesting too deep")),
+                "{:#?}",
+                output.static_errors()
+            );
+        }
+    }
+
+    #[test]
+    fn bbox_excludes_construction_geometry() {
+        // `bbox` used to include construction geometry that the GDS exporter
+        // drops, so a placement computed from it did not match the output.
+        let source = "cell bot() {
+                          let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;
+                          let c = crect(layer=\"met2\", x0=-500., y0=-500., x1=500., y1=500.);
+                      }
+                      cell top() {
+                          let b = bot();
+                          let bb = bbox(b);
+                          let m = rect(\"met3\", x0=bb.x0, y0=bb.y0, x1=bb.x1, y1=bb.y1)!;
+                      }";
+        let (_dir, output) = scratch_workspace("bbox", source);
+        assert!(output.static_errors().is_empty());
+        let compiled = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        let data = compiled.unwrap_valid();
+        let top = &data.cells[&data.top];
+        let drawn = top
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) if !rect.construction => Some(rect),
+                _ => None,
+            })
+            .expect("top emits one drawn rectangle");
+        assert_relative_eq!(drawn.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(drawn.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
+        assert_relative_eq!(drawn.y1.0, 10., epsilon = EPSILON);
     }
 }
 pub mod cli;
