@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 dyn-stack = { version = "0.13.2", default-features = false, features = ["alloc"] }
 faer = { version = "0.24.4", default-features = false, features = ["std", "sparse-linalg"] }

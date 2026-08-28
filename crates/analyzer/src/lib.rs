@@ -27,7 +27,7 @@ use futures::prelude::*;
 use indexmap::IndexMap;
 use rpc::{CompilationSnapshot, GuiClient, InstancePreview, LangServer, insert_statement};
 use serde::{Deserialize, Serialize};
-use tarpc::{context, server::Channel, tokio_serde::formats::Json};
+use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader},
     process::{Child, Command},
@@ -657,14 +657,17 @@ impl Backend {
         self.publish_compilation(result).await
     }
 
-    async fn publish_compilation(&self, result: CompileResult) -> Option<CompilationSnapshot> {
+    async fn publish_compilation(&self, mut result: CompileResult) -> Option<CompilationSnapshot> {
         let identity = result.identity.clone();
         if !self.state.is_latest_compile_request(&identity).await {
             return None;
         }
         let mut current_diagnostics =
             diagnostics(&result.root_dir, &result.ast, result.output.as_ref());
-        let snapshot = result.output.clone().map(|output| CompilationSnapshot {
+        // The compiled GDS can contain millions of geometry values. Move it
+        // into the RPC snapshot after diagnostics have borrowed it instead of
+        // deep-cloning the complete layout immediately before serialization.
+        let snapshot = result.output.take().map(|output| CompilationSnapshot {
             revision: identity.revision,
             output,
         });
@@ -690,10 +693,7 @@ impl Backend {
             if !self.state.is_latest_compile_request(&identity).await {
                 return None;
             }
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, message)
-                .await;
+            self.state.report_message(MessageType::ERROR, message).await;
         }
         for (uri, diagnostics) in current_diagnostics {
             if !self.state.is_latest_compile_request(&identity).await {
@@ -834,10 +834,16 @@ impl Notification for FocusEditor {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        #[allow(deprecated)]
-        let root_dir = params
-            .root_uri
-            .and_then(|root| root.to_file_path().map(|path| path.into_owned()));
+        let root_uri = params
+            .workspace_folders
+            .and_then(|folders| folders.into_iter().next())
+            .map(|folder| folder.uri);
+        #[expect(
+            deprecated,
+            reason = "root_uri remains necessary for LSP clients without workspaceFolders support"
+        )]
+        let root_uri = root_uri.or(params.root_uri);
+        let root_dir = root_uri.and_then(|root| root.to_file_path().map(|path| path.into_owned()));
         if let Some(root_dir) = root_dir {
             let _ = self.state.root_dir.set(root_dir);
             let connection = self.state.gui_connection().await;
@@ -1524,7 +1530,7 @@ pub async fn main_with_io_on_listener<I, O>(
     O: AsyncWrite,
 {
     let mut listener =
-        match tarpc::serde_transport::tcp::listen_on(rpc_listener, Json::default).await {
+        match tarpc::serde_transport::tcp::listen_on(rpc_listener, Bincode::default).await {
             Ok(listener) => listener,
             Err(error) => {
                 eprintln!("failed to configure analyzer RPC listener: {error}");

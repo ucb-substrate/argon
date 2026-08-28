@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 analyzer = { package = "argon-analyzer", path = "../analyzer" }
 argonc = { path = "../compiler" }
@@ -12,3 +15,4 @@ futures = { workspace = true }
 tarpc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["full"] }
+tower-lsp-server = { workspace = true }

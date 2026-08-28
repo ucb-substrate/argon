@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 autobins = false
 
+[lints]
+workspace = true
+
 [dependencies]
 derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.35", features = ["sparse"] }

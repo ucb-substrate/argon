@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 autobins = false
 
+[lints]
+workspace = true
+
 [lib]
 name = "analyzer"
 

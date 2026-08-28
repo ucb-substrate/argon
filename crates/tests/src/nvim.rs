@@ -19,4 +19,14 @@ mod tests {
         let child = command.spawn().expect("start headless Neovim");
         crate::finish_nvim(child).await;
     }
+
+    #[tokio::test]
+    async fn completed_gui_command_returns_focus_to_gui() {
+        let mut command = crate::nvim_command();
+        command
+            .arg("-l")
+            .arg(crate::repository_root().join("crates/tests/fixtures/nvim/focus.lua"));
+        let child = command.spawn().expect("start headless Neovim");
+        crate::finish_nvim(child).await;
+    }
 }
