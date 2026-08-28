@@ -2722,6 +2722,26 @@ struct CellExecKey {
     scope_name: Option<String>,
 }
 
+/// Assign a deterministic ID to a semantic cell execution. Incremental
+/// artifacts can then retain their immutable compiled cells without remapping
+/// every instance edge into the next execution's allocation namespace.
+fn stable_cell_id(key: &CellExecKey) -> CellId {
+    stable_cell_subgraph_id(key, u64::MAX)
+}
+
+/// Imported GDS structures are children of one source-level cell execution.
+/// Give each structure a stable ID in that execution's namespace as well.
+fn stable_cell_subgraph_id(key: &CellExecKey, index: u64) -> CellId {
+    let encoded =
+        bincode::serialize(&(key, index)).expect("cell execution keys should always serialize");
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in b"argon-compiled-cell".iter().chain(&encoded) {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+    }
+    // Zero is reserved by diagnostics as an unknown cell.
+    if hash == 0 { 1 } else { hash }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 enum CellArgKey {
     Float(u64),
@@ -3080,8 +3100,8 @@ struct ExecPass<'a> {
     // The first element of this stack is the root cell.
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
-    compiled_cells: IndexMap<CellId, CompiledCell>,
-    compiled_cell_artifacts: HashMap<CellId, Arc<CompiledCell>>,
+    compiled_cells: IndexMap<CellId, Arc<CompiledCell>>,
+    compiled_cell_value_ids: HashMap<CellId, ValueId>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
     seed_artifacts: HashMap<CellExecKey, CellArtifact>,
     artifacts: HashMap<CellExecKey, CellArtifact>,
@@ -3181,7 +3201,7 @@ impl<'a> ExecPass<'a> {
             next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
-            compiled_cell_artifacts: HashMap::new(),
+            compiled_cell_value_ids: HashMap::new(),
             compiled_cell_cache: HashMap::new(),
             seed_artifacts: artifacts
                 .into_iter()
@@ -3447,57 +3467,45 @@ impl<'a> ExecPass<'a> {
     }
 
     fn import_artifact(&mut self, artifact: &CellArtifact) -> Option<CellId> {
-        let old_cells = artifact.cells.keys().copied().collect_vec();
-        let cell_ids = old_cells
-            .iter()
-            .map(|old| (*old, self.alloc_id()))
-            .collect::<HashMap<_, _>>();
         if artifact.cells.values().any(|cell| {
             cell.objects.values().any(|object| {
                 matches!(object, SolvedValue::Instance(instance)
-                    if !cell_ids.contains_key(&instance.cell))
+                    if !artifact.cells.contains_key(&instance.cell))
             })
         }) {
             return None;
         }
 
-        let cell_values = cell_ids
-            .values()
+        let cell_values = artifact
+            .cells
+            .keys()
             .copied()
             .map(|cell| {
                 let value = self.new_ready_value(Value::Cell(cell));
                 (cell, value)
             })
             .collect::<HashMap<_, _>>();
-        for old in old_cells {
-            let new = cell_ids[&old];
-            let mut cell = artifact.cells[&old].as_ref().clone();
-            for object in cell.objects.values_mut() {
-                if let SolvedValue::Instance(instance) = object {
-                    instance.cell = cell_ids[&instance.cell];
-                    instance.cell_vid = cell_values[&instance.cell];
-                }
-            }
-            self.compiled_cell_artifacts
-                .insert(new, Arc::new(cell.clone()));
-            if self.compiled_cells.insert(new, cell).is_some() {
+        for (cell, value) in &cell_values {
+            self.compiled_cell_value_ids.insert(*cell, *value);
+        }
+        for (cell_id, cell) in &artifact.cells {
+            if let Some(existing) = self.compiled_cells.get(cell_id)
+                && !Arc::ptr_eq(existing, cell)
+            {
                 return None;
             }
+            self.compiled_cells.insert(*cell_id, cell.clone());
         }
-        for (key, old) in &artifact.cell_keys {
-            self.compiled_cell_cache.insert(key.clone(), cell_ids[old]);
+        for (key, cell) in &artifact.cell_keys {
+            self.compiled_cell_cache.insert(key.clone(), *cell);
         }
         for dependency in &artifact.dependencies {
             self.observe_dependency(*dependency);
         }
         for error in &artifact.errors {
-            let mut error = error.clone();
-            if let Some(cell) = cell_ids.get(&error.cell) {
-                error.cell = *cell;
-            }
-            self.errors.push(error);
+            self.errors.push(error.clone());
         }
-        Some(cell_ids[&artifact.root])
+        Some(artifact.root)
     }
 
     fn make_artifact(
@@ -3523,15 +3531,7 @@ impl<'a> ExecPass<'a> {
             .compiled_cells
             .iter()
             .filter(|(cell, _)| reachable.contains(*cell))
-            .map(|(cell, value)| {
-                (
-                    *cell,
-                    self.compiled_cell_artifacts
-                        .get(cell)
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(value.clone())),
-                )
-            })
+            .map(|(cell, value)| (*cell, value.clone()))
             .collect();
         let mut cell_keys = self
             .compiled_cell_cache
@@ -3595,7 +3595,8 @@ impl<'a> ExecPass<'a> {
             let error_start = self.errors.len();
             self.artifact_dependency_stack
                 .push(IndexSet::from_iter([cell]));
-            let cell_id = match self.execute_gds_cell(&declared_name, &path, scope_name) {
+            let cell_id = match self.execute_gds_cell(&cache_key, &declared_name, &path, scope_name)
+            {
                 Ok(cell_id) => cell_id,
                 Err(()) => {
                     self.artifact_dependency_stack.pop();
@@ -3662,7 +3663,11 @@ impl<'a> ExecPass<'a> {
             bindings: Default::default(),
         };
 
-        let cell_id = self.alloc_id();
+        let cell_id = stable_cell_id(&cache_key);
+        assert!(
+            !self.compiled_cells.contains_key(&cell_id),
+            "stable compiled-cell ID collision"
+        );
         let error_start = self.errors.len();
         self.artifact_dependency_stack
             .push(IndexSet::from_iter([cell]));
@@ -3861,9 +3866,7 @@ impl<'a> ExecPass<'a> {
             .pop_back()
             .expect("failed to pop cell id");
 
-        let compiled_cell = self.emit(cell_id);
-        self.compiled_cell_artifacts
-            .insert(cell_id, Arc::new(compiled_cell.clone()));
+        let compiled_cell = Arc::new(self.emit(cell_id));
         assert!(self.compiled_cells.insert(cell_id, compiled_cell).is_none());
         self.compiled_cell_cache.insert(cache_key.clone(), cell_id);
         let dependencies = self
@@ -3879,6 +3882,7 @@ impl<'a> ExecPass<'a> {
 
     fn execute_gds_cell(
         &mut self,
+        cache_key: &CellExecKey,
         declared_name: &str,
         path: &FsPath,
         scope_name: Option<String>,
@@ -3895,7 +3899,7 @@ impl<'a> ExecPass<'a> {
             }
         };
         let cell_ids = (0..imported.structs.len())
-            .map(|_| self.alloc_id())
+            .map(|index| stable_cell_subgraph_id(cache_key, index as u64))
             .collect::<Vec<_>>();
         // Imported hierarchy has no source-level cell calls, but field access
         // through a child instance still needs a ready cell value.
@@ -3905,6 +3909,7 @@ impl<'a> ExecPass<'a> {
                 let vid = self.value_id();
                 self.values
                     .insert(vid, DeferValue::Ready(Value::Cell(*cell_id)));
+                self.compiled_cell_value_ids.insert(*cell_id, vid);
                 vid
             })
             .collect::<Vec<_>>();
@@ -4064,9 +4069,7 @@ impl<'a> ExecPass<'a> {
                 unsolved_vars: IndexSet::new(),
                 inconsistent_constraints: IndexSet::new(),
             };
-            self.compiled_cell_artifacts
-                .insert(cell_id, Arc::new(cell.clone()));
-            self.compiled_cells.insert(cell_id, cell);
+            self.compiled_cells.insert(cell_id, Arc::new(cell));
         }
         Ok(top_id)
     }
@@ -5874,6 +5877,7 @@ impl<'a> ExecPass<'a> {
                         });
                         let cell =
                             self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
+                        self.compiled_cell_value_ids.entry(cell).or_insert(vid);
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                         true
                     } else {
@@ -6375,6 +6379,7 @@ impl<'a> ExecPass<'a> {
                                                 });
                                                 return Err(());
                                             };
+                                        let compiled_cell_value_ids = &self.compiled_cell_value_ids;
                                         let obj_id = &mut self.next_id;
                                         let objects = &mut self
                                             .cell_states
@@ -6491,7 +6496,7 @@ impl<'a> ExecPass<'a> {
                                                     let id = object_id(obj_id);
                                                     let oinst = Instance {
                                                         id,
-                                                        cell: cinst.cell_vid,
+                                                        cell: compiled_cell_value_ids[&cinst.cell],
                                                         x: LinearExpr::add(inst.x.clone(), cx),
                                                         y: LinearExpr::add(inst.y.clone(), cy),
                                                         angle,
@@ -7187,7 +7192,11 @@ pub fn bbox_dim_union(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledData {
-    pub cells: IndexMap<CellId, CompiledCell>,
+    /// Immutable compiled cells are structurally shared by incremental cache
+    /// entries and successive public snapshots. Serde's `rc` support keeps the
+    /// binary artifact representation transparent while in-process clones are
+    /// O(number of cells), not O(number of geometry objects).
+    pub cells: IndexMap<CellId, Arc<CompiledCell>>,
     pub top: CellId,
     pub tech: crate::tech::Technology,
 }

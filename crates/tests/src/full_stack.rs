@@ -4,7 +4,7 @@ use std::{net::Ipv4Addr, path::PathBuf};
 
 use analyzer::{
     ArgonConfig,
-    rpc::{CompilationSnapshot, Gui, InstancePreview, LangServerClient},
+    rpc::{CompilationSnapshot, CompilationUpdate, Gui, InstancePreview, LangServerClient},
 };
 use argonc::{
     ast::Span,
@@ -47,8 +47,13 @@ struct HeadlessGui {
 }
 
 impl Gui for HeadlessGui {
-    async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
-        let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
+    async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) -> bool {
+        let CompilationUpdate::Full(output) = snapshot.update else {
+            // This minimal test double deliberately asks the analyzer to retry
+            // with a full snapshot. The real GUI materializes deltas.
+            return false;
+        };
+        let (kind, scope, rect_count) = snapshot_details(&output);
         self.events
             .send(GuiEvent::UpdateCell {
                 revision: snapshot.revision,
@@ -57,6 +62,7 @@ impl Gui for HeadlessGui {
                 rect_count,
             })
             .expect("full-stack test should still be receiving GUI events");
+        true
     }
 
     async fn show_message(

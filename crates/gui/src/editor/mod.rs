@@ -5,7 +5,9 @@ use std::{
     sync::Arc,
 };
 
-use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
+use analyzer::rpc::{
+    CompilationDelta, CompilationSnapshot, CompilationUpdate, InstancePreview, LangServerAction,
+};
 use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
     bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
@@ -70,6 +72,9 @@ pub struct CompileOutputState {
     pub selected_scope: ScopePath,
     pub state: Arc<IndexMap<ScopePath, ScopeState>>,
     pub scope_paths: Arc<IndexMap<ScopeAddress, ScopePath>>,
+    /// Layers referenced by each compiled cell. Keeping this per cell lets a
+    /// small edit reuse layer discovery for very large imported cells.
+    pub used_layers: Arc<IndexMap<CellId, IndexSet<SharedString>>>,
 }
 
 pub struct Layers {
@@ -83,6 +88,9 @@ pub struct EditorState {
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
+    /// Last materialized compiler output. Deltas are applied here before any
+    /// presentation state is updated.
+    pub last_output: Option<CompileOutput>,
     pub fatal_error: Option<SharedString>,
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
@@ -92,6 +100,51 @@ pub struct EditorState {
     pub lang_server_client: SyncLangServerClient,
     pub subscriptions: Vec<Subscription>,
     pub(crate) tool: Entity<ToolState>,
+}
+
+fn apply_compilation_delta(
+    previous_revision: Option<u64>,
+    previous: Option<&CompileOutput>,
+    delta: CompilationDelta,
+) -> Option<CompileOutput> {
+    if previous_revision != Some(delta.base_revision) {
+        return None;
+    }
+    let mut data = match previous? {
+        CompileOutput::Valid(data) => data.clone(),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            output: Some(data), ..
+        }) => data.clone(),
+        _ => return None,
+    };
+    for cell in delta.removed_cells {
+        data.cells.shift_remove(&cell);
+    }
+    for (cell, compiled) in delta.cells {
+        data.cells.insert(cell, compiled);
+    }
+    data.top = delta.top;
+    Some(if delta.errors.is_empty() {
+        CompileOutput::Valid(data)
+    } else {
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors: delta.errors,
+            output: Some(data),
+        })
+    })
+}
+
+fn materialize_compilation_update(
+    previous_revision: Option<u64>,
+    previous: Option<&CompileOutput>,
+    update: CompilationUpdate,
+) -> Option<CompileOutput> {
+    match update {
+        CompilationUpdate::Full(output) => Some(output),
+        CompilationUpdate::Delta(delta) => {
+            apply_compilation_delta(previous_revision, previous, delta)
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -145,6 +198,7 @@ struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
     state: IndexMap<ScopePath, ScopeState>,
     scope_paths: IndexMap<ScopeAddress, ScopePath>,
+    unchanged_cells: IndexSet<CellId>,
 }
 
 fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
@@ -169,6 +223,25 @@ fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
             },
         );
     }
+}
+
+fn compiled_cell_used_layers(cell: &argonc::compile::CompiledCell) -> IndexSet<SharedString> {
+    let mut layers = IndexSet::new();
+    for scope in cell.scopes.values() {
+        for (object, _) in &scope.emit {
+            let layer = match &cell.objects[object] {
+                SolvedValue::Rect(rect) => rect.layer.as_deref(),
+                SolvedValue::Polygon(polygon) => Some(polygon.layer.as_str()),
+                SolvedValue::Path(path) => Some(path.layer.as_str()),
+                SolvedValue::Text(text) => Some(text.layer.as_str()),
+                SolvedValue::Instance(_) | SolvedValue::Dimension(_) => None,
+            };
+            if let Some(layer) = layer {
+                layers.insert(SharedString::from(layer.to_owned()));
+            }
+        }
+    }
+    layers
 }
 
 impl EditorState {
@@ -196,6 +269,9 @@ impl EditorState {
         state: &mut ProcessScopeState,
         parent: Option<ScopeAddress>,
     ) {
+        if state.unchanged_cells.contains(&scope.cell) && state.scope_paths.contains_key(&scope) {
+            return;
+        }
         let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
         let mut scope_path = if let Some(parent) = &parent {
             state.scope_paths[parent].clone()
@@ -336,6 +412,7 @@ impl EditorState {
         );
     }
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
+        self.last_output = Some(output.clone());
         let error_summary = compile_error_summary(&output).map(SharedString::from);
         let mut recoverable_error = None;
         let solved_cell = match output {
@@ -356,6 +433,7 @@ impl EditorState {
                 return;
             }
         };
+        let old_cell = self.solved_cell.read(cx).clone();
         let root_scope = ScopeAddress {
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
@@ -364,6 +442,36 @@ impl EditorState {
             .name
             .clone();
         let mut state = ProcessScopeState::default();
+        let mut used_layers = IndexMap::new();
+        for (cell_id, cell) in &solved_cell.cells {
+            let unchanged = old_cell
+                .as_ref()
+                .and_then(|old| old.output.cells.get(cell_id))
+                .is_some_and(|old| Arc::ptr_eq(old, cell));
+            if unchanged {
+                state.unchanged_cells.insert(*cell_id);
+            }
+            let layers = if unchanged {
+                old_cell
+                    .as_ref()
+                    .and_then(|old| old.used_layers.get(cell_id))
+                    .cloned()
+                    .unwrap_or_else(|| compiled_cell_used_layers(cell))
+            } else {
+                compiled_cell_used_layers(cell)
+            };
+            used_layers.insert(*cell_id, layers);
+        }
+        if let Some(old) = &old_cell {
+            for (address, path) in old.scope_paths.iter() {
+                if state.unchanged_cells.contains(&address.cell) {
+                    state.scope_paths.insert(*address, path.clone());
+                    if let Some(scope) = old.state.get(path) {
+                        state.state.insert(path.clone(), scope.clone());
+                    }
+                }
+            }
+        }
         let old_layers = self.layers.read(cx);
         for layer in &solved_cell.tech.layers {
             let name = SharedString::from(layer.name.clone());
@@ -385,11 +493,15 @@ impl EditorState {
                 },
             );
         }
+        for layer in used_layers.values().flatten() {
+            mark_layer_used(&mut state, layer);
+        }
         self.process_scope(cx, &solved_cell, root_scope, &mut state, None);
         let ProcessScopeState {
             layers,
             state,
             scope_paths,
+            unchanged_cells: _,
         } = state;
         self.layers.update(cx, |old_layers, cx| {
             old_layers.layers = layers;
@@ -416,6 +528,7 @@ impl EditorState {
                     .unwrap_or_else(|| vec![root_scope_name.clone()]),
                 state: Arc::new(state),
                 scope_paths: Arc::new(scope_paths),
+                used_layers: Arc::new(used_layers),
             });
             cx.notify();
         });
@@ -455,6 +568,7 @@ impl Editor {
                 workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
+                last_output: None,
                 fatal_error: None,
                 message: None,
                 connection_error: None,
@@ -508,23 +622,25 @@ impl Editor {
         editor
     }
 
-    fn apply_snapshot(&self, cx: &mut App, snapshot: CompilationSnapshot) -> bool {
+    fn apply_output(&self, cx: &mut App, revision: u64, output: CompileOutput) -> bool {
         if self
             .state
             .read(cx)
             .compilation_revision
-            .is_some_and(|revision| snapshot.revision < revision)
+            .is_some_and(|current| revision < current)
         {
             return false;
         }
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
-            state.compilation_revision = Some(snapshot.revision);
-            state.update(cx, snapshot.output);
+            state.compilation_revision = Some(revision);
+            state.update(cx, output);
             cx.notify();
         });
-        self.canvas
-            .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.finish_sse_persist(cx);
+            canvas.finish_source_compilation(revision, cx);
+        });
         true
     }
 
@@ -535,14 +651,39 @@ impl Editor {
         });
     }
 
-    pub fn update_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
-        if self.canvas.read(cx).is_sse_dragging() {
-            self.canvas
-                .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
-            return;
+    pub fn update_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) -> bool {
+        let revision = snapshot.revision;
+        let output = {
+            let state = self.state.read(cx);
+            if state
+                .compilation_revision
+                .is_some_and(|current| revision < current)
+            {
+                return false;
+            }
+            let Some(output) = materialize_compilation_update(
+                state.compilation_revision,
+                state.last_output.as_ref(),
+                snapshot.update,
+            ) else {
+                return false;
+            };
+            output
+        };
+        if !self.canvas.read(cx).accepts_compilation(revision, &output) {
+            return false;
         }
-        if !self.canvas.read(cx).accepts_snapshot(&snapshot) || !self.apply_snapshot(cx, snapshot) {
-            return;
+        if self.canvas.read(cx).is_sse_dragging() {
+            self.canvas.update(cx, |canvas, _| {
+                canvas.defer_snapshot(CompilationSnapshot {
+                    revision,
+                    update: CompilationUpdate::Full(output),
+                })
+            });
+            return true;
+        }
+        if !self.apply_output(cx, revision, output) {
+            return false;
         }
         let state = self.state.clone();
         self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
@@ -560,6 +701,7 @@ impl Editor {
             });
             cx.notify();
         });
+        true
     }
 
     pub fn set_workspace_modified(&self, cx: &mut App, modified: bool) {
@@ -850,14 +992,16 @@ pub enum Event {}
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::Arc};
 
+    use analyzer::rpc::CompilationDelta;
     use argonc::{
         ast::Span,
         compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
+        incremental::IncrementalCompiler,
     };
 
-    use super::compile_error_summary;
+    use super::{apply_compilation_delta, compile_error_summary};
 
     #[test]
     fn compile_error_summary_shows_the_first_error_and_remaining_count() {
@@ -888,5 +1032,83 @@ mod tests {
             compile_error_summary(&CompileOutput::FatalParseErrors).as_deref(),
             Some("fatal parse errors encountered")
         );
+    }
+
+    #[test]
+    fn compilation_delta_materializes_over_shared_cells_and_checks_its_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = argonc::WorkspaceConfig::new(&root).with_tech(Some(tech));
+        let target = vec!["top".to_owned()];
+        let source = |marker| {
+            format!(
+                "cell child() {{ let shape = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }}\n\
+                 cell top() {{ let marker = {marker}; let child = inst(child()); }}\n"
+            )
+        };
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), source(1));
+        let previous = compiler.compile_cell(&config, &target, Vec::new());
+        compiler.set_source_text(root, source(2));
+        let current = compiler.compile_cell(&config, &target, Vec::new());
+        fn output_data(
+            output: &CompileOutput,
+        ) -> (
+            &argonc::compile::CompiledData,
+            Vec<argonc::compile::ExecError>,
+        ) {
+            match output {
+                CompileOutput::Valid(data) => (data, Vec::new()),
+                CompileOutput::ExecErrors(errors) => (
+                    errors.output.as_ref().expect("recoverable compiler output"),
+                    errors.errors.clone(),
+                ),
+                output => panic!("test cell should compile: {output:?}"),
+            }
+        }
+        let (previous_data, _) = output_data(&previous);
+        let (current_data, current_errors) = output_data(&current);
+        let changed = current_data
+            .cells
+            .iter()
+            .filter(|(id, cell)| {
+                previous_data
+                    .cells
+                    .get(*id)
+                    .is_none_or(|old| !Arc::ptr_eq(old, cell))
+            })
+            .map(|(id, cell)| (*id, cell.clone()))
+            .collect();
+        let delta = CompilationDelta {
+            base_revision: 4,
+            top: current_data.top,
+            cells: changed,
+            removed_cells: Vec::new(),
+            errors: current_errors,
+        };
+        assert!(apply_compilation_delta(Some(3), Some(&previous), delta.clone()).is_none());
+
+        let materialized = apply_compilation_delta(Some(4), Some(&previous), delta).unwrap();
+        let materialized = match &materialized {
+            CompileOutput::Valid(data) => data,
+            CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(materialized.cells.len(), current_data.cells.len());
+        assert!(Arc::ptr_eq(
+            &materialized.cells[&current_data.top],
+            &current_data.cells[&current_data.top]
+        ));
+        let child = previous_data
+            .cells
+            .keys()
+            .find(|id| **id != previous_data.top)
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &materialized.cells[child],
+            &previous_data.cells[child]
+        ));
     }
 }

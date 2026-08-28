@@ -25,7 +25,10 @@ use argonc::{
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
-use rpc::{CompilationSnapshot, GuiClient, InstancePreview, LangServer, insert_statement};
+use rpc::{
+    CompilationDelta, CompilationSnapshot, CompilationUpdate, GuiClient, InstancePreview,
+    LangServer, insert_statement,
+};
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tokio::{
@@ -323,11 +326,79 @@ struct GuiConnection {
     client: GuiClient,
 }
 
+#[derive(Clone, Debug)]
+struct SentCompilation {
+    revision: u64,
+    output: CompileOutput,
+}
+
 #[derive(Debug, Default)]
 struct GuiState {
     connection: Option<GuiConnection>,
     process: Option<Child>,
     next_connection_id: u64,
+    sent_compilation: Option<SentCompilation>,
+}
+
+#[derive(Debug)]
+struct CompiledSnapshot {
+    revision: u64,
+    output: CompileOutput,
+}
+
+fn compiled_data_and_errors(
+    output: &CompileOutput,
+) -> Option<(&compile::CompiledData, &[compile::ExecError])> {
+    match output {
+        CompileOutput::Valid(data) => Some((data, &[])),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            errors,
+            output: Some(data),
+        }) => Some((data, errors)),
+        _ => None,
+    }
+}
+
+fn compilation_update(
+    base: Option<&SentCompilation>,
+    current: &CompiledSnapshot,
+) -> CompilationUpdate {
+    let Some(base) = base else {
+        return CompilationUpdate::Full(current.output.clone());
+    };
+    let Some((old, _)) = compiled_data_and_errors(&base.output) else {
+        return CompilationUpdate::Full(current.output.clone());
+    };
+    let Some((new, errors)) = compiled_data_and_errors(&current.output) else {
+        return CompilationUpdate::Full(current.output.clone());
+    };
+    if serde_json::to_vec(&old.tech).ok() != serde_json::to_vec(&new.tech).ok() {
+        return CompilationUpdate::Full(current.output.clone());
+    }
+
+    let cells = new
+        .cells
+        .iter()
+        .filter(|(id, cell)| {
+            old.cells
+                .get(*id)
+                .is_none_or(|previous| !Arc::ptr_eq(previous, cell))
+        })
+        .map(|(id, cell)| (*id, cell.clone()))
+        .collect();
+    let removed_cells = old
+        .cells
+        .keys()
+        .filter(|id| !new.cells.contains_key(*id))
+        .copied()
+        .collect();
+    CompilationUpdate::Delta(CompilationDelta {
+        base_revision: base.revision,
+        top: new.top,
+        cells,
+        removed_cells,
+        errors: errors.to_vec(),
+    })
 }
 
 fn is_gui_disconnected(error: &tarpc::client::RpcError) -> bool {
@@ -504,7 +575,35 @@ impl State {
             client,
         };
         gui.connection = Some(connection.clone());
+        gui.sent_compilation = None;
         connection
+    }
+
+    async fn sent_gui_compilation(&self, id: u64) -> Option<SentCompilation> {
+        let gui = self.gui.lock().await;
+        gui.connection
+            .as_ref()
+            .is_some_and(|connection| connection.id == id)
+            .then(|| gui.sent_compilation.clone())
+            .flatten()
+    }
+
+    async fn record_gui_compilation(&self, id: u64, snapshot: &CompiledSnapshot) {
+        let mut gui = self.gui.lock().await;
+        if gui
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.id == id)
+            && gui
+                .sent_compilation
+                .as_ref()
+                .is_none_or(|sent| snapshot.revision >= sent.revision)
+        {
+            gui.sent_compilation = Some(SentCompilation {
+                revision: snapshot.revision,
+                output: snapshot.output.clone(),
+            });
+        }
     }
 
     async fn take_gui_process(&self) -> Option<Child> {
@@ -536,6 +635,7 @@ impl State {
             .is_some_and(|current| current.id == id)
         {
             gui.connection = None;
+            gui.sent_compilation = None;
         }
     }
 
@@ -555,6 +655,19 @@ impl State {
                 self.clear_gui_connection(connection.id).await;
             }
         }
+    }
+
+    pub(crate) async fn update_workspace_modified(&self, modified: bool) {
+        let connection = {
+            let mut source = self.source_state.lock().await;
+            if source.workspace_modified == modified {
+                return;
+            }
+            source.workspace_modified = modified;
+            drop(source);
+            self.gui_connection().await
+        };
+        self.publish_workspace_modified(modified, connection).await;
     }
 
     async fn publish_workspace_path(&self, connection: Option<GuiConnection>) -> bool {
@@ -638,7 +751,7 @@ impl Backend {
 
     /// Compile and publish diagnostics for an exact source/cell identity.
     /// GUI presentation is deliberately handled by the caller.
-    async fn compile_snapshot(&self, identity: CompileIdentity) -> Option<CompilationSnapshot> {
+    async fn compile_snapshot(&self, identity: CompileIdentity) -> Option<CompiledSnapshot> {
         let request = {
             let source = self.state.source_state.lock().await;
             if source.compile_identity() != identity {
@@ -657,7 +770,7 @@ impl Backend {
         self.publish_compilation(result).await
     }
 
-    async fn publish_compilation(&self, mut result: CompileResult) -> Option<CompilationSnapshot> {
+    async fn publish_compilation(&self, mut result: CompileResult) -> Option<CompiledSnapshot> {
         let identity = result.identity.clone();
         if !self.state.is_latest_compile_request(&identity).await {
             return None;
@@ -667,7 +780,7 @@ impl Backend {
         // The compiled GDS can contain millions of geometry values. Move it
         // into the RPC snapshot after diagnostics have borrowed it instead of
         // deep-cloning the complete layout immediately before serialization.
-        let snapshot = result.output.take().map(|output| CompilationSnapshot {
+        let snapshot = result.output.take().map(|output| CompiledSnapshot {
             revision: identity.revision,
             output,
         });
@@ -714,7 +827,7 @@ impl Backend {
     async fn send_cell_update(
         &self,
         identity: &CompileIdentity,
-        snapshot: CompilationSnapshot,
+        snapshot: CompiledSnapshot,
     ) -> Option<GuiConnection> {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
@@ -723,11 +836,40 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
+        let base = self.state.sent_gui_compilation(connection.id).await;
+        let update = compilation_update(base.as_ref(), &snapshot);
+        let sent_delta = matches!(update, CompilationUpdate::Delta(_));
         let result = connection
             .client
-            .update_cell(context::current(), snapshot)
+            .update_cell(
+                context::current(),
+                CompilationSnapshot {
+                    revision: snapshot.revision,
+                    update,
+                },
+            )
             .await;
-        self.handle_gui_result(&connection, result).await?;
+        let accepted = self.handle_gui_result(&connection, result).await?;
+        if !accepted && sent_delta {
+            let result = connection
+                .client
+                .update_cell(
+                    context::current(),
+                    CompilationSnapshot {
+                        revision: snapshot.revision,
+                        update: CompilationUpdate::Full(snapshot.output.clone()),
+                    },
+                )
+                .await;
+            if !self.handle_gui_result(&connection, result).await? {
+                return None;
+            }
+        } else if !accepted {
+            return None;
+        }
+        self.state
+            .record_gui_compilation(connection.id, &snapshot)
+            .await;
         Some(connection)
     }
 
@@ -777,18 +919,7 @@ impl Backend {
     }
 
     async fn workspace_modified(&self, params: WorkspaceModifiedParams) -> Result<()> {
-        let gui_client = {
-            let mut source = self.state.source_state.lock().await;
-            if source.workspace_modified == params.modified {
-                return Ok(());
-            }
-            source.workspace_modified = params.modified;
-            drop(source);
-            self.state.gui_connection().await
-        };
-        self.state
-            .publish_workspace_modified(params.modified, gui_client)
-            .await;
+        self.state.update_workspace_modified(params.modified).await;
         Ok(())
     }
 }
@@ -1015,7 +1146,12 @@ fn preview_instance_cell(
 }
 
 impl Backend {
-    async fn start_gui(&self) -> Result<()> {
+    /// Focuses a live GUI or starts a replacement for a missing/stale one.
+    ///
+    /// The return value is true only when an existing connection is ready for
+    /// an immediate RPC. A newly spawned GUI registers asynchronously and
+    /// opens `SourceState::cell` as part of registration.
+    async fn start_or_focus_gui(&self) -> Result<bool> {
         if let Some(connection) = self.state.gui_connection().await {
             self.state
                 .editor_client
@@ -1027,7 +1163,7 @@ impl Backend {
                         .editor_client
                         .show_message(MessageType::LOG, "Connected to existing GUI!")
                         .await;
-                    return Ok(());
+                    return Ok(true);
                 }
                 Err(error) if is_gui_disconnected(&error) => {
                     self.state.clear_gui_connection(connection.id).await;
@@ -1044,7 +1180,7 @@ impl Backend {
                             format!("Could not activate the GUI: {error}"),
                         )
                         .await;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -1108,15 +1244,21 @@ impl Backend {
             }
         });
 
-        Ok(())
+        Ok(false)
+    }
+
+    async fn start_gui(&self) -> Result<()> {
+        self.start_or_focus_gui().await.map(|_| ())
+    }
+
+    async fn select_cell(&self, cell: impl Into<String>) -> CompileIdentity {
+        let mut source = self.state.source_state.lock().await;
+        source.cell = Some(cell.into());
+        source.compile_identity()
     }
 
     async fn select_and_open_cell(&self, cell: impl Into<String>) {
-        let identity = {
-            let mut source = self.state.source_state.lock().await;
-            source.cell = Some(cell.into());
-            source.compile_identity()
-        };
+        let identity = self.select_cell(cell).await;
         self.open_cell_view(identity).await;
     }
 
@@ -1136,7 +1278,10 @@ impl Backend {
             .editor_client
             .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
-        self.select_and_open_cell(params.cell).await;
+        let identity = self.select_cell(params.cell).await;
+        if self.start_or_focus_gui().await? {
+            self.open_cell_view(identity).await;
+        }
         Ok(())
     }
 
@@ -1604,13 +1749,16 @@ mod tests {
 
     use argonc::{
         compile::{self, CellArg, CompileInput, CompileOutput, ExecErrorCompileOutput},
+        incremental::IncrementalCompiler,
         parse,
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, is_gui_disconnected,
-        parse_config, preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
+        ArgonConfig, CompiledSnapshot, DEFAULT_LOG_LEVEL, SentCompilation, SourceState,
+        compilation_update, config_with_key, is_gui_disconnected, parse_config,
+        preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
     };
+    use crate::rpc::CompilationUpdate;
 
     #[test]
     fn only_transport_errors_disconnect_the_gui() {
@@ -1655,6 +1803,45 @@ mod tests {
         let opened = source.compile_identity();
         assert_ne!(edited, opened);
         assert_eq!(opened, source.compile_identity());
+    }
+
+    #[test]
+    fn compilation_delta_contains_only_the_changed_parent_cell() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
+        let config = argonc::WorkspaceConfig::new(&root).with_tech(Some(tech));
+        let cell = vec!["top".to_owned()];
+        let mut compiler = IncrementalCompiler::new();
+        let source = |marker| {
+            format!(
+                "cell child() {{ let shape = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }}\n\
+                 cell top() {{ let marker = {marker}; let child = inst(child()); }}\n"
+            )
+        };
+        compiler.set_source_text(root.clone(), source(1));
+        let first = compiler.compile_cell(&config, &cell, Vec::new());
+        compiler.set_source_text(root, source(2));
+        let second = compiler.compile_cell(&config, &cell, Vec::new());
+
+        let update = compilation_update(
+            Some(&SentCompilation {
+                revision: 1,
+                output: first,
+            }),
+            &CompiledSnapshot {
+                revision: 2,
+                output: second,
+            },
+        );
+        let CompilationUpdate::Delta(delta) = update else {
+            panic!("matching technologies should produce a delta");
+        };
+        assert_eq!(delta.base_revision, 1);
+        assert!(delta.removed_cells.is_empty());
+        assert_eq!(delta.cells.len(), 1, "the child cell should be omitted");
+        assert!(delta.cells.contains_key(&delta.top));
     }
 
     #[test]

@@ -1,12 +1,13 @@
 //! RPC types shared by the analyzer and Argone.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use argonc::{
     ast::Span,
-    compile::{BasicRect, CellId, CompileOutput, CompiledData},
+    compile::{BasicRect, CellId, CompileOutput, CompiledCell, CompiledData, ExecError},
     parse::WorkspaceParseAst,
 };
+use indexmap::IndexMap;
 
 use serde::{Deserialize, Serialize};
 use tarpc::{context, tokio_serde::formats::Bincode};
@@ -83,12 +84,29 @@ pub struct InstancePreview {
     pub scope_span: Span,
 }
 
+/// The complete output used to initialize or resynchronize a GUI, or a cell
+/// delta based on the last revision that GUI acknowledged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CompilationUpdate {
+    Full(CompileOutput),
+    Delta(CompilationDelta),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationDelta {
+    pub base_revision: u64,
+    pub top: CellId,
+    pub cells: IndexMap<CellId, Arc<CompiledCell>>,
+    pub removed_cells: Vec<CellId>,
+    pub errors: Vec<ExecError>,
+}
+
 /// A compiled GUI result tied to the exact analyzer source revision that
 /// produced it. Diagnostics continue to travel over LSP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompilationSnapshot {
     pub revision: u64,
-    pub output: CompileOutput,
+    pub update: CompilationUpdate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,7 +143,9 @@ pub trait LangServer {
 
 #[tarpc::service]
 pub trait Gui {
-    async fn update_cell(snapshot: CompilationSnapshot);
+    /// Returns whether the snapshot was accepted. A rejected delta is retried
+    /// as a full snapshot so reconnects and deferred UI updates self-heal.
+    async fn update_cell(snapshot: CompilationSnapshot) -> bool;
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
@@ -167,6 +187,79 @@ pub(crate) struct SourceInsertion {
     pub(crate) tracked_span: cfgrammar::Span,
 }
 
+fn leading_indentation(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+fn indentation_at_offset(document: &Document, offset: usize) -> String {
+    let position = document.offset_to_pos(offset);
+    let prefix = document.substr(Position::new(position.line, 0)..position);
+    let indentation = leading_indentation(prefix);
+    if indentation.len() == prefix.len() {
+        indentation.to_owned()
+    } else {
+        // A tail expression can share the opening-brace line. In that case,
+        // preserve its source column when moving it below the new statement.
+        " ".repeat(position.character as usize)
+    }
+}
+
+fn inferred_indentation_unit(document: &Document, parent: &str) -> String {
+    document
+        .contents()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(leading_indentation)
+        .filter_map(|indentation| {
+            indentation
+                .strip_prefix(parent)
+                .filter(|suffix| !suffix.is_empty())
+        })
+        .min_by_key(|suffix| suffix.chars().count())
+        .unwrap_or("    ")
+        .to_owned()
+}
+
+fn scope_body_indentation(
+    document: &Document,
+    scope_span: cfgrammar::Span,
+    tail_start: Option<usize>,
+) -> String {
+    if let Some(tail_start) = tail_start {
+        return indentation_at_offset(document, tail_start);
+    }
+
+    let start = document.offset_to_pos(scope_span.start());
+    let stop = document.offset_to_pos(scope_span.end());
+    let closing_line = document.substr(Position::new(stop.line, 0)..stop);
+    let closing_indentation = leading_indentation(closing_line);
+
+    if start.line + 1 < stop.line {
+        let body = document.substr(Position::new(start.line + 1, 0)..Position::new(stop.line, 0));
+        if let Some(indentation) = body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(leading_indentation)
+        {
+            return indentation.to_owned();
+        }
+    }
+
+    format!(
+        "{closing_indentation}{}",
+        inferred_indentation_unit(document, closing_indentation)
+    )
+}
+
+fn statement_offset_with_indentation(statement: &str, offset: usize, indentation: &str) -> usize {
+    offset
+        + statement.as_bytes()[..offset]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count()
+            * indentation.len()
+}
+
 pub(crate) fn insert_statement(
     document: &Document,
     scope_span: cfgrammar::Span,
@@ -174,30 +267,35 @@ pub(crate) fn insert_statement(
     statement: &str,
     tracked: std::ops::Range<usize>,
 ) -> SourceInsertion {
+    let indentation = scope_body_indentation(document, scope_span, tail_start);
     let (offset, prefix, suffix) = if let Some(offset) = tail_start {
-        let position = document.offset_to_pos(offset);
-        (
-            offset,
-            String::new(),
-            format!("\n{}", " ".repeat(position.character as usize)),
-        )
+        (offset, String::new(), format!("\n{indentation}"))
     } else {
         let start = document.offset_to_pos(scope_span.start());
         let stop = document.offset_to_pos(scope_span.end());
         let line = document.substr(Position::new(stop.line, 0)..stop);
-        let indentation = &line[..line.len() - line.trim_start().len()];
+        let closing_indentation = leading_indentation(line);
         (
             scope_span.end() - 1,
             if start.line == stop.line {
-                "\n".to_owned()
+                format!("\n{indentation}")
             } else {
-                "    ".to_owned()
+                indentation
+                    .strip_prefix(closing_indentation)
+                    .unwrap_or(&indentation)
+                    .to_owned()
             },
-            format!("\n{indentation}"),
+            format!("\n{closing_indentation}"),
         )
     };
     let position = document.offset_to_pos(offset);
-    let tracked_start = offset + prefix.len() + tracked.start;
+    let tracked_start = offset
+        + prefix.len()
+        + statement_offset_with_indentation(statement, tracked.start, &indentation);
+    let tracked_end = offset
+        + prefix.len()
+        + statement_offset_with_indentation(statement, tracked.end, &indentation);
+    let statement = statement.replace('\n', &format!("\n{indentation}"));
 
     SourceInsertion {
         offset,
@@ -205,7 +303,7 @@ pub(crate) fn insert_statement(
             range: Range::new(position, position),
             new_text: format!("{prefix}{statement}{suffix}"),
         },
-        tracked_span: cfgrammar::Span::new(tracked_start, offset + prefix.len() + tracked.end),
+        tracked_span: cfgrammar::Span::new(tracked_start, tracked_end),
     }
 }
 
@@ -348,18 +446,6 @@ impl State {
             }
         }
         let result: Result<(), String> = async {
-            if let Some(uri) = focus {
-                self.editor_client
-                    .show_document(ShowDocumentParams {
-                        uri,
-                        external: None,
-                        take_focus: None,
-                        selection: None,
-                    })
-                    .await
-                    .map_err(|error| format!("could not show source document: {error}"))?;
-            }
-
             let response = self
                 .editor_client
                 .apply_edit(WorkspaceEdit {
@@ -373,6 +459,22 @@ impl State {
                 return Err(response
                     .failure_reason
                     .unwrap_or_else(|| "editor rejected source edit".to_owned()));
+            }
+
+            // Source revelation is a convenience, not a prerequisite for the
+            // edit. Sending the workspace edit first lets Neovim emit
+            // `didChange` and start compilation without waiting on a serial
+            // window/showDocument round trip.
+            if let Some(uri) = focus {
+                let _ = self
+                    .editor_client
+                    .show_document(ShowDocumentParams {
+                        uri,
+                        external: None,
+                        take_focus: None,
+                        selection: None,
+                    })
+                    .await;
             }
 
             Ok(())
@@ -393,6 +495,11 @@ impl State {
             self.report_message(MessageType::ERROR, error).await;
             false
         } else {
+            // A successful workspace edit necessarily dirties the editor
+            // buffer. Publish that fact immediately instead of waiting for
+            // Neovim's scheduled BufModifiedSet notification; Neovim remains
+            // authoritative and will publish `false` after the buffer is saved.
+            self.update_workspace_modified(true).await;
             true
         }
     }
@@ -1199,5 +1306,60 @@ mod tests {
 
         assert_eq!(insertion.edit.range.start, Position::new(1, 0));
         assert_eq!(insertion.edit.new_text, "    eq(x, y);\n");
+    }
+
+    #[test]
+    fn matches_the_indentation_of_existing_scope_statements() {
+        let source = "cell top() {\n  let inst0 = inst(child());\n}\n";
+        let scope_start = source.find('{').expect("scope should start");
+        let closing_brace = source.find('}').expect("scope should end");
+        let insertion = insert_statement(
+            &Document::new(source, 0),
+            cfgrammar::Span::new(scope_start, closing_brace + 1),
+            None,
+            "let r = rect()!;",
+            8..14,
+        );
+
+        assert_eq!(insertion.edit.new_text, "  let r = rect()!;\n");
+        assert_eq!(
+            insertion.tracked_span,
+            cfgrammar::Span::new(closing_brace + 2 + 8, closing_brace + 2 + 14)
+        );
+    }
+
+    #[test]
+    fn infers_file_indentation_for_an_empty_scope() {
+        let source = "cell child() {\n\tlet r = rect()!;\n}\n\ncell top() {\n}\n";
+        let scope_start = source.rfind('{').expect("scope should start");
+        let closing_brace = source.rfind('}').expect("scope should end");
+        let insertion = insert_statement(
+            &Document::new(source, 0),
+            cfgrammar::Span::new(scope_start, closing_brace + 1),
+            None,
+            "eq(x, y);",
+            0..0,
+        );
+
+        assert_eq!(insertion.edit.new_text, "\teq(x, y);\n");
+    }
+
+    #[test]
+    fn applies_scope_indentation_to_multiline_statements() {
+        let source = "cell top() {\n  let inst0 = inst(child());\n}\n";
+        let scope_start = source.find('{').expect("scope should start");
+        let closing_brace = source.find('}').expect("scope should end");
+        let insertion = insert_statement(
+            &Document::new(source, 0),
+            cfgrammar::Span::new(scope_start, closing_brace + 1),
+            None,
+            "let p = polygon(\n        points\n    )!;",
+            8..38,
+        );
+
+        assert_eq!(
+            insertion.edit.new_text,
+            "  let p = polygon(\n          points\n      )!;\n"
+        );
     }
 }

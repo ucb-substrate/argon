@@ -65,21 +65,16 @@ fn is_disconnected(error: &tarpc::client::RpcError) -> bool {
     )
 }
 
+async fn connect_client_async(lang_server_addr: SocketAddr) -> Result<LangServerClient> {
+    let mut transport = tarpc::serde_transport::tcp::connect(lang_server_addr, Bincode::default);
+    transport.config_mut().max_frame_length(usize::MAX);
+    let transport = transport.await?;
+    Ok(LangServerClient::new(tarpc::client::Config::default(), transport).spawn())
+}
+
 fn connect_client(app: &AsyncApp, lang_server_addr: SocketAddr) -> Result<LangServerClient> {
     app.background_executor()
-        .block(
-            async move {
-                let mut transport =
-                    tarpc::serde_transport::tcp::connect(lang_server_addr, Bincode::default);
-                transport.config_mut().max_frame_length(usize::MAX);
-                let transport = transport.await?;
-                Ok::<_, std::io::Error>(
-                    LangServerClient::new(tarpc::client::Config::default(), transport).spawn(),
-                )
-            }
-            .compat(),
-        )
-        .map_err(Into::into)
+        .block(connect_client_async(lang_server_addr).compat())
 }
 
 impl SyncLangServerClient {
@@ -293,6 +288,74 @@ impl SyncLangServerClient {
         })
     }
 
+    /// Submit a draw edit without blocking GPUI's event thread. The canvas
+    /// keeps an optimistic rectangle visible until either this request fails
+    /// or a newer compiled revision arrives.
+    pub fn draw_rect_async(
+        &self,
+        scope_span: Span,
+        var_name: String,
+        rect: BasicRect<f64>,
+        request_id: u64,
+    ) {
+        let client = lock_unpoisoned(&self.client).clone();
+        let shared_client = self.client.clone();
+        let lang_server_addr = self.lang_server_addr;
+        let to_exec = self.to_exec.clone();
+        let rpc_context = context::current();
+        self.app
+            .background_executor()
+            .spawn(
+                async move {
+                    let result = match client
+                        .draw_rect(
+                            rpc_context,
+                            scope_span.clone(),
+                            var_name.clone(),
+                            rect.clone(),
+                        )
+                        .await
+                    {
+                        Err(error) if is_disconnected(&error) => {
+                            match connect_client_async(lang_server_addr).await {
+                                Ok(client) => {
+                                    *lock_unpoisoned(&shared_client) = client.clone();
+                                    client
+                                        .draw_rect(rpc_context, scope_span, var_name, rect)
+                                        .await
+                                        .map_err(|error| error.to_string())
+                                }
+                                Err(error) => Err(error.to_string()),
+                            }
+                        }
+                        result => result.map_err(|error| error.to_string()),
+                    };
+                    let accepted = matches!(&result, Ok(Some(_)));
+                    let rejected = matches!(&result, Ok(None));
+                    let connection_error = result.err();
+                    let _ = to_exec.unbounded_send(Box::new(move |editor, cx| {
+                        let _ = cx.update(|cx| {
+                            editor.canvas.update(cx, |canvas, cx| {
+                                canvas.finish_draw_rect_request(request_id, accepted, cx);
+                            });
+                            editor.state.update(cx, |state, cx| {
+                                state.connection_error = connection_error.map(Into::into);
+                                if rejected && state.message.is_none() {
+                                    state.show_message(
+                                        MessageType::ERROR,
+                                        crate::editor::SOURCE_EDIT_REJECTED_MESSAGE,
+                                    );
+                                }
+                                cx.notify();
+                            });
+                        });
+                    }));
+                }
+                .compat(),
+            )
+            .detach();
+    }
+
     pub fn draw_polygon(
         &self,
         scope_span: Span,
@@ -432,13 +495,22 @@ pub struct GuiServer {
 }
 
 impl Gui for GuiServer {
-    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
-        self.to_exec
+    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) -> bool {
+        let (response, accepted) = oneshot::channel();
+        if self
+            .to_exec
             .send(Box::new(move |editor, cx| {
-                let _ = cx.update(|cx| editor.update_cell(cx, snapshot));
+                let accepted = cx
+                    .update(|cx| editor.update_cell(cx, snapshot))
+                    .unwrap_or(false);
+                let _ = response.send(accepted);
             }))
             .await
-            .unwrap();
+            .is_err()
+        {
+            return false;
+        }
+        accepted.await.unwrap_or(false)
     }
 
     async fn fit(mut self, _: context::Context) {

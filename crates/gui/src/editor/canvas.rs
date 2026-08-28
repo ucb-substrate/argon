@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
     ops::{Add, Sub},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -62,12 +62,15 @@ const RASTER_CACHE_RESOLUTION: f32 = 0.5;
 /// compact per-layer occupancy mask. Hierarchy is still fully flattened; only
 /// the final sub-pixel representation becomes cheaper.
 const GEOMETRY_LOD_SIZE_PX: f32 = 1.;
-/// Disabled: cell-local raster tiles can turn dense bitcells into opaque
-/// blocks at intermediate zoom levels. Keep the implementation isolated while
-/// the flattened per-layer occupancy path remains authoritative.
-const CELL_RASTER_TILES_ENABLED: bool = false;
-const CELL_RASTER_TILE_MAX_SIZE: u32 = 16;
+/// Cell-local coverage stays separated by layer, so unchanged imported cells
+/// can be composited into a new parent raster without flattening their geometry
+/// again. The tile is built at the current raster resolution; it therefore
+/// follows the same LOD behavior as the flattened renderer.
+const CELL_RASTER_TILES_ENABLED: bool = true;
+const CELL_RASTER_TILE_MAX_SIZE: u32 = 2048;
+const CELL_RASTER_TILE_MAX_PIXELS: u32 = 2 * 1024 * 1024;
 const CELL_RASTER_TILE_CACHE_LIMIT: usize = 256;
+const CELL_RASTER_TILE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// Keep a 5x5 field of viewport-sized rasters. The center tile is always built
 /// first, followed by the two Chebyshev-distance rings around it.
 const NAVIGATION_TILE_RADIUS: i32 = 2;
@@ -805,6 +808,15 @@ struct PendingDimensionPreview {
     value: String,
 }
 
+#[derive(Clone)]
+struct PendingDrawRect {
+    request_id: u64,
+    rect: Rect,
+    layer: LayerState,
+    after_revision: Option<u64>,
+    compiled: bool,
+}
+
 // TODO: potentially re-use compiler provided object IDs
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 pub struct GlobalObjectId {
@@ -857,6 +869,10 @@ pub struct LayoutCanvas {
     pending_sse_values: Vec<PendingSseValue>,
     deferred_snapshot: Option<CompilationSnapshot>,
     sse_persist_after_revision: Option<u64>,
+    /// A completed draw gesture is painted immediately while Neovim applies
+    /// the source edit and the analyzer compiles its replacement snapshot.
+    pending_draw_rect: Option<PendingDrawRect>,
+    next_source_edit_request: u64,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
@@ -915,6 +931,10 @@ pub struct LayoutCanvas {
     /// retained navigation atlas after a replacement has arrived.
     raster_content_revision: u64,
     raster_content_revision_signal: Arc<AtomicU64>,
+    /// A source edit keeps the last complete frame visible until the center
+    /// tile for the new content revision is ready. Presentation changes such
+    /// as hiding a layer still invalidate old pixels immediately.
+    raster_allow_stale_content: bool,
     raster_output: Option<Arc<CompiledData>>,
     raster_scope_state: Option<Arc<IndexMap<editor::ScopePath, editor::ScopeState>>>,
     raster_selected_scope: Option<editor::ScopePath>,
@@ -931,6 +951,12 @@ pub struct LayoutCanvas {
     //
     // Final bounds of layout canvas only determined in paint step.
     pending_init: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RasterPresentationChange {
+    clear_cell_tiles: bool,
+    retain_visible_raster: bool,
 }
 
 #[derive(Clone)]
@@ -1042,19 +1068,31 @@ struct CellRasterTileKey {
     orientation: TransformationMatrix,
     width: u16,
     height: u16,
-    content_revision: u64,
+    /// Pointer identity is stable for structurally shared compiled cells and
+    /// changes whenever that cell's transitive compiled artifact changes.
+    cell_version: usize,
 }
 
 struct CellRasterTile {
     width: u16,
     height: u16,
-    layers: Vec<Option<Arc<[u8]>>>,
+    layers: Vec<CellRasterTileLayer>,
+    /// Keeps the allocation identity in the key from being reused after a
+    /// changed cell is dropped, without retaining its potentially huge data.
+    _cell_version: Weak<compile::CompiledCell>,
+}
+
+#[derive(Default)]
+struct CellRasterTileLayer {
+    fill: Option<Arc<[u8]>>,
+    outline: Option<Arc<[u8]>>,
 }
 
 #[derive(Default)]
 struct CellRasterTileCache {
     entries: HashMap<CellRasterTileKey, Arc<CellRasterTile>>,
     insertion_order: VecDeque<CellRasterTileKey>,
+    bytes: usize,
 }
 
 impl CellRasterTileCache {
@@ -1063,12 +1101,22 @@ impl CellRasterTileCache {
     }
 
     fn insert(&mut self, key: CellRasterTileKey, tile: Arc<CellRasterTile>) {
-        if self.entries.insert(key, tile).is_none() {
+        let tile_bytes = tile.byte_len();
+        if let Some(previous) = self.entries.insert(key, tile) {
+            self.bytes = self.bytes.saturating_sub(previous.byte_len());
+        } else {
             self.insertion_order.push_back(key);
         }
-        while self.entries.len() > CELL_RASTER_TILE_CACHE_LIMIT {
+        self.bytes = self.bytes.saturating_add(tile_bytes);
+        while self.entries.len() > CELL_RASTER_TILE_CACHE_LIMIT
+            || self.bytes > CELL_RASTER_TILE_CACHE_BYTES
+        {
             if let Some(oldest) = self.insertion_order.pop_front() {
-                self.entries.remove(&oldest);
+                if let Some(tile) = self.entries.remove(&oldest) {
+                    self.bytes = self.bytes.saturating_sub(tile.byte_len());
+                }
+            } else {
+                break;
             }
         }
     }
@@ -1076,6 +1124,18 @@ impl CellRasterTileCache {
     fn clear(&mut self) {
         self.entries.clear();
         self.insertion_order.clear();
+        self.bytes = 0;
+    }
+}
+
+impl CellRasterTile {
+    fn byte_len(&self) -> usize {
+        self.layers
+            .iter()
+            .flat_map(|layer| [layer.fill.as_ref(), layer.outline.as_ref()])
+            .flatten()
+            .map(|coverage| coverage.len())
+            .sum()
     }
 }
 
@@ -1274,7 +1334,11 @@ fn expand_raster_for_display(image: image::RgbaImage) -> image::RgbaImage {
 
 fn raster_stipple_is_on(x: u32, y: u32, stipple_phase: i64) -> bool {
     let period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.) as i64;
-    (x as i64 - y as i64 - stipple_phase).rem_euclid(period) == 0
+    // GPUI's PatternSlash shader rotates screen coordinates by +45 degrees,
+    // so its first pattern coordinate is proportional to x + y. Keep the
+    // retained raster on that same diagonal for a seamless exact-to-raster
+    // handoff after an edit.
+    (x as i64 + y as i64 - stipple_phase).rem_euclid(period) == 0
 }
 
 fn raster_from_style_planes(
@@ -1300,7 +1364,7 @@ fn raster_from_style_planes(
 }
 
 fn raster_stipple_phase(offset: Point<Pixels>) -> i64 {
-    (f32::from(offset.x) - f32::from(offset.y)).round() as i64
+    (f32::from(offset.x) + f32::from(offset.y)).round() as i64
 }
 
 fn mark_raster_occupancy(
@@ -1339,7 +1403,11 @@ fn paint_raster_occupancy(
     pixel_count: usize,
     layer: &LayerState,
 ) {
-    let mut color = layer.color;
+    let mut color = if layer.fill == ShapeFill::Hollow {
+        layer.border_color
+    } else {
+        layer.color
+    };
     if layer.fill == ShapeFill::Stippling {
         // Below one screen pixel the slash pattern has no stable phase. Its
         // average coverage produces the same solid-looking density as other
@@ -1376,6 +1444,41 @@ fn mark_tile_rect(coverage: &mut [u8], width: u32, height: u32, bounds: Bounds<P
     };
     for y in y0..y1 {
         coverage[(y * width + x0) as usize..(y * width + x1) as usize].fill(u8::MAX);
+    }
+}
+
+fn mark_tile_line(
+    coverage: &mut [u8],
+    width: u32,
+    height: u32,
+    start: Point<f32>,
+    stop: Point<f32>,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let dx = stop.x - start.x;
+    let dy = stop.y - start.y;
+    let steps = dx.abs().max(dy.abs()).ceil().max(1.) as u32;
+    for step in 0..=steps {
+        let fraction = step as f32 / steps as f32;
+        let x = (start.x + dx * fraction)
+            .round()
+            .clamp(0., width.saturating_sub(1) as f32) as u32;
+        let y = (start.y + dy * fraction)
+            .round()
+            .clamp(0., height.saturating_sub(1) as f32) as u32;
+        coverage[(y * width + x) as usize] = u8::MAX;
+    }
+}
+
+fn mark_tile_polygon_outline(coverage: &mut [u8], width: u32, height: u32, points: &[Point<f32>]) {
+    for (start, stop) in points
+        .iter()
+        .zip(points.iter().cycle().skip(1))
+        .take(points.len())
+    {
+        mark_tile_line(coverage, width, height, *start, *stop);
     }
 }
 
@@ -1462,16 +1565,25 @@ fn build_cell_raster_tile(
     let mut coverage = (0..layer_count)
         .map(|_| vec![0; width as usize * height as usize])
         .collect::<Vec<_>>();
+    let mut outlines = (0..layer_count)
+        .map(|_| vec![0; width as usize * height as usize])
+        .collect::<Vec<_>>();
     let mut queue = VecDeque::from_iter([(address, orientation, (0., 0.))]);
 
     while let Some((address @ ScopeAddress { cell, scope }, mat, ofs)) = queue.pop_front() {
+        if navigation_raster_cancelled(input) {
+            return None;
+        }
         let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
         if !scope_state.visible {
             continue;
         }
         let cell_info = &input.solved_cell.output.cells[&cell];
         let scope_info = &cell_info.scopes[&scope];
-        for (object, _) in &scope_info.emit {
+        for (object_index, (object, _)) in scope_info.emit.iter().enumerate() {
+            if object_index % 256 == 0 && navigation_raster_cancelled(input) {
+                return None;
+            }
             match &cell_info.objects[object] {
                 SolvedValue::Rect(rect) if !rect.construction => {
                     let Some(layer) = rect
@@ -1492,11 +1604,19 @@ fn build_cell_raster_tile(
                         width as f32 * ((rp1.0 + ofs.0 - x0) / (x1 - x0)) as f32,
                         height as f32 * ((y1 - rp1.1 - ofs.1) / (y1 - y0)) as f32,
                     );
-                    mark_tile_rect(
-                        &mut coverage[layer.z],
+                    let bounds = Bounds::from_corners(tp0.min(&tp1).map(px), tp0.max(&tp1).map(px));
+                    mark_tile_rect(&mut coverage[layer.z], width as u32, height as u32, bounds);
+                    let corners = [
+                        Point::new(f32::from(bounds.left()), f32::from(bounds.top())),
+                        Point::new(f32::from(bounds.right()), f32::from(bounds.top())),
+                        Point::new(f32::from(bounds.right()), f32::from(bounds.bottom())),
+                        Point::new(f32::from(bounds.left()), f32::from(bounds.bottom())),
+                    ];
+                    mark_tile_polygon_outline(
+                        &mut outlines[layer.z],
                         width as u32,
                         height as u32,
-                        Bounds::from_corners(tp0.min(&tp1).map(px), tp0.max(&tp1).map(px)),
+                        &corners,
                     );
                 }
                 SolvedValue::Polygon(polygon) => {
@@ -1519,6 +1639,41 @@ fn build_cell_raster_tile(
                         })
                         .collect::<Vec<_>>();
                     mark_tile_polygon(&mut coverage[layer.z], width as u32, height as u32, &points);
+                    mark_tile_polygon_outline(
+                        &mut outlines[layer.z],
+                        width as u32,
+                        height as u32,
+                        &points,
+                    );
+                }
+                SolvedValue::Path(path) => {
+                    let Some(layer) = input
+                        .layers
+                        .get(path.layer.as_str())
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let Some(outline) = path.outline() else {
+                        continue;
+                    };
+                    let points = outline
+                        .into_iter()
+                        .map(|point| {
+                            let point = ifmatvec(mat, point);
+                            Point::new(
+                                width as f32 * ((point.0 + ofs.0 - x0) / (x1 - x0)) as f32,
+                                height as f32 * ((y1 - point.1 - ofs.1) / (y1 - y0)) as f32,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    mark_tile_polygon(&mut coverage[layer.z], width as u32, height as u32, &points);
+                    mark_tile_polygon_outline(
+                        &mut outlines[layer.z],
+                        width as u32,
+                        height as u32,
+                        &points,
+                    );
                 }
                 SolvedValue::Instance(instance) if !instance.construction => {
                     let mut instance_mat = TransformationMatrix::identity();
@@ -1554,20 +1709,26 @@ fn build_cell_raster_tile(
 
     let layers = coverage
         .into_iter()
-        .map(|coverage| {
-            coverage
+        .zip(outlines)
+        .map(|(fill, outline)| CellRasterTileLayer {
+            fill: fill
                 .iter()
                 .any(|value| *value != 0)
-                .then(|| Arc::<[u8]>::from(coverage))
+                .then(|| Arc::<[u8]>::from(fill)),
+            outline: outline
+                .iter()
+                .any(|value| *value != 0)
+                .then(|| Arc::<[u8]>::from(outline)),
         })
         .collect::<Vec<_>>();
     layers
         .iter()
-        .any(Option::is_some)
+        .any(|layer| layer.fill.is_some() || layer.outline.is_some())
         .then_some(CellRasterTile {
             width,
             height,
             layers,
+            _cell_version: Arc::downgrade(&input.solved_cell.output.cells[&address.cell]),
         })
 }
 
@@ -1578,12 +1739,13 @@ fn cached_cell_raster_tile(
     width: u16,
     height: u16,
 ) -> Option<Arc<CellRasterTile>> {
+    let cell_version = Arc::as_ptr(&input.solved_cell.output.cells[&address.cell]) as usize;
     let key = CellRasterTileKey {
         address,
         orientation,
         width,
         height,
-        content_revision: input.content_revision,
+        cell_version,
     };
     if let Some(tile) = input
         .cell_raster_tiles
@@ -1615,6 +1777,9 @@ fn paint_raster_tile(
     primitive: &RasterTilePrimitive,
     layer: &LayerState,
 ) {
+    if layer.fill == ShapeFill::Hollow {
+        return;
+    }
     let Some((x0, x1)) = raster_pixel_range(
         f32::from(primitive.bounds.origin.x),
         f32::from(primitive.bounds.origin.x + primitive.bounds.size.width),
@@ -2166,6 +2331,9 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
     let mut tile_primitives = (0..layer_count)
         .map(|_| Vec::<RasterTilePrimitive>::new())
         .collect::<Vec<_>>();
+    let mut tile_outline_primitives = (0..layer_count)
+        .map(|_| Vec::<RasterTilePrimitive>::new())
+        .collect::<Vec<_>>();
     let mut seen_tile_candidates = HashSet::<CellRasterTileKey>::new();
     let geometry_lod_size = GEOMETRY_LOD_SIZE_PX * RASTER_CACHE_RESOLUTION;
     let mut texts = Vec::new();
@@ -2225,22 +2393,31 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             if CELL_RASTER_TILES_ENABLED
                 && depth > 0
                 && input.hierarchy_depth == usize::MAX
+                && !(input.include_text
+                    && layout_text_metrics(viewport.scale, TEXT_LAYOUT_SIZE).is_some())
                 && tile_width <= CELL_RASTER_TILE_MAX_SIZE
                 && tile_height <= CELL_RASTER_TILE_MAX_SIZE
+                && tile_width.saturating_mul(tile_height) <= CELL_RASTER_TILE_MAX_PIXELS
             {
+                let cell_version =
+                    Arc::as_ptr(&input.solved_cell.output.cells[&address.cell]) as usize;
                 let key = CellRasterTileKey {
                     address,
                     orientation: mat,
                     width: tile_width as u16,
                     height: tile_height as u16,
-                    content_revision: input.content_revision,
+                    cell_version,
                 };
                 let cached = input
                     .cell_raster_tiles
                     .lock()
                     .expect("cell raster tile cache poisoned")
                     .get(&key);
-                let tile = if cached.is_some() || !seen_tile_candidates.insert(key) {
+                // The first child of the edited source cell is commonly a
+                // large imported macro. Build it eagerly once; repeated cells
+                // retain the cheaper second-occurrence heuristic.
+                let eager = depth == 1;
+                let tile = if cached.is_some() || eager || !seen_tile_candidates.insert(key) {
                     cached.or_else(|| {
                         cached_cell_raster_tile(
                             &input,
@@ -2254,9 +2431,17 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                     None
                 };
                 if let Some(tile) = tile {
-                    for (layer_index, coverage) in tile.layers.iter().enumerate() {
-                        if let Some(coverage) = coverage {
+                    for (layer_index, layer) in tile.layers.iter().enumerate() {
+                        if let Some(coverage) = &layer.fill {
                             tile_primitives[layer_index].push(RasterTilePrimitive {
+                                coverage: coverage.clone(),
+                                tile_width: tile.width,
+                                tile_height: tile.height,
+                                bounds: pixel_bounds,
+                            });
+                        }
+                        if let Some(coverage) = &layer.outline {
+                            tile_outline_primitives[layer_index].push(RasterTilePrimitive {
                                 coverage: coverage.clone(),
                                 tile_width: tile.width,
                                 tile_height: tile.height,
@@ -2332,6 +2517,68 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                         .iter()
                         .map(|(x, y)| {
                             let point = ifmatvec(mat, (x.0, y.0));
+                            Point::new(
+                                raster_scale * (point.0 + ofs.0) as f32
+                                    + f32::from(raster_offset.x),
+                                raster_scale * -(point.1 + ofs.1) as f32
+                                    + f32::from(raster_offset.y),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let (min_x, max_x, min_y, max_y) = points.iter().fold(
+                        (
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                        ),
+                        |(min_x, max_x, min_y, max_y), point| {
+                            (
+                                min_x.min(point.x),
+                                max_x.max(point.x),
+                                min_y.min(point.y),
+                                max_y.max(point.y),
+                            )
+                        },
+                    );
+                    if max_x < 0. || min_x > width as f32 || max_y < 0. || min_y > height as f32 {
+                        continue;
+                    }
+                    let bounds = Bounds::from_corners(
+                        Point::new(px(min_x), px(min_y)),
+                        Point::new(px(max_x), px(max_y)),
+                    );
+                    if (max_x - min_x).max(max_y - min_y) <= geometry_lod_size {
+                        mark_raster_occupancy(
+                            &mut low_detail_occupancy[layer.z],
+                            width,
+                            height,
+                            bounds,
+                        );
+                        continue;
+                    }
+                    polygon_primitives[layer.z].push(RasterPolygonPrimitive {
+                        points,
+                        fill: layer.fill,
+                        color: layer.color,
+                        border_color: layer.border_color,
+                    });
+                }
+                SolvedValue::Path(path) => {
+                    let Some(layer) = input
+                        .layers
+                        .get(path.layer.as_str())
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let Some(outline) = path.outline() else {
+                        continue;
+                    };
+                    let points = outline
+                        .into_iter()
+                        .map(|point| {
+                            let point = ifmatvec(mat, point);
                             Point::new(
                                 raster_scale * (point.0 + ofs.0) as f32
                                     + f32::from(raster_offset.x),
@@ -2494,30 +2741,34 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                     return None;
                 }
                 let RasterRectPrimitive { bounds, color, .. } = primitive;
-                fill_raster_rect(
-                    &mut fill_target,
-                    width,
-                    height,
-                    *bounds,
-                    ShapeFill::Solid,
-                    *color,
-                    0,
-                );
+                if primitive.fill != ShapeFill::Hollow {
+                    fill_raster_rect(
+                        &mut fill_target,
+                        width,
+                        height,
+                        *bounds,
+                        ShapeFill::Solid,
+                        *color,
+                        0,
+                    );
+                }
             }
             for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
                 }
                 let RasterPolygonPrimitive { points, color, .. } = primitive;
-                fill_raster_polygon(
-                    &mut fill_target,
-                    width,
-                    height,
-                    points,
-                    ShapeFill::Solid,
-                    *color,
-                    0,
-                );
+                if primitive.fill != ShapeFill::Hollow {
+                    fill_raster_polygon(
+                        &mut fill_target,
+                        width,
+                        height,
+                        points,
+                        ShapeFill::Solid,
+                        *color,
+                        0,
+                    );
+                }
             }
         }
         {
@@ -2583,6 +2834,25 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 composite: RasterComposite::Replace,
                 touched: Some(&mut on_layer_touched),
             };
+            if let Some(layer) = layer {
+                let mut outline_layer = layer.clone();
+                outline_layer.fill = ShapeFill::Solid;
+                outline_layer.color = layer.border_color;
+                for (primitive_index, primitive) in
+                    tile_outline_primitives[layer_index].iter().enumerate()
+                {
+                    if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                        return None;
+                    }
+                    paint_raster_tile(
+                        &mut outline_target,
+                        width,
+                        height,
+                        primitive,
+                        &outline_layer,
+                    );
+                }
+            }
             for (primitive_index, primitive) in rect_layer.iter().enumerate() {
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
@@ -2626,6 +2896,25 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 composite: RasterComposite::Replace,
                 touched: Some(&mut off_layer_touched),
             };
+            if let Some(layer) = layer {
+                let mut outline_layer = layer.clone();
+                outline_layer.fill = ShapeFill::Solid;
+                outline_layer.color = layer.border_color;
+                for (primitive_index, primitive) in
+                    tile_outline_primitives[layer_index].iter().enumerate()
+                {
+                    if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                        return None;
+                    }
+                    paint_raster_tile(
+                        &mut outline_target,
+                        width,
+                        height,
+                        primitive,
+                        &outline_layer,
+                    );
+                }
+            }
             for (primitive_index, primitive) in rect_layer.iter().enumerate() {
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
@@ -2888,6 +3177,32 @@ fn raster_tile_set_matches_target(tiles: &LayoutRasterTileSet, target: RasterTil
         && tiles.screen_viewport == target.screen_viewport
         && tiles.scale == target.scale
         && tiles.content_revision == target.content_revision
+}
+
+fn raster_revision_displayable(
+    content_revision: u64,
+    current_revision: u64,
+    allow_stale_content: bool,
+) -> bool {
+    content_revision == current_revision || allow_stale_content
+}
+
+fn should_retain_raster_during_update(
+    has_old_output: bool,
+    has_new_output: bool,
+    same_output: bool,
+    technology_changed: bool,
+    presentation_changed: bool,
+) -> bool {
+    has_old_output && has_new_output && !same_output && !technology_changed && !presentation_changed
+}
+
+fn compilation_finishes_pending_draw(after_revision: Option<u64>, revision: u64) -> bool {
+    after_revision.is_none_or(|previous| revision > previous)
+}
+
+fn pending_draw_can_handoff_to_raster(pending: Option<&PendingDrawRect>) -> bool {
+    pending.is_some_and(|pending| pending.compiled)
 }
 
 fn single_raster_tile_set(cache: LayoutRasterCache) -> LayoutRasterTileSet {
@@ -3435,7 +3750,13 @@ impl Element for CanvasElement {
         let raster_presentation = inner
             .raster_reprojection
             .clone()
-            .filter(|cache| cache.content_revision == inner.raster_content_revision)
+            .filter(|cache| {
+                raster_revision_displayable(
+                    cache.content_revision,
+                    inner.raster_content_revision,
+                    inner.raster_allow_stale_content,
+                )
+            })
             .map(|cache| {
                 (
                     single_raster_tile_set(cache),
@@ -3449,7 +3770,13 @@ impl Element for CanvasElement {
                 inner
                     .raster_tiles
                     .clone()
-                    .filter(|tiles| tiles.content_revision == inner.raster_content_revision)
+                    .filter(|tiles| {
+                        raster_revision_displayable(
+                            tiles.content_revision,
+                            inner.raster_content_revision,
+                            inner.raster_allow_stale_content,
+                        )
+                    })
                     .map(|tiles| {
                         let display = inner
                             .raster_display
@@ -3464,6 +3791,7 @@ impl Element for CanvasElement {
             let offset = display.offset;
             let origin_coords = offset + bounds.origin;
             let navigation_cache_active = inner.navigation_cache_active;
+            let pending_draw_rect = inner.pending_draw_rect.clone();
             let hover_hit = (!navigation_cache_active)
                 .then(|| inner.hover_hit.clone())
                 .flatten();
@@ -3615,6 +3943,16 @@ impl Element for CanvasElement {
                             preview.border_styles,
                         ));
                     }
+                    if let Some(pending) = &pending_draw_rect {
+                        window.paint_quad(get_paint_quad(
+                            get_rect_bounds(&pending.rect, bounds, scale, offset),
+                            pending.layer.fill,
+                            pending.layer.color,
+                            pending.layer.border_color,
+                            pending.rect.border_widths,
+                            pending.rect.border_styles,
+                        ));
+                    }
                     if let ToolState::PlaceInstance(placement) = &tool {
                         let translation = (
                             layout_mouse_position.x as f64,
@@ -3701,7 +4039,21 @@ impl Element for CanvasElement {
             // synchronous hierarchy traversal (and its temporary omissions)
             // while it is in flight.
             let bg_style = inner.bg_style.clone();
-            bg_style.paint(bounds, window, cx, |_window, _cx| {});
+            let pending = inner.pending_draw_rect.clone();
+            let scale = inner.scale;
+            let offset = inner.offset;
+            bg_style.paint(bounds, window, cx, |window, _cx| {
+                if let Some(pending) = &pending {
+                    window.paint_quad(get_paint_quad(
+                        get_rect_bounds(&pending.rect, bounds, scale, offset),
+                        pending.layer.fill,
+                        pending.layer.color,
+                        pending.layer.border_color,
+                        pending.rect.border_widths,
+                        pending.rect.border_styles,
+                    ));
+                }
+            });
             return;
         }
         let layers = state.layers.read(cx);
@@ -3716,6 +4068,9 @@ impl Element for CanvasElement {
         let mut instance_sse_candidates = Vec::new();
         let mut select_rects = Vec::new();
         let mut source_coordinates = SseSourceCoordinates::new();
+        if let Some(pending) = &inner.pending_draw_rect {
+            rects.push((pending.rect.clone(), pending.layer.clone()));
+        }
         let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
         let grid = solved_cell
             .as_ref()
@@ -5431,6 +5786,7 @@ impl Element for CanvasElement {
                         .raster_images_to_drop
                         .extend(previous.tiles.into_values().map(|cache| cache.image));
                 }
+                inner.raster_allow_stale_content = false;
                 if let Some(previous) = inner.raster_staging_tiles.take() {
                     inner
                         .raster_images_to_drop
@@ -5526,6 +5882,8 @@ impl LayoutCanvas {
             pending_sse_values: Vec::new(),
             deferred_snapshot: None,
             sse_persist_after_revision: None,
+            pending_draw_rect: None,
+            next_source_edit_request: 0,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
             sse_handles: Vec::new(),
@@ -5538,35 +5896,40 @@ impl LayoutCanvas {
             scale: 1.0,
             screen_bounds: Bounds::default(),
             _subscriptions: vec![cx.observe(state, |canvas, _, cx| {
-                if !canvas.update_raster_presentation(cx) {
+                let Some(change) = canvas.update_raster_presentation(cx) else {
                     return;
-                }
+                };
                 canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
                 canvas
                     .raster_content_revision_signal
                     .store(canvas.raster_content_revision, Ordering::Release);
-                canvas
-                    .cell_raster_tiles
-                    .lock()
-                    .expect("cell raster tile cache poisoned")
-                    .clear();
-                // Presentation changes invalidate every old pixel immediately.
-                // In particular, a hidden layer must never survive in a
-                // transformed or retained navigation image.
-                if let Some(previous) = canvas.raster_tiles.take() {
+                if change.clear_cell_tiles {
                     canvas
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
+                        .cell_raster_tiles
+                        .lock()
+                        .expect("cell raster tile cache poisoned")
+                        .clear();
                 }
                 if let Some(previous) = canvas.raster_staging_tiles.take() {
                     canvas
                         .raster_images_to_drop
                         .extend(previous.tiles.into_values().map(|cache| cache.image));
                 }
-                if let Some(previous) = canvas.raster_reprojection.take() {
-                    canvas.raster_images_to_drop.push(previous.image);
+                canvas.raster_allow_stale_content = change.retain_visible_raster;
+                if !change.retain_visible_raster {
+                    // Presentation changes invalidate every old pixel
+                    // immediately. In particular, a hidden layer must never
+                    // survive in a transformed navigation image.
+                    if let Some(previous) = canvas.raster_tiles.take() {
+                        canvas
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    if let Some(previous) = canvas.raster_reprojection.take() {
+                        canvas.raster_images_to_drop.push(previous.image);
+                    }
+                    canvas.raster_display = None;
                 }
-                canvas.raster_display = None;
                 canvas.raster_tile_target = None;
                 canvas.navigation_cache_active = canvas.raster_output.is_some();
                 if canvas.raster_output.is_some()
@@ -5598,6 +5961,7 @@ impl LayoutCanvas {
             raster_scale_signal: Arc::new(AtomicU64::new(1.0_f32.to_bits() as u64)),
             raster_content_revision: 0,
             raster_content_revision_signal: Arc::new(AtomicU64::new(0)),
+            raster_allow_stale_content: false,
             raster_output: None,
             raster_scope_state: None,
             raster_selected_scope: None,
@@ -5613,7 +5977,7 @@ impl LayoutCanvas {
 
     /// Records the exact state that changes raster pixels. UI-only changes,
     /// such as selecting a layer in the sidebar, do not force a rebuild.
-    fn update_raster_presentation(&mut self, cx: &gpui::App) -> bool {
+    fn update_raster_presentation(&mut self, cx: &gpui::App) -> Option<RasterPresentationChange> {
         let (
             output,
             scope_state,
@@ -5680,13 +6044,51 @@ impl LayoutCanvas {
             (None, None) => true,
             _ => false,
         };
+        let selected_scope_changed = self.raster_selected_scope != selected_scope;
+        let layer_visibility_changed = self.raster_layer_visibility != layer_visibility;
+        let hierarchy_depth_changed = self.raster_hierarchy_depth != hierarchy_depth;
+        let hide_external_geometry_changed =
+            self.raster_hide_external_geometry != hide_external_geometry;
+        let dark_mode_changed = self.raster_dark_mode != dark_mode;
         let changed = !same_output
             || !same_scope_state
-            || self.raster_selected_scope != selected_scope
-            || self.raster_layer_visibility != layer_visibility
-            || self.raster_hierarchy_depth != hierarchy_depth
-            || self.raster_hide_external_geometry != hide_external_geometry
-            || self.raster_dark_mode != dark_mode;
+            || selected_scope_changed
+            || layer_visibility_changed
+            || hierarchy_depth_changed
+            || hide_external_geometry_changed
+            || dark_mode_changed;
+        if !changed {
+            return None;
+        }
+        let technology_changed = match (&self.raster_output, &output) {
+            (Some(old), Some(new)) if !same_output => {
+                serde_json::to_vec(&old.tech).ok() != serde_json::to_vec(&new.tech).ok()
+            }
+            (Some(_), None) | (None, Some(_)) => true,
+            _ => false,
+        };
+        let presentation_changed = selected_scope_changed
+            || layer_visibility_changed
+            || hierarchy_depth_changed
+            || hide_external_geometry_changed
+            || dark_mode_changed;
+        let retain_visible_raster = should_retain_raster_during_update(
+            self.raster_output.is_some(),
+            output.is_some(),
+            same_output,
+            technology_changed,
+            presentation_changed,
+        );
+        // Coverage tiles are independent of the parent output revision and of
+        // colors. They only need flushing when visibility/hierarchy semantics
+        // change, or when the technology's layer indexing changes. A scope map
+        // replacement with the same compiled output is a UI visibility edit.
+        let clear_cell_tiles = technology_changed
+            || layer_visibility_changed
+            || hierarchy_depth_changed
+            || hide_external_geometry_changed
+            || selected_scope_changed
+            || (!same_scope_state && same_output);
         self.raster_output = output;
         self.raster_scope_state = scope_state;
         self.raster_selected_scope = selected_scope;
@@ -5695,7 +6097,10 @@ impl LayoutCanvas {
         self.raster_hierarchy_depth = hierarchy_depth;
         self.raster_hide_external_geometry = hide_external_geometry;
         self.raster_dark_mode = dark_mode;
-        changed
+        Some(RasterPresentationChange {
+            clear_cell_tiles,
+            retain_visible_raster,
+        })
     }
 
     fn advance_raster_generation(&mut self) {
@@ -5951,6 +6356,10 @@ impl LayoutCanvas {
             }
             tiles.navigation = true;
             tiles.center = target.center;
+            self.raster_allow_stale_content = false;
+            if pending_draw_can_handoff_to_raster(self.pending_draw_rect.as_ref()) {
+                self.pending_draw_rect = None;
+            }
             self.update_raster_display_transform();
             return;
         }
@@ -5981,6 +6390,10 @@ impl LayoutCanvas {
             if let Some(previous) = self.raster_tiles.replace(replacement) {
                 self.raster_images_to_drop
                     .extend(previous.tiles.into_values().map(|cache| cache.image));
+            }
+            self.raster_allow_stale_content = false;
+            if pending_draw_can_handoff_to_raster(self.pending_draw_rect.as_ref()) {
+                self.pending_draw_rect = None;
             }
             self.clear_raster_reprojection();
             self.raster_display = self
@@ -6050,6 +6463,10 @@ impl LayoutCanvas {
         if let Some(previous) = self.raster_tiles.replace(replacement) {
             self.raster_images_to_drop
                 .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        self.raster_allow_stale_content = false;
+        if pending_draw_can_handoff_to_raster(self.pending_draw_rect.as_ref()) {
+            self.pending_draw_rect = None;
         }
         self.clear_raster_reprojection();
         self.raster_display = Some(display);
@@ -6165,6 +6582,41 @@ impl LayoutCanvas {
 
     pub(crate) fn take_deferred_snapshot(&mut self) -> Option<CompilationSnapshot> {
         self.deferred_snapshot.take()
+    }
+
+    pub(crate) fn finish_draw_rect_request(
+        &mut self,
+        request_id: u64,
+        accepted: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !accepted
+            && self
+                .pending_draw_rect
+                .as_ref()
+                .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.pending_draw_rect = None;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn finish_source_compilation(&mut self, revision: u64, cx: &mut Context<Self>) {
+        let compiled = self.pending_draw_rect.as_ref().is_some_and(|pending| {
+            compilation_finishes_pending_draw(pending.after_revision, revision)
+        });
+        if !compiled {
+            return;
+        }
+        if self.raster_tiles.is_none() && !self.navigation_cache_active {
+            // Small layouts paint newly compiled geometry directly. Retained
+            // layouts keep the optimistic rectangle until their replacement
+            // content raster is installed.
+            self.pending_draw_rect = None;
+            cx.notify();
+        } else if let Some(pending) = &mut self.pending_draw_rect {
+            pending.compiled = true;
+        }
     }
 
     fn sse_drag_delta_for_targets(
@@ -6453,71 +6905,64 @@ impl LayoutCanvas {
                                 let p1 = snapped_layout_mouse_position;
                                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
-                                self.state.update(cx, |state, cx| {
-                                    let error: Option<SharedString> =
-                                        state.solved_cell.update(cx, {
-                                            |cell, cx| {
-                                                if let Some(cell) = cell.as_mut() {
-                                                    // TODO update in memory representation of code
-                                                    // TODO add solver to gui
-                                                    let scope_address =
-                                                        &cell.state[&cell.selected_scope].address;
-                                                    let reachable_objs =
-                                                        cell.output.reachable_objs(
-                                                            scope_address.cell,
-                                                            scope_address.scope,
-                                                        );
-                                                    let names: IndexSet<_> =
-                                                        reachable_objs.values().collect();
-                                                    let scope = cell
-                                                        .output
-                                                        .cells
-                                                        .get(&scope_address.cell)
-                                                        .unwrap()
-                                                        .scopes
-                                                        .get(&scope_address.scope)
-                                                        .unwrap();
-                                                    let rect_name = (0..)
-                                                        .map(|i| format!("rect{i}"))
-                                                        .find(|name| !names.contains(name))
-                                                        .unwrap();
-
-                                                    match state.lang_server_client.draw_rect(
-                                                        scope.span.clone(),
-                                                        rect_name,
-                                                        compile::BasicRect {
-                                                            layer: state
-                                                                .layers
-                                                                .read(cx)
-                                                                .selected_layer
-                                                                .clone()
-                                                                .map(|s| s.to_string()),
-                                                            x0: draw_source_coordinate(p0p.x, grid),
-                                                            y0: draw_source_coordinate(p0p.y, grid),
-                                                            x1: draw_source_coordinate(p1p.x, grid),
-                                                            y1: draw_source_coordinate(p1p.y, grid),
-                                                            construction: false,
-                                                        },
-                                                    ) {
-                                                        Ok(None) => Some(
-                                                            SOURCE_EDIT_REJECTED_MESSAGE.into(),
-                                                        ),
-                                                        Ok(Some(_)) => None,
-                                                        Err(_) => None,
-                                                    }
-                                                } else {
-                                                    Some("no cell to edit".into())
-                                                }
-                                            }
-                                        });
-                                    if state.message.is_none()
-                                        && let Some(error) = error
-                                    {
-                                        state.show_message(MessageType::ERROR, error);
-                                    }
+                                let request = state.solved_cell.read(cx).as_ref().map(|cell| {
+                                    let scope_address = &cell.state[&cell.selected_scope].address;
+                                    let reachable_objs = cell
+                                        .output
+                                        .reachable_objs(scope_address.cell, scope_address.scope);
+                                    let names: IndexSet<_> = reachable_objs.values().collect();
+                                    let scope = &cell.output.cells[&scope_address.cell].scopes
+                                        [&scope_address.scope];
+                                    let rect_name = (0..)
+                                        .map(|i| format!("rect{i}"))
+                                        .find(|name| !names.contains(name))
+                                        .unwrap();
+                                    (scope.span.clone(), rect_name)
                                 });
+                                if let Some((scope_span, rect_name)) = request {
+                                    self.next_source_edit_request =
+                                        self.next_source_edit_request.wrapping_add(1);
+                                    let request_id = self.next_source_edit_request;
+                                    self.pending_draw_rect = Some(PendingDrawRect {
+                                        request_id,
+                                        rect: Rect {
+                                            object_path: Vec::new(),
+                                            x0: p0p.x,
+                                            y0: p0p.y,
+                                            x1: p1p.x,
+                                            y1: p1p.y,
+                                            id: None,
+                                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                            border_styles: Edges::all(BorderStyle::Solid),
+                                            cvars: None,
+                                        },
+                                        layer: layer_info.clone(),
+                                        after_revision: state.compilation_revision,
+                                        compiled: false,
+                                    });
+                                    state.lang_server_client.draw_rect_async(
+                                        scope_span,
+                                        rect_name,
+                                        compile::BasicRect {
+                                            layer: Some(layer.to_string()),
+                                            x0: draw_source_coordinate(p0p.x, grid),
+                                            y0: draw_source_coordinate(p0p.y, grid),
+                                            x1: draw_source_coordinate(p1p.x, grid),
+                                            y1: draw_source_coordinate(p1p.y, grid),
+                                            construction: false,
+                                        },
+                                        request_id,
+                                    );
+                                } else {
+                                    let _ = state.lang_server_client.show_message(
+                                        MessageType::ERROR,
+                                        "No cell is available to edit.",
+                                    );
+                                }
+                                cx.notify();
                             } else {
                                 rect_tool.p0 = Some(snapped_layout_mouse_position);
+                                cx.notify();
                             }
                         } else {
                             let _ = state.lang_server_client.show_message(
@@ -7087,6 +7532,9 @@ impl LayoutCanvas {
                 .dispatch_action(&EditDim, window, cx);
             window.prevent_default();
         }
+        // Geometry gestures mutate canvas-owned optimistic state from inside
+        // the tool entity update above; notify the canvas itself as well.
+        cx.notify();
     }
 
     fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
@@ -7534,14 +7982,18 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
-    pub(crate) fn accepts_snapshot(&self, snapshot: &CompilationSnapshot) -> bool {
+    pub(crate) fn accepts_compilation(
+        &self,
+        revision: u64,
+        output: &compile::CompileOutput,
+    ) -> bool {
         if !self.is_sse_persisting {
             return true;
         }
-        if !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision) {
+        if !snapshot_follows_revision(revision, self.sse_persist_after_revision) {
             return false;
         }
-        let data = match &snapshot.output {
+        let data = match output {
             compile::CompileOutput::Valid(data) => Some(data),
             compile::CompileOutput::ExecErrors(output) => output.output.as_ref(),
             compile::CompileOutput::StaticErrors(_) | compile::CompileOutput::FatalParseErrors => {
@@ -7848,10 +8300,22 @@ mod tests {
             let local_x = world.0 + f32::from(offset.x).round() as i64;
             let local_y = world.1 + f32::from(offset.y).round() as i64;
             assert_eq!(
-                (local_x - local_y - phase).rem_euclid(period),
-                (world.0 - world.1).rem_euclid(period)
+                (local_x + local_y - phase).rem_euclid(period),
+                (world.0 + world.1).rem_euclid(period)
             );
         }
+    }
+
+    #[test]
+    fn raster_stippling_matches_gpui_slash_direction() {
+        let period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.) as u32;
+        assert!(raster_stipple_is_on(0, 0, 0));
+        for x in 1..period {
+            // As x increases, y decreases: the same `/` diagonal produced by
+            // GPUI's PatternSlash shader before the raster replaces it.
+            assert!(raster_stipple_is_on(x, period - x, 0));
+        }
+        assert!(!raster_stipple_is_on(1, 1, 0));
     }
 
     #[test]
@@ -7907,6 +8371,40 @@ mod tests {
         assert!(!paint_should_start_navigation_worker(true, false, true));
         assert!(!paint_should_start_navigation_worker(true, true, false));
         assert!(!paint_should_start_navigation_worker(false, false, false));
+    }
+
+    #[test]
+    fn old_content_is_visible_only_during_an_atomic_content_swap() {
+        assert!(should_retain_raster_during_update(
+            true, true, false, false, false
+        ));
+        assert!(!should_retain_raster_during_update(
+            true, true, false, false, true
+        ));
+        assert!(!should_retain_raster_during_update(
+            true, true, false, true, false
+        ));
+        assert!(!should_retain_raster_during_update(
+            true, false, false, false, false
+        ));
+        assert!(raster_revision_displayable(7, 8, true));
+        assert!(!raster_revision_displayable(7, 8, false));
+        assert!(raster_revision_displayable(8, 8, false));
+        assert!(!compilation_finishes_pending_draw(Some(8), 8));
+        assert!(compilation_finishes_pending_draw(Some(8), 9));
+        assert!(compilation_finishes_pending_draw(None, 1));
+
+        let (rect, layer) = dimension_rect(0., 10., 0);
+        let mut pending = PendingDrawRect {
+            request_id: 1,
+            rect,
+            layer,
+            after_revision: Some(8),
+            compiled: false,
+        };
+        assert!(!pending_draw_can_handoff_to_raster(Some(&pending)));
+        pending.compiled = true;
+        assert!(pending_draw_can_handoff_to_raster(Some(&pending)));
     }
 
     #[test]
@@ -8095,7 +8593,7 @@ mod tests {
         blend_raster_layer(&mut output, &mut layer, &mut touched);
 
         let pixel = |x: usize, y: usize| &output[(y * width + x) * 4..(y * width + x + 1) * 4];
-        assert_eq!(pixel(1, 1), [255, 0, 0, 255]);
+        assert_eq!(pixel(4, 1), [255, 0, 0, 255]);
         assert_eq!(pixel(2, 1), [0, 0, 255, 255]);
     }
 
@@ -8181,6 +8679,48 @@ mod tests {
     }
 
     #[test]
+    fn hollow_cell_tiles_do_not_paint_their_fill_mask() {
+        let primitive = RasterTilePrimitive {
+            coverage: Arc::<[u8]>::from(vec![u8::MAX; 16]),
+            tile_width: 4,
+            tile_height: 4,
+            bounds: Bounds::new(Point::default(), Size::new(px(4.), px(4.))),
+        };
+        let mut buffer = vec![0; 4 * 4 * 4];
+        let mut layer = dimension_rect(0., 1., 0).1;
+        layer.fill = ShapeFill::Hollow;
+        let mut target = RasterPaintTarget {
+            buffer: &mut buffer,
+            composite: RasterComposite::Union,
+            touched: None,
+        };
+
+        paint_raster_tile(&mut target, 4, 4, &primitive, &layer);
+
+        assert!(buffer.iter().all(|channel| *channel == 0));
+    }
+
+    #[test]
+    fn cell_tile_outline_mask_preserves_an_empty_interior() {
+        let mut coverage = vec![0; 8 * 8];
+        mark_tile_polygon_outline(
+            &mut coverage,
+            8,
+            8,
+            &[
+                Point::new(1., 1.),
+                Point::new(6., 1.),
+                Point::new(6., 6.),
+                Point::new(1., 6.),
+            ],
+        );
+
+        assert_eq!(coverage[3 * 8 + 3], 0);
+        assert_eq!(coverage[8 + 3], u8::MAX);
+        assert_eq!(coverage[3 * 8 + 6], u8::MAX);
+    }
+
+    #[test]
     fn subpixel_tile_polygons_still_leave_an_occupancy_hint() {
         let mut coverage = vec![0; 16];
         mark_tile_polygon(
@@ -8232,6 +8772,177 @@ mod tests {
             input,
             &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
         )
+    }
+
+    fn hollow_hierarchy_raster_fixture() -> CompileOutputState {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(
+            &source_path,
+            r#"
+cell child() {
+    let shape = rect("met1", x0=0., y0=0., x1=400., y1=400.);
+    text("zoom detail", "met1", 200., 200.);
+}
+cell top() {
+    let child_instance = inst(child(), x=0., y=0.);
+}
+"#,
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        );
+        let output = match output {
+            argonc::compile::CompileOutput::Valid(output) => output,
+            output => panic!("raster fixture should compile: {output:?}"),
+        };
+        let top = output.top;
+        let top_address = ScopeAddress {
+            cell: top,
+            scope: output.cells[&top].root,
+        };
+        let child = output.cells[&top]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_instance)
+            .expect("top instance")
+            .cell;
+        let child_address = ScopeAddress {
+            cell: child,
+            scope: output.cells[&child].root,
+        };
+        let bbox_id = output.cells[&child]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_rect)
+            .expect("child rectangle")
+            .id;
+        let bbox = || compile::Rect {
+            layer: None,
+            id: bbox_id,
+            x0: 0.,
+            y0: 0.,
+            x1: 400.,
+            y1: 400.,
+            construction: true,
+            span: None,
+        };
+        let top_path = vec!["top".to_owned()];
+        let child_path = vec!["top".to_owned(), "child_instance".to_owned()];
+        CompileOutputState {
+            output: Arc::new(output),
+            selected_scope: top_path.clone(),
+            state: Arc::new(IndexMap::from([
+                (
+                    top_path.clone(),
+                    editor::ScopeState {
+                        name: "top".to_owned(),
+                        address: top_address,
+                        visible: true,
+                        bbox: Some(bbox()),
+                        parent: None,
+                    },
+                ),
+                (
+                    child_path.clone(),
+                    editor::ScopeState {
+                        name: "child_instance".to_owned(),
+                        address: child_address,
+                        visible: true,
+                        bbox: Some(bbox()),
+                        parent: Some(top_address),
+                    },
+                ),
+            ])),
+            scope_paths: Arc::new(IndexMap::from([
+                (top_address, top_path),
+                (child_address, child_path),
+            ])),
+            used_layers: Arc::default(),
+        }
+    }
+
+    fn hierarchy_navigation_input(
+        solved_cell: CompileOutputState,
+        scale: f32,
+        cell_raster_tiles: Arc<Mutex<CellRasterTileCache>>,
+    ) -> NavigationRasterInput {
+        let content_revision = 1;
+        NavigationRasterInput {
+            solved_cell,
+            layers: Arc::new(IndexMap::from([(
+                SharedString::from("met1"),
+                LayerState {
+                    name: "met1".into(),
+                    color: rgb(0xff0000),
+                    fill: ShapeFill::Hollow,
+                    used: true,
+                    border_color: rgb(0x00ff00),
+                    visible: true,
+                    z: 0,
+                },
+            )])),
+            hierarchy_depth: usize::MAX,
+            hide_external_geometry: false,
+            viewport: ViewportTransform {
+                size: Size::new(px(512.), px(512.)),
+                screen_size: Size::new(px(512.), px(512.)),
+                scale,
+                offset: Point::new(px(10.), px(scale * 400. + 10.)),
+            },
+            text_color: rgb(0xffffff),
+            include_text: true,
+            content_revision,
+            content_revision_signal: Arc::new(AtomicU64::new(content_revision)),
+            scale_signal: Arc::new(AtomicU64::new(scale.to_bits() as u64)),
+            cell_raster_tiles,
+            cancel_if_generation_changes: None,
+        }
+    }
+
+    #[test]
+    fn hierarchical_raster_preserves_hollow_outlines_and_restores_zoom_detail() {
+        let solved_cell = hollow_hierarchy_raster_fixture();
+        let cell_tiles = Arc::new(Mutex::new(CellRasterTileCache::default()));
+
+        let low_zoom = build_navigation_raster(hierarchy_navigation_input(
+            solved_cell.clone(),
+            0.25,
+            cell_tiles.clone(),
+        ))
+        .expect("low-zoom raster");
+        let low_planes = low_zoom.style_planes.expect("low-zoom style planes");
+        let low_center = (30 * low_planes.width as usize + 30) * 4;
+        assert_eq!(low_planes.stipple_on[low_center + 3], 0);
+        assert_eq!(low_planes.stipple_off[low_center + 3], 0);
+        assert!(
+            low_planes
+                .stipple_on
+                .chunks_exact(4)
+                .any(|pixel| pixel == [0, 255, 0, 255]),
+            "the cached child cell must retain its green outline"
+        );
+        assert!(low_zoom.texts.is_empty());
+        assert_eq!(cell_tiles.lock().unwrap().entries.len(), 1);
+
+        let high_zoom = build_navigation_raster(hierarchy_navigation_input(
+            solved_cell,
+            1.,
+            cell_tiles.clone(),
+        ))
+        .expect("high-zoom raster");
+        let high_planes = high_zoom.style_planes.expect("high-zoom style planes");
+        let high_center = (105 * high_planes.width as usize + 105) * 4;
+        assert_eq!(high_planes.stipple_on[high_center + 3], 0);
+        assert_eq!(high_planes.stipple_off[high_center + 3], 0);
+        assert_eq!(high_zoom.texts.len(), 1, "zoom must restore text detail");
+        assert_eq!(cell_tiles.lock().unwrap().entries.len(), 1);
     }
 
     fn dimension_rect(x0: f32, size: f32, z: usize) -> (Rect, LayerState) {
@@ -8947,6 +9658,7 @@ cell top() {
             selected_scope: Vec::new(),
             state: Arc::default(),
             scope_paths: Arc::default(),
+            used_layers: Arc::default(),
         };
         let scope = ScopeAddress {
             cell: top,

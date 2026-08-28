@@ -1022,12 +1022,20 @@ fn dependency_origin_remaps(
             return None;
         }
         let path = current.source_path.clone();
-        changed_paths.insert(path.clone());
+        let positions_changed = dependency
+            .snapshot
+            .origins
+            .iter()
+            .zip(&current.origins)
+            .any(|(old, new)| old != new);
         insert_origin_pairs(
             remaps.entry(path).or_default(),
             &dependency.snapshot.origins,
             &current.origins,
         );
+        if positions_changed {
+            changed_paths.insert(current.source_path.clone());
+        }
     }
     Some((changed_paths, remaps))
 }
@@ -1171,9 +1179,23 @@ impl CachedCellArtifact {
             return Some(self.artifact.clone());
         }
         let mut artifact = self.artifact.clone();
-        let mut cells = serde_json::to_value(&artifact.cells).ok()?;
-        remap_serialized_spans(&mut cells, &changed_paths, &remaps).then_some(())?;
-        artifact.cells = serde_json::from_value(cells).ok()?;
+        // Remap only cells whose scopes originate in an edited source file.
+        // In particular, a GDS artifact can hold millions of objects but all
+        // of its scopes point at the unchanged GDS path. Serializing the whole
+        // artifact here would both deep-copy that geometry and defeat Arc
+        // identity, even though there is no span in it to update.
+        for cell in artifact.cells.values_mut() {
+            if !cell
+                .scopes
+                .values()
+                .any(|scope| changed_paths.contains(&scope.span.path))
+            {
+                continue;
+            }
+            let mut value = serde_json::to_value(cell.as_ref()).ok()?;
+            remap_serialized_spans(&mut value, &changed_paths, &remaps).then_some(())?;
+            *cell = Arc::new(serde_json::from_value(value).ok()?);
+        }
         let mut errors = serde_json::to_value(&artifact.errors).ok()?;
         remap_serialized_spans(&mut errors, &changed_paths, &remaps).then_some(())?;
         artifact.errors = serde_json::from_value(errors).ok()?;
@@ -1619,6 +1641,11 @@ cell bot() {
             ),
             "{first:?}"
         );
+        let first_data = match &first {
+            CompileOutput::Valid(data) => data,
+            CompileOutput::ExecErrors(output) => output.output.as_ref().unwrap(),
+            _ => unreachable!(),
+        };
         let before = compiler.stats();
 
         compiler.set_source_text(
@@ -1629,9 +1656,37 @@ cell bot() {
         );
         let second = compiler.compile_cell(&config, &cell, Vec::new());
         assert!(matches!(
-            second,
+            &second,
             CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
         ));
+        let second_data = match &second {
+            CompileOutput::Valid(data) => data,
+            CompileOutput::ExecErrors(output) => output.output.as_ref().unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(first_data.top, second_data.top);
+        assert!(
+            !Arc::ptr_eq(
+                &first_data.cells[&first_data.top],
+                &second_data.cells[&second_data.top]
+            ),
+            "the edited parent must be replaced"
+        );
+        let shared_children = first_data
+            .cells
+            .iter()
+            .filter(|(id, cell)| {
+                **id != first_data.top
+                    && second_data
+                        .cells
+                        .get(*id)
+                        .is_some_and(|next| Arc::ptr_eq(cell, next))
+            })
+            .count();
+        assert!(
+            shared_children >= 2,
+            "leaf and bot should be structurally shared, found {shared_children} shared children"
+        );
         let after = compiler.stats();
 
         assert_eq!(
@@ -1642,6 +1697,63 @@ cell bot() {
             after.cell_artifact_cache_hits > before.cell_artifact_cache_hits,
             "before={before:?}, after={after:?}"
         );
+    }
+
+    #[test]
+    fn source_insertion_keeps_an_unchanged_gds_artifact_shared() {
+        use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let gds_path = directory.path().join("macro.gds");
+        let mut library = GdsLibrary::new("fixture");
+        let mut structure = GdsStruct::new("layout_top");
+        structure.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+            layer: 235,
+            datatype: 4,
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(0, 20),
+                GdsPoint::new(10, 20),
+                GdsPoint::new(10, 0),
+            ],
+            ..Default::default()
+        }));
+        library.structs.push(structure);
+        library.save(&gds_path).unwrap();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = WorkspaceConfig::new(&root)
+            .with_tech(Some(tech))
+            .with_gds_imports([("macro".to_owned(), gds_path)]);
+        let target = vec!["top".to_owned()];
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root.clone(),
+            "cell top() {\n  let imported = inst(macro());\n}\n",
+        );
+        let first = compiler.compile_cell(&config, &target, Vec::new());
+        compiler.set_source_text(
+            root,
+            "cell top() {\n  let marker = 1;\n  let imported = inst(macro());\n}\n",
+        );
+        let second = compiler.compile_cell(&config, &target, Vec::new());
+        fn data(output: &CompileOutput) -> &compile::CompiledData {
+            match output {
+                CompileOutput::Valid(data) => data,
+                CompileOutput::ExecErrors(output) => output.output.as_ref().unwrap(),
+                output => panic!("cell should compile: {output:?}"),
+            }
+        }
+        let first = data(&first);
+        let second = data(&second);
+        assert_eq!(first.top, second.top);
+        assert!(!Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        let imported = first.cells.keys().find(|cell| **cell != first.top).unwrap();
+        assert!(Arc::ptr_eq(&first.cells[imported], &second.cells[imported]));
     }
 
     #[test]
