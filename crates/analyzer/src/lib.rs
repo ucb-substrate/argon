@@ -92,6 +92,12 @@ pub struct GuiConfig {
     pub dark_mode: bool,
     /// Maximum rendered hierarchy depth. Omitted means unlimited.
     pub hierarchy_depth: Option<usize>,
+    /// Global GUI icon-size override in logical pixels.
+    #[serde(default, deserialize_with = "deserialize_gui_size")]
+    pub icon_size: Option<f32>,
+    /// Global GUI font-size override in logical pixels.
+    #[serde(default, deserialize_with = "deserialize_gui_size")]
+    pub font_size: Option<f32>,
 }
 
 impl Default for GuiConfig {
@@ -99,8 +105,39 @@ impl Default for GuiConfig {
         Self {
             dark_mode: true,
             hierarchy_depth: None,
+            icon_size: None,
+            font_size: None,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HumanReadableGuiSize {
+    Integer(u16),
+    Float(f32),
+    None(()),
+}
+
+fn deserialize_gui_size<'de, D>(deserializer: D) -> std::result::Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let size = if deserializer.is_human_readable() {
+        match HumanReadableGuiSize::deserialize(deserializer)? {
+            HumanReadableGuiSize::Integer(size) => Some(f32::from(size)),
+            HumanReadableGuiSize::Float(size) => Some(size),
+            HumanReadableGuiSize::None(()) => None,
+        }
+    } else {
+        Option::<f32>::deserialize(deserializer)?
+    };
+    if size.is_some_and(|size| !size.is_finite() || !(1.0..=256.0).contains(&size)) {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "GUI sizes must be between 1 and 256 logical pixels",
+        ));
+    }
+    Ok(size)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1608,8 +1645,9 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, is_gui_disconnected,
-        parse_config, preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
+        ArgonConfig, DEFAULT_LOG_LEVEL, GuiConfig, SourceState, config_with_key,
+        is_gui_disconnected, parse_config, preview_instance_cell, read_unpoisoned, write_config,
+        write_unpoisoned,
     };
 
     #[test]
@@ -1675,13 +1713,37 @@ mod tests {
     fn runtime_configuration_is_loaded_from_toml() {
         let config = parse_config(
             "[analyzer]\ncompile_debounce_ms = 0\n\
-             [gui]\ndark_mode = false\nhierarchy_depth = 3\n",
+             [gui]\ndark_mode = false\nhierarchy_depth = 3\nicon_size = 18\nfont_size = 15.5\n",
         )
         .expect("valid runtime configuration");
         assert_eq!(config.analyzer.compile_debounce_ms, 0);
         assert!(!config.gui.dark_mode);
         assert_eq!(config.gui.hierarchy_depth, Some(3));
+        assert_eq!(config.gui.icon_size, Some(18.));
+        assert_eq!(config.gui.font_size, Some(15.5));
         assert!(parse_config("[gui]\nunknown = true\n").is_err());
+        assert!(parse_config("[gui]\nicon_size = 0\n").is_err());
+        assert!(parse_config("[gui]\nfont_size = 257\n").is_err());
+    }
+
+    #[test]
+    fn runtime_configuration_round_trips_through_rpc_encoding() {
+        for config in [
+            ArgonConfig::default(),
+            ArgonConfig {
+                gui: GuiConfig {
+                    icon_size: Some(18.),
+                    font_size: Some(15.5),
+                    ..GuiConfig::default()
+                },
+                ..ArgonConfig::default()
+            },
+        ] {
+            let encoded = bincode::serialize(&config).unwrap();
+            let decoded: ArgonConfig = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded.gui.icon_size, config.gui.icon_size);
+            assert_eq!(decoded.gui.font_size, config.gui.font_size);
+        }
     }
 
     #[test]
@@ -1689,10 +1751,14 @@ mod tests {
         let config = ArgonConfig::default();
         let config = config_with_key(&config, "gui.hierarchy_depth", Some("3")).unwrap();
         let config = config_with_key(&config, "gui.dark_mode", Some("false")).unwrap();
+        let config = config_with_key(&config, "gui.icon_size", Some("22")).unwrap();
+        let config = config_with_key(&config, "gui.font_size", Some("13.5")).unwrap();
         let config = config_with_key(&config, "log.level", Some("analyzer=debug")).unwrap();
 
         assert_eq!(config.gui.hierarchy_depth, Some(3));
         assert!(!config.gui.dark_mode);
+        assert_eq!(config.gui.icon_size, Some(22.));
+        assert_eq!(config.gui.font_size, Some(13.5));
         assert_eq!(config.log.level, "analyzer=debug");
         assert_eq!(config.analyzer.compile_debounce_ms, 150);
     }
@@ -1705,6 +1771,8 @@ mod tests {
         assert_eq!(config.gui.hierarchy_depth, None);
         assert!(config_with_key(&config, "gui.unknown", Some("true")).is_err());
         assert!(config_with_key(&config, "gui.dark_mode", Some("2")).is_err());
+        assert!(config_with_key(&config, "gui.icon_size", Some("0")).is_err());
+        assert!(config_with_key(&config, "gui.font_size", Some("300")).is_err());
         assert!(config_with_key(&config, "gui..dark_mode", Some("true")).is_err());
     }
 

@@ -9,7 +9,9 @@ local diagnostics = require('argon.diagnostics')
 local config_keys = {
   'analyzer.compile_debounce_ms',
   'gui.dark_mode',
+  'gui.font_size',
   'gui.hierarchy_depth',
+  'gui.icon_size',
   'log.level',
 }
 
