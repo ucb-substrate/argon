@@ -22,7 +22,7 @@ use tower_lsp_server::ls_types::MessageType;
 use crate::{
     actions::{
         FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save,
-        ShowMessages, Undo,
+        ShowDiagnostics, ShowMessages, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -85,7 +85,8 @@ pub struct EditorState {
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
-    pub fatal_error: Option<SharedString>,
+    pub compilation_error: Option<EditorMessage>,
+    pub fatal_error: Option<EditorMessage>,
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
@@ -100,20 +101,20 @@ pub struct EditorState {
 pub struct EditorMessage {
     pub typ: MessageType,
     pub text: SharedString,
+    pub details: MessageDetails,
 }
 
-fn compile_error_summary(output: &CompileOutput) -> Option<String> {
-    let diagnostics = argonc::diagnostics::from_compile_output(output);
-    let first = diagnostics.first()?;
-    let remaining = diagnostics.len() - 1;
-    Some(if remaining == 0 {
-        first.message.clone()
-    } else {
-        format!(
-            "{} (and {remaining} more error{})",
-            first.message,
-            if remaining == 1 { "" } else { "s" }
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageDetails {
+    Diagnostics,
+    Messages,
+}
+
+fn compilation_error_message(output: &CompileOutput) -> Option<EditorMessage> {
+    (!matches!(output, CompileOutput::Valid(_))).then(|| EditorMessage {
+        typ: MessageType::ERROR,
+        text: "Compilation errors".into(),
+        details: MessageDetails::Diagnostics,
     })
 }
 
@@ -125,7 +126,6 @@ pub struct Editor {
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
-    pub(crate) text_input: Entity<TextInput>,
 }
 
 fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
@@ -187,6 +187,7 @@ impl EditorState {
             self.message = Some(EditorMessage {
                 typ,
                 text: message.into(),
+                details: MessageDetails::Messages,
             });
         }
     }
@@ -360,8 +361,11 @@ impl EditorState {
     }
 
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
-        let error_summary = compile_error_summary(&output).map(SharedString::from);
-        let mut recoverable_error = None;
+        let compilation_error = compilation_error_message(&output);
+        // Compilation status belongs to the accepted snapshot, rather than to
+        // the general message queue. In particular, a valid snapshot must
+        // always remove a banner left by an earlier failed compilation.
+        self.compilation_error = compilation_error;
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
@@ -369,16 +373,11 @@ impl EditorState {
                 errors,
             }) => {
                 if errors.iter().any(|error| error.kind.is_invalid_cell()) {
-                    self.fatal_error = error_summary;
                     return;
                 }
-                recoverable_error = error_summary;
                 d
             }
-            _ => {
-                self.fatal_error = error_summary;
-                return;
-            }
+            _ => return,
         };
         let root_scope = ScopeAddress {
             scope: solved_cell.cells[&solved_cell.top].root,
@@ -443,11 +442,7 @@ impl EditorState {
             });
             cx.notify();
         });
-        self.fatal_error = None;
-        self.message = recoverable_error.map(|text| EditorMessage {
-            typ: MessageType::ERROR,
-            text,
-        });
+        self.message = None;
     }
 }
 
@@ -481,6 +476,7 @@ impl Editor {
                 workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
+                compilation_error: None,
                 fatal_error: None,
                 message: None,
                 connection_error: None,
@@ -497,16 +493,23 @@ impl Editor {
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
         window.focus(&canvas_focus_handle);
+        let text_input = cx.new(|cx| {
+            TextInput::new_dimension_input(
+                cx,
+                text_input_focus_handle.clone(),
+                canvas_focus_handle.clone(),
+                &state,
+            )
+        });
         let canvas = cx.new(|cx| {
             LayoutCanvas::new(
                 cx,
                 &state,
                 canvas_focus_handle.clone(),
                 text_input_focus_handle.clone(),
+                text_input.clone(),
             )
         });
-        let text_input = cx
-            .new(|cx| TextInput::new_dimension_input(cx, text_input_focus_handle, &state, &canvas));
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state, &canvas));
 
@@ -517,7 +520,6 @@ impl Editor {
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
-            text_input,
         };
         cx.to_async()
             .spawn({
@@ -633,6 +635,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // This root listener also receives moves from the canvas itself and
+        // keeps drags alive when the pointer leaves its bounds. Registering the
+        // same handler on LayoutCanvas would process every in-canvas move twice.
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
         cx.notify();
@@ -686,11 +691,20 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(None, cx);
+        self.open_invoking_command(None, true, cx);
     }
 
     fn show_messages(&mut self, _: &ShowMessages, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_invoking_command(Some("messages<CR>"), cx);
+        self.open_invoking_command(Some("messages<CR>"), false, cx);
+    }
+
+    fn show_diagnostics(
+        &mut self,
+        _: &ShowDiagnostics,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon diagnostics<CR>"), false, cx);
     }
 
     fn instantiate_command(
@@ -699,7 +713,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon inst "), cx);
+        self.open_invoking_command(Some("Argon inst "), true, cx);
     }
 
     fn open_cell_command(
@@ -708,25 +722,40 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon openCell "), cx);
+        self.open_invoking_command(Some("Argon openCell "), true, cx);
     }
 
-    fn open_invoking_command(&mut self, command: Option<&str>, cx: &mut Context<Self>) {
-        // Neovim may be blocked at a hit-enter or error prompt. Focus it
-        // before queuing the notification so the user can clear that prompt.
-        self.focus_invoker(cx);
+    fn open_invoking_command(
+        &mut self,
+        command: Option<&str>,
+        return_to_gui: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A returning workflow may be blocked at a hit-enter or error prompt.
+        // Focus Neovim first so the user can clear it before the notification.
+        if return_to_gui {
+            self.focus_invoker(cx);
+        }
         let _ = self
             .state
             .read(cx)
             .lang_server_client
-            .open_command_bar(command.map(str::to_owned));
+            .open_command_bar(command.map(str::to_owned), return_to_gui);
+        if !return_to_gui {
+            // Leave the final activation request pointed at Neovim. Commands
+            // configured this way intentionally do not bounce back to Argon.
+            self.focus_invoker(cx);
+        }
     }
 
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
         if !crate::focus::activate_invoker() {
             self.state.update(cx, |state, _cx| {
-                state.fatal_error =
-                    Some("could not identify the application that invoked Argone".into());
+                state.fatal_error = Some(EditorMessage {
+                    typ: MessageType::ERROR,
+                    text: "could not identify the application that invoked Argone".into(),
+                    details: MessageDetails::Messages,
+                });
             });
         }
     }
@@ -739,10 +768,96 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
-        let (font_size, icon_size) = {
+        let font_size = self.state.read(cx).font_size;
+        let displayed_status = {
             let state = self.state.read(cx);
-            (state.font_size, state.icon_size)
+            state
+                .connection_error
+                .clone()
+                .map(|error| {
+                    (
+                        EditorMessage {
+                            typ: MessageType::ERROR,
+                            text: error,
+                            details: MessageDetails::Messages,
+                        },
+                        true,
+                    )
+                })
+                .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
+                .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                .or_else(|| state.message.clone().map(|message| (message, false)))
         };
+        let status_bar = displayed_status.map(|(message, is_connection_error)| {
+            let details = message.details;
+            let is_compilation_error = details == MessageDetails::Diagnostics;
+            let title = if is_compilation_error {
+                "Compilation errors"
+            } else if is_connection_error {
+                "Connection error"
+            } else if message.typ == MessageType::ERROR {
+                "Error"
+            } else if message.typ == MessageType::WARNING {
+                "Warning"
+            } else {
+                "Message"
+            };
+            let status_text = if is_compilation_error {
+                SharedString::from(title)
+            } else {
+                SharedString::from(format!("{title}: {}", message.text))
+            };
+            let action_label = if is_compilation_error {
+                "Open diagnostics (Ctrl-Shift-D)"
+            } else {
+                "View messages (Ctrl-Shift-M)"
+            };
+            let mut status_message = div()
+                .overflow_x_hidden()
+                .text_ellipsis()
+                .text_color(theme.error)
+                .child(status_text);
+            if !is_compilation_error {
+                status_message = status_message.flex_1();
+            }
+            div()
+                .id("status_bar")
+                .border_t_1()
+                .border_color(theme.divider)
+                .bg(theme.bg)
+                .px_2()
+                .py_1()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    svg()
+                        .path("icons/circle-exclamation-solid-full.svg")
+                        .w(px(14.))
+                        .h_auto()
+                        .text_color(theme.error),
+                )
+                .child(status_message)
+                .child(
+                    div()
+                        .id("show_status_details")
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .child(action_label)
+                        .on_click(cx.listener(move |editor, _, _, cx| {
+                            if details == MessageDetails::Diagnostics {
+                                editor.open_invoking_command(
+                                    Some("Argon diagnostics<CR>"),
+                                    false,
+                                    cx,
+                                );
+                            } else {
+                                editor.open_invoking_command(Some("messages<CR>"), false, cx);
+                            }
+                        })),
+                )
+        });
         let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
@@ -751,6 +866,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))
+            .on_action(cx.listener(Self::show_diagnostics))
             .on_action(cx.listener(Self::show_messages))
             .on_action(cx.listener(Self::instantiate_command))
             .on_action(cx.listener(Self::open_cell_command))
@@ -777,105 +893,16 @@ impl Render for Editor {
                     .flex_1()
                     .min_h_0()
                     .child(self.hierarchy_sidebar.clone())
-                    .child({
-                        let mut d = div()
+                    .child(
+                        div()
                             .flex_1()
                             .relative()
                             .overflow_hidden()
-                            .child(self.canvas.clone());
-
-                        let displayed_error = {
-                            let state = self.state.read(cx);
-                            state
-                                .connection_error
-                                .clone()
-                                .map(|error| ("Connection error", error, true, true))
-                                .or_else(|| {
-                                    state
-                                        .fatal_error
-                                        .clone()
-                                        .map(|error| ("Error", error, false, true))
-                                })
-                                .or_else(|| {
-                                    state.message.clone().map(|message| {
-                                        let title = if message.typ == MessageType::ERROR {
-                                            "Error"
-                                        } else if message.typ == MessageType::WARNING {
-                                            "Warning"
-                                        } else {
-                                            "Message"
-                                        };
-                                        (title, message.text, false, false)
-                                    })
-                                })
-                        };
-                        if let Some((title, error, is_connection_error, editing_disabled)) =
-                            displayed_error
-                        {
-                            let error_detail =
-                                div()
-                                    .text_color(theme.subtext)
-                                    .child(if is_connection_error {
-                                        "Editing is disabled until the connection recovers."
-                                    } else if editing_disabled {
-                                        "Editing is disabled until this error is fixed."
-                                    } else {
-                                        "The last operation was not completed."
-                                    });
-                            let error_detail = if let Some(font_size) = font_size {
-                                error_detail.text_size(px(font_size * 6. / 7.))
-                            } else {
-                                error_detail.text_xs()
-                            };
-                            let details_link = div()
-                                .id("show_error_details")
-                                .mt_1()
-                                .text_color(theme.text)
-                                .child("View details in Neovim (Ctrl-Shift-M)")
-                                .on_click(cx.listener(|editor, _, _, cx| {
-                                    editor.open_invoking_command(Some("messages<CR>"), cx);
-                                }));
-                            let details_link = if let Some(font_size) = font_size {
-                                details_link.text_size(px(font_size * 6. / 7.))
-                            } else {
-                                details_link.text_xs()
-                            };
-                            d = d.child(
-                                div()
-                                    .id("error_modal")
-                                    .bg(theme.bg)
-                                    .border_1()
-                                    .border_color(theme.divider)
-                                    .rounded_sm()
-                                    .absolute()
-                                    .p_2()
-                                    .child(
-                                        div().flex().flex_row().text_color(theme.error).child(
-                                            div().flex().flex_col().child(div().flex_1()).child(
-                                            svg()
-                                                .path("icons/circle-exclamation-solid-full.svg")
-                                                .w(px(icon_size.unwrap_or(20.)))
-                                                .h_auto()
-                                                .mr_1()
-                                                .text_color(theme.error)).child(div().flex_1())
-                                        )
-                                        .child(div().child(title))
-                                    )
-                                    .child(error)
-                                    .child(error_detail)
-                                    .child(details_link)
-                                    .whitespace_normal()
-                                    .top_2()
-                                    .left_2()
-                                    .right_2()
-                            );
-                        }
-
-                        d
-                    })
+                            .child(self.canvas.clone()),
+                    )
                     .child(self.layer_sidebar.clone()),
             )
-            .child(self.text_input.clone());
+            .children(status_bar);
         root = if let Some(font_size) = font_size {
             root.text_size(px(font_size))
         } else {
@@ -897,10 +924,10 @@ mod tests {
         compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
     };
 
-    use super::compile_error_summary;
+    use super::{MessageDetails, compilation_error_message};
 
     #[test]
-    fn compile_error_summary_shows_the_first_error_and_remaining_count() {
+    fn compilation_error_message_does_not_embed_individual_diagnostics() {
         let span = Span {
             path: PathBuf::from("lib.ar"),
             span: cfgrammar::Span::new(0, 1),
@@ -920,13 +947,30 @@ mod tests {
             ],
         });
 
-        assert_eq!(
-            compile_error_summary(&output).as_deref(),
-            Some("`missing` is not declared in this scope (and 1 more error)")
+        let message = compilation_error_message(&output).expect("compilation should have failed");
+        assert_eq!(message.text.as_ref(), "Compilation errors");
+        assert_eq!(message.details, MessageDetails::Diagnostics);
+
+        let message = compilation_error_message(&CompileOutput::FatalParseErrors)
+            .expect("compilation should have failed");
+        assert_eq!(message.text.as_ref(), "Compilation errors");
+        assert_eq!(message.details, MessageDetails::Diagnostics);
+
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(&source_path, "cell top() {}\n").unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let valid = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
         );
-        assert_eq!(
-            compile_error_summary(&CompileOutput::FatalParseErrors).as_deref(),
-            Some("fatal parse errors encountered")
-        );
+        assert!(matches!(&valid, CompileOutput::Valid(_)));
+        assert!(compilation_error_message(&valid).is_none());
     }
 }
