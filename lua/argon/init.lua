@@ -3,6 +3,7 @@ local M = {}
 local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
+local focus = require('argon.focus')
 local save = require('argon.save')
 
 local function schedule_workspace_modified(client_id)
@@ -72,12 +73,8 @@ vim.api.nvim_create_autocmd('LspDetach', {
     end,
 })
 
-local function focus_gui()
-    client.any_buf_request('custom/startGui', nil, client.print_error)
-end
-
 for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
-    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus_gui, {
+    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus.gui, {
         desc = 'Focus Argon GUI',
         silent = true,
         nowait = true,
@@ -213,12 +210,7 @@ M.start = function(bufnr)
             end,
             ['custom/focusEditor'] = function(_, command, _)
                 vim.schedule(function()
-                    local mode = vim.api.nvim_get_mode().mode
-                    local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
-                    if type(command) == 'string' then
-                        keys = keys .. command
-                    end
-                    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(keys, true, false, true), 'n', false)
+                    focus.editor(command)
                 end)
             end,
         },
@@ -236,6 +228,7 @@ M.start = function(bufnr)
                 lsp_client:request('custom/startGui', nil, client.print_error, bufnr)
             end)
         end
+        schedule_workspace_modified(lsp_client.id)
     end
 
     local old_on_exit = lsp_start_config.on_exit
@@ -252,7 +245,6 @@ M.start = function(bufnr)
     local client_id = vim.lsp.start(lsp_start_config, { bufnr = bufnr })
     if client_id then
         track_modified_buffer(bufnr, client_id)
-        schedule_workspace_modified(client_id)
     end
     return client_id
 end

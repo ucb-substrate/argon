@@ -65,7 +65,10 @@ mod platform {
         else {
             return false;
         };
-        #[allow(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "ignoring other apps still guarantees activation on macOS versions before 14"
+        )]
         application.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps)
     }
 }

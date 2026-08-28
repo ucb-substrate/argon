@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 autobins = false
 
+[lints]
+workspace = true
+
 [dependencies]
 anyhow = { workspace = true }
 argonc = { version = "0.1.0", path = "../compiler" }

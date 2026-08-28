@@ -2,6 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     ops::{Add, Sub},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use analyzer::rpc::{
@@ -16,19 +20,23 @@ use argonc::{
 use enumify::enumify;
 use geometry::{dir::Dir, transform::TransformationMatrix};
 use gpui::{
-    BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity, FillOptions,
-    FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement, PathBuilder, PathStyle,
-    Pixels, Point, Render, Rgba, ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription,
-    TextRun, Window, div, pattern_slash, px, rgb, size, solid_background,
+    AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity,
+    FillOptions, FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
+    PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent,
+    SharedString, Size, Style, Styled, Subscription, Task, TextRun, Window, div, pattern_slash, px,
+    rgb, size, solid_background,
 };
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::*,
-    editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
+    editor::{
+        self, CompileOutputState, EditorState, LayerState, SOURCE_EDIT_REJECTED_MESSAGE,
+        ScopeAddress,
+    },
     sse::SparseVec,
 };
 
@@ -41,6 +49,32 @@ pub enum ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
+/// Above this size, retain a viewport raster for interactive redraws. GPUI can
+/// replay a clean retained view, but pan/zoom dirties this immediate element;
+/// transforming one sprite avoids rebuilding hundreds of thousands of quads.
+const RASTER_CACHE_GEOMETRY_THRESHOLD: usize = 50_000;
+/// Rasterize geometry at half resolution so complex fills remain cheap. The
+/// completed pixels are expanded with nearest-neighbor sampling before GPUI
+/// sees them; this preserves discrete layer colors despite GPUI's hard-coded
+/// linear image sampler.
+const RASTER_CACHE_RESOLUTION: f32 = 0.5;
+/// Geometry smaller than this in the interaction raster is accumulated into a
+/// compact per-layer occupancy mask. Hierarchy is still fully flattened; only
+/// the final sub-pixel representation becomes cheaper.
+const GEOMETRY_LOD_SIZE_PX: f32 = 1.;
+/// Disabled: cell-local raster tiles can turn dense bitcells into opaque
+/// blocks at intermediate zoom levels. Keep the implementation isolated while
+/// the flattened per-layer occupancy path remains authoritative.
+const CELL_RASTER_TILES_ENABLED: bool = false;
+const CELL_RASTER_TILE_MAX_SIZE: u32 = 16;
+const CELL_RASTER_TILE_CACHE_LIMIT: usize = 256;
+/// Keep a 5x5 field of viewport-sized rasters. The center tile is always built
+/// first, followed by the two Chebyshev-distance rings around it.
+const NAVIGATION_TILE_RADIUS: i32 = 2;
+const TEXT_LAYOUT_SIZE: f32 = 16.;
+const SCOPE_TEXT_LAYOUT_SIZE: f32 = 12.;
+const MIN_READABLE_TEXT_PX: f32 = 5.;
+const MAX_TEXT_PX: f32 = 64.;
 const DEFAULT_DRAW_PATH_WIDTH: f32 = 20.;
 const DOT_DIAMETER: Pixels = px(3.);
 const DOT_SPACING: Pixels = px(7.);
@@ -834,20 +868,222 @@ pub struct LayoutCanvas {
     // shared between SSE and dragging
     drag_start: Point<Pixels>,
     mouse_position: Point<Pixels>,
+    hover_hit: Option<SelectionHit>,
     shift_down: bool,
     // zoom state
     scale: f32,
     screen_bounds: Bounds<Pixels>,
-    #[allow(unused)]
-    subscriptions: Vec<Subscription>,
+    // Retained to keep the canvas's observations active.
+    _subscriptions: Vec<Subscription>,
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
     dim_hitboxes: Vec<(Span, Vec<Bounds<Pixels>>, SharedString)>,
+    raster_tiles: Option<LayoutRasterTileSet>,
+    /// A different zoom level or disconnected pan is assembled here while
+    /// the complete previous field remains visible. It is promoted atomically
+    /// once the inner 3x3 is ready.
+    raster_staging_tiles: Option<LayoutRasterTileSet>,
+    /// Directly-created RenderImages bypass GPUI's managed image cache. Keep
+    /// replaced images until the next paint can explicitly evict them from
+    /// every sprite atlas, including the currently updating window.
+    raster_images_to_drop: Vec<Arc<RenderImage>>,
+    /// A viewport-sized image reprojected from retained semantic style planes.
+    /// Unlike scaling the completed tile image, this reapplies stippling in
+    /// destination pixels so its width and period remain stable during zoom.
+    raster_reprojection: Option<LayoutRasterCache>,
+    raster_display: Option<RasterDisplayTransform>,
+    raster_tile_target: Option<RasterTileTarget>,
+    navigation_cache_active: bool,
+    raster_refinement: Option<Task<()>>,
+    /// Only one background raster worker runs at a time. Input events merely
+    /// advance the requested generation; the worker coalesces them and always
+    /// continues with the newest viewport after finishing its current image.
+    raster_worker_active: bool,
+    /// Monotonically identifies the newest requested raster. A slow render for
+    /// an older viewport must never replace a newer, more appropriate LOD.
+    raster_generation: u64,
+    /// Background expanded rasters inspect this without returning to the UI
+    /// thread, allowing new navigation to preempt obsolete retention work.
+    raster_generation_signal: Arc<AtomicU64>,
+    /// Unlike panning, a scale change makes every in-flight raster the wrong
+    /// LOD. Workers check this independently so zoom immediately preempts old
+    /// same-scale pan work without causing pan renders to cancel each other.
+    raster_scale_signal: Arc<AtomicU64>,
+    /// Changes only when layout content or its presentation changes, not for
+    /// pan/zoom. It prevents a stale layer-visibility raster from entering the
+    /// retained navigation atlas after a replacement has arrived.
+    raster_content_revision: u64,
+    raster_content_revision_signal: Arc<AtomicU64>,
+    raster_output: Option<Arc<CompiledData>>,
+    raster_scope_state: Option<Arc<IndexMap<editor::ScopePath, editor::ScopeState>>>,
+    raster_selected_scope: Option<editor::ScopePath>,
+    raster_layer_visibility: Vec<bool>,
+    raster_hierarchy_depth: usize,
+    raster_hide_external_geometry: bool,
+    /// Conservative world-space bounds for everything the active presentation
+    /// can draw. If retained tiles contain this box, zooming out may expose
+    /// uncovered background but cannot expose missing geometry.
+    raster_layout_bbox: Option<compile::Rect<f64>>,
+    raster_dark_mode: bool,
+    cell_raster_tiles: Arc<Mutex<CellRasterTileCache>>,
     // True if waiting on render step to finish some initialization.
     //
     // Final bounds of layout canvas only determined in paint step.
     pending_init: bool,
+}
+
+#[derive(Clone)]
+struct LayoutRasterCache {
+    image: Arc<RenderImage>,
+    style_planes: Option<Arc<RasterStylePlanes>>,
+    texts: Arc<[TextLabel]>,
+    scope_labels: Arc<[LabeledBbox]>,
+    /// Logical extent covered by the raster image, including overscan.
+    viewport: Size<Pixels>,
+    /// Canvas size for which this cache was requested.
+    screen_viewport: Size<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+    content_revision: u64,
+}
+
+/// Fully composited colors for the two possible states of the shared slash
+/// pattern at each retained raster pixel. Sampling these planes preserves all
+/// layer ordering and outline replacement while allowing a destination raster
+/// to choose a fresh, fixed-size stipple phase after a camera transform.
+struct RasterStylePlanes {
+    width: u32,
+    height: u32,
+    stipple_on: Arc<[u8]>,
+    stipple_off: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RasterTileIndex {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Clone)]
+struct LayoutRasterTileSet {
+    tiles: HashMap<RasterTileIndex, LayoutRasterCache>,
+    /// Exact UI-thread rasters seed the center for first paint but must still
+    /// be replaced by the fully flattened navigation traversal.
+    navigation: bool,
+    /// Offset used by tile (0, 0). Other tiles are translated by an integral
+    /// tile stride, which keeps their raster phases mutually congruent.
+    anchor_offset: Point<Pixels>,
+    tile_size: Size<Pixels>,
+    screen_viewport: Size<Pixels>,
+    scale: f32,
+    content_revision: u64,
+    center: RasterTileIndex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RasterTileTarget {
+    anchor_offset: Point<Pixels>,
+    tile_size: Size<Pixels>,
+    screen_viewport: Size<Pixels>,
+    scale: f32,
+    content_revision: u64,
+    center: RasterTileIndex,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RasterDisplayTransform {
+    scale: f32,
+    offset: Point<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+struct ViewportTransform {
+    size: Size<Pixels>,
+    screen_size: Size<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct NavigationRasterInput {
+    solved_cell: CompileOutputState,
+    layers: Arc<IndexMap<SharedString, LayerState>>,
+    hierarchy_depth: usize,
+    hide_external_geometry: bool,
+    viewport: ViewportTransform,
+    text_color: Rgba,
+    include_text: bool,
+    content_revision: u64,
+    content_revision_signal: Arc<AtomicU64>,
+    scale_signal: Arc<AtomicU64>,
+    cell_raster_tiles: Arc<Mutex<CellRasterTileCache>>,
+    cancel_if_generation_changes: Option<(Arc<AtomicU64>, u64)>,
+}
+
+struct RasterRectPrimitive {
+    bounds: Bounds<Pixels>,
+    fill: ShapeFill,
+    color: Rgba,
+    border_color: Rgba,
+}
+
+struct RasterPolygonPrimitive {
+    points: Vec<Point<f32>>,
+    fill: ShapeFill,
+    color: Rgba,
+    border_color: Rgba,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct CellRasterTileKey {
+    address: ScopeAddress,
+    orientation: TransformationMatrix,
+    width: u16,
+    height: u16,
+    content_revision: u64,
+}
+
+struct CellRasterTile {
+    width: u16,
+    height: u16,
+    layers: Vec<Option<Arc<[u8]>>>,
+}
+
+#[derive(Default)]
+struct CellRasterTileCache {
+    entries: HashMap<CellRasterTileKey, Arc<CellRasterTile>>,
+    insertion_order: VecDeque<CellRasterTileKey>,
+}
+
+impl CellRasterTileCache {
+    fn get(&self, key: &CellRasterTileKey) -> Option<Arc<CellRasterTile>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: CellRasterTileKey, tile: Arc<CellRasterTile>) {
+        if self.entries.insert(key, tile).is_none() {
+            self.insertion_order.push_back(key);
+        }
+        while self.entries.len() > CELL_RASTER_TILE_CACHE_LIMIT {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.insertion_order.clear();
+    }
+}
+
+struct RasterTilePrimitive {
+    coverage: Arc<[u8]>,
+    tile_width: u16,
+    tile_height: u16,
+    bounds: Bounds<Pixels>,
 }
 
 impl IntoElement for CanvasElement {
@@ -893,6 +1129,1867 @@ fn get_rect_bounds(
         Point::new(scale * px(x0), scale * px(-y1)) + offset + bounds.origin,
         Size::new(scale * px(x1 - x0), scale * px(y1 - y0)),
     )
+}
+
+fn raster_channel(value: f32) -> f32 {
+    value.clamp(0., 1.)
+}
+
+#[derive(Clone, Copy)]
+enum RasterComposite {
+    /// Idempotent union of shapes sharing one layer.
+    Union,
+    /// Outlines replace the fill of their own layer.
+    Replace,
+}
+
+fn layout_text_metrics(scale: f32, layout_size: f32) -> Option<(Pixels, Pixels)> {
+    let size = (scale.abs() * layout_size).min(MAX_TEXT_PX);
+    (size >= MIN_READABLE_TEXT_PX).then(|| (px(size), px(size * 1.125)))
+}
+
+/// Blend a GPUI color into the BGRA image format expected by `RenderImage`.
+fn blend_raster_pixel(buffer: &mut [u8], pixel: usize, color: Rgba) {
+    let source_alpha = raster_channel(color.a);
+    if source_alpha <= 0. {
+        return;
+    }
+    let index = pixel * 4;
+    let destination_alpha = buffer[index + 3] as f32 / 255.;
+    let output_alpha = source_alpha + destination_alpha * (1. - source_alpha);
+    let source = [color.b, color.g, color.r];
+    if output_alpha > 0. {
+        for channel in 0..3 {
+            let destination = buffer[index + channel] as f32 / 255.;
+            let output = (raster_channel(source[channel]) * source_alpha
+                + destination * destination_alpha * (1. - source_alpha))
+                / output_alpha;
+            buffer[index + channel] = (output * 255.).round() as u8;
+        }
+    }
+    buffer[index + 3] = (output_alpha * 255.).round() as u8;
+}
+
+fn composite_raster_pixel(
+    buffer: &mut [u8],
+    pixel: usize,
+    color: Rgba,
+    composite: RasterComposite,
+    touched: Option<&mut Vec<usize>>,
+) {
+    let index = pixel * 4;
+    let was_transparent = buffer[index + 3] == 0;
+    match composite {
+        RasterComposite::Union => {
+            let alpha = (raster_channel(color.a) * 255.).round() as u8;
+            if alpha > buffer[index + 3] {
+                buffer[index] = (raster_channel(color.b) * 255.).round() as u8;
+                buffer[index + 1] = (raster_channel(color.g) * 255.).round() as u8;
+                buffer[index + 2] = (raster_channel(color.r) * 255.).round() as u8;
+                buffer[index + 3] = alpha;
+            }
+        }
+        RasterComposite::Replace => {
+            buffer[index] = (raster_channel(color.b) * 255.).round() as u8;
+            buffer[index + 1] = (raster_channel(color.g) * 255.).round() as u8;
+            buffer[index + 2] = (raster_channel(color.r) * 255.).round() as u8;
+            buffer[index + 3] = (raster_channel(color.a) * 255.).round() as u8;
+        }
+    }
+    if was_transparent
+        && buffer[index + 3] != 0
+        && let Some(touched) = touched
+    {
+        touched.push(pixel);
+    }
+}
+
+struct RasterPaintTarget<'a> {
+    buffer: &'a mut [u8],
+    composite: RasterComposite,
+    touched: Option<&'a mut Vec<usize>>,
+}
+
+impl RasterPaintTarget<'_> {
+    fn pixel(&mut self, pixel: usize, color: Rgba) {
+        composite_raster_pixel(
+            self.buffer,
+            pixel,
+            color,
+            self.composite,
+            self.touched.as_deref_mut(),
+        );
+    }
+}
+
+fn blend_raster_layer(buffer: &mut [u8], layer: &mut [u8], touched: &mut Vec<usize>) {
+    for pixel in touched.drain(..) {
+        let source = &mut layer[pixel * 4..pixel * 4 + 4];
+        if source[3] == 0 {
+            continue;
+        }
+        if source[3] == u8::MAX {
+            buffer[pixel * 4..pixel * 4 + 4].copy_from_slice(source);
+        } else {
+            blend_raster_pixel(
+                buffer,
+                pixel,
+                Rgba {
+                    b: source[0] as f32 / 255.,
+                    g: source[1] as f32 / 255.,
+                    r: source[2] as f32 / 255.,
+                    a: source[3] as f32 / 255.,
+                },
+            );
+        }
+        source.fill(0);
+    }
+}
+
+fn raster_pixel_range(start: f32, stop: f32, limit: u32) -> Option<(u32, u32)> {
+    let lower = start.min(stop).floor().clamp(0., limit as f32) as u32;
+    let upper = start.max(stop).ceil().clamp(0., limit as f32) as u32;
+    (lower < upper).then_some((lower, upper))
+}
+
+fn raster_unclipped_pixel_range(start: f32, stop: f32) -> Option<(i32, i32)> {
+    let lower = start.min(stop).floor() as i32;
+    let upper = start.max(stop).ceil() as i32;
+    (lower < upper).then_some((lower, upper))
+}
+
+fn raster_logical_size(width: u32, height: u32) -> Size<Pixels> {
+    Size::new(
+        px(width as f32 / RASTER_CACHE_RESOLUTION),
+        px(height as f32 / RASTER_CACHE_RESOLUTION),
+    )
+}
+
+fn expand_raster_for_display(image: image::RgbaImage) -> image::RgbaImage {
+    let logical_size = raster_logical_size(image.width(), image.height());
+    let width = f32::from(logical_size.width).round().max(1.) as u32;
+    let height = f32::from(logical_size.height).round().max(1.) as u32;
+    image::imageops::resize(&image, width, height, image::imageops::FilterType::Nearest)
+}
+
+fn raster_stipple_is_on(x: u32, y: u32, stipple_phase: i64) -> bool {
+    let period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.) as i64;
+    (x as i64 - y as i64 - stipple_phase).rem_euclid(period) == 0
+}
+
+fn raster_from_style_planes(
+    width: u32,
+    height: u32,
+    stipple_on: &[u8],
+    stipple_off: &[u8],
+    stipple_phase: i64,
+) -> Option<image::RgbaImage> {
+    let mut buffer = vec![0; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = (y * width + x) as usize;
+            let source = if raster_stipple_is_on(x, y, stipple_phase) {
+                stipple_on
+            } else {
+                stipple_off
+            };
+            buffer[pixel * 4..pixel * 4 + 4].copy_from_slice(&source[pixel * 4..pixel * 4 + 4]);
+        }
+    }
+    image::RgbaImage::from_raw(width, height, buffer)
+}
+
+fn raster_stipple_phase(offset: Point<Pixels>) -> i64 {
+    (f32::from(offset.x) - f32::from(offset.y)).round() as i64
+}
+
+fn mark_raster_occupancy(
+    occupancy: &mut Option<Vec<u64>>,
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+) {
+    let Some((x0, x1)) = raster_pixel_range(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.x + bounds.size.width),
+        width,
+    ) else {
+        return;
+    };
+    let Some((y0, y1)) = raster_pixel_range(
+        f32::from(bounds.origin.y),
+        f32::from(bounds.origin.y + bounds.size.height),
+        height,
+    ) else {
+        return;
+    };
+    let pixel_count = width as usize * height as usize;
+    let occupancy = occupancy.get_or_insert_with(|| vec![0; pixel_count.div_ceil(64)]);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let pixel = (y * width + x) as usize;
+            occupancy[pixel / 64] |= 1_u64 << (pixel % 64);
+        }
+    }
+}
+
+fn paint_raster_occupancy(
+    target: &mut RasterPaintTarget<'_>,
+    occupancy: &[u64],
+    pixel_count: usize,
+    layer: &LayerState,
+) {
+    let mut color = layer.color;
+    if layer.fill == ShapeFill::Stippling {
+        // Below one screen pixel the slash pattern has no stable phase. Its
+        // average coverage produces the same solid-looking density as other
+        // flattened sub-pixel geometry.
+        color.a *= 0.25;
+    }
+    for (word_index, word) in occupancy.iter().enumerate() {
+        let mut remaining = *word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros() as usize;
+            let pixel = word_index * 64 + bit;
+            if pixel < pixel_count {
+                target.pixel(pixel, color);
+            }
+            remaining &= remaining - 1;
+        }
+    }
+}
+
+fn mark_tile_rect(coverage: &mut [u8], width: u32, height: u32, bounds: Bounds<Pixels>) {
+    let Some((x0, x1)) = raster_pixel_range(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.x + bounds.size.width),
+        width,
+    ) else {
+        return;
+    };
+    let Some((y0, y1)) = raster_pixel_range(
+        f32::from(bounds.origin.y),
+        f32::from(bounds.origin.y + bounds.size.height),
+        height,
+    ) else {
+        return;
+    };
+    for y in y0..y1 {
+        coverage[(y * width + x0) as usize..(y * width + x1) as usize].fill(u8::MAX);
+    }
+}
+
+fn mark_tile_polygon(coverage: &mut [u8], width: u32, height: u32, points: &[Point<f32>]) {
+    if points.len() < 3 {
+        return;
+    }
+    let mut painted = false;
+    for y in 0..height {
+        let scan_y = y as f32 + 0.5;
+        let mut intersections = Vec::with_capacity(points.len());
+        for (start, stop) in points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+        {
+            if (start.y <= scan_y && stop.y > scan_y) || (stop.y <= scan_y && start.y > scan_y) {
+                let fraction = (scan_y - start.y) / (stop.y - start.y);
+                intersections.push(start.x + fraction * (stop.x - start.x));
+            }
+        }
+        intersections.sort_by(f32::total_cmp);
+        for pair in intersections.chunks_exact(2) {
+            let Some((x0, x1)) = raster_pixel_range(pair[0], pair[1], width) else {
+                continue;
+            };
+            coverage[(y * width + x0) as usize..(y * width + x1) as usize].fill(u8::MAX);
+            painted = true;
+        }
+    }
+    if !painted {
+        let (min_x, max_x, min_y, max_y) = points.iter().fold(
+            (
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ),
+            |(min_x, max_x, min_y, max_y), point| {
+                (
+                    min_x.min(point.x),
+                    max_x.max(point.x),
+                    min_y.min(point.y),
+                    max_y.max(point.y),
+                )
+            },
+        );
+        mark_tile_rect(
+            coverage,
+            width,
+            height,
+            Bounds::from_corners(
+                Point::new(px(min_x), px(min_y)),
+                Point::new(px(max_x), px(max_y)),
+            ),
+        );
+    }
+}
+
+fn build_cell_raster_tile(
+    input: &NavigationRasterInput,
+    address: ScopeAddress,
+    orientation: TransformationMatrix,
+    width: u16,
+    height: u16,
+) -> Option<CellRasterTile> {
+    let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
+    let bbox = scope_state.bbox.as_ref()?;
+    let p0 = ifmatvec(orientation, (bbox.x0, bbox.y0));
+    let p1 = ifmatvec(orientation, (bbox.x1, bbox.y1));
+    let x0 = p0.0.min(p1.0);
+    let x1 = p0.0.max(p1.0);
+    let y0 = p0.1.min(p1.1);
+    let y1 = p0.1.max(p1.1);
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let layer_count = input
+        .layers
+        .values()
+        .map(|layer| layer.z)
+        .max()
+        .map_or(0, |z| z + 1);
+    let mut coverage = (0..layer_count)
+        .map(|_| vec![0; width as usize * height as usize])
+        .collect::<Vec<_>>();
+    let mut queue = VecDeque::from_iter([(address, orientation, (0., 0.))]);
+
+    while let Some((address @ ScopeAddress { cell, scope }, mat, ofs)) = queue.pop_front() {
+        let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
+        if !scope_state.visible {
+            continue;
+        }
+        let cell_info = &input.solved_cell.output.cells[&cell];
+        let scope_info = &cell_info.scopes[&scope];
+        for (object, _) in &scope_info.emit {
+            match &cell_info.objects[object] {
+                SolvedValue::Rect(rect) if !rect.construction => {
+                    let Some(layer) = rect
+                        .layer
+                        .as_ref()
+                        .and_then(|name| input.layers.get(name.as_str()))
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let rp0 = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                    let rp1 = ifmatvec(mat, (rect.x1.0, rect.y1.0));
+                    let tp0 = Point::new(
+                        width as f32 * ((rp0.0 + ofs.0 - x0) / (x1 - x0)) as f32,
+                        height as f32 * ((y1 - rp0.1 - ofs.1) / (y1 - y0)) as f32,
+                    );
+                    let tp1 = Point::new(
+                        width as f32 * ((rp1.0 + ofs.0 - x0) / (x1 - x0)) as f32,
+                        height as f32 * ((y1 - rp1.1 - ofs.1) / (y1 - y0)) as f32,
+                    );
+                    mark_tile_rect(
+                        &mut coverage[layer.z],
+                        width as u32,
+                        height as u32,
+                        Bounds::from_corners(tp0.min(&tp1).map(px), tp0.max(&tp1).map(px)),
+                    );
+                }
+                SolvedValue::Polygon(polygon) => {
+                    let Some(layer) = input
+                        .layers
+                        .get(polygon.layer.as_str())
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let points = polygon
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            let point = ifmatvec(mat, (x.0, y.0));
+                            Point::new(
+                                width as f32 * ((point.0 + ofs.0 - x0) / (x1 - x0)) as f32,
+                                height as f32 * ((y1 - point.1 - ofs.1) / (y1 - y0)) as f32,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    mark_tile_polygon(&mut coverage[layer.z], width as u32, height as u32, &points);
+                }
+                SolvedValue::Instance(instance) if !instance.construction => {
+                    let mut instance_mat = TransformationMatrix::identity();
+                    if instance.reflect {
+                        instance_mat = instance_mat.reflect_vert();
+                    }
+                    instance_mat = instance_mat.rotate(instance.angle);
+                    let instance_ofs = ifmatvec(mat, (instance.x, instance.y));
+                    let child = instance.cell;
+                    queue.push_back((
+                        ScopeAddress {
+                            cell: child,
+                            scope: input.solved_cell.output.cells[&child].root,
+                        },
+                        mat * instance_mat,
+                        (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        for child in &scope_info.children {
+            queue.push_back((
+                ScopeAddress {
+                    cell,
+                    scope: *child,
+                },
+                mat,
+                ofs,
+            ));
+        }
+    }
+
+    let layers = coverage
+        .into_iter()
+        .map(|coverage| {
+            coverage
+                .iter()
+                .any(|value| *value != 0)
+                .then(|| Arc::<[u8]>::from(coverage))
+        })
+        .collect::<Vec<_>>();
+    layers
+        .iter()
+        .any(Option::is_some)
+        .then_some(CellRasterTile {
+            width,
+            height,
+            layers,
+        })
+}
+
+fn cached_cell_raster_tile(
+    input: &NavigationRasterInput,
+    address: ScopeAddress,
+    orientation: TransformationMatrix,
+    width: u16,
+    height: u16,
+) -> Option<Arc<CellRasterTile>> {
+    let key = CellRasterTileKey {
+        address,
+        orientation,
+        width,
+        height,
+        content_revision: input.content_revision,
+    };
+    if let Some(tile) = input
+        .cell_raster_tiles
+        .lock()
+        .expect("cell raster tile cache poisoned")
+        .get(&key)
+    {
+        return Some(tile);
+    }
+    let tile = Arc::new(build_cell_raster_tile(
+        input,
+        address,
+        orientation,
+        width,
+        height,
+    )?);
+    input
+        .cell_raster_tiles
+        .lock()
+        .expect("cell raster tile cache poisoned")
+        .insert(key, tile.clone());
+    Some(tile)
+}
+
+fn paint_raster_tile(
+    target: &mut RasterPaintTarget<'_>,
+    raster_width: u32,
+    raster_height: u32,
+    primitive: &RasterTilePrimitive,
+    layer: &LayerState,
+) {
+    let Some((x0, x1)) = raster_pixel_range(
+        f32::from(primitive.bounds.origin.x),
+        f32::from(primitive.bounds.origin.x + primitive.bounds.size.width),
+        raster_width,
+    ) else {
+        return;
+    };
+    let Some((y0, y1)) = raster_pixel_range(
+        f32::from(primitive.bounds.origin.y),
+        f32::from(primitive.bounds.origin.y + primitive.bounds.size.height),
+        raster_height,
+    ) else {
+        return;
+    };
+    let bounds_width = f32::from(primitive.bounds.size.width).max(f32::EPSILON);
+    let bounds_height = f32::from(primitive.bounds.size.height).max(f32::EPSILON);
+    let resolve_stipple_pattern = raster_tile_resolves_stipple(primitive, layer);
+    let mut color = layer.color;
+    if layer.fill == ShapeFill::Stippling && !resolve_stipple_pattern {
+        color.a *= 0.25;
+    }
+    for y in y0..y1 {
+        let source_y = (((y as f32 + 0.5 - f32::from(primitive.bounds.origin.y)) / bounds_height)
+            * primitive.tile_height as f32)
+            .floor()
+            .clamp(0., primitive.tile_height as f32 - 1.) as u16;
+        for x in x0..x1 {
+            let source_x = (((x as f32 + 0.5 - f32::from(primitive.bounds.origin.x))
+                / bounds_width)
+                * primitive.tile_width as f32)
+                .floor()
+                .clamp(0., primitive.tile_width as f32 - 1.) as u16;
+            let coverage = primitive.coverage
+                [(source_y as usize * primitive.tile_width as usize) + source_x as usize];
+            if coverage == 0 {
+                continue;
+            }
+            let mut pixel_color = color;
+            pixel_color.a *= coverage as f32 / u8::MAX as f32;
+            if resolve_stipple_pattern {
+                composite_raster_fill_pixel(
+                    target,
+                    raster_width,
+                    x,
+                    y,
+                    ShapeFill::Stippling,
+                    pixel_color,
+                    0,
+                );
+            } else {
+                target.pixel(
+                    (y as usize * raster_width as usize) + x as usize,
+                    pixel_color,
+                );
+            }
+        }
+    }
+}
+
+fn raster_tile_resolves_stipple(primitive: &RasterTilePrimitive, layer: &LayerState) -> bool {
+    let stipple_period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.);
+    layer.fill == ShapeFill::Stippling
+        && f32::from(primitive.bounds.size.width) >= stipple_period
+        && f32::from(primitive.bounds.size.height) >= stipple_period
+}
+
+fn fill_raster_rect(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+    fill: ShapeFill,
+    color: Rgba,
+    stipple_phase: i64,
+) {
+    let Some((x0, x1)) = raster_pixel_range(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.x + bounds.size.width),
+        width,
+    ) else {
+        return;
+    };
+    let Some((y0, y1)) = raster_pixel_range(
+        f32::from(bounds.origin.y),
+        f32::from(bounds.origin.y + bounds.size.height),
+        height,
+    ) else {
+        return;
+    };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            composite_raster_fill_pixel(target, width, x, y, fill, color, stipple_phase);
+        }
+    }
+}
+
+/// Match GPUI's global slash pattern with a fixed one-raster-pixel stroke.
+/// A retained raster pixel covers two logical pixels, so keeping the sample
+/// fully opaque is preferable to alpha-based sub-sampling: it gives outlines
+/// and stipple strokes the same stable width and preserves layer paint order.
+fn composite_raster_fill_pixel(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    x: u32,
+    y: u32,
+    fill: ShapeFill,
+    color: Rgba,
+    stipple_phase: i64,
+) {
+    if fill == ShapeFill::Stippling && !raster_stipple_is_on(x, y, stipple_phase) {
+        return;
+    }
+    target.pixel((y * width + x) as usize, color);
+}
+
+fn stroke_raster_rect(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+    color: Rgba,
+) {
+    let Some((x0, x1)) = raster_unclipped_pixel_range(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.x + bounds.size.width),
+    ) else {
+        return;
+    };
+    let Some((y0, y1)) = raster_unclipped_pixel_range(
+        f32::from(bounds.origin.y),
+        f32::from(bounds.origin.y + bounds.size.height),
+    ) else {
+        return;
+    };
+
+    let bottom = y1 - 1;
+    let right = x1 - 1;
+    let clipped_x0 = x0.clamp(0, width as i32);
+    let clipped_x1 = x1.clamp(0, width as i32);
+    if clipped_x0 < clipped_x1 {
+        for x in clipped_x0..clipped_x1 {
+            if y0 >= 0 && y0 < height as i32 {
+                target.pixel((y0 as u32 * width + x as u32) as usize, color);
+            }
+            if bottom != y0 && bottom >= 0 && bottom < height as i32 {
+                target.pixel((bottom as u32 * width + x as u32) as usize, color);
+            }
+        }
+    }
+    // Exclude the two horizontal rows so corners are written exactly once.
+    let clipped_y0 = (y0 + 1).clamp(0, height as i32);
+    let clipped_y1 = bottom.clamp(0, height as i32);
+    for y in clipped_y0..clipped_y1 {
+        if x0 >= 0 && x0 < width as i32 {
+            target.pixel((y as u32 * width + x0 as u32) as usize, color);
+        }
+        if right != x0 && right >= 0 && right < width as i32 {
+            target.pixel((y as u32 * width + right as u32) as usize, color);
+        }
+    }
+}
+
+fn fill_raster_polygon(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    height: u32,
+    points: &[Point<f32>],
+    fill: ShapeFill,
+    color: Rgba,
+    stipple_phase: i64,
+) {
+    if points.len() < 3 {
+        return;
+    }
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let Some((y0, y1)) = raster_pixel_range(min_y, max_y, height) else {
+        return;
+    };
+    let mut intersections = Vec::with_capacity(points.len());
+    for y in y0..y1 {
+        intersections.clear();
+        let scan_y = y as f32 + 0.5;
+        for (start, stop) in points
+            .iter()
+            .zip(points.iter().cycle().skip(1))
+            .take(points.len())
+        {
+            if (start.y <= scan_y && stop.y > scan_y) || (stop.y <= scan_y && start.y > scan_y) {
+                let fraction = (scan_y - start.y) / (stop.y - start.y);
+                intersections.push(start.x + fraction * (stop.x - start.x));
+            }
+        }
+        intersections.sort_by(f32::total_cmp);
+        for pair in intersections.chunks_exact(2) {
+            let Some((x0, x1)) = raster_pixel_range(pair[0], pair[1], width) else {
+                continue;
+            };
+            for x in x0..x1 {
+                composite_raster_fill_pixel(target, width, x, y, fill, color, stipple_phase);
+            }
+        }
+    }
+}
+
+fn stroke_raster_line(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    height: u32,
+    start: Point<f32>,
+    stop: Point<f32>,
+    color: Rgba,
+) {
+    let steps = (stop.x - start.x)
+        .abs()
+        .max((stop.y - start.y).abs())
+        .ceil() as usize;
+    for step in 0..=steps {
+        let fraction = if steps == 0 {
+            0.
+        } else {
+            step as f32 / steps as f32
+        };
+        let x = (start.x + fraction * (stop.x - start.x)).round() as i32;
+        let y = (start.y + fraction * (stop.y - start.y)).round() as i32;
+        if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
+            target.pixel((y as u32 * width + x as u32) as usize, color);
+        }
+    }
+}
+
+fn build_layout_raster(
+    rects: &[(Rect, LayerState)],
+    polygons: &[(Polygon, LayerState)],
+    scope_rects: &[LabeledBbox],
+    texts: &[TextLabel],
+    viewport: ViewportTransform,
+    theme: &crate::theme::Theme,
+    content_revision: u64,
+) -> Option<LayoutRasterCache> {
+    let width = (f32::from(viewport.size.width) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    let height = (f32::from(viewport.size.height) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let buffer_len = width as usize * height as usize * 4;
+    let mut stipple_on = vec![0; buffer_len];
+    let mut stipple_off = vec![0; buffer_len];
+    let mut on_layer_buffer = vec![0; buffer_len];
+    let mut off_layer_buffer = vec![0; buffer_len];
+    let mut on_layer_touched = Vec::new();
+    let mut off_layer_touched = Vec::new();
+    let local_bounds = Bounds::new(
+        Point::default(),
+        Size::new(px(width as f32), px(height as f32)),
+    );
+    let raster_scale = viewport.scale * RASTER_CACHE_RESOLUTION;
+    let raster_offset = Point::new(
+        viewport.offset.x * RASTER_CACHE_RESOLUTION,
+        viewport.offset.y * RASTER_CACHE_RESOLUTION,
+    );
+    let stipple_phase = raster_stipple_phase(raster_offset);
+    let raster_rects = rects
+        .iter()
+        .map(|(rect, layer)| {
+            (
+                get_rect_bounds(rect, local_bounds, raster_scale, raster_offset),
+                layer,
+            )
+        })
+        .collect::<Vec<_>>();
+    let raster_polygons = polygons
+        .iter()
+        .map(|(polygon, layer)| {
+            let points = polygon
+                .points
+                .iter()
+                .map(|point| {
+                    Point::new(
+                        raster_scale * point.x + f32::from(raster_offset.x),
+                        raster_scale * -point.y + f32::from(raster_offset.y),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (points, layer)
+        })
+        .collect::<Vec<_>>();
+    let layer_count = raster_rects
+        .iter()
+        .map(|(_, layer)| layer.z)
+        .chain(raster_polygons.iter().map(|(_, layer)| layer.z))
+        .max()
+        .map_or(0, |z| z + 1);
+    let mut rect_layers = vec![Vec::new(); layer_count];
+    let mut polygon_layers = vec![Vec::new(); layer_count];
+    for (index, (_, layer)) in raster_rects.iter().enumerate() {
+        rect_layers[layer.z].push(index);
+    }
+    for (index, (_, layer)) in raster_polygons.iter().enumerate() {
+        polygon_layers[layer.z].push(index);
+    }
+    for (rect_layer, polygon_layer) in rect_layers.iter().zip(&polygon_layers) {
+        // The on plane treats every stippled fill as solid. The off plane
+        // omits stippled fills but retains solid fills. Selecting between the
+        // two after a camera transform restores the pattern at fixed screen
+        // size without losing any cross-layer compositing information.
+        let mut on_fill_target = RasterPaintTarget {
+            buffer: &mut on_layer_buffer,
+            composite: RasterComposite::Union,
+            touched: Some(&mut on_layer_touched),
+        };
+        for index in rect_layer {
+            let (bounds, layer) = raster_rects[*index];
+            fill_raster_rect(
+                &mut on_fill_target,
+                width,
+                height,
+                bounds,
+                ShapeFill::Solid,
+                layer.color,
+                0,
+            );
+        }
+        for index in polygon_layer {
+            let (points, layer) = &raster_polygons[*index];
+            fill_raster_polygon(
+                &mut on_fill_target,
+                width,
+                height,
+                points,
+                ShapeFill::Solid,
+                layer.color,
+                0,
+            );
+        }
+        let mut off_fill_target = RasterPaintTarget {
+            buffer: &mut off_layer_buffer,
+            composite: RasterComposite::Union,
+            touched: Some(&mut off_layer_touched),
+        };
+        for index in rect_layer {
+            let (bounds, layer) = raster_rects[*index];
+            if layer.fill == ShapeFill::Solid {
+                fill_raster_rect(
+                    &mut off_fill_target,
+                    width,
+                    height,
+                    bounds,
+                    ShapeFill::Solid,
+                    layer.color,
+                    0,
+                );
+            }
+        }
+        for index in polygon_layer {
+            let (points, layer) = &raster_polygons[*index];
+            if layer.fill == ShapeFill::Solid {
+                fill_raster_polygon(
+                    &mut off_fill_target,
+                    width,
+                    height,
+                    points,
+                    ShapeFill::Solid,
+                    layer.color,
+                    0,
+                );
+            }
+        }
+        let mut on_outline_target = RasterPaintTarget {
+            buffer: &mut on_layer_buffer,
+            composite: RasterComposite::Replace,
+            touched: Some(&mut on_layer_touched),
+        };
+        for index in rect_layer {
+            let (bounds, layer) = raster_rects[*index];
+            stroke_raster_rect(
+                &mut on_outline_target,
+                width,
+                height,
+                bounds,
+                layer.border_color,
+            );
+        }
+        for index in polygon_layer {
+            let (points, layer) = &raster_polygons[*index];
+            for (start, stop) in points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+            {
+                stroke_raster_line(
+                    &mut on_outline_target,
+                    width,
+                    height,
+                    *start,
+                    *stop,
+                    layer.border_color,
+                );
+            }
+        }
+        let mut off_outline_target = RasterPaintTarget {
+            buffer: &mut off_layer_buffer,
+            composite: RasterComposite::Replace,
+            touched: Some(&mut off_layer_touched),
+        };
+        for index in rect_layer {
+            let (bounds, layer) = raster_rects[*index];
+            stroke_raster_rect(
+                &mut off_outline_target,
+                width,
+                height,
+                bounds,
+                layer.border_color,
+            );
+        }
+        for index in polygon_layer {
+            let (points, layer) = &raster_polygons[*index];
+            for (start, stop) in points
+                .iter()
+                .zip(points.iter().cycle().skip(1))
+                .take(points.len())
+            {
+                stroke_raster_line(
+                    &mut off_outline_target,
+                    width,
+                    height,
+                    *start,
+                    *stop,
+                    layer.border_color,
+                );
+            }
+        }
+        blend_raster_layer(&mut stipple_on, &mut on_layer_buffer, &mut on_layer_touched);
+        blend_raster_layer(
+            &mut stipple_off,
+            &mut off_layer_buffer,
+            &mut off_layer_touched,
+        );
+    }
+    let mut on_overlay_target = RasterPaintTarget {
+        buffer: &mut stipple_on,
+        composite: RasterComposite::Replace,
+        touched: None,
+    };
+    for bbox in scope_rects {
+        let bounds = get_rect_bounds(&bbox.rect, local_bounds, raster_scale, raster_offset);
+        stroke_raster_rect(&mut on_overlay_target, width, height, bounds, theme.text);
+    }
+    let mut off_overlay_target = RasterPaintTarget {
+        buffer: &mut stipple_off,
+        composite: RasterComposite::Replace,
+        touched: None,
+    };
+    for bbox in scope_rects {
+        let bounds = get_rect_bounds(&bbox.rect, local_bounds, raster_scale, raster_offset);
+        stroke_raster_rect(&mut off_overlay_target, width, height, bounds, theme.text);
+    }
+    let image = expand_raster_for_display(raster_from_style_planes(
+        width,
+        height,
+        &stipple_on,
+        &stipple_off,
+        stipple_phase,
+    )?);
+    Some(LayoutRasterCache {
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+        style_planes: Some(Arc::new(RasterStylePlanes {
+            width,
+            height,
+            stipple_on: stipple_on.into(),
+            stipple_off: stipple_off.into(),
+        })),
+        texts: texts.to_vec().into(),
+        scope_labels: scope_rects.to_vec().into(),
+        // Use the texture's actual logical extent after rounding. Otherwise
+        // an odd-sized canvas stretches every texel by a tiny amount and a
+        // replacement raster appears to shift the geometry.
+        viewport: raster_logical_size(width, height),
+        screen_viewport: viewport.screen_size,
+        scale: viewport.scale,
+        offset: viewport.offset,
+        content_revision,
+    })
+}
+
+/// Builds the viewport raster without touching GPUI's scene or entity state.
+/// This is intentionally independent from the exact/editable paint path so it
+/// can run on the background executor while the UI keeps transforming the last
+/// completed image at display refresh rate.
+fn navigation_raster_cancelled(input: &NavigationRasterInput) -> bool {
+    input.content_revision_signal.load(Ordering::Acquire) != input.content_revision
+        || input.scale_signal.load(Ordering::Acquire) != input.viewport.scale.to_bits() as u64
+        || input
+            .cancel_if_generation_changes
+            .as_ref()
+            .is_some_and(|(signal, generation)| signal.load(Ordering::Acquire) != *generation)
+}
+
+fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterCache> {
+    if navigation_raster_cancelled(&input) {
+        return None;
+    }
+    let viewport = input.viewport;
+    let width = (f32::from(viewport.size.width) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    let height = (f32::from(viewport.size.height) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let raster_scale = viewport.scale * RASTER_CACHE_RESOLUTION;
+    let raster_offset = Point::new(
+        viewport.offset.x * RASTER_CACHE_RESOLUTION,
+        viewport.offset.y * RASTER_CACHE_RESOLUTION,
+    );
+    let stipple_phase = raster_stipple_phase(raster_offset);
+    let local_bounds = Bounds::new(
+        Point::default(),
+        Size::new(px(width as f32), px(height as f32)),
+    );
+    let layer_count = input
+        .layers
+        .values()
+        .map(|layer| layer.z)
+        .max()
+        .map_or(0, |z| z + 1);
+    let mut rect_primitives = (0..layer_count)
+        .map(|_| Vec::<RasterRectPrimitive>::new())
+        .collect::<Vec<_>>();
+    let mut polygon_primitives = (0..layer_count)
+        .map(|_| Vec::<RasterPolygonPrimitive>::new())
+        .collect::<Vec<_>>();
+    let mut low_detail_occupancy = (0..layer_count)
+        .map(|_| None::<Vec<u64>>)
+        .collect::<Vec<_>>();
+    let mut tile_primitives = (0..layer_count)
+        .map(|_| Vec::<RasterTilePrimitive>::new())
+        .collect::<Vec<_>>();
+    let mut seen_tile_candidates = HashSet::<CellRasterTileKey>::new();
+    let geometry_lod_size = GEOMETRY_LOD_SIZE_PX * RASTER_CACHE_RESOLUTION;
+    let mut texts = Vec::new();
+    let mut scope_rects = Vec::new();
+
+    let selected = &input.solved_cell.state[&input.solved_cell.selected_scope].address;
+    let mut queue = VecDeque::from_iter([(
+        ScopeAddress {
+            cell: selected.cell,
+            scope: if input.hide_external_geometry {
+                selected.scope
+            } else {
+                input.solved_cell.output.cells[&selected.cell].root
+            },
+        },
+        TransformationMatrix::identity(),
+        (0., 0.),
+        0,
+    )]);
+
+    while let Some((address @ ScopeAddress { cell, scope }, mat, ofs, depth)) = queue.pop_front() {
+        if navigation_raster_cancelled(&input) {
+            return None;
+        }
+        let cell_info = &input.solved_cell.output.cells[&cell];
+        let scope_info = &cell_info.scopes[&scope];
+        let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
+
+        if let Some(bbox) = &scope_state.bbox {
+            let p0 = ifmatvec(mat, (bbox.x0, bbox.y0));
+            let p1 = ifmatvec(mat, (bbox.x1, bbox.y1));
+            let rect = Rect {
+                x0: (p0.0.min(p1.0) + ofs.0) as f32,
+                y0: (p0.1.min(p1.1) + ofs.1) as f32,
+                x1: (p0.0.max(p1.0) + ofs.0) as f32,
+                y1: (p0.1.max(p1.1) + ofs.1) as f32,
+                id: None,
+                object_path: Vec::new(),
+                border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                border_styles: Edges::all(BorderStyle::Solid),
+                cvars: None,
+            };
+            let pixel_bounds = get_rect_bounds(&rect, local_bounds, raster_scale, raster_offset);
+            if depth > 0 && !pixel_bounds.intersects(&local_bounds) {
+                continue;
+            }
+            if depth >= input.hierarchy_depth || !scope_state.visible {
+                scope_rects.push(LabeledBbox {
+                    rect,
+                    label: scope_state.name.clone().into(),
+                    origin: None,
+                });
+                continue;
+            }
+            let tile_width = f32::from(pixel_bounds.size.width).ceil().max(1.) as u32;
+            let tile_height = f32::from(pixel_bounds.size.height).ceil().max(1.) as u32;
+            if CELL_RASTER_TILES_ENABLED
+                && depth > 0
+                && input.hierarchy_depth == usize::MAX
+                && tile_width <= CELL_RASTER_TILE_MAX_SIZE
+                && tile_height <= CELL_RASTER_TILE_MAX_SIZE
+            {
+                let key = CellRasterTileKey {
+                    address,
+                    orientation: mat,
+                    width: tile_width as u16,
+                    height: tile_height as u16,
+                    content_revision: input.content_revision,
+                };
+                let cached = input
+                    .cell_raster_tiles
+                    .lock()
+                    .expect("cell raster tile cache poisoned")
+                    .get(&key);
+                let tile = if cached.is_some() || !seen_tile_candidates.insert(key) {
+                    cached.or_else(|| {
+                        cached_cell_raster_tile(
+                            &input,
+                            address,
+                            mat,
+                            tile_width as u16,
+                            tile_height as u16,
+                        )
+                    })
+                } else {
+                    None
+                };
+                if let Some(tile) = tile {
+                    for (layer_index, coverage) in tile.layers.iter().enumerate() {
+                        if let Some(coverage) = coverage {
+                            tile_primitives[layer_index].push(RasterTilePrimitive {
+                                coverage: coverage.clone(),
+                                tile_width: tile.width,
+                                tile_height: tile.height,
+                                bounds: pixel_bounds,
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        for (object_index, (object, _)) in scope_info.emit.iter().enumerate() {
+            if object_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                return None;
+            }
+            match &cell_info.objects[object] {
+                SolvedValue::Rect(rect) if !rect.construction => {
+                    let Some(layer) = rect
+                        .layer
+                        .as_ref()
+                        .and_then(|name| input.layers.get(name.as_str()))
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let p0 = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                    let p1 = ifmatvec(mat, (rect.x1.0, rect.y1.0));
+                    let layout_rect = Rect {
+                        x0: (p0.0.min(p1.0) + ofs.0) as f32,
+                        y0: (p0.1.min(p1.1) + ofs.1) as f32,
+                        x1: (p0.0.max(p1.0) + ofs.0) as f32,
+                        y1: (p0.1.max(p1.1) + ofs.1) as f32,
+                        id: None,
+                        object_path: Vec::new(),
+                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                        border_styles: Edges::all(BorderStyle::Solid),
+                        cvars: None,
+                    };
+                    let bounds =
+                        get_rect_bounds(&layout_rect, local_bounds, raster_scale, raster_offset);
+                    if !bounds.intersects(&local_bounds) {
+                        continue;
+                    }
+                    if f32::from(bounds.size.width).max(f32::from(bounds.size.height))
+                        <= geometry_lod_size
+                    {
+                        mark_raster_occupancy(
+                            &mut low_detail_occupancy[layer.z],
+                            width,
+                            height,
+                            bounds,
+                        );
+                        continue;
+                    }
+                    rect_primitives[layer.z].push(RasterRectPrimitive {
+                        bounds,
+                        fill: layer.fill,
+                        color: layer.color,
+                        border_color: layer.border_color,
+                    });
+                }
+                SolvedValue::Polygon(polygon) => {
+                    let Some(layer) = input
+                        .layers
+                        .get(polygon.layer.as_str())
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let points = polygon
+                        .points
+                        .iter()
+                        .map(|(x, y)| {
+                            let point = ifmatvec(mat, (x.0, y.0));
+                            Point::new(
+                                raster_scale * (point.0 + ofs.0) as f32
+                                    + f32::from(raster_offset.x),
+                                raster_scale * -(point.1 + ofs.1) as f32
+                                    + f32::from(raster_offset.y),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let (min_x, max_x, min_y, max_y) = points.iter().fold(
+                        (
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                            f32::INFINITY,
+                            f32::NEG_INFINITY,
+                        ),
+                        |(min_x, max_x, min_y, max_y), point| {
+                            (
+                                min_x.min(point.x),
+                                max_x.max(point.x),
+                                min_y.min(point.y),
+                                max_y.max(point.y),
+                            )
+                        },
+                    );
+                    if max_x < 0. || min_x > width as f32 || max_y < 0. || min_y > height as f32 {
+                        continue;
+                    }
+                    let bounds = Bounds::from_corners(
+                        Point::new(px(min_x), px(min_y)),
+                        Point::new(px(max_x), px(max_y)),
+                    );
+                    if (max_x - min_x).max(max_y - min_y) <= geometry_lod_size {
+                        mark_raster_occupancy(
+                            &mut low_detail_occupancy[layer.z],
+                            width,
+                            height,
+                            bounds,
+                        );
+                        continue;
+                    }
+                    polygon_primitives[layer.z].push(RasterPolygonPrimitive {
+                        points,
+                        fill: layer.fill,
+                        color: layer.color,
+                        border_color: layer.border_color,
+                    });
+                }
+                SolvedValue::Instance(instance) if !instance.construction => {
+                    let mut instance_mat = TransformationMatrix::identity();
+                    if instance.reflect {
+                        instance_mat = instance_mat.reflect_vert();
+                    }
+                    instance_mat = instance_mat.rotate(instance.angle);
+                    let instance_ofs = ifmatvec(mat, (instance.x, instance.y));
+                    let child = instance.cell;
+                    queue.push_back((
+                        ScopeAddress {
+                            cell: child,
+                            scope: input.solved_cell.output.cells[&child].root,
+                        },
+                        mat * instance_mat,
+                        (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1),
+                        depth + 1,
+                    ));
+                }
+                SolvedValue::Text(text)
+                    if input.include_text
+                        && layout_text_metrics(viewport.scale, TEXT_LAYOUT_SIZE).is_some() =>
+                {
+                    let Some(layer) = input
+                        .layers
+                        .get(text.layer.as_str())
+                        .filter(|layer| layer.visible)
+                    else {
+                        continue;
+                    };
+                    let position = ifmatvec(mat, (text.x, text.y));
+                    let raster_position = Point::new(
+                        raster_scale * (position.0 + ofs.0) as f32 + f32::from(raster_offset.x),
+                        raster_scale * -(position.1 + ofs.1) as f32 + f32::from(raster_offset.y),
+                    );
+                    let text_margin = MAX_TEXT_PX * RASTER_CACHE_RESOLUTION;
+                    if raster_position.x < -text_margin
+                        || raster_position.x > width as f32 + text_margin
+                        || raster_position.y < -text_margin
+                        || raster_position.y > height as f32 + text_margin
+                    {
+                        continue;
+                    }
+                    texts.push(TextLabel {
+                        text: text.text.clone().into(),
+                        position: Point::new(
+                            (position.0 + ofs.0) as f32,
+                            (position.1 + ofs.1) as f32,
+                        ),
+                        layer: layer.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        for child in &scope_info.children {
+            queue.push_back((
+                ScopeAddress {
+                    cell,
+                    scope: *child,
+                },
+                mat,
+                ofs,
+                depth + 1,
+            ));
+        }
+    }
+
+    let buffer_len = width as usize * height as usize * 4;
+    let mut stipple_on = vec![0; buffer_len];
+    let mut stipple_off = vec![0; buffer_len];
+    let mut on_layer_buffer = vec![0; buffer_len];
+    let mut off_layer_buffer = vec![0; buffer_len];
+    let mut on_layer_touched = Vec::new();
+    let mut off_layer_touched = Vec::new();
+    let pixel_count = width as usize * height as usize;
+    for (layer_index, (rect_layer, polygon_layer)) in
+        rect_primitives.iter().zip(&polygon_primitives).enumerate()
+    {
+        if navigation_raster_cancelled(&input) {
+            return None;
+        }
+        let layer = input
+            .layers
+            .values()
+            .find(|layer| layer.z == layer_index && layer.visible);
+        {
+            let mut fill_target = RasterPaintTarget {
+                buffer: &mut on_layer_buffer,
+                composite: RasterComposite::Union,
+                touched: Some(&mut on_layer_touched),
+            };
+            if let Some(occupancy) = low_detail_occupancy[layer_index].as_ref()
+                && let Some(layer) = layer
+            {
+                paint_raster_occupancy(&mut fill_target, occupancy, pixel_count, layer);
+            }
+            if let Some(layer) = layer {
+                for (primitive_index, primitive) in tile_primitives[layer_index].iter().enumerate()
+                {
+                    if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                        return None;
+                    }
+                    let mut on_layer = layer.clone();
+                    if raster_tile_resolves_stipple(primitive, layer) {
+                        on_layer.fill = ShapeFill::Solid;
+                    }
+                    paint_raster_tile(&mut fill_target, width, height, primitive, &on_layer);
+                }
+            }
+            for (primitive_index, primitive) in rect_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                let RasterRectPrimitive { bounds, color, .. } = primitive;
+                fill_raster_rect(
+                    &mut fill_target,
+                    width,
+                    height,
+                    *bounds,
+                    ShapeFill::Solid,
+                    *color,
+                    0,
+                );
+            }
+            for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                let RasterPolygonPrimitive { points, color, .. } = primitive;
+                fill_raster_polygon(
+                    &mut fill_target,
+                    width,
+                    height,
+                    points,
+                    ShapeFill::Solid,
+                    *color,
+                    0,
+                );
+            }
+        }
+        {
+            let mut fill_target = RasterPaintTarget {
+                buffer: &mut off_layer_buffer,
+                composite: RasterComposite::Union,
+                touched: Some(&mut off_layer_touched),
+            };
+            if let Some(occupancy) = low_detail_occupancy[layer_index].as_ref()
+                && let Some(layer) = layer
+            {
+                paint_raster_occupancy(&mut fill_target, occupancy, pixel_count, layer);
+            }
+            if let Some(layer) = layer {
+                for (primitive_index, primitive) in tile_primitives[layer_index].iter().enumerate()
+                {
+                    if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                        return None;
+                    }
+                    if layer.fill == ShapeFill::Solid
+                        || !raster_tile_resolves_stipple(primitive, layer)
+                    {
+                        paint_raster_tile(&mut fill_target, width, height, primitive, layer);
+                    }
+                }
+            }
+            for (primitive_index, primitive) in rect_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                if primitive.fill == ShapeFill::Solid {
+                    fill_raster_rect(
+                        &mut fill_target,
+                        width,
+                        height,
+                        primitive.bounds,
+                        ShapeFill::Solid,
+                        primitive.color,
+                        0,
+                    );
+                }
+            }
+            for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                if primitive.fill == ShapeFill::Solid {
+                    fill_raster_polygon(
+                        &mut fill_target,
+                        width,
+                        height,
+                        &primitive.points,
+                        ShapeFill::Solid,
+                        primitive.color,
+                        0,
+                    );
+                }
+            }
+        }
+        {
+            let mut outline_target = RasterPaintTarget {
+                buffer: &mut on_layer_buffer,
+                composite: RasterComposite::Replace,
+                touched: Some(&mut on_layer_touched),
+            };
+            for (primitive_index, primitive) in rect_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                stroke_raster_rect(
+                    &mut outline_target,
+                    width,
+                    height,
+                    primitive.bounds,
+                    primitive.border_color,
+                );
+            }
+            for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                let RasterPolygonPrimitive {
+                    points,
+                    border_color,
+                    ..
+                } = primitive;
+                for (start, stop) in points
+                    .iter()
+                    .zip(points.iter().cycle().skip(1))
+                    .take(points.len())
+                {
+                    stroke_raster_line(
+                        &mut outline_target,
+                        width,
+                        height,
+                        *start,
+                        *stop,
+                        *border_color,
+                    );
+                }
+            }
+        }
+        {
+            let mut outline_target = RasterPaintTarget {
+                buffer: &mut off_layer_buffer,
+                composite: RasterComposite::Replace,
+                touched: Some(&mut off_layer_touched),
+            };
+            for (primitive_index, primitive) in rect_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                stroke_raster_rect(
+                    &mut outline_target,
+                    width,
+                    height,
+                    primitive.bounds,
+                    primitive.border_color,
+                );
+            }
+            for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
+                if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
+                    return None;
+                }
+                for (start, stop) in primitive
+                    .points
+                    .iter()
+                    .zip(primitive.points.iter().cycle().skip(1))
+                    .take(primitive.points.len())
+                {
+                    stroke_raster_line(
+                        &mut outline_target,
+                        width,
+                        height,
+                        *start,
+                        *stop,
+                        primitive.border_color,
+                    );
+                }
+            }
+        }
+        blend_raster_layer(&mut stipple_on, &mut on_layer_buffer, &mut on_layer_touched);
+        blend_raster_layer(
+            &mut stipple_off,
+            &mut off_layer_buffer,
+            &mut off_layer_touched,
+        );
+    }
+    let mut on_overlay_target = RasterPaintTarget {
+        buffer: &mut stipple_on,
+        composite: RasterComposite::Replace,
+        touched: None,
+    };
+    for bbox in &scope_rects {
+        let bounds = get_rect_bounds(&bbox.rect, local_bounds, raster_scale, raster_offset);
+        stroke_raster_rect(
+            &mut on_overlay_target,
+            width,
+            height,
+            bounds,
+            input.text_color,
+        );
+    }
+    let mut off_overlay_target = RasterPaintTarget {
+        buffer: &mut stipple_off,
+        composite: RasterComposite::Replace,
+        touched: None,
+    };
+    for bbox in &scope_rects {
+        let bounds = get_rect_bounds(&bbox.rect, local_bounds, raster_scale, raster_offset);
+        stroke_raster_rect(
+            &mut off_overlay_target,
+            width,
+            height,
+            bounds,
+            input.text_color,
+        );
+    }
+
+    let image = expand_raster_for_display(raster_from_style_planes(
+        width,
+        height,
+        &stipple_on,
+        &stipple_off,
+        stipple_phase,
+    )?);
+    Some(LayoutRasterCache {
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+        style_planes: Some(Arc::new(RasterStylePlanes {
+            width,
+            height,
+            stipple_on: stipple_on.into(),
+            stipple_off: stipple_off.into(),
+        })),
+        texts: texts.into(),
+        scope_labels: scope_rects.into(),
+        viewport: raster_logical_size(width, height),
+        screen_viewport: viewport.screen_size,
+        scale: viewport.scale,
+        offset: viewport.offset,
+        content_revision: input.content_revision,
+    })
+}
+
+fn raster_bounds(
+    cache: &LayoutRasterCache,
+    bounds: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Bounds<Pixels> {
+    let ratio = scale / cache.scale;
+    Bounds::new(
+        Point::new(
+            bounds.origin.x + offset.x - cache.offset.x * ratio,
+            bounds.origin.y + offset.y - cache.offset.y * ratio,
+        ),
+        Size::new(cache.viewport.width * ratio, cache.viewport.height * ratio),
+    )
+}
+
+fn reproject_raster_tiles(
+    tiles: &LayoutRasterTileSet,
+    bounds: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Option<LayoutRasterCache> {
+    let width = (f32::from(bounds.size.width) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    let height = (f32::from(bounds.size.height) * RASTER_CACHE_RESOLUTION)
+        .ceil()
+        .max(1.) as u32;
+    let mut output = vec![0; width as usize * height as usize * 4];
+    let stipple_phase = raster_stipple_phase(Point::new(
+        offset.x * RASTER_CACHE_RESOLUTION,
+        offset.y * RASTER_CACHE_RESOLUTION,
+    ));
+    let mut texts = Vec::new();
+    let mut scope_labels = Vec::new();
+    let mut copied_tile = false;
+
+    for index in navigation_tile_order(tiles.center) {
+        let Some(cache) = tiles.tiles.get(&index) else {
+            continue;
+        };
+        let target = raster_bounds(cache, bounds, scale, offset);
+        if !target.intersects(&bounds) {
+            continue;
+        }
+        let planes = cache.style_planes.as_ref()?;
+        let target_origin = target.origin - bounds.origin;
+        let target_x0 = f32::from(target_origin.x) * RASTER_CACHE_RESOLUTION;
+        let target_y0 = f32::from(target_origin.y) * RASTER_CACHE_RESOLUTION;
+        let target_width = f32::from(target.size.width) * RASTER_CACHE_RESOLUTION;
+        let target_height = f32::from(target.size.height) * RASTER_CACHE_RESOLUTION;
+        let Some((x0, x1)) = raster_pixel_range(target_x0, target_x0 + target_width, width) else {
+            continue;
+        };
+        let Some((y0, y1)) = raster_pixel_range(target_y0, target_y0 + target_height, height)
+        else {
+            continue;
+        };
+        if target_width <= 0. || target_height <= 0. {
+            continue;
+        }
+        copied_tile = true;
+        texts.extend(cache.texts.iter().cloned());
+        scope_labels.extend(cache.scope_labels.iter().cloned());
+        for y in y0..y1 {
+            let source_y = (((y as f32 + 0.5 - target_y0) / target_height) * planes.height as f32)
+                .floor()
+                .clamp(0., planes.height as f32 - 1.) as u32;
+            for x in x0..x1 {
+                let source_x = (((x as f32 + 0.5 - target_x0) / target_width) * planes.width as f32)
+                    .floor()
+                    .clamp(0., planes.width as f32 - 1.) as u32;
+                let source_pixel = (source_y * planes.width + source_x) as usize;
+                let destination_pixel = (y * width + x) as usize;
+                let source = if raster_stipple_is_on(x, y, stipple_phase) {
+                    &planes.stipple_on
+                } else {
+                    &planes.stipple_off
+                };
+                output[destination_pixel * 4..destination_pixel * 4 + 4]
+                    .copy_from_slice(&source[source_pixel * 4..source_pixel * 4 + 4]);
+            }
+        }
+    }
+    if !copied_tile {
+        return None;
+    }
+
+    let image = expand_raster_for_display(image::RgbaImage::from_raw(width, height, output)?);
+    Some(LayoutRasterCache {
+        image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+        style_planes: None,
+        texts: texts.into(),
+        scope_labels: scope_labels.into(),
+        viewport: raster_logical_size(width, height),
+        screen_viewport: bounds.size,
+        scale,
+        offset,
+        content_revision: tiles.content_revision,
+    })
+}
+
+fn align_navigation_raster_offset(value: Pixels) -> Pixels {
+    px((f32::from(value) * RASTER_CACHE_RESOLUTION).round() / RASTER_CACHE_RESOLUTION)
+}
+
+fn navigation_tile_size(screen_size: Size<Pixels>) -> Size<Pixels> {
+    raster_logical_size(
+        (f32::from(screen_size.width) * RASTER_CACHE_RESOLUTION)
+            .ceil()
+            .max(1.) as u32,
+        (f32::from(screen_size.height) * RASTER_CACHE_RESOLUTION)
+            .ceil()
+            .max(1.) as u32,
+    )
+}
+
+fn navigation_tile_order(center: RasterTileIndex) -> Vec<RasterTileIndex> {
+    let mut tiles = Vec::with_capacity(((NAVIGATION_TILE_RADIUS * 2 + 1).pow(2)) as usize);
+    for radius in 0..=NAVIGATION_TILE_RADIUS {
+        for y in -radius..=radius {
+            for x in -radius..=radius {
+                if x.abs().max(y.abs()) == radius {
+                    tiles.push(RasterTileIndex {
+                        x: center.x + x,
+                        y: center.y + y,
+                    });
+                }
+            }
+        }
+    }
+    tiles
+}
+
+fn navigation_inner_tiles_complete(
+    tiles: &HashMap<RasterTileIndex, LayoutRasterCache>,
+    center: RasterTileIndex,
+) -> bool {
+    (-1..=1).all(|y| {
+        (-1..=1).all(|x| {
+            tiles.contains_key(&RasterTileIndex {
+                x: center.x + x,
+                y: center.y + y,
+            })
+        })
+    })
+}
+
+fn raster_tile_offset(
+    anchor_offset: Point<Pixels>,
+    tile_size: Size<Pixels>,
+    index: RasterTileIndex,
+) -> Point<Pixels> {
+    anchor_offset
+        - Point::new(
+            tile_size.width * index.x as f32,
+            tile_size.height * index.y as f32,
+        )
+}
+
+fn raster_tile_set_matches_target(tiles: &LayoutRasterTileSet, target: RasterTileTarget) -> bool {
+    tiles.anchor_offset == target.anchor_offset
+        && tiles.tile_size == target.tile_size
+        && tiles.screen_viewport == target.screen_viewport
+        && tiles.scale == target.scale
+        && tiles.content_revision == target.content_revision
+}
+
+fn single_raster_tile_set(cache: LayoutRasterCache) -> LayoutRasterTileSet {
+    let anchor_offset = cache.offset;
+    let tile_size = cache.viewport;
+    let screen_viewport = cache.screen_viewport;
+    let scale = cache.scale;
+    let content_revision = cache.content_revision;
+    LayoutRasterTileSet {
+        tiles: HashMap::from([(RasterTileIndex { x: 0, y: 0 }, cache)]),
+        navigation: false,
+        anchor_offset,
+        tile_size,
+        screen_viewport,
+        scale,
+        content_revision,
+        center: RasterTileIndex { x: 0, y: 0 },
+    }
+}
+
+fn raster_tiles_cover_bounds(
+    tiles: &LayoutRasterTileSet,
+    canvas: Bounds<Pixels>,
+    required: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> bool {
+    if tiles.tiles.is_empty() || tiles.scale <= 0. {
+        return false;
+    }
+    let ratio = scale / tiles.scale;
+    let tile_width = f32::from(tiles.tile_size.width) * ratio;
+    let tile_height = f32::from(tiles.tile_size.height) * ratio;
+    if tile_width <= 0. || tile_height <= 0. {
+        return false;
+    }
+    let base = Point::new(
+        canvas.origin.x + offset.x - tiles.anchor_offset.x * ratio,
+        canvas.origin.y + offset.y - tiles.anchor_offset.y * ratio,
+    );
+    let required_bottom_right = required.bottom_right();
+    let min_x = ((f32::from(required.origin.x) - f32::from(base.x)) / tile_width).floor() as i32;
+    let min_y = ((f32::from(required.origin.y) - f32::from(base.y)) / tile_height).floor() as i32;
+    let max_x = (((f32::from(required_bottom_right.x) - f32::from(base.x)) / tile_width) - 1e-4)
+        .ceil() as i32
+        - 1;
+    let max_y = (((f32::from(required_bottom_right.y) - f32::from(base.y)) / tile_height) - 1e-4)
+        .ceil() as i32
+        - 1;
+    (min_y..=max_y)
+        .all(|y| (min_x..=max_x).all(|x| tiles.tiles.contains_key(&RasterTileIndex { x, y })))
+}
+
+fn navigation_raster_capture_transform(tiles: &LayoutRasterTileSet) -> RasterDisplayTransform {
+    RasterDisplayTransform {
+        scale: tiles.scale,
+        offset: raster_tile_offset(tiles.anchor_offset, tiles.tile_size, tiles.center),
+    }
+}
+
+fn layout_bbox_screen_bounds(
+    bbox: &compile::Rect<f64>,
+    canvas: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Bounds<Pixels> {
+    let x0 = bbox.x0.min(bbox.x1) as f32;
+    let x1 = bbox.x0.max(bbox.x1) as f32;
+    let y0 = bbox.y0.min(bbox.y1) as f32;
+    let y1 = bbox.y0.max(bbox.y1) as f32;
+    Bounds::new(
+        Point::new(
+            canvas.origin.x + offset.x + px(scale * x0),
+            canvas.origin.y + offset.y - px(scale * y1),
+        ),
+        Size::new(px(scale * (x1 - x0)), px(scale * (y1 - y0))),
+    )
+}
+
+/// Return a congruent display transform while the full overscanned image still
+/// covers the canvas, or while every drawable layout coordinate is still
+/// represented by a retained tile. The latter permits unlimited shrinking of
+/// a fully captured layout: newly exposed pixels are known-empty background.
+fn navigation_raster_transform(
+    tiles: &LayoutRasterTileSet,
+    canvas: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+    layout_bounds: Option<Bounds<Pixels>>,
+) -> Option<RasterDisplayTransform> {
+    let covers_canvas = raster_tiles_cover_bounds(tiles, canvas, canvas, scale, offset);
+    let covers_layout = layout_bounds
+        .is_some_and(|bounds| raster_tiles_cover_bounds(tiles, canvas, bounds, scale, offset));
+    (covers_canvas || covers_layout).then_some(RasterDisplayTransform { scale, offset })
+}
+
+fn paint_should_start_navigation_worker(
+    has_solved_layout: bool,
+    raster_matches_viewport: bool,
+    raster_worker_active: bool,
+) -> bool {
+    has_solved_layout && !raster_matches_viewport && !raster_worker_active
 }
 
 fn sort_initial_condition_pair(
@@ -1292,11 +3389,35 @@ impl Element for CanvasElement {
         window: &mut gpui::Window,
         cx: &mut gpui::App,
     ) {
+        let stale_images = self.inner.update(cx, |inner, _| {
+            std::mem::take(&mut inner.raster_images_to_drop)
+        });
+        for image in stale_images {
+            cx.drop_image(image, Some(window));
+        }
         self.inner.update(cx, |inner, cx| {
             inner.screen_bounds = bounds;
+            inner.update_raster_display_transform();
             if inner.pending_init {
                 inner.pending_init = false;
                 inner.fit_to_screen(cx);
+            }
+            let has_solved_layout = inner.state.read(cx).solved_cell.read(cx).is_some();
+            let raster_matches_viewport = inner
+                .raster_tiles
+                .as_ref()
+                .is_some_and(|tiles| tiles.screen_viewport == bounds.size);
+            // A paint notification is also emitted after each background tile
+            // finishes or is cancelled. Retargeting an already-running first
+            // tile here advances its generation, causing that tile to cancel
+            // and notify again forever. Navigation input still explicitly
+            // retargets the worker when the viewport actually changes.
+            if paint_should_start_navigation_worker(
+                has_solved_layout,
+                raster_matches_viewport,
+                inner.raster_worker_active,
+            ) {
+                inner.request_navigation_raster(cx);
             }
         });
         let inner = self.inner.read(cx);
@@ -1304,6 +3425,285 @@ impl Element for CanvasElement {
         let hide_external_geometry = &inner.state.read(cx).hide_external_geometry;
         let state = inner.state.read(cx);
         let tool = state.tool.read(cx).clone();
+        let select_overview = matches!(
+            &tool,
+            ToolState::Select(SelectToolState { selected_obj: None })
+        );
+        let use_raster_cache = inner.navigation_cache_active
+            || select_overview
+            || matches!(&tool, ToolState::DrawRect(_) | ToolState::PlaceInstance(_));
+        let raster_presentation = inner
+            .raster_reprojection
+            .clone()
+            .filter(|cache| cache.content_revision == inner.raster_content_revision)
+            .map(|cache| {
+                (
+                    single_raster_tile_set(cache),
+                    RasterDisplayTransform {
+                        scale: inner.scale,
+                        offset: inner.offset,
+                    },
+                )
+            })
+            .or_else(|| {
+                inner
+                    .raster_tiles
+                    .clone()
+                    .filter(|tiles| tiles.content_revision == inner.raster_content_revision)
+                    .map(|tiles| {
+                        let display = inner
+                            .raster_display
+                            .unwrap_or_else(|| navigation_raster_capture_transform(&tiles));
+                        (tiles, display)
+                    })
+            });
+        if use_raster_cache && let Some((tiles, display)) = raster_presentation {
+            let theme = state.theme();
+            let bg_style = inner.bg_style.clone();
+            let scale = display.scale;
+            let offset = display.offset;
+            let origin_coords = offset + bounds.origin;
+            let navigation_cache_active = inner.navigation_cache_active;
+            let hover_hit = (!navigation_cache_active)
+                .then(|| inner.hover_hit.clone())
+                .flatten();
+            let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
+            let draw_rect_preview =
+                if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool {
+                    let layers = state.layers.read(cx);
+                    layers
+                        .selected_layer
+                        .as_ref()
+                        .and_then(|name| layers.layers.get(name))
+                        .filter(|layer| layer.visible)
+                        .map(|layer| {
+                            (
+                                Rect {
+                                    object_path: Vec::new(),
+                                    x0: p0.x.min(layout_mouse_position.x),
+                                    y0: p0.y.min(layout_mouse_position.y),
+                                    x1: p0.x.max(layout_mouse_position.x),
+                                    y1: p0.y.max(layout_mouse_position.y),
+                                    id: None,
+                                    border_widths: Edges::all(SELECT_WIDTH),
+                                    border_styles: Edges::all(BorderStyle::Dashed),
+                                    cvars: None,
+                                },
+                                layer.clone(),
+                            )
+                        })
+                } else {
+                    None
+                };
+            bg_style.paint(bounds, window, cx, |window, cx| {
+                window.paint_layer(bounds, |window| {
+                    window.paint_quad(get_paint_path(
+                        Bounds::new(
+                            Point::new(origin_coords.x, bounds.origin.y),
+                            Size::new(px(0.), bounds.size.height),
+                        ),
+                        theme.axes,
+                        DEFAULT_BORDER_WIDTH,
+                    ));
+                    window.paint_quad(get_paint_path(
+                        Bounds::new(
+                            Point::new(bounds.origin.x, origin_coords.y),
+                            Size::new(bounds.size.width, px(0.)),
+                        ),
+                        theme.axes,
+                        DEFAULT_BORDER_WIDTH,
+                    ));
+                    let visible_tiles = navigation_tile_order(tiles.center)
+                        .into_iter()
+                        .filter_map(|index| tiles.tiles.get(&index))
+                        .filter(|cache| {
+                            raster_bounds(cache, bounds, scale, offset).intersects(&bounds)
+                        })
+                        .collect::<Vec<_>>();
+                    for cache in &visible_tiles {
+                        window
+                            .paint_image(
+                                raster_bounds(cache, bounds, scale, offset),
+                                Corners::all(px(0.)),
+                                cache.image.clone(),
+                                0,
+                                false,
+                            )
+                            .unwrap();
+                    }
+                    if let Some((font_size, line_height)) =
+                        layout_text_metrics(scale, TEXT_LAYOUT_SIZE)
+                    {
+                        let mut painted = HashSet::new();
+                        for label in visible_tiles.iter().flat_map(|cache| cache.texts.iter()) {
+                            let key = (
+                                label.position.x.to_bits(),
+                                label.position.y.to_bits(),
+                                label.layer.z,
+                                label.text.clone(),
+                            );
+                            if !painted.insert(key) {
+                                continue;
+                            }
+                            let runs = &[TextRun {
+                                len: label.text.len(),
+                                font: window.text_style().font(),
+                                color: label.layer.border_color.into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }];
+                            window
+                                .text_system()
+                                .shape_line(label.text.clone(), font_size, runs, None)
+                                .paint(
+                                    Point::new(
+                                        scale * px(label.position.x),
+                                        scale * px(-label.position.y),
+                                    ) + offset
+                                        + bounds.origin,
+                                    line_height,
+                                    window,
+                                    cx,
+                                )
+                                .unwrap();
+                        }
+                    }
+                    if let Some((font_size, line_height)) =
+                        layout_text_metrics(scale, SCOPE_TEXT_LAYOUT_SIZE)
+                    {
+                        let mut painted = HashSet::new();
+                        for bbox in visible_tiles
+                            .iter()
+                            .flat_map(|cache| cache.scope_labels.iter())
+                        {
+                            let key = (
+                                bbox.rect.x0.to_bits(),
+                                bbox.rect.y0.to_bits(),
+                                bbox.rect.x1.to_bits(),
+                                bbox.rect.y1.to_bits(),
+                                bbox.label.clone(),
+                            );
+                            if !painted.insert(key) {
+                                continue;
+                            }
+                            let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset)
+                                .origin
+                                + Point::new(px(4.), px(2.));
+                            let runs = &[TextRun {
+                                len: bbox.label.len(),
+                                font: window.text_style().font(),
+                                color: theme.text.into(),
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            }];
+                            window
+                                .text_system()
+                                .shape_line(bbox.label.clone(), font_size, runs, None)
+                                .paint(text_origin, line_height, window, cx)
+                                .unwrap();
+                        }
+                    }
+                    if let Some((preview, layer)) = &draw_rect_preview {
+                        window.paint_quad(get_paint_quad(
+                            get_rect_bounds(preview, bounds, scale, offset),
+                            layer.fill,
+                            layer.color,
+                            rgb(0xffff00),
+                            preview.border_widths,
+                            preview.border_styles,
+                        ));
+                    }
+                    if let ToolState::PlaceInstance(placement) = &tool {
+                        let translation = (
+                            layout_mouse_position.x as f64,
+                            layout_mouse_position.y as f64,
+                        );
+                        for rect in &placement.rects {
+                            let rect =
+                                rect.transform(TransformationMatrix::identity(), translation);
+                            window.paint_quad(get_paint_quad(
+                                get_rect_bounds(&rect, bounds, scale, offset),
+                                ShapeFill::Solid,
+                                Rgba {
+                                    a: 0.,
+                                    ..rgb(0xffff00)
+                                },
+                                rgb(0xffff00),
+                                rect.border_widths,
+                                rect.border_styles,
+                            ));
+                        }
+                        for polygon in &placement.polygons {
+                            let polygon =
+                                polygon.transform(TransformationMatrix::identity(), translation);
+                            let points = polygon
+                                .points
+                                .iter()
+                                .map(|point| {
+                                    Point::new(scale * px(point.x), scale * px(-point.y))
+                                        + offset
+                                        + bounds.origin
+                                })
+                                .collect::<Vec<_>>();
+                            let mut border = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
+                            border.add_polygon(&points, true);
+                            if let Ok(path) = border.build() {
+                                window.paint_path(path, rgb(0xffff00));
+                            }
+                        }
+                    }
+                    if let Some(hit) = hover_hit {
+                        match hit.outline {
+                            SelectionOutline::Rect {
+                                bounds,
+                                border_styles,
+                            } => window.paint_quad(get_paint_quad(
+                                bounds,
+                                ShapeFill::Solid,
+                                Rgba {
+                                    a: 0.,
+                                    ..rgb(0xffff00)
+                                },
+                                rgb(0xffff00),
+                                Edges::all(SELECT_WIDTH),
+                                border_styles,
+                            )),
+                            SelectionOutline::Polygon {
+                                points,
+                                edge_styles,
+                            } => paint_polygon_border(
+                                window,
+                                &points,
+                                &edge_styles,
+                                SELECT_WIDTH,
+                                rgb(0xffff00),
+                            ),
+                            SelectionOutline::Polyline {
+                                points,
+                                segment_styles,
+                            } => paint_polyline(
+                                window,
+                                &points,
+                                &segment_styles,
+                                SELECT_WIDTH,
+                                rgb(0xffff00),
+                            ),
+                        }
+                    }
+                });
+            });
+            return;
+        }
+        if inner.navigation_cache_active && inner.raster_tiles.is_none() {
+            // The first flattened raster is built off the UI thread. Avoid a
+            // synchronous hierarchy traversal (and its temporary omissions)
+            // while it is in flight.
+            let bg_style = inner.bg_style.clone();
+            bg_style.paint(bounds, window, cx, |_window, _cx| {});
+            return;
+        }
         let layers = state.layers.read(cx);
         let mut sse_dv = None;
 
@@ -1354,28 +3754,32 @@ impl Element for CanvasElement {
                 mat,
                 ofs,
                 depth,
-                mut show,
+                show,
                 path,
             )) = queue.pop_front()
             {
                 let cell_info = &solved_cell.output.cells[&cell];
                 let scope_info = &cell_info.scopes[&scope];
                 let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
-                if depth >= state.hierarchy_depth || !scope_state.visible {
-                    if let Some(bbox) = &scope_state.bbox {
-                        let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
-                        let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
-                        let rect = Rect {
-                            x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                            y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                            x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                            y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                            id: Some(scope_info.span.clone()),
-                            object_path: Vec::new(),
-                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                            border_styles: Edges::all(BorderStyle::Solid),
-                            cvars: None,
-                        };
+                if let Some(bbox) = &scope_state.bbox {
+                    let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
+                    let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
+                    let rect = Rect {
+                        x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                        y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                        x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                        y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                        id: Some(scope_info.span.clone()),
+                        object_path: Vec::new(),
+                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                        border_styles: Edges::all(BorderStyle::Solid),
+                        cvars: None,
+                    };
+                    let pixel_bounds = get_rect_bounds(&rect, bounds, inner.scale, inner.offset);
+                    if depth > 0 && !pixel_bounds.intersects(&bounds) {
+                        continue;
+                    }
+                    if depth >= state.hierarchy_depth || !scope_state.visible {
                         if let ToolState::Select(SelectToolState { selected_obj }) = &tool
                             && &rect.id == selected_obj
                         {
@@ -1391,8 +3795,8 @@ impl Element for CanvasElement {
                                 origin: None,
                             });
                         }
+                        continue;
                     }
-                    show = false;
                 }
                 for (obj, _) in &scope_info.emit {
                     let mut object_path = path.clone();
@@ -1837,6 +4241,7 @@ impl Element for CanvasElement {
                             if let Some(layer) = layer
                                 && show
                                 && layer.visible
+                                && layout_text_metrics(inner.scale, TEXT_LAYOUT_SIZE).is_some()
                             {
                                 texts.push(TextLabel {
                                     text: text.text.clone().into(),
@@ -1889,6 +4294,7 @@ impl Element for CanvasElement {
             .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
+        let content_revision = inner.raster_content_revision;
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
         let mut vertex_handle_points = Vec::new();
@@ -2194,7 +4600,11 @@ impl Element for CanvasElement {
                         }
                     }
                     for label in &texts {
-                        let font_size = px(16.);
+                        let Some((font_size, line_height)) =
+                            layout_text_metrics(scale, TEXT_LAYOUT_SIZE)
+                        else {
+                            break;
+                        };
                         let runs = &[TextRun {
                             len: label.text.len(),
                             font: window.text_style().font(),
@@ -2212,7 +4622,7 @@ impl Element for CanvasElement {
                                     scale * px(-label.position.y),
                                 ) + offset
                                     + bounds.origin,
-                                px(18.),
+                                line_height,
                                 window,
                                 cx,
                             )
@@ -2222,12 +4632,19 @@ impl Element for CanvasElement {
                         window.paint_quad(get_paint_quad(
                             get_rect_bounds(&bbox.rect, bounds, scale, offset),
                             ShapeFill::Solid,
-                            Rgba { a: 0., ..theme.text },
+                            Rgba {
+                                a: 0.,
+                                ..theme.text
+                            },
                             theme.text,
                             bbox.rect.border_widths,
                             bbox.rect.border_styles,
                         ));
-                        let font_size = px(12.);
+                        let Some((font_size, line_height)) =
+                            layout_text_metrics(scale, SCOPE_TEXT_LAYOUT_SIZE)
+                        else {
+                            continue;
+                        };
                         let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
                             + Point::new(px(4.), px(2.));
                         let runs = &[TextRun {
@@ -2241,7 +4658,7 @@ impl Element for CanvasElement {
                         window
                             .text_system()
                             .shape_line(bbox.label.clone(), font_size, runs, None)
-                            .paint(text_origin, px(14.), window, cx)
+                            .paint(text_origin, line_height, window, cx)
                             .unwrap();
                         if let Some(origin) = bbox.origin
                             && matches!(
@@ -2978,14 +5395,63 @@ impl Element for CanvasElement {
                     }
                 })
             });
+        let raster_cache = (select_overview
+            && rects.len() + polygons.len() + scope_rects.len() >= RASTER_CACHE_GEOMETRY_THRESHOLD)
+            .then(|| {
+                build_layout_raster(
+                    &rects,
+                    &polygons,
+                    &scope_rects,
+                    &texts,
+                    ViewportTransform {
+                        size: bounds.size,
+                        screen_size: bounds.size,
+                        scale,
+                        offset,
+                    },
+                    theme,
+                    content_revision,
+                )
+            })
+            .flatten();
+        let refresh_cached_raster = raster_cache.is_some() && select_overview;
+        let raster_tiles = raster_cache.map(single_raster_tile_set);
         self.inner.update(cx, |inner, cx| {
+            if select_overview {
+                inner.raster_display = raster_tiles.as_ref().map(|tiles| {
+                    let layout_bounds = inner
+                        .raster_layout_bbox
+                        .as_ref()
+                        .map(|bbox| layout_bbox_screen_bounds(bbox, bounds, scale, offset));
+                    navigation_raster_transform(tiles, bounds, scale, offset, layout_bounds)
+                        .unwrap_or_else(|| navigation_raster_capture_transform(tiles))
+                });
+                if let Some(previous) = std::mem::replace(&mut inner.raster_tiles, raster_tiles) {
+                    inner
+                        .raster_images_to_drop
+                        .extend(previous.tiles.into_values().map(|cache| cache.image));
+                }
+                if let Some(previous) = inner.raster_staging_tiles.take() {
+                    inner
+                        .raster_images_to_drop
+                        .extend(previous.tiles.into_values().map(|cache| cache.image));
+                }
+                inner.clear_raster_reprojection();
+                inner.raster_tile_target = None;
+            }
             inner.rects = rects;
             inner.polygons = polygons;
             inner.scope_rects = scope_rects;
             inner.dim_hitboxes = dim_hitboxes;
             inner.sse_handles = sse_handles;
             inner.sse_bodies = sse_bodies;
-            cx.notify();
+            if refresh_cached_raster {
+                // The first exact traversal intentionally avoids expanding
+                // millions of shapes on the UI thread. Replace that initial
+                // cache with the flattened background raster before the user
+                // begins navigating.
+                inner.request_navigation_raster(cx);
+            }
         });
     }
 }
@@ -3067,17 +5533,612 @@ impl LayoutCanvas {
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
+            hover_hit: None,
             shift_down: false,
             scale: 1.0,
             screen_bounds: Bounds::default(),
-            subscriptions: vec![cx.observe(state, |_, _, cx| cx.notify())],
+            _subscriptions: vec![cx.observe(state, |canvas, _, cx| {
+                if !canvas.update_raster_presentation(cx) {
+                    return;
+                }
+                canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
+                canvas
+                    .raster_content_revision_signal
+                    .store(canvas.raster_content_revision, Ordering::Release);
+                canvas
+                    .cell_raster_tiles
+                    .lock()
+                    .expect("cell raster tile cache poisoned")
+                    .clear();
+                // Presentation changes invalidate every old pixel immediately.
+                // In particular, a hidden layer must never survive in a
+                // transformed or retained navigation image.
+                if let Some(previous) = canvas.raster_tiles.take() {
+                    canvas
+                        .raster_images_to_drop
+                        .extend(previous.tiles.into_values().map(|cache| cache.image));
+                }
+                if let Some(previous) = canvas.raster_staging_tiles.take() {
+                    canvas
+                        .raster_images_to_drop
+                        .extend(previous.tiles.into_values().map(|cache| cache.image));
+                }
+                if let Some(previous) = canvas.raster_reprojection.take() {
+                    canvas.raster_images_to_drop.push(previous.image);
+                }
+                canvas.raster_display = None;
+                canvas.raster_tile_target = None;
+                canvas.navigation_cache_active = canvas.raster_output.is_some();
+                if canvas.raster_output.is_some()
+                    && canvas.screen_bounds.size.width > px(0.)
+                    && canvas.screen_bounds.size.height > px(0.)
+                {
+                    canvas.request_navigation_raster(cx);
+                } else {
+                    canvas.advance_raster_generation();
+                }
+                cx.notify();
+            })],
             state: state.clone(),
             rects: Vec::new(),
             polygons: Vec::new(),
             scope_rects: Vec::new(),
             dim_hitboxes: Vec::new(),
+            raster_tiles: None,
+            raster_staging_tiles: None,
+            raster_images_to_drop: Vec::new(),
+            raster_reprojection: None,
+            raster_display: None,
+            raster_tile_target: None,
+            navigation_cache_active: false,
+            raster_refinement: None,
+            raster_worker_active: false,
+            raster_generation: 0,
+            raster_generation_signal: Arc::new(AtomicU64::new(0)),
+            raster_scale_signal: Arc::new(AtomicU64::new(1.0_f32.to_bits() as u64)),
+            raster_content_revision: 0,
+            raster_content_revision_signal: Arc::new(AtomicU64::new(0)),
+            raster_output: None,
+            raster_scope_state: None,
+            raster_selected_scope: None,
+            raster_layer_visibility: Vec::new(),
+            raster_hierarchy_depth: usize::MAX,
+            raster_hide_external_geometry: false,
+            raster_layout_bbox: None,
+            raster_dark_mode: true,
+            cell_raster_tiles: Arc::new(Mutex::new(CellRasterTileCache::default())),
             pending_init: true,
         }
+    }
+
+    /// Records the exact state that changes raster pixels. UI-only changes,
+    /// such as selecting a layer in the sidebar, do not force a rebuild.
+    fn update_raster_presentation(&mut self, cx: &gpui::App) -> bool {
+        let (
+            output,
+            scope_state,
+            selected_scope,
+            layout_bbox,
+            layer_visibility,
+            hierarchy_depth,
+            hide_external_geometry,
+            dark_mode,
+        ) = {
+            let state = self.state.read(cx);
+            let hide_external_geometry = state.hide_external_geometry;
+            let solved_cell = state.solved_cell.read(cx);
+            let (output, scope_state, selected_scope, layout_bbox) = solved_cell
+                .as_ref()
+                .map(|solved| {
+                    let selected = solved.state[&solved.selected_scope].address;
+                    let displayed = if hide_external_geometry {
+                        selected
+                    } else {
+                        ScopeAddress {
+                            cell: selected.cell,
+                            scope: solved.output.cells[&selected.cell].root,
+                        }
+                    };
+                    let layout_bbox = solved
+                        .scope_paths
+                        .get(&displayed)
+                        .and_then(|path| solved.state.get(path))
+                        .and_then(|scope| scope.bbox.clone());
+                    (
+                        Some(solved.output.clone()),
+                        Some(solved.state.clone()),
+                        Some(solved.selected_scope.clone()),
+                        layout_bbox,
+                    )
+                })
+                .unwrap_or((None, None, None, None));
+            let layer_visibility = state
+                .layers
+                .read(cx)
+                .layers
+                .values()
+                .map(|layer| layer.visible)
+                .collect::<Vec<_>>();
+            (
+                output,
+                scope_state,
+                selected_scope,
+                layout_bbox,
+                layer_visibility,
+                state.hierarchy_depth,
+                hide_external_geometry,
+                state.dark_mode,
+            )
+        };
+        let same_output = match (&self.raster_output, &output) {
+            (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        };
+        let same_scope_state = match (&self.raster_scope_state, &scope_state) {
+            (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        };
+        let changed = !same_output
+            || !same_scope_state
+            || self.raster_selected_scope != selected_scope
+            || self.raster_layer_visibility != layer_visibility
+            || self.raster_hierarchy_depth != hierarchy_depth
+            || self.raster_hide_external_geometry != hide_external_geometry
+            || self.raster_dark_mode != dark_mode;
+        self.raster_output = output;
+        self.raster_scope_state = scope_state;
+        self.raster_selected_scope = selected_scope;
+        self.raster_layout_bbox = layout_bbox;
+        self.raster_layer_visibility = layer_visibility;
+        self.raster_hierarchy_depth = hierarchy_depth;
+        self.raster_hide_external_geometry = hide_external_geometry;
+        self.raster_dark_mode = dark_mode;
+        changed
+    }
+
+    fn advance_raster_generation(&mut self) {
+        self.raster_generation = self.raster_generation.wrapping_add(1);
+        self.raster_generation_signal
+            .store(self.raster_generation, Ordering::Release);
+    }
+
+    fn begin_navigation(&mut self) {
+        self.advance_raster_generation();
+        self.navigation_cache_active = true;
+        self.hover_hit = None;
+    }
+
+    fn prepare_navigation_tile_target(&mut self) {
+        let screen_viewport = self.screen_bounds.size;
+        let tile_size = navigation_tile_size(screen_viewport);
+        let raster_scale = self.scale;
+        let display_ratio = self.scale / raster_scale;
+        let capture_offset =
+            Point::new(self.offset.x / display_ratio, self.offset.y / display_ratio);
+        let mut anchor_offset = Point::new(
+            align_navigation_raster_offset(capture_offset.x),
+            align_navigation_raster_offset(capture_offset.y),
+        );
+        let mut center = RasterTileIndex { x: 0, y: 0 };
+        let reusable_tiles = self
+            .raster_staging_tiles
+            .as_ref()
+            .filter(|tiles| {
+                tiles.scale == raster_scale
+                    && tiles.screen_viewport == screen_viewport
+                    && tiles.tile_size == tile_size
+                    && tiles.content_revision == self.raster_content_revision
+            })
+            .or_else(|| {
+                self.raster_tiles.as_ref().filter(|tiles| {
+                    tiles.scale == raster_scale
+                        && tiles.screen_viewport == screen_viewport
+                        && tiles.tile_size == tile_size
+                        && tiles.content_revision == self.raster_content_revision
+                })
+            });
+        if let Some(tiles) = reusable_tiles {
+            let candidate = RasterTileIndex {
+                x: ((f32::from(tiles.anchor_offset.x) - f32::from(capture_offset.x))
+                    / f32::from(tile_size.width))
+                .round() as i32,
+                y: ((f32::from(tiles.anchor_offset.y) - f32::from(capture_offset.y))
+                    / f32::from(tile_size.height))
+                .round() as i32,
+            };
+            let overlaps_retained_field = navigation_tile_order(candidate)
+                .iter()
+                .any(|index| tiles.tiles.contains_key(index));
+            if overlaps_retained_field {
+                anchor_offset = tiles.anchor_offset;
+                center = candidate;
+            }
+        }
+
+        let target = RasterTileTarget {
+            anchor_offset,
+            tile_size,
+            screen_viewport,
+            scale: raster_scale,
+            content_revision: self.raster_content_revision,
+            center,
+            generation: self.raster_generation,
+        };
+        if let Some(tiles) = self
+            .raster_tiles
+            .as_mut()
+            .filter(|tiles| raster_tile_set_matches_target(tiles, target))
+        {
+            let retained = navigation_tile_order(center)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut discarded = Vec::new();
+            tiles.tiles.retain(|index, cache| {
+                if retained.contains(index) {
+                    true
+                } else {
+                    discarded.push(cache.image.clone());
+                    false
+                }
+            });
+            tiles.center = center;
+            self.raster_images_to_drop.extend(discarded);
+        }
+        let staging_matches = self
+            .raster_staging_tiles
+            .as_ref()
+            .is_some_and(|tiles| raster_tile_set_matches_target(tiles, target));
+        if staging_matches {
+            let tiles = self.raster_staging_tiles.as_mut().expect("checked above");
+            let retained = navigation_tile_order(center)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut discarded = Vec::new();
+            tiles.tiles.retain(|index, cache| {
+                if retained.contains(index) {
+                    true
+                } else {
+                    discarded.push(cache.image.clone());
+                    false
+                }
+            });
+            tiles.center = center;
+            self.raster_images_to_drop.extend(discarded);
+        } else if let Some(previous) = self.raster_staging_tiles.take() {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        self.raster_tile_target = Some(target);
+        self.raster_scale_signal
+            .store(target.scale.to_bits() as u64, Ordering::Release);
+    }
+
+    fn update_raster_display_transform(&mut self) -> bool {
+        let Some(tiles) = self
+            .raster_tiles
+            .as_ref()
+            .filter(|tiles| tiles.content_revision == self.raster_content_revision)
+        else {
+            return false;
+        };
+        let layout_bounds = self.raster_layout_bbox.as_ref().map(|bbox| {
+            layout_bbox_screen_bounds(bbox, self.screen_bounds, self.scale, self.offset)
+        });
+        if let Some(transform) = navigation_raster_transform(
+            tiles,
+            self.screen_bounds,
+            self.scale,
+            self.offset,
+            layout_bounds,
+        ) {
+            self.raster_display = Some(transform);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear_raster_reprojection(&mut self) {
+        if let Some(previous) = self.raster_reprojection.take() {
+            self.raster_images_to_drop.push(previous.image);
+        }
+    }
+
+    fn refresh_raster_reprojection(&mut self) {
+        let reprojection = self.raster_tiles.as_ref().and_then(|tiles| {
+            if tiles.scale == self.scale
+                || tiles.content_revision != self.raster_content_revision
+                || tiles.screen_viewport != self.screen_bounds.size
+            {
+                return None;
+            }
+            let layout_bounds = self.raster_layout_bbox.as_ref().map(|bbox| {
+                layout_bbox_screen_bounds(bbox, self.screen_bounds, self.scale, self.offset)
+            });
+            navigation_raster_transform(
+                tiles,
+                self.screen_bounds,
+                self.scale,
+                self.offset,
+                layout_bounds,
+            )?;
+            reproject_raster_tiles(tiles, self.screen_bounds, self.scale, self.offset)
+        });
+        if let Some(previous) = std::mem::replace(&mut self.raster_reprojection, reprojection) {
+            self.raster_images_to_drop.push(previous.image);
+        }
+    }
+
+    fn navigation_raster_input(
+        &self,
+        cx: &gpui::App,
+        target: RasterTileTarget,
+        index: RasterTileIndex,
+    ) -> Option<NavigationRasterInput> {
+        let state = self.state.read(cx);
+        let solved_cell = state.solved_cell.read(cx).clone()?;
+        Some(NavigationRasterInput {
+            solved_cell,
+            layers: Arc::new(state.layers.read(cx).layers.clone()),
+            hierarchy_depth: state.hierarchy_depth,
+            hide_external_geometry: state.hide_external_geometry,
+            viewport: ViewportTransform {
+                size: target.tile_size,
+                screen_size: target.screen_viewport,
+                scale: target.scale,
+                offset: raster_tile_offset(target.anchor_offset, target.tile_size, index),
+            },
+            text_color: state.theme().text,
+            include_text: true,
+            content_revision: target.content_revision,
+            content_revision_signal: self.raster_content_revision_signal.clone(),
+            scale_signal: self.raster_scale_signal.clone(),
+            cell_raster_tiles: self.cell_raster_tiles.clone(),
+            cancel_if_generation_changes: Some((
+                self.raster_generation_signal.clone(),
+                target.generation,
+            )),
+        })
+    }
+
+    fn next_navigation_tile(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<(RasterTileTarget, RasterTileIndex, NavigationRasterInput)> {
+        let target = self.raster_tile_target?;
+        if target.generation != self.raster_generation {
+            return None;
+        }
+        let matching_tiles = self
+            .raster_staging_tiles
+            .as_ref()
+            .filter(|tiles| tiles.navigation && raster_tile_set_matches_target(tiles, target))
+            .or_else(|| {
+                self.raster_tiles.as_ref().filter(|tiles| {
+                    tiles.navigation && raster_tile_set_matches_target(tiles, target)
+                })
+            });
+        let index = navigation_tile_order(target.center)
+            .into_iter()
+            .find(|index| !matching_tiles.is_some_and(|tiles| tiles.tiles.contains_key(index)))?;
+        let input = self.navigation_raster_input(cx, target, index)?;
+        Some((target, index, input))
+    }
+
+    fn install_navigation_tile(
+        &mut self,
+        target: RasterTileTarget,
+        index: RasterTileIndex,
+        cache: LayoutRasterCache,
+    ) {
+        if self.raster_tile_target != Some(target)
+            || target.generation != self.raster_generation
+            || cache.content_revision != self.raster_content_revision
+        {
+            self.raster_images_to_drop.push(cache.image);
+            return;
+        }
+        let matches_active = self
+            .raster_tiles
+            .as_ref()
+            .is_some_and(|tiles| raster_tile_set_matches_target(tiles, target));
+        if matches_active {
+            let tiles = self.raster_tiles.as_mut().expect("matching active tiles");
+            if let Some(previous) = tiles.tiles.insert(index, cache) {
+                self.raster_images_to_drop.push(previous.image);
+            }
+            tiles.navigation = true;
+            tiles.center = target.center;
+            self.update_raster_display_transform();
+            return;
+        }
+
+        let can_stage_over_active = self.raster_tiles.as_ref().is_some_and(|tiles| {
+            tiles.content_revision == target.content_revision
+                && tiles.screen_viewport == target.screen_viewport
+        });
+        if !can_stage_over_active {
+            // There is no compatible previous frame to retain (initial load,
+            // content invalidation, or resize), so make the center visible as
+            // soon as possible instead of waiting for nine tiles.
+            if index != target.center {
+                self.raster_images_to_drop.push(cache.image);
+                return;
+            }
+            let mut replacement = LayoutRasterTileSet {
+                tiles: HashMap::new(),
+                navigation: true,
+                anchor_offset: target.anchor_offset,
+                tile_size: target.tile_size,
+                screen_viewport: target.screen_viewport,
+                scale: target.scale,
+                content_revision: target.content_revision,
+                center: target.center,
+            };
+            replacement.tiles.insert(index, cache);
+            if let Some(previous) = self.raster_tiles.replace(replacement) {
+                self.raster_images_to_drop
+                    .extend(previous.tiles.into_values().map(|cache| cache.image));
+            }
+            self.clear_raster_reprojection();
+            self.raster_display = self
+                .raster_tiles
+                .as_ref()
+                .map(navigation_raster_capture_transform);
+            return;
+        }
+
+        let staging_matches = self
+            .raster_staging_tiles
+            .as_ref()
+            .is_some_and(|tiles| raster_tile_set_matches_target(tiles, target));
+        if !staging_matches {
+            if index != target.center {
+                self.raster_images_to_drop.push(cache.image);
+                return;
+            }
+            if let Some(previous) = self.raster_staging_tiles.take() {
+                self.raster_images_to_drop
+                    .extend(previous.tiles.into_values().map(|cache| cache.image));
+            }
+            self.raster_staging_tiles = Some(LayoutRasterTileSet {
+                tiles: HashMap::new(),
+                navigation: true,
+                anchor_offset: target.anchor_offset,
+                tile_size: target.tile_size,
+                screen_viewport: target.screen_viewport,
+                scale: target.scale,
+                content_revision: target.content_revision,
+                center: target.center,
+            });
+        }
+
+        let staging = self
+            .raster_staging_tiles
+            .as_mut()
+            .expect("staging tiles initialized above");
+        if let Some(previous) = staging.tiles.insert(index, cache) {
+            self.raster_images_to_drop.push(previous.image);
+        }
+        staging.center = target.center;
+
+        if !navigation_inner_tiles_complete(&staging.tiles, staging.center) {
+            return;
+        }
+        let layout_bounds = self.raster_layout_bbox.as_ref().map(|bbox| {
+            layout_bbox_screen_bounds(bbox, self.screen_bounds, self.scale, self.offset)
+        });
+        let Some(display) = navigation_raster_transform(
+            staging,
+            self.screen_bounds,
+            self.scale,
+            self.offset,
+            layout_bounds,
+        ) else {
+            // The target moved far enough while these tiles were rendering
+            // that even the completed inner ring cannot represent the current
+            // view. Keep the previous frame while the outer ring or a retarget
+            // catches up.
+            return;
+        };
+        let replacement = self
+            .raster_staging_tiles
+            .take()
+            .expect("checked and completed above");
+        if let Some(previous) = self.raster_tiles.replace(replacement) {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        self.clear_raster_reprojection();
+        self.raster_display = Some(display);
+    }
+
+    fn request_navigation_raster(&mut self, cx: &mut Context<Self>) {
+        self.navigation_cache_active = true;
+        if self.is_dragging
+            && (self.raster_cache_has_pan_margin()
+                || (self.raster_worker_active && self.raster_tiles_cover_canvas()))
+        {
+            return;
+        }
+        self.advance_raster_generation();
+        self.prepare_navigation_tile_target();
+        if self.raster_worker_active {
+            return;
+        }
+        self.raster_worker_active = true;
+        self.raster_refinement = Some(cx.spawn(async move |canvas, cx| {
+            loop {
+                let Some((target, index, input)) = canvas
+                    .update(cx, |canvas, cx| canvas.next_navigation_tile(cx))
+                    .ok()
+                    .flatten()
+                else {
+                    let _ = canvas.update(cx, |canvas, cx| {
+                        canvas.raster_worker_active = false;
+                        canvas.navigation_cache_active =
+                            canvas.is_dragging || canvas.raster_staging_tiles.is_some();
+                        cx.notify();
+                    });
+                    return;
+                };
+                let cache = cx
+                    .background_spawn(async move { build_navigation_raster(input) })
+                    .await;
+                let _ = canvas.update(cx, |canvas, cx| {
+                    if let Some(cache) = cache {
+                        canvas.install_navigation_tile(target, index, cache);
+                    }
+                    cx.notify();
+                });
+            }
+        }));
+    }
+
+    fn raster_tiles_cover_canvas(&self) -> bool {
+        self.raster_tiles.as_ref().is_some_and(|tiles| {
+            tiles.content_revision == self.raster_content_revision
+                && raster_tiles_cover_bounds(
+                    tiles,
+                    self.screen_bounds,
+                    self.screen_bounds,
+                    self.scale,
+                    self.offset,
+                )
+        })
+    }
+
+    /// Recenter only after the current 5x5 field loses a half-viewport guard.
+    /// Integral tile shifts retain the overlapping rows/columns, so ordinary
+    /// panning schedules only the newly exposed outer ring.
+    fn raster_cache_has_pan_margin(&self) -> bool {
+        let Some(tiles) = self
+            .raster_tiles
+            .as_ref()
+            .filter(|tiles| tiles.content_revision == self.raster_content_revision)
+        else {
+            return false;
+        };
+        if tiles.scale != self.scale || tiles.screen_viewport != self.screen_bounds.size {
+            return false;
+        }
+        let guard = Size::new(tiles.tile_size.width / 2., tiles.tile_size.height / 2.);
+        let guarded_canvas = Bounds::new(
+            self.screen_bounds.origin - Point::new(guard.width, guard.height),
+            Size::new(
+                self.screen_bounds.size.width + guard.width * 2.,
+                self.screen_bounds.size.height + guard.height * 2.,
+            ),
+        );
+        raster_tiles_cover_bounds(
+            tiles,
+            self.screen_bounds,
+            guarded_canvas,
+            self.scale,
+            self.offset,
+        )
     }
 
     pub(crate) fn place_instance(&mut self, preview: InstancePreview, cx: &mut Context<Self>) {
@@ -3298,6 +6359,24 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn fit_to_screen(&mut self, cx: &mut Context<Self>) {
+        self.advance_raster_generation();
+        if let Some(previous) = self.raster_tiles.take() {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        if let Some(previous) = self.raster_staging_tiles.take() {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        if let Some(previous) = self.raster_reprojection.take() {
+            self.raster_images_to_drop.push(previous.image);
+        }
+        self.raster_display = None;
+        self.raster_tile_target = None;
+        self.navigation_cache_active = false;
+        self.raster_refinement = None;
+        self.raster_worker_active = false;
+        self.hover_hit = None;
         if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
                 let scope_address = &cell.state[&cell.selected_scope].address;
@@ -3325,6 +6404,8 @@ impl LayoutCanvas {
         } else {
             self.offset = Point::new(px(0.), self.screen_bounds.size.height);
         }
+        self.raster_scale_signal
+            .store(self.scale.to_bits() as u64, Ordering::Release);
         cx.notify();
     }
 
@@ -3373,62 +6454,66 @@ impl LayoutCanvas {
                                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                                 self.state.update(cx, |state, cx| {
-                                    let error = state.solved_cell.update(cx, {
-                                        |cell, cx| {
-                                            if let Some(cell) = cell.as_mut() {
-                                                // TODO update in memory representation of code
-                                                // TODO add solver to gui
-                                                let scope_address =
-                                                    &cell.state[&cell.selected_scope].address;
-                                                let reachable_objs = cell.output.reachable_objs(
-                                                    scope_address.cell,
-                                                    scope_address.scope,
-                                                );
-                                                let names: IndexSet<_> =
-                                                    reachable_objs.values().collect();
-                                                let scope = cell
-                                                    .output
-                                                    .cells
-                                                    .get_mut(&scope_address.cell)
-                                                    .unwrap()
-                                                    .scopes
-                                                    .get_mut(&scope_address.scope)
-                                                    .unwrap();
-                                                let rect_name = (0..)
-                                                    .map(|i| format!("rect{i}"))
-                                                    .find(|name| !names.contains(name))
-                                                    .unwrap();
+                                    let error: Option<SharedString> =
+                                        state.solved_cell.update(cx, {
+                                            |cell, cx| {
+                                                if let Some(cell) = cell.as_mut() {
+                                                    // TODO update in memory representation of code
+                                                    // TODO add solver to gui
+                                                    let scope_address =
+                                                        &cell.state[&cell.selected_scope].address;
+                                                    let reachable_objs =
+                                                        cell.output.reachable_objs(
+                                                            scope_address.cell,
+                                                            scope_address.scope,
+                                                        );
+                                                    let names: IndexSet<_> =
+                                                        reachable_objs.values().collect();
+                                                    let scope = cell
+                                                        .output
+                                                        .cells
+                                                        .get(&scope_address.cell)
+                                                        .unwrap()
+                                                        .scopes
+                                                        .get(&scope_address.scope)
+                                                        .unwrap();
+                                                    let rect_name = (0..)
+                                                        .map(|i| format!("rect{i}"))
+                                                        .find(|name| !names.contains(name))
+                                                        .unwrap();
 
-                                                match state.lang_server_client.draw_rect(
-                                                    scope.span.clone(),
-                                                    rect_name,
-                                                    compile::BasicRect {
-                                                        layer: state
-                                                            .layers
-                                                            .read(cx)
-                                                            .selected_layer
-                                                            .clone()
-                                                            .map(|s| s.to_string()),
-                                                        x0: draw_source_coordinate(p0p.x, grid),
-                                                        y0: draw_source_coordinate(p0p.y, grid),
-                                                        x1: draw_source_coordinate(p1p.x, grid),
-                                                        y1: draw_source_coordinate(p1p.y, grid),
-                                                        construction: false,
-                                                    },
-                                                ) {
-                                                    Ok(None) => Some(
-                                                        "inconsistent editor and GUI state".into(),
-                                                    ),
-                                                    Ok(Some(_)) => None,
-                                                    Err(_) => None,
+                                                    match state.lang_server_client.draw_rect(
+                                                        scope.span.clone(),
+                                                        rect_name,
+                                                        compile::BasicRect {
+                                                            layer: state
+                                                                .layers
+                                                                .read(cx)
+                                                                .selected_layer
+                                                                .clone()
+                                                                .map(|s| s.to_string()),
+                                                            x0: draw_source_coordinate(p0p.x, grid),
+                                                            y0: draw_source_coordinate(p0p.y, grid),
+                                                            x1: draw_source_coordinate(p1p.x, grid),
+                                                            y1: draw_source_coordinate(p1p.y, grid),
+                                                            construction: false,
+                                                        },
+                                                    ) {
+                                                        Ok(None) => Some(
+                                                            SOURCE_EDIT_REJECTED_MESSAGE.into(),
+                                                        ),
+                                                        Ok(Some(_)) => None,
+                                                        Err(_) => None,
+                                                    }
+                                                } else {
+                                                    Some("no cell to edit".into())
                                                 }
-                                            } else {
-                                                Some("no cell to edit".into())
                                             }
-                                        }
-                                    });
-                                    if state.fatal_error.is_none() {
-                                        state.fatal_error = error;
+                                        });
+                                    if state.message.is_none()
+                                        && let Some(error) = error
+                                    {
+                                        state.show_message(MessageType::ERROR, error);
                                     }
                                 });
                             } else {
@@ -3537,10 +6622,14 @@ impl LayoutCanvas {
                             cx.notify();
                         }
                         Ok(None) => {
-                            let _ = self.state.read(cx).lang_server_client.show_message(
-                                MessageType::ERROR,
-                                "Could not insert the instance into the source scope.",
-                            );
+                            self.state.update(cx, |state, _cx| {
+                                if state.message.is_none() {
+                                    state.show_message(
+                                        MessageType::ERROR,
+                                        SOURCE_EDIT_REJECTED_MESSAGE,
+                                    );
+                                }
+                            });
                         }
                         Err(_) => {}
                     }
@@ -4102,7 +7191,7 @@ impl LayoutCanvas {
 
             let mut inserted = false;
             self.state.update(cx, |state, cx| {
-                let error = state.solved_cell.update(cx, |cell, _cx| {
+                let error: Option<SharedString> = state.solved_cell.update(cx, |cell, _cx| {
                     let Some(cell) = cell.as_mut() else {
                         return Some("no cell to edit".into());
                     };
@@ -4147,12 +7236,14 @@ impl LayoutCanvas {
                             inserted = true;
                             None
                         }
-                        Ok(None) => Some("inconsistent editor and GUI state".into()),
+                        Ok(None) => Some(SOURCE_EDIT_REJECTED_MESSAGE.into()),
                         Err(_) => None,
                     }
                 });
-                if state.fatal_error.is_none() {
-                    state.fatal_error = error;
+                if state.message.is_none()
+                    && let Some(error) = error
+                {
+                    state.show_message(MessageType::ERROR, error);
                 }
             });
             if inserted {
@@ -4303,6 +7394,7 @@ impl LayoutCanvas {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        self.begin_navigation();
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
@@ -4318,8 +7410,17 @@ impl LayoutCanvas {
         self.shift_down = event.modifiers.shift;
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
+            self.hover_hit = None;
+            self.update_raster_display_transform();
+            if self.raster_reprojection.is_some() {
+                self.refresh_raster_reprojection();
+            }
+            self.request_navigation_raster(cx);
         } else if self.is_sse_dragging {
             self.sse_delta = self.mouse_position - self.drag_start;
+            self.hover_hit = None;
+        } else {
+            self.hover_hit = self.selection_hits_at(event.position).into_iter().next();
         }
         cx.notify();
     }
@@ -4328,12 +7429,16 @@ impl LayoutCanvas {
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        let was_dragging = self.is_dragging;
         self.is_dragging = false;
         self.is_sse_dragging = false;
         self.sse_delta = Point::default();
         self.sse_targets.clear();
+        if was_dragging {
+            self.request_navigation_raster(cx);
+        }
     }
 
     /// Computes replacements for existing fallbacks plus AST-aware requests to
@@ -4485,6 +7590,12 @@ impl LayoutCanvas {
             + event.position;
         self.offset = b1 - self.screen_bounds.origin;
         self.scale = new_scale;
+        self.update_raster_display_transform();
+        self.refresh_raster_reprojection();
+        // Preserve the old field as a scaled fallback, but begin producing an
+        // exact-scale replacement immediately. Staging prevents a lone center
+        // tile from replacing it until the new inner 3x3 is complete.
+        self.request_navigation_raster(cx);
 
         cx.notify();
     }
@@ -4542,6 +7653,573 @@ pub(crate) fn find_obj_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raster_pixel_ranges_are_clipped_to_the_viewport() {
+        assert_eq!(raster_pixel_range(-2.5, 2.2, 10), Some((0, 3)));
+        assert_eq!(raster_pixel_range(8.1, 12., 10), Some((8, 10)));
+        assert_eq!(raster_pixel_range(12., 14., 10), None);
+        assert_eq!(raster_pixel_range(4., 4., 10), None);
+    }
+
+    #[test]
+    fn raster_pixels_use_bgra_channel_order() {
+        let mut pixel = [0; 4];
+        blend_raster_pixel(
+            &mut pixel,
+            0,
+            Rgba {
+                r: 1.,
+                g: 0.5,
+                b: 0.,
+                a: 1.,
+            },
+        );
+        assert_eq!(pixel, [0, 128, 255, 255]);
+    }
+
+    #[test]
+    fn retained_raster_expands_without_interpolating_layer_colors() {
+        let image = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        let expanded = expand_raster_for_display(image);
+
+        assert_eq!(expanded.dimensions(), (4, 2));
+        for y in 0..2 {
+            assert_eq!(expanded.get_pixel(0, y).0, [255, 0, 0, 255]);
+            assert_eq!(expanded.get_pixel(1, y).0, [255, 0, 0, 255]);
+            assert_eq!(expanded.get_pixel(2, y).0, [0, 0, 255, 255]);
+            assert_eq!(expanded.get_pixel(3, y).0, [0, 0, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn style_planes_apply_stippling_in_destination_pixels() {
+        let stipple_on = [255, 0, 0, 255].repeat(10);
+        let stipple_off = vec![0; stipple_on.len()];
+        let image = raster_from_style_planes(10, 1, &stipple_on, &stipple_off, 0).unwrap();
+
+        for x in 0..10 {
+            assert_eq!(
+                image.get_pixel(x, 0).0[3] != 0,
+                x == 0 || x == 5,
+                "the half-resolution slash period must remain five pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn tile_reprojection_restipples_instead_of_scaling_the_old_pattern() {
+        let source_width = 5;
+        let source_height = 5;
+        let stipple_on = [255, 0, 0, 255].repeat(source_width * source_height);
+        let stipple_off = vec![0; stipple_on.len()];
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(10, 10),
+        )]));
+        let cache = LayoutRasterCache {
+            image,
+            style_planes: Some(Arc::new(RasterStylePlanes {
+                width: source_width as u32,
+                height: source_height as u32,
+                stipple_on: stipple_on.into(),
+                stipple_off: stipple_off.into(),
+            })),
+            texts: Arc::from([]),
+            scope_labels: Arc::from([]),
+            viewport: Size::new(px(10.), px(10.)),
+            screen_viewport: Size::new(px(20.), px(20.)),
+            scale: 1.,
+            offset: Point::default(),
+            content_revision: 0,
+        };
+        let tiles = LayoutRasterTileSet {
+            tiles: HashMap::from([(RasterTileIndex { x: 0, y: 0 }, cache)]),
+            navigation: true,
+            anchor_offset: Point::default(),
+            tile_size: Size::new(px(10.), px(10.)),
+            screen_viewport: Size::new(px(20.), px(20.)),
+            scale: 1.,
+            content_revision: 0,
+            center: RasterTileIndex { x: 0, y: 0 },
+        };
+        let reprojected = reproject_raster_tiles(
+            &tiles,
+            Bounds::new(Point::default(), Size::new(px(20.), px(20.))),
+            2.,
+            Point::default(),
+        )
+        .unwrap();
+        let bytes = reprojected.image.as_bytes(0).unwrap();
+        let alpha = |x: usize, y: usize| bytes[(y * 20 + x) * 4 + 3];
+
+        assert_eq!(alpha(0, 0), 255);
+        assert_eq!(alpha(2, 0), 0);
+        assert_eq!(alpha(10, 0), 255);
+    }
+
+    #[test]
+    fn same_layer_overlap_is_idempotent_but_separate_layers_blend() {
+        let color = Rgba {
+            a: 0.5,
+            ..rgb(0xff0000)
+        };
+        let mut first_layer = vec![0; 4];
+        let mut first_touched = Vec::new();
+        composite_raster_pixel(
+            &mut first_layer,
+            0,
+            color,
+            RasterComposite::Union,
+            Some(&mut first_touched),
+        );
+        composite_raster_pixel(
+            &mut first_layer,
+            0,
+            color,
+            RasterComposite::Union,
+            Some(&mut first_touched),
+        );
+        composite_raster_pixel(
+            &mut first_layer,
+            0,
+            color,
+            RasterComposite::Replace,
+            Some(&mut first_touched),
+        );
+        assert_eq!(first_layer[3], 128);
+        assert_eq!(first_touched, [0]);
+
+        let mut output = vec![0; 4];
+        blend_raster_layer(&mut output, &mut first_layer, &mut first_touched);
+        assert_eq!(output[3], 128);
+        assert_eq!(first_layer, [0; 4]);
+        assert!(first_touched.is_empty());
+
+        let mut second_layer = vec![0; 4];
+        let mut second_touched = Vec::new();
+        composite_raster_pixel(
+            &mut second_layer,
+            0,
+            color,
+            RasterComposite::Union,
+            Some(&mut second_touched),
+        );
+        blend_raster_layer(&mut output, &mut second_layer, &mut second_touched);
+        assert_eq!(output[3], 192);
+    }
+
+    #[test]
+    fn raster_stippling_preserves_transparent_gaps() {
+        let mut pixels = vec![0; 10 * 4];
+        {
+            let mut target = RasterPaintTarget {
+                buffer: &mut pixels,
+                composite: RasterComposite::Union,
+                touched: None,
+            };
+            fill_raster_rect(
+                &mut target,
+                10,
+                1,
+                Bounds::new(Point::default(), Size::new(px(10.), px(1.))),
+                ShapeFill::Stippling,
+                Rgba {
+                    r: 1.,
+                    g: 0.,
+                    b: 0.,
+                    a: 1.,
+                },
+                0,
+            );
+        }
+        let alphas = pixels
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .collect::<Vec<_>>();
+        assert_eq!(alphas, [255, 0, 0, 0, 0, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn raster_stippling_is_anchored_to_layout_coordinates() {
+        let period = (10. * RASTER_CACHE_RESOLUTION).round().max(1.) as i64;
+        let world = (13_i64, 3_i64);
+        for offset in [Point::new(px(0.), px(0.)), Point::new(px(7.), px(-4.))] {
+            let phase = raster_stipple_phase(offset);
+            let local_x = world.0 + f32::from(offset.x).round() as i64;
+            let local_y = world.1 + f32::from(offset.y).round() as i64;
+            assert_eq!(
+                (local_x - local_y - phase).rem_euclid(period),
+                (world.0 - world.1).rem_euclid(period)
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_tiles_are_scheduled_center_then_two_rings() {
+        let center = RasterTileIndex { x: 7, y: -4 };
+        let order = navigation_tile_order(center);
+        assert_eq!(order.len(), 25);
+        assert_eq!(order[0], center);
+        assert!(
+            order[1..9]
+                .iter()
+                .all(|index| { (index.x - center.x).abs().max((index.y - center.y).abs()) == 1 })
+        );
+        assert!(
+            order[9..]
+                .iter()
+                .all(|index| { (index.x - center.x).abs().max((index.y - center.y).abs()) == 2 })
+        );
+        assert_eq!(order.iter().copied().collect::<HashSet<_>>().len(), 25);
+    }
+
+    #[test]
+    fn zoom_level_handoff_requires_the_complete_inner_three_by_three() {
+        let center = RasterTileIndex { x: 3, y: -2 };
+        let order = navigation_tile_order(center);
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(1, 1),
+        )]));
+        let cache = LayoutRasterCache {
+            image,
+            style_planes: None,
+            texts: Arc::from([]),
+            scope_labels: Arc::from([]),
+            viewport: Size::new(px(1.), px(1.)),
+            screen_viewport: Size::new(px(1.), px(1.)),
+            scale: 1.,
+            offset: Point::default(),
+            content_revision: 0,
+        };
+        let mut tiles = HashMap::new();
+        for index in order.iter().take(8) {
+            tiles.insert(*index, cache.clone());
+        }
+        assert!(!navigation_inner_tiles_complete(&tiles, center));
+
+        tiles.insert(order[8], cache);
+        assert!(navigation_inner_tiles_complete(&tiles, center));
+    }
+
+    #[test]
+    fn paint_does_not_restart_an_in_flight_first_tile() {
+        assert!(paint_should_start_navigation_worker(true, false, false));
+        assert!(!paint_should_start_navigation_worker(true, false, true));
+        assert!(!paint_should_start_navigation_worker(true, true, false));
+        assert!(!paint_should_start_navigation_worker(false, false, false));
+    }
+
+    #[test]
+    fn five_by_five_tiles_cover_navigation_and_detect_missing_visible_tiles() {
+        let image = image::RgbaImage::new(1, 1);
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(image)]));
+        let tile_size = Size::new(px(100.), px(80.));
+        let anchor_offset = Point::new(px(110.), px(80.));
+        let cache = LayoutRasterCache {
+            image,
+            style_planes: None,
+            texts: Arc::from([]),
+            scope_labels: Arc::from([]),
+            viewport: tile_size,
+            screen_viewport: tile_size,
+            scale: 2.,
+            offset: anchor_offset,
+            content_revision: 0,
+        };
+        let mut tiles = LayoutRasterTileSet {
+            tiles: navigation_tile_order(RasterTileIndex { x: 0, y: 0 })
+                .into_iter()
+                .map(|index| {
+                    let mut tile = cache.clone();
+                    tile.offset = raster_tile_offset(anchor_offset, tile_size, index);
+                    (index, tile)
+                })
+                .collect(),
+            navigation: true,
+            anchor_offset,
+            tile_size,
+            screen_viewport: tile_size,
+            scale: 2.,
+            content_revision: 0,
+            center: RasterTileIndex { x: 0, y: 0 },
+        };
+        let canvas = Bounds::new(Point::default(), tile_size);
+        assert_eq!(
+            navigation_raster_capture_transform(&tiles),
+            RasterDisplayTransform {
+                scale: 2.,
+                offset: anchor_offset,
+            }
+        );
+        let shrunk_offset = Point::new(anchor_offset.x / 2., anchor_offset.y / 2.);
+        assert!(navigation_raster_transform(&tiles, canvas, 1., shrunk_offset, None).is_some());
+        assert!(
+            navigation_raster_transform(
+                &tiles,
+                canvas,
+                2.,
+                anchor_offset + Point::new(px(190.), px(150.)),
+                None,
+            )
+            .is_some()
+        );
+
+        tiles
+            .tiles
+            .retain(|index, _| *index == RasterTileIndex { x: 0, y: 0 });
+        let contained_layout =
+            Bounds::new(Point::new(px(10.), px(10.)), Size::new(px(20.), px(20.)));
+        assert!(!raster_tiles_cover_bounds(
+            &tiles,
+            canvas,
+            canvas,
+            1.,
+            shrunk_offset,
+        ));
+        assert_eq!(
+            navigation_raster_transform(&tiles, canvas, 1., shrunk_offset, Some(contained_layout),),
+            Some(RasterDisplayTransform {
+                scale: 1.,
+                offset: shrunk_offset,
+            })
+        );
+
+        tiles.tiles.remove(&RasterTileIndex { x: 0, y: 0 });
+        assert_eq!(
+            navigation_raster_transform(&tiles, canvas, 2., anchor_offset, None),
+            None
+        );
+    }
+
+    #[test]
+    fn fractional_rectangle_outline_stays_one_raster_pixel_wide() {
+        let mut buffer = vec![0; 8 * 8 * 4];
+        {
+            let mut target = RasterPaintTarget {
+                buffer: &mut buffer,
+                composite: RasterComposite::Replace,
+                touched: None,
+            };
+            stroke_raster_rect(
+                &mut target,
+                8,
+                8,
+                Bounds::new(Point::new(px(1.25), px(1.25)), Size::new(px(4.2), px(4.2))),
+                Rgba {
+                    a: 0.5,
+                    ..rgb(0xff0000)
+                },
+            );
+        }
+
+        assert_eq!(
+            buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0).count(),
+            16
+        );
+        assert!(
+            buffer
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] != 0)
+                .all(|pixel| pixel[3] == 128),
+            "corners and straight edges must have identical alpha"
+        );
+        assert_eq!(buffer[(8 + 1) * 4 + 3], 128);
+        assert_eq!(buffer[(2 * 8 + 2) * 4 + 3], 0);
+    }
+
+    #[test]
+    fn rectangle_outline_does_not_turn_viewport_clipping_into_an_edge() {
+        let mut buffer = vec![0; 8 * 8 * 4];
+        let mut target = RasterPaintTarget {
+            buffer: &mut buffer,
+            composite: RasterComposite::Replace,
+            touched: None,
+        };
+        stroke_raster_rect(
+            &mut target,
+            8,
+            8,
+            Bounds::new(Point::new(px(-5.), px(1.)), Size::new(px(9.), px(4.))),
+            rgb(0xff0000),
+        );
+
+        let alpha = |x: usize, y: usize| buffer[(y * 8 + x) * 4 + 3];
+        assert_eq!(alpha(0, 2), 0, "the viewport boundary is not geometry");
+        assert_eq!(alpha(3, 2), 255, "the rectangle's real right edge remains");
+        assert_eq!(
+            alpha(0, 1),
+            255,
+            "the real horizontal edge is clipped normally"
+        );
+    }
+
+    #[test]
+    fn higher_layer_stipple_covers_lower_outlines_without_blending() {
+        let width = 10;
+        let height = 3;
+        let mut output = vec![0; width * height * 4];
+        let mut layer = vec![0; output.len()];
+        let mut touched = Vec::new();
+        {
+            let mut target = RasterPaintTarget {
+                buffer: &mut layer,
+                composite: RasterComposite::Replace,
+                touched: Some(&mut touched),
+            };
+            stroke_raster_line(
+                &mut target,
+                width as u32,
+                height as u32,
+                Point::new(0., 1.),
+                Point::new(9., 1.),
+                rgb(0xff0000),
+            );
+        }
+        blend_raster_layer(&mut output, &mut layer, &mut touched);
+        {
+            let mut target = RasterPaintTarget {
+                buffer: &mut layer,
+                composite: RasterComposite::Union,
+                touched: Some(&mut touched),
+            };
+            fill_raster_rect(
+                &mut target,
+                width as u32,
+                height as u32,
+                Bounds::new(Point::default(), Size::new(px(10.), px(3.))),
+                ShapeFill::Stippling,
+                rgb(0x0000ff),
+                0,
+            );
+        }
+        blend_raster_layer(&mut output, &mut layer, &mut touched);
+
+        let pixel = |x: usize, y: usize| &output[(y * width + x) * 4..(y * width + x + 1) * 4];
+        assert_eq!(pixel(1, 1), [255, 0, 0, 255]);
+        assert_eq!(pixel(2, 1), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn overlapping_opaque_outlines_replace_without_bright_corners() {
+        let width = 7;
+        let height = 7;
+        let bounds = Bounds::new(Point::new(px(1.), px(1.)), Size::new(px(5.), px(5.)));
+        let mut output = vec![0; width * height * 4];
+        let mut layer = vec![0; output.len()];
+        let mut touched = Vec::new();
+        for color in [rgb(0xff0000), rgb(0x0000ff)] {
+            let mut target = RasterPaintTarget {
+                buffer: &mut layer,
+                composite: RasterComposite::Replace,
+                touched: Some(&mut touched),
+            };
+            stroke_raster_rect(&mut target, width as u32, height as u32, bounds, color);
+            blend_raster_layer(&mut output, &mut layer, &mut touched);
+        }
+
+        let blue = [255, 0, 0, 255];
+        assert_eq!(&output[(width + 1) * 4..(width + 2) * 4], blue);
+        assert_eq!(&output[(width + 3) * 4..(width + 4) * 4], blue);
+        assert_eq!(&output[(3 * width + 1) * 4..(3 * width + 2) * 4], blue);
+    }
+
+    #[test]
+    fn subpixel_geometry_is_deduplicated_in_layer_occupancy() {
+        let bounds = Bounds::new(Point::new(px(1.1), px(1.1)), Size::new(px(0.2), px(0.2)));
+        let mut occupancy = None;
+        mark_raster_occupancy(&mut occupancy, 4, 4, bounds);
+        mark_raster_occupancy(&mut occupancy, 4, 4, bounds);
+        let mut buffer = vec![0; 4 * 4 * 4];
+        let mut layer = dimension_rect(0., 1., 0).1;
+        layer.fill = ShapeFill::Stippling;
+
+        let mut target = RasterPaintTarget {
+            buffer: &mut buffer,
+            composite: RasterComposite::Union,
+            touched: None,
+        };
+        paint_raster_occupancy(&mut target, occupancy.as_ref().unwrap(), 16, &layer);
+
+        assert_eq!(buffer[5 * 4 + 3], 64);
+        assert_eq!(
+            buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn navigation_raster_offset_stays_on_the_half_resolution_pixel_grid() {
+        assert_eq!(align_navigation_raster_offset(px(0.9)), px(0.));
+        assert_eq!(align_navigation_raster_offset(px(1.1)), px(2.));
+        assert_eq!(align_navigation_raster_offset(px(3.1)), px(4.));
+        assert_eq!(
+            raster_logical_size(501, 251),
+            Size::new(px(1002.), px(502.))
+        );
+    }
+
+    #[test]
+    fn tiny_stippled_cell_tiles_use_average_coverage_without_empty_phases() {
+        let primitive = RasterTilePrimitive {
+            coverage: Arc::<[u8]>::from(vec![u8::MAX; 4]),
+            tile_width: 2,
+            tile_height: 2,
+            bounds: Bounds::new(Point::default(), Size::new(px(2.), px(2.))),
+        };
+        let mut buffer = vec![0; 2 * 2 * 4];
+        let mut layer = dimension_rect(0., 1., 0).1;
+        layer.fill = ShapeFill::Stippling;
+
+        let mut target = RasterPaintTarget {
+            buffer: &mut buffer,
+            composite: RasterComposite::Union,
+            touched: None,
+        };
+        paint_raster_tile(&mut target, 2, 2, &primitive, &layer);
+
+        assert!(buffer.chunks_exact(4).all(|pixel| pixel[3] == 64));
+    }
+
+    #[test]
+    fn subpixel_tile_polygons_still_leave_an_occupancy_hint() {
+        let mut coverage = vec![0; 16];
+        mark_tile_polygon(
+            &mut coverage,
+            4,
+            4,
+            &[
+                Point::new(1.1, 1.1),
+                Point::new(1.2, 1.1),
+                Point::new(1.15, 1.2),
+            ],
+        );
+        assert!(coverage.iter().any(|pixel| *pixel != 0));
+    }
+
+    #[test]
+    fn visible_stippled_cell_tiles_keep_the_slash_pattern() {
+        let primitive = RasterTilePrimitive {
+            coverage: Arc::<[u8]>::from(vec![u8::MAX; 25]),
+            tile_width: 5,
+            tile_height: 5,
+            bounds: Bounds::new(Point::default(), Size::new(px(5.), px(5.))),
+        };
+        let mut buffer = vec![0; 5 * 5 * 4];
+        let mut layer = dimension_rect(0., 1., 0).1;
+        layer.fill = ShapeFill::Stippling;
+
+        let mut target = RasterPaintTarget {
+            buffer: &mut buffer,
+            composite: RasterComposite::Union,
+            touched: None,
+        };
+        paint_raster_tile(&mut target, 5, 5, &primitive, &layer);
+
+        assert_eq!(
+            buffer.chunks_exact(4).filter(|pixel| pixel[3] != 0).count(),
+            5
+        );
+    }
 
     fn compile(
         ast: &argonc::parse::WorkspaceParseAst,
@@ -5265,10 +8943,10 @@ cell top() {
             .find_map(|object| object.get_rect().map(|rect| rect.id))
             .unwrap();
         let state = CompileOutputState {
-            output,
+            output: Arc::new(output),
             selected_scope: Vec::new(),
-            state: Default::default(),
-            scope_paths: Default::default(),
+            state: Arc::default(),
+            scope_paths: Arc::default(),
         };
         let scope = ScopeAddress {
             cell: top,
