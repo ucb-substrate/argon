@@ -23,7 +23,7 @@ use gpui::{
     AppContext, BorderStyle, Bounds, Context, Corners, DefiniteLength, Edges, Element, Entity,
     FillOptions, FocusHandle, Focusable, Half, InteractiveElement, IntoElement, Length,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, ParentElement,
-    PathBuilder, PathStyle, Pixels, Point, Priority, Render, RenderImage, Rgba, ScrollWheelEvent,
+    PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba, ScrollWheelEvent,
     SharedString, Size, Style, Styled, Subscription, Task, TextRun, Window, div, pattern_slash, px,
     rgb, size, solid_background,
 };
@@ -115,9 +115,9 @@ impl ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
-/// Above this size, retain a viewport raster for interactive redraws. GPUI can
-/// replay a clean retained view, but pan/zoom dirties this immediate element;
-/// transforming one sprite avoids rebuilding hundreds of thousands of quads.
+/// Above this visible primitive count, retain a viewport raster for interactive
+/// redraws. Sparse views stay on the geometry path so their CPU cost follows
+/// visible geometry rather than screen area.
 const RASTER_CACHE_GEOMETRY_THRESHOLD: usize = 50_000;
 /// Rasterize geometry at half resolution so complex fills remain cheap. The
 /// completed pixels are expanded with nearest-neighbor sampling before GPUI
@@ -985,6 +985,10 @@ pub struct LayoutCanvas {
     /// silently scale the old bitmap, widening both outlines and stippling.
     raster_display_frozen: bool,
     raster_tile_target: Option<RasterTileTarget>,
+    /// Sparse views are painted as geometry. Viewport rasters are enabled only
+    /// after the exact traversal finds enough visible primitives to justify
+    /// their fixed pixel cost.
+    raster_cache_enabled: bool,
     navigation_cache_active: bool,
     raster_refinement: Option<Task<()>>,
     /// Only one background raster worker runs at a time. Input events merely
@@ -1969,6 +1973,7 @@ fn raster_style_plane_fill(fill: ShapeFill, stipple_on: bool) -> Option<ShapeFil
     }
 }
 
+#[cfg(test)]
 fn raster_from_style_planes(
     width: u32,
     height: u32,
@@ -2503,6 +2508,85 @@ fn rasterized_patterned_rect_preview(
     ))
 }
 
+/// Rasterize only a custom-pattern polygon's visible bounding box. Sparse
+/// layouts stay on GPUI's geometry path; the CPU work for their technology
+/// bitmaps therefore follows visible patterned geometry instead of the whole
+/// canvas.
+fn rasterized_patterned_polygon(
+    points: &[Point<Pixels>],
+    canvas_bounds: Bounds<Pixels>,
+    fill: ShapeFill,
+    color: Rgba,
+    stipple_phase: RasterStipplePhase,
+) -> Option<(Bounds<Pixels>, Arc<RenderImage>)> {
+    if !matches!(fill, ShapeFill::Pattern(_)) || points.len() < 3 {
+        return None;
+    }
+    let mut point_iter = points.iter();
+    let first = *point_iter.next()?;
+    let polygon_bounds = point_iter.fold(Bounds::new(first, Size::default()), |bounds, point| {
+        Bounds::from_corners(
+            Point::new(bounds.left().min(point.x), bounds.top().min(point.y)),
+            Point::new(bounds.right().max(point.x), bounds.bottom().max(point.y)),
+        )
+    });
+    let visible = polygon_bounds.intersect(&canvas_bounds);
+    if visible.size.width <= px(0.) || visible.size.height <= px(0.) {
+        return None;
+    }
+
+    let raster_x0 = (f32::from(visible.origin.x - canvas_bounds.origin.x) * RASTER_CACHE_RESOLUTION)
+        .floor() as i32;
+    let raster_y0 = (f32::from(visible.origin.y - canvas_bounds.origin.y) * RASTER_CACHE_RESOLUTION)
+        .floor() as i32;
+    let raster_x1 = (f32::from(visible.right() - canvas_bounds.origin.x) * RASTER_CACHE_RESOLUTION)
+        .ceil() as i32;
+    let raster_y1 = (f32::from(visible.bottom() - canvas_bounds.origin.y) * RASTER_CACHE_RESOLUTION)
+        .ceil() as i32;
+    let width = (raster_x1 - raster_x0).max(1) as u32;
+    let height = (raster_y1 - raster_y0).max(1) as u32;
+    let local_points = points
+        .iter()
+        .map(|point| {
+            Point::new(
+                f32::from(point.x - canvas_bounds.origin.x) * RASTER_CACHE_RESOLUTION
+                    - raster_x0 as f32,
+                f32::from(point.y - canvas_bounds.origin.y) * RASTER_CACHE_RESOLUTION
+                    - raster_y0 as f32,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut buffer = vec![0; width as usize * height as usize * 4];
+    let mut target = RasterPaintTarget {
+        buffer: &mut buffer,
+        composite: RasterComposite::Union,
+        touched: None,
+    };
+    fill_raster_polygon(
+        &mut target,
+        width,
+        height,
+        &local_points,
+        fill,
+        color,
+        RasterStipplePhase {
+            x: stipple_phase.x - i64::from(raster_x0),
+            y: stipple_phase.y - i64::from(raster_y0),
+        },
+    );
+    let image = expand_raster_for_display(image::RgbaImage::from_raw(width, height, buffer)?);
+    Some((
+        Bounds::new(
+            Point::new(
+                canvas_bounds.origin.x + px(raster_x0 as f32 / RASTER_CACHE_RESOLUTION),
+                canvas_bounds.origin.y + px(raster_y0 as f32 / RASTER_CACHE_RESOLUTION),
+            ),
+            raster_logical_size(width, height),
+        ),
+        Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+    ))
+}
+
 /// Match GPUI's global slash pattern with a fixed one-raster-pixel stroke.
 /// A retained raster pixel covers two logical pixels, so keeping the sample
 /// fully opaque is preferable to alpha-based sub-sampling: it gives outlines
@@ -2667,6 +2751,7 @@ fn collect_raster_outline_geometry<'a>(
     builder.finish()
 }
 
+#[cfg(test)]
 fn build_layout_raster(
     rects: &[(Rect, LayerState)],
     polygons: &[(Polygon, LayerState)],
@@ -3155,11 +3240,13 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             };
             let pixel_bounds = get_rect_bounds(&rect, local_bounds, raster_scale, raster_offset);
             if depth >= input.hierarchy_depth || !scope_state.visible {
-                scope_rects.push(LabeledBbox {
-                    rect,
-                    label: scope_state.name.clone().into(),
-                    origin: None,
-                });
+                if pixel_bounds.intersects(&local_bounds) {
+                    scope_rects.push(LabeledBbox {
+                        rect,
+                        label: scope_state.name.clone().into(),
+                        origin: None,
+                    });
+                }
                 continue;
             }
             let tile_width = f32::from(pixel_bounds.size.width).ceil().max(1.) as u32;
@@ -3481,6 +3568,32 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 depth + 1,
             ));
         }
+    }
+
+    let has_raster_geometry = rect_primitives.iter().any(|layer| !layer.is_empty())
+        || polygon_primitives.iter().any(|layer| !layer.is_empty())
+        || tile_primitives.iter().any(|layer| !layer.is_empty())
+        || coalesced_outline_occupancy
+            .iter()
+            .any(|occupancy| occupancy.is_some())
+        || !scope_rects.is_empty();
+    if !has_raster_geometry {
+        // Text is painted by GPUI after the retained image. An otherwise empty
+        // tile needs no screen-sized color/style planes: a transparent pixel
+        // stretches to the tile's logical extent with identical output.
+        return Some(LayoutRasterCache {
+            image: Arc::new(RenderImage::new(vec![image::Frame::new(
+                image::RgbaImage::new(1, 1),
+            )])),
+            style_planes: None,
+            texts: texts.into(),
+            scope_labels: Arc::new([]),
+            viewport: raster_logical_size(width, height),
+            screen_viewport: viewport.screen_size,
+            scale: viewport.scale,
+            offset: viewport.offset,
+            content_revision: input.content_revision,
+        });
     }
 
     let outline_geometry = collect_raster_outline_geometry(
@@ -3808,13 +3921,22 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         );
     }
 
-    let image = expand_raster_for_display(raster_from_style_planes(
+    if navigation_raster_cancelled(&input) {
+        return None;
+    }
+    let image = raster_from_style_planes_cancellable(
         width,
         height,
         &stipple_on,
         &stipple_off,
         stipple_phase,
-    )?);
+        || navigation_raster_cancelled(&input),
+    )?;
+    let image =
+        expand_raster_for_display_cancellable(image, || navigation_raster_cancelled(&input))?;
+    if navigation_raster_cancelled(&input) {
+        return None;
+    }
     let outline_correction = build_raster_outline_correction(
         outline_geometry,
         outline_pixels.as_deref(),
@@ -4429,14 +4551,6 @@ fn navigation_tile_order(center: RasterTileIndex) -> Vec<RasterTileIndex> {
     tiles
 }
 
-fn navigation_tile_priority(center: RasterTileIndex, index: RasterTileIndex) -> Priority {
-    if index == center {
-        Priority::High
-    } else {
-        Priority::Low
-    }
-}
-
 fn navigation_inner_tiles_complete(
     tiles: &HashMap<RasterTileIndex, LayoutRasterCache>,
     center: RasterTileIndex,
@@ -4567,10 +4681,15 @@ fn navigation_raster_transform(
 
 fn paint_should_start_navigation_worker(
     has_solved_layout: bool,
+    raster_cache_enabled: bool,
     raster_matches_viewport: bool,
     raster_worker_active: bool,
 ) -> bool {
-    has_solved_layout && !raster_matches_viewport && !raster_worker_active
+    has_solved_layout && raster_cache_enabled && !raster_matches_viewport && !raster_worker_active
+}
+
+fn visible_geometry_uses_raster_cache(select_overview: bool, visible_count: usize) -> bool {
+    select_overview && visible_count >= RASTER_CACHE_GEOMETRY_THRESHOLD
 }
 
 fn sort_initial_condition_pair(
@@ -4939,6 +5058,26 @@ fn get_paint_quad(
     }
 }
 
+fn polygon_screen_bounds(
+    polygon: &Polygon,
+    canvas_bounds: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Option<Bounds<Pixels>> {
+    let mut points = polygon.points.iter().map(|point| {
+        Point::new(scale * px(point.x), scale * px(-point.y)) + offset + canvas_bounds.origin
+    });
+    let first = points.next()?;
+    Some(
+        points.fold(Bounds::new(first, Size::default()), |bounds, point| {
+            Bounds::from_corners(
+                Point::new(bounds.left().min(point.x), bounds.top().min(point.y)),
+                Point::new(bounds.right().max(point.x), bounds.bottom().max(point.y)),
+            )
+        }),
+    )
+}
+
 impl Element for CanvasElement {
     type RequestLayoutState = ();
     type PrepaintState = ();
@@ -5011,6 +5150,7 @@ impl Element for CanvasElement {
             // retargets the worker when the viewport actually changes.
             if paint_should_start_navigation_worker(
                 has_solved_layout,
+                inner.raster_cache_enabled,
                 raster_matches_viewport,
                 inner.raster_worker_active,
             ) {
@@ -5026,9 +5166,10 @@ impl Element for CanvasElement {
             &tool,
             ToolState::Select(SelectToolState { selected_obj: None })
         );
-        let use_raster_cache = inner.navigation_cache_active
-            || select_overview
-            || matches!(&tool, ToolState::DrawRect(_) | ToolState::PlaceInstance(_));
+        let use_raster_cache = inner.raster_cache_enabled
+            && (inner.navigation_cache_active
+                || select_overview
+                || matches!(&tool, ToolState::DrawRect(_) | ToolState::PlaceInstance(_)));
         let raster_presentation = inner
             .raster_reprojection
             .clone()
@@ -5327,14 +5468,6 @@ impl Element for CanvasElement {
                     canvas.update(cx, |inner, _| inner.raster_images_to_drop.push(image));
                 });
             }
-            return;
-        }
-        if inner.navigation_cache_active && inner.raster_tiles.is_none() {
-            // The first flattened raster is built off the UI thread. Avoid a
-            // synchronous hierarchy traversal (and its temporary omissions)
-            // while it is in flight.
-            let bg_style = inner.bg_style.clone();
-            bg_style.paint(bounds, window, cx, |_window, _cx| {});
             return;
         }
         let layers = state.layers.read(cx);
@@ -5927,7 +6060,25 @@ impl Element for CanvasElement {
             .collect_vec();
         let scale = inner.scale;
         let offset = inner.offset;
-        let content_revision = inner.raster_content_revision;
+        let visible_geometry_count = rects
+            .iter()
+            .filter(|(rect, _)| get_rect_bounds(rect, bounds, scale, offset).intersects(&bounds))
+            .count()
+            + polygons
+                .iter()
+                .filter(|(polygon, _)| {
+                    polygon_screen_bounds(polygon, bounds, scale, offset)
+                        .is_some_and(|polygon_bounds| polygon_bounds.intersects(&bounds))
+                })
+                .count()
+            + scope_rects
+                .iter()
+                .filter(|bbox| {
+                    get_rect_bounds(&bbox.rect, bounds, scale, offset).intersects(&bounds)
+                })
+                .count();
+        let raster_cache_requested =
+            visible_geometry_uses_raster_cache(select_overview, visible_geometry_count);
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
         let mut vertex_handle_points = Vec::new();
@@ -6058,6 +6209,11 @@ impl Element for CanvasElement {
             .and_then(|layer| layers.layers.get(layer))
             .cloned();
         let theme = inner.state.read(cx).theme();
+        let stipple_phase = raster_stipple_phase(Point::new(
+            offset.x * RASTER_CACHE_RESOLUTION,
+            offset.y * RASTER_CACHE_RESOLUTION,
+        ));
+        let mut transient_geometry_images = Vec::new();
         inner
             .bg_style
             .clone()
@@ -6088,14 +6244,49 @@ impl Element for CanvasElement {
                         DEFAULT_BORDER_WIDTH,
                     ));
                     for (r, l) in &rects {
-                        window.paint_quad(get_paint_quad(
-                            get_rect_bounds(r, bounds, scale, offset),
-                            l.fill,
-                            l.color,
-                            l.border_color,
-                            r.border_widths,
-                            r.border_styles,
-                        ));
+                        let rect_bounds = get_rect_bounds(r, bounds, scale, offset);
+                        if !rect_bounds.intersects(&bounds) {
+                            continue;
+                        }
+                        if matches!(l.fill, ShapeFill::Pattern(_)) {
+                            if let Some((image_bounds, image)) =
+                                rasterized_patterned_rect_preview(
+                                    rect_bounds,
+                                    bounds,
+                                    l.fill,
+                                    l.color,
+                                    stipple_phase,
+                                )
+                            {
+                                window
+                                    .paint_image(
+                                        image_bounds,
+                                        Corners::all(px(0.)),
+                                        image.clone(),
+                                        0,
+                                        false,
+                                    )
+                                    .unwrap();
+                                transient_geometry_images.push(image);
+                            }
+                            window.paint_quad(get_paint_quad(
+                                rect_bounds,
+                                ShapeFill::Hollow,
+                                l.color,
+                                l.border_color,
+                                r.border_widths,
+                                r.border_styles,
+                            ));
+                        } else {
+                            window.paint_quad(get_paint_quad(
+                                rect_bounds,
+                                l.fill,
+                                l.color,
+                                l.border_color,
+                                r.border_widths,
+                                r.border_styles,
+                            ));
+                        }
                     }
                     for (polygon, layer) in &polygons {
                         let points = polygon
@@ -6103,12 +6294,38 @@ impl Element for CanvasElement {
                             .iter()
                             .map(|point| self.inner.read(cx).layout_to_px(*point))
                             .collect::<Vec<_>>();
-                        paint_polygon_fill(
-                            window,
-                            &points,
-                            layer,
-                            polygon.centerline.is_some(),
-                        );
+                        if polygon_screen_bounds(polygon, bounds, scale, offset)
+                            .is_none_or(|polygon_bounds| !polygon_bounds.intersects(&bounds))
+                        {
+                            continue;
+                        }
+                        if matches!(layer.fill, ShapeFill::Pattern(_)) {
+                            if let Some((image_bounds, image)) = rasterized_patterned_polygon(
+                                &points,
+                                bounds,
+                                layer.fill,
+                                layer.color,
+                                stipple_phase,
+                            ) {
+                                window
+                                    .paint_image(
+                                        image_bounds,
+                                        Corners::all(px(0.)),
+                                        image.clone(),
+                                        0,
+                                        false,
+                                    )
+                                    .unwrap();
+                                transient_geometry_images.push(image);
+                            }
+                        } else {
+                            paint_polygon_fill(
+                                window,
+                                &points,
+                                layer,
+                                polygon.centerline.is_some(),
+                            );
+                        }
                         paint_polygon_border(
                             window,
                             &points,
@@ -6137,7 +6354,28 @@ impl Element for CanvasElement {
                             .chain(std::iter::once(preview_position))
                             .map(|point| self.inner.read(cx).layout_to_px(point))
                             .collect::<Vec<_>>();
-                        paint_polygon_fill(window, &points, layer, false);
+                        if matches!(layer.fill, ShapeFill::Pattern(_)) {
+                            if let Some((image_bounds, image)) = rasterized_patterned_polygon(
+                                &points,
+                                bounds,
+                                layer.fill,
+                                layer.color,
+                                stipple_phase,
+                            ) {
+                                window
+                                    .paint_image(
+                                        image_bounds,
+                                        Corners::all(px(0.)),
+                                        image.clone(),
+                                        0,
+                                        false,
+                                    )
+                                    .unwrap();
+                                transient_geometry_images.push(image);
+                            }
+                        } else {
+                            paint_polygon_fill(window, &points, layer, false);
+                        }
                         paint_polygon_border(
                             window,
                             &points,
@@ -6197,7 +6435,28 @@ impl Element for CanvasElement {
                                         .layout_to_px(Point::new(x as f32, y as f32))
                                 })
                                 .collect::<Vec<_>>();
-                            paint_polygon_fill(window, &outline, layer, true);
+                            if matches!(layer.fill, ShapeFill::Pattern(_)) {
+                                if let Some((image_bounds, image)) = rasterized_patterned_polygon(
+                                    &outline,
+                                    bounds,
+                                    layer.fill,
+                                    layer.color,
+                                    stipple_phase,
+                                ) {
+                                    window
+                                        .paint_image(
+                                            image_bounds,
+                                            Corners::all(px(0.)),
+                                            image.clone(),
+                                            0,
+                                            false,
+                                        )
+                                        .unwrap();
+                                    transient_geometry_images.push(image);
+                                }
+                            } else {
+                                paint_polygon_fill(window, &outline, layer, true);
+                            }
                             paint_polygon_border(
                                 window,
                                 &outline,
@@ -7028,50 +7287,38 @@ impl Element for CanvasElement {
                     }
                 })
             });
-        let raster_cache = (select_overview
-            && rects.len() + polygons.len() + scope_rects.len() >= RASTER_CACHE_GEOMETRY_THRESHOLD)
-            .then(|| {
-                build_layout_raster(
-                    &rects,
-                    &polygons,
-                    &scope_rects,
-                    &texts,
-                    ViewportTransform {
-                        size: bounds.size,
-                        screen_size: bounds.size,
-                        scale,
-                        offset,
-                    },
-                    theme,
-                    content_revision,
-                )
-            })
-            .flatten();
-        let refresh_cached_raster = raster_cache.is_some() && select_overview;
-        let raster_tiles = raster_cache.map(single_raster_tile_set);
+        if !transient_geometry_images.is_empty() {
+            let canvas = self.inner.clone();
+            cx.defer(move |cx| {
+                canvas.update(cx, |inner, _| {
+                    inner
+                        .raster_images_to_drop
+                        .extend(transient_geometry_images)
+                });
+            });
+        }
         self.inner.update(cx, |inner, cx| {
             if select_overview {
+                let was_raster_cache_enabled = inner.raster_cache_enabled;
+                inner.raster_cache_enabled = raster_cache_requested;
+                inner.navigation_cache_active = raster_cache_requested;
                 inner.resolve_raster_display_freeze();
-                inner.raster_display = raster_tiles.as_ref().map(|tiles| {
-                    let layout_bounds = inner
-                        .raster_layout_bbox
-                        .as_ref()
-                        .map(|bbox| layout_bbox_screen_bounds(bbox, bounds, scale, offset));
-                    navigation_raster_transform(tiles, bounds, scale, offset, layout_bounds)
-                        .unwrap_or_else(|| navigation_raster_capture_transform(tiles))
-                });
-                if let Some(previous) = std::mem::replace(&mut inner.raster_tiles, raster_tiles) {
-                    inner
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
+                if !raster_cache_requested && was_raster_cache_enabled {
+                    inner.advance_raster_generation();
+                    inner.raster_display = None;
+                    if let Some(previous) = inner.raster_tiles.take() {
+                        inner
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    if let Some(previous) = inner.raster_staging_tiles.take() {
+                        inner
+                            .raster_images_to_drop
+                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    }
+                    inner.clear_raster_reprojection();
+                    inner.raster_tile_target = None;
                 }
-                if let Some(previous) = inner.raster_staging_tiles.take() {
-                    inner
-                        .raster_images_to_drop
-                        .extend(previous.tiles.into_values().map(|cache| cache.image));
-                }
-                inner.clear_raster_reprojection();
-                inner.raster_tile_target = None;
             }
             inner.rects = rects;
             inner.polygons = polygons;
@@ -7079,11 +7326,10 @@ impl Element for CanvasElement {
             inner.dim_hitboxes = dim_hitboxes;
             inner.sse_handles = sse_handles;
             inner.sse_bodies = sse_bodies;
-            if refresh_cached_raster {
-                // The first exact traversal intentionally avoids expanding
-                // millions of shapes on the UI thread. Replace that initial
-                // cache with the flattened background raster before the user
-                // begins navigating.
+            if select_overview && raster_cache_requested && !inner.raster_worker_active {
+                // The geometry frame has already been submitted. Build its
+                // retained replacement off-thread, center first, without
+                // delaying presentation of that first frame.
                 inner.request_navigation_raster(cx);
             }
         });
@@ -7215,11 +7461,15 @@ impl LayoutCanvas {
                 canvas.raster_display = None;
                 canvas.raster_display_frozen = false;
                 canvas.raster_tile_target = None;
-                canvas.navigation_cache_active = canvas.raster_output.is_some();
-                if canvas.raster_output.is_some()
+                canvas.navigation_cache_active =
+                    canvas.raster_cache_enabled && canvas.raster_output.is_some();
+                let can_render = canvas.raster_output.is_some()
                     && canvas.screen_bounds.size.width > px(0.)
-                    && canvas.screen_bounds.size.height > px(0.)
-                {
+                    && canvas.screen_bounds.size.height > px(0.);
+                if can_render {
+                    canvas.request_navigation_overview(cx);
+                }
+                if canvas.raster_cache_enabled && can_render {
                     canvas.request_navigation_raster(cx);
                 } else {
                     canvas.advance_raster_generation();
@@ -7241,6 +7491,7 @@ impl LayoutCanvas {
             raster_display: None,
             raster_display_frozen: false,
             raster_tile_target: None,
+            raster_cache_enabled: false,
             navigation_cache_active: false,
             raster_refinement: None,
             raster_worker_active: false,
@@ -7358,7 +7609,7 @@ impl LayoutCanvas {
 
     fn begin_navigation(&mut self) {
         self.advance_raster_generation();
-        self.navigation_cache_active = true;
+        self.navigation_cache_active = self.raster_cache_enabled;
         self.hover_hit = None;
     }
 
@@ -7894,6 +8145,11 @@ impl LayoutCanvas {
     }
 
     fn request_navigation_raster(&mut self, cx: &mut Context<Self>) {
+        if !self.raster_cache_enabled {
+            self.navigation_cache_active = false;
+            self.advance_raster_generation();
+            return;
+        }
         self.navigation_cache_active = true;
         if self.is_dragging
             && (self.raster_cache_has_pan_margin()
@@ -9214,6 +9470,10 @@ impl LayoutCanvas {
         {
             return;
         }
+        // Invalidate an outer-ring render before doing any UI-thread camera or
+        // reprojection work. The serialized worker will observe this signal,
+        // abandon that prefetch, and choose the new zoom's center tile next.
+        self.advance_raster_generation();
         let previous_raster_display = self.raster_display;
 
         // Keep the layout point under `position` fixed on screen.
@@ -9759,6 +10019,41 @@ mod tests {
     }
 
     #[test]
+    fn empty_navigation_tile_skips_screen_sized_style_planes() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        std::fs::write(&source_path, "cell top() {}\n").unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        )
+        .unwrap_valid();
+        let viewport = ViewportTransform {
+            size: Size::new(px(1_800.), px(1_100.)),
+            screen_size: Size::new(px(1_800.), px(1_100.)),
+            scale: 1.,
+            offset: Point::default(),
+        };
+        let input = raster_test_navigation_input(
+            raster_test_compile_output_state(output),
+            Arc::new(IndexMap::new()),
+            viewport,
+            true,
+        );
+
+        let cache = build_navigation_raster(input).unwrap();
+
+        assert!(cache.style_planes.is_none());
+        assert!(cache.texts.is_empty());
+        assert!(cache.scope_labels.is_empty());
+        assert_eq!(cache.viewport, viewport.size);
+    }
+
+    #[test]
     fn indexed_hierarchy_raster_matches_linear_reference_pixel_for_pixel() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("lib.ar");
@@ -9885,18 +10180,35 @@ cell top() {
                 let pixel = 40 * planes.width as usize + 15;
                 assert_ne!(planes.stipple_on[pixel * 4 + 3], 0);
             }
-            assert_raster_style_planes_equal(
-                &format!("viewport {viewport_index}: indexed vs linear"),
-                indexed.style_planes.as_deref().unwrap(),
-                linear.style_planes.as_deref().unwrap(),
-                0,
-            );
-            assert_raster_style_planes_equal(
-                &format!("viewport {viewport_index}: indexed vs flattened"),
-                indexed.style_planes.as_deref().unwrap(),
-                reference.style_planes.as_deref().unwrap(),
-                1,
-            );
+            if let Some(indexed_planes) = indexed.style_planes.as_deref() {
+                assert_raster_style_planes_equal(
+                    &format!("viewport {viewport_index}: indexed vs linear"),
+                    indexed_planes,
+                    linear.style_planes.as_deref().unwrap(),
+                    0,
+                );
+                assert_raster_style_planes_equal(
+                    &format!("viewport {viewport_index}: indexed vs flattened"),
+                    indexed_planes,
+                    reference.style_planes.as_deref().unwrap(),
+                    1,
+                );
+            } else {
+                assert!(linear.style_planes.is_none());
+                let reference_planes = reference.style_planes.as_deref().unwrap();
+                assert!(
+                    reference_planes
+                        .stipple_on
+                        .iter()
+                        .all(|channel| *channel == 0)
+                );
+                assert!(
+                    reference_planes
+                        .stipple_off
+                        .iter()
+                        .all(|channel| *channel == 0)
+                );
+            }
         }
     }
 
@@ -9928,6 +10240,36 @@ cell top() {
             assert_eq!(expanded.get_pixel(2, y).0, [0, 0, 255, 255]);
             assert_eq!(expanded.get_pixel(3, y).0, [0, 0, 255, 255]);
         }
+    }
+
+    #[test]
+    fn raster_expansion_observes_cancellation_between_rows() {
+        let image = image::RgbaImage::new(8, 8);
+        let mut checks = 0;
+        let expanded = expand_raster_for_display_cancellable(image, || {
+            checks += 1;
+            checks == 3
+        });
+
+        assert!(expanded.is_none());
+        assert_eq!(checks, 3);
+    }
+
+    #[test]
+    fn sparse_visible_geometry_stays_on_the_direct_paint_path() {
+        assert!(!visible_geometry_uses_raster_cache(true, 0));
+        assert!(!visible_geometry_uses_raster_cache(
+            true,
+            RASTER_CACHE_GEOMETRY_THRESHOLD - 1
+        ));
+        assert!(visible_geometry_uses_raster_cache(
+            true,
+            RASTER_CACHE_GEOMETRY_THRESHOLD
+        ));
+        assert!(!visible_geometry_uses_raster_cache(
+            false,
+            RASTER_CACHE_GEOMETRY_THRESHOLD
+        ));
     }
 
     #[test]
@@ -9963,42 +10305,6 @@ cell top() {
                 .collect::<Vec<_>>(),
         )
         .unwrap()
-    }
-
-    #[test]
-    #[ignore]
-    fn diagnose_empty_raster_stages() {
-        let width = 900;
-        let height = 550;
-        let buffer_len = width as usize * height as usize * 4;
-
-        let start = std::time::Instant::now();
-        let stipple_on = vec![0; buffer_len];
-        let stipple_off = vec![0; buffer_len];
-        let on_layer = vec![0; buffer_len];
-        let off_layer = vec![0; buffer_len];
-        std::hint::black_box((&on_layer, &off_layer));
-        eprintln!("allocate four planes: {:?}", start.elapsed());
-
-        let start = std::time::Instant::now();
-        let image = raster_from_style_planes(
-            width,
-            height,
-            &stipple_on,
-            &stipple_off,
-            RasterStipplePhase::default(),
-        )
-        .unwrap();
-        eprintln!("compose source image: {:?}", start.elapsed());
-
-        let start = std::time::Instant::now();
-        let image = expand_raster_for_display(image);
-        eprintln!("expand image: {:?}", start.elapsed());
-
-        let start = std::time::Instant::now();
-        let render = RenderImage::new(vec![image::Frame::new(image)]);
-        std::hint::black_box(render);
-        eprintln!("wrap render image: {:?}", start.elapsed());
     }
 
     #[test]
@@ -10584,10 +10890,21 @@ cell top() {
 
     #[test]
     fn paint_does_not_restart_an_in_flight_first_tile() {
-        assert!(paint_should_start_navigation_worker(true, false, false));
-        assert!(!paint_should_start_navigation_worker(true, false, true));
-        assert!(!paint_should_start_navigation_worker(true, true, false));
-        assert!(!paint_should_start_navigation_worker(false, false, false));
+        assert!(paint_should_start_navigation_worker(
+            true, true, false, false
+        ));
+        assert!(!paint_should_start_navigation_worker(
+            true, false, false, false
+        ));
+        assert!(!paint_should_start_navigation_worker(
+            true, true, false, true
+        ));
+        assert!(!paint_should_start_navigation_worker(
+            true, true, true, false
+        ));
+        assert!(!paint_should_start_navigation_worker(
+            false, true, false, false
+        ));
     }
 
     #[test]
