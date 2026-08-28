@@ -25,7 +25,7 @@ use gpui::AsyncApp;
 use tarpc::{
     context,
     server::{Channel, incoming::Incoming},
-    tokio_serde::formats::Json,
+    tokio_serde::formats::Bincode,
 };
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
@@ -70,7 +70,7 @@ fn connect_client(app: &AsyncApp, lang_server_addr: SocketAddr) -> Result<LangSe
         .block(
             async move {
                 let mut transport =
-                    tarpc::serde_transport::tcp::connect(lang_server_addr, Json::default);
+                    tarpc::serde_transport::tcp::connect(lang_server_addr, Bincode::default);
                 transport.config_mut().max_frame_length(usize::MAX);
                 let transport = transport.await?;
                 Ok::<_, std::io::Error>(
@@ -190,14 +190,17 @@ impl SyncLangServerClient {
                         .and_then(|_| tokio::net::TcpListener::from_std(listener))
                     {
                         Ok(listener) => {
-                            tarpc::serde_transport::tcp::listen_on(listener, Json::default).await
+                            tarpc::serde_transport::tcp::listen_on(listener, Bincode::default).await
                         }
                         Err(error) => Err(error),
                     }
                 } else {
                     let port = configured_port.unwrap_or(0);
-                    tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, port), Json::default)
-                        .await
+                    tarpc::serde_transport::tcp::listen(
+                        (Ipv4Addr::LOCALHOST, port),
+                        Bincode::default,
+                    )
+                    .await
                 };
                 match result {
                     Ok(listener) => listener,

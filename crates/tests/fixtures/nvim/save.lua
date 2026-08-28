@@ -26,6 +26,17 @@ local old_get_buffers = vim.lsp.get_buffers_by_client_id
 local old_is_attached = vim.lsp.buf_is_attached
 local old_get_client = vim.lsp.get_client_by_id
 local notification
+local fake_client = {
+  name = 'argon',
+  initialized = false,
+  stopped = false,
+  is_stopped = function(self)
+    return self.stopped
+  end,
+  request = function(_, method, params)
+    notification = { method = method, params = params }
+  end,
+}
 vim.lsp.get_buffers_by_client_id = function(id)
   assert(id == client_id)
   return buffers
@@ -35,15 +46,13 @@ vim.lsp.buf_is_attached = function(bufnr, id)
 end
 vim.lsp.get_client_by_id = function(id)
   assert(id == client_id)
-  return {
-    name = 'argon',
-    request = function(_, method, params)
-      notification = { method = method, params = params }
-    end,
-  }
+  return fake_client
 end
 
 assert(save.workspace_modified(client_id))
+save.notify_workspace_modified(client_id)
+assert(notification == nil)
+fake_client.initialized = true
 save.notify_workspace_modified(client_id)
 assert(notification.method == 'custom/workspaceModified')
 assert(notification.params.modified)
@@ -61,6 +70,11 @@ assert(vim.bo[non_argon].modified)
 assert(not save.workspace_modified(client_id))
 save.notify_workspace_modified(client_id)
 assert(not notification.params.modified)
+fake_client.stopped = true
+notification = nil
+vim.api.nvim_buf_set_lines(first, 0, -1, false, { 'modified after stop' })
+save.notify_workspace_modified(client_id)
+assert(notification == nil)
 
 vim.lsp.get_buffers_by_client_id = old_get_buffers
 vim.lsp.buf_is_attached = old_is_attached

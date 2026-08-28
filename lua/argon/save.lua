@@ -34,6 +34,16 @@ function M.notify_workspace_modified(client_id)
     if not lsp_client or lsp_client.name ~= 'argon' then
         return
     end
+    -- vim.lsp.start() returns a client id before the initialization handshake
+    -- necessarily completes, and LspDetach can run while the client is
+    -- stopping. Requests in either state are rejected locally by Neovim with
+    -- ServerNotInitialized, so leave the state uncached for a later retry.
+    if not lsp_client.initialized
+        or (type(lsp_client.is_stopped) == 'function' and lsp_client:is_stopped())
+    then
+        reported_workspace_modified[client_id] = nil
+        return
+    end
     local modified = M.workspace_modified(client_id)
     if reported_workspace_modified[client_id] == modified then
         return

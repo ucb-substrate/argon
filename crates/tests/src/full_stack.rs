@@ -11,7 +11,7 @@ use argonc::{
     compile::{CompileOutput, CompiledData},
 };
 use futures::prelude::*;
-use tarpc::{context, server::Channel, tokio_serde::formats::Json};
+use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tempfile::TempDir;
 use tokio::{sync::mpsc, time};
 
@@ -169,7 +169,7 @@ impl Session {
             .port();
         let (events_tx, events) = mpsc::unbounded_channel();
         let mut listener =
-            tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
+            tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Bincode::default)
                 .await
                 .expect("bind headless GUI RPC listener");
         listener.config_mut().max_frame_length(usize::MAX);
@@ -259,7 +259,7 @@ impl Session {
         time::timeout(TEST_TIMEOUT, async {
             loop {
                 let mut transport =
-                    tarpc::serde_transport::tcp::connect(self.analyzer_addr, Json::default);
+                    tarpc::serde_transport::tcp::connect(self.analyzer_addr, Bincode::default);
                 transport.config_mut().max_frame_length(usize::MAX);
                 if let Ok(transport) = transport.await {
                     return LangServerClient::new(tarpc::client::Config::default(), transport)

@@ -9,7 +9,7 @@ use argonc::{
 };
 
 use serde::{Deserialize, Serialize};
-use tarpc::{context, tokio_serde::formats::Json};
+use tarpc::{context, tokio_serde::formats::Bincode};
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
     Uri, WorkspaceEdit,
@@ -405,7 +405,7 @@ impl State {
 
 impl LangServer for State {
     async fn register(self, _: tarpc::context::Context, addr: SocketAddr) -> () {
-        let mut transport = tarpc::serde_transport::tcp::connect(addr, Json::default);
+        let mut transport = tarpc::serde_transport::tcp::connect(addr, Bincode::default);
         transport.config_mut().max_frame_length(usize::MAX);
         let gui_client = match transport.await {
             Ok(transport) => GuiClient::new(tarpc::client::Config::default(), transport).spawn(),
