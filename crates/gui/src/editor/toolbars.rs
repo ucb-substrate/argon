@@ -30,6 +30,10 @@ const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.;
 const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.;
 const SIDEBAR_SCROLLBAR_MIN_THUMB: f32 = 24.;
 
+fn small_font_size(font_size: f32) -> f32 {
+    font_size * 6. / 7.
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SidebarEdge {
     Left,
@@ -391,6 +395,7 @@ struct ToolTip {
     label: SharedString,
     hotkey: Option<SharedString>,
     theme: &'static Theme,
+    font_size: Option<f32>,
 }
 
 impl ToolTip {
@@ -399,12 +404,14 @@ impl ToolTip {
         label: &'static str,
         hotkey: Option<SharedString>,
         theme: &'static Theme,
+        font_size: Option<f32>,
         cx: &mut App,
     ) -> AnyView {
         cx.new(|_cx| Self {
             label: label.into(),
             hotkey,
             theme,
+            font_size,
         })
         .into()
     }
@@ -437,9 +444,8 @@ impl Render for ToolTip {
         let theme = self.theme;
         // Tooltips are painted as their own root element, so the editor's text styles
         // do not cascade into them.
-        div()
+        let mut tooltip = div()
             .font_family("Zed Plex Sans")
-            .text_sm()
             .text_color(theme.text)
             .ml_2()
             .mt_2()
@@ -455,11 +461,20 @@ impl Render for ToolTip {
             .bg(theme.bg)
             .whitespace_nowrap()
             .child(self.label.clone())
-            .children(
-                self.hotkey
-                    .clone()
-                    .map(|hotkey| div().text_xs().text_color(theme.subtext).child(hotkey)),
-            )
+            .children(self.hotkey.clone().map(|hotkey| {
+                let hotkey = div().text_color(theme.subtext).child(hotkey);
+                if let Some(font_size) = self.font_size {
+                    hotkey.text_size(px(small_font_size(font_size)))
+                } else {
+                    hotkey.text_xs()
+                }
+            }));
+        tooltip = if let Some(font_size) = self.font_size {
+            tooltip.text_size(px(font_size))
+        } else {
+            tooltip.text_sm()
+        };
+        tooltip
     }
 }
 
@@ -469,7 +484,10 @@ impl Render for ToolBar {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let theme = self.state.read(cx).theme();
+        let editor_state = self.state.read(cx);
+        let theme = editor_state.theme();
+        let icon_size = editor_state.icon_size;
+        let font_size = editor_state.font_size;
         div()
             .border_color(theme.divider)
             .p_2()
@@ -624,7 +642,7 @@ impl Render for ToolBar {
                     },
                     ToolbarItem::Spacer,
                 ];
-                let wh = 20.;
+                let wh = icon_size.unwrap_or(20.);
                 tools
                     .iter()
                     .map(|item| match item {
@@ -656,7 +674,7 @@ impl Render for ToolBar {
                                 .tooltip({
                                     let label = *label;
                                     move |_window, cx| {
-                                        ToolTip::build(label, hotkey.clone(), theme, cx)
+                                        ToolTip::build(label, hotkey.clone(), theme, font_size, cx)
                                     }
                                 })
                                 .on_click({
@@ -787,9 +805,10 @@ impl Render for LayerSideBar {
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         let layers = self.layers.read(cx);
-        let theme = self.editor_state.read(cx).theme();
+        let editor_state = self.editor_state.read(cx);
+        let theme = editor_state.theme();
         let width = self.state.read(cx).width;
-        let icon_wh = 16.;
+        let icon_wh = editor_state.icon_size.unwrap_or(16.);
         let icon_div = || {
             div()
                 .w(px(icon_wh + 8.))
@@ -1072,7 +1091,7 @@ impl HierarchySideBar {
         count: usize,
         depth: usize,
     ) {
-        let icon_wh = 16.;
+        let icon_wh = self.editor_state.read(cx).icon_size.unwrap_or(16.);
         let icon_div = || {
             div()
                 .w(px(icon_wh + 8.))
@@ -1090,7 +1109,8 @@ impl HierarchySideBar {
         let scope_path = solved_cell.scope_paths[&scope].clone();
         let self_entity = cx.entity();
         let expanded = self.state.read(cx).expanded_scopes.contains(&scope_path);
-        let theme = self.editor_state.read(cx).theme();
+        let editor_state = self.editor_state.read(cx);
+        let theme = editor_state.theme();
         if scope_state
             .name
             .to_lowercase()
@@ -1264,7 +1284,9 @@ impl HierarchySideBar {
                 0,
             );
         }
-        let theme = self.editor_state.read(cx).theme();
+        let editor_state = self.editor_state.read(cx);
+        let theme = editor_state.theme();
+        let font_size = editor_state.font_size;
         let mut scroll_area = sidebar_scroll_area(
             "hierarchy_scroll_area",
             div().flex().flex_col().items_start().children(scopes),
@@ -1334,6 +1356,16 @@ impl HierarchySideBar {
                         }
                     });
             }
+            let menu_header = div()
+                .px_2()
+                .pb_1()
+                .text_color(theme.subtext)
+                .child(cell_name);
+            let menu_header = if let Some(font_size) = font_size {
+                menu_header.text_size(px(small_font_size(font_size)))
+            } else {
+                menu_header.text_xs()
+            };
             let menu = div()
                 .id("hierarchy_context_menu")
                 .absolute()
@@ -1353,14 +1385,7 @@ impl HierarchySideBar {
                     window.prevent_default();
                     cx.stop_propagation();
                 })
-                .child(
-                    div()
-                        .px_2()
-                        .pb_1()
-                        .text_xs()
-                        .text_color(theme.subtext)
-                        .child(cell_name),
-                )
+                .child(menu_header)
                 .child(action);
             scroll_area = scroll_area.child(deferred(menu).with_priority(1));
         }
@@ -1374,9 +1399,10 @@ impl Render for HierarchySideBar {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let theme = self.editor_state.read(cx).theme();
+        let editor_state = self.editor_state.read(cx);
+        let theme = editor_state.theme();
         let width = self.state.read(cx).width;
-        let icon_wh = 16.;
+        let icon_wh = editor_state.icon_size.unwrap_or(16.);
         let icon_div = || {
             div()
                 .w(px(icon_wh + 8.))

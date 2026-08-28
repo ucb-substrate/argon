@@ -487,6 +487,8 @@ impl Gui for GuiServer {
                     .update(cx, |state, cx| {
                         state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
                         state.dark_mode = config.gui.dark_mode;
+                        state.icon_size = config.gui.icon_size;
+                        state.font_size = config.gui.font_size;
                         cx.notify();
                     })
                     .unwrap();

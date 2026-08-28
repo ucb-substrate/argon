@@ -75,6 +75,8 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub icon_size: Option<f32>,
+    pub font_size: Option<f32>,
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
@@ -434,6 +436,8 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                icon_size: None,
+                font_size: None,
                 workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
@@ -690,7 +694,11 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
-        div()
+        let (font_size, icon_size) = {
+            let state = self.state.read(cx);
+            (state.font_size, state.icon_size)
+        };
+        let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
@@ -709,7 +717,6 @@ impl Render for Editor {
             .border_color(theme.divider)
             .bg(theme.bg)
             .rounded(px(10.))
-            .text_sm()
             .text_color(theme.text)
             .overflow_hidden()
             .whitespace_nowrap()
@@ -740,6 +747,18 @@ impl Render for Editor {
                                 .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
                         };
                         if let Some((error, is_connection_error)) = displayed_error {
+                            let error_detail = div().text_color(theme.subtext).child(
+                                if is_connection_error {
+                                    "This message will disappear when the connection recovers."
+                                } else {
+                                    "Fix the error and save in the editor to dismiss."
+                                },
+                            );
+                            let error_detail = if let Some(font_size) = font_size {
+                                error_detail.text_size(px(font_size * 6. / 7.))
+                            } else {
+                                error_detail.text_xs()
+                            };
                             d = d.child(
                                 div()
                                     .id("error_modal")
@@ -754,7 +773,7 @@ impl Render for Editor {
                                             div().flex().flex_col().child(div().flex_1()).child(
                                             svg()
                                                 .path("icons/circle-exclamation-solid-full.svg")
-                                                .w(px(20.))
+                                                .w(px(icon_size.unwrap_or(20.)))
                                                 .h_auto()
                                                 .mr_1()
                                                 .text_color(theme.error)).child(div().flex_1())
@@ -762,13 +781,7 @@ impl Render for Editor {
                                         .child(div().child("Error"))
                                     )
                                     .child(format!("Editing may be disabled due to error: {error}."))
-                                    .child(div().text_xs().text_color(theme.subtext).child(
-                                        if is_connection_error {
-                                            "This message will disappear when the connection recovers."
-                                        } else {
-                                            "Fix the error and save in the editor to dismiss."
-                                        }
-                                    ))
+                                    .child(error_detail)
                                     .whitespace_normal()
                                     .top_2()
                                     .left_2()
@@ -780,7 +793,13 @@ impl Render for Editor {
                     })
                     .child(self.layer_sidebar.clone()),
             )
-            .child(self.text_input.clone())
+            .child(self.text_input.clone());
+        root = if let Some(font_size) = font_size {
+            root.text_size(px(font_size))
+        } else {
+            root.text_sm()
+        };
+        root
     }
 }
 
