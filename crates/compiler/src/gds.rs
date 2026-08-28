@@ -7,6 +7,8 @@ use ::gds::{
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use indexmap::IndexMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tracing::trace;
 use uniquify::Names;
 
@@ -46,8 +48,20 @@ impl GdsExporter {
         }
     }
 
-    fn coord_to_gds(&self, coord: f64) -> i32 {
-        (coord * self.display_unit).round() as i32
+    /// Converts a source coordinate to an integer GDS database unit.
+    ///
+    /// Checked rather than a bare `as i32`, which *saturates*: an out-of-range
+    /// coordinate would otherwise be written as `2147483647` and a NaN as `0`,
+    /// with the export reporting success. `check_geometry` rejects both before
+    /// a run gets this far, so reaching the error here means the exporter was
+    /// handed output that never passed that gate -- report it rather than
+    /// inventing a number.
+    fn coord_to_gds(&self, coord: f64) -> Result<i32> {
+        let dbu = (coord * self.display_unit).round();
+        if !dbu.is_finite() || dbu < f64::from(i32::MIN) || dbu > f64::from(i32::MAX) {
+            bail!("coordinate {coord} cannot be represented in this technology's database units");
+        }
+        Ok(dbu as i32)
     }
 }
 
@@ -659,10 +673,25 @@ impl CompileOutput {
         {
             let mut exporter = GdsExporter::new("TOP", &output.tech);
             output.cell_to_gds(&mut exporter, output.top)?;
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            exporter.lib.save(out_path).map_err(|e| anyhow!("{e}"))?;
+            let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            // Write through a sibling temporary file and rename on success.
+            // `GdsLibrary::save` streams records, so a write that fails partway
+            // -- an over-long record, a full disk -- otherwise leaves a
+            // truncated `.gds` at the real path, next to a `.bin` that was
+            // written earlier in the run and looks perfectly valid.
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".argon-gds").suffix(".tmp");
+            // A temporary file is created 0600 so its contents are never
+            // briefly world-readable. That is the wrong mode for a build
+            // artifact, so give the finished file the permissions
+            // `File::create` would have.
+            #[cfg(unix)]
+            builder.permissions(std::fs::Permissions::from_mode(0o644));
+            let temp = builder.tempfile_in(parent)?;
+            exporter.lib.save(temp.path()).map_err(|e| anyhow!("{e}"))?;
+            temp.persist(out_path)
+                .map_err(|e| anyhow!("could not finalize `{}`: {e}", out_path.display()))?;
         }
 
         Ok(())
@@ -694,10 +723,10 @@ impl CompiledData {
                             layer,
                             xtype: datatype,
                         } = exporter.map[layer];
-                        let x0 = exporter.coord_to_gds(rect.x0.0);
-                        let x1 = exporter.coord_to_gds(rect.x1.0);
-                        let y0 = exporter.coord_to_gds(rect.y0.0);
-                        let y1 = exporter.coord_to_gds(rect.y1.0);
+                        let x0 = exporter.coord_to_gds(rect.x0.0)?;
+                        let x1 = exporter.coord_to_gds(rect.x1.0)?;
+                        let y0 = exporter.coord_to_gds(rect.y0.0)?;
+                        let y1 = exporter.coord_to_gds(rect.y1.0)?;
                         ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                             layer,
                             datatype,
@@ -721,9 +750,12 @@ impl CompiledData {
                         .points
                         .iter()
                         .map(|(x, y)| {
-                            GdsPoint::new(exporter.coord_to_gds(x.0), exporter.coord_to_gds(y.0))
+                            Ok(GdsPoint::new(
+                                exporter.coord_to_gds(x.0)?,
+                                exporter.coord_to_gds(y.0)?,
+                            ))
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                     points.push(points[0].clone());
                     ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                         layer,
@@ -737,9 +769,11 @@ impl CompiledData {
                         layer,
                         xtype: datatype,
                     } = exporter.map[&path.layer];
-                    let width = exporter.coord_to_gds(path.width.0.abs());
-                    let begin_extension = exporter.coord_to_gds(path.begin_extension.0);
-                    let end_extension = exporter.coord_to_gds(path.end_extension.0);
+                    // `check_geometry` has already rejected a negative width,
+                    // so the absolute value only normalizes `-0.`.
+                    let width = exporter.coord_to_gds(path.width.0.abs())?;
+                    let begin_extension = exporter.coord_to_gds(path.begin_extension.0)?;
+                    let end_extension = exporter.coord_to_gds(path.end_extension.0)?;
                     let (path_type, begin_extn, end_extn) =
                         if begin_extension == 0 && end_extension == 0 {
                             (None, None, None)
@@ -761,12 +795,12 @@ impl CompiledData {
                             .points
                             .iter()
                             .map(|(x, y)| {
-                                GdsPoint::new(
-                                    exporter.coord_to_gds(x.0),
-                                    exporter.coord_to_gds(y.0),
-                                )
+                                Ok(GdsPoint::new(
+                                    exporter.coord_to_gds(x.0)?,
+                                    exporter.coord_to_gds(y.0)?,
+                                ))
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                         ..Default::default()
                     }));
                 }
@@ -775,8 +809,8 @@ impl CompiledData {
                         layer,
                         xtype: texttype,
                     } = exporter.map[&text.layer];
-                    let x = exporter.coord_to_gds(text.x);
-                    let y = exporter.coord_to_gds(text.y);
+                    let x = exporter.coord_to_gds(text.x)?;
+                    let y = exporter.coord_to_gds(text.y)?;
                     ocell.elems.push(GdsElement::GdsTextElem(GdsTextElem {
                         string: ArcStr::from(&text.text),
                         layer,
@@ -791,7 +825,7 @@ impl CompiledData {
                     }
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
                         name: exporter.names.name(&i.cell).unwrap().clone(),
-                        xy: GdsPoint::new(exporter.coord_to_gds(i.x), exporter.coord_to_gds(i.y)),
+                        xy: GdsPoint::new(exporter.coord_to_gds(i.x)?, exporter.coord_to_gds(i.y)?),
                         strans: Some(GdsStrans {
                             reflected: i.reflect,
                             abs_mag: false,
@@ -992,8 +1026,19 @@ mod tests {
         )
         .unwrap();
         let exporter = GdsExporter::new("test", &tech);
-        assert_eq!(exporter.coord_to_gds(1.25), 1250);
+        assert_eq!(exporter.coord_to_gds(1.25).unwrap(), 1250);
         assert_eq!(exporter.lib.units.db_unit(), 1e-9);
+
+        // `f64 as i32` saturates, so an unchecked conversion turns any of
+        // these into `i32::MAX` (or `0`, for NaN) and writes it as a real
+        // coordinate. `check_geometry` rejects them before the exporter runs;
+        // this is the backstop for an output that skipped that gate.
+        for coord in [1e9, -1e9, f64::INFINITY, f64::NAN] {
+            assert!(
+                exporter.coord_to_gds(coord).is_err(),
+                "{coord} must not saturate"
+            );
+        }
     }
 
     #[test]

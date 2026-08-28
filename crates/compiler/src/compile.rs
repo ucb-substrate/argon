@@ -74,6 +74,14 @@ const MAX_SOLVE_ITERS: u64 = 1 << 24;
 /// [`crate::run_with_stack`] reserves.
 const MAX_EVAL_DEPTH: u32 = 4096;
 
+/// The longest text label a GDSII `STRING` record may carry, in bytes.
+///
+/// The format itself only bounds a record at `u16::MAX`, but the GDSII
+/// specification caps a text string at 512, and every tool in the flow assumes
+/// it. Checking against the spec limit rather than the format limit also means
+/// the writer can never fail partway through a file.
+pub(crate) const MAX_TEXT_LEN: usize = 512;
+
 pub const BUILTINS: [&str; 15] = [
     "list",
     "cons",
@@ -152,7 +160,7 @@ pub fn execute_cell(
         Ok(tech) => tech,
         Err(error) => return invalid_tech_output(ast, error.to_string()),
     };
-    check_output_layers(
+    check_output(
         ExecPass::new(ast, tech, &config.gds_imports).execute(input),
         tech_file,
     )
@@ -173,7 +181,7 @@ pub fn execute_cell_invocation(
         Ok(tech) => tech,
         Err(error) => return invalid_tech_output(ast, error.to_string()),
     };
-    check_output_layers(
+    check_output(
         ExecPass::new(ast, tech, &config.gds_imports).execute_invocation(invocation),
         tech_file,
     )
@@ -202,7 +210,7 @@ fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> Co
     })
 }
 
-fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
+fn check_output(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -215,6 +223,7 @@ fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput 
         o => return o,
     };
     check_layers(&data, tech_file, &mut errors);
+    check_geometry(&data, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -725,6 +734,156 @@ fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecErro
                 _ => {}
             }
         }
+    }
+}
+
+/// Validates geometry that only becomes checkable once every coordinate has a
+/// number: the range a GDS database unit can hold, the snap grid for values
+/// that never passed through the solver, and dimensions whose sign the
+/// exporter would otherwise quietly discard.
+///
+/// This runs before any output is written, so a rejected design produces a
+/// diagnostic with a span instead of a `.gds` full of `i32::MAX`.
+fn check_geometry(data: &CompiledData, errs: &mut Vec<ExecError>) {
+    let tech = &data.tech;
+    for (cell_id, cell) in data.cells.iter() {
+        let cell_id = *cell_id;
+        for (_, obj) in cell.objects.iter() {
+            match obj {
+                SolvedValue::Rect(r) => {
+                    let coords = [r.x0.0, r.y0.0, r.x1.0, r.y1.0];
+                    check_coordinates(coords, tech, cell_id, &r.span, errs);
+                }
+                SolvedValue::Polygon(p) => {
+                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]);
+                    check_coordinates(coords, tech, cell_id, &p.span, errs);
+                }
+                SolvedValue::Path(p) => {
+                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]).chain([
+                        p.width.0,
+                        p.begin_extension.0,
+                        p.end_extension.0,
+                    ]);
+                    check_coordinates(coords, tech, cell_id, &p.span, errs);
+                    check_path_dimensions(p, cell_id, errs);
+                }
+                SolvedValue::Instance(i) => {
+                    let span = Some(i.span.clone());
+                    check_coordinates([i.x, i.y], tech, cell_id, &span, errs);
+                }
+                SolvedValue::Text(t) => {
+                    check_coordinates([t.x, t.y], tech, cell_id, &t.span, errs);
+                    check_text(t, cell_id, errs);
+                }
+                SolvedValue::Dimension(_) => {}
+            }
+        }
+    }
+}
+
+/// Applies [`check_coordinate`] to every coordinate of one shape, all of which
+/// share the shape's span.
+fn check_coordinates(
+    values: impl IntoIterator<Item = f64>,
+    tech: &Technology,
+    cell: CellId,
+    span: &Option<Span>,
+    errs: &mut Vec<ExecError>,
+) {
+    for value in values {
+        check_coordinate(value, tech, cell, span, errs);
+    }
+}
+
+/// Rejects a coordinate that cannot be written as a GDS database unit.
+///
+/// `f64 as i32` saturates rather than wrapping or trapping, so an unchecked
+/// out-of-range coordinate lands on `i32::MAX` and the run still exits 0 --
+/// two edges of a rectangle collapse onto the same point and the shape
+/// silently vanishes.
+fn check_coordinate(
+    value: f64,
+    tech: &Technology,
+    cell: CellId,
+    span: &Option<Span>,
+    errs: &mut Vec<ExecError>,
+) {
+    if !value.is_finite() {
+        errs.push(ExecError {
+            span: span.clone(),
+            cell,
+            kind: ExecErrorKind::NonFiniteValue,
+        });
+        return;
+    }
+    let dbu = value * tech.display_unit as f64;
+    if dbu < f64::from(i32::MIN) || dbu > f64::from(i32::MAX) {
+        errs.push(ExecError {
+            span: span.clone(),
+            cell,
+            kind: ExecErrorKind::CoordinateOutOfRange {
+                value,
+                min: tech.dbu_to_display(i32::MIN),
+                max: tech.dbu_to_display(i32::MAX),
+            },
+        });
+    }
+}
+
+/// Rejects negative path widths and extensions.
+///
+/// The exporter used to absolutize the width and pass the extensions straight
+/// through, so `width=-10.` silently became a 10-unit-wide wire and a negative
+/// extension became a negative `BGNEXTN` that no downstream tool agrees on.
+/// Neither has a meaning worth guessing at.
+fn check_path_dimensions(path: &Path<(f64, LinearExpr)>, cell: CellId, errs: &mut Vec<ExecError>) {
+    if path.width.0 < 0. {
+        errs.push(ExecError {
+            span: path.span.clone(),
+            cell,
+            kind: ExecErrorKind::NegativePathWidth(path.width.0),
+        });
+    }
+    for (end, value) in [
+        ("begin", path.begin_extension.0),
+        ("end", path.end_extension.0),
+    ] {
+        if value < 0. {
+            errs.push(ExecError {
+                span: path.span.clone(),
+                cell,
+                kind: ExecErrorKind::NegativePathExtension {
+                    end: end.to_owned(),
+                    value,
+                },
+            });
+        }
+    }
+}
+
+/// Rejects text a GDS `STRING` record cannot represent.
+///
+/// The record is a byte string with no encoding negotiation, so raw UTF-8 is
+/// mojibake in every viewer, and its length is counted in bytes rather than
+/// characters. Checking here rather than at write time means an over-long
+/// label is a diagnostic instead of a half-written file.
+fn check_text(text: &Text<f64>, cell: CellId, errs: &mut Vec<ExecError>) {
+    if let Some(character) = text.text.chars().find(|c| !c.is_ascii()) {
+        errs.push(ExecError {
+            span: text.span.clone(),
+            cell,
+            kind: ExecErrorKind::NonAsciiText { character },
+        });
+    }
+    if text.text.len() > MAX_TEXT_LEN {
+        errs.push(ExecError {
+            span: text.span.clone(),
+            cell,
+            kind: ExecErrorKind::TextTooLong {
+                len: text.text.len(),
+                limit: MAX_TEXT_LEN,
+            },
+        });
     }
 }
 
@@ -2664,6 +2823,10 @@ pub struct Polygon<T> {
     pub layer: String,
     pub id: ObjectId,
     pub points: Vec<(T, T)>,
+    /// Geometry that exists only to constrain the layout, and is therefore
+    /// excluded from both `bbox` and the GDS exporter. See
+    /// [`SolvedValue::is_layout`].
+    pub construction: bool,
     pub span: Option<Span>,
 }
 
@@ -2679,6 +2842,10 @@ pub struct Path<T> {
     /// These retain the geometry of imported GDS path types 0, 2, and 4.
     pub begin_extension: T,
     pub end_extension: T,
+    /// Geometry that exists only to constrain the layout, and is therefore
+    /// excluded from both `bbox` and the GDS exporter. See
+    /// [`SolvedValue::is_layout`].
+    pub construction: bool,
     pub span: Option<Span>,
 }
 
@@ -2831,6 +2998,14 @@ struct CellState {
     constraint_span_map: IndexMap<ConstraintId, Span>,
     var_span_map: IndexMap<Var, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
+    /// Objects built by reading a shape out of a placed instance.
+    ///
+    /// A proxy is a view of geometry the instance's `SREF` already draws, so
+    /// it is construction geometry by default. `!` on such a value is an
+    /// explicit request to flatten that one shape into the parent as well;
+    /// [`ExecPass::mark_emitted_proxies_as_layout`] uses this set to tell the
+    /// two apart once the emission list has been resolved to object IDs.
+    proxy_objects: IndexSet<ObjectId>,
 }
 
 impl CellState {
@@ -2882,6 +3057,38 @@ struct ExecPass<'a> {
     /// need an explicit limit rather than relying on the trampoline.
     eval_depth: u32,
     errors: Vec<ExecError>,
+}
+
+/// Promotes a proxy the author explicitly emitted to real layout geometry.
+///
+/// Reading a shape out of a placed instance builds a *proxy* of the child's
+/// geometry in the parent's frame, so `inst.member.x0` has something to name.
+/// The instance's own `SREF` already draws that shape, so a proxy is
+/// construction geometry: drawing it would put a phantom boundary exactly on
+/// top of the instance. Applying `!` to one is an explicit request to flatten
+/// that single shape into the parent as well, so it becomes layout.
+///
+/// This has to run after the emission lists are resolved rather than where the
+/// proxy is built: `!` can be applied to a value that *selects* a proxy built
+/// earlier -- `elem(inst.arr)!` -- so only the resolved object ID identifies
+/// which one the author meant.
+fn mark_emitted_proxies_as_layout(
+    cell: &mut CompiledCell,
+    proxies: &IndexSet<ObjectId>,
+    emitted: &IndexSet<ObjectId>,
+) {
+    for id in proxies.intersection(emitted) {
+        let Some(object) = cell.objects.get_mut(id) else {
+            continue;
+        };
+        match object {
+            SolvedValue::Rect(rect) => rect.construction = false,
+            SolvedValue::Polygon(polygon) => polygon.construction = false,
+            SolvedValue::Path(path) => path.construction = false,
+            SolvedValue::Instance(instance) => instance.construction = false,
+            SolvedValue::Text(_) | SolvedValue::Dimension(_) => {}
+        }
+    }
 }
 
 fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
@@ -3380,6 +3587,7 @@ impl<'a> ExecPass<'a> {
                         constraint_span_map: IndexMap::new(),
                         var_span_map: IndexMap::new(),
                         var_dependents: IndexMap::new(),
+                        proxy_objects: IndexSet::new(),
                     }
                 )
                 .is_none()
@@ -3548,12 +3756,17 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
-        for var in self.cell_state(cell_id).solver.off_grid_vars().clone() {
+        let grid = self.cell_state(cell_id).solver.grid();
+        for (var, value) in self.cell_state(cell_id).solver.off_grid_vars().clone() {
             let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
             self.errors.push(ExecError {
                 span,
                 cell: cell_id,
-                kind: ExecErrorKind::OffGrid(var),
+                kind: ExecErrorKind::OffGrid {
+                    value,
+                    snapped: crate::tech::snap(value, grid),
+                    grid,
+                },
             });
         }
 
@@ -3697,6 +3910,7 @@ impl<'a> ExecPass<'a> {
                                 .into_iter()
                                 .map(|(x, y)| ((x, LinearExpr::from(x)), (y, LinearExpr::from(y))))
                                 .collect(),
+                            construction: false,
                             span: None,
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_polygon_{element_index}"))),
@@ -3719,6 +3933,7 @@ impl<'a> ExecPass<'a> {
                                 .collect(),
                             begin_extension: (begin_extension, LinearExpr::from(begin_extension)),
                             end_extension: (end_extension, LinearExpr::from(end_extension)),
+                            construction: false,
                             span: None,
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_path_{element_index}"))),
@@ -3873,6 +4088,7 @@ impl<'a> ExecPass<'a> {
                             )
                         })
                         .collect(),
+                    construction: polygon.construction,
                     span: polygon.span.clone(),
                 }),
                 Object::Path(path) => SolvedValue::Path(Path {
@@ -3915,16 +4131,46 @@ impl<'a> ExecPass<'a> {
                             .expect("path end extension not solved"),
                         path.end_extension.clone(),
                     ),
+                    construction: path.construction,
                     span: path.span.clone(),
                 }),
-                Object::Text(text) => SolvedValue::Text(Text {
-                    id: text.id,
-                    text: text.text.clone(),
-                    layer: text.layer.clone(),
-                    x: state.solver.eval_expr(&text.x).expect("text x not solved"),
-                    y: state.solver.eval_expr(&text.y).expect("text x not solved"),
-                    span: text.span.clone(),
-                }),
+                Object::Text(text) => {
+                    // A text position can be built entirely from constants, so
+                    // unlike every other coordinate it need not pass through a
+                    // solver variable -- and the solver's grid check only ever
+                    // looks at variables. Compare the exact value against the
+                    // snapped one here, or a label silently moves on export.
+                    let grid = state.solver.grid();
+                    let mut snap_coord = |expr: &LinearExpr, what: &str| {
+                        let exact = state
+                            .solver
+                            .eval_expr_exact(expr)
+                            .unwrap_or_else(|| panic!("text {what} not solved"));
+                        let snapped = crate::tech::snap(exact, grid);
+                        if snapped != exact {
+                            self.errors.push(ExecError {
+                                span: text.span.clone(),
+                                cell,
+                                kind: ExecErrorKind::OffGrid {
+                                    value: exact,
+                                    snapped,
+                                    grid,
+                                },
+                            });
+                        }
+                        snapped
+                    };
+                    let x = snap_coord(&text.x, "x");
+                    let y = snap_coord(&text.y, "y");
+                    SolvedValue::Text(Text {
+                        id: text.id,
+                        text: text.text.clone(),
+                        layer: text.layer.clone(),
+                        x,
+                        y,
+                        span: text.span.clone(),
+                    })
+                }
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
                     p: (
@@ -4016,11 +4262,13 @@ impl<'a> ExecPass<'a> {
             ccell.objects.insert(*id, emit_obj(obj));
         }
 
+        let mut emitted = IndexSet::new();
         for emit in state.emit.iter() {
             let obj_id = emit_value(emit.value)
                 .expect("failed to emit")
                 .into_elem()
                 .expect("emitted non-element object");
+            emitted.insert(obj_id);
             ccell
                 .scopes
                 .get_mut(&emit.scope)
@@ -4035,6 +4283,7 @@ impl<'a> ExecPass<'a> {
         }
 
         for emit in state.object_emit.iter() {
+            emitted.insert(emit.object);
             ccell
                 .scopes
                 .get_mut(&emit.scope)
@@ -4047,6 +4296,8 @@ impl<'a> ExecPass<'a> {
                     },
                 ));
         }
+
+        mark_emitted_proxies_as_layout(&mut ccell, &state.proxy_objects, &emitted);
 
         for (id, scope) in state.scopes.iter() {
             for (seq_num, (name, value)) in scope.bindings.iter() {
@@ -4827,6 +5078,7 @@ impl<'a> ExecPass<'a> {
                             id,
                             layer,
                             points,
+                            construction: false,
                             span: Some(span.clone()),
                         };
                         let state = self.cell_state_mut(cell_id);
@@ -4982,6 +5234,7 @@ impl<'a> ExecPass<'a> {
                             points,
                             begin_extension,
                             end_extension,
+                            construction: false,
                             span: Some(span.clone()),
                         };
                         state.objects.insert(id, path.clone().into());
@@ -5329,31 +5582,41 @@ impl<'a> ExecPass<'a> {
                             // Build the whole `[Int]` in one O(n) pass (O(log n) pushes),
                             // avoiding the per-element interpreter overhead (frame, scope,
                             // deferred value) of the old recursive `cons` definition.
+                            // A zero step never reaches `stop`, so there is
+                            // no sequence it could mean; it used to fall
+                            // through the `> 0` test and yield an empty one,
+                            // as a descending range did.
+                            if *step == 0 {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::ZeroRangeStep,
+                                });
+                                return Err(());
+                            }
                             let mut seq = Seq::new();
-                            if *step > 0 {
-                                let mut i = *start;
-                                while i < *stop {
-                                    if seq.len() >= MAX_SEQ_LEN {
-                                        let span = self.span(&vref.loc, c.expr.span);
-                                        self.errors.push(ExecError {
-                                            span: Some(span),
-                                            cell: cell_id,
-                                            kind: ExecErrorKind::LimitExceeded {
-                                                what: "sequence length".to_owned(),
-                                                limit: MAX_SEQ_LEN,
-                                            },
-                                        });
-                                        return Err(());
-                                    }
-                                    seq.push_back(Value::Int(i));
-                                    // A wrapping `i` would drive the counter
-                                    // negative and make `i < stop` loop
-                                    // forever; the correct result is simply
-                                    // the elements produced so far.
-                                    match i.checked_add(*step) {
-                                        Some(next) => i = next,
-                                        None => break,
-                                    }
+                            let mut i = *start;
+                            while if *step > 0 { i < *stop } else { i > *stop } {
+                                if seq.len() >= MAX_SEQ_LEN {
+                                    let span = self.span(&vref.loc, c.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::LimitExceeded {
+                                            what: "sequence length".to_owned(),
+                                            limit: MAX_SEQ_LEN,
+                                        },
+                                    });
+                                    return Err(());
+                                }
+                                seq.push_back(Value::Int(i));
+                                // A wrapping `i` would reverse the comparison
+                                // and loop forever; the correct result is
+                                // simply the elements produced so far.
+                                match i.checked_add(*step) {
+                                    Some(next) => i = next,
+                                    None => break,
                                 }
                             }
                             self.values.insert(vid, Defer::Ready(Value::Seq(seq)));
@@ -6250,11 +6513,10 @@ impl<'a> ExecPass<'a> {
                                                 return Err(());
                                             };
                                         let obj_id = &mut self.next_id;
-                                        let objects = &mut self
-                                            .cell_states
-                                            .get_mut(&cell_id)
-                                            .unwrap()
-                                            .objects;
+                                        let cell_state =
+                                            self.cell_states.get_mut(&cell_id).unwrap();
+                                        let proxies = &mut cell_state.proxy_objects;
+                                        let objects = &mut cell_state.objects;
                                         let transformed = Value::from_array(field_value.map(
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
@@ -6281,9 +6543,14 @@ impl<'a> ExecPass<'a> {
                                                             rect.y1,
                                                             inst.y.clone(),
                                                         ),
-                                                        construction: rect.construction,
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: rect.span.clone(),
                                                     };
+                                                    proxies.insert(xrect.id);
                                                     objects.insert(xrect.id, xrect.clone().into());
                                                     Value::Rect(xrect)
                                                 }
@@ -6311,8 +6578,14 @@ impl<'a> ExecPass<'a> {
                                                                 )
                                                             })
                                                             .collect(),
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: polygon.span.clone(),
                                                     };
+                                                    proxies.insert(polygon.id);
                                                     objects
                                                         .insert(polygon.id, polygon.clone().into());
                                                     Value::Polygon(polygon)
@@ -6348,8 +6621,14 @@ impl<'a> ExecPass<'a> {
                                                         end_extension: LinearExpr::from(
                                                             path.end_extension.0,
                                                         ),
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: path.span.clone(),
                                                     };
+                                                    proxies.insert(path.id);
                                                     objects.insert(path.id, path.clone().into());
                                                     Value::Path(path)
                                                 }
@@ -6370,9 +6649,14 @@ impl<'a> ExecPass<'a> {
                                                         y: LinearExpr::add(inst.y.clone(), cy),
                                                         angle,
                                                         reflect,
-                                                        construction: cinst.construction,
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: cinst.span.clone(),
                                                     };
+                                                    proxies.insert(oinst.id);
                                                     objects.insert(oinst.id, oinst.clone().into());
                                                     Value::Inst(oinst)
                                                 }
@@ -7033,8 +7317,10 @@ impl SolvedValue {
     pub fn is_layout(&self) -> bool {
         match self {
             SolvedValue::Rect(rect) => !rect.construction,
+            SolvedValue::Polygon(polygon) => !polygon.construction,
+            SolvedValue::Path(path) => !path.construction,
             SolvedValue::Instance(inst) => !inst.construction,
-            _ => true,
+            SolvedValue::Text(_) | SolvedValue::Dimension(_) => true,
         }
     }
 }

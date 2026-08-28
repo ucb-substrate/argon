@@ -53,32 +53,52 @@ impl AstMetadata for ParseMetadata {
     type TupleExpr = ();
 }
 
-pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, anyhow::Error> {
-    let root_lib = root_lib.as_ref();
-    let Some(last) = path.last() else {
-        return Ok(PathBuf::from(root_lib));
-    };
-    let mut base_path = root_lib
+/// The two files a `mod <name>;` declaration can name.
+pub struct ModCandidates {
+    /// `<name>.ar` beside the declaring module.
+    pub direct: PathBuf,
+    /// `<name>/mod.ar` below the declaring module.
+    pub nested: PathBuf,
+}
+
+/// Both files `mod <name>;` could resolve to, whether or not either exists.
+///
+/// [`get_mod`] picks between them by asking the filesystem, which means a
+/// module's resolution — and with it the presence of a missing-module or a
+/// duplicate-module error — depends on files that the resolved path alone does
+/// not name. Callers that must notice when resolution *changes*, such as an
+/// incremental session deciding whether a cached parse is still valid, have to
+/// watch the whole pair rather than the winner.
+pub fn mod_candidates(root_lib: impl AsRef<Path>, parents: &[String], name: &str) -> ModCandidates {
+    let mut nested = root_lib
+        .as_ref()
         .parent()
         .unwrap_or_else(|| Path::new(""))
         .to_path_buf();
-    for m in &path[0..path.len() - 1] {
-        base_path.push(m);
-    }
-    let mut direct_path = base_path.clone();
-    direct_path.push(format!("{last}.ar"));
-    base_path.push(last);
-    base_path.push("mod.ar");
-    if direct_path.is_file() && base_path.is_file() {
+    nested.extend(parents);
+    let mut direct = nested.clone();
+    direct.push(format!("{name}.ar"));
+    nested.push(name);
+    nested.push("mod.ar");
+    ModCandidates { direct, nested }
+}
+
+pub fn get_mod(root_lib: impl AsRef<Path>, path: &ModPath) -> Result<PathBuf, anyhow::Error> {
+    let root_lib = root_lib.as_ref();
+    let Some((last, parents)) = path.split_last() else {
+        return Ok(PathBuf::from(root_lib));
+    };
+    let ModCandidates { direct, nested } = mod_candidates(root_lib, parents, last);
+    if direct.is_file() && nested.is_file() {
         bail!("both module paths exist for module `{last}`");
     }
-    if direct_path == root_lib {
+    if direct == root_lib {
         bail!("circular module `{last}`");
     }
-    if direct_path.is_file() {
-        Ok(direct_path)
+    if direct.is_file() {
+        Ok(direct)
     } else {
-        Ok(base_path)
+        Ok(nested)
     }
 }
 
