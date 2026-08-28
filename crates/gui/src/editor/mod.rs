@@ -80,6 +80,8 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub icon_size: Option<f32>,
+    pub font_size: Option<f32>,
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
@@ -335,6 +337,28 @@ impl EditorState {
             },
         );
     }
+
+    /// Re-root the current compiled hierarchy at an already compiled child cell.
+    ///
+    /// This keeps the exact parameterization represented by the selected cell ID;
+    /// reconstructing a source invocation from the hierarchy label would lose it.
+    pub(crate) fn set_top_cell(&mut self, cell: CellId, cx: &mut App) -> bool {
+        let Some(mut output) = self
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|state| state.output.as_ref().clone())
+        else {
+            return false;
+        };
+        if output.top == cell || !output.cells.contains_key(&cell) {
+            return false;
+        }
+        output.top = cell;
+        self.update(cx, CompileOutput::Valid(output));
+        true
+    }
+
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
         let error_summary = compile_error_summary(&output).map(SharedString::from);
         let mut recoverable_error = None;
@@ -452,6 +476,8 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                icon_size: None,
+                font_size: None,
                 workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
@@ -557,6 +583,7 @@ impl Editor {
                 state
                     .expanded_scopes
                     .retain(|path| scope_paths.contains(path));
+                state.context_menu = None;
             });
             cx.notify();
         });
@@ -712,7 +739,11 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
-        div()
+        let (font_size, icon_size) = {
+            let state = self.state.read(cx);
+            (state.font_size, state.icon_size)
+        };
+        let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
@@ -732,7 +763,6 @@ impl Render for Editor {
             .border_color(theme.divider)
             .bg(theme.bg)
             .rounded(px(10.))
-            .text_sm()
             .text_color(theme.text)
             .overflow_hidden()
             .whitespace_nowrap()
@@ -782,6 +812,34 @@ impl Render for Editor {
                         if let Some((title, error, is_connection_error, editing_disabled)) =
                             displayed_error
                         {
+                            let error_detail =
+                                div()
+                                    .text_color(theme.subtext)
+                                    .child(if is_connection_error {
+                                        "Editing is disabled until the connection recovers."
+                                    } else if editing_disabled {
+                                        "Editing is disabled until this error is fixed."
+                                    } else {
+                                        "The last operation was not completed."
+                                    });
+                            let error_detail = if let Some(font_size) = font_size {
+                                error_detail.text_size(px(font_size * 6. / 7.))
+                            } else {
+                                error_detail.text_xs()
+                            };
+                            let details_link = div()
+                                .id("show_error_details")
+                                .mt_1()
+                                .text_color(theme.text)
+                                .child("View details in Neovim (Ctrl-Shift-M)")
+                                .on_click(cx.listener(|editor, _, _, cx| {
+                                    editor.open_invoking_command(Some("messages<CR>"), cx);
+                                }));
+                            let details_link = if let Some(font_size) = font_size {
+                                details_link.text_size(px(font_size * 6. / 7.))
+                            } else {
+                                details_link.text_xs()
+                            };
                             d = d.child(
                                 div()
                                     .id("error_modal")
@@ -796,7 +854,7 @@ impl Render for Editor {
                                             div().flex().flex_col().child(div().flex_1()).child(
                                             svg()
                                                 .path("icons/circle-exclamation-solid-full.svg")
-                                                .w(px(20.))
+                                                .w(px(icon_size.unwrap_or(20.)))
                                                 .h_auto()
                                                 .mr_1()
                                                 .text_color(theme.error)).child(div().flex_1())
@@ -804,32 +862,8 @@ impl Render for Editor {
                                         .child(div().child(title))
                                     )
                                     .child(error)
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.subtext)
-                                            .child(if is_connection_error {
-                                                "Editing is disabled until the connection recovers."
-                                            } else if editing_disabled {
-                                                "Editing is disabled until this error is fixed."
-                                            } else {
-                                                "The last operation was not completed."
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("show_error_details")
-                                            .mt_1()
-                                            .text_xs()
-                                            .text_color(theme.text)
-                                            .child("View details in Neovim (Ctrl-Shift-M)")
-                                            .on_click(cx.listener(|editor, _, _, cx| {
-                                                editor.open_invoking_command(
-                                                    Some("messages<CR>"),
-                                                    cx,
-                                                );
-                                            })),
-                                    )
+                                    .child(error_detail)
+                                    .child(details_link)
                                     .whitespace_normal()
                                     .top_2()
                                     .left_2()
@@ -841,7 +875,13 @@ impl Render for Editor {
                     })
                     .child(self.layer_sidebar.clone()),
             )
-            .child(self.text_input.clone())
+            .child(self.text_input.clone());
+        root = if let Some(font_size) = font_size {
+            root.text_size(px(font_size))
+        } else {
+            root.text_sm()
+        };
+        root
     }
 }
 

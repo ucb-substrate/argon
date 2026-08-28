@@ -293,6 +293,21 @@ hierarchy sidebar, press `i`, enter a cell invocation such as
 desired location and click to insert it. The placement tool remains active so
 you can click again to insert more copies; press `Esc` when finished.
 
+## Configuration
+
+Argon's configuration file is `~/.config/argon/config.toml`, or
+`$XDG_CONFIG_HOME/argon/config.toml` when `XDG_CONFIG_HOME` is set. The GUI's
+font and icon sizes can be overridden in logical pixels:
+
+```toml
+[gui]
+font_size = 14
+icon_size = 18
+```
+
+Both values are optional and must be between 1 and 256. Omit them to use the
+built-in sizes. Run `:Argon reload` after editing the file.
+
 ## Logs
 
 The analyzer and Argone write to one shared log at
