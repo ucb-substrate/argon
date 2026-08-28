@@ -232,6 +232,7 @@ dependencies = [
  "arc",
  "arcstr",
  "argonc",
+ "bincode",
  "bytes",
  "cfgrammar",
  "clap",

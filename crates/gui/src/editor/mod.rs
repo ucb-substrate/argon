@@ -80,6 +80,8 @@ pub struct Layers {
 pub struct EditorState {
     pub hierarchy_depth: usize,
     pub dark_mode: bool,
+    pub icon_size: Option<f32>,
+    pub font_size: Option<f32>,
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
@@ -336,6 +338,28 @@ impl EditorState {
             },
         );
     }
+
+    /// Re-root the current compiled hierarchy at an already compiled child cell.
+    ///
+    /// This keeps the exact parameterization represented by the selected cell ID;
+    /// reconstructing a source invocation from the hierarchy label would lose it.
+    pub(crate) fn set_top_cell(&mut self, cell: CellId, cx: &mut App) -> bool {
+        let Some(mut output) = self
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|state| state.output.as_ref().clone())
+        else {
+            return false;
+        };
+        if output.top == cell || !output.cells.contains_key(&cell) {
+            return false;
+        }
+        output.top = cell;
+        self.update(cx, CompileOutput::Valid(output));
+        true
+    }
+
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
         let compilation_error = compilation_error_message(&output);
         // Compilation status belongs to the accepted snapshot, rather than to
@@ -447,6 +471,8 @@ impl Editor {
             EditorState {
                 hierarchy_depth: usize::MAX,
                 dark_mode: true,
+                icon_size: None,
+                font_size: None,
                 workspace_path: None,
                 workspace_modified: false,
                 compilation_revision: None,
@@ -559,6 +585,7 @@ impl Editor {
                 state
                     .expanded_scopes
                     .retain(|path| scope_paths.contains(path));
+                state.context_menu = None;
             });
             cx.notify();
         });
@@ -741,6 +768,7 @@ impl Editor {
 impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
+        let font_size = self.state.read(cx).font_size;
         let displayed_status = {
             let state = self.state.read(cx);
             state
@@ -814,7 +842,6 @@ impl Render for Editor {
                 .child(
                     div()
                         .id("show_status_details")
-                        .text_sm()
                         .text_color(theme.text)
                         .cursor_pointer()
                         .child(action_label)
@@ -831,7 +858,7 @@ impl Render for Editor {
                         })),
                 )
         });
-        div()
+        let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
             .on_action(cx.listener(Self::on_undo))
@@ -852,7 +879,6 @@ impl Render for Editor {
             .border_color(theme.divider)
             .bg(theme.bg)
             .rounded(px(10.))
-            .text_sm()
             .text_color(theme.text)
             .overflow_hidden()
             .whitespace_nowrap()
@@ -876,7 +902,13 @@ impl Render for Editor {
                     )
                     .child(self.layer_sidebar.clone()),
             )
-            .children(status_bar)
+            .children(status_bar);
+        root = if let Some(font_size) = font_size {
+            root.text_size(px(font_size))
+        } else {
+            root.text_sm()
+        };
+        root
     }
 }
 
