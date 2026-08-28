@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use analyzer::rpc::LangServerAction;
-use argonc::compile::SolvedValue;
+use argonc::compile::{CellId, SolvedValue};
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
@@ -22,6 +22,293 @@ use crate::{
 };
 
 use super::EditorState;
+
+const DEFAULT_SIDEBAR_WIDTH: f32 = 200.;
+const MIN_SIDEBAR_WIDTH: f32 = 180.;
+const MAX_SIDEBAR_WIDTH: f32 = 600.;
+const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 6.;
+const SIDEBAR_SCROLLBAR_WIDTH: f32 = 10.;
+const SIDEBAR_SCROLLBAR_MIN_THUMB: f32 = 24.;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarEdge {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidebarResize(SidebarEdge);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidebarScrollDrag {
+    axis: SidebarScrollAxis,
+    grab_offset: Pixels,
+}
+
+#[derive(Default)]
+struct SidebarScrollState {
+    drag: Option<SidebarScrollDrag>,
+}
+
+fn clamp_sidebar_width(width: Pixels) -> Pixels {
+    width.clamp(px(MIN_SIDEBAR_WIDTH), px(MAX_SIDEBAR_WIDTH))
+}
+
+fn axis_size(size: Size<Pixels>, axis: SidebarScrollAxis) -> Pixels {
+    match axis {
+        SidebarScrollAxis::Horizontal => size.width,
+        SidebarScrollAxis::Vertical => size.height,
+    }
+}
+
+fn axis_position(position: Point<Pixels>, axis: SidebarScrollAxis) -> Pixels {
+    match axis {
+        SidebarScrollAxis::Horizontal => position.x,
+        SidebarScrollAxis::Vertical => position.y,
+    }
+}
+
+fn scrollbar_thumb_metrics(
+    viewport_length: Pixels,
+    max_offset: Pixels,
+    current_offset: Pixels,
+    track_length: Pixels,
+) -> Option<(Pixels, Pixels)> {
+    if viewport_length <= px(0.) || max_offset <= px(0.) || track_length <= px(0.) {
+        return None;
+    }
+
+    let content_length = viewport_length + max_offset;
+    let minimum_thumb_length = px(SIDEBAR_SCROLLBAR_MIN_THUMB).min(track_length);
+    let thumb_length = (track_length * (viewport_length / content_length))
+        .clamp(minimum_thumb_length, track_length);
+    let thumb_travel = track_length - thumb_length;
+    let progress = (-current_offset / max_offset).clamp(0., 1.);
+    Some((thumb_travel * progress, thumb_length))
+}
+
+fn scrollbar_thumb_bounds(
+    scroll_handle: &ScrollHandle,
+    track_bounds: Bounds<Pixels>,
+    axis: SidebarScrollAxis,
+) -> Option<Bounds<Pixels>> {
+    let viewport_length = axis_size(scroll_handle.bounds().size, axis);
+    let max_offset = axis_size(scroll_handle.max_offset(), axis);
+    let current_offset = axis_position(scroll_handle.offset(), axis);
+    let track_length = axis_size(track_bounds.size, axis);
+    let (thumb_offset, thumb_length) =
+        scrollbar_thumb_metrics(viewport_length, max_offset, current_offset, track_length)?;
+    let mut thumb_bounds = track_bounds;
+    match axis {
+        SidebarScrollAxis::Horizontal => {
+            thumb_bounds.origin.x += thumb_offset;
+            thumb_bounds.size.width = thumb_length;
+        }
+        SidebarScrollAxis::Vertical => {
+            thumb_bounds.origin.y += thumb_offset;
+            thumb_bounds.size.height = thumb_length;
+        }
+    }
+    Some(thumb_bounds)
+}
+
+fn scroll_to_scrollbar_position(
+    scroll_handle: &ScrollHandle,
+    track_bounds: Bounds<Pixels>,
+    axis: SidebarScrollAxis,
+    cursor_position: Point<Pixels>,
+    grab_offset: Pixels,
+) {
+    let Some(thumb_bounds) = scrollbar_thumb_bounds(scroll_handle, track_bounds, axis) else {
+        return;
+    };
+    let track_length = axis_size(track_bounds.size, axis);
+    let thumb_length = axis_size(thumb_bounds.size, axis);
+    let thumb_travel = track_length - thumb_length;
+    if thumb_travel <= px(0.) {
+        return;
+    }
+
+    let thumb_start = (axis_position(cursor_position, axis)
+        - axis_position(track_bounds.origin, axis)
+        - grab_offset)
+        .clamp(px(0.), thumb_travel);
+    let max_offset = axis_size(scroll_handle.max_offset(), axis);
+    let new_axis_offset = -max_offset * (thumb_start / thumb_travel);
+    let mut new_offset = scroll_handle.offset();
+    match axis {
+        SidebarScrollAxis::Horizontal => new_offset.x = new_axis_offset,
+        SidebarScrollAxis::Vertical => new_offset.y = new_axis_offset,
+    }
+    scroll_handle.set_offset(new_offset);
+}
+
+fn sidebar_scrollbar(
+    axis: SidebarScrollAxis,
+    scroll_handle: ScrollHandle,
+    scroll_state: Entity<SidebarScrollState>,
+    owner: EntityId,
+    theme: &'static Theme,
+) -> impl IntoElement {
+    let track_color = Hsla::from(theme.divider).opacity(0.35);
+    let thumb_color = Hsla::from(theme.subtext).opacity(0.7);
+    canvas(
+        |_, _, _| (),
+        move |track_bounds, _, window, _cx| {
+            window.paint_quad(fill(track_bounds, track_color));
+            let thumb_bounds = scrollbar_thumb_bounds(&scroll_handle, track_bounds, axis);
+            if let Some(thumb_bounds) = thumb_bounds {
+                window.paint_quad(fill(thumb_bounds, thumb_color));
+            } else {
+                window.paint_quad(fill(track_bounds, thumb_color.opacity(0.35)));
+            }
+
+            window.on_mouse_event({
+                let scroll_handle = scroll_handle.clone();
+                let scroll_state = scroll_state.clone();
+                move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.button != MouseButton::Left
+                        || !track_bounds.contains(&event.position)
+                    {
+                        return;
+                    }
+                    let Some(thumb_bounds) =
+                        scrollbar_thumb_bounds(&scroll_handle, track_bounds, axis)
+                    else {
+                        return;
+                    };
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    let in_thumb = thumb_bounds.contains(&event.position);
+                    let grab_offset = if in_thumb {
+                        axis_position(event.position, axis)
+                            - axis_position(thumb_bounds.origin, axis)
+                    } else {
+                        axis_size(thumb_bounds.size, axis) / 2.
+                    };
+                    if !in_thumb {
+                        scroll_to_scrollbar_position(
+                            &scroll_handle,
+                            track_bounds,
+                            axis,
+                            event.position,
+                            grab_offset,
+                        );
+                    }
+                    scroll_state.update(cx, |state, _cx| {
+                        state.drag = Some(SidebarScrollDrag { axis, grab_offset });
+                    });
+                    cx.notify(owner);
+                }
+            });
+            window.on_mouse_event({
+                let scroll_handle = scroll_handle.clone();
+                let scroll_state = scroll_state.clone();
+                move |event: &MouseMoveEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Capture || !event.dragging() {
+                        return;
+                    }
+                    let Some(drag) = scroll_state.read(cx).drag else {
+                        return;
+                    };
+                    if drag.axis != axis {
+                        return;
+                    }
+                    scroll_to_scrollbar_position(
+                        &scroll_handle,
+                        track_bounds,
+                        axis,
+                        event.position,
+                        drag.grab_offset,
+                    );
+                    cx.notify(owner);
+                }
+            });
+            window.on_mouse_event({
+                let scroll_state = scroll_state.clone();
+                move |event: &MouseUpEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                        return;
+                    }
+                    if scroll_state
+                        .read(cx)
+                        .drag
+                        .is_some_and(|drag| drag.axis == axis)
+                    {
+                        scroll_state.update(cx, |state, _cx| state.drag = None);
+                        cx.notify(owner);
+                    }
+                }
+            });
+        },
+    )
+    .size_full()
+}
+
+fn sidebar_scroll_area(
+    id: &'static str,
+    content: Div,
+    scroll_handle: &ScrollHandle,
+    scroll_state: &Entity<SidebarScrollState>,
+    owner: EntityId,
+    theme: &'static Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .child(
+            content
+                .id(SharedString::from(format!("{id}_content")))
+                .size_full()
+                .min_h_0()
+                .min_w_0()
+                .overflow_scroll()
+                .scrollbar_width(px(SIDEBAR_SCROLLBAR_WIDTH))
+                .track_scroll(scroll_handle),
+        )
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .w(px(SIDEBAR_SCROLLBAR_WIDTH))
+                .cursor_default()
+                .child(sidebar_scrollbar(
+                    SidebarScrollAxis::Vertical,
+                    scroll_handle.clone(),
+                    scroll_state.clone(),
+                    owner,
+                    theme,
+                )),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .w_full()
+                .h(px(SIDEBAR_SCROLLBAR_WIDTH))
+                .cursor_default()
+                .child(sidebar_scrollbar(
+                    SidebarScrollAxis::Horizontal,
+                    scroll_handle.clone(),
+                    scroll_state.clone(),
+                    owner,
+                    theme,
+                )),
+        )
+}
 
 pub struct TitleBar {
     state: Entity<EditorState>,
@@ -441,15 +728,26 @@ mod tool_bar_tests {
     }
 }
 
-#[derive(Default)]
 pub struct LayerSideBarState {
     used_filter: bool,
+    width: Pixels,
+}
+
+impl Default for LayerSideBarState {
+    fn default() -> Self {
+        Self {
+            used_filter: false,
+            width: px(DEFAULT_SIDEBAR_WIDTH),
+        }
+    }
 }
 
 pub struct LayerSideBar {
     layers: Entity<Layers>,
     name_filter: Entity<TextInput>,
     state: Entity<LayerSideBarState>,
+    scroll_handle: ScrollHandle,
+    scroll_state: Entity<SidebarScrollState>,
     editor_state: Entity<EditorState>,
     // Retained to keep the sidebar's observations active.
     _subscriptions: Vec<Subscription>,
@@ -465,6 +763,7 @@ impl LayerSideBar {
         let name_filter =
             cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
         let state = cx.new(|_cx| LayerSideBarState::default());
+        let scroll_state = cx.new(|_cx| SidebarScrollState::default());
         let subscriptions = vec![
             cx.observe(&layers, |_, _, cx| cx.notify()),
             cx.observe(&name_filter, |_, _, cx| cx.notify()),
@@ -473,6 +772,8 @@ impl LayerSideBar {
             layers,
             name_filter,
             state,
+            scroll_handle: ScrollHandle::new(),
+            scroll_state,
             editor_state: editor_state.clone(),
             _subscriptions: subscriptions,
         }
@@ -487,11 +788,13 @@ impl Render for LayerSideBar {
     ) -> impl gpui::IntoElement {
         let layers = self.layers.read(cx);
         let theme = self.editor_state.read(cx).theme();
+        let width = self.state.read(cx).width;
         let icon_wh = 16.;
         let icon_div = || {
             div()
                 .w(px(icon_wh + 8.))
                 .h(px(icon_wh + 8.))
+                .flex_shrink_0()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -500,8 +803,10 @@ impl Render for LayerSideBar {
         div()
             .flex()
             .flex_col()
+            .relative()
             .h_full()
-            .w(px(200.))
+            .w(width)
+            .flex_shrink_0()
             .p_1()
             .border_l_1()
             .border_t_1()
@@ -588,96 +893,137 @@ impl Render for LayerSideBar {
                     ),
             )
             .child(self.name_filter.clone())
+            .child(sidebar_scroll_area(
+                "layers_scroll_area",
+                div().flex().flex_col().items_start().children(
+                    layers
+                        .layers
+                        .values()
+                        .filter(|layer| {
+                            layer
+                                .name
+                                .to_lowercase()
+                                .contains(&self.name_filter.read(cx).content.to_lowercase())
+                                && (!self.state.read(cx).used_filter || layer.used)
+                        })
+                        .map(|layer| {
+                            div()
+                                .flex()
+                                .min_w_full()
+                                .flex_shrink_0()
+                                .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
+                                    theme.selection
+                                } else {
+                                    theme.sidebar
+                                })
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("layer_select_{}", layer.z)))
+                                        .flex_grow()
+                                        .flex_shrink_0()
+                                        .child(layer.name.clone())
+                                        .on_click({
+                                            let layers = self.layers.clone();
+                                            let name = layer.name.clone();
+                                            move |_event, _window, cx| {
+                                                layers.update(cx, |state, cx| {
+                                                    state.selected_layer = Some(name.clone());
+                                                    cx.notify();
+                                                })
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    icon_div()
+                                        .child(
+                                            svg()
+                                                .path(if layer.visible {
+                                                    "icons/eye-solid-full.svg"
+                                                } else {
+                                                    "icons/eye-slash-solid-full.svg"
+                                                })
+                                                .w(px(icon_wh))
+                                                .h_auto()
+                                                .text_color(theme.text),
+                                        )
+                                        .child(div().flex_1())
+                                        .id(SharedString::from(format!(
+                                            "layer_control_{}",
+                                            layer.z
+                                        )))
+                                        .on_click({
+                                            let layers = self.layers.clone();
+                                            let name = layer.name.clone();
+                                            move |_event, _window, cx| {
+                                                layers.update(cx, |state, cx| {
+                                                    state.layers.get_mut(&name).unwrap().visible =
+                                                        !state.layers[&name].visible;
+                                                    cx.notify();
+                                                })
+                                            }
+                                        }),
+                                )
+                        }),
+                ),
+                &self.scroll_handle,
+                &self.scroll_state,
+                cx.entity_id(),
+                theme,
+            ))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .items_start()
-                    .id("layers_scroll_vert")
-                    .overflow_y_scroll()
-                    .children(
-                        layers
-                            .layers
-                            .values()
-                            .filter(|layer| {
-                                layer
-                                    .name
-                                    .to_lowercase()
-                                    .contains(&self.name_filter.read(cx).content.to_lowercase())
-                                    && (!self.state.read(cx).used_filter || layer.used)
-                            })
-                            .map(|layer| {
-                                div()
-                                    .flex()
-                                    .w_full()
-                                    .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
-                                        theme.selection
-                                    } else {
-                                        theme.sidebar
-                                    })
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "layer_select_{}",
-                                                layer.z
-                                            )))
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .child(layer.name.clone())
-                                            .on_click({
-                                                let layers = self.layers.clone();
-                                                let name = layer.name.clone();
-                                                move |_event, _window, cx| {
-                                                    layers.update(cx, |state, cx| {
-                                                        state.selected_layer = Some(name.clone());
-                                                        cx.notify();
-                                                    })
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        icon_div()
-                                            .child(
-                                                svg()
-                                                    .path(if layer.visible {
-                                                        "icons/eye-solid-full.svg"
-                                                    } else {
-                                                        "icons/eye-slash-solid-full.svg"
-                                                    })
-                                                    .w(px(icon_wh))
-                                                    .h_auto()
-                                                    .text_color(theme.text),
-                                            )
-                                            .child(div().flex_1())
-                                            .id(SharedString::from(format!(
-                                                "layer_control_{}",
-                                                layer.z
-                                            )))
-                                            .on_click({
-                                                let layers = self.layers.clone();
-                                                let name = layer.name.clone();
-                                                move |_event, _window, cx| {
-                                                    layers.update(cx, |state, cx| {
-                                                        state
-                                                            .layers
-                                                            .get_mut(&name)
-                                                            .unwrap()
-                                                            .visible = !state.layers[&name].visible;
-                                                        cx.notify();
-                                                    })
-                                                }
-                                            }),
-                                    )
-                            }),
-                    ),
+                    .id("layers_resize_handle")
+                    .absolute()
+                    .top_0()
+                    .left(px(-SIDEBAR_RESIZE_HANDLE_WIDTH / 2.))
+                    .h_full()
+                    .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
+                    .cursor_col_resize()
+                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_drag(SidebarResize(SidebarEdge::Left), |_, _, _window, cx| {
+                        cx.new(|_cx| Empty)
+                    }),
             )
+            .on_drag_move::<SidebarResize>({
+                let state = self.state.clone();
+                move |event, _window, cx| {
+                    if event.drag(cx).0 != SidebarEdge::Left {
+                        return;
+                    }
+                    let width = clamp_sidebar_width(event.bounds.right() - event.event.position.x);
+                    state.update(cx, |state, cx| {
+                        if state.width != width {
+                            state.width = width;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
     }
 }
 
-#[derive(Default)]
 pub struct HierarchySideBarState {
     pub expanded_scopes: IndexSet<ScopePath>,
+    width: Pixels,
+    pub(super) context_menu: Option<HierarchyContextMenu>,
+}
+
+impl Default for HierarchySideBarState {
+    fn default() -> Self {
+        Self {
+            expanded_scopes: IndexSet::new(),
+            width: px(DEFAULT_SIDEBAR_WIDTH),
+            context_menu: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct HierarchyContextMenu {
+    cell: CellId,
+    position: Point<Pixels>,
 }
 
 pub struct HierarchySideBar {
@@ -685,6 +1031,9 @@ pub struct HierarchySideBar {
     tool: Entity<ToolState>,
     name_filter: Entity<TextInput>,
     pub state: Entity<HierarchySideBarState>,
+    scroll_handle: ScrollHandle,
+    scroll_state: Entity<SidebarScrollState>,
+    canvas: Entity<LayoutCanvas>,
     // Retained to keep the sidebar's observations active.
     _subscriptions: Vec<Subscription>,
 }
@@ -701,11 +1050,15 @@ impl HierarchySideBar {
             cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
         let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
         let state = cx.new(|_cx| HierarchySideBarState::default());
+        let scroll_state = cx.new(|_cx| SidebarScrollState::default());
         Self {
             editor_state: editor_state.clone(),
             tool,
             name_filter,
             state,
+            scroll_handle: ScrollHandle::new(),
+            scroll_state,
+            canvas: canvas.clone(),
             _subscriptions: subscriptions,
         }
     }
@@ -724,6 +1077,7 @@ impl HierarchySideBar {
             div()
                 .w(px(icon_wh + 8.))
                 .h(px(icon_wh + 8.))
+                .flex_shrink_0()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -742,10 +1096,55 @@ impl HierarchySideBar {
             .to_lowercase()
             .contains(&self.name_filter.read(cx).content.to_lowercase())
         {
+            let is_cell = solved_cell.output.cells[&scope.cell].root == scope.scope;
+            let mut scope_name = div()
+                .id(SharedString::from(format!("scope_select_{scope:?}")))
+                .flex_grow()
+                .flex_shrink_0()
+                .child(format!(
+                    "{}{}",
+                    scope_state.name,
+                    if count > 1 {
+                        format!(" ({count})")
+                    } else {
+                        "".to_string()
+                    }
+                ))
+                .on_click({
+                    let scope_path = scope_path.clone();
+                    move |_event, _window, cx| {
+                        solved_cell_clone_1.update(cx, |state, cx| {
+                            if let Some(state) = state.as_mut() {
+                                state.selected_scope = scope_path.clone();
+                                cx.notify();
+                            }
+                        });
+                        tool_clone.update(cx, |tool, cx| {
+                            *tool = ToolState::default();
+                            cx.notify();
+                        });
+                    }
+                });
+            if is_cell {
+                let sidebar_state = self.state.clone();
+                scope_name =
+                    scope_name.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        sidebar_state.update(cx, |state, cx| {
+                            state.context_menu = Some(HierarchyContextMenu {
+                                cell: scope.cell,
+                                position: event.position,
+                            });
+                            cx.notify();
+                        });
+                    });
+            }
             scopes.push(
                 div()
                     .flex()
-                    .w_full()
+                    .min_w_full()
+                    .flex_shrink_0()
                     .bg(
                         if scope == solved_cell.state[&solved_cell.selected_scope].address {
                             theme.selection
@@ -753,7 +1152,7 @@ impl HierarchySideBar {
                             theme.sidebar
                         },
                     )
-                    .child(div().w(px(12. * depth as f32)))
+                    .child(div().w(px(12. * depth as f32)).flex_shrink_0())
                     .child(
                         icon_div()
                             .child(
@@ -781,36 +1180,7 @@ impl HierarchySideBar {
                                 }
                             }),
                     )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("scope_select_{scope:?}")))
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(format!(
-                                "{}{}",
-                                scope_state.name,
-                                if count > 1 {
-                                    format!(" ({count})")
-                                } else {
-                                    "".to_string()
-                                }
-                            ))
-                            .on_click({
-                                let scope_path = scope_path.clone();
-                                move |_event, _window, cx| {
-                                    solved_cell_clone_1.update(cx, |state, cx| {
-                                        if let Some(state) = state.as_mut() {
-                                            state.selected_scope = scope_path.clone();
-                                            cx.notify();
-                                        }
-                                    });
-                                    tool_clone.update(cx, |tool, cx| {
-                                        *tool = ToolState::default();
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
+                    .child(scope_name)
                     .child(
                         icon_div()
                             .child(
@@ -894,13 +1264,107 @@ impl HierarchySideBar {
                 0,
             );
         }
-        div()
-            .flex()
-            .flex_col()
-            .w_full()
-            .id("layers_scroll_vert")
-            .overflow_y_scroll()
-            .children(scopes)
+        let theme = self.editor_state.read(cx).theme();
+        let mut scroll_area = sidebar_scroll_area(
+            "hierarchy_scroll_area",
+            div().flex().flex_col().items_start().children(scopes),
+            &self.scroll_handle,
+            &self.scroll_state,
+            cx.entity_id(),
+            theme,
+        );
+
+        let context_menu = self.state.read(cx).context_menu;
+        if let Some(context_menu) = context_menu {
+            let (cell_name, is_current_top) = {
+                let editor_state = self.editor_state.read(cx);
+                let solved_cell = editor_state.solved_cell.read(cx);
+                let Some(solved_cell) = solved_cell.as_ref() else {
+                    return scroll_area;
+                };
+                let Some(cell) = solved_cell.output.cells.get(&context_menu.cell) else {
+                    return scroll_area;
+                };
+                (
+                    cell.scopes[&cell.root].name.clone(),
+                    solved_cell.output.top == context_menu.cell,
+                )
+            };
+            let bounds = self.scroll_handle.bounds();
+            let menu_width = px(180.);
+            let menu_height = px(58.);
+            let local_position = point(
+                (context_menu.position.x - bounds.origin.x)
+                    .clamp(px(0.), (bounds.size.width - menu_width).max(px(0.))),
+                (context_menu.position.y - bounds.origin.y)
+                    .clamp(px(0.), (bounds.size.height - menu_height).max(px(0.))),
+            );
+            let mut action =
+                div()
+                    .id("set_hierarchy_top_cell")
+                    .px_2()
+                    .py_1()
+                    .child(if is_current_top {
+                        "Current top cell"
+                    } else {
+                        "Set as top cell"
+                    });
+            if is_current_top {
+                action = action.text_color(theme.subtext);
+            } else {
+                let editor_state = self.editor_state.clone();
+                let canvas = self.canvas.clone();
+                let sidebar_state = self.state.clone();
+                let cell = context_menu.cell;
+                action = action
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.selection))
+                    .on_click(move |_event, _window, cx| {
+                        sidebar_state.update(cx, |state, cx| {
+                            state.context_menu = None;
+                            cx.notify();
+                        });
+                        let changed =
+                            editor_state.update(cx, |state, cx| state.set_top_cell(cell, cx));
+                        if changed {
+                            canvas.update(cx, |canvas, cx| {
+                                canvas.fit_to_screen(cx);
+                                cx.notify();
+                            });
+                        }
+                    });
+            }
+            let menu = div()
+                .id("hierarchy_context_menu")
+                .absolute()
+                .left(local_position.x)
+                .top(local_position.y)
+                .w(menu_width)
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.divider)
+                .shadow_md()
+                .bg(theme.bg)
+                .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_down(MouseButton::Right, |_event, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .child(
+                    div()
+                        .px_2()
+                        .pb_1()
+                        .text_xs()
+                        .text_color(theme.subtext)
+                        .child(cell_name),
+                )
+                .child(action);
+            scroll_area = scroll_area.child(deferred(menu).with_priority(1));
+        }
+        scroll_area
     }
 }
 
@@ -911,11 +1375,13 @@ impl Render for HierarchySideBar {
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         let theme = self.editor_state.read(cx).theme();
+        let width = self.state.read(cx).width;
         let icon_wh = 16.;
         let icon_div = || {
             div()
                 .w(px(icon_wh + 8.))
                 .h(px(icon_wh + 8.))
+                .flex_shrink_0()
                 .flex()
                 .flex_col()
                 .items_center()
@@ -924,8 +1390,10 @@ impl Render for HierarchySideBar {
         div()
             .flex()
             .flex_col()
+            .relative()
             .h_full()
-            .w(px(200.))
+            .w(width)
+            .flex_shrink_0()
             .p_1()
             .border_r_1()
             .border_t_1()
@@ -1067,5 +1535,79 @@ impl Render for HierarchySideBar {
             )
             .child(self.name_filter.clone())
             .child(self.render_scopes(cx))
+            .child(
+                div()
+                    .id("hierarchy_resize_handle")
+                    .absolute()
+                    .top_0()
+                    .right(px(-SIDEBAR_RESIZE_HANDLE_WIDTH / 2.))
+                    .h_full()
+                    .w(px(SIDEBAR_RESIZE_HANDLE_WIDTH))
+                    .cursor_col_resize()
+                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_drag(SidebarResize(SidebarEdge::Right), |_, _, _window, cx| {
+                        cx.new(|_cx| Empty)
+                    }),
+            )
+            .on_mouse_down(MouseButton::Left, {
+                let state = self.state.clone();
+                move |_event, _window, cx| {
+                    if state.read(cx).context_menu.is_some() {
+                        state.update(cx, |state, cx| {
+                            state.context_menu = None;
+                            cx.notify();
+                        });
+                    }
+                }
+            })
+            .on_drag_move::<SidebarResize>({
+                let state = self.state.clone();
+                move |event, _window, cx| {
+                    if event.drag(cx).0 != SidebarEdge::Right {
+                        return;
+                    }
+                    let width = clamp_sidebar_width(event.event.position.x - event.bounds.left());
+                    state.update(cx, |state, cx| {
+                        if state.width != width {
+                            state.width = width;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+    }
+}
+
+#[cfg(test)]
+mod sidebar_layout_tests {
+    use gpui::px;
+
+    use super::{
+        MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, clamp_sidebar_width, scrollbar_thumb_metrics,
+    };
+
+    #[test]
+    fn sidebar_width_is_limited_to_usable_bounds() {
+        assert_eq!(clamp_sidebar_width(px(80.)), px(MIN_SIDEBAR_WIDTH));
+        assert_eq!(clamp_sidebar_width(px(320.)), px(320.));
+        assert_eq!(clamp_sidebar_width(px(900.)), px(MAX_SIDEBAR_WIDTH));
+    }
+
+    #[test]
+    fn scrollbar_thumb_tracks_the_visible_fraction_and_offset() {
+        assert_eq!(
+            scrollbar_thumb_metrics(px(100.), px(100.), px(-50.), px(100.)),
+            Some((px(25.), px(50.)))
+        );
+        assert_eq!(
+            scrollbar_thumb_metrics(px(100.), px(0.), px(0.), px(100.)),
+            None
+        );
+        assert_eq!(
+            scrollbar_thumb_metrics(px(10.), px(10.), px(-5.), px(10.)),
+            Some((px(0.), px(10.)))
+        );
     }
 }

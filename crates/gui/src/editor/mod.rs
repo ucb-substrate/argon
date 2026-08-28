@@ -299,6 +299,28 @@ impl EditorState {
             },
         );
     }
+
+    /// Re-root the current compiled hierarchy at an already compiled child cell.
+    ///
+    /// This keeps the exact parameterization represented by the selected cell ID;
+    /// reconstructing a source invocation from the hierarchy label would lose it.
+    pub(crate) fn set_top_cell(&mut self, cell: CellId, cx: &mut App) -> bool {
+        let Some(mut output) = self
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|state| state.output.clone())
+        else {
+            return false;
+        };
+        if output.top == cell || !output.cells.contains_key(&cell) {
+            return false;
+        }
+        output.top = cell;
+        self.update(cx, CompileOutput::Valid(output));
+        true
+    }
+
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
@@ -516,6 +538,7 @@ impl Editor {
                 state
                     .expanded_scopes
                     .retain(|path| scope_paths.contains(path));
+                state.context_menu = None;
             });
             cx.notify();
         });
