@@ -262,6 +262,7 @@ dependencies = [
  "tarpc",
  "tempfile",
  "tokio",
+ "tower-lsp-server",
 ]
 
 [[package]]
@@ -313,6 +314,7 @@ dependencies = [
  "futures",
  "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
  "gpui",
+ "image",
  "indexmap",
  "itertools 0.15.0",
  "lazy_static",

@@ -11,7 +11,7 @@ use argonc::{
     compile::{CompileOutput, CompiledData},
 };
 use futures::prelude::*;
-use tarpc::{context, server::Channel, tokio_serde::formats::Json};
+use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tempfile::TempDir;
 use tokio::{sync::mpsc, time};
 
@@ -31,6 +31,10 @@ pub enum GuiEvent {
         kind: OutputKind,
         scope: Option<Span>,
         rect_count: usize,
+    },
+    Message {
+        typ: tower_lsp_server::ls_types::MessageType,
+        message: String,
     },
     Fit,
     WorkspacePath(Option<PathBuf>),
@@ -52,6 +56,17 @@ impl Gui for HeadlessGui {
                 scope,
                 rect_count,
             })
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn show_message(
+        self,
+        _: context::Context,
+        typ: tower_lsp_server::ls_types::MessageType,
+        message: String,
+    ) {
+        self.events
+            .send(GuiEvent::Message { typ, message })
             .expect("full-stack test should still be receiving GUI events");
     }
 
@@ -154,7 +169,7 @@ impl Session {
             .port();
         let (events_tx, events) = mpsc::unbounded_channel();
         let mut listener =
-            tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Json::default)
+            tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Bincode::default)
                 .await
                 .expect("bind headless GUI RPC listener");
         listener.config_mut().max_frame_length(usize::MAX);
@@ -244,7 +259,7 @@ impl Session {
         time::timeout(TEST_TIMEOUT, async {
             loop {
                 let mut transport =
-                    tarpc::serde_transport::tcp::connect(self.analyzer_addr, Json::default);
+                    tarpc::serde_transport::tcp::connect(self.analyzer_addr, Bincode::default);
                 transport.config_mut().max_frame_length(usize::MAX);
                 if let Ok(transport) = transport.await {
                     return LangServerClient::new(tarpc::client::Config::default(), transport)
@@ -410,6 +425,38 @@ mod tests {
             }
 
             std::fs::write(&session.ack, "ok\n").expect("acknowledge diagnostic recovery");
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn analyzer_errors_are_mirrored_to_the_gui() {
+        assert_completes("waiting for analyzer error in GUI", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("rpc_errors");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+            analyzer
+                .open_cell(context::current(), "top(".to_owned())
+                .await
+                .expect("invalid open-cell request should reach analyzer");
+
+            loop {
+                if let GuiEvent::Message { typ, message } = session.next_event().await
+                    && typ == tower_lsp_server::ls_types::MessageType::ERROR
+                    && message.contains("Open cell is invalid")
+                {
+                    break;
+                }
+            }
+
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge mirrored GUI error");
             finish_nvim(child).await;
         })
         .await;

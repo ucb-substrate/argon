@@ -7,12 +7,13 @@ use gpui::{
     SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill, point,
     prelude::*, px, relative, size,
 };
+use tower_lsp_server::ls_types::MessageType;
 use unicode_segmentation::*;
 
 use crate::{
     actions::*,
     editor::{
-        EditorState,
+        EditorState, SOURCE_EDIT_REJECTED_MESSAGE,
         canvas::{DrawDimToolState, EditDimToolState, LayoutCanvas, ToolState},
     },
 };
@@ -279,7 +280,10 @@ impl TextInput {
                 match result {
                     Ok(None) => {
                         self.state.update(cx, |state, _cx| {
-                            state.fatal_error = Some("inconsistent editor and GUI state".into());
+                            if state.message.is_none() {
+                                state
+                                    .show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
+                            }
                         });
                         false
                     }
