@@ -51,6 +51,9 @@ pub enum StaticErrorKind {
     /// The operands in a binary expression must have the same type.
     #[error("operands of binary expression must have the same type")]
     BinOpMismatchedTypes,
+    /// The operands in a comparison must have the same type.
+    #[error("operands of a comparison must have the same type")]
+    ComparisonMismatchedTypes,
     /// Floating-point values cannot be compared for equality or inequality.
     #[error("cannot compare equality or inequality of floating point numbers")]
     FloatEquality,

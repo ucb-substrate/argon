@@ -1799,6 +1799,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let left_ty = left.ty();
         let right_ty = right.ty();
         let lub_ty = left_ty.lub(&right_ty);
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::ComparisonMismatchedTypes,
+            });
+        }
         if left_ty == Ty::Float && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne) {
             self.errors.push(StaticError {
                 span: self.span(input.span),
@@ -1831,23 +1837,28 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::SeqNilNotOrd,
             });
         }
+        // A sequence may only be compared for equality/inequality against `[]`:
+        // the evaluator has no arm for two populated sequences, and none for
+        // ordering a sequence at all.
         if matches!(lub_ty, Ty::Seq(_))
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
+            && !((input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
+                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
         {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::SeqMustCompareEqSeqNil,
             });
         }
-        if !matches!(
-            left_ty,
-            Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
-        ) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::ComparisonInvalidType,
-            });
+        for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
+            if !matches!(
+                ty,
+                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+            ) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::ComparisonInvalidType,
+                });
+            }
         }
 
         Ty::Bool
