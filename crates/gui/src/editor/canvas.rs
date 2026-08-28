@@ -6,7 +6,6 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 use analyzer::rpc::{
@@ -70,8 +69,6 @@ const OUTLINE_REPROJECTION_PRIMITIVE_LIMIT: usize = 50_000;
 /// genuinely narrower geometry still becomes one stable occupancy feature.
 const MIN_RESOLVABLE_OUTLINE_GAP_RASTER_PIXELS: f32 = 0.;
 const NAVIGATION_OVERVIEW_SIZE: Pixels = px(160.);
-const NAVIGATION_PREVIEW_MARGIN: Pixels = px(12.);
-const NAVIGATION_OVERVIEW_HOLD: Duration = Duration::from_millis(700);
 /// Geometry smaller than this in the interaction raster is accumulated into a
 /// compact per-layer occupancy mask. Hierarchy is still fully flattened; only
 /// the final sub-pixel representation becomes cheaper.
@@ -906,13 +903,11 @@ pub struct LayoutCanvas {
     /// Unlike scaling the completed tile image, this reapplies stippling in
     /// destination pixels so its width and period remain stable during zoom.
     raster_reprojection: Option<LayoutRasterCache>,
-    /// Low-resolution render of the complete displayed cell. This is shown
-    /// throughout zoom/pan interaction and briefly after it ends.
+    /// Low-resolution render of the complete displayed cell shown in the
+    /// persistent hierarchy-sidebar overview pane.
     raster_overview: Option<LayoutRasterCache>,
     raster_overview_requested_revision: Option<u64>,
     raster_overview_refinement: Option<Task<()>>,
-    raster_overview_visible: bool,
-    raster_overview_visibility_task: Option<Task<()>>,
     raster_display: Option<RasterDisplayTransform>,
     /// Holds the retained raster at its last safe presentation while a zoom
     /// whose outlines are too expensive to reproject waits for an exact LOD.
@@ -1061,6 +1056,21 @@ struct ViewportTransform {
     screen_size: Size<Pixels>,
     scale: f32,
     offset: Point<Pixels>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NavigationOverviewSnapshot {
+    pub image: Arc<RenderImage>,
+    pub image_bounds: Bounds<Pixels>,
+    pub viewport_bounds: Bounds<Pixels>,
+    bounds: Bounds<Pixels>,
+    display: ViewportTransform,
+}
+
+impl NavigationOverviewSnapshot {
+    pub(crate) fn world_at(&self, position: Point<Pixels>) -> Point<f32> {
+        navigation_overview_world_point(self.display, position, self.bounds)
+    }
 }
 
 #[derive(Clone)]
@@ -3551,25 +3561,6 @@ fn raster_bounds(
     )
 }
 
-fn navigation_overview_bounds(bounds: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
-    let width = f32::from(bounds.size.width);
-    let height = f32::from(bounds.size.height);
-    let margin = f32::from(NAVIGATION_PREVIEW_MARGIN);
-    if width <= 2. * margin || height <= 2. * margin {
-        return None;
-    }
-    let side = (width - 2. * margin)
-        .min(height - 2. * margin)
-        .min(f32::from(NAVIGATION_OVERVIEW_SIZE));
-    Some(Bounds::new(
-        Point::new(
-            bounds.origin.x + NAVIGATION_PREVIEW_MARGIN,
-            bounds.bottom() - NAVIGATION_PREVIEW_MARGIN - px(side),
-        ),
-        Size::new(px(side), px(side)),
-    ))
-}
-
 fn navigation_overview_layers(
     layers: &IndexMap<SharedString, LayerState>,
 ) -> IndexMap<SharedString, LayerState> {
@@ -3581,16 +3572,22 @@ fn navigation_overview_layers(
 }
 
 fn navigation_overview_viewport(bbox: &compile::Rect<f64>) -> ViewportTransform {
-    navigation_overview_viewport_for_extents(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+    navigation_overview_viewport_for_extents_in_size(
+        bbox.x0,
+        bbox.y0,
+        bbox.x1,
+        bbox.y1,
+        Size::new(NAVIGATION_OVERVIEW_SIZE, NAVIGATION_OVERVIEW_SIZE),
+    )
 }
 
-fn navigation_overview_viewport_for_extents(
+fn navigation_overview_viewport_for_extents_in_size(
     bbox_x0: f64,
     bbox_y0: f64,
     bbox_x1: f64,
     bbox_y1: f64,
+    size: Size<Pixels>,
 ) -> ViewportTransform {
-    let size = Size::new(NAVIGATION_OVERVIEW_SIZE, NAVIGATION_OVERVIEW_SIZE);
     let x0 = bbox_x0.min(bbox_x1) as f32;
     let x1 = bbox_x0.max(bbox_x1) as f32;
     let y0 = bbox_y0.min(bbox_y1) as f32;
@@ -3610,6 +3607,7 @@ fn navigation_overview_viewport_for_extents(
 fn navigation_overview_display_viewport(
     bbox: &compile::Rect<f64>,
     current: ViewportTransform,
+    size: Size<Pixels>,
 ) -> ViewportTransform {
     navigation_overview_display_viewport_for_bounds(
         RasterBvhBounds {
@@ -3619,15 +3617,23 @@ fn navigation_overview_display_viewport(
             max_y: bbox.y0.max(bbox.y1),
         },
         current,
+        size,
     )
 }
 
 fn navigation_overview_display_viewport_for_bounds(
     cell: RasterBvhBounds,
     current: ViewportTransform,
+    size: Size<Pixels>,
 ) -> ViewportTransform {
     let world = raster_viewport_world_bounds(current).union(cell);
-    navigation_overview_viewport_for_extents(world.min_x, world.min_y, world.max_x, world.max_y)
+    navigation_overview_viewport_for_extents_in_size(
+        world.min_x,
+        world.min_y,
+        world.max_x,
+        world.max_y,
+        size,
+    )
 }
 
 fn navigation_overview_world_bounds(
@@ -3657,6 +3663,21 @@ fn navigation_overview_viewport_bounds(
     target: Bounds<Pixels>,
 ) -> Bounds<Pixels> {
     navigation_overview_world_bounds(overview, raster_viewport_world_bounds(current), target)
+}
+
+fn navigation_overview_world_point(
+    overview: ViewportTransform,
+    position: Point<Pixels>,
+    target: Bounds<Pixels>,
+) -> Point<f32> {
+    let x_scale = f32::from(target.size.width) / f32::from(overview.size.width);
+    let y_scale = f32::from(target.size.height) / f32::from(overview.size.height);
+    let local_x = f32::from(position.x - target.origin.x) / x_scale;
+    let local_y = f32::from(position.y - target.origin.y) / y_scale;
+    Point::new(
+        (local_x - f32::from(overview.offset.x)) / overview.scale,
+        (f32::from(overview.offset.y) - local_y) / overview.scale,
+    )
 }
 
 fn minimum_centered_bounds_size(bounds: Bounds<Pixels>, minimum: Pixels) -> Bounds<Pixels> {
@@ -4681,42 +4702,6 @@ impl Element for CanvasElement {
         let use_raster_cache = inner.navigation_cache_active
             || select_overview
             || matches!(&tool, ToolState::DrawRect(_) | ToolState::PlaceInstance(_));
-        let navigation_overview = (inner.raster_display_frozen || inner.raster_overview_visible)
-            .then(|| {
-                let cache = inner
-                    .raster_overview
-                    .clone()
-                    .filter(|cache| cache.content_revision == inner.raster_content_revision)?;
-                let bbox = inner.raster_layout_bbox.as_ref()?;
-                let overview_bounds = navigation_overview_bounds(bounds)?;
-                let current = ViewportTransform {
-                    size: bounds.size,
-                    screen_size: bounds.size,
-                    scale: inner.scale,
-                    offset: inner.offset,
-                };
-                let display = navigation_overview_display_viewport(bbox, current);
-                let cache_viewport = ViewportTransform {
-                    size: cache.viewport,
-                    screen_size: cache.screen_viewport,
-                    scale: cache.scale,
-                    offset: cache.offset,
-                };
-                let image_bounds = navigation_overview_world_bounds(
-                    display,
-                    raster_viewport_world_bounds(cache_viewport),
-                    overview_bounds,
-                );
-                let viewport_bounds = clamp_bounds_to_container(
-                    minimum_centered_bounds_size(
-                        navigation_overview_viewport_bounds(display, current, overview_bounds),
-                        px(3.),
-                    ),
-                    overview_bounds,
-                );
-                Some((cache, overview_bounds, image_bounds, viewport_bounds))
-            })
-            .flatten();
         let raster_presentation = inner
             .raster_reprojection
             .clone()
@@ -4976,73 +4961,6 @@ impl Element for CanvasElement {
                         }
                     }
                 });
-                if let Some((overview, overview_bounds, image_bounds, viewport_bounds)) =
-                    &navigation_overview
-                {
-                    // GPUI paint layers may batch and reorder overlapping
-                    // primitives within one layer. Keep the image and each
-                    // overlay in distinct layers so the viewport is always
-                    // composited above the macro.
-                    window.paint_layer(*overview_bounds, |window| {
-                        window.paint_quad(get_paint_quad(
-                            *overview_bounds,
-                            ShapeFill::Solid,
-                            theme.bg,
-                            theme.divider,
-                            Edges::all(px(0.)),
-                            Edges::all(BorderStyle::Solid),
-                        ));
-                    });
-                    window.paint_layer(*overview_bounds, |window| {
-                        window
-                            .paint_image(
-                                *image_bounds,
-                                Corners::all(px(0.)),
-                                overview.image.clone(),
-                                0,
-                                false,
-                            )
-                            .unwrap();
-                    });
-                    window.paint_layer(*overview_bounds, |window| {
-                        window.paint_quad(get_paint_quad(
-                            *overview_bounds,
-                            ShapeFill::Hollow,
-                            Rgba {
-                                a: 0.,
-                                ..theme.text
-                            },
-                            theme.text,
-                            Edges::all(px(1.)),
-                            Edges::all(BorderStyle::Solid),
-                        ));
-                    });
-                    window.paint_layer(*overview_bounds, |window| {
-                        // A background-colored halo separates the viewport
-                        // from both dark and light macro geometry.
-                        window.paint_quad(get_paint_quad(
-                            *viewport_bounds,
-                            ShapeFill::Hollow,
-                            Rgba { a: 0., ..theme.bg },
-                            theme.bg,
-                            Edges::all(px(4.)),
-                            Edges::all(BorderStyle::Solid),
-                        ));
-                    });
-                    window.paint_layer(*overview_bounds, |window| {
-                        window.paint_quad(get_paint_quad(
-                            *viewport_bounds,
-                            ShapeFill::Hollow,
-                            Rgba {
-                                a: 0.,
-                                ..theme.text
-                            },
-                            theme.text,
-                            Edges::all(px(2.)),
-                            Edges::all(BorderStyle::Solid),
-                        ));
-                    });
-                }
             });
             return;
         }
@@ -6768,7 +6686,7 @@ impl Element for CanvasElement {
         let raster_tiles = raster_cache.map(single_raster_tile_set);
         self.inner.update(cx, |inner, cx| {
             if select_overview {
-                inner.resolve_raster_display_freeze(cx);
+                inner.resolve_raster_display_freeze();
                 inner.raster_display = raster_tiles.as_ref().map(|tiles| {
                     let layout_bounds = inner
                         .raster_layout_bbox
@@ -6923,8 +6841,6 @@ impl LayoutCanvas {
                 }
                 canvas.raster_overview_requested_revision = None;
                 canvas.raster_overview_refinement = None;
-                canvas.raster_overview_visible = false;
-                canvas.raster_overview_visibility_task = None;
                 canvas.raster_display = None;
                 canvas.raster_display_frozen = false;
                 canvas.raster_tile_target = None;
@@ -6951,8 +6867,6 @@ impl LayoutCanvas {
             raster_overview: None,
             raster_overview_requested_revision: None,
             raster_overview_refinement: None,
-            raster_overview_visible: false,
-            raster_overview_visibility_task: None,
             raster_display: None,
             raster_display_frozen: false,
             raster_tile_target: None,
@@ -7218,38 +7132,108 @@ impl LayoutCanvas {
         true
     }
 
+    pub(crate) fn navigation_overview_snapshot(
+        &self,
+        bounds: Bounds<Pixels>,
+    ) -> Option<NavigationOverviewSnapshot> {
+        if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+            return None;
+        }
+        let cache = self
+            .raster_overview
+            .as_ref()
+            .filter(|cache| cache.content_revision == self.raster_content_revision)?;
+        let bbox = self.raster_layout_bbox.as_ref()?;
+        let current = ViewportTransform {
+            size: self.screen_bounds.size,
+            screen_size: self.screen_bounds.size,
+            scale: self.scale,
+            offset: self.offset,
+        };
+        let display = navigation_overview_display_viewport(bbox, current, bounds.size);
+        let cache_viewport = ViewportTransform {
+            size: cache.viewport,
+            screen_size: cache.screen_viewport,
+            scale: cache.scale,
+            offset: cache.offset,
+        };
+        let image_bounds = navigation_overview_world_bounds(
+            display,
+            raster_viewport_world_bounds(cache_viewport),
+            bounds,
+        );
+        let viewport_bounds = clamp_bounds_to_container(
+            minimum_centered_bounds_size(
+                navigation_overview_viewport_bounds(display, current, bounds),
+                px(3.),
+            ),
+            bounds,
+        );
+        Some(NavigationOverviewSnapshot {
+            image: cache.image.clone(),
+            image_bounds,
+            viewport_bounds,
+            bounds,
+            display,
+        })
+    }
+
+    pub(crate) fn center_viewport_on(&mut self, position: Point<f32>, cx: &mut Context<Self>) {
+        if self.screen_bounds.size.width <= px(0.) || self.screen_bounds.size.height <= px(0.) {
+            return;
+        }
+        self.begin_navigation();
+        self.offset = Point::new(
+            self.screen_bounds.size.width / 2. - px(self.scale * position.x),
+            self.screen_bounds.size.height / 2. + px(self.scale * position.y),
+        );
+        self.hover_hit = None;
+        self.update_raster_display_transform();
+        self.request_navigation_raster(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn fit_viewport_to_world_bounds(
+        &mut self,
+        first: Point<f32>,
+        second: Point<f32>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.screen_bounds.size.width <= px(0.) || self.screen_bounds.size.height <= px(0.) {
+            return;
+        }
+        let x0 = first.x.min(second.x);
+        let x1 = first.x.max(second.x);
+        let y0 = first.y.min(second.y);
+        let y1 = first.y.max(second.y);
+        let previous_raster_display = self.raster_display;
+        self.scale = fit_scale(self.screen_bounds.size, x1 - x0, y1 - y0).min(100.);
+        self.offset = Point::new(
+            px((-(x0 + x1) * self.scale + f32::from(self.screen_bounds.size.width)) / 2.),
+            px(((y0 + y1) * self.scale + f32::from(self.screen_bounds.size.height)) / 2.),
+        );
+        self.hover_hit = None;
+        let requested_raster_display = self.raster_display_transform_for_current_view();
+        let has_safe_reprojection = self.refresh_raster_reprojection();
+        self.raster_display = raster_zoom_display_transform(
+            previous_raster_display,
+            requested_raster_display,
+            has_safe_reprojection,
+        );
+        self.raster_display_frozen = !has_safe_reprojection;
+        self.request_navigation_overview(cx);
+        self.request_navigation_raster(cx);
+        cx.notify();
+    }
+
     fn clear_raster_reprojection(&mut self) {
         if let Some(previous) = self.raster_reprojection.take() {
             self.raster_images_to_drop.push(previous.image);
         }
     }
 
-    fn keep_navigation_overview_visible(&mut self, cx: &mut Context<Self>) {
-        self.raster_overview_visible = true;
-        self.raster_overview_visibility_task = Some(cx.spawn(async move |canvas, cx| {
-            cx.background_executor()
-                .timer(NAVIGATION_OVERVIEW_HOLD)
-                .await;
-            let _ = canvas.update(cx, |canvas, cx| {
-                if !canvas.raster_display_frozen && !canvas.is_dragging {
-                    canvas.raster_overview_visible = false;
-                    cx.notify();
-                }
-            });
-        }));
-    }
-
-    fn show_navigation_overview(&mut self, cx: &mut Context<Self>) {
-        self.keep_navigation_overview_visible(cx);
-        self.request_navigation_overview(cx);
-    }
-
-    fn resolve_raster_display_freeze(&mut self, cx: &mut Context<Self>) {
-        let was_frozen = self.raster_display_frozen;
+    fn resolve_raster_display_freeze(&mut self) {
         self.raster_display_frozen = false;
-        if was_frozen {
-            self.keep_navigation_overview_visible(cx);
-        }
     }
 
     fn request_navigation_overview(&mut self, cx: &mut Context<Self>) {
@@ -7403,7 +7387,6 @@ impl LayoutCanvas {
         target: RasterTileTarget,
         index: RasterTileIndex,
         cache: LayoutRasterCache,
-        cx: &mut Context<Self>,
     ) {
         if self.raster_tile_target != Some(target)
             || target.generation != self.raster_generation
@@ -7423,7 +7406,7 @@ impl LayoutCanvas {
             }
             tiles.navigation = true;
             tiles.center = target.center;
-            self.resolve_raster_display_freeze(cx);
+            self.resolve_raster_display_freeze();
             self.update_raster_display_transform();
             return;
         }
@@ -7456,7 +7439,7 @@ impl LayoutCanvas {
                     .extend(previous.tiles.into_values().map(|cache| cache.image));
             }
             self.clear_raster_reprojection();
-            self.resolve_raster_display_freeze(cx);
+            self.resolve_raster_display_freeze();
             self.raster_display = self
                 .raster_tiles
                 .as_ref()
@@ -7535,7 +7518,7 @@ impl LayoutCanvas {
                 .extend(previous.tiles.into_values().map(|cache| cache.image));
         }
         self.clear_raster_reprojection();
-        self.resolve_raster_display_freeze(cx);
+        self.resolve_raster_display_freeze();
         self.raster_display = Some(display);
     }
 
@@ -7573,7 +7556,7 @@ impl LayoutCanvas {
                     .await;
                 let _ = canvas.update(cx, |canvas, cx| {
                     if let Some(cache) = cache {
-                        canvas.install_navigation_tile(target, index, cache, cx);
+                        canvas.install_navigation_tile(target, index, cache);
                         canvas.request_navigation_overview(cx);
                     }
                     cx.notify();
@@ -7858,8 +7841,6 @@ impl LayoutCanvas {
         }
         self.raster_display = None;
         self.raster_display_frozen = false;
-        self.raster_overview_visible = false;
-        self.raster_overview_visibility_task = None;
         self.raster_tile_target = None;
         self.navigation_cache_active = false;
         self.raster_refinement = None;
@@ -8886,7 +8867,7 @@ impl LayoutCanvas {
         self.is_dragging = true;
         self.drag_start = event.position;
         self.offset_start = self.offset;
-        self.show_navigation_overview(cx);
+        self.request_navigation_overview(cx);
     }
 
     pub(crate) fn on_mouse_move(
@@ -8900,10 +8881,10 @@ impl LayoutCanvas {
         if self.is_dragging {
             self.offset = self.offset_start + (event.position - self.drag_start);
             self.hover_hit = None;
-            self.show_navigation_overview(cx);
+            self.request_navigation_overview(cx);
             self.update_raster_display_transform();
             if self.raster_reprojection.is_some() && self.refresh_raster_reprojection() {
-                self.resolve_raster_display_freeze(cx);
+                self.resolve_raster_display_freeze();
             }
             self.request_navigation_raster(cx);
         } else if self.is_sse_dragging {
@@ -8927,7 +8908,7 @@ impl LayoutCanvas {
         self.sse_delta = Point::default();
         self.sse_targets.clear();
         if was_dragging {
-            self.show_navigation_overview(cx);
+            self.request_navigation_overview(cx);
             self.request_navigation_raster(cx);
         }
     }
@@ -9093,7 +9074,7 @@ impl LayoutCanvas {
             has_safe_reprojection,
         );
         self.raster_display_frozen = !has_safe_reprojection;
-        self.show_navigation_overview(cx);
+        self.request_navigation_overview(cx);
         // Retarget the exact renderer on every wheel event. The worker cancels
         // obsolete generations and immediately continues with the newest LOD.
         self.request_navigation_raster(cx);
@@ -9178,15 +9159,6 @@ mod tests {
     }
 
     #[test]
-    fn navigation_overview_is_square_and_bottom_left_anchored() {
-        let canvas = Bounds::new(Point::new(px(10.), px(20.)), Size::new(px(1000.), px(500.)));
-        let overview = navigation_overview_bounds(canvas).unwrap();
-
-        assert_eq!(overview.size, Size::new(px(160.), px(160.)));
-        assert_eq!(overview.origin, Point::new(px(22.), px(348.)));
-    }
-
-    #[test]
     fn navigation_overview_uses_only_visible_layers_with_their_original_colors() {
         let (_, mut visible) = dimension_rect(0., 10., 0);
         visible.color = rgb(0xff2400);
@@ -9209,7 +9181,13 @@ mod tests {
     fn navigation_overview_maps_the_current_world_viewport() {
         let overview_bounds =
             Bounds::new(Point::new(px(22.), px(348.)), Size::new(px(160.), px(160.)));
-        let overview = navigation_overview_viewport_for_extents(-50., -50., 50., 50.);
+        let overview = navigation_overview_viewport_for_extents_in_size(
+            -50.,
+            -50.,
+            50.,
+            50.,
+            overview_bounds.size,
+        );
         let current = ViewportTransform {
             size: Size::new(px(144.), px(144.)),
             screen_size: Size::new(px(144.), px(144.)),
@@ -9227,6 +9205,26 @@ mod tests {
     }
 
     #[test]
+    fn navigation_overview_maps_pointer_positions_back_to_world_space() {
+        let target = Bounds::new(Point::new(px(20.), px(30.)), Size::new(px(240.), px(120.)));
+        let overview =
+            navigation_overview_viewport_for_extents_in_size(-100., -50., 100., 50., target.size);
+
+        let center =
+            navigation_overview_world_point(overview, Point::new(px(140.), px(90.)), target);
+        let macro_top_left = Point::new(
+            target.origin.x + overview.offset.x - px(100. * overview.scale),
+            target.origin.y + overview.offset.y - px(50. * overview.scale),
+        );
+        let top_left = navigation_overview_world_point(overview, macro_top_left, target);
+
+        assert!((center.x - 0.).abs() < 1e-4);
+        assert!((center.y - 0.).abs() < 1e-4);
+        assert!((top_left.x + 100.).abs() < 1e-4);
+        assert!((top_left.y - 50.).abs() < 1e-4);
+    }
+
+    #[test]
     fn navigation_overview_fits_the_cell_or_an_outside_macro_viewport() {
         let cell = RasterBvhBounds {
             min_x: -50.,
@@ -9235,7 +9233,8 @@ mod tests {
             max_y: 50.,
         };
         let target = Bounds::new(Point::default(), Size::new(px(160.), px(160.)));
-        let cell_view = navigation_overview_viewport_for_extents(-50., -50., 50., 50.);
+        let cell_view =
+            navigation_overview_viewport_for_extents_in_size(-50., -50., 50., 50., target.size);
         let cell_image_world = raster_viewport_world_bounds(cell_view);
 
         let zoomed_in = ViewportTransform {
@@ -9244,7 +9243,8 @@ mod tests {
             scale: 1.,
             offset: Point::new(px(10.), px(10.)),
         };
-        let zoomed_in_display = navigation_overview_display_viewport_for_bounds(cell, zoomed_in);
+        let zoomed_in_display =
+            navigation_overview_display_viewport_for_bounds(cell, zoomed_in, target.size);
         let zoomed_in_image =
             navigation_overview_world_bounds(zoomed_in_display, cell_image_world, target);
         let zoomed_in_indicator =
@@ -9258,7 +9258,8 @@ mod tests {
             scale: 1.,
             offset: Point::new(px(100.), px(100.)),
         };
-        let zoomed_out_display = navigation_overview_display_viewport_for_bounds(cell, zoomed_out);
+        let zoomed_out_display =
+            navigation_overview_display_viewport_for_bounds(cell, zoomed_out, target.size);
         let zoomed_out_image =
             navigation_overview_world_bounds(zoomed_out_display, cell_image_world, target);
         let zoomed_out_indicator = clamp_bounds_to_container(
