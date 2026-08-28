@@ -443,6 +443,12 @@ pub trait AstTransformer {
     type InputS;
     type OutputS;
 
+    /// Allows long editor-driven transformations to stop at AST node
+    /// boundaries. Callers discard the partial output when this becomes true.
+    fn should_cancel(&self) -> bool {
+        false
+    }
+
     fn dispatch_ident(
         &mut self,
         input: &Ident<Self::InputS, Self::InputMetadata>,
@@ -1009,12 +1015,16 @@ pub trait AstTransformer {
         &mut self,
         input: &Scope<Self::InputS, Self::InputMetadata>,
     ) -> Scope<Self::OutputS, Self::OutputMetadata> {
-        let stmts = input
-            .stmts
-            .iter()
-            .map(|stmt| self.transform_statement(stmt))
-            .collect_vec();
-        let tail = input.tail.as_ref().map(|stmt| self.transform_expr(stmt));
+        let mut stmts = Vec::new();
+        for stmt in &input.stmts {
+            if self.should_cancel() {
+                break;
+            }
+            stmts.push(self.transform_statement(stmt));
+        }
+        let tail = (!self.should_cancel())
+            .then(|| input.tail.as_ref().map(|stmt| self.transform_expr(stmt)))
+            .flatten();
         let metadata = self.dispatch_scope(input, &stmts, &tail);
         Scope {
             scope_order: input.scope_order,

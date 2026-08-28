@@ -6,6 +6,7 @@ use indexmap::IndexMap;
 
 use crate::{
     ast::{Ast, AstMetadata, CallExpr, Decl, ModPath, Span, WorkspaceAst, annotated::AnnotatedAst},
+    cancellation::CancellationToken,
     compile::{StaticError, StaticErrorKind},
     parser::ParseError,
     workspace::WorkspaceConfig,
@@ -287,29 +288,43 @@ pub fn parse_workspace_with_config_sources_and_cache(
     sources: &IndexMap<PathBuf, ArcStr>,
     cache: &mut ParseCache,
 ) -> ParseOutput {
+    parse_workspace_with_config_sources_and_cache_cancellable(config, sources, cache, None)
+        .expect("uncancellable workspace parse cannot be cancelled")
+}
+
+pub(crate) fn parse_workspace_with_config_sources_and_cache_cancellable(
+    config: &WorkspaceConfig,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    cache: &mut ParseCache,
+    cancellation: Option<&CancellationToken>,
+) -> Option<ParseOutput> {
     let mut output = ParseOutput::default();
     for (name, path) in &config.dependencies {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         let dep_root = if path.is_dir() {
             path.join("lib.ar")
         } else {
             path.clone()
         };
         output.merge(
-            parse_workspace_with_sources(dep_root, sources, cache),
+            parse_workspace_with_sources_cancellable(dep_root, sources, cache, cancellation)?,
             Some(name),
         );
     }
     output.merge(
-        parse_workspace_with_sources(config.root_lib(), sources, cache),
+        parse_workspace_with_sources_cancellable(config.root_lib(), sources, cache, cancellation)?,
         None,
     );
     add_gds_imports(&mut output, config.gds_imports.iter().cloned());
     let std_path = PathBuf::from(STD_PATH);
-    let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
+    let (std_ast, std_diagnostics) =
+        parse_source_cancellable(ArcStr::from(STD_SOURCE), std_path.clone(), cancellation)?;
     // TODO: fix std library overwriting user-defined std mods.
     output.asts.insert(vec!["std".to_string()], std_ast);
     output.errs.insert(std_path, (std_diagnostics, Vec::new()));
-    output
+    (!cancellation.is_some_and(CancellationToken::is_cancelled)).then_some(output)
 }
 
 /// Overlay-aware workspace parsing with a reusable successful-file cache.
@@ -566,6 +581,16 @@ fn parse_workspace_with_sources(
     sources: &IndexMap<PathBuf, ArcStr>,
     cache: &mut ParseCache,
 ) -> ParseOutput {
+    parse_workspace_with_sources_cancellable(root_lib, sources, cache, None)
+        .expect("uncancellable workspace parse cannot be cancelled")
+}
+
+fn parse_workspace_with_sources_cancellable(
+    root_lib: impl AsRef<Path>,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    cache: &mut ParseCache,
+    cancellation: Option<&CancellationToken>,
+) -> Option<ParseOutput> {
     let root_lib = root_lib.as_ref();
 
     let mut stack = vec![vec![]];
@@ -573,9 +598,13 @@ fn parse_workspace_with_sources(
     let mut workspace_errs = IndexMap::new();
 
     while let Some(path) = stack.pop() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
         match get_mod(root_lib, &path) {
             Ok(file_path) => {
-                let (ast, errs) = parse_cached(&file_path, sources, cache);
+                let (ast, errs) =
+                    parse_cached_cancellable(&file_path, sources, cache, cancellation)?;
                 let mut mod_spans = Vec::new();
                 for decl in &ast.0.ast.decls {
                     if let Decl::Mod(decl) = decl {
@@ -608,17 +637,21 @@ fn parse_workspace_with_sources(
         }
     }
 
-    ParseOutput {
+    Some(ParseOutput {
         asts: workspace_ast,
         errs: workspace_errs,
-    }
+    })
 }
 
-fn parse_cached(
+fn parse_cached_cancellable(
     path: &Path,
     sources: &IndexMap<PathBuf, ArcStr>,
     cache: &mut ParseCache,
-) -> (ParseResult, ParseDiagnostics) {
+    cancellation: Option<&CancellationToken>,
+) -> Option<(ParseResult, ParseDiagnostics)> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
     let source = match sources.get(path).cloned() {
         Some(source) => Ok(source),
         None => std::fs::read_to_string(path).map(ArcStr::from),
@@ -627,24 +660,24 @@ fn parse_cached(
         Ok(source) => source,
         Err(error) => {
             cache.misses += 1;
-            return (
+            return Some((
                 (
                     make_backup_ast("".into(), path.to_path_buf()),
                     Some(error.into()),
                 ),
                 Vec::new(),
-            );
+            ));
         }
     };
     if let Some((cached_source, ast)) = cache.entries.get(path)
         && cached_source == &source
     {
         cache.hits += 1;
-        return ((ast.clone(), None), Vec::new());
+        return Some(((ast.clone(), None), Vec::new()));
     }
 
     cache.misses += 1;
-    let result = parse_source(source.clone(), path.to_path_buf());
+    let result = parse_source_cancellable(source.clone(), path.to_path_buf(), cancellation)?;
     if result.0.1.is_none() {
         cache
             .entries
@@ -652,14 +685,25 @@ fn parse_cached(
     } else {
         cache.entries.shift_remove(path);
     }
-    result
+    Some(result)
 }
 
 fn parse_source(input: ArcStr, path: PathBuf) -> (ParseResult, ParseDiagnostics) {
-    match crate::parser::parse_ast(input.clone(), path.clone()) {
-        Ok(ast) => ((ast, None), Vec::new()),
-        Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
-    }
+    parse_source_cancellable(input, path, None)
+        .expect("uncancellable source parse cannot be cancelled")
+}
+
+fn parse_source_cancellable(
+    input: ArcStr,
+    path: PathBuf,
+    cancellation: Option<&CancellationToken>,
+) -> Option<(ParseResult, ParseDiagnostics)> {
+    Some(
+        match crate::parser::parse_ast_cancellable(input.clone(), path.clone(), cancellation)? {
+            Ok(ast) => ((ast, None), Vec::new()),
+            Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
+        },
+    )
 }
 
 /// Parse one source file from memory.

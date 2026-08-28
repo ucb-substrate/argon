@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use sparse_linear_solver::{analyze as analyze_sparse_system, nullspace as sparse_nullspace};
 use std::collections::VecDeque;
 
+use crate::cancellation::CancellationToken;
+
 const EPSILON: f64 = 1e-8;
 const DEFAULT_GRID: f64 = 0.1;
 
@@ -44,6 +46,8 @@ pub struct Solver {
     /// components. Kept only when no elimination substitution changed the
     /// coordinate space, so SSE can reuse the factorization result.
     sparse_nullspace_cache: Option<Vec<Vec<(f64, Var)>>>,
+    cancellation: Option<CancellationToken>,
+    cancelled: bool,
 }
 
 impl Default for Solver {
@@ -63,6 +67,8 @@ impl Default for Solver {
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
+            cancellation: None,
+            cancelled: false,
         }
     }
 }
@@ -73,14 +79,39 @@ impl Solver {
     }
 
     pub fn with_grid(grid: f64) -> Self {
+        Self::with_grid_cancellable(grid, None)
+    }
+
+    pub fn with_grid_cancellable(grid: f64, cancellation: Option<&CancellationToken>) -> Self {
         assert!(
             grid.is_finite() && grid > 0.,
             "solver grid must be positive and finite"
         );
         Self {
             grid,
+            cancellation: cancellation.cloned(),
             ..Self::default()
         }
+    }
+
+    #[inline]
+    fn cancellation_requested(&mut self) -> bool {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.cancelled = true;
+        }
+        self.cancelled
+    }
+
+    pub fn was_cancelled(&self) -> bool {
+        self.cancelled
+            || self
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
     }
 
     pub fn new_var(&mut self) -> Var {
@@ -97,6 +128,9 @@ impl Solver {
 
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
+            if self.cancellation_requested() {
+                return;
+            }
             // Find any unsolved variable and constrain it to equal 0.
             let v = self.unsolved_vars.first().unwrap();
             self.constrain_eq0(LinearExpr::from(*v));
@@ -204,6 +238,9 @@ impl Solver {
     ///
     /// Constraints should be simplified before this function is invoked.
     pub fn solve(&mut self) {
+        if self.cancellation_requested() {
+            return;
+        }
         if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
             return;
         }
@@ -221,6 +258,9 @@ impl Solver {
         self.sparse_nullspace_cache = Some(Vec::new());
 
         for component in self.constraint_components() {
+            if self.cancellation_requested() {
+                return;
+            }
             self.solve_component(&component.vars, &component.constraints);
         }
         for (id, constraint) in self.constraints.iter_mut() {
@@ -252,6 +292,9 @@ impl Solver {
         self.elim_worklist.clear();
         self.elim_worklist.extend(self.constraints.keys().copied());
         while let Some(id) = self.elim_worklist.pop_front() {
+            if self.cancellation_requested() {
+                return;
+            }
             let Some(constraint) = self.constraints.get_mut(&id) else {
                 continue;
             };

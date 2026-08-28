@@ -8,6 +8,7 @@
 //! (the grammar puts them on the hidden channel).
 
 use super::token::{Token, TokenKind, keyword_or_ident};
+use crate::cancellation::CancellationToken;
 
 #[inline]
 fn is_ident_start(b: u8) -> bool {
@@ -26,15 +27,32 @@ pub struct Lexer<'a> {
     pos: usize,
     /// Added to every emitted offset so spans index the original input.
     base: u32,
+    cancellation: Option<&'a CancellationToken>,
 }
 
 impl<'a> Lexer<'a> {
+    #[cfg(test)]
     pub fn new(src: &'a str, offset_base: usize) -> Self {
+        Self::new_cancellable(src, offset_base, None)
+    }
+
+    pub fn new_cancellable(
+        src: &'a str,
+        offset_base: usize,
+        cancellation: Option<&'a CancellationToken>,
+    ) -> Self {
         Self {
             src: src.as_bytes(),
             pos: 0,
             base: offset_base as u32,
+            cancellation,
         }
+    }
+
+    #[inline]
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     #[inline]
@@ -46,6 +64,10 @@ impl<'a> Lexer<'a> {
     fn skip_trivia(&mut self) {
         let n = self.src.len();
         while self.pos < n {
+            if self.pos & 0xfff == 0 && self.cancelled() {
+                self.pos = n;
+                return;
+            }
             match self.src[self.pos] {
                 b' ' | b'\t' | b'\r' | b'\n' => self.pos += 1,
                 b'/' if self.pos + 1 < n && self.src[self.pos + 1] == b'/' => {
@@ -65,6 +87,9 @@ impl<'a> Lexer<'a> {
 
     /// Produce the next significant token (or `Eof`).
     pub fn next_token(&mut self) -> Token {
+        if self.cancelled() {
+            self.pos = self.src.len();
+        }
         self.skip_trivia();
         let n = self.src.len();
         let start = self.pos;
@@ -84,6 +109,10 @@ impl<'a> Lexer<'a> {
     fn lex_ident_or_keyword(&mut self, start: usize) -> Token {
         self.pos += 1;
         while self.pos < self.src.len() && is_ident_continue(self.src[self.pos]) {
+            if self.pos & 0xfff == 0 && self.cancelled() {
+                self.pos = self.src.len();
+                break;
+            }
             self.pos += 1;
         }
         let kind = keyword_or_ident(&self.src[start..self.pos]);
@@ -93,6 +122,10 @@ impl<'a> Lexer<'a> {
     fn lex_int(&mut self, start: usize) -> Token {
         self.pos += 1;
         while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+            if self.pos & 0xfff == 0 && self.cancelled() {
+                self.pos = self.src.len();
+                break;
+            }
             self.pos += 1;
         }
         self.tok(TokenKind::IntLit, start, self.pos)
@@ -104,6 +137,10 @@ impl<'a> Lexer<'a> {
         let n = self.src.len();
         let mut i = start + 1;
         while i < n {
+            if i & 0xfff == 0 && self.cancelled() {
+                self.pos = n;
+                return self.tok(TokenKind::Eof, n, n);
+            }
             match self.src[i] {
                 b'"' => {
                     self.pos = i + 1;

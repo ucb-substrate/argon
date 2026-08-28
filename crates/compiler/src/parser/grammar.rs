@@ -24,6 +24,7 @@ use crate::ast::{
     SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
     TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
 };
+use crate::cancellation::CancellationToken;
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
 
@@ -116,11 +117,20 @@ pub struct Parser<'a> {
     scope_orders: Vec<u64>,
     depth: u32,
     pub errors: Vec<ParseError>,
+    cancellation: Option<&'a CancellationToken>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str, offset_base: usize) -> Self {
-        let mut lexer = Lexer::new(src, offset_base);
+        Self::new_cancellable(src, offset_base, None)
+    }
+
+    pub fn new_cancellable(
+        src: &'a str,
+        offset_base: usize,
+        cancellation: Option<&'a CancellationToken>,
+    ) -> Self {
+        let mut lexer = Lexer::new_cancellable(src, offset_base, cancellation);
         let cur = lexer.next_token();
         let nxt = lexer.next_token();
         Self {
@@ -134,7 +144,13 @@ impl<'a> Parser<'a> {
             scope_orders: vec![0],
             depth: 0,
             errors: Vec::new(),
+            cancellation,
         }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
 
     // ------------------------------------------------------------------

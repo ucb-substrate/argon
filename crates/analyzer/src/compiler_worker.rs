@@ -1,8 +1,13 @@
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex, mpsc},
+    thread,
+};
 
 use arc::Library;
 use argonc::{
     WorkspaceConfig,
+    cancellation::CancellationToken,
     compile::{CompileOutput, StaticErrorCompileOutput},
     incremental::IncrementalCompiler,
     parse::WorkspaceParseAst,
@@ -41,6 +46,7 @@ enum Command {
     RemoveSource(PathBuf),
     Compile {
         request: CompileRequest,
+        cancellation: CancellationToken,
         response: oneshot::Sender<CompileResult>,
     },
 }
@@ -50,6 +56,7 @@ enum Command {
 #[derive(Clone, Debug)]
 pub(crate) struct CompilerWorker {
     commands: mpsc::Sender<Command>,
+    active_cancellation: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl CompilerWorker {
@@ -59,21 +66,50 @@ impl CompilerWorker {
             .name("argon-compiler".to_owned())
             .spawn(move || run(receiver))
             .expect("spawn incremental compiler worker");
-        Self { commands }
+        Self {
+            commands,
+            active_cancellation: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn cancel_active(&self) {
+        if let Some(cancellation) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            cancellation.cancel();
+        }
     }
 
     pub(crate) fn set_source_text(&self, path: PathBuf, contents: String) {
+        self.cancel_active();
         let _ = self.commands.send(Command::SetSource { path, contents });
     }
 
     pub(crate) fn remove_source(&self, path: PathBuf) {
+        self.cancel_active();
         let _ = self.commands.send(Command::RemoveSource(path));
     }
 
     pub(crate) async fn compile(&self, request: CompileRequest) -> Option<CompileResult> {
         let (response, result) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = self
+            .active_cancellation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(cancellation.clone())
+        {
+            previous.cancel();
+        }
         self.commands
-            .send(Command::Compile { request, response })
+            .send(Command::Compile {
+                request,
+                cancellation,
+                response,
+            })
             .ok()?;
         result.await.ok()
     }
@@ -89,35 +125,45 @@ fn run(commands: mpsc::Receiver<Command>) {
             Command::RemoveSource(path) => {
                 compiler.remove_source(&path);
             }
-            Command::Compile { request, response } => {
-                let _ = response.send(compile(&mut compiler, request));
+            Command::Compile {
+                request,
+                cancellation,
+                response,
+            } => {
+                if let Some(result) = compile(&mut compiler, request, &cancellation) {
+                    let _ = response.send(result);
+                }
             }
         }
     }
 }
 
-fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> CompileResult {
+fn compile(
+    compiler: &mut IncrementalCompiler,
+    request: CompileRequest,
+    cancellation: &CancellationToken,
+) -> Option<CompileResult> {
     let CompileRequest { identity, root_dir } = request;
     let manifest_path = root_dir.join("Argon.toml");
     let library = if manifest_path.is_file() {
         match Library::load(&manifest_path) {
             Ok(library) => Some(library),
             Err(error) => {
-                return CompileResult {
+                return Some(CompileResult {
                     identity,
                     config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                     root_dir,
                     ast: WorkspaceParseAst::default(),
                     output: None,
                     messages: vec![error.to_string()],
-                };
+                });
             }
         }
     } else {
         None
     };
     let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
-    let analysis = compiler.analyze_workspace(&workspace);
+    let analysis = compiler.analyze_workspace_cancellable(&workspace, cancellation)?;
     let ast = analysis.ast;
     let mut messages = Vec::new();
 
@@ -140,17 +186,18 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                     )
                 };
                 messages.push(format!("Could not open cell: {message}"));
-                return CompileResult {
+                return Some(CompileResult {
                     identity,
                     root_dir,
                     config: workspace,
                     ast,
                     output: None,
                     messages,
-                };
+                });
             }
-            match compiler.compile_invocation(&workspace, cell) {
-                Ok(output) => Some(output),
+            match compiler.compile_invocation_cancellable(&workspace, cell, cancellation) {
+                Ok(Some(output)) => Some(output),
+                Ok(None) => return None,
                 Err(error) => {
                     messages.push(format!("Open cell is invalid: {error}"));
                     None
@@ -163,14 +210,14 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
         Some(CompileOutput::FatalParseErrors)
     };
 
-    CompileResult {
+    (!cancellation.is_cancelled()).then_some(CompileResult {
         identity,
         root_dir,
         config: workspace,
         ast,
         output,
         messages,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +268,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.identity.revision, 2);
+        assert!(matches!(second.output, Some(CompileOutput::Valid(_))));
+    }
+
+    #[tokio::test]
+    async fn source_update_cancels_in_flight_compilation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+            &tech,
+        )
+        .unwrap();
+        std::fs::write(&root, "cell top() {}\n").unwrap();
+        std::fs::write(
+            directory.path().join("Argon.toml"),
+            "name = \"worker-cancel-test\"\ntech = \"tech.toml\"\n",
+        )
+        .unwrap();
+
+        let worker = CompilerWorker::new();
+        worker.set_source_text(
+            root.clone(),
+            "cell top() { for i in std::range(500000) { let value = i; } }\n".to_owned(),
+        );
+        let compiling_worker = worker.clone();
+        let root_dir = directory.path().to_path_buf();
+        let first = tokio::spawn(async move {
+            compiling_worker
+                .compile(CompileRequest {
+                    identity: CompileIdentity {
+                        revision: 1,
+                        cell: Some("top()".to_owned()),
+                    },
+                    root_dir,
+                })
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        worker.set_source_text(root, "cell top() {}\n".to_owned());
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(2), first)
+            .await
+            .expect("cancelled compilation should stop promptly")
+            .unwrap();
+        assert!(cancelled.is_none());
+
+        let second = worker
+            .compile(CompileRequest {
+                identity: CompileIdentity {
+                    revision: 2,
+                    cell: Some("top()".to_owned()),
+                },
+                root_dir: directory.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
         assert!(matches!(second.output, Some(CompileOutput::Valid(_))));
     }
 }

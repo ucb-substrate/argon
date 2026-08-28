@@ -7,6 +7,7 @@ use indexmap::IndexMap;
 use crate::ast::{
     Ast, AstMetadata, AstTransformer, CallExpr, Decl, Ident, Scope, Span, StringLiteral,
 };
+use crate::cancellation::CancellationToken;
 
 #[derive_where(Debug, Clone)]
 pub struct AnnotatedAst<T: AstMetadata> {
@@ -27,16 +28,30 @@ pub struct AnnotatedAst<T: AstMetadata> {
 
 impl<T: AstMetadata> AnnotatedAst<T> {
     pub fn new<S>(text: ArcStr, ast: &Ast<S, T>, path: PathBuf) -> Self {
+        Self::new_cancellable(text, ast, path, None)
+            .expect("uncancellable AST annotation cannot be cancelled")
+    }
+
+    pub(crate) fn new_cancellable<S>(
+        text: ArcStr,
+        ast: &Ast<S, T>,
+        path: PathBuf,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<Self> {
         let mut pass = AstAnnotationPass {
             text,
             path: path.clone(),
             span2scope: Default::default(),
             span2call: Default::default(),
             phantom: Default::default(),
+            cancellation,
         };
 
         let mut decls = Vec::new();
         for decl in &ast.decls {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return None;
+            }
             match decl {
                 Decl::Fn(f) => {
                     decls.push(Decl::Fn(pass.transform_fn_decl(f)));
@@ -59,7 +74,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             }
         }
 
-        Self {
+        Some(Self {
             source_text: pass.text.clone(),
             text: pass.text,
             generated_declarations: 0,
@@ -70,7 +85,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             path,
             span2scope: pass.span2scope,
             span2call: pass.span2call,
-        }
+        })
     }
 
     /// Moves declarations parsed from the end of the backing text to the
@@ -88,19 +103,25 @@ impl<T: AstMetadata> AnnotatedAst<T> {
     }
 }
 
-struct AstAnnotationPass<S, T: AstMetadata> {
+struct AstAnnotationPass<'a, S, T: AstMetadata> {
     text: ArcStr,
     path: PathBuf,
     span2scope: IndexMap<Span, Scope<Substr, T>>,
     span2call: IndexMap<Span, CallExpr<Substr, T>>,
     phantom: PhantomData<S>,
+    cancellation: Option<&'a CancellationToken>,
 }
 
-impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
+impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<'_, S, T> {
     type InputMetadata = T;
     type OutputMetadata = T;
     type InputS = S;
     type OutputS = Substr;
+
+    fn should_cancel(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+    }
 
     fn dispatch_ident(
         &mut self,

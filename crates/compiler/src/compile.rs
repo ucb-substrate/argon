@@ -27,6 +27,7 @@ use crate::ast::{
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
+use crate::cancellation::CancellationToken;
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
@@ -62,19 +63,29 @@ pub const BUILTINS: [&str; 15] = [
 pub fn static_compile(
     ast: &WorkspaceParseAst,
 ) -> Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)> {
-    if !ast.contains_key(&vec![]) {
+    static_compile_cancellable(ast, None).expect("uncancellable static analysis cannot cancel")
+}
+
+pub(crate) fn static_compile_cancellable(
+    ast: &WorkspaceParseAst,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)>> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return None;
+    }
+    if !ast.contains_key(&vec![]) {
+        return Some(None);
     }
     let (dag, mut errors) = construct_dag(ast);
     // Type checking depends on a complete topological module order. Continuing
     // with a missing module or a dependency cycle only produces misleading
     // follow-on errors from half-populated module binding frames.
     if !errors.is_empty() {
-        return Some((IndexMap::new(), StaticErrorCompileOutput { errors }));
+        return Some(Some((IndexMap::new(), StaticErrorCompileOutput { errors })));
     }
-    let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
+    let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag, cancellation)?;
     errors.extend(new_errors);
-    Some((ast, StaticErrorCompileOutput { errors }))
+    Some(Some((ast, StaticErrorCompileOutput { errors })))
 }
 
 /// Runs static analysis for a parsed workspace and folds parser diagnostics
@@ -130,21 +141,54 @@ pub(crate) fn execute_cell_tracked(
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> TrackedExecution {
+    execute_cell_tracked_with_artifacts(ast, input, config, Vec::new())
+}
+
+pub(crate) fn execute_cell_tracked_with_artifacts(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+    config: &WorkspaceConfig,
+    artifacts: Vec<CellArtifact>,
+) -> TrackedExecution {
+    execute_cell_tracked_with_artifacts_cancellable(ast, input, config, artifacts, None)
+        .expect("uncancellable cell execution cannot be cancelled")
+}
+
+pub(crate) fn execute_cell_tracked_with_artifacts_cancellable(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+    config: &WorkspaceConfig,
+    artifacts: Vec<CellArtifact>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<TrackedExecution> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
     let Some(tech_file) = config.tech.as_deref() else {
-        return TrackedExecution::without_dependencies(missing_tech_output());
+        return Some(TrackedExecution::without_dependencies(missing_tech_output()));
     };
     let tech = match read_tech(tech_file) {
         Ok(tech) => tech,
         Err(error) => {
-            return TrackedExecution::without_dependencies(invalid_tech_output(
+            return Some(TrackedExecution::without_dependencies(invalid_tech_output(
                 ast,
                 error.to_string(),
-            ));
+            )));
         }
     };
-    let mut execution = ExecPass::new(ast, tech, &config.gds_imports).execute_tracked(input);
+    let mut execution = ExecPass::with_artifacts_cancellable(
+        ast,
+        tech,
+        &config.gds_imports,
+        artifacts,
+        cancellation,
+    )
+    .execute_tracked(input);
+    if execution.cancelled {
+        return None;
+    }
     execution.output = check_output_layers(execution.output, tech_file);
-    execution
+    Some(execution)
 }
 
 /// Executes a cell invocation spliced into `ast` by
@@ -163,27 +207,65 @@ pub(crate) fn execute_cell_invocation_tracked(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> TrackedExecution {
+    execute_cell_invocation_tracked_with_artifacts(ast, invocation, config, Vec::new())
+}
+
+pub(crate) fn execute_cell_invocation_tracked_with_artifacts(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+    artifacts: Vec<CellArtifact>,
+) -> TrackedExecution {
+    execute_cell_invocation_tracked_with_artifacts_cancellable(
+        ast, invocation, config, artifacts, None,
+    )
+    .expect("uncancellable invocation execution cannot be cancelled")
+}
+
+pub(crate) fn execute_cell_invocation_tracked_with_artifacts_cancellable(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+    artifacts: Vec<CellArtifact>,
+    cancellation: Option<&CancellationToken>,
+) -> Option<TrackedExecution> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
     let Some(tech_file) = config.tech.as_deref() else {
-        return TrackedExecution::without_dependencies(missing_tech_output());
+        return Some(TrackedExecution::without_dependencies(missing_tech_output()));
     };
     let tech = match read_tech(tech_file) {
         Ok(tech) => tech,
         Err(error) => {
-            return TrackedExecution::without_dependencies(invalid_tech_output(
+            return Some(TrackedExecution::without_dependencies(invalid_tech_output(
                 ast,
                 error.to_string(),
-            ));
+            )));
         }
     };
-    let mut execution =
-        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation_tracked(invocation);
+    let mut execution = ExecPass::with_artifacts_cancellable(
+        ast,
+        tech,
+        &config.gds_imports,
+        artifacts,
+        cancellation,
+    )
+    .execute_invocation_tracked(invocation);
+    if execution.cancelled {
+        return None;
+    }
     execution.output = check_output_layers(execution.output, tech_file);
-    execution
+    Some(execution)
 }
 
 pub(crate) struct TrackedExecution {
     pub(crate) output: CompileOutput,
     pub(crate) dependencies: IndexSet<VarId>,
+    pub(crate) artifacts: Vec<CellArtifact>,
+    pub(crate) artifact_hits: u64,
+    pub(crate) artifact_misses: u64,
+    cancelled: bool,
 }
 
 impl TrackedExecution {
@@ -191,6 +273,10 @@ impl TrackedExecution {
         Self {
             output,
             dependencies: IndexSet::new(),
+            artifacts: Vec::new(),
+            artifact_hits: 0,
+            artifact_misses: 0,
+            cancelled: false,
         }
     }
 }
@@ -260,6 +346,8 @@ pub fn compile(
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
 
+pub(crate) type ModuleDependencies = IndexMap<ModPath, Vec<ModPath>>;
+
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
@@ -280,6 +368,22 @@ pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> (ModDag<'_>, Vec<StaticE
         .collect();
     errors.extend(dependency_cycle_errors(ast, &dag));
     (dag, errors)
+}
+
+pub(crate) fn module_dependencies(
+    ast: &WorkspaceParseAst,
+) -> (ModuleDependencies, Vec<StaticError>) {
+    let (dag, errors) = construct_dag(ast);
+    let dependencies = dag
+        .into_iter()
+        .map(|(module, dependencies)| {
+            (
+                module.clone(),
+                dependencies.keys().map(|path| (*path).clone()).collect(),
+            )
+        })
+        .collect();
+    (dependencies, errors)
 }
 
 fn module_name(path: &ModPath) -> String {
@@ -744,28 +848,59 @@ fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecErro
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct VarIdTyFrame {
-    var_bindings: IndexMap<Substr, (VarId, Ty)>,
+    var_bindings: IndexMap<String, (VarId, Ty)>,
+}
+
+impl VarIdTyFrame {
+    pub(crate) fn interface_fingerprint(&self) -> Vec<u8> {
+        let mut bindings = self.var_bindings.iter().collect_vec();
+        bindings.sort_by(|(left, _), (right, _)| left.cmp(right));
+        bincode::serialize(&bindings).expect("module interface bindings should always serialize")
+    }
+}
+
+pub(crate) struct TypedModuleOutput {
+    pub(crate) ast: AnnotatedAst<VarIdTyMetadata>,
+    pub(crate) bindings: VarIdTyFrame,
+    pub(crate) errors: Vec<StaticError>,
 }
 
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
-    mod_bindings: &'a IndexMap<&'a ModPath, VarIdTyFrame>,
+    mod_bindings: &'a IndexMap<ModPath, VarIdTyFrame>,
     current_path: &'a ModPath,
     next_id: VarId,
     bindings: Vec<VarIdTyFrame>,
     errors: Vec<StaticError>,
+    cancellation: Option<&'a CancellationToken>,
+}
+
+struct WorkspaceVarIdTyPass<'a> {
+    ast: &'a WorkspaceParseAst,
+    dag: &'a ModDag<'a>,
+    cancellation: Option<&'a CancellationToken>,
+    mod_bindings: IndexMap<ModPath, VarIdTyFrame>,
+    workspace_ast: WorkspaceAst<VarIdTyMetadata>,
+    errors: Vec<StaticError>,
+    next_id: VarId,
 }
 
 pub(crate) fn execute_var_id_ty_pass<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
-) -> (WorkspaceAst<VarIdTyMetadata>, Vec<StaticError>) {
-    let mut mod_bindings = IndexMap::new();
-    let mut workspace_ast = IndexMap::new();
-    let mut errors = Vec::new();
-    let mut next_id = 1;
+    cancellation: Option<&'a CancellationToken>,
+) -> Option<(WorkspaceAst<VarIdTyMetadata>, Vec<StaticError>)> {
+    let mut pass = WorkspaceVarIdTyPass {
+        ast,
+        dag,
+        cancellation,
+        mod_bindings: IndexMap::new(),
+        workspace_ast: IndexMap::new(),
+        errors: Vec::new(),
+        next_id: 1,
+    };
     let std_mod_path = vec!["std".to_string()];
     let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
     if let Some((root, _)) = ast.get_key_value(&vec![]) {
@@ -774,59 +909,83 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
             .flatten()
             .chain(ast.keys())
         {
-            execute_var_id_ty_pass_inner(
-                ast,
-                dag,
-                path,
-                &mut mod_bindings,
-                &mut workspace_ast,
-                &mut errors,
-                &mut next_id,
-            );
+            if !pass.analyze(path) {
+                return None;
+            }
         }
     }
-    (workspace_ast, errors)
+    Some((pass.workspace_ast, pass.errors))
 }
-pub(crate) fn execute_var_id_ty_pass_inner<'a>(
-    ast: &'a WorkspaceParseAst,
-    dag: &'a ModDag<'a>,
-    current_path: &'a ModPath,
-    mod_bindings: &mut IndexMap<&'a ModPath, VarIdTyFrame>,
-    workspace_ast: &mut WorkspaceAst<VarIdTyMetadata>,
-    errors: &mut Vec<StaticError>,
-    next_id: &mut VarId,
-) {
-    // TODO: fix hacky way to track visited modules.
-    if mod_bindings.contains_key(&current_path) {
-        return;
-    }
-    mod_bindings.insert(current_path, VarIdTyFrame::default());
 
-    for children in dag[&current_path].keys() {
-        execute_var_id_ty_pass_inner(
-            ast,
-            dag,
-            children,
-            mod_bindings,
-            workspace_ast,
-            errors,
-            next_id,
+impl<'a> WorkspaceVarIdTyPass<'a> {
+    fn analyze(&mut self, current_path: &'a ModPath) -> bool {
+        if self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return false;
+        }
+        // TODO: fix hacky way to track visited modules.
+        if self.mod_bindings.contains_key(current_path) {
+            return true;
+        }
+        self.mod_bindings
+            .insert(current_path.clone(), VarIdTyFrame::default());
+
+        let dependencies = self.dag[current_path].keys().copied().collect_vec();
+        for dependency in dependencies {
+            if !self.analyze(dependency) {
+                return false;
+            }
+        }
+
+        let mut pass = VarIdTyPass {
+            ast: &self.ast[current_path],
+            mod_bindings: &self.mod_bindings,
+            current_path,
+            next_id: self.next_id,
+            bindings: vec![VarIdTyFrame::default()],
+            errors: vec![],
+            cancellation: self.cancellation,
+        };
+        let ast = pass.execute();
+        self.workspace_ast.insert(current_path.clone(), ast);
+        self.errors.extend(pass.errors);
+        self.next_id = pass.next_id;
+        self.mod_bindings.insert(
+            current_path.clone(),
+            pass.bindings.into_iter().next().unwrap(),
         );
+        !self
+            .cancellation
+            .is_some_and(CancellationToken::is_cancelled)
     }
+}
 
+pub(crate) fn analyze_module_cancellable<'a>(
+    ast: &'a WorkspaceParseAst,
+    current_path: &'a ModPath,
+    mod_bindings: &'a IndexMap<ModPath, VarIdTyFrame>,
+    cancellation: Option<&'a CancellationToken>,
+) -> Option<TypedModuleOutput> {
     let mut pass = VarIdTyPass {
         ast: &ast[current_path],
         mod_bindings,
         current_path,
-        next_id: *next_id,
+        next_id: semantic_local_id_start(current_path),
         bindings: vec![VarIdTyFrame::default()],
-        errors: vec![],
+        errors: Vec::new(),
+        cancellation,
     };
     let ast = pass.execute();
-    workspace_ast.insert(current_path.clone(), ast);
-    errors.extend(pass.errors);
-    *next_id = pass.next_id;
-    mod_bindings.insert(current_path, pass.bindings.into_iter().next().unwrap());
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
+    Some(TypedModuleOutput {
+        ast,
+        bindings: pass.bindings.into_iter().next().unwrap(),
+        errors: pass.errors,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1062,7 +1221,7 @@ impl<'a> VarIdTyPass<'a> {
             .last_mut()
             .unwrap()
             .var_bindings
-            .insert(name.clone(), (id, ty));
+            .insert(name.to_string(), (id, ty));
         id
     }
 
@@ -1073,22 +1232,34 @@ impl<'a> VarIdTyPass<'a> {
         // allowing imported enum types in signatures and imported functions in
         // any declaration body regardless of source order.
         for decl in &self.ast.ast.decls {
+            if self.should_cancel() {
+                break;
+            }
             if let Decl::Enum(e) = decl {
                 self.declare_enum_decl(e);
             }
         }
         for decl in &self.ast.ast.decls {
+            if self.should_cancel() {
+                break;
+            }
             if let Decl::Use(u) = decl {
                 self.declare_use_decl(u);
             }
         }
         for decl in &self.ast.ast.decls {
+            if self.should_cancel() {
+                break;
+            }
             if let Decl::Fn(f) = decl {
                 self.declare_fn_decl(f);
             }
         }
 
         for decl in &self.ast.ast.decls {
+            if self.should_cancel() {
+                break;
+            }
             match decl {
                 Decl::Fn(f) => {
                     decls.push(Decl::Fn(self.transform_fn_decl(f)));
@@ -1163,7 +1334,7 @@ impl<'a> VarIdTyPass<'a> {
                 .last_mut()
                 .unwrap()
                 .var_bindings
-                .insert(local_name.name.clone(), binding);
+                .insert(local_name.name.to_string(), binding);
         } else {
             self.errors.push(StaticError {
                 span: self.span(use_decl.span),
@@ -1476,11 +1647,61 @@ impl<S> Expr<S, VarIdTyMetadata> {
     }
 }
 
+/// Stable typed contract for cache invalidation. Variable IDs are omitted so
+/// one-shot invocation analysis and per-module incremental analysis produce
+/// identical versions, while resolved enum variants and structural cell field
+/// types remain part of the contract.
+pub(crate) fn declaration_contract_fingerprint(
+    declaration: &Decl<Substr, VarIdTyMetadata>,
+) -> Option<Vec<u8>> {
+    match declaration {
+        Decl::Cell(cell) => {
+            let args = cell
+                .args
+                .iter()
+                .map(|argument| &argument.metadata.1)
+                .collect_vec();
+            let fields = cell
+                .scope
+                .stmts
+                .iter()
+                .filter_map(|statement| match statement {
+                    Statement::LetBinding(binding) => {
+                        Some((binding.name.name.as_str(), binding.value.ty()))
+                    }
+                    _ => None,
+                })
+                .collect_vec();
+            Some(
+                bincode::serialize(&("cell", args, fields))
+                    .expect("typed cell contracts should always serialize"),
+            )
+        }
+        Decl::Fn(function) => {
+            let args = function
+                .args
+                .iter()
+                .map(|argument| &argument.metadata.1)
+                .collect_vec();
+            Some(
+                bincode::serialize(&("fn", args, &function.scope.metadata))
+                    .expect("typed function contracts should always serialize"),
+            )
+        }
+        _ => None,
+    }
+}
+
 impl<'a> AstTransformer for VarIdTyPass<'a> {
     type InputMetadata = ParseMetadata;
     type OutputMetadata = VarIdTyMetadata;
     type InputS = Substr;
     type OutputS = Substr;
+
+    fn should_cancel(&self) -> bool {
+        self.cancellation
+            .is_some_and(CancellationToken::is_cancelled)
+    }
 
     fn dispatch_ident(
         &mut self,
@@ -2303,7 +2524,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 .mod_bindings
                 .get(&path)
                 .as_ref()
-                .and_then(|mod_binding| mod_binding.var_bindings.get(name).cloned());
+                .and_then(|mod_binding| mod_binding.var_bindings.get(name.as_str()).cloned());
             self.typecheck_call(name, lookup, input.span, args, false)
         }
     }
@@ -2494,14 +2715,14 @@ impl CellArg {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 struct CellExecKey {
     cell: VarId,
     args: Vec<CellArgKey>,
     scope_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 enum CellArgKey {
     Float(u64),
     Int(i64),
@@ -2509,6 +2730,32 @@ enum CellArgKey {
     String(String),
     Enum(String),
     Seq(Vec<CellArgKey>),
+}
+
+/// A solved cell subgraph that can be imported into a later execution after
+/// its declaration dependencies have been validated by the incremental
+/// session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct CellArtifact {
+    cell_keys: HashMap<CellExecKey, CellId>,
+    pub(crate) cells: IndexMap<CellId, Arc<CompiledCell>>,
+    root: CellId,
+    pub(crate) dependencies: IndexSet<VarId>,
+    pub(crate) errors: Vec<ExecError>,
+}
+
+impl CellArtifact {
+    pub(crate) fn same_key(&self, other: &Self) -> bool {
+        let root_key = self
+            .cell_keys
+            .iter()
+            .find_map(|(key, cell)| (*cell == self.root).then_some(key));
+        let other_root_key = other
+            .cell_keys
+            .iter()
+            .find_map(|(key, cell)| (*cell == other.root).then_some(key));
+        root_key == other_root_key
+    }
 }
 
 impl From<&CellArg> for CellArgKey {
@@ -2552,6 +2799,28 @@ fn semantic_declaration_id(module: &ModPath, kind: &str, name: &str) -> VarId {
     write(kind.as_bytes());
     write(name.as_bytes());
     hash | (1_u64 << 63)
+}
+
+/// Gives independently analyzed modules disjoint, deterministic local-ID
+/// namespaces. Top-level declarations use the high half of the ID space.
+fn semantic_local_id_start(module: &ModPath) -> VarId {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in b"argon-module-locals"
+        .iter()
+        .copied()
+        .chain(module.iter().flat_map(|component| {
+            component
+                .as_bytes()
+                .iter()
+                .copied()
+                .chain(std::iter::once(0xff))
+        }))
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    // Reserve enough low bits for all practical local bindings in a module,
+    // while keeping the declaration-ID high bit clear.
+    (hash & 0x7fff_ffff_0000_0000) | 0x0000_0000_0010_0000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2812,7 +3081,15 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, CompiledCell>,
+    compiled_cell_artifacts: HashMap<CellId, Arc<CompiledCell>>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    seed_artifacts: HashMap<CellExecKey, CellArtifact>,
+    artifacts: HashMap<CellExecKey, CellArtifact>,
+    artifact_dependency_stack: Vec<IndexSet<VarId>>,
+    artifact_hits: u64,
+    artifact_misses: u64,
+    cancellation: Option<CancellationToken>,
+    cancelled: bool,
     /// Cell declaration generated for a compiler entry point's invocation, and
     /// the cell it executed as. A call made directly by that cell is the
     /// top-level invocation rather than a nested instantiation, so it is named
@@ -2849,10 +3126,12 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 }
 
 impl<'a> ExecPass<'a> {
-    pub(crate) fn new(
+    pub(crate) fn with_artifacts_cancellable(
         ast: &'a WorkspaceAst<VarIdTyMetadata>,
         tech: Technology,
         gds_imports: &[(String, PathBuf)],
+        artifacts: Vec<CellArtifact>,
+        cancellation: Option<&CancellationToken>,
     ) -> Self {
         let gds_imports = gds_imports
             .iter()
@@ -2902,7 +3181,25 @@ impl<'a> ExecPass<'a> {
             next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            compiled_cell_artifacts: HashMap::new(),
             compiled_cell_cache: HashMap::new(),
+            seed_artifacts: artifacts
+                .into_iter()
+                .map(|artifact| {
+                    let key = artifact
+                        .cell_keys
+                        .iter()
+                        .find_map(|(key, cell)| (*cell == artifact.root).then(|| key.clone()))
+                        .expect("cell artifacts contain their root key");
+                    (key, artifact)
+                })
+                .collect(),
+            artifacts: HashMap::new(),
+            artifact_dependency_stack: Vec::new(),
+            artifact_hits: 0,
+            artifact_misses: 0,
+            cancellation: cancellation.cloned(),
+            cancelled: false,
             entry_cell_var: None,
             entry_cell: None,
             dependencies: IndexSet::new(),
@@ -2920,6 +3217,18 @@ impl<'a> ExecPass<'a> {
         }
     }
 
+    #[inline]
+    fn cancellation_requested(&mut self) -> bool {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.cancelled = true;
+        }
+        self.cancelled
+    }
+
     pub(crate) fn lookup(&self, frame: FrameId, var: VarId) -> Option<ValueId> {
         let frame = self
             .frames
@@ -2933,7 +3242,13 @@ impl<'a> ExecPass<'a> {
     }
 
     pub(crate) fn execute_tracked(mut self, input: CompileInput<'a>) -> TrackedExecution {
+        if self.cancellation_requested() {
+            return self.complete(CompileOutput::FatalParseErrors);
+        }
         self.declare_globals();
+        if self.cancellation_requested() {
+            return self.complete(CompileOutput::FatalParseErrors);
+        }
         if input.cell.is_empty() {
             let output = CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
@@ -3006,7 +3321,13 @@ impl<'a> ExecPass<'a> {
         mut self,
         invocation: &CellInvocation,
     ) -> TrackedExecution {
+        if self.cancellation_requested() {
+            return self.complete(CompileOutput::FatalParseErrors);
+        }
         self.declare_globals();
+        if self.cancellation_requested() {
+            return self.complete(CompileOutput::FatalParseErrors);
+        }
         let ast = self.ast;
         let root = &ast[&ModPath::new()];
         let entry = root
@@ -3106,10 +3427,125 @@ impl<'a> ExecPass<'a> {
         self.complete(output)
     }
 
-    fn complete(self, output: CompileOutput) -> TrackedExecution {
+    fn complete(mut self, output: CompileOutput) -> TrackedExecution {
+        self.cancellation_requested();
         TrackedExecution {
             output,
-            dependencies: self.dependencies,
+            dependencies: std::mem::take(&mut self.dependencies),
+            artifacts: std::mem::take(&mut self.artifacts).into_values().collect(),
+            artifact_hits: self.artifact_hits,
+            artifact_misses: self.artifact_misses,
+            cancelled: self.cancelled,
+        }
+    }
+
+    fn observe_dependency(&mut self, dependency: VarId) {
+        self.dependencies.insert(dependency);
+        for dependencies in &mut self.artifact_dependency_stack {
+            dependencies.insert(dependency);
+        }
+    }
+
+    fn import_artifact(&mut self, artifact: &CellArtifact) -> Option<CellId> {
+        let old_cells = artifact.cells.keys().copied().collect_vec();
+        let cell_ids = old_cells
+            .iter()
+            .map(|old| (*old, self.alloc_id()))
+            .collect::<HashMap<_, _>>();
+        if artifact.cells.values().any(|cell| {
+            cell.objects.values().any(|object| {
+                matches!(object, SolvedValue::Instance(instance)
+                    if !cell_ids.contains_key(&instance.cell))
+            })
+        }) {
+            return None;
+        }
+
+        let cell_values = cell_ids
+            .values()
+            .copied()
+            .map(|cell| {
+                let value = self.new_ready_value(Value::Cell(cell));
+                (cell, value)
+            })
+            .collect::<HashMap<_, _>>();
+        for old in old_cells {
+            let new = cell_ids[&old];
+            let mut cell = artifact.cells[&old].as_ref().clone();
+            for object in cell.objects.values_mut() {
+                if let SolvedValue::Instance(instance) = object {
+                    instance.cell = cell_ids[&instance.cell];
+                    instance.cell_vid = cell_values[&instance.cell];
+                }
+            }
+            self.compiled_cell_artifacts
+                .insert(new, Arc::new(cell.clone()));
+            if self.compiled_cells.insert(new, cell).is_some() {
+                return None;
+            }
+        }
+        for (key, old) in &artifact.cell_keys {
+            self.compiled_cell_cache.insert(key.clone(), cell_ids[old]);
+        }
+        for dependency in &artifact.dependencies {
+            self.observe_dependency(*dependency);
+        }
+        for error in &artifact.errors {
+            let mut error = error.clone();
+            if let Some(cell) = cell_ids.get(&error.cell) {
+                error.cell = *cell;
+            }
+            self.errors.push(error);
+        }
+        Some(cell_ids[&artifact.root])
+    }
+
+    fn make_artifact(
+        &self,
+        root_key: &CellExecKey,
+        root: CellId,
+        dependencies: IndexSet<VarId>,
+        error_start: usize,
+    ) -> CellArtifact {
+        let mut reachable = IndexSet::new();
+        let mut pending = vec![root];
+        while let Some(cell_id) = pending.pop() {
+            if !reachable.insert(cell_id) {
+                continue;
+            }
+            for object in self.compiled_cells[&cell_id].objects.values() {
+                if let SolvedValue::Instance(instance) = object {
+                    pending.push(instance.cell);
+                }
+            }
+        }
+        let cells = self
+            .compiled_cells
+            .iter()
+            .filter(|(cell, _)| reachable.contains(*cell))
+            .map(|(cell, value)| {
+                (
+                    *cell,
+                    self.compiled_cell_artifacts
+                        .get(cell)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(value.clone())),
+                )
+            })
+            .collect();
+        let mut cell_keys = self
+            .compiled_cell_cache
+            .iter()
+            .filter(|(_, cell)| reachable.contains(*cell))
+            .map(|(key, cell)| (key.clone(), *cell))
+            .collect::<HashMap<_, _>>();
+        cell_keys.insert(root_key.clone(), root);
+        CellArtifact {
+            cell_keys,
+            cells,
+            root,
+            dependencies,
+            errors: self.errors[error_start..].to_vec(),
         }
     }
 
@@ -3119,8 +3555,11 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        if self.cancellation_requested() {
+            return Err(());
+        }
         if self.entry_cell_var != Some(cell) {
-            self.dependencies.insert(cell);
+            self.observe_dependency(cell);
         }
         let cache_key = CellExecKey {
             cell,
@@ -3129,6 +3568,17 @@ impl<'a> ExecPass<'a> {
         };
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
+        }
+        if self.entry_cell_var != Some(cell)
+            && let Some(artifact) = self.seed_artifacts.remove(&cache_key)
+            && let Some(cell_id) = self.import_artifact(&artifact)
+        {
+            self.artifact_hits += 1;
+            self.artifacts.insert(cache_key, artifact);
+            return Ok(cell_id);
+        }
+        if self.entry_cell_var != Some(cell) {
+            self.artifact_misses += 1;
         }
         if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
             if !args.is_empty() {
@@ -3142,8 +3592,23 @@ impl<'a> ExecPass<'a> {
                 });
                 return Err(());
             }
-            let cell_id = self.execute_gds_cell(&declared_name, &path, scope_name)?;
-            self.compiled_cell_cache.insert(cache_key, cell_id);
+            let error_start = self.errors.len();
+            self.artifact_dependency_stack
+                .push(IndexSet::from_iter([cell]));
+            let cell_id = match self.execute_gds_cell(&declared_name, &path, scope_name) {
+                Ok(cell_id) => cell_id,
+                Err(()) => {
+                    self.artifact_dependency_stack.pop();
+                    return Err(());
+                }
+            };
+            self.compiled_cell_cache.insert(cache_key.clone(), cell_id);
+            let dependencies = self
+                .artifact_dependency_stack
+                .pop()
+                .expect("GDS cell artifact dependency frame exists");
+            let artifact = self.make_artifact(&cache_key, cell_id, dependencies, error_start);
+            self.artifacts.insert(cache_key, artifact);
             return Ok(cell_id);
         }
         let mut frame = Frame {
@@ -3198,6 +3663,9 @@ impl<'a> ExecPass<'a> {
         };
 
         let cell_id = self.alloc_id();
+        let error_start = self.errors.len();
+        self.artifact_dependency_stack
+            .push(IndexSet::from_iter([cell]));
         if self.entry_cell_var == Some(cell) {
             self.entry_cell = Some(cell_id);
         }
@@ -3208,7 +3676,10 @@ impl<'a> ExecPass<'a> {
                     cell_id,
                     CellState {
                         solve_iters: 0,
-                        solver: Solver::with_grid(self.tech.grid_step()),
+                        solver: Solver::with_grid_cancellable(
+                            self.tech.grid_step(),
+                            self.cancellation.as_ref(),
+                        ),
                         fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
@@ -3238,6 +3709,9 @@ impl<'a> ExecPass<'a> {
 
         let mut seq_num = SeqNum::new();
         for stmt in cell_decl.scope.stmts.iter() {
+            if self.cancellation_requested() {
+                return Err(());
+            }
             let loc = DynLoc {
                 cell: cell_id,
                 frame: fid,
@@ -3275,6 +3749,9 @@ impl<'a> ExecPass<'a> {
         }
 
         while {
+            if self.cancellation_requested() {
+                return Err(());
+            }
             let state = self.cell_state(cell_id);
             !state.deferred.is_empty() || !state.solver.fully_solved()
         } {
@@ -3283,12 +3760,18 @@ impl<'a> ExecPass<'a> {
                 let state = self.cell_state_mut(cell_id);
                 state.deferred.pop()
             } {
+                if self.cancellation_requested() {
+                    return Err(());
+                }
                 progress |= self.eval_partial(cell_id, vid)?;
             }
 
             let state = self.cell_state_mut(cell_id);
             state.solve_iters += 1;
             state.solver.solve();
+            if state.solver.was_cancelled() {
+                return Err(());
+            }
             progress = !state.solver.updated_vars().is_empty() || progress;
             let update_var_dependents = |state: &mut CellState| {
                 for var in state.solver.updated_vars().clone() {
@@ -3378,9 +3861,19 @@ impl<'a> ExecPass<'a> {
             .pop_back()
             .expect("failed to pop cell id");
 
-        let cell = self.emit(cell_id);
-        assert!(self.compiled_cells.insert(cell_id, cell).is_none());
-        self.compiled_cell_cache.insert(cache_key, cell_id);
+        let compiled_cell = self.emit(cell_id);
+        self.compiled_cell_artifacts
+            .insert(cell_id, Arc::new(compiled_cell.clone()));
+        assert!(self.compiled_cells.insert(cell_id, compiled_cell).is_none());
+        self.compiled_cell_cache.insert(cache_key.clone(), cell_id);
+        let dependencies = self
+            .artifact_dependency_stack
+            .pop()
+            .expect("cell artifact dependency frame exists");
+        if self.entry_cell_var != Some(cell) {
+            let artifact = self.make_artifact(&cache_key, cell_id, dependencies, error_start);
+            self.artifacts.insert(cache_key, artifact);
+        }
         Ok(cell_id)
     }
 
@@ -3561,19 +4054,19 @@ impl<'a> ExecPass<'a> {
                     emit,
                 },
             )]);
-            self.compiled_cells.insert(
-                cell_id,
-                CompiledCell {
-                    scopes,
-                    root,
-                    fields,
-                    sse_basis: SseBasis::Nullspace(Vec::new()),
-                    objects,
-                    fallback_constraints_used: Vec::new(),
-                    unsolved_vars: IndexSet::new(),
-                    inconsistent_constraints: IndexSet::new(),
-                },
-            );
+            let cell = CompiledCell {
+                scopes,
+                root,
+                fields,
+                sse_basis: SseBasis::Nullspace(Vec::new()),
+                objects,
+                fallback_constraints_used: Vec::new(),
+                unsolved_vars: IndexSet::new(),
+                inconsistent_constraints: IndexSet::new(),
+            };
+            self.compiled_cell_artifacts
+                .insert(cell_id, Arc::new(cell.clone()));
+            self.compiled_cells.insert(cell_id, cell);
         }
         Ok(top_id)
     }
@@ -3871,6 +4364,9 @@ impl<'a> ExecPass<'a> {
     fn declare_globals(&mut self) {
         for ast in self.ast.values() {
             for decl in &ast.ast.decls {
+                if self.cancellation_requested() {
+                    return;
+                }
                 match decl {
                     Decl::Fn(f) => {
                         let vid = self.value_id();
@@ -3997,6 +4493,9 @@ impl<'a> ExecPass<'a> {
     ) -> ValueId {
         let mut seq_num = SeqNum::new();
         for stmt in &s.stmts {
+            if self.cancellation_requested() {
+                return self.nil_value;
+            }
             let loc = DynLoc {
                 cell: cell_id,
                 frame,
@@ -4098,7 +4597,7 @@ impl<'a> ExecPass<'a> {
                         }))
                     })
                 } else {
-                    self.dependencies.insert(
+                    self.observe_dependency(
                         c.metadata
                             .0
                             .expect("no var ID assigned to function being called"),
@@ -4330,6 +4829,9 @@ impl<'a> ExecPass<'a> {
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
+        if self.cancellation_requested() {
+            return Err(());
+        }
         let v = self.values.get(&vid);
         if v.is_none() {
             return Ok(false);
@@ -5023,15 +5525,19 @@ impl<'a> ExecPass<'a> {
                         if let (Value::Int(start), Value::Int(stop), Value::Int(step)) =
                             (start, stop, step)
                         {
+                            let (start, stop, step) = (*start, *stop, *step);
                             // Build the whole `[Int]` in one O(n) pass (O(log n) pushes),
                             // avoiding the per-element interpreter overhead (frame, scope,
                             // deferred value) of the old recursive `cons` definition.
                             let mut seq = Seq::new();
-                            if *step > 0 {
-                                let mut i = *start;
-                                while i < *stop {
+                            if step > 0 {
+                                let mut i = start;
+                                while i < stop {
+                                    if self.cancellation_requested() {
+                                        return Err(());
+                                    }
                                     seq.push_back(Value::Int(i));
-                                    i += *step;
+                                    i += step;
                                 }
                             }
                             self.values.insert(vid, Defer::Ready(Value::Seq(seq)));
@@ -6209,6 +6715,9 @@ impl<'a> ExecPass<'a> {
                         }
                     };
                     for (i, elem) in seq.iter().enumerate() {
+                        if self.cancellation_requested() {
+                            return Err(());
+                        }
                         let mut frame = Frame {
                             bindings: Default::default(),
                             parent: Some(vref.loc.frame),

@@ -16,6 +16,7 @@ use cfgrammar::Span;
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{CallExpr, Decl};
+use crate::cancellation::CancellationToken;
 use crate::parse::{AnnotatedParseAst, ParseMetadata};
 
 /// A syntax error with the byte span (into the original input) it occurred at.
@@ -33,14 +34,25 @@ pub struct ParseError {
 /// by span, so spans must be byte-exact (they index the original, untrimmed
 /// input). On any syntax error, returns every collected diagnostic.
 pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<ParseError>> {
+    parse_ast_cancellable(input, path, None).expect("uncancellable parse cannot be cancelled")
+}
+
+pub(crate) fn parse_ast_cancellable(
+    input: ArcStr,
+    path: PathBuf,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Result<AnnotatedParseAst, Vec<ParseError>>> {
     let input_for_ast = input.clone();
     let normalized = input.trim_start_matches(char::is_whitespace);
     let offset_base = input.len() - normalized.len();
 
-    let mut parser = grammar::Parser::new(normalized, offset_base);
+    let mut parser = grammar::Parser::new_cancellable(normalized, offset_base, cancellation);
     let ast = parser.parse_root();
+    if parser.is_cancelled() {
+        return None;
+    }
     if !parser.errors.is_empty() {
-        return Err(parser.finish_errors(offset_base, input.len()));
+        return Some(Err(parser.finish_errors(offset_base, input.len())));
     }
     let unsupported = ast
         .decls
@@ -58,9 +70,13 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
         })
         .collect::<Vec<_>>();
     if !unsupported.is_empty() {
-        return Err(unsupported);
+        return Some(Err(unsupported));
     }
-    Ok(AnnotatedAst::new(input_for_ast, &ast, path))
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return None;
+    }
+    let annotated = AnnotatedAst::new_cancellable(input_for_ast, &ast, path, cancellation)?;
+    Some(Ok(annotated))
 }
 
 /// Parse a single cell invocation (a `callExpr`) from raw input, as used by the
