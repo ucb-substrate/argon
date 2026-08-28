@@ -104,6 +104,16 @@ fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
     rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
 }
 
+fn shape_fill(dither_pattern: &str) -> ShapeFill {
+    match dither_pattern {
+        "I0" => ShapeFill::Solid,
+        "I1" => ShapeFill::Hollow,
+        // Built-in and custom patterns are retained by the technology model.
+        // Until the renderer implements each bitmap, use its existing stipple.
+        _ => ShapeFill::Stippling,
+    }
+}
+
 #[derive(Default)]
 struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
@@ -320,19 +330,19 @@ impl EditorState {
             .clone();
         let mut state = ProcessScopeState::default();
         let old_layers = self.layers.read(cx);
-        for layer in &solved_cell.layers.layers {
+        for layer in &solved_cell.tech.layers {
             let name = SharedString::from(layer.name.clone());
             let visible = old_layers
                 .layers
                 .get(&name)
                 .map(|layer| layer.visible)
-                .unwrap_or(true);
+                .unwrap_or(layer.style.visible);
             state.layers.insert(
                 name.clone(),
                 LayerState {
                     name,
                     color: rgb_to_rgba(layer.fill_color),
-                    fill: ShapeFill::Stippling,
+                    fill: shape_fill(&layer.style.dither_pattern),
                     border_color: rgb_to_rgba(layer.border_color),
                     visible,
                     used: false,

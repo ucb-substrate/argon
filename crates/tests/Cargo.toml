@@ -5,6 +5,9 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 analyzer = { package = "argon-analyzer", path = "../analyzer" }
 argonc = { path = "../compiler" }

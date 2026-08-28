@@ -1,2 +1,2 @@
 name = "bool-literal"
-lyp = "../lyp/basic.lyp"
+tech = "../tech/basic.tech.toml"

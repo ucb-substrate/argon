@@ -140,9 +140,9 @@ pub enum StaticErrorKind {
     /// Source text could not be parsed.
     #[error("error during parsing: {0}")]
     ParseError(String),
-    /// A layer-properties file is invalid.
+    /// A technology file is invalid.
     #[error("{0}")]
-    InvalidLyp(String),
+    InvalidTech(String),
     /// A source file could not be loaded or resolved.
     #[error("could not load source: {0}")]
     SourceError(String),
@@ -160,9 +160,9 @@ pub struct ExecError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Error)]
 pub enum ExecErrorKind {
-    /// Dynamic compilation requires a workspace layer-properties file.
-    #[error("workspace does not configure a LYP file")]
-    MissingLyp,
+    /// Dynamic compilation requires a workspace technology file.
+    #[error("workspace does not configure a technology file")]
+    MissingTech,
     /// A transformation contains a non-Manhattan rotation.
     #[error("non-Manhattan rotation")]
     InvalidRotation,
@@ -196,18 +196,18 @@ pub enum ExecErrorKind {
     /// A cell does not have enough constraints for a unique solution.
     #[error("cell is underconstrained")]
     Underconstrained,
-    /// A rectangle uses a layer absent from the layer-properties file.
-    #[error("rectangle uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
-    IllegalLayer { layer: String, lyp: String },
-    /// A text label uses a layer absent from the layer-properties file.
-    #[error("text uses layer `{layer}`, which is not defined in LYP file `{lyp}`")]
-    IllegalTextLayer { layer: String, lyp: String },
+    /// A rectangle uses a layer absent from the technology file.
+    #[error("rectangle uses layer `{layer}`, which is not defined in technology file `{tech}`")]
+    IllegalLayer { layer: String, tech: String },
+    /// A text label uses a layer absent from the technology file.
+    #[error("text uses layer `{layer}`, which is not defined in technology file `{tech}`")]
+    IllegalTextLayer { layer: String, tech: String },
     /// A constraint conflicts with the rest of the system.
     #[error("inconsistent constraint")]
     InconsistentConstraint(ConstraintId),
-    /// A value is not sufficiently close to its required rounding step.
-    #[error("invalid rounding")]
-    InvalidRounding(Var),
+    /// A solved value is not sufficiently close to the technology grid.
+    #[error("solved value is off grid")]
+    OffGrid(Var),
     /// A cell or instance has no bounding box.
     #[error("empty bbox")]
     EmptyBbox,
