@@ -986,113 +986,111 @@ impl Render for Editor {
                 ),
             )
         };
-        let status_bar = (displayed_status.is_some() || activity_label.is_some()).then(|| {
-            let mut status_fills_space = false;
-            let mut bar = div()
-                .id("status_bar")
-                .border_t_1()
-                .border_color(theme.divider)
-                .bg(theme.bg)
-                .px_2()
-                .py_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2();
-            if let Some((message, is_connection_error)) = displayed_status {
-                let details = message.details;
-                let is_compilation_error = details == MessageDetails::Diagnostics;
-                let title = if is_compilation_error {
-                    "Compilation errors"
-                } else if is_connection_error {
-                    "Connection error"
-                } else if message.typ == MessageType::ERROR {
-                    "Error"
-                } else if message.typ == MessageType::WARNING {
-                    "Warning"
-                } else {
-                    "Message"
-                };
-                let status_text = if is_compilation_error {
-                    SharedString::from(title)
-                } else {
-                    SharedString::from(format!("{title}: {}", message.text))
-                };
-                let action_label = if is_compilation_error {
-                    "Open diagnostics (Ctrl-Shift-D)"
-                } else {
-                    "View messages (Ctrl-Shift-M)"
-                };
-                let mut status_message = div()
-                    .overflow_x_hidden()
-                    .text_ellipsis()
-                    .text_color(theme.error)
-                    .child(status_text);
-                if !is_compilation_error {
-                    status_message = status_message.flex_1();
-                    status_fills_space = true;
-                }
-                bar = bar
+        let mut status_fills_space = false;
+        let mut status_bar = div()
+            .id("status_bar")
+            .border_t_1()
+            .border_color(theme.divider)
+            .bg(theme.bg)
+            .px_2()
+            .py_1()
+            .min_h(px(27.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2();
+        if let Some((message, is_connection_error)) = displayed_status {
+            let details = message.details;
+            let is_compilation_error = details == MessageDetails::Diagnostics;
+            let title = if is_compilation_error {
+                "Compilation errors"
+            } else if is_connection_error {
+                "Connection error"
+            } else if message.typ == MessageType::ERROR {
+                "Error"
+            } else if message.typ == MessageType::WARNING {
+                "Warning"
+            } else {
+                "Message"
+            };
+            let status_text = if is_compilation_error {
+                SharedString::from(title)
+            } else {
+                SharedString::from(format!("{title}: {}", message.text))
+            };
+            let action_label = if is_compilation_error {
+                "Open diagnostics (Ctrl-Shift-D)"
+            } else {
+                "View messages (Ctrl-Shift-M)"
+            };
+            let mut status_message = div()
+                .overflow_x_hidden()
+                .text_ellipsis()
+                .text_color(theme.error)
+                .child(status_text);
+            if !is_compilation_error {
+                status_message = status_message.flex_1();
+                status_fills_space = true;
+            }
+            status_bar = status_bar
+                .child(
+                    svg()
+                        .path("icons/circle-exclamation-solid-full.svg")
+                        .w(px(14.))
+                        .h_auto()
+                        .text_color(theme.error),
+                )
+                .child(status_message)
+                .child(
+                    div()
+                        .id("show_status_details")
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .child(action_label)
+                        .on_click(cx.listener(move |editor, _, _, cx| {
+                            if details == MessageDetails::Diagnostics {
+                                editor.open_invoking_command(
+                                    Some("Argon diagnostics<CR>"),
+                                    false,
+                                    cx,
+                                );
+                            } else {
+                                editor.open_invoking_command(Some("messages<CR>"), false, cx);
+                            }
+                        })),
+                );
+        }
+        if let Some(activity_label) = activity_label {
+            if !status_fills_space {
+                status_bar = status_bar.child(div().flex_1());
+            }
+            status_bar = status_bar.child(
+                div()
+                    .id("compilation_status")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_color(theme.subtext)
                     .child(
                         svg()
-                            .path("icons/circle-exclamation-solid-full.svg")
+                            .path("icons/arrow-rotate-right-solid-full.svg")
                             .w(px(14.))
                             .h_auto()
-                            .text_color(theme.error),
+                            .text_color(theme.subtext)
+                            .with_animation(
+                                "compilation_spinner",
+                                Animation::new(Duration::from_millis(800)).repeat(),
+                                |icon, delta| {
+                                    icon.with_transformation(Transformation::rotate(percentage(
+                                        delta,
+                                    )))
+                                },
+                            ),
                     )
-                    .child(status_message)
-                    .child(
-                        div()
-                            .id("show_status_details")
-                            .text_color(theme.text)
-                            .cursor_pointer()
-                            .child(action_label)
-                            .on_click(cx.listener(move |editor, _, _, cx| {
-                                if details == MessageDetails::Diagnostics {
-                                    editor.open_invoking_command(
-                                        Some("Argon diagnostics<CR>"),
-                                        false,
-                                        cx,
-                                    );
-                                } else {
-                                    editor.open_invoking_command(Some("messages<CR>"), false, cx);
-                                }
-                            })),
-                    );
-            }
-            if let Some(activity_label) = activity_label {
-                if !status_fills_space {
-                    bar = bar.child(div().flex_1());
-                }
-                bar = bar.child(
-                    div()
-                        .id("compilation_status")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .text_color(theme.subtext)
-                        .child(
-                            svg()
-                                .path("icons/arrow-rotate-right-solid-full.svg")
-                                .w(px(14.))
-                                .h_auto()
-                                .text_color(theme.subtext)
-                                .with_animation(
-                                    "compilation_spinner",
-                                    Animation::new(Duration::from_millis(800)).repeat(),
-                                    |icon, delta| {
-                                        icon.with_transformation(Transformation::rotate(
-                                            percentage(delta),
-                                        ))
-                                    },
-                                ),
-                        )
-                        .child(activity_label),
-                );
-            }
-            bar
-        });
+                    .child(activity_label),
+            );
+        }
         let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
@@ -1137,7 +1135,7 @@ impl Render for Editor {
                     )
                     .child(self.layer_sidebar.clone()),
             )
-            .children(status_bar);
+            .child(status_bar);
         root = if let Some(font_size) = font_size {
             root.text_size(px(font_size))
         } else {
