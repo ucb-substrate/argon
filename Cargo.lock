@@ -262,6 +262,7 @@ dependencies = [
  "tarpc",
  "tempfile",
  "tokio",
+ "tower-lsp-server",
 ]
 
 [[package]]

@@ -33,7 +33,10 @@ use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::*,
-    editor::{self, CompileOutputState, EditorState, LayerState, ScopeAddress},
+    editor::{
+        self, CompileOutputState, EditorState, LayerState, SOURCE_EDIT_REJECTED_MESSAGE,
+        ScopeAddress,
+    },
     sse::SparseVec,
 };
 
@@ -6451,62 +6454,66 @@ impl LayoutCanvas {
                                 let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
                                 let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
                                 self.state.update(cx, |state, cx| {
-                                    let error = state.solved_cell.update(cx, {
-                                        |cell, cx| {
-                                            if let Some(cell) = cell.as_mut() {
-                                                // TODO update in memory representation of code
-                                                // TODO add solver to gui
-                                                let scope_address =
-                                                    &cell.state[&cell.selected_scope].address;
-                                                let reachable_objs = cell.output.reachable_objs(
-                                                    scope_address.cell,
-                                                    scope_address.scope,
-                                                );
-                                                let names: IndexSet<_> =
-                                                    reachable_objs.values().collect();
-                                                let scope = cell
-                                                    .output
-                                                    .cells
-                                                    .get(&scope_address.cell)
-                                                    .unwrap()
-                                                    .scopes
-                                                    .get(&scope_address.scope)
-                                                    .unwrap();
-                                                let rect_name = (0..)
-                                                    .map(|i| format!("rect{i}"))
-                                                    .find(|name| !names.contains(name))
-                                                    .unwrap();
+                                    let error: Option<SharedString> =
+                                        state.solved_cell.update(cx, {
+                                            |cell, cx| {
+                                                if let Some(cell) = cell.as_mut() {
+                                                    // TODO update in memory representation of code
+                                                    // TODO add solver to gui
+                                                    let scope_address =
+                                                        &cell.state[&cell.selected_scope].address;
+                                                    let reachable_objs =
+                                                        cell.output.reachable_objs(
+                                                            scope_address.cell,
+                                                            scope_address.scope,
+                                                        );
+                                                    let names: IndexSet<_> =
+                                                        reachable_objs.values().collect();
+                                                    let scope = cell
+                                                        .output
+                                                        .cells
+                                                        .get(&scope_address.cell)
+                                                        .unwrap()
+                                                        .scopes
+                                                        .get(&scope_address.scope)
+                                                        .unwrap();
+                                                    let rect_name = (0..)
+                                                        .map(|i| format!("rect{i}"))
+                                                        .find(|name| !names.contains(name))
+                                                        .unwrap();
 
-                                                match state.lang_server_client.draw_rect(
-                                                    scope.span.clone(),
-                                                    rect_name,
-                                                    compile::BasicRect {
-                                                        layer: state
-                                                            .layers
-                                                            .read(cx)
-                                                            .selected_layer
-                                                            .clone()
-                                                            .map(|s| s.to_string()),
-                                                        x0: draw_source_coordinate(p0p.x, grid),
-                                                        y0: draw_source_coordinate(p0p.y, grid),
-                                                        x1: draw_source_coordinate(p1p.x, grid),
-                                                        y1: draw_source_coordinate(p1p.y, grid),
-                                                        construction: false,
-                                                    },
-                                                ) {
-                                                    Ok(None) => Some(
-                                                        "inconsistent editor and GUI state".into(),
-                                                    ),
-                                                    Ok(Some(_)) => None,
-                                                    Err(_) => None,
+                                                    match state.lang_server_client.draw_rect(
+                                                        scope.span.clone(),
+                                                        rect_name,
+                                                        compile::BasicRect {
+                                                            layer: state
+                                                                .layers
+                                                                .read(cx)
+                                                                .selected_layer
+                                                                .clone()
+                                                                .map(|s| s.to_string()),
+                                                            x0: draw_source_coordinate(p0p.x, grid),
+                                                            y0: draw_source_coordinate(p0p.y, grid),
+                                                            x1: draw_source_coordinate(p1p.x, grid),
+                                                            y1: draw_source_coordinate(p1p.y, grid),
+                                                            construction: false,
+                                                        },
+                                                    ) {
+                                                        Ok(None) => Some(
+                                                            SOURCE_EDIT_REJECTED_MESSAGE.into(),
+                                                        ),
+                                                        Ok(Some(_)) => None,
+                                                        Err(_) => None,
+                                                    }
+                                                } else {
+                                                    Some("no cell to edit".into())
                                                 }
-                                            } else {
-                                                Some("no cell to edit".into())
                                             }
-                                        }
-                                    });
-                                    if state.fatal_error.is_none() {
-                                        state.fatal_error = error;
+                                        });
+                                    if state.message.is_none()
+                                        && let Some(error) = error
+                                    {
+                                        state.show_message(MessageType::ERROR, error);
                                     }
                                 });
                             } else {
@@ -6615,10 +6622,14 @@ impl LayoutCanvas {
                             cx.notify();
                         }
                         Ok(None) => {
-                            let _ = self.state.read(cx).lang_server_client.show_message(
-                                MessageType::ERROR,
-                                "Could not insert the instance into the source scope.",
-                            );
+                            self.state.update(cx, |state, _cx| {
+                                if state.message.is_none() {
+                                    state.show_message(
+                                        MessageType::ERROR,
+                                        SOURCE_EDIT_REJECTED_MESSAGE,
+                                    );
+                                }
+                            });
                         }
                         Err(_) => {}
                     }
@@ -7180,7 +7191,7 @@ impl LayoutCanvas {
 
             let mut inserted = false;
             self.state.update(cx, |state, cx| {
-                let error = state.solved_cell.update(cx, |cell, _cx| {
+                let error: Option<SharedString> = state.solved_cell.update(cx, |cell, _cx| {
                     let Some(cell) = cell.as_mut() else {
                         return Some("no cell to edit".into());
                     };
@@ -7225,12 +7236,14 @@ impl LayoutCanvas {
                             inserted = true;
                             None
                         }
-                        Ok(None) => Some("inconsistent editor and GUI state".into()),
+                        Ok(None) => Some(SOURCE_EDIT_REJECTED_MESSAGE.into()),
                         Err(_) => None,
                     }
                 });
-                if state.fatal_error.is_none() {
-                    state.fatal_error = error;
+                if state.message.is_none()
+                    && let Some(error) = error
+                {
+                    state.show_message(MessageType::ERROR, error);
                 }
             });
             if inserted {

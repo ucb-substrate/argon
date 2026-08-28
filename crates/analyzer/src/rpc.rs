@@ -5,6 +5,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use argonc::{
     ast::Span,
     compile::{BasicRect, CellId, CompileOutput, CompiledData},
+    parse::WorkspaceParseAst,
 };
 
 use serde::{Deserialize, Serialize};
@@ -125,6 +126,7 @@ pub trait LangServer {
 #[tarpc::service]
 pub trait Gui {
     async fn update_cell(snapshot: CompilationSnapshot);
+    async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
     async fn workspace_modified(modified: bool);
@@ -135,6 +137,15 @@ pub trait Gui {
 }
 
 pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
+pub(crate) const READ_ONLY_GENERATED_SOURCE_MESSAGE: &str =
+    "Imported GDS cells are read-only in the GUI. Open an Argon source cell to edit geometry.";
+
+pub(crate) fn source_edit_error(ast: &WorkspaceParseAst, span: &Span) -> Option<&'static str> {
+    let Some(ast) = ast.values().find(|ast| ast.path == span.path) else {
+        return Some("The selected GUI object is no longer part of the current Argon workspace.");
+    };
+    (span.span.end() > ast.source_text.len()).then_some(READ_ONLY_GENERATED_SOURCE_MESSAGE)
+}
 
 pub(crate) fn editor_buffers_are_current(source: &SourceState, compiled: &PublishedState) -> bool {
     compiled.ast.values().all(|ast| {
@@ -308,6 +319,19 @@ fn instance_placement_expression(invocation: &str, x: f64, y: f64) -> String {
 }
 
 impl State {
+    pub(crate) async fn report_message(&self, typ: MessageType, message: impl Into<String>) {
+        let message = message.into();
+        self.editor_client.show_message(typ, message.clone()).await;
+        if typ != MessageType::LOG
+            && let Some(connection) = self.gui_connection().await
+        {
+            let _ = connection
+                .client
+                .show_message(context::current(), typ, message)
+                .await;
+        }
+    }
+
     async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
@@ -366,9 +390,7 @@ impl State {
                 }
             }
             drop(state);
-            self.editor_client
-                .show_message(MessageType::ERROR, error)
-                .await;
+            self.report_message(MessageType::ERROR, error).await;
             false
         } else {
             true
@@ -458,11 +480,14 @@ impl LangServer for State {
         rect: BasicRect<f64>,
     ) -> Option<Span> {
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
         let url = Uri::from_file_path(&scope_span.path)?;
         let ast = workspace_ast
             .values()
@@ -509,11 +534,14 @@ impl LangServer for State {
             return None;
         }
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
         let url = Uri::from_file_path(&scope_span.path)?;
         let ast = workspace_ast
             .values()
@@ -550,11 +578,14 @@ impl LangServer for State {
             return None;
         }
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
         let url = Uri::from_file_path(&scope_span.path)?;
         let ast = workspace_ast
             .values()
@@ -589,11 +620,14 @@ impl LangServer for State {
         y: f64,
     ) -> Option<Span> {
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
         let url = Uri::from_file_path(&scope_span.path)?;
         let ast = workspace_ast
             .values()
@@ -641,11 +675,14 @@ impl LangServer for State {
         params: DimensionParams,
     ) -> Option<Span> {
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
         let url = Uri::from_file_path(&scope_span.path)?;
         let ast = workspace_ast
             .values()
@@ -685,11 +722,14 @@ impl LangServer for State {
         value: String,
     ) -> Option<Span> {
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
         let url = Uri::from_file_path(&span.path)?;
         let ast = workspace_ast.values().find(|ast| ast.path == span.path)?;
         let call = ast.span2call.get(&span)?;
@@ -727,11 +767,23 @@ impl LangServer for State {
             return Some(Vec::new());
         }
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return None;
         };
+        let source_error = edits
+            .iter()
+            .map(|edit| &edit.span)
+            .chain(
+                initial_conditions
+                    .iter()
+                    .map(|initial_condition| &initial_condition.call_span),
+            )
+            .find_map(|span| source_edit_error(&workspace_ast, span));
+        if let Some(error) = source_error {
+            self.report_message(MessageType::ERROR, error).await;
+            return None;
+        }
 
         // Resolve "ensure kwarg" requests against the current AST. Existing
         // kwargs become ordinary value replacements. Missing kwargs sharing a
@@ -849,11 +901,14 @@ impl LangServer for State {
         rhs: String,
     ) {
         let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.editor_client
-                .show_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
             return;
         };
+        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
+            self.report_message(MessageType::ERROR, error).await;
+            return;
+        }
         let Some(url) = Uri::from_file_path(&scope_span.path) else {
             return;
         };
@@ -919,9 +974,10 @@ mod tests {
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
-        Document, DrawSegmentConstraint, PathParams, PolygonParams, editor_buffers_are_current,
-        insert_statement, instance_placement_expression, missing_initial_condition_edit,
-        path_expression, polygon_expression, segment_constraint_statements,
+        Document, DrawSegmentConstraint, PathParams, PolygonParams,
+        READ_ONLY_GENERATED_SOURCE_MESSAGE, editor_buffers_are_current, insert_statement,
+        instance_placement_expression, missing_initial_condition_edit, path_expression,
+        polygon_expression, segment_constraint_statements, source_edit_error,
     };
     use crate::{PublishedState, SourceState};
 
@@ -945,6 +1001,31 @@ mod tests {
             .insert(uri, Document::new(source, 1));
 
         assert!(editor_buffers_are_current(&source_state, &compiled));
+
+        let source_scope = compiled
+            .ast
+            .values()
+            .find(|ast| ast.path == source_path)
+            .and_then(|ast| ast.span2scope.keys().next())
+            .cloned()
+            .expect("source cell should have a scope");
+        assert_eq!(source_edit_error(&compiled.ast, &source_scope), None);
+
+        let imported_scope = compiled
+            .ast
+            .values()
+            .find(|ast| ast.path == source_path)
+            .and_then(|ast| {
+                ast.span2scope
+                    .keys()
+                    .find(|span| span.span.end() > ast.source_text.len())
+            })
+            .cloned()
+            .expect("GDS declaration should have a generated scope");
+        assert_eq!(
+            source_edit_error(&compiled.ast, &imported_scope),
+            Some(READ_ONLY_GENERATED_SOURCE_MESSAGE)
+        );
     }
 
     #[test]
