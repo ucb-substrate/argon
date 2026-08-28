@@ -2093,6 +2093,155 @@ mod tests {
         )));
     }
 
+    fn static_errors(source: &str) -> Vec<crate::compile::StaticError> {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        output.errors
+    }
+
+    fn comparison_source(comparison: &str) -> String {
+        format!(
+            r#"
+                enum E {{ A, B }}
+                fn ident(value: Any) -> Any {{ value }}
+                cell top() {{
+                    let r = rect("met1", x0=0., y0=0., y1=10.);
+                    let e = E::A;
+                    let anything = ident(3);
+                    let s = cons(1, []);
+                    let t = cons(2, []);
+                    let empty = [];
+                    if {comparison} {{ eq(r.x1, 100.); }} else {{ eq(r.x1, 200.); }};
+                }}
+            "#
+        )
+    }
+
+    #[test]
+    fn comparison_checks_both_operands() {
+        // Each of these used to pass `arc check` and then hit an `unreachable!()`
+        // in the evaluator, because only the left operand was type checked.
+        for comparison in [
+            "1. < 2",
+            "1 < 2.",
+            "1 == E::A",
+            r#"1 == "x""#,
+            "1 < r",
+            "1. == anything",
+            "1. < anything",
+        ] {
+            let errors = static_errors(&comparison_source(comparison));
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error.kind,
+                    StaticErrorKind::ComparisonMismatchedTypes
+                        | StaticErrorKind::ComparisonInvalidType
+                )),
+                "`{comparison}` should be rejected as a comparison: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequences_only_compare_for_equality_against_seq_nil() {
+        // The evaluator has no arm for two populated sequences, and none for
+        // ordering a sequence, so everything but `seq == []` must be rejected.
+        for comparison in ["s == t", "s != t", "s < t", "s < []", "[] > s"] {
+            let errors = static_errors(&comparison_source(comparison));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error.kind, StaticErrorKind::SeqMustCompareEqSeqNil)),
+                "`{comparison}` should be rejected as a sequence comparison: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_accepts_matching_operands() {
+        for comparison in [
+            "1 < 2",
+            "1. < 2.",
+            "e == E::A",
+            "s == []",
+            "[] != s",
+            "empty == []",
+        ] {
+            let errors = static_errors(&comparison_source(comparison));
+            assert!(
+                errors.is_empty(),
+                "`{comparison}` should type check: {errors:?}"
+            );
+        }
+    }
+
+    fn fn_decl_source(decl: &str) -> String {
+        format!(
+            r#"
+                enum E {{ A, B }}
+                {decl}
+                cell top() {{
+                    let r = rect("met1", x0=0., y0=0., x1=1., y1=2.)!;
+                }}
+            "#
+        )
+    }
+
+    #[test]
+    fn fn_body_must_match_declared_return_ty() {
+        // Each of these used to pass `arc check`, then abort the evaluator: callers
+        // trust the declared return type, so the body's value reaches an `unwrap_*`
+        // expecting the declared representation.
+        for decl in [
+            "fn f() -> Float { }",
+            "fn f() -> Bool { 1 }",
+            "fn f() -> Float { 1 }",
+            "fn f() -> Int { 1. }",
+            "fn f() -> Int { E::A }",
+            "fn f() -> [Int] { 1 }",
+            "fn f() -> (Int, Int) { 1 }",
+            "fn f() -> [Int] { cons(1., []) }",
+            "fn f(x: Int) { x }",
+        ] {
+            let errors = static_errors(&fn_decl_source(decl));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error.kind, StaticErrorKind::IncorrectTy { .. })),
+                "`{decl}` should be rejected: its body does not return the declared type: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fn_body_matching_declared_return_ty_is_accepted() {
+        for decl in [
+            "fn f() { }",
+            "fn f() -> Float { 1. }",
+            "fn f() -> Int { 1 }",
+            "fn f() -> Bool { true }",
+            "fn f() -> E { E::A }",
+            "fn f(x: Int) -> Int { x }",
+            "fn f() -> [Int] { cons(1, []) }",
+            // An empty sequence inhabits every sequence type, as `is_eq_ty` allows.
+            "fn f() -> [Int] { [] }",
+            "fn f() -> (Int, Float) { (1, 2.,) }",
+            // A trailing semicolon makes the body's value `()`, matching no return type.
+            "fn f() { let x = 1; }",
+            "fn f() -> Any { 1 }",
+            "fn f(x: Any) -> Int { x }",
+        ] {
+            let errors = static_errors(&fn_decl_source(decl));
+            assert!(errors.is_empty(), "`{decl}` should type check: {errors:?}");
+        }
+    }
+
     #[test]
     fn argon_path_dimensions_are_constrained_and_exported() {
         let root = parse_source_text(
