@@ -451,8 +451,8 @@ pub struct LayerSideBar {
     name_filter: Entity<TextInput>,
     state: Entity<LayerSideBarState>,
     editor_state: Entity<EditorState>,
-    #[allow(dead_code)]
-    subscriptions: Vec<Subscription>,
+    // Retained to keep the sidebar's observations active.
+    _subscriptions: Vec<Subscription>,
 }
 
 impl LayerSideBar {
@@ -474,7 +474,7 @@ impl LayerSideBar {
             name_filter,
             state,
             editor_state: editor_state.clone(),
-            subscriptions,
+            _subscriptions: subscriptions,
         }
     }
 }
@@ -685,8 +685,8 @@ pub struct HierarchySideBar {
     tool: Entity<ToolState>,
     name_filter: Entity<TextInput>,
     pub state: Entity<HierarchySideBarState>,
-    #[allow(dead_code)]
-    subscriptions: Vec<Subscription>,
+    // Retained to keep the sidebar's observations active.
+    _subscriptions: Vec<Subscription>,
 }
 
 impl HierarchySideBar {
@@ -706,7 +706,7 @@ impl HierarchySideBar {
             tool,
             name_filter,
             state,
-            subscriptions,
+            _subscriptions: subscriptions,
         }
     }
 
