@@ -662,11 +662,11 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(None, cx);
+        self.open_invoking_command(None, true, cx);
     }
 
     fn show_messages(&mut self, _: &ShowMessages, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_invoking_command(Some("messages<CR>"), cx);
+        self.open_invoking_command(Some("messages<CR>"), false, cx);
     }
 
     fn show_diagnostics(
@@ -675,7 +675,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_diagnostics(cx);
+        self.open_invoking_command(Some("Argon diagnostics<CR>"), false, cx);
     }
 
     fn instantiate_command(
@@ -684,7 +684,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon inst "), cx);
+        self.open_invoking_command(Some("Argon inst "), true, cx);
     }
 
     fn open_cell_command(
@@ -693,25 +693,30 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon openCell "), cx);
+        self.open_invoking_command(Some("Argon openCell "), true, cx);
     }
 
-    fn open_invoking_command(&mut self, command: Option<&str>, cx: &mut Context<Self>) {
-        // Neovim may be blocked at a hit-enter or error prompt. Focus it
-        // before queuing the notification so the user can clear that prompt.
-        self.focus_invoker(cx);
+    fn open_invoking_command(
+        &mut self,
+        command: Option<&str>,
+        return_to_gui: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A returning workflow may be blocked at a hit-enter or error prompt.
+        // Focus Neovim first so the user can clear it before the notification.
+        if return_to_gui {
+            self.focus_invoker(cx);
+        }
         let _ = self
             .state
             .read(cx)
             .lang_server_client
-            .open_command_bar(command.map(str::to_owned));
-    }
-
-    fn open_diagnostics(&mut self, cx: &mut Context<Self>) {
-        let _ = self.state.read(cx).lang_server_client.open_diagnostics();
-        // The diagnostics notification does not use Neovim's command line, so
-        // make the OS activation request last and leave focus in the editor.
-        self.focus_invoker(cx);
+            .open_command_bar(command.map(str::to_owned), return_to_gui);
+        if !return_to_gui {
+            // Leave the final activation request pointed at Neovim. Commands
+            // configured this way intentionally do not bounce back to Argon.
+            self.focus_invoker(cx);
+        }
     }
 
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
@@ -811,9 +816,13 @@ impl Render for Editor {
                         .child(action_label)
                         .on_click(cx.listener(move |editor, _, _, cx| {
                             if details == MessageDetails::Diagnostics {
-                                editor.open_diagnostics(cx);
+                                editor.open_invoking_command(
+                                    Some("Argon diagnostics<CR>"),
+                                    false,
+                                    cx,
+                                );
                             } else {
-                                editor.open_invoking_command(Some("messages<CR>"), cx);
+                                editor.open_invoking_command(Some("messages<CR>"), false, cx);
                             }
                         })),
                 )

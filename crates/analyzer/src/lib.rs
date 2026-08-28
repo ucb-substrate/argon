@@ -827,18 +827,9 @@ impl Request for Save {
 struct FocusEditor;
 
 impl Notification for FocusEditor {
-    type Params = Option<String>;
+    type Params = rpc::FocusEditorParams;
 
     const METHOD: &'static str = "custom/focusEditor";
-}
-
-#[derive(Debug, Clone, Copy)]
-struct OpenDiagnostics;
-
-impl Notification for OpenDiagnostics {
-    type Params = ();
-
-    const METHOD: &'static str = "custom/openDiagnostics";
 }
 
 impl LanguageServer for Backend {

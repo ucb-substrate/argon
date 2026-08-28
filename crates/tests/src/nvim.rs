@@ -21,7 +21,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_gui_command_returns_focus_to_gui() {
+    async fn gui_commands_respect_return_focus_configuration() {
         let mut command = crate::nvim_command();
         command
             .arg("-l")
