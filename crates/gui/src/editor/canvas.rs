@@ -3213,6 +3213,20 @@ fn fit_scale(viewport: Size<Pixels>, width: f32, height: f32) -> f32 {
     }
 }
 
+fn offset_after_horizontal_reflow(
+    offset: Point<Pixels>,
+    previous_bounds: Bounds<Pixels>,
+    next_bounds: Bounds<Pixels>,
+) -> Point<Pixels> {
+    if previous_bounds.size.width <= px(0.) || previous_bounds.size.height <= px(0.) {
+        return offset;
+    }
+    Point::new(
+        offset.x + previous_bounds.origin.x - next_bounds.origin.x,
+        offset.y,
+    )
+}
+
 /// Flatten the solved geometry of one compiled cell into rectangles relative
 /// to that cell's origin. Placement paints these as a single pointer-following
 /// outline without disturbing the layout currently open in the editor.
@@ -3396,6 +3410,8 @@ impl Element for CanvasElement {
             cx.drop_image(image, Some(window));
         }
         self.inner.update(cx, |inner, cx| {
+            inner.offset =
+                offset_after_horizontal_reflow(inner.offset, inner.screen_bounds, bounds);
             inner.screen_bounds = bounds;
             inner.update_raster_display_transform();
             if inner.pending_init {
@@ -8699,6 +8715,30 @@ mod tests {
         assert_eq!(fit_scale(viewport, 100., 0.), 9.);
         assert_eq!(fit_scale(viewport, 0., 100.), 4.5);
         assert_eq!(fit_scale(viewport, 100., 100.), 4.5);
+    }
+
+    #[test]
+    fn horizontal_canvas_reflow_keeps_the_layout_origin_stationary() {
+        let previous_bounds =
+            Bounds::new(Point::new(px(200.), px(80.)), Size::new(px(800.), px(600.)));
+        let next_bounds = Bounds::new(Point::new(px(280.), px(80.)), Size::new(px(720.), px(600.)));
+        let offset = Point::new(px(350.), px(240.));
+        let next_offset = offset_after_horizontal_reflow(offset, previous_bounds, next_bounds);
+
+        assert_eq!(
+            previous_bounds.origin.x + offset.x,
+            next_bounds.origin.x + next_offset.x
+        );
+        assert_eq!(next_offset.y, offset.y);
+
+        let right_sidebar_reflow = Bounds::new(
+            previous_bounds.origin,
+            Size::new(px(700.), previous_bounds.size.height),
+        );
+        assert_eq!(
+            offset_after_horizontal_reflow(offset, previous_bounds, right_sidebar_reflow),
+            offset
+        );
     }
 
     #[test]

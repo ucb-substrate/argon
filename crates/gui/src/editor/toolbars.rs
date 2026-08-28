@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use analyzer::rpc::LangServerAction;
-use argonc::compile::{CellId, SolvedValue};
+use argonc::compile::{CellId, CompiledData, SolvedValue};
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
@@ -256,9 +256,9 @@ fn sidebar_scrollbar(
     .size_full()
 }
 
-fn sidebar_scroll_area(
+fn sidebar_scroll_frame(
     id: &'static str,
-    content: Div,
+    content: impl IntoElement,
     scroll_handle: &ScrollHandle,
     scroll_state: &Entity<SidebarScrollState>,
     owner: EntityId,
@@ -270,16 +270,7 @@ fn sidebar_scroll_area(
         .flex_1()
         .min_h_0()
         .min_w_0()
-        .child(
-            content
-                .id(SharedString::from(format!("{id}_content")))
-                .size_full()
-                .min_h_0()
-                .min_w_0()
-                .overflow_scroll()
-                .scrollbar_width(px(SIDEBAR_SCROLLBAR_WIDTH))
-                .track_scroll(scroll_handle),
-        )
+        .child(content)
         .child(
             div()
                 .absolute()
@@ -312,6 +303,31 @@ fn sidebar_scroll_area(
                     theme,
                 )),
         )
+}
+
+fn sidebar_scroll_area(
+    id: &'static str,
+    content: Div,
+    scroll_handle: &ScrollHandle,
+    scroll_state: &Entity<SidebarScrollState>,
+    owner: EntityId,
+    theme: &'static Theme,
+) -> Stateful<Div> {
+    sidebar_scroll_frame(
+        id,
+        content
+            .id(SharedString::from(format!("{id}_content")))
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .overflow_scroll()
+            .scrollbar_width(px(SIDEBAR_SCROLLBAR_WIDTH))
+            .track_scroll(scroll_handle),
+        scroll_handle,
+        scroll_state,
+        owner,
+        theme,
+    )
 }
 
 pub struct TitleBar {
@@ -1025,6 +1041,7 @@ impl Render for LayerSideBar {
 
 pub struct HierarchySideBarState {
     pub expanded_scopes: IndexSet<ScopePath>,
+    rows_revision: u64,
     width: Pixels,
     pub(super) context_menu: Option<HierarchyContextMenu>,
 }
@@ -1033,6 +1050,7 @@ impl Default for HierarchySideBarState {
     fn default() -> Self {
         Self {
             expanded_scopes: IndexSet::new(),
+            rows_revision: 0,
             width: px(DEFAULT_SIDEBAR_WIDTH),
             context_menu: None,
         }
@@ -1045,13 +1063,30 @@ pub(super) struct HierarchyContextMenu {
     position: Point<Pixels>,
 }
 
+#[derive(Clone, Copy)]
+struct HierarchyRow {
+    scope: ScopeAddress,
+    count: usize,
+    depth: usize,
+}
+
+struct HierarchyRowsCache {
+    output: Arc<CompiledData>,
+    rows_revision: u64,
+    filter: String,
+    rows: Arc<Vec<HierarchyRow>>,
+    widest_row: Option<usize>,
+}
+
 pub struct HierarchySideBar {
     editor_state: Entity<EditorState>,
     tool: Entity<ToolState>,
     name_filter: Entity<TextInput>,
     pub state: Entity<HierarchySideBarState>,
     scroll_handle: ScrollHandle,
+    list_scroll_handle: UniformListScrollHandle,
     scroll_state: Entity<SidebarScrollState>,
+    rows_cache: Option<HierarchyRowsCache>,
     canvas: Entity<LayoutCanvas>,
     // Retained to keep the sidebar's observations active.
     _subscriptions: Vec<Subscription>,
@@ -1070,169 +1105,40 @@ impl HierarchySideBar {
         let subscriptions = vec![cx.observe(&solved_cell, |_, _, cx| cx.notify())];
         let state = cx.new(|_cx| HierarchySideBarState::default());
         let scroll_state = cx.new(|_cx| SidebarScrollState::default());
+        let list_scroll_handle = UniformListScrollHandle::new();
+        let scroll_handle = list_scroll_handle.0.borrow().base_handle.clone();
         Self {
             editor_state: editor_state.clone(),
             tool,
             name_filter,
             state,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle,
+            list_scroll_handle,
             scroll_state,
+            rows_cache: None,
             canvas: canvas.clone(),
             _subscriptions: subscriptions,
         }
     }
 
-    fn render_scopes_helper(
-        &mut self,
-        cx: &mut Context<Self>,
+    fn collect_scope_rows(
         solved_cell: &CompileOutputState,
-        scopes: &mut Vec<Div>,
+        expanded_scopes: &IndexSet<ScopePath>,
+        filter: &str,
+        rows: &mut Vec<HierarchyRow>,
         scope: ScopeAddress,
         count: usize,
         depth: usize,
     ) {
-        let icon_wh = self.editor_state.read(cx).icon_size.unwrap_or(16.);
-        let icon_div = || {
-            div()
-                .w(px(icon_wh + 8.))
-                .h(px(icon_wh + 8.))
-                .flex_shrink_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .child(div().flex_1())
-        };
-        let solved_cell_clone_1 = self.editor_state.read(cx).solved_cell.clone();
-        let solved_cell_clone_2 = self.editor_state.read(cx).solved_cell.clone();
-        let tool_clone = self.tool.clone();
         let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
-        let scope_path = solved_cell.scope_paths[&scope].clone();
-        let self_entity = cx.entity();
-        let expanded = self.state.read(cx).expanded_scopes.contains(&scope_path);
-        let editor_state = self.editor_state.read(cx);
-        let theme = editor_state.theme();
-        if scope_state
-            .name
-            .to_lowercase()
-            .contains(&self.name_filter.read(cx).content.to_lowercase())
-        {
-            let is_cell = solved_cell.output.cells[&scope.cell].root == scope.scope;
-            let mut scope_name = div()
-                .id(SharedString::from(format!("scope_select_{scope:?}")))
-                .flex_grow()
-                .flex_shrink_0()
-                .child(format!(
-                    "{}{}",
-                    scope_state.name,
-                    if count > 1 {
-                        format!(" ({count})")
-                    } else {
-                        "".to_string()
-                    }
-                ))
-                .on_click({
-                    let scope_path = scope_path.clone();
-                    move |_event, _window, cx| {
-                        solved_cell_clone_1.update(cx, |state, cx| {
-                            if let Some(state) = state.as_mut() {
-                                state.selected_scope = scope_path.clone();
-                                cx.notify();
-                            }
-                        });
-                        tool_clone.update(cx, |tool, cx| {
-                            *tool = ToolState::default();
-                            cx.notify();
-                        });
-                    }
-                });
-            if is_cell {
-                let sidebar_state = self.state.clone();
-                scope_name =
-                    scope_name.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                        window.prevent_default();
-                        cx.stop_propagation();
-                        sidebar_state.update(cx, |state, cx| {
-                            state.context_menu = Some(HierarchyContextMenu {
-                                cell: scope.cell,
-                                position: event.position,
-                            });
-                            cx.notify();
-                        });
-                    });
-            }
-            scopes.push(
-                div()
-                    .flex()
-                    .min_w_full()
-                    .flex_shrink_0()
-                    .bg(
-                        if scope == solved_cell.state[&solved_cell.selected_scope].address {
-                            theme.selection
-                        } else {
-                            theme.sidebar
-                        },
-                    )
-                    .child(div().w(px(12. * depth as f32)).flex_shrink_0())
-                    .child(
-                        icon_div()
-                            .child(
-                                svg()
-                                    .path(if expanded {
-                                        "icons/angle-down-solid-full.svg"
-                                    } else {
-                                        "icons/angle-right-solid-full.svg"
-                                    })
-                                    .w(px(icon_wh))
-                                    .h_auto()
-                                    .text_color(theme.text),
-                            )
-                            .child(div().flex_1())
-                            .id(SharedString::from(format!("scope_collapse_{scope:?}",)))
-                            .on_click({
-                                let scope_path = scope_path.clone();
-                                move |_event, _window, cx| {
-                                    self_entity.read(cx).state.clone().update(cx, |state, cx| {
-                                        if !state.expanded_scopes.insert(scope_path.clone()) {
-                                            state.expanded_scopes.swap_remove(&scope_path);
-                                        }
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    )
-                    .child(scope_name)
-                    .child(
-                        icon_div()
-                            .child(
-                                svg()
-                                    .path(if scope_state.visible {
-                                        "icons/eye-solid-full.svg"
-                                    } else {
-                                        "icons/eye-slash-solid-full.svg"
-                                    })
-                                    .w(px(icon_wh))
-                                    .h_auto()
-                                    .text_color(theme.text),
-                            )
-                            .child(div().flex_1())
-                            .id(SharedString::from(format!("scope_control_{scope:?}",)))
-                            .on_click({
-                                let scope_path = scope_path.clone();
-                                move |_event, _window, cx| {
-                                    solved_cell_clone_2.update(cx, |state, cx| {
-                                        if let Some(state) = state.as_mut() {
-                                            let visible = state.state[&scope_path].visible;
-                                            Arc::make_mut(&mut state.state)
-                                                .get_mut(&scope_path)
-                                                .unwrap()
-                                                .visible = !visible;
-                                            cx.notify();
-                                        }
-                                    })
-                                }
-                            }),
-                    ),
-            );
+        let scope_path = &solved_cell.scope_paths[&scope];
+        let expanded = expanded_scopes.contains(scope_path);
+        if scope_state.name.to_lowercase().contains(filter) {
+            rows.push(HierarchyRow {
+                scope,
+                count,
+                depth,
+            });
         }
         let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
         let mut cells = IndexMap::new();
@@ -1246,20 +1152,22 @@ impl HierarchySideBar {
         if expanded {
             for (cell, count) in cells {
                 let scope = solved_cell.output.cells[&cell].root;
-                self.render_scopes_helper(
-                    cx,
+                Self::collect_scope_rows(
                     solved_cell,
-                    scopes,
+                    expanded_scopes,
+                    filter,
+                    rows,
                     ScopeAddress { scope, cell },
                     count,
                     depth + 1,
                 );
             }
             for child_scope in scope_info.children.clone() {
-                self.render_scopes_helper(
-                    cx,
+                Self::collect_scope_rows(
                     solved_cell,
-                    scopes,
+                    expanded_scopes,
+                    filter,
+                    rows,
                     ScopeAddress {
                         scope: child_scope,
                         cell: scope.cell,
@@ -1271,28 +1179,253 @@ impl HierarchySideBar {
         }
     }
 
-    fn render_scopes(&mut self, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
-        let mut scopes = Vec::new();
-        if let Some(state) = self.editor_state.read(cx).solved_cell.read(cx).clone() {
-            let scope = state.output.cells[&state.output.top].root;
-            self.render_scopes_helper(
-                cx,
-                &state,
-                &mut scopes,
+    fn render_scope_row(
+        &mut self,
+        cx: &mut Context<Self>,
+        solved_cell: &CompileOutputState,
+        row: HierarchyRow,
+    ) -> Div {
+        let HierarchyRow {
+            scope,
+            count,
+            depth,
+        } = row;
+        let editor_state = self.editor_state.read(cx);
+        let icon_wh = editor_state.icon_size.unwrap_or(16.);
+        let theme = editor_state.theme();
+        let solved_cell_entity = editor_state.solved_cell.clone();
+        let icon_div = || {
+            div()
+                .w(px(icon_wh + 8.))
+                .h(px(icon_wh + 8.))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .child(div().flex_1())
+        };
+        let tool = self.tool.clone();
+        let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
+        let scope_path = solved_cell.scope_paths[&scope].clone();
+        let expanded = self.state.read(cx).expanded_scopes.contains(&scope_path);
+        let is_cell = solved_cell.output.cells[&scope.cell].root == scope.scope;
+        let mut scope_name = div()
+            .id(SharedString::from(format!("scope_select_{scope:?}")))
+            .flex_grow()
+            .flex_shrink_0()
+            .child(format!(
+                "{}{}",
+                scope_state.name,
+                if count > 1 {
+                    format!(" ({count})")
+                } else {
+                    String::new()
+                }
+            ))
+            .on_click({
+                let scope_path = scope_path.clone();
+                let solved_cell = solved_cell_entity.clone();
+                let canvas = self.canvas.clone();
+                move |_event, _window, cx| {
+                    let selection_changed = solved_cell.update(cx, |state, cx| {
+                        let Some(state) = state.as_mut() else {
+                            return false;
+                        };
+                        if state.selected_scope == scope_path {
+                            return false;
+                        }
+                        state.selected_scope = scope_path.clone();
+                        cx.notify();
+                        true
+                    });
+                    tool.update(cx, |tool, cx| {
+                        *tool = ToolState::default();
+                        cx.notify();
+                    });
+                    if selection_changed {
+                        canvas.update(cx, |canvas, cx| canvas.fit_to_screen(cx));
+                    }
+                }
+            });
+        if is_cell {
+            let sidebar_state = self.state.clone();
+            scope_name = scope_name.on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                window.prevent_default();
+                cx.stop_propagation();
+                sidebar_state.update(cx, |state, cx| {
+                    state.context_menu = Some(HierarchyContextMenu {
+                        cell: scope.cell,
+                        position: event.position,
+                    });
+                    cx.notify();
+                });
+            });
+        }
+
+        div()
+            .flex()
+            .min_w_full()
+            .flex_shrink_0()
+            .bg(
+                if scope == solved_cell.state[&solved_cell.selected_scope].address {
+                    theme.selection
+                } else {
+                    theme.sidebar
+                },
+            )
+            .child(div().w(px(12. * depth as f32)).flex_shrink_0())
+            .child(
+                icon_div()
+                    .child(
+                        svg()
+                            .path(if expanded {
+                                "icons/angle-down-solid-full.svg"
+                            } else {
+                                "icons/angle-right-solid-full.svg"
+                            })
+                            .w(px(icon_wh))
+                            .h_auto()
+                            .text_color(theme.text),
+                    )
+                    .child(div().flex_1())
+                    .id(SharedString::from(format!("scope_collapse_{scope:?}",)))
+                    .on_click({
+                        let scope_path = scope_path.clone();
+                        let state = self.state.clone();
+                        move |_event, _window, cx| {
+                            state.update(cx, |state, cx| {
+                                if !state.expanded_scopes.insert(scope_path.clone()) {
+                                    state.expanded_scopes.swap_remove(&scope_path);
+                                }
+                                state.rows_revision = state.rows_revision.wrapping_add(1);
+                                cx.notify();
+                            });
+                        }
+                    }),
+            )
+            .child(scope_name)
+            .child(
+                icon_div()
+                    .child(
+                        svg()
+                            .path(if scope_state.visible {
+                                "icons/eye-solid-full.svg"
+                            } else {
+                                "icons/eye-slash-solid-full.svg"
+                            })
+                            .w(px(icon_wh))
+                            .h_auto()
+                            .text_color(theme.text),
+                    )
+                    .child(div().flex_1())
+                    .id(SharedString::from(format!("scope_control_{scope:?}",)))
+                    .on_click({
+                        let solved_cell = solved_cell_entity;
+                        move |_event, _window, cx| {
+                            solved_cell.update(cx, |state, cx| {
+                                if let Some(state) = state.as_mut() {
+                                    let visible = state.state[&scope_path].visible;
+                                    Arc::make_mut(&mut state.state)
+                                        .get_mut(&scope_path)
+                                        .unwrap()
+                                        .visible = !visible;
+                                    cx.notify();
+                                }
+                            })
+                        }
+                    }),
+            )
+    }
+
+    fn cached_rows(
+        &mut self,
+        cx: &mut Context<Self>,
+        solved_cell: &CompileOutputState,
+    ) -> (Arc<Vec<HierarchyRow>>, Option<usize>) {
+        let rows_revision = self.state.read(cx).rows_revision;
+        let filter = self.name_filter.read(cx).content.to_lowercase();
+        let cache_is_current = self.rows_cache.as_ref().is_some_and(|cache| {
+            Arc::ptr_eq(&cache.output, &solved_cell.output)
+                && cache.rows_revision == rows_revision
+                && cache.filter == filter
+        });
+        if !cache_is_current {
+            let expanded_scopes = self.state.read(cx).expanded_scopes.clone();
+            let mut rows = Vec::new();
+            let root_scope = solved_cell.output.cells[&solved_cell.output.top].root;
+            Self::collect_scope_rows(
+                solved_cell,
+                &expanded_scopes,
+                &filter,
+                &mut rows,
                 ScopeAddress {
-                    scope,
-                    cell: state.output.top,
+                    scope: root_scope,
+                    cell: solved_cell.output.top,
                 },
                 1,
                 0,
             );
+            let widest_row = rows
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, row)| {
+                    let name = &solved_cell.state[&solved_cell.scope_paths[&row.scope]].name;
+                    let count_width = if row.count > 1 {
+                        row.count.to_string().len() + 3
+                    } else {
+                        0
+                    };
+                    row.depth * 2 + name.chars().count() + count_width
+                })
+                .map(|(index, _)| index);
+            self.rows_cache = Some(HierarchyRowsCache {
+                output: solved_cell.output.clone(),
+                rows_revision,
+                filter,
+                rows: Arc::new(rows),
+                widest_row,
+            });
         }
+        let cache = self.rows_cache.as_ref().unwrap();
+        (cache.rows.clone(), cache.widest_row)
+    }
+
+    fn render_scopes(&mut self, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        let solved_cell = self.editor_state.read(cx).solved_cell.read(cx).clone();
+        let (rows, widest_row) = if let Some(solved_cell) = solved_cell.as_ref() {
+            self.cached_rows(cx, solved_cell)
+        } else {
+            self.rows_cache = None;
+            (Arc::new(Vec::new()), None)
+        };
+        let row_count = rows.len();
+        let rows_for_render = rows.clone();
+        let solved_cell_for_render = solved_cell.clone();
         let editor_state = self.editor_state.read(cx);
         let theme = editor_state.theme();
         let font_size = editor_state.font_size;
-        let mut scroll_area = sidebar_scroll_area(
+        let list = uniform_list(
+            "hierarchy_rows",
+            row_count,
+            cx.processor(move |sidebar, range: std::ops::Range<usize>, _window, cx| {
+                let Some(solved_cell) = solved_cell_for_render.as_ref() else {
+                    return Vec::new();
+                };
+                range
+                    .filter_map(|index| rows_for_render.get(index).copied())
+                    .map(|row| sidebar.render_scope_row(cx, solved_cell, row))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .with_width_from_item(widest_row)
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .track_scroll(self.list_scroll_handle.clone())
+        .size_full()
+        .min_h_0()
+        .min_w_0();
+        let mut scroll_area = sidebar_scroll_frame(
             "hierarchy_scroll_area",
-            div().flex().flex_col().items_start().children(scopes),
+            list,
             &self.scroll_handle,
             &self.scroll_state,
             cx.entity_id(),
@@ -1511,6 +1644,7 @@ impl Render for HierarchySideBar {
                                     }
                                     self_entity.read(cx).state.clone().update(cx, |state, cx| {
                                         state.expanded_scopes = scope_paths;
+                                        state.rows_revision = state.rows_revision.wrapping_add(1);
                                         cx.notify();
                                     });
                                 }
@@ -1532,6 +1666,7 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     self_entity.read(cx).state.clone().update(cx, |state, cx| {
                                         state.expanded_scopes.clear();
+                                        state.rows_revision = state.rows_revision.wrapping_add(1);
                                         cx.notify();
                                     });
                                 }

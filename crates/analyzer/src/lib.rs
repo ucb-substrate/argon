@@ -113,25 +113,31 @@ impl Default for GuiConfig {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum GuiSize {
+enum HumanReadableGuiSize {
     Integer(u16),
     Float(f32),
+    None(()),
 }
 
 fn deserialize_gui_size<'de, D>(deserializer: D) -> std::result::Result<Option<f32>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let size = match GuiSize::deserialize(deserializer)? {
-        GuiSize::Integer(size) => f32::from(size),
-        GuiSize::Float(size) => size,
+    let size = if deserializer.is_human_readable() {
+        match HumanReadableGuiSize::deserialize(deserializer)? {
+            HumanReadableGuiSize::Integer(size) => Some(f32::from(size)),
+            HumanReadableGuiSize::Float(size) => Some(size),
+            HumanReadableGuiSize::None(()) => None,
+        }
+    } else {
+        Option::<f32>::deserialize(deserializer)?
     };
-    if !size.is_finite() || !(1.0..=256.0).contains(&size) {
+    if size.is_some_and(|size| !size.is_finite() || !(1.0..=256.0).contains(&size)) {
         return Err(<D::Error as serde::de::Error>::custom(
             "GUI sizes must be between 1 and 256 logical pixels",
         ));
     }
-    Ok(Some(size))
+    Ok(size)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1639,8 +1645,9 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, SourceState, config_with_key, is_gui_disconnected,
-        parse_config, preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
+        ArgonConfig, DEFAULT_LOG_LEVEL, GuiConfig, SourceState, config_with_key,
+        is_gui_disconnected, parse_config, preview_instance_cell, read_unpoisoned, write_config,
+        write_unpoisoned,
     };
 
     #[test]
@@ -1717,6 +1724,26 @@ mod tests {
         assert!(parse_config("[gui]\nunknown = true\n").is_err());
         assert!(parse_config("[gui]\nicon_size = 0\n").is_err());
         assert!(parse_config("[gui]\nfont_size = 257\n").is_err());
+    }
+
+    #[test]
+    fn runtime_configuration_round_trips_through_rpc_encoding() {
+        for config in [
+            ArgonConfig::default(),
+            ArgonConfig {
+                gui: GuiConfig {
+                    icon_size: Some(18.),
+                    font_size: Some(15.5),
+                    ..GuiConfig::default()
+                },
+                ..ArgonConfig::default()
+            },
+        ] {
+            let encoded = bincode::serialize(&config).unwrap();
+            let decoded: ArgonConfig = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded.gui.icon_size, config.gui.icon_size);
+            assert_eq!(decoded.gui.font_size, config.gui.font_size);
+        }
     }
 
     #[test]
