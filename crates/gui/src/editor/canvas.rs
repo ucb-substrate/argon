@@ -9563,8 +9563,7 @@ cell top() {
                 .stipple_on
                 .as_chunks::<4>()
                 .0
-                .iter()
-                .any(|pixel| pixel == [255, 0, 0, 255]),
+                .contains(&[255, 0, 0, 255]),
             "the unresolved pair is retained as one opaque border-colored strip"
         );
         assert!(
