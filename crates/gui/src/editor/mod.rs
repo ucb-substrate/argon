@@ -22,7 +22,7 @@ use tower_lsp_server::ls_types::MessageType;
 use crate::{
     actions::{
         FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save,
-        ShowMessages, Undo,
+        ShowDiagnostics, ShowMessages, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -83,7 +83,7 @@ pub struct EditorState {
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
     pub compilation_revision: Option<u64>,
-    pub fatal_error: Option<SharedString>,
+    pub fatal_error: Option<EditorMessage>,
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
@@ -98,20 +98,20 @@ pub struct EditorState {
 pub struct EditorMessage {
     pub typ: MessageType,
     pub text: SharedString,
+    pub details: MessageDetails,
 }
 
-fn compile_error_summary(output: &CompileOutput) -> Option<String> {
-    let diagnostics = argonc::diagnostics::from_compile_output(output);
-    let first = diagnostics.first()?;
-    let remaining = diagnostics.len() - 1;
-    Some(if remaining == 0 {
-        first.message.clone()
-    } else {
-        format!(
-            "{} (and {remaining} more error{})",
-            first.message,
-            if remaining == 1 { "" } else { "s" }
-        )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageDetails {
+    Diagnostics,
+    Messages,
+}
+
+fn compilation_error_message(output: &CompileOutput) -> Option<EditorMessage> {
+    (!matches!(output, CompileOutput::Valid(_))).then(|| EditorMessage {
+        typ: MessageType::ERROR,
+        text: "Compilation errors".into(),
+        details: MessageDetails::Diagnostics,
     })
 }
 
@@ -185,6 +185,7 @@ impl EditorState {
             self.message = Some(EditorMessage {
                 typ,
                 text: message.into(),
+                details: MessageDetails::Messages,
             });
         }
     }
@@ -336,7 +337,7 @@ impl EditorState {
         );
     }
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
-        let error_summary = compile_error_summary(&output).map(SharedString::from);
+        let compilation_error = compilation_error_message(&output);
         let mut recoverable_error = None;
         let solved_cell = match output {
             CompileOutput::Valid(d) => d,
@@ -345,14 +346,14 @@ impl EditorState {
                 errors,
             }) => {
                 if errors.iter().any(|error| error.kind.is_invalid_cell()) {
-                    self.fatal_error = error_summary;
+                    self.fatal_error = compilation_error;
                     return;
                 }
-                recoverable_error = error_summary;
+                recoverable_error = compilation_error;
                 d
             }
             _ => {
-                self.fatal_error = error_summary;
+                self.fatal_error = compilation_error;
                 return;
             }
         };
@@ -420,10 +421,7 @@ impl EditorState {
             cx.notify();
         });
         self.fatal_error = None;
-        self.message = recoverable_error.map(|text| EditorMessage {
-            typ: MessageType::ERROR,
-            text,
-        });
+        self.message = recoverable_error;
     }
 }
 
@@ -666,6 +664,15 @@ impl Editor {
         self.open_invoking_command(Some("messages<CR>"), cx);
     }
 
+    fn show_diagnostics(
+        &mut self,
+        _: &ShowDiagnostics,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon diagnostics<CR>"), cx);
+    }
+
     fn instantiate_command(
         &mut self,
         _: &InstantiateCommand,
@@ -698,8 +705,11 @@ impl Editor {
     fn focus_invoker(&mut self, cx: &mut Context<Self>) {
         if !crate::focus::activate_invoker() {
             self.state.update(cx, |state, _cx| {
-                state.fatal_error =
-                    Some("could not identify the application that invoked Argone".into());
+                state.fatal_error = Some(EditorMessage {
+                    typ: MessageType::ERROR,
+                    text: "could not identify the application that invoked Argone".into(),
+                    details: MessageDetails::Messages,
+                });
             });
         }
     }
@@ -720,6 +730,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::on_redo))
             .on_action(cx.listener(Self::focus_invoking_app))
             .on_action(cx.listener(Self::focus_invoking_app_command_bar))
+            .on_action(cx.listener(Self::show_diagnostics))
             .on_action(cx.listener(Self::show_messages))
             .on_action(cx.listener(Self::instantiate_command))
             .on_action(cx.listener(Self::open_cell_command))
@@ -759,29 +770,53 @@ impl Render for Editor {
                             state
                                 .connection_error
                                 .clone()
-                                .map(|error| ("Connection error", error, true, true))
+                                .map(|error| {
+                                    (
+                                        EditorMessage {
+                                            typ: MessageType::ERROR,
+                                            text: error,
+                                            details: MessageDetails::Messages,
+                                        },
+                                        true,
+                                        true,
+                                    )
+                                })
                                 .or_else(|| {
                                     state
                                         .fatal_error
                                         .clone()
-                                        .map(|error| ("Error", error, false, true))
+                                        .map(|error| (error, false, true))
                                 })
                                 .or_else(|| {
-                                    state.message.clone().map(|message| {
-                                        let title = if message.typ == MessageType::ERROR {
-                                            "Error"
-                                        } else if message.typ == MessageType::WARNING {
-                                            "Warning"
-                                        } else {
-                                            "Message"
-                                        };
-                                        (title, message.text, false, false)
-                                    })
+                                    state.message.clone().map(|message| (message, false, false))
                                 })
                         };
-                        if let Some((title, error, is_connection_error, editing_disabled)) =
+                        if let Some((message, is_connection_error, editing_disabled)) =
                             displayed_error
                         {
+                            let is_compilation_error =
+                                message.details == MessageDetails::Diagnostics;
+                            let title = if is_compilation_error {
+                                "Compilation errors"
+                            } else if is_connection_error {
+                                "Connection error"
+                            } else if message.typ == MessageType::ERROR {
+                                "Error"
+                            } else if message.typ == MessageType::WARNING {
+                                "Warning"
+                            } else {
+                                "Message"
+                            };
+                            let details_label = if is_compilation_error {
+                                "Open Argon diagnostics (Ctrl-Shift-D)"
+                            } else {
+                                "View details in Neovim (Ctrl-Shift-M)"
+                            };
+                            let details_command = if is_compilation_error {
+                                "Argon diagnostics<CR>"
+                            } else {
+                                "messages<CR>"
+                            };
                             d = d.child(
                                 div()
                                     .id("error_modal")
@@ -803,18 +838,23 @@ impl Render for Editor {
                                         )
                                         .child(div().child(title))
                                     )
-                                    .child(error)
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.subtext)
-                                            .child(if is_connection_error {
-                                                "Editing is disabled until the connection recovers."
-                                            } else if editing_disabled {
-                                                "Editing is disabled until this error is fixed."
-                                            } else {
-                                                "The last operation was not completed."
-                                            }),
+                                    .children(
+                                        (!is_compilation_error)
+                                            .then(|| div().child(message.text)),
+                                    )
+                                    .children(
+                                        (!is_compilation_error).then(|| {
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme.subtext)
+                                                .child(if is_connection_error {
+                                                    "Editing is disabled until the connection recovers."
+                                                } else if editing_disabled {
+                                                    "Editing is disabled until this error is fixed."
+                                                } else {
+                                                    "The last operation was not completed."
+                                                })
+                                        }),
                                     )
                                     .child(
                                         div()
@@ -822,10 +862,10 @@ impl Render for Editor {
                                             .mt_1()
                                             .text_xs()
                                             .text_color(theme.text)
-                                            .child("View details in Neovim (Ctrl-Shift-M)")
-                                            .on_click(cx.listener(|editor, _, _, cx| {
+                                            .child(details_label)
+                                            .on_click(cx.listener(move |editor, _, _, cx| {
                                                 editor.open_invoking_command(
-                                                    Some("messages<CR>"),
+                                                    Some(details_command),
                                                     cx,
                                                 );
                                             })),
@@ -857,10 +897,10 @@ mod tests {
         compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
     };
 
-    use super::compile_error_summary;
+    use super::{MessageDetails, compilation_error_message};
 
     #[test]
-    fn compile_error_summary_shows_the_first_error_and_remaining_count() {
+    fn compilation_error_message_does_not_embed_individual_diagnostics() {
         let span = Span {
             path: PathBuf::from("lib.ar"),
             span: cfgrammar::Span::new(0, 1),
@@ -880,13 +920,13 @@ mod tests {
             ],
         });
 
-        assert_eq!(
-            compile_error_summary(&output).as_deref(),
-            Some("`missing` is not declared in this scope (and 1 more error)")
-        );
-        assert_eq!(
-            compile_error_summary(&CompileOutput::FatalParseErrors).as_deref(),
-            Some("fatal parse errors encountered")
-        );
+        let message = compilation_error_message(&output).expect("compilation should have failed");
+        assert_eq!(message.text.as_ref(), "Compilation errors");
+        assert_eq!(message.details, MessageDetails::Diagnostics);
+
+        let message = compilation_error_message(&CompileOutput::FatalParseErrors)
+            .expect("compilation should have failed");
+        assert_eq!(message.text.as_ref(), "Compilation errors");
+        assert_eq!(message.details, MessageDetails::Diagnostics);
     }
 }

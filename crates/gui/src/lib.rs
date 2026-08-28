@@ -168,6 +168,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("1", One, Some("LayoutCanvas")),
         KeyBinding::new("*", All, Some("LayoutCanvas")),
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
+        KeyBinding::new("ctrl-shift-d", ShowDiagnostics, None),
         KeyBinding::new("ctrl-shift-m", ShowMessages, None),
         KeyBinding::new(":", FocusInvokerCommandBar, None),
         KeyBinding::new("escape", Cancel, Some("LayoutCanvas")),
@@ -224,6 +225,7 @@ mod tests {
         instantiate_count: usize,
         open_cell_count: usize,
         focus_invoker_count: usize,
+        show_diagnostics_count: usize,
         show_messages_count: usize,
         save_count: usize,
     }
@@ -246,6 +248,9 @@ mod tests {
                 .on_action(cx.listener(|view, _: &OpenCellCommand, _, _| view.open_cell_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvoker, _, _| view.focus_invoker_count += 1),
+                )
+                .on_action(
+                    cx.listener(|view, _: &ShowDiagnostics, _, _| view.show_diagnostics_count += 1),
                 )
                 .on_action(
                     cx.listener(|view, _: &ShowMessages, _, _| view.show_messages_count += 1),
@@ -278,6 +283,7 @@ mod tests {
                     instantiate_count: 0,
                     open_cell_count: 0,
                     focus_invoker_count: 0,
+                    show_diagnostics_count: 0,
                     show_messages_count: 0,
                     save_count: 0,
                 })
@@ -288,7 +294,10 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r p i o ctrl-shift-m : ctrl-\\ cmd-s");
+        cx.simulate_keystrokes(
+            *window,
+            "u r p i o ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+        );
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
@@ -298,6 +307,7 @@ mod tests {
                 assert_eq!(view.instantiate_count, 0);
                 assert_eq!(view.open_cell_count, 0);
                 assert_eq!(view.focus_invoker_count, 1);
+                assert_eq!(view.show_diagnostics_count, 1);
                 assert_eq!(view.show_messages_count, 1);
                 assert_eq!(view.save_count, 1);
             })
@@ -306,7 +316,10 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r p i o ctrl-shift-m : ctrl-\\ cmd-s");
+        cx.simulate_keystrokes(
+            *window,
+            "u r p i o ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+        );
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
@@ -316,6 +329,7 @@ mod tests {
                 assert_eq!(view.instantiate_count, 1);
                 assert_eq!(view.open_cell_count, 1);
                 assert_eq!(view.focus_invoker_count, 2);
+                assert_eq!(view.show_diagnostics_count, 2);
                 assert_eq!(view.show_messages_count, 2);
                 assert_eq!(view.save_count, 2);
             })
