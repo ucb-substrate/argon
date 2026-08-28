@@ -650,9 +650,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The canvas handles pointer motion inside its own bounds. The editor-level
+        // listener exists only so an in-progress drag can continue after leaving
+        // those bounds; forwarding ordinary toolbar/sidebar motion would run layout
+        // hit testing and invalidate the entire editor for every mouse event.
+        if !self.canvas.read(cx).has_active_pointer_drag() {
+            return;
+        }
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
-        cx.notify();
     }
 
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
