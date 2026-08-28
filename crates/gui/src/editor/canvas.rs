@@ -2032,7 +2032,7 @@ fn expand_raster_for_display_cancellable(
     // empty tile's debug-build time in its generic sampling machinery. Copying
     // complete pixels and rows is substantially cheaper and gives long-running
     // outer-ring prefetches a cancellation point on every source row.
-    if width % source_width != 0 || height % source_height != 0 {
+    if !width.is_multiple_of(source_width) || !height.is_multiple_of(source_height) {
         return (!cancelled()).then(|| {
             image::imageops::resize(&image, width, height, image::imageops::FilterType::Nearest)
         });
@@ -2051,10 +2051,12 @@ fn expand_raster_for_display_cancellable(
         let output_row_start = source_y * vertical_scale * output_stride;
         let output_row = &mut output[output_row_start..output_row_start + output_stride];
         for (source_pixel, output_pixels) in source_row
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .zip(output_row.chunks_exact_mut(4 * horizontal_scale))
         {
-            for output_pixel in output_pixels.chunks_exact_mut(4) {
+            for output_pixel in output_pixels.as_chunks_mut::<4>().0 {
                 output_pixel.copy_from_slice(source_pixel);
             }
         }
@@ -7955,7 +7957,7 @@ impl LayoutCanvas {
                 state.hierarchy_depth,
                 state.hide_external_geometry,
                 matches!(
-                    &*state.tool.read(cx),
+                    state.tool.read(cx),
                     ToolState::Select(SelectToolState { selected_obj: None })
                 ),
             )
@@ -10198,7 +10200,7 @@ impl LayoutCanvas {
             let hover_changed = self.hover_hit != next_hover;
             self.hover_hit = next_hover;
             let tool_tracks_pointer = !matches!(
-                &*self.state.read(cx).tool.read(cx),
+                self.state.read(cx).tool.read(cx),
                 ToolState::Select(_) | ToolState::EditDim(_)
             );
             if hover_changed || shift_changed || tool_tracks_pointer {
@@ -10804,7 +10806,7 @@ mod tests {
 
         assert!(emits.is_empty());
         assert_eq!(occupancies.len(), 1);
-        assert_eq!(occupancies[0].layers.as_ref(), &[layer.clone()]);
+        assert_eq!(occupancies[0].layers.as_ref(), std::slice::from_ref(&layer));
 
         let sparse_node = RasterBvhNode::build(
             (0..16)
