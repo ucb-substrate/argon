@@ -10,7 +10,7 @@ use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
     bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
 };
-use canvas::{LayoutCanvas, ShapeFill};
+use canvas::{LayoutCanvas, ShapeFill, StipplePattern};
 use futures::StreamExt;
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -132,12 +132,26 @@ fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
     rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
 }
 
-fn shape_fill(dither_pattern: &str) -> ShapeFill {
+fn shape_fill(
+    dither_pattern: &str,
+    custom_patterns: &[argonc::tech::CustomDitherPattern],
+) -> ShapeFill {
     match dither_pattern {
         "I0" => ShapeFill::Solid,
         "I1" => ShapeFill::Hollow,
-        // Built-in and custom patterns are retained by the technology model.
-        // Until the renderer implements each bitmap, use its existing stipple.
+        reference if reference.starts_with('C') => reference[1..]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| custom_patterns.get(index))
+            .and_then(|pattern| StipplePattern::from_lines(&pattern.lines))
+            .map(|pattern| match pattern.coverage() {
+                0. => ShapeFill::Hollow,
+                1. => ShapeFill::Solid,
+                _ => ShapeFill::Pattern(pattern),
+            })
+            .unwrap_or(ShapeFill::Stippling),
+        // KLayout built-ins other than solid and clear do not carry their
+        // bitmap in the technology file, so retain the legacy slash fallback.
         _ => ShapeFill::Stippling,
     }
 }
@@ -401,7 +415,10 @@ impl EditorState {
                 LayerState {
                     name,
                     color: rgb_to_rgba(layer.fill_color),
-                    fill: shape_fill(&layer.style.dither_pattern),
+                    fill: shape_fill(
+                        &layer.style.dither_pattern,
+                        &solved_cell.tech.custom_dither_patterns,
+                    ),
                     border_color: rgb_to_rgba(layer.border_color),
                     visible,
                     used: false,
@@ -897,7 +914,9 @@ mod tests {
         compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
     };
 
-    use super::compile_error_summary;
+    use argonc::tech::CustomDitherPattern;
+
+    use super::{ShapeFill, compile_error_summary, shape_fill};
 
     #[test]
     fn compile_error_summary_shows_the_first_error_and_remaining_count() {
@@ -928,5 +947,64 @@ mod tests {
             compile_error_summary(&CompileOutput::FatalParseErrors).as_deref(),
             Some("fatal parse errors encountered")
         );
+    }
+
+    #[test]
+    fn custom_dither_references_use_technology_array_positions() {
+        let patterns = vec![
+            CustomDitherPattern {
+                lines: vec!["........".to_owned(); 8],
+                order: 90,
+                name: "blank".to_owned(),
+            },
+            CustomDitherPattern {
+                lines: vec!["********".to_owned(); 8],
+                order: 10,
+                name: "solid".to_owned(),
+            },
+            CustomDitherPattern {
+                lines: (0..8)
+                    .map(|y| {
+                        let mut row = [b'.'; 8];
+                        row[y] = b'*';
+                        String::from_utf8(row.to_vec()).unwrap()
+                    })
+                    .collect(),
+                order: 1,
+                name: "diagonal".to_owned(),
+            },
+        ];
+
+        assert_eq!(shape_fill("C0", &patterns), ShapeFill::Hollow);
+        assert_eq!(shape_fill("C1", &patterns), ShapeFill::Solid);
+        assert!(matches!(shape_fill("C2", &patterns), ShapeFill::Pattern(_)));
+        assert_eq!(
+            shape_fill("C9", &patterns),
+            ShapeFill::Stippling,
+            "missing custom references retain the legacy fallback"
+        );
+    }
+
+    #[test]
+    fn every_sky130_custom_dither_reference_resolves_to_its_bitmap() {
+        let tech = argonc::tech::read_tech(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdks/sky130/sky130.tech.toml"),
+        )
+        .unwrap();
+        let custom_layers = tech
+            .layers
+            .iter()
+            .filter(|layer| layer.style.dither_pattern.starts_with('C'))
+            .collect::<Vec<_>>();
+
+        assert!(!custom_layers.is_empty());
+        for layer in custom_layers {
+            assert_ne!(
+                shape_fill(&layer.style.dither_pattern, &tech.custom_dither_patterns,),
+                ShapeFill::Stippling,
+                "{} references an unavailable custom bitmap",
+                layer.name
+            );
+        }
     }
 }

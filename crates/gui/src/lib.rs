@@ -167,6 +167,16 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("0", Zero, Some("LayoutCanvas")),
         KeyBinding::new("1", One, Some("LayoutCanvas")),
         KeyBinding::new("*", All, Some("LayoutCanvas")),
+        KeyBinding::new("left", PanLeft, Some("LayoutCanvas")),
+        KeyBinding::new("right", PanRight, Some("LayoutCanvas")),
+        KeyBinding::new("up", PanUp, Some("LayoutCanvas")),
+        KeyBinding::new("down", PanDown, Some("LayoutCanvas")),
+        KeyBinding::new("cmd-=", ZoomIn, Some("LayoutCanvas")),
+        KeyBinding::new("cmd-+", ZoomIn, Some("LayoutCanvas")),
+        KeyBinding::new("cmd--", ZoomOut, Some("LayoutCanvas")),
+        KeyBinding::new("ctrl-=", ZoomIn, Some("LayoutCanvas")),
+        KeyBinding::new("ctrl-+", ZoomIn, Some("LayoutCanvas")),
+        KeyBinding::new("ctrl--", ZoomOut, Some("LayoutCanvas")),
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
         KeyBinding::new("ctrl-shift-m", ShowMessages, None),
         KeyBinding::new(":", FocusInvokerCommandBar, None),
@@ -226,6 +236,9 @@ mod tests {
         focus_invoker_count: usize,
         show_messages_count: usize,
         save_count: usize,
+        pan_count: usize,
+        zoom_in_count: usize,
+        zoom_out_count: usize,
     }
 
     impl Render for ShortcutTestView {
@@ -235,6 +248,12 @@ mod tests {
                 .on_action(cx.listener(|view, _: &Save, _, _| view.save_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
                 .on_action(cx.listener(|view, _: &DrawPolygon, _, _| view.draw_polygon_count += 1))
+                .on_action(cx.listener(|view, _: &PanLeft, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &PanRight, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &PanUp, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &PanDown, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &ZoomIn, _, _| view.zoom_in_count += 1))
+                .on_action(cx.listener(|view, _: &ZoomOut, _, _| view.zoom_out_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
                         view.command_bar_count += 1
@@ -280,6 +299,9 @@ mod tests {
                     focus_invoker_count: 0,
                     show_messages_count: 0,
                     save_count: 0,
+                    pan_count: 0,
+                    zoom_in_count: 0,
+                    zoom_out_count: 0,
                 })
             })
             .unwrap()
@@ -288,7 +310,10 @@ mod tests {
         window
             .update(cx, |view, window, _| window.focus(&view.input_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r p i o ctrl-shift-m : ctrl-\\ cmd-s");
+        cx.simulate_keystrokes(
+            *window,
+            "u r p i o left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-m : ctrl-\\ cmd-s",
+        );
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 0);
@@ -300,13 +325,19 @@ mod tests {
                 assert_eq!(view.focus_invoker_count, 1);
                 assert_eq!(view.show_messages_count, 1);
                 assert_eq!(view.save_count, 1);
+                assert_eq!(view.pan_count, 0);
+                assert_eq!(view.zoom_in_count, 0);
+                assert_eq!(view.zoom_out_count, 0);
             })
             .unwrap();
 
         window
             .update(cx, |view, window, _| window.focus(&view.canvas_focus))
             .unwrap();
-        cx.simulate_keystrokes(*window, "u r p i o ctrl-shift-m : ctrl-\\ cmd-s");
+        cx.simulate_keystrokes(
+            *window,
+            "u r p i o left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-m : ctrl-\\ cmd-s",
+        );
         window
             .update(cx, |view, _, _| {
                 assert_eq!(view.undo_count, 1);
@@ -318,6 +349,9 @@ mod tests {
                 assert_eq!(view.focus_invoker_count, 2);
                 assert_eq!(view.show_messages_count, 2);
                 assert_eq!(view.save_count, 2);
+                assert_eq!(view.pan_count, 4);
+                assert_eq!(view.zoom_in_count, 4);
+                assert_eq!(view.zoom_out_count, 2);
             })
             .unwrap();
     }
