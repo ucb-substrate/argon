@@ -1880,6 +1880,52 @@ mod tests {
     }
 
     #[test]
+    fn underconstrained_errors_point_to_each_source_expression() {
+        let source = r#"
+            cell top() {
+                let first = rect("met1");
+                let second = rect("met1");
+            }
+        "#;
+        let path = PathBuf::from("/virtual/lib.ar");
+        let root = parse_source_text(source, path.clone()).unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+
+        let errors = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_exec_errors()
+        .errors
+        .into_iter()
+        .filter(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+        .collect::<Vec<_>>();
+
+        assert_eq!(errors.len(), 2);
+        let spans = errors
+            .iter()
+            .map(|error| error.span.as_ref().expect("error should point to a value"))
+            .collect::<Vec<_>>();
+        assert!(spans.iter().all(|span| span.path == path));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &source[span.span.start()..span.span.end()])
+                .collect::<Vec<_>>(),
+            vec!["rect(\"met1\")", "rect(\"met1\")"]
+        );
+        assert_ne!(spans[0], spans[1]);
+    }
+
+    #[test]
     fn argon_invalid_cast() {
         let o = parse_workspace_with_std(ARGON_INVALID_CAST);
         assert!(o.static_errors().is_empty());
