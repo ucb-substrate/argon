@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
@@ -84,6 +85,7 @@ pub struct EditorState {
     pub font_size: Option<f32>,
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
+    pub compilation_activities: IndexSet<u64>,
     pub compilation_revision: Option<u64>,
     pub compilation_error: Option<EditorMessage>,
     pub fatal_error: Option<EditorMessage>,
@@ -475,6 +477,7 @@ impl Editor {
                 font_size: None,
                 workspace_path: None,
                 workspace_modified: false,
+                compilation_activities: IndexSet::new(),
                 compilation_revision: None,
                 compilation_error: None,
                 fatal_error: None,
@@ -559,6 +562,17 @@ impl Editor {
     pub fn fit_to_screen(&self, cx: &mut App) {
         self.canvas.update(cx, |canvas, cx| {
             canvas.fit_to_screen(cx);
+            cx.notify();
+        });
+    }
+
+    pub fn set_compilation_active(&self, cx: &mut App, activity_id: u64, active: bool) {
+        self.state.update(cx, |state, cx| {
+            if active {
+                state.compilation_activities.insert(activity_id);
+            } else {
+                state.compilation_activities.shift_remove(&activity_id);
+            }
             cx.notify();
         });
     }
@@ -769,58 +783,31 @@ impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
         let font_size = self.state.read(cx).font_size;
-        let displayed_status = {
+        let (displayed_status, is_compiling) = {
             let state = self.state.read(cx);
-            state
-                .connection_error
-                .clone()
-                .map(|error| {
-                    (
-                        EditorMessage {
-                            typ: MessageType::ERROR,
-                            text: error,
-                            details: MessageDetails::Messages,
-                        },
-                        true,
-                    )
-                })
-                .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
-                .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
-                .or_else(|| state.message.clone().map(|message| (message, false)))
+            (
+                state
+                    .connection_error
+                    .clone()
+                    .map(|error| {
+                        (
+                            EditorMessage {
+                                typ: MessageType::ERROR,
+                                text: error,
+                                details: MessageDetails::Messages,
+                            },
+                            true,
+                        )
+                    })
+                    .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
+                    .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                    .or_else(|| state.message.clone().map(|message| (message, false))),
+                !state.compilation_activities.is_empty(),
+            )
         };
-        let status_bar = displayed_status.map(|(message, is_connection_error)| {
-            let details = message.details;
-            let is_compilation_error = details == MessageDetails::Diagnostics;
-            let title = if is_compilation_error {
-                "Compilation errors"
-            } else if is_connection_error {
-                "Connection error"
-            } else if message.typ == MessageType::ERROR {
-                "Error"
-            } else if message.typ == MessageType::WARNING {
-                "Warning"
-            } else {
-                "Message"
-            };
-            let status_text = if is_compilation_error {
-                SharedString::from(title)
-            } else {
-                SharedString::from(format!("{title}: {}", message.text))
-            };
-            let action_label = if is_compilation_error {
-                "Open diagnostics (Ctrl-Shift-D)"
-            } else {
-                "View messages (Ctrl-Shift-M)"
-            };
-            let mut status_message = div()
-                .overflow_x_hidden()
-                .text_ellipsis()
-                .text_color(theme.error)
-                .child(status_text);
-            if !is_compilation_error {
-                status_message = status_message.flex_1();
-            }
-            div()
+        let status_bar = (displayed_status.is_some() || is_compiling).then(|| {
+            let mut status_fills_space = false;
+            let mut bar = div()
                 .id("status_bar")
                 .border_t_1()
                 .border_color(theme.divider)
@@ -830,33 +817,100 @@ impl Render for Editor {
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .child(
-                    svg()
-                        .path("icons/circle-exclamation-solid-full.svg")
-                        .w(px(14.))
-                        .h_auto()
-                        .text_color(theme.error),
-                )
-                .child(status_message)
-                .child(
+                .gap_2();
+            if let Some((message, is_connection_error)) = displayed_status {
+                let details = message.details;
+                let is_compilation_error = details == MessageDetails::Diagnostics;
+                let title = if is_compilation_error {
+                    "Compilation errors"
+                } else if is_connection_error {
+                    "Connection error"
+                } else if message.typ == MessageType::ERROR {
+                    "Error"
+                } else if message.typ == MessageType::WARNING {
+                    "Warning"
+                } else {
+                    "Message"
+                };
+                let status_text = if is_compilation_error {
+                    SharedString::from(title)
+                } else {
+                    SharedString::from(format!("{title}: {}", message.text))
+                };
+                let action_label = if is_compilation_error {
+                    "Open diagnostics (Ctrl-Shift-D)"
+                } else {
+                    "View messages (Ctrl-Shift-M)"
+                };
+                let mut status_message = div()
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .text_color(theme.error)
+                    .child(status_text);
+                if !is_compilation_error {
+                    status_message = status_message.flex_1();
+                    status_fills_space = true;
+                }
+                bar = bar
+                    .child(
+                        svg()
+                            .path("icons/circle-exclamation-solid-full.svg")
+                            .w(px(14.))
+                            .h_auto()
+                            .text_color(theme.error),
+                    )
+                    .child(status_message)
+                    .child(
+                        div()
+                            .id("show_status_details")
+                            .text_color(theme.text)
+                            .cursor_pointer()
+                            .child(action_label)
+                            .on_click(cx.listener(move |editor, _, _, cx| {
+                                if details == MessageDetails::Diagnostics {
+                                    editor.open_invoking_command(
+                                        Some("Argon diagnostics<CR>"),
+                                        false,
+                                        cx,
+                                    );
+                                } else {
+                                    editor.open_invoking_command(Some("messages<CR>"), false, cx);
+                                }
+                            })),
+                    );
+            }
+            if is_compiling {
+                if !status_fills_space {
+                    bar = bar.child(div().flex_1());
+                }
+                bar = bar.child(
                     div()
-                        .id("show_status_details")
-                        .text_color(theme.text)
-                        .cursor_pointer()
-                        .child(action_label)
-                        .on_click(cx.listener(move |editor, _, _, cx| {
-                            if details == MessageDetails::Diagnostics {
-                                editor.open_invoking_command(
-                                    Some("Argon diagnostics<CR>"),
-                                    false,
-                                    cx,
-                                );
-                            } else {
-                                editor.open_invoking_command(Some("messages<CR>"), false, cx);
-                            }
-                        })),
-                )
+                        .id("compilation_status")
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .text_color(theme.subtext)
+                        .child(
+                            svg()
+                                .path("icons/arrow-rotate-right-solid-full.svg")
+                                .w(px(14.))
+                                .h_auto()
+                                .text_color(theme.subtext)
+                                .with_animation(
+                                    "compilation_spinner",
+                                    Animation::new(Duration::from_millis(800)).repeat(),
+                                    |icon, delta| {
+                                        icon.with_transformation(Transformation::rotate(
+                                            percentage(delta),
+                                        ))
+                                    },
+                                ),
+                        )
+                        .child("Compiling"),
+                );
+            }
+            bar
         });
         let mut root = div()
             .id("top")

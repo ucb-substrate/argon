@@ -435,6 +435,24 @@ pub struct GuiServer {
 }
 
 impl Gui for GuiServer {
+    async fn compilation_started(mut self, _: context::Context, activity_id: u64) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, true));
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn compilation_finished(mut self, _: context::Context, activity_id: u64) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, false));
+            }))
+            .await
+            .unwrap();
+    }
+
     async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
