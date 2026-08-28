@@ -9,8 +9,8 @@ use std::{
 };
 
 use analyzer::rpc::{
-    CompilationSnapshot, DimensionParams, DrawSegmentConstraint, InitialConditionEdit,
-    InstancePreview, PathParams, PolygonParams, ValueEdit,
+    DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
+    PolygonParams, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -34,8 +34,8 @@ use tower_lsp_server::ls_types::MessageType;
 use crate::{
     actions::*,
     editor::{
-        self, CompileOutputState, EditorState, LayerState, SOURCE_EDIT_REJECTED_MESSAGE,
-        ScopeAddress, input::TextInput,
+        self, CompileOutputState, EditorState, LayerState, PreparedCompilationSnapshot,
+        SOURCE_EDIT_REJECTED_MESSAGE, ScopeAddress, input::TextInput,
     },
     sse::SparseVec,
 };
@@ -926,7 +926,7 @@ pub struct LayoutCanvas {
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
     pending_sse_values: Vec<PendingSseValue>,
-    deferred_snapshot: Option<CompilationSnapshot>,
+    deferred_snapshot: Option<PreparedCompilationSnapshot>,
     sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
@@ -7113,6 +7113,15 @@ impl LayoutCanvas {
             .store(self.raster_generation, Ordering::Release);
     }
 
+    fn set_rendering(&self, rendering: bool, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if state.rendering != rendering {
+                state.rendering = rendering;
+                cx.notify();
+            }
+        });
+    }
+
     fn begin_navigation(&mut self) {
         self.advance_raster_generation();
         self.navigation_cache_active = true;
@@ -7664,6 +7673,7 @@ impl LayoutCanvas {
             return;
         }
         self.raster_worker_active = true;
+        self.set_rendering(true, cx);
         self.raster_refinement = Some(cx.spawn(async move |canvas, cx| {
             loop {
                 let Some((target, index, input)) = canvas
@@ -7675,6 +7685,7 @@ impl LayoutCanvas {
                         canvas.raster_worker_active = false;
                         canvas.navigation_cache_active =
                             canvas.is_dragging || canvas.raster_staging_tiles.is_some();
+                        canvas.set_rendering(false, cx);
                         cx.notify();
                     });
                     return;
@@ -7755,11 +7766,11 @@ impl LayoutCanvas {
         self.is_sse_dragging
     }
 
-    pub(crate) fn defer_snapshot(&mut self, snapshot: CompilationSnapshot) {
+    pub(crate) fn defer_snapshot(&mut self, snapshot: PreparedCompilationSnapshot) {
         self.deferred_snapshot = Some(snapshot);
     }
 
-    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<CompilationSnapshot> {
+    pub(crate) fn take_deferred_snapshot(&mut self) -> Option<PreparedCompilationSnapshot> {
         self.deferred_snapshot.take()
     }
 
@@ -7973,6 +7984,11 @@ impl LayoutCanvas {
         self.navigation_cache_active = false;
         self.raster_refinement = None;
         self.raster_worker_active = false;
+        // Fitting invalidates the old worker but immediately schedules a
+        // replacement on the next paint. Keep the activity handoff continuous
+        // while a solved layout is still waiting to be rasterized.
+        let has_solved_layout = self.state.read(cx).solved_cell.read(cx).is_some();
+        self.set_rendering(has_solved_layout, cx);
         self.hover_hit = None;
         if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
@@ -9200,7 +9216,7 @@ impl LayoutCanvas {
 
     /// Ends the optimistic drag preview once a compile result based on the
     /// rewritten source has reached the GUI.
-    pub(crate) fn accepts_snapshot(&self, snapshot: &CompilationSnapshot) -> bool {
+    pub(crate) fn accepts_snapshot(&self, snapshot: &PreparedCompilationSnapshot) -> bool {
         if !self.is_sse_persisting {
             return true;
         }
