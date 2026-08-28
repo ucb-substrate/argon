@@ -231,6 +231,25 @@ M.start = function(bufnr)
         schedule_workspace_modified(lsp_client.id)
     end
 
+    local old_on_attach = lsp_start_config.on_attach
+    lsp_start_config.on_attach = function(lsp_client, attached_bufnr, ...)
+        -- Neovim maps `grr` to references and points `tagfunc` (so `<C-]>`)
+        -- at go-to-definition on its own. `gd` is the mapping people reach
+        -- for first, so provide it, leaving any existing one alone.
+        if
+            lsp_client:supports_method('textDocument/definition')
+            and vim.fn.maparg('gd', 'n', false, true).buffer ~= 1
+        then
+            vim.keymap.set('n', 'gd', vim.lsp.buf.definition, {
+                buffer = attached_bufnr,
+                desc = 'argon: go to definition',
+            })
+        end
+        if type(old_on_attach) == 'function' then
+            old_on_attach(lsp_client, attached_bufnr, ...)
+        end
+    end
+
     local old_on_exit = lsp_start_config.on_exit
     lsp_start_config.on_exit = function(...)
         -- on_exit runs in_fast_event

@@ -23,6 +23,15 @@ pub const STD_SOURCE: &str = include_str!("std/lib.ar");
 /// by a compiler entry point rather than by a source file.
 pub const CELL_PATH: &str = "<argon-cell>";
 
+/// Source text for a compiler-internal path that has no file on disk.
+///
+/// The standard library is compiled into the binary, so anything that reads a
+/// source file by path — diagnostic rendering, an editor jumping to a
+/// definition — has to go through here rather than the filesystem.
+pub fn virtual_source(path: &Path) -> Option<&'static str> {
+    (path == Path::new(STD_PATH)).then_some(STD_SOURCE)
+}
+
 impl AstMetadata for ParseMetadata {
     type Ident = ();
     type IdentPath = ();

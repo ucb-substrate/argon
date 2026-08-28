@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{self, IsTerminal, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ast::Span,
     compile::{CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput},
-    parse::{CellInvocation, STD_PATH, STD_SOURCE},
+    parse::CellInvocation,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -142,10 +142,9 @@ pub fn render(writer: &mut impl Write, diagnostic: &Diagnostic, color: bool) -> 
         return Ok(());
     };
     let file_source = fs::read_to_string(path).ok();
-    let source = match (&diagnostic.source, path == Path::new(STD_PATH)) {
-        (Some(source), _) => Some(source.as_str()),
-        (None, true) => Some(STD_SOURCE),
-        (None, false) => file_source.as_deref(),
+    let source = match &diagnostic.source {
+        Some(source) => Some(source.as_str()),
+        None => crate::parse::virtual_source(path).or(file_source.as_deref()),
     };
     let (line, column, line_text, underline) = source
         .map(|source| source_location(source, start, diagnostic.end.unwrap_or(start)))

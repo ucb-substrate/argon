@@ -172,6 +172,20 @@ vim.pack.add({
 The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
 
+Errors are reported as you type; `:Argon diagnostics` opens them in a list.
+Code navigation works on variables, function and cell names, enums and their
+variants, module paths, and the fields of an instance:
+
+| Mapping | Action |
+|---|---|
+| `gd`, `<C-]>` | Go to definition |
+| `grr` | List references |
+
+Navigation crosses files, follows path dependencies into other libraries, and
+jumps into the standard library, which is written to `~/.cache/argon` the
+first time you navigate into it. It keeps working while the workspace has
+errors, answering from the last version that type-checked.
+
 From an Argon project directory, start Neovim and the GUI together:
 
 ```bash

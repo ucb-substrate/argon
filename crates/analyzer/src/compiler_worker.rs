@@ -1,10 +1,15 @@
-use std::{path::PathBuf, sync::mpsc, thread};
+use std::{
+    path::PathBuf,
+    sync::{Arc, mpsc},
+    thread,
+};
 
 use arc::Library;
 use argonc::{
     WorkspaceConfig,
     compile::{CompileOutput, StaticErrorCompileOutput},
     incremental::IncrementalCompiler,
+    nav::NavIndex,
     parse::WorkspaceParseAst,
 };
 use tokio::sync::oneshot;
@@ -29,6 +34,10 @@ pub(crate) struct CompileResult {
     pub(crate) root_dir: PathBuf,
     pub(crate) config: WorkspaceConfig,
     pub(crate) ast: WorkspaceParseAst,
+    /// Position-indexed definitions and references. `None` only until the
+    /// workspace has type-checked once; after that the session keeps serving
+    /// the last index that had content.
+    pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) output: Option<CompileOutput>,
     pub(crate) messages: Vec<String>,
 }
@@ -108,6 +117,7 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                     config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                     root_dir,
                     ast: WorkspaceParseAst::default(),
+                    nav: None,
                     output: None,
                     messages: vec![error.to_string()],
                 };
@@ -118,6 +128,7 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
     };
     let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
     let analysis = compiler.analyze_workspace(&workspace);
+    let nav = compiler.nav(&workspace);
     let ast = analysis.ast;
     let mut messages = Vec::new();
 
@@ -145,6 +156,7 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
                     root_dir,
                     config: workspace,
                     ast,
+                    nav,
                     output: None,
                     messages,
                 };
@@ -168,6 +180,7 @@ fn compile(compiler: &mut IncrementalCompiler, request: CompileRequest) -> Compi
         root_dir,
         config: workspace,
         ast,
+        nav,
         output,
         messages,
     }

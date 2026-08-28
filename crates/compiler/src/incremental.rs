@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use arcstr::ArcStr;
@@ -18,6 +19,7 @@ use crate::{
     compile::{
         self, CellArg, CompileInput, CompileOutput, StaticAnalysis, StaticErrorCompileOutput,
     },
+    nav::NavIndex,
     parse,
     workspace::WorkspaceConfig,
 };
@@ -62,6 +64,8 @@ struct StaticCache {
     key: u64,
     disk_revisions: Vec<TrackedFileRevision>,
     analysis: StaticAnalysis,
+    /// Built lazily, because only editor sessions ask for it.
+    nav: Option<Arc<NavIndex>>,
 }
 
 /// Stateful compiler used by long-lived analyzer processes.
@@ -73,6 +77,10 @@ pub struct IncrementalCompiler {
     static_cache: Option<StaticCache>,
     execution_cache: HashMap<u64, CompileOutput>,
     execution_environment: Option<u64>,
+    /// The most recent navigation index that had content. Retained so that
+    /// editor navigation keeps answering while the workspace does not
+    /// type-check, which is most of the time while someone is typing.
+    last_good_nav: Option<Arc<NavIndex>>,
     stats: IncrementalStats,
 }
 
@@ -157,6 +165,38 @@ impl IncrementalCompiler {
         self.revision
     }
 
+    /// Navigation index for the current sources.
+    ///
+    /// Falls back to the most recent index that had content, so that a
+    /// half-written edit does not take go-to-definition away. Returned behind
+    /// an `Arc` because the analyzer shares one index across requests and
+    /// `StaticAnalysis` is cloned on every analysis.
+    pub fn nav(&mut self, config: &WorkspaceConfig) -> Option<Arc<NavIndex>> {
+        self.ensure_analysis(config);
+        let cache = self.static_cache.as_mut().expect("analysis cache");
+        if cache.nav.is_none()
+            && let Some(typed) = cache.analysis.typed_ast.as_ref()
+        {
+            let index = NavIndex::build(typed);
+            let tracked = typed.values().map(|module| module.path.as_path()).collect();
+            let usable = match &self.last_good_nav {
+                Some(previous) => index.covers(previous, &tracked),
+                // Nothing better to fall back to. An import error or a missing
+                // root module yields an empty typed AST, which is a compile
+                // failure rather than a workspace with nothing in it.
+                None => !index.is_empty(),
+            };
+            if usable {
+                cache.nav = Some(Arc::new(index));
+            }
+        }
+        if let Some(nav) = cache.nav.clone() {
+            self.last_good_nav = Some(nav.clone());
+            return Some(nav);
+        }
+        self.last_good_nav.clone()
+    }
+
     pub fn analyze_workspace(&mut self, config: &WorkspaceConfig) -> StaticAnalysis {
         self.ensure_analysis(config);
         self.static_cache
@@ -193,6 +233,7 @@ impl IncrementalCompiler {
             key,
             disk_revisions,
             analysis,
+            nav: None,
         });
     }
 
@@ -454,6 +495,33 @@ mod tests {
         let second = compiler.analyze_workspace(&config);
         assert!(!second.errors.is_empty());
         assert_eq!(compiler.stats().static_cache_hits, 1);
+    }
+
+    #[test]
+    fn navigation_survives_an_edit_that_does_not_compile() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/argon_library/lib.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), source.clone());
+
+        let good = compiler
+            .nav(&config)
+            .expect("a workspace that compiles is indexed");
+        let cell = source.find("cell test").unwrap() + "cell ".len();
+        assert!(good.definition_at(&root, cell).is_some());
+
+        // A syntax error leaves nothing to index. The previous index is served
+        // instead, so navigation does not disappear mid-keystroke.
+        compiler.set_source_text(root.clone(), "cell broken( {".to_owned());
+        let stale = compiler
+            .nav(&config)
+            .expect("the last good index is retained");
+        assert!(stale.definition_at(&root, cell).is_some());
+
+        compiler.set_source_text(root.clone(), source);
+        assert!(compiler.nav(&config).is_some());
     }
 
     #[test]
