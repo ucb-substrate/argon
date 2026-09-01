@@ -100,6 +100,34 @@ pub const BUILTINS: [&str; 15] = [
     "bbox",
 ];
 
+/// The module that the leading segments of a qualified `path` name.
+///
+/// `std::…` is absolute into the standard library, `lib::…` is absolute from
+/// the workspace root, and anything else is relative to `current`. `items` is
+/// how many trailing segments name the thing being resolved rather than its
+/// module: one for a `use` or a call, two for an `Enum::Variant`.
+///
+/// Which of the three forms a path takes is decided by its *first* segment, so
+/// the trailing item segments are dropped only after that: `use lib;` names the
+/// workspace root, not a child of the current module.
+pub(crate) fn module_prefix<'a>(
+    current: &ModPath,
+    path: impl IntoIterator<Item = &'a str>,
+    items: usize,
+) -> ModPath {
+    let path: Vec<&str> = path.into_iter().collect();
+    let prefix = &path[..path.len().saturating_sub(items)];
+    match path.first().copied() {
+        Some("std") => vec!["std".to_string()],
+        Some("lib") => prefix.iter().skip(1).map(|name| name.to_string()).collect(),
+        _ => current
+            .iter()
+            .cloned()
+            .chain(prefix.iter().map(|name| name.to_string()))
+            .collect(),
+    }
+}
+
 pub fn static_compile(
     ast: &WorkspaceParseAst,
 ) -> Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)> {
@@ -380,28 +408,11 @@ impl<'a> ImportPass<'a> {
     }
 
     fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        match use_decl.path[0].name.as_str() {
-            "std" => vec!["std".to_string()],
-            "lib" => use_decl
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(1)
-                .map(|ident| ident.name.to_string())
-                .collect(),
-            _ => self
-                .current_path
-                .iter()
-                .cloned()
-                .chain(
-                    use_decl
-                        .path
-                        .iter()
-                        .dropping_back(1)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect(),
-        }
+        module_prefix(
+            self.current_path,
+            use_decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        )
     }
 
     pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
@@ -1051,6 +1062,28 @@ impl Ty {
         }
     }
 
+    /// The source spelling of a primitive type, for the names that can appear
+    /// as an identifier.
+    ///
+    /// The inverse of [`Self::from_name`], so that anything reporting what a
+    /// type annotation resolved to reads the same table the annotation was
+    /// resolved against. `()` and `[]` are spellings the grammar produces
+    /// rather than identifiers, so they have no name here.
+    pub fn primitive_name(&self) -> Option<&'static str> {
+        Some(match self {
+            Ty::Bool => "Bool",
+            Ty::Int => "Int",
+            Ty::Float => "Float",
+            Ty::Rect => "Rect",
+            Ty::Polygon => "Polygon",
+            Ty::Path => "Path",
+            Ty::Point => "Point",
+            Ty::Any => "Any",
+            Ty::String => "String",
+            _ => return None,
+        })
+    }
+
     /// Computes the least upper bound (LUB) of self and other.
     /// For use in type promotion.
     ///
@@ -1079,8 +1112,8 @@ impl Ty {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
-    args: Vec<Ty>,
-    ret: Ty,
+    pub(crate) args: Vec<Ty>,
+    pub(crate) ret: Ty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1093,35 +1126,50 @@ pub struct CellFnTy {
     /// keeps the type representation a DAG rather than a tree: a cell that
     /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
     /// type size stays linear in hierarchy depth instead of doubling per level.
-    cell: Arc<CellTy>,
+    pub(crate) cell: Arc<CellTy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct CellTy {
-    data: IndexMap<String, Ty>,
+    pub(crate) data: IndexMap<String, Ty>,
     /// GDS-backed cells publish geometry fields at execution time. Their
     /// generated source declaration is intentionally only a signature, so
     /// field names cannot be enumerated by the source type pass.
     dynamic_fields: bool,
+    /// The declaring cell's [`VarId`], for navigation from a field access back
+    /// to the `let` that declared the field.
+    ///
+    /// Identity, not structure: cell typing is structural, so two cells with
+    /// the same fields must stay interchangeable. [`PartialEq`] therefore
+    /// ignores this field, and it is `None` for the generated signature of a
+    /// GDS-backed cell.
+    pub(crate) def: Option<VarId>,
+}
+
+impl PartialEq for CellTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data && self.dynamic_fields == other.dynamic_fields
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumTy {
-    id: EnumId,
-    variants: IndexSet<String>,
+    pub(crate) id: EnumId,
+    pub(crate) variants: IndexSet<String>,
 }
 
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type IdentPath = (Option<VarId>, Ty);
-    type EnumDecl = ();
+    /// `None` when the name was rejected before it could be bound.
+    type EnumDecl = Option<(VarId, EnumId)>;
     type StructDecl = ();
     type StructField = ();
     type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
     type ForLoop = VarId; // the var ID of the var Ident
-    type FnDecl = (PathBuf, VarId);
+    type FnDecl = (PathBuf, VarId, Ty);
     type IfExpr = Ty;
     type MatchExpr = Ty;
     type BinOpExpr = Ty;
@@ -1185,13 +1233,21 @@ impl<'a> VarIdTyPass<'a> {
         id
     }
 
-    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
-        let id = self.alloc_id();
+    /// Binds `name` to an id allocated earlier by [`Self::alloc_id`].
+    ///
+    /// Split out of [`Self::alloc`] for declarations whose type embeds their
+    /// own id, which have to know it before the type can be built.
+    fn bind(&mut self, name: &Substr, id: VarId, ty: Ty) {
         self.bindings
             .last_mut()
             .unwrap()
             .var_bindings
             .insert(name.clone(), (id, ty));
+    }
+
+    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
+        let id = self.alloc_id();
+        self.bind(name, id, ty);
         id
     }
 
@@ -1240,39 +1296,28 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
 
-        AnnotatedAst::new(
+        let mut annotated = AnnotatedAst::new(
             self.ast.text.clone(),
             &Ast {
                 decls,
                 span: self.ast.ast.span,
             },
             self.ast.path.clone(),
-        )
+        );
+        // Re-annotating starts from a clean slate; carry over what describes
+        // the file rather than the declarations that were just transformed.
+        annotated.source_text = self.ast.source_text.clone();
+        annotated.generated_declarations = self.ast.generated_declarations;
+        annotated.parsed = self.ast.parsed;
+        annotated
     }
 
     fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        match use_decl.path[0].name.as_str() {
-            "std" => vec!["std".to_string()],
-            "lib" => use_decl
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(1)
-                .map(|ident| ident.name.to_string())
-                .collect(),
-            _ => self
-                .current_path
-                .iter()
-                .cloned()
-                .chain(
-                    use_decl
-                        .path
-                        .iter()
-                        .dropping_back(1)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect(),
-        }
+        module_prefix(
+            self.current_path,
+            use_decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        )
     }
 
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
@@ -1708,7 +1753,7 @@ impl<'a> VarIdTyPass<'a> {
 }
 
 impl<S> Expr<S, VarIdTyMetadata> {
-    fn ty(&self) -> Ty {
+    pub(crate) fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
@@ -1766,30 +1811,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         } else {
             // look up enum
-            let path = match input.path[0].name.as_str() {
-                "std" => {
-                    vec!["std".to_string()]
-                }
-                "lib" => input
-                    .path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(2)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec(),
-                _ => self
-                    .current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        input
-                            .path
-                            .iter()
-                            .dropping_back(2)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec(),
-            };
+            let path = module_prefix(
+                self.current_path,
+                input.path.iter().map(|ident| ident.name.as_str()),
+                2,
+            );
             let enum_ = &input.path[input.path.len() - 2];
             let lookup = if path.is_empty() || &path == self.current_path {
                 self.lookup(&enum_.name)
@@ -1831,9 +1857,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     fn dispatch_enum_decl(
         &mut self,
         _input: &crate::ast::EnumDecl<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
         _variants: &[Ident<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+        // `declare_enum_decl` hoisted this binding before any body was walked,
+        // so it normally resolves. A name that collided with a builtin was
+        // rejected there and never bound, and there is no id to report: a
+        // shared placeholder would make every such enum in the workspace look
+        // like the same declaration.
+        match self.lookup(&name.name) {
+            Some((var_id, Ty::Enum(enum_ty))) => Some((var_id, enum_ty.id)),
+            _ => None,
+        }
     }
 
     fn dispatch_cell_decl(
@@ -1866,7 +1901,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             };
             self.assert_eq_ty(span, &scope.metadata, &fn_ty.ret);
         }
-        (self.ast.path.clone(), var_id)
+        (self.ast.path.clone(), var_id, ty)
     }
 
     fn transform_fn_decl(
@@ -1947,14 +1982,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .any(|decl| {
                 matches!(decl, Decl::Cell(cell) if cell.span == input.span && cell.name.name == input.name.name)
             });
+        // The cell's type embeds its own id so that a field access on an
+        // instance can be traced back to the declaring cell. A GDS-backed cell
+        // has no declared fields to trace back to, so it records none and
+        // field accesses on it fall through to the builtin geometry fields.
+        let cell_id = self.alloc_id();
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             cell: Arc::new(CellTy {
                 data,
                 dynamic_fields,
+                def: (!dynamic_fields).then_some(cell_id),
             }),
         }));
-        self.alloc(&input.name.name, ty);
+        self.bind(&input.name.name, cell_id, ty);
         let name = self.transform_ident(&input.name);
         let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
@@ -2520,29 +2561,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 name => self.typecheck_call(name, self.lookup(name), input.span, args, true),
             }
         } else {
-            let path = match func.path[0].name.as_str() {
-                "std" => {
-                    vec!["std".to_string()]
-                }
-                "lib" => func
-                    .path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(1)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec(),
-                _ => self
-                    .current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        func.path
-                            .iter()
-                            .dropping_back(1)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec(),
-            };
+            let path = module_prefix(
+                self.current_path,
+                func.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
             let name = &func.path.last().unwrap().name;
             let lookup = self
                 .mod_bindings
@@ -2816,6 +2839,57 @@ pub fn format_initial_condition(value: f64, grid: f64) -> String {
         value
     } else {
         format!("{value}.")
+    }
+}
+
+#[cfg(test)]
+mod module_prefix_tests {
+    use super::module_prefix;
+
+    fn current() -> Vec<String> {
+        vec!["nested".to_owned()]
+    }
+
+    #[test]
+    fn a_relative_path_hangs_off_the_current_module() {
+        assert_eq!(
+            module_prefix(&current(), ["inner", "item"], 1),
+            ["nested", "inner"]
+        );
+        assert_eq!(module_prefix(&current(), ["item"], 1), ["nested"]);
+    }
+
+    #[test]
+    fn lib_and_std_are_absolute() {
+        assert_eq!(
+            module_prefix(&current(), ["lib", "utils", "item"], 1),
+            ["utils"]
+        );
+        assert_eq!(
+            module_prefix(&current(), ["std", "shapes", "item"], 1),
+            ["std"]
+        );
+    }
+
+    /// The leading segment decides which of the three forms a path takes, so
+    /// it has to be read before the item segments are dropped: `use lib;`
+    /// names the workspace root, not a `lib` child of the current module.
+    #[test]
+    fn a_single_segment_absolute_path_is_still_absolute() {
+        assert_eq!(module_prefix(&current(), ["lib"], 1), [] as [String; 0]);
+        assert_eq!(module_prefix(&current(), ["std"], 1), ["std"]);
+    }
+
+    #[test]
+    fn an_enum_variant_drops_both_its_item_segments() {
+        assert_eq!(
+            module_prefix(&current(), ["lib", "kinds", "Kind", "Variant"], 2),
+            ["kinds"]
+        );
+        assert_eq!(
+            module_prefix(&current(), ["Kind", "Variant"], 2),
+            ["nested"]
+        );
     }
 }
 

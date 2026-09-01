@@ -465,6 +465,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn definitions_and_references_are_served_to_neovim() {
+        assert_completes("waiting for navigation requests", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(
+                "cell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\n",
+            )
+            .await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("navigation");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge navigation");
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn analyzer_errors_are_mirrored_to_the_gui() {
         assert_completes("waiting for analyzer error in GUI", async {
             let _guard = FULL_STACK_LOCK.lock().await;

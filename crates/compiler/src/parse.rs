@@ -23,6 +23,15 @@ pub const STD_SOURCE: &str = include_str!("std/lib.ar");
 /// by a compiler entry point rather than by a source file.
 pub const CELL_PATH: &str = "<argon-cell>";
 
+/// Source text for a compiler-internal path that has no file on disk.
+///
+/// The standard library is compiled into the binary, so anything that reads a
+/// source file by path — diagnostic rendering, an editor jumping to a
+/// definition — has to go through here rather than the filesystem.
+pub fn virtual_source(path: &Path) -> Option<&'static str> {
+    (path == Path::new(STD_PATH)).then_some(STD_SOURCE)
+}
+
 impl AstMetadata for ParseMetadata {
     type Ident = ();
     type IdentPath = ();
@@ -201,14 +210,16 @@ impl ParseOutput {
 
 fn make_backup_ast(input: ArcStr, path: PathBuf) -> AnnotatedParseAst {
     let input_len = input.len();
-    AnnotatedParseAst::new(
+    let mut ast = AnnotatedParseAst::new(
         input,
         &Ast::<Substr, _> {
             decls: vec![],
             span: cfgrammar::Span::new(0, input_len),
         },
         path,
-    )
+    );
+    ast.parsed = false;
+    ast
 }
 
 fn diagnostics_from_errors(errs: Vec<ParseError>) -> ParseDiagnostics {
@@ -608,21 +619,14 @@ fn parse_workspace_with_sources(
                 workspace_errs.insert(file_path, (errs, mod_spans));
             }
             Err(e) => {
-                workspace_ast.insert(
-                    path,
-                    (
-                        // TODO: make better data structures so this dummy isn't necessary.
-                        AnnotatedParseAst::new(
-                            "".into(),
-                            &Ast::<Substr, _> {
-                                decls: vec![],
-                                span: cfgrammar::Span::new(0, 0),
-                            },
-                            root_lib.into(),
-                        ),
-                        Some(e),
-                    ),
-                );
+                // TODO: make better data structures so this dummy isn't necessary.
+                //
+                // A module whose file could not even be located did not come
+                // from a successful parse, and it borrows the root's path for
+                // want of one of its own. Marking it unparsed keeps tooling
+                // that indexes by path from mistaking this empty stand-in for
+                // the root module's own source.
+                workspace_ast.insert(path, (make_backup_ast("".into(), root_lib.into()), Some(e)));
             }
         }
     }

@@ -4,6 +4,7 @@ pub mod compile;
 pub mod diagnostics;
 pub mod gds;
 pub mod incremental;
+pub mod nav;
 pub mod parse;
 mod parser;
 pub mod solver;
@@ -2186,6 +2187,50 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         output.errors
+    }
+
+    /// Cell typing is structural. `CellTy` carries the declaring cell's `VarId`
+    /// so that a field access can be navigated back to its `let`, and that id
+    /// is deliberately excluded from `PartialEq`: if it were not, two cells
+    /// with identical fields would stop being interchangeable and a branch
+    /// over them would silently widen to `Ty::Any`.
+    #[test]
+    fn structurally_identical_cells_remain_interchangeable() {
+        let source = |field: &str| {
+            format!(
+                r#"
+                cell left() {{
+                    let met = rect("met1", x0=0., y0=0., x1=10., y1=10.);
+                }}
+
+                cell right() {{
+                    let met = rect("met1", x0=0., y0=0., x1=20., y1=20.);
+                }}
+
+                cell top(pick: Bool) {{
+                    let chosen = if pick {{ left() }} else {{ right() }};
+                    let placed = inst(chosen);
+                    eq(placed.{field}.x0, 0.);
+                }}
+                "#
+            )
+        };
+
+        // The branches share a cell type, so the common field type-checks.
+        let errors = static_errors(&source("met"));
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        // And the type is still a cell rather than `Ty::Any`: an unknown field
+        // is caught. Were the declaring cell's id part of `CellTy` equality,
+        // the two branches would no longer unify, `Ty::lub` would widen the
+        // branch to `Ty::Any`, and this error would silently disappear.
+        let errors = static_errors(&source("missing"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, StaticErrorKind::NoFieldOnTy { .. })),
+            "{errors:#?}"
+        );
     }
 
     fn comparison_source(comparison: &str) -> String {
