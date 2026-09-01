@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use indexmap::IndexMap;
+use arcstr::ArcStr;
 
 use crate::{
     ast::{
@@ -26,7 +26,6 @@ use crate::{
         Statement, TySpec, TySpecKind, UseDecl, WorkspaceAst,
     },
     compile::{BUILTINS, EnumId, Ty, VarId, VarIdTyMetadata, module_prefix},
-    parse::CELL_PATH,
 };
 
 /// Identity of something that can be navigated to.
@@ -109,6 +108,15 @@ pub struct NavIndex {
     /// Identifier tokens per file, sorted by start offset. Entries are single
     /// tokens and never overlap.
     refs: HashMap<PathBuf, Vec<(cfgrammar::Span, Target)>>,
+    /// Editor-visible source of every file that parsed, including files that
+    /// contributed no identifier.
+    ///
+    /// Every span in the index is a byte offset into the text recorded here,
+    /// and an index outlives the sources it was built from: it keeps answering
+    /// while a half-written edit does not compile. Carrying the text makes the
+    /// index self-describing, so a reader can align an offset against the
+    /// buffer an editor has now instead of assuming the two still agree.
+    sources: HashMap<PathBuf, ArcStr>,
     defs: HashMap<DefKey, Definition>,
     usages: HashMap<DefKey, Vec<crate::ast::Span>>,
 }
@@ -119,15 +127,32 @@ impl NavIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.refs.is_empty()
+        self.sources.is_empty()
     }
 
-    /// The files this index has entries for.
+    /// The files this index covers.
     pub fn files(&self) -> impl Iterator<Item = &Path> {
-        self.refs.keys().map(PathBuf::as_path)
+        self.sources.keys().map(PathBuf::as_path)
     }
 
-    /// Whether this index still covers every file `previous` did.
+    /// The text this index's offsets into `file` are relative to.
+    pub fn source(&self, file: &Path) -> Option<&ArcStr> {
+        self.sources.get(file)
+    }
+
+    /// The files an index built from `ast` would cover.
+    ///
+    /// Answered without building the index, so one that is about to be judged
+    /// unusable is never built. Kept in step with the `sources` insert in
+    /// the builder's walk, which is the definition this reproduces.
+    pub fn coverage(ast: &WorkspaceAst<VarIdTyMetadata>) -> HashSet<&Path> {
+        ast.values()
+            .filter(|module| indexes_source(module))
+            .map(|module| module.path.as_path())
+            .collect()
+    }
+
+    /// Whether `coverage` still covers every file this index does.
     ///
     /// A file drops out of the index when it stops parsing, because the parser
     /// reports a failure rather than a partial tree and the module is left
@@ -135,10 +160,13 @@ impl NavIndex {
     /// signal to keep serving the previous index rather than to replace it.
     /// `tracked` is the set of files the workspace still contains, so that a
     /// file which was genuinely removed does not pin the index forever.
-    pub fn covers(&self, previous: &NavIndex, tracked: &HashSet<&Path>) -> bool {
-        previous
-            .files()
-            .all(|path| self.refs.contains_key(path) || !tracked.contains(path))
+    ///
+    /// Coverage is per file walked, not per file that yielded an identifier: a
+    /// file whose every declaration is commented out still parses, and must
+    /// not be mistaken for one that stopped parsing.
+    pub fn covered_by(&self, coverage: &HashSet<&Path>, tracked: &HashSet<&Path>) -> bool {
+        self.files()
+            .all(|path| coverage.contains(path) || !tracked.contains(path))
     }
 
     /// The identifier token covering `offset` in `file`, and what it refers to.
@@ -191,13 +219,19 @@ impl NavIndex {
     }
 }
 
-/// Primitive type names, kept as `'static` so a reference to one costs nothing.
-const BUILTIN_TYPES: [&str; 9] = [
-    "Bool", "Int", "Float", "Rect", "Polygon", "Path", "Point", "Any", "String",
-];
-
+/// The primitive type `name` spells, read off the type checker's own table so
+/// the two cannot disagree about which names resolve.
 fn builtin_type(name: &str) -> Option<&'static str> {
-    BUILTIN_TYPES.into_iter().find(|builtin| *builtin == name)
+    Ty::from_name(name)?.primitive_name()
+}
+
+/// The [`VarId`] of the cell a type was declared by, if it was declared by one.
+fn declaring_cell(ty: &Ty) -> Option<VarId> {
+    match ty {
+        Ty::CellFn(cell_fn) => cell_fn.cell.def,
+        Ty::Cell(cell) | Ty::Inst(cell) => cell.def,
+        _ => None,
+    }
 }
 
 fn builtin_function(name: &str) -> Option<&'static str> {
@@ -206,8 +240,6 @@ fn builtin_function(name: &str) -> Option<&'static str> {
 
 struct Builder<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    /// Which file each module lives in.
-    files: IndexMap<&'a ModPath, &'a Path>,
     /// The `VarId` an enum's name is bound to, by the id inside its [`Ty`].
     enums: HashMap<EnumId, VarId>,
     /// Cell `VarId` to field name to the `VarId` of the `let` declaring it.
@@ -221,16 +253,32 @@ struct Builder<'a> {
     index: NavIndex,
 }
 
-/// Whether a module is real source rather than a compiler-internal splice.
+/// Whether a module is real source rather than something the compiler
+/// synthesized.
+///
+/// Two module paths name no Argon source file: the entry-cell splice
+/// ([`crate::parse::CELL_PATH`]), which has no file at all, and a module made
+/// up entirely of GDS imports, which is recorded against the binary `.gds`
+/// file the cells came from. Neither is something an editor can usefully open,
+/// so checking for the source extension covers both and any future
+/// synthesized path.
 fn is_navigable(path: &Path) -> bool {
-    path != Path::new(CELL_PATH)
+    path.extension().is_some_and(|extension| extension == "ar")
+}
+
+/// Whether a module contributes its source text to an index.
+///
+/// A file that did not parse has an empty declaration list and no usable
+/// offsets, so it is left out entirely rather than recorded as a file the
+/// index covers.
+fn indexes_source(module: &crate::ast::annotated::AnnotatedAst<VarIdTyMetadata>) -> bool {
+    module.parsed && is_navigable(&module.path)
 }
 
 impl<'a> Builder<'a> {
     fn new(ast: &'a WorkspaceAst<VarIdTyMetadata>) -> Self {
         let mut builder = Self {
             ast,
-            files: IndexMap::new(),
             enums: HashMap::new(),
             cell_fields: HashMap::new(),
             current: const { &Vec::new() },
@@ -242,16 +290,15 @@ impl<'a> Builder<'a> {
         builder
     }
 
-    /// Records what the reference walk needs to have seen already: which file
-    /// each module is in, which `VarId` each enum's name holds, and which
-    /// `let` declares each of a cell's fields. All three can be referred to
-    /// from a module that is walked earlier.
+    /// Records what the reference walk needs to have seen already: which
+    /// `VarId` each enum's name holds, and which `let` declares each of a
+    /// cell's fields. Both can be referred to from a module that is walked
+    /// earlier.
     fn collect_declarations(&mut self) {
         for (module, ast) in self.ast.iter() {
             if !is_navigable(&ast.path) {
                 continue;
             }
-            self.files.insert(module, &ast.path);
             self.index.defs.insert(
                 DefKey::Module(module.clone()),
                 Definition {
@@ -263,7 +310,9 @@ impl<'a> Builder<'a> {
             for decl in &ast.ast.decls {
                 match decl {
                     Decl::Enum(decl) => {
-                        self.enums.insert(decl.metadata.1, decl.metadata.0);
+                        if let Some((name_id, enum_id)) = decl.metadata {
+                            self.enums.insert(enum_id, name_id);
+                        }
                     }
                     Decl::Cell(decl) => {
                         let fields = decl
@@ -293,6 +342,11 @@ impl<'a> Builder<'a> {
             self.current = module;
             self.path = &ast.path;
             self.visible = ast.source_text.len();
+            if indexes_source(ast) {
+                self.index
+                    .sources
+                    .insert(ast.path.clone(), ast.source_text.clone());
+            }
             for decl in &ast.ast.decls {
                 self.decl(decl);
             }
@@ -384,7 +438,11 @@ impl<'a> Builder<'a> {
     }
 
     fn enum_decl(&mut self, decl: &'a EnumDecl<arcstr::Substr, VarIdTyMetadata>) {
-        let name_id = decl.metadata.0;
+        // A name the type pass rejected has no id, so there is nothing to key
+        // a definition by and nothing that could refer to it.
+        let Some((name_id, _)) = decl.metadata else {
+            return;
+        };
         self.define(DefKey::Var(name_id), SymbolKind::Enum, &decl.name);
         for variant in &decl.variants {
             self.define(
@@ -431,7 +489,11 @@ impl<'a> Builder<'a> {
         // `use` has no metadata of its own; the imported binding reuses the
         // original declaration's `VarId`, so resolve it structurally against
         // the exporting module's declarations.
-        let module = module_prefix(self.current, prefix.iter().map(|ident| ident.name.as_str()));
+        let module = module_prefix(
+            self.current,
+            decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        );
         let target = self
             .exported(&module, &item.name)
             .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id)));
@@ -445,17 +507,39 @@ impl<'a> Builder<'a> {
 
     /// The `VarId` a module exports under `name`, if any.
     fn exported(&self, module: &ModPath, name: &str) -> Option<VarId> {
-        self.ast
-            .get(module)?
-            .ast
-            .decls
-            .iter()
-            .find_map(|decl| match decl {
-                Decl::Fn(decl) if decl.name.name == name => Some(decl.metadata.1),
-                Decl::Cell(decl) if decl.name.name == name => Some(decl.metadata.1),
-                Decl::Enum(decl) if decl.name.name == name => Some(decl.metadata.0),
-                _ => None,
-            })
+        self.exported_within(module, name, 0)
+    }
+
+    /// [`Self::exported`], following the module's own imports.
+    ///
+    /// A module's exports are its declarations plus everything it imported:
+    /// `declare_use_decl` installs an import into the module's binding frame,
+    /// so `use lib::a::thing;` resolves when `a` only re-exported `thing`.
+    /// Declarations are checked first because they are bound last and so win.
+    /// `depth` bounds the chase, since a cycle of re-exports is a user error
+    /// the type checker reports rather than something to hang on.
+    fn exported_within(&self, module: &ModPath, name: &str, depth: usize) -> Option<VarId> {
+        const MAX_REEXPORT_DEPTH: usize = 16;
+        let decls = &self.ast.get(module)?.ast.decls;
+        let declared = decls.iter().find_map(|decl| match decl {
+            Decl::Fn(decl) if decl.name.name == name => Some(decl.metadata.1),
+            Decl::Cell(decl) if decl.name.name == name => Some(decl.metadata.1),
+            Decl::Enum(decl) if decl.name.name == name => decl.metadata.map(|(id, _)| id),
+            _ => None,
+        });
+        if declared.is_some() || depth == MAX_REEXPORT_DEPTH {
+            return declared;
+        }
+        decls.iter().find_map(|decl| {
+            let Decl::Use(decl) = decl else { return None };
+            let item = decl.path.last()?;
+            if decl.alias.as_ref().unwrap_or(item).name != name {
+                return None;
+            }
+            let exporter =
+                module_prefix(module, decl.path.iter().map(|ident| ident.name.as_str()), 1);
+            self.exported_within(&exporter, &item.name, depth + 1)
+        })
     }
 
     fn arg_decl(&mut self, arg: &'a ArgDecl<arcstr::Substr, VarIdTyMetadata>) {
@@ -485,10 +569,17 @@ impl<'a> Builder<'a> {
                     .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id)));
                 self.record(name.span, target);
             }
-            (TySpecKind::Ident(name), _) => {
-                let target = builtin_type(&name.name).map_or(Target::Unresolved, |name| {
-                    Target::Builtin(Builtin::Type(name))
-                });
+            (TySpecKind::Ident(name), ty) => {
+                // `ty_from_spec` resolves a name that is not a primitive by
+                // looking it up, so an annotation can also name a declaration.
+                // A cell's type carries the id of the cell that declared it,
+                // which is the only such name with somewhere to jump to.
+                let target = match declaring_cell(ty) {
+                    Some(id) => Target::Def(DefKey::Var(id)),
+                    None => builtin_type(&name.name).map_or(Target::Unresolved, |name| {
+                        Target::Builtin(Builtin::Type(name))
+                    }),
+                };
                 self.record(name.span, target);
             }
             (TySpecKind::Seq(inner), Ty::Seq(element)) => self.ty_spec(inner, element),
@@ -652,11 +743,15 @@ impl<'a> Builder<'a> {
     }
 
     /// Records each leading segment of a qualified path as the module it names.
+    ///
+    /// `prefix` is already only the module segments, so none of it names an
+    /// item to be dropped.
     fn module_path(&mut self, prefix: &'a [Ident<arcstr::Substr, VarIdTyMetadata>]) {
         for length in 1..=prefix.len() {
             let module = module_prefix(
                 self.current,
                 prefix[..length].iter().map(|ident| ident.name.as_str()),
+                0,
             );
             let key = DefKey::Module(module);
             let target = if self.index.defs.contains_key(&key) {
@@ -677,8 +772,18 @@ impl<'a> Builder<'a> {
             Ty::Inst(cell) if name != "x" && name != "y" => cell
                 .def
                 .and_then(|cell_id| self.cell_fields.get(&cell_id))
-                .and_then(|fields| fields.get(name))
-                .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id))),
+                .map_or(
+                    // A GDS-backed cell declares no fields to trace back to:
+                    // its source declaration is only a signature, and the
+                    // fields it publishes come from the layout at execution
+                    // time. Treat them like any other compiler-provided field.
+                    Target::Builtin(Builtin::Field(name.to_string())),
+                    |fields| {
+                        fields
+                            .get(name)
+                            .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id)))
+                    },
+                ),
             Ty::Inst(_) | Ty::Rect | Ty::Polygon | Ty::Path | Ty::Point => {
                 Target::Builtin(Builtin::Field(name.to_string()))
             }
@@ -769,6 +874,14 @@ mod tests {
             .collect();
         let expected: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn compiler_internal_paths_are_not_navigable() {
+        assert!(!is_navigable(Path::new(crate::parse::CELL_PATH)));
+        assert!(!is_navigable(Path::new("/virtual/sram.gds")));
+        assert!(is_navigable(Path::new(STD_PATH)));
+        assert!(is_navigable(Path::new(ROOT)));
     }
 
     #[test]
@@ -868,6 +981,26 @@ cell top() {
         );
     }
 
+    /// A type annotation resolves through an ordinary lookup when it is not a
+    /// primitive, so it can name a cell.
+    #[test]
+    fn a_type_annotation_naming_a_cell_resolves_to_it() {
+        check(
+            r#"
+cell inn$0er() {
+    let met = rect("met1");
+}
+
+fn take(c: inn$0er) -> Float { 1. }
+
+cell top() {
+    eq(rect("met1").w, take(inner()));
+}
+"#,
+            &["inner#0", "inner#0"],
+        );
+    }
+
     #[test]
     fn a_cell_field_resolves_to_the_let_that_declares_it() {
         check(
@@ -884,6 +1017,133 @@ cell top() {
 "#,
             &["met#0"],
         );
+    }
+
+    /// A GDS-backed cell's declaration is a signature the compiler generated,
+    /// with no `let` to trace a field back to. Its fields come from the layout
+    /// at execution time, so they are compiler-provided rather than names that
+    /// failed to resolve.
+    #[test]
+    fn a_field_of_a_gds_backed_instance_is_a_builtin() {
+        let source = "\
+cell top() {
+    let c = imported();
+    let i = inst(c);
+    eq(i.metal, 0.);
+}
+";
+        // What `add_gds_imports` produces: a bare signature appended after the
+        // editor-visible source and promoted to the front of declaration order.
+        let generated = "cell imported() {}\n";
+        let mut root =
+            parse_source_text(format!("{source}\n{generated}"), PathBuf::from(ROOT)).unwrap();
+        root.promote_last_declarations(1);
+        root.source_text = arcstr::ArcStr::from(source);
+        root.generated_declarations = 1;
+        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (typed, _) = static_compile(&ast).unwrap();
+        let index = NavIndex::build(&typed);
+
+        let offset = source.find("metal").unwrap();
+        let (_, target) = index
+            .target_at(Path::new(ROOT), offset)
+            .expect("the field is indexed");
+        assert_eq!(*target, Target::Builtin(Builtin::Field("metal".to_owned())));
+
+        // The generated signature itself is past the editor-visible source, so
+        // nothing in it is indexed.
+        assert!(
+            index
+                .refs
+                .get(Path::new(ROOT))
+                .is_some_and(|entries| entries.iter().all(|(span, _)| span.end() <= source.len()))
+        );
+    }
+
+    /// An import resolves against what the exporting module makes available,
+    /// which includes what that module itself imported.
+    #[test]
+    fn a_re_exported_item_resolves_to_its_original_declaration() {
+        let source =
+            "use lib::middle::thing;\n\ncell top() {\n    eq(rect(\"met1\").w, thing());\n}\n";
+        let modules = [
+            (Vec::new(), source, ROOT),
+            (
+                vec!["middle".to_owned()],
+                "use lib::origin::thing;\n",
+                "/virtual/middle.ar",
+            ),
+            (
+                vec!["origin".to_owned()],
+                "fn thing() -> Float { 3. }\n",
+                "/virtual/origin.ar",
+            ),
+        ];
+        let mut ast: IndexMap<_, _> = modules
+            .into_iter()
+            .map(|(module, text, path)| {
+                (
+                    module,
+                    parse_source_text(text.to_owned(), PathBuf::from(path)).unwrap(),
+                )
+            })
+            .collect();
+        ast.insert(
+            vec!["std".to_owned()],
+            parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap(),
+        );
+        let (typed, _) = static_compile(&ast).unwrap();
+        let index = NavIndex::build(&typed);
+
+        let definition = index
+            .definition_at(Path::new(ROOT), source.find("thing").unwrap())
+            .expect("the imported name resolves");
+        assert_eq!(definition.kind, SymbolKind::Function);
+        let DefLocation::Source(span) = &definition.location else {
+            panic!("expected a source location, got {:?}", definition.location);
+        };
+        assert_eq!(span.path, Path::new("/virtual/origin.ar"));
+    }
+
+    /// A module made up entirely of GDS imports is recorded against the binary
+    /// the cells came from. There is no Argon source there, so nothing in it
+    /// is a place to send an editor.
+    #[test]
+    fn a_gds_only_module_is_not_a_file_to_jump_to() {
+        let source = "cell top() {\n    let c = macros::sram();\n    let i = inst(c);\n}\n";
+        let root = parse_source_text(source.to_owned(), PathBuf::from(ROOT)).unwrap();
+        // What `add_gds_imports` produces for a namespaced import: a module of
+        // bare signatures whose path is the `.gds` file and whose
+        // editor-visible source is empty.
+        let mut macros = parse_source_text(
+            "cell sram() {}\n".to_owned(),
+            PathBuf::from("/virtual/sram.gds"),
+        )
+        .unwrap();
+        macros.promote_last_declarations(1);
+        macros.source_text = arcstr::ArcStr::from("");
+        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
+        let ast = IndexMap::from([
+            (Vec::new(), root),
+            (vec!["macros".to_owned()], macros),
+            (vec!["std".to_owned()], std),
+        ]);
+        let (typed, _) = static_compile(&ast).unwrap();
+        let index = NavIndex::build(&typed);
+
+        assert!(
+            index.source(Path::new("/virtual/sram.gds")).is_none(),
+            "a binary is not an indexed source"
+        );
+        for name in ["macros", "sram"] {
+            assert!(
+                index
+                    .definition_at(Path::new(ROOT), source.find(name).unwrap())
+                    .is_none(),
+                "{name} should have nowhere to jump to"
+            );
+        }
     }
 
     #[test]

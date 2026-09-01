@@ -38,6 +38,29 @@ local function track_modified_buffer(bufnr, client_id)
     })
 end
 
+--- Buffers this plugin installed its own `gd` mapping in.
+local gd_mapped_buffers = {}
+
+--- Drops the `gd` mapping this plugin installed, once no argon client is left
+--- attached.
+---
+--- `vim.lsp.buf.definition` does nothing without a client, so leaving it would
+--- permanently shadow Vim's builtin `gd` for the life of the buffer -- and
+--- make the next attach believe someone else already owns the mapping.
+---@param bufnr number
+local function release_gd_mapping(bufnr)
+  if not gd_mapped_buffers[bufnr] then
+    return
+  end
+  if #vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) > 0 then
+    return
+  end
+  gd_mapped_buffers[bufnr] = nil
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    pcall(vim.keymap.del, 'n', 'gd', { buffer = bufnr })
+  end
+end
+
 local modified_group = vim.api.nvim_create_augroup('argon_workspace_modified', { clear = true })
 vim.api.nvim_create_autocmd('BufModifiedSet', {
     group = modified_group,
@@ -70,6 +93,10 @@ vim.api.nvim_create_autocmd('LspDetach', {
             clients[args.data.client_id] = nil
         end
         schedule_workspace_modified(args.data.client_id)
+        -- Scheduled: the detaching client is still attached at this point.
+        vim.schedule(function()
+            release_gd_mapping(args.buf)
+        end)
     end,
 })
 
@@ -129,6 +156,44 @@ local function restart(bufnr, filter, callback)
   end)
 end
 
+--- Whether `gd` is already mapped for `bufnr`, buffer-locally or globally.
+---
+--- `maparg` would answer for the *current* buffer, which is not necessarily
+--- the one being attached to, and would report a buffer-local mapping in
+--- preference to a global one. Both lists are read directly instead.
+---@param bufnr number The buffer to check
+---@return boolean
+local function gd_is_mapped(bufnr)
+  for _, mappings in ipairs({
+    vim.api.nvim_buf_get_keymap(bufnr, 'n'),
+    vim.api.nvim_get_keymap('n'),
+  }) do
+    for _, mapping in ipairs(mappings) do
+      if mapping.lhs == 'gd' then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+--- The directory the analyzer writes the embedded standard library into.
+---
+--- Mirrors `argon_cache_dir` in the analyzer: `$XDG_CACHE_HOME`, or `~/.cache`
+--- when it is unset.
+---@return string|nil
+local function std_cache_dir()
+  local base = vim.env.XDG_CACHE_HOME
+  if not base or base == '' then
+    local home = vim.uv.os_homedir() or vim.env.HOME
+    if not home or home == '' then
+      return nil
+    end
+    base = home .. '/.cache'
+  end
+  return vim.fs.normalize(base .. '/argon/std')
+end
+
 M.get_root_dir = function(bufnr)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
     local bufname = vim.api.nvim_buf_get_name(bufnr)
@@ -140,6 +205,21 @@ end
 ---@param bufnr? number The buffer number (optional), defaults to the current buffer
 M.start = function(bufnr)
     bufnr = bufnr or vim.api.nvim_get_current_buf()
+    -- A buffer under the cache directory is the read-only copy of the standard
+    -- library that go-to-definition opened. Its root file is named `lib.ar`,
+    -- so workspace detection would treat it as a project of its own and start
+    -- a second analyzer rooted at the cache; the client the user jumped from
+    -- already answers for it.
+    local std_cache = std_cache_dir()
+    if
+        std_cache
+        and vim.startswith(
+            vim.fs.normalize(vim.api.nvim_buf_get_name(bufnr)),
+            std_cache .. '/'
+        )
+    then
+        return
+    end
     if not config.cmd and vim.fn.executable(config.analyzer) ~= 1 then
         vim.notify(
           'argon: Could not find argon-analyzer. Install it with Cargo or configure vim.g.argon.analyzer.',
@@ -153,7 +233,7 @@ M.start = function(bufnr)
           'argon: Could not detect workspace, treating current file as root.',
           vim.log.levels.WARN
         )
-        root_dir = vim.fs.dirname(bufname)
+        root_dir = vim.fs.dirname(vim.api.nvim_buf_get_name(bufnr))
     end
     local analyzer_cmd = config.cmd or { config.analyzer }
     if type(analyzer_cmd) == 'table' then
@@ -238,12 +318,13 @@ M.start = function(bufnr)
         -- for first, so provide it, leaving any existing one alone.
         if
             lsp_client:supports_method('textDocument/definition')
-            and vim.fn.maparg('gd', 'n', false, true).buffer ~= 1
+            and not gd_is_mapped(attached_bufnr)
         then
             vim.keymap.set('n', 'gd', vim.lsp.buf.definition, {
                 buffer = attached_bufnr,
                 desc = 'argon: go to definition',
             })
+            gd_mapped_buffers[attached_bufnr] = true
         end
         if type(old_on_attach) == 'function' then
             old_on_attach(lsp_client, attached_bufnr, ...)

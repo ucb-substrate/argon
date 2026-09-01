@@ -6,6 +6,7 @@ pub mod rpc;
 pub mod cli;
 
 use std::{
+    collections::HashMap,
     env, fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -156,43 +157,34 @@ impl Default for LogConfig {
     }
 }
 
-pub fn argon_config_path() -> Option<PathBuf> {
-    env::var_os("XDG_CONFIG_HOME")
+/// Argon's own subdirectory of one XDG base directory.
+///
+/// `variable` is the XDG environment variable naming the base directory, and
+/// `home_fallback` the path relative to the home directory that the XDG
+/// specification falls back to when it is unset or empty.
+fn argon_xdg_dir(variable: &str, home_fallback: &str) -> Option<PathBuf> {
+    env::var_os(variable)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             homedir::my_home()
                 .ok()
                 .flatten()
-                .map(|home| home.join(".config"))
+                .map(|home| home.join(home_fallback))
         })
-        .map(|directory| directory.join("argon/config.toml"))
+        .map(|directory| directory.join("argon"))
+}
+
+pub fn argon_config_path() -> Option<PathBuf> {
+    argon_xdg_dir("XDG_CONFIG_HOME", ".config").map(|directory| directory.join("config.toml"))
 }
 
 pub fn argon_state_dir() -> Option<PathBuf> {
-    env::var_os("XDG_STATE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            homedir::my_home()
-                .ok()
-                .flatten()
-                .map(|home| home.join(".local/state"))
-        })
-        .map(|directory| directory.join("argon"))
+    argon_xdg_dir("XDG_STATE_HOME", ".local/state")
 }
 
 pub fn argon_cache_dir() -> Option<PathBuf> {
-    env::var_os("XDG_CACHE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            homedir::my_home()
-                .ok()
-                .flatten()
-                .map(|home| home.join(".cache"))
-        })
-        .map(|directory| directory.join("argon"))
+    argon_xdg_dir("XDG_CACHE_HOME", ".cache")
 }
 
 pub fn argon_log_path() -> Option<PathBuf> {
@@ -365,8 +357,13 @@ impl SourceState {
 pub(crate) struct PublishedState {
     pub(crate) config: WorkspaceConfig,
     pub(crate) ast: Arc<WorkspaceParseAst>,
-    /// Latest navigation index that had content. Replaced only when a compile
-    /// produces a new one, so navigation keeps working through a broken edit.
+    /// Latest usable navigation index.
+    ///
+    /// This can be older than `ast`: the compiler keeps serving the last index
+    /// that covered the workspace so navigation survives a broken edit, and
+    /// decides on its own when that index is superseded. The index carries the
+    /// sources its offsets are into, so a stale one stays readable without
+    /// retaining the parse it came from.
     pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
@@ -446,22 +443,53 @@ fn compile_open_cell(
     compile::execute_cell_invocation(ast, invocation, config)
 }
 
-/// Range of `span` within the editor-visible text of the file that produced it.
+/// Ranges compiler spans against the workspace files they came from.
 ///
-/// Returns `None` when the file is not part of the compiled workspace or when
-/// the span starts beyond the editor-visible source. Generated declarations
-/// (GDS import stubs, spliced entry cells) are appended past that boundary, so
-/// this is what keeps them from being reported at a position no buffer has.
-fn span_range(ast: &WorkspaceParseAst, span: &Span, encoding: PositionEncoding) -> Option<Range> {
-    let module = ast.values().find(|module| module.path == span.path)?;
-    if span.span.start() > module.source_text.len() {
-        return None;
+/// Building a [`Document`] indexes every line of a file, so the one built for
+/// a file is kept for the rest of the batch: a single compile routinely
+/// reports many errors against the same handful of files.
+struct SpanRanger<'a> {
+    ast: &'a WorkspaceParseAst,
+    encoding: PositionEncoding,
+    documents: HashMap<PathBuf, Option<Document>>,
+}
+
+impl<'a> SpanRanger<'a> {
+    fn new(ast: &'a WorkspaceParseAst, encoding: PositionEncoding) -> Self {
+        Self {
+            ast,
+            encoding,
+            documents: HashMap::new(),
+        }
     }
-    let doc = Document::new(&module.source_text, 0, encoding);
-    Some(Range {
-        start: doc.offset_to_pos(span.span.start()),
-        end: doc.offset_to_pos(span.span.end()),
-    })
+
+    /// Range of `span` within the editor-visible text of the file that produced
+    /// it.
+    ///
+    /// Returns `None` when the file is not part of the compiled workspace or
+    /// when the span starts beyond the editor-visible source. Generated
+    /// declarations (GDS import stubs, spliced entry cells) are appended past
+    /// that boundary, so this is what keeps them from being reported at a
+    /// position no buffer has.
+    fn range(&mut self, span: &Span) -> Option<Range> {
+        let ast = self.ast;
+        let encoding = self.encoding;
+        let document = self
+            .documents
+            .entry(span.path.clone())
+            .or_insert_with(|| {
+                let module = ast.values().find(|module| module.path == span.path)?;
+                Some(Document::new(&module.source_text, 0, encoding))
+            })
+            .as_ref()?;
+        if span.span.start() > document.contents().len() {
+            return None;
+        }
+        Some(Range {
+            start: document.offset_to_pos(span.span.start()),
+            end: document.offset_to_pos(span.span.end()),
+        })
+    }
 }
 
 fn diagnostics(
@@ -500,8 +528,9 @@ fn diagnostics(
                 .collect(),
             CompileOutput::Valid(_) => vec![],
         };
+        let mut ranger = SpanRanger::new(ast, encoding);
         for (span, message) in errs {
-            if let Some(range) = span_range(ast, &span, encoding)
+            if let Some(range) = ranger.range(&span)
                 && let Some(url) = Uri::from_file_path(&span.path)
             {
                 diagnostics.entry(url).or_default().push(Diagnostic {
@@ -525,7 +554,11 @@ pub struct State {
     position_encoding: Arc<OnceLock<PositionEncoding>>,
     /// The embedded standard library, written to disk on first use so the
     /// editor can open it. `None` if it could not be written.
-    std_file: Arc<OnceLock<Option<PathBuf>>>,
+    ///
+    /// An async cell because writing it is filesystem work that has to happen
+    /// off the runtime's worker threads, and because requests arriving while
+    /// the write is in flight should await it rather than repeat it.
+    std_file: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
@@ -774,8 +807,12 @@ impl Backend {
             }
             compiled.config = result.config;
             compiled.ast = Arc::new(result.ast);
-            if result.nav.is_some() {
-                compiled.nav = result.nav;
+            // The compiler only ever answers `None` before the workspace has
+            // type-checked once, or on a path that never asked it (a manifest
+            // that would not load). Neither is a reason to throw away an index
+            // that is still good.
+            if let Some(nav) = result.nav {
+                compiled.nav = Some(nav);
             }
             compiled.compiled_revision = identity.revision;
         }

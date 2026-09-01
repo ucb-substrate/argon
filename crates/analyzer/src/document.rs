@@ -108,13 +108,32 @@ impl Document {
         let mut units = 0usize;
         let mut bytes = 0usize;
         for c in text.chars() {
-            if units >= target {
+            // `substr` hands back the line terminator too, but no character
+            // addresses it: LSP clamps a column past the end of a line to the
+            // end of that line's content. Walking into the terminator would
+            // let an edit anchored at end-of-line delete the newline and join
+            // the line to the next one.
+            if units >= target || c == '\n' || c == '\r' {
                 break;
             }
             units += self.encoding.width(c);
             bytes += c.len_utf8();
         }
         Some(Pos::new(position.line, bytes as u32))
+    }
+
+    /// Byte-offset position of a client-facing position, clamped into the
+    /// document.
+    ///
+    /// A position on a line the document does not have names its end: clients
+    /// legitimately address the end of a document that way, and an edit
+    /// anchored there has to land somewhere rather than be dropped.
+    fn clamped_pos(&self, position: Position) -> Pos {
+        self.position_to_pos(position).unwrap_or_else(|| {
+            self.contents
+                .offset_to_pos(self.contents.text().len())
+                .unwrap_or(Pos::new(0, 0))
+        })
     }
 
     pub(crate) fn position_to_offset(&self, position: Position) -> Option<usize> {
@@ -138,21 +157,23 @@ impl Document {
         self.contents.text().get(start..end)
     }
 
+    /// Applies incremental changes in order, so each range addresses the text
+    /// the preceding change produced.
+    ///
+    /// Every range is clamped into the document rather than skipped. Skipping
+    /// one would leave this copy of the buffer permanently disagreeing with the
+    /// editor's, silently, for every diagnostic and every navigation answer
+    /// that follows.
     pub(crate) fn apply_changes(&mut self, changes: Vec<DocumentChange>, version: i32) {
         if version > self.version {
             for change in changes {
-                let range = match change.range {
-                    Some(range) => {
-                        let (Some(start), Some(end)) = (
-                            self.position_to_pos(range.start),
-                            self.position_to_pos(range.end),
-                        ) else {
-                            continue;
-                        };
-                        Some(start..end)
-                    }
-                    None => None,
-                };
+                let range = change.range.map(|range| {
+                    let start = self.clamped_pos(range.start);
+                    // A client may not send an inverted range, but clamping an
+                    // out-of-range one can produce a start past the end.
+                    let end = self.clamped_pos(range.end).max(start);
+                    start..end
+                });
                 self.contents = IndexedText::new(ArcStr::from(apply_change(
                     &self.contents,
                     TextChange {
@@ -218,9 +239,10 @@ mod tests {
     #[test]
     fn out_of_range_input_is_clamped_rather_than_rejected() {
         let doc = doc(PositionEncoding::Utf16);
-        // Past the end of a line clamps to that line's end (which includes its
-        // newline), and past the last line clamps to the end of the document.
-        let first_line_end = MIXED.find('\n').unwrap() + 1;
+        // Past the end of a line clamps to the end of that line's content,
+        // short of its newline, and past the last line clamps to the end of
+        // the document.
+        let first_line_end = MIXED.find('\n').unwrap();
         assert_eq!(
             doc.position_to_offset(Position::new(0, 999)),
             Some(first_line_end)
@@ -230,6 +252,36 @@ mod tests {
             Some(MIXED.len())
         );
         assert_eq!(doc.offset_to_pos(MIXED.len() + 100).line, 1);
+    }
+
+    #[test]
+    fn an_edit_past_the_end_of_a_line_does_not_swallow_its_newline() {
+        let mut doc = doc(PositionEncoding::Utf16);
+        // A column past the end of line 0 is a common way to say "end of
+        // line"; inserting there must not join the two lines.
+        doc.apply_changes(
+            vec![DocumentChange {
+                range: Some(Range::new(Position::new(0, 999), Position::new(0, 999))),
+                patch: " done".to_owned(),
+            }],
+            1,
+        );
+        assert_eq!(doc.contents(), "let w = 1.; // µ and 𝄞 done\nlet h = 2.;\n");
+    }
+
+    #[test]
+    fn an_edit_on_a_line_the_document_does_not_have_still_lands() {
+        let mut doc = Document::new("abc\n", 0, PositionEncoding::Utf8);
+        // Nothing maps line 40; the previous code dropped the change and bumped
+        // the version anyway, leaving this copy of the buffer behind forever.
+        doc.apply_changes(
+            vec![DocumentChange {
+                range: Some(Range::new(Position::new(40, 0), Position::new(40, 0))),
+                patch: "xyz".to_owned(),
+            }],
+            1,
+        );
+        assert_eq!(doc.contents(), "abc\nxyz");
     }
 
     #[test]

@@ -131,6 +131,28 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
     definition() ~= nil,
     'navigation should keep answering from the last index that compiled'
   )
+
+  -- A broken edit *before* the position under test shifts every offset after
+  -- it. The retained index still describes the file as it was, so the answer
+  -- has to be translated rather than read off the stale offsets directly.
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  wait_for('the restored file to compile', function()
+    return #vim.diagnostic.get(bufnr) == 0
+  end)
+  vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { 'cell broken( {' })
+  wait_for('the leading broken edit to reach the analyzer', function()
+    return #vim.diagnostic.get(bufnr) > 0
+  end)
+  params.position = { line = use_line + 1, character = use_column }
+  local shifted = definition()
+  assert(shifted, 'navigation should survive a broken edit above the cursor')
+  assert(
+    shifted.range.start.line == location.range.start.line + 1,
+    'the definition should follow the inserted line, expected '
+      .. tostring(location.range.start.line + 1)
+      .. ' got '
+      .. tostring(shifted.range.start.line)
+  )
 elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
   -- The Rust test drives the analyzer RPC directly and acknowledges the
   -- mirrored GUI error after observing it.
