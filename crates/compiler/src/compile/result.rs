@@ -45,9 +45,9 @@ pub enum StaticErrorKind {
     /// Match arms must be comprehensive.
     #[error("match arms must be comprehensive")]
     MatchArmsNotComprehensive,
-    /// The operands in a binary expression must have the same type.
-    #[error("operands of binary expression must have the same type")]
-    BinOpMismatchedTypes,
+    /// The operands in an arithmetic expression must have the same type.
+    #[error("operands of an arithmetic expression must have the same type")]
+    ArithMismatchedTypes,
     /// The operands in a comparison must have the same type.
     #[error("operands of a comparison must have the same type")]
     ComparisonMismatchedTypes,
@@ -57,6 +57,9 @@ pub enum StaticErrorKind {
     /// Enum values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on enum values")]
     EnumsNotOrd,
+    /// Boolean values cannot be ordered.
+    #[error("cannot perform greater/less than comparisons on booleans")]
+    BoolNotOrd,
     /// Nil values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
@@ -66,12 +69,15 @@ pub enum StaticErrorKind {
     /// Sequences may only be compared with an empty sequence for equality.
     #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
     SeqMustCompareEqSeqNil,
-    /// A type cannot be used in a binary expression.
-    #[error("type cannot be used in a binary expression: {0:?}")]
-    BinOpInvalidType(Ty),
+    /// A type cannot be used in an arithmetic expression.
+    #[error("type cannot be used in an arithmetic expression: {0:?}")]
+    ArithInvalidType(Ty),
     /// A type cannot be used in a unary operation.
     #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,
+    /// A type cannot be used as an operand of `&&`, `||`, or `!`.
+    #[error("type cannot be used in a boolean expression; `&&`, `||`, and `!` require Bool")]
+    BoolOpInvalidType,
     /// A type cannot be used in a comparison expression.
     #[error("type cannot be used in comparison expression")]
     ComparisonInvalidType,

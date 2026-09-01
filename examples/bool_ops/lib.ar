@@ -1,0 +1,45 @@
+// `&&`, `||`, and `!` combine conditions so a generator can make one decision
+// from several measurements instead of nesting an `if` per term.
+//
+// `&&` and `||` short-circuit: the right operand is only evaluated when the
+// left one does not already decide the result. Because an Argon expression can
+// draw geometry and add constraints, that is a statement about what gets built,
+// not only about speed -- nothing in a skipped operand is constructed.
+
+// A strap is wide enough to take a via only if it clears the minimum in both
+// directions, and vias are skipped entirely on a cell marked as a dummy.
+cell strap(w: Float, h: Float, dummy: Bool) {
+    let met1 = rect("met1", x0=0., y0=0., x1=w, y1=h)!;
+
+    let wide = w >= 40. && h >= 40.;
+    let square = w >= 40. && h >= 40. && !(w > 100. || h > 100.);
+
+    if !dummy && wide {
+        // Centered via, inset from every edge of the strap.
+        let via = rect("via1")!;
+        eq(via.x0, met1.x0 + 10.);
+        eq(via.y0, met1.y0 + 10.);
+        eq(via.x1, met1.x1 - 10.);
+        eq(via.y1, met1.y1 - 10.);
+    } else { };
+
+    // A marker layer for the "big enough, but not oversized" case.
+    if square {
+        let mark = rect("met2", x0=0., y0=h, x1=10., y1=h + 10.)!;
+    } else { };
+}
+
+cell top() {
+    let small = inst(strap(20., 20., false));
+    eq(small.x, 0.);
+    eq(small.y, 0.);
+
+    let tall = inst(strap(60., 60., false));
+    eq(tall.x, 200.);
+    eq(tall.y, 0.);
+
+    // Marked as a dummy, so the via is skipped even though it is wide enough.
+    let blank = inst(strap(60., 60., true));
+    eq(blank.x, 400.);
+    eq(blank.y, 0.);
+}
