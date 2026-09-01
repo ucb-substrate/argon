@@ -121,7 +121,55 @@ pub struct CustomLineStyle {
     pub name: String,
 }
 
+/// Independently comparable parts of a normalized technology. Incremental
+/// compilation uses these values instead of the technology file's revision so
+/// an unrelated edit (for example, changing a fill color) does not invalidate
+/// solved geometry. Presentation fields are intentionally not a cache key;
+/// the current [`Technology`] is attached to every returned output instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct TechnologyFingerprints {
+    pub(crate) solver: SolverTechnologyFingerprint,
+    pub(crate) layer_validation: LayerValidationTechnologyFingerprint,
+    pub(crate) gds_import: GdsImportTechnologyFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SolverTechnologyFingerprint(u64);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct LayerValidationTechnologyFingerprint(Vec<String>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GdsImportTechnologyFingerprint(Vec<u8>);
+
 impl Technology {
+    pub(crate) fn fingerprints(&self) -> TechnologyFingerprints {
+        let mut layer_names = self
+            .layers
+            .iter()
+            .map(|layer| layer.name.clone())
+            .collect::<Vec<_>>();
+        layer_names.sort();
+        let mut pin_layers = self.pin_layers.iter().collect::<Vec<_>>();
+        pin_layers.sort_by_key(|(name, _)| *name);
+
+        let gds_import = bincode::serialize(&(
+            self.dbu.to_bits(),
+            self.display_unit,
+            self.layers
+                .iter()
+                .map(|layer| (&layer.name, layer.gds_layer, layer.gds_datatype))
+                .collect::<Vec<_>>(),
+            pin_layers,
+        ))
+        .expect("normalized GDS technology inputs should always serialize");
+        TechnologyFingerprints {
+            solver: SolverTechnologyFingerprint(self.grid_step().to_bits()),
+            layer_validation: LayerValidationTechnologyFingerprint(layer_names),
+            gds_import: GdsImportTechnologyFingerprint(gds_import),
+        }
+    }
+
     /// Snap-grid spacing in Argon source/display coordinate units.
     pub fn grid_step(&self) -> f64 {
         self.grid as f64 / self.display_unit as f64

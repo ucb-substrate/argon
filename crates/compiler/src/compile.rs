@@ -4,11 +4,13 @@
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::hash::Hasher;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use arcstr::Substr;
 use enumify::enumify;
+use fnv::FnvHasher;
 use geometry::transform::{Rotation, TransformationMatrix};
 use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
@@ -150,7 +152,7 @@ pub(crate) fn execute_cell_tracked_with_artifacts(
     config: &WorkspaceConfig,
     artifacts: Vec<CellArtifact>,
 ) -> TrackedExecution {
-    execute_cell_tracked_with_artifacts_cancellable(ast, input, config, artifacts, None)
+    execute_cell_tracked_with_artifacts_cancellable(ast, input, config, artifacts, Vec::new(), None)
         .expect("uncancellable cell execution cannot be cancelled")
 }
 
@@ -159,6 +161,7 @@ pub(crate) fn execute_cell_tracked_with_artifacts_cancellable(
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
     artifacts: Vec<CellArtifact>,
+    continuations: Vec<CellContinuation>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<TrackedExecution> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -181,6 +184,7 @@ pub(crate) fn execute_cell_tracked_with_artifacts_cancellable(
         tech,
         &config.gds_imports,
         artifacts,
+        continuations,
         cancellation,
     )
     .execute_tracked(input);
@@ -217,7 +221,12 @@ pub(crate) fn execute_cell_invocation_tracked_with_artifacts(
     artifacts: Vec<CellArtifact>,
 ) -> TrackedExecution {
     execute_cell_invocation_tracked_with_artifacts_cancellable(
-        ast, invocation, config, artifacts, None,
+        ast,
+        invocation,
+        config,
+        artifacts,
+        Vec::new(),
+        None,
     )
     .expect("uncancellable invocation execution cannot be cancelled")
 }
@@ -227,6 +236,7 @@ pub(crate) fn execute_cell_invocation_tracked_with_artifacts_cancellable(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
     artifacts: Vec<CellArtifact>,
+    continuations: Vec<CellContinuation>,
     cancellation: Option<&CancellationToken>,
 ) -> Option<TrackedExecution> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
@@ -249,6 +259,7 @@ pub(crate) fn execute_cell_invocation_tracked_with_artifacts_cancellable(
         tech,
         &config.gds_imports,
         artifacts,
+        continuations,
         cancellation,
     )
     .execute_invocation_tracked(invocation);
@@ -263,8 +274,11 @@ pub(crate) struct TrackedExecution {
     pub(crate) output: CompileOutput,
     pub(crate) dependencies: IndexSet<VarId>,
     pub(crate) artifacts: Vec<CellArtifact>,
+    pub(crate) continuation: Option<CellContinuation>,
     pub(crate) artifact_hits: u64,
     pub(crate) artifact_misses: u64,
+    pub(crate) continuation_hits: u64,
+    pub(crate) continuation_misses: u64,
     cancelled: bool,
 }
 
@@ -274,8 +288,11 @@ impl TrackedExecution {
             output,
             dependencies: IndexSet::new(),
             artifacts: Vec::new(),
+            continuation: None,
             artifact_hits: 0,
             artifact_misses: 0,
+            continuation_hits: 0,
+            continuation_misses: 0,
             cancelled: false,
         }
     }
@@ -324,6 +341,43 @@ fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput 
             errors,
             output: Some(data),
         })
+    }
+}
+
+/// Rebinds a cached geometry snapshot to the current presentation technology.
+/// Layer diagnostics are a post-execution concern, so callers can request a
+/// fresh validation pass without rerunning evaluation or the solver.
+pub(crate) fn refresh_output_technology(
+    res: CompileOutput,
+    tech: Technology,
+    tech_file: &FsPath,
+    recheck_layers: bool,
+) -> CompileOutput {
+    let res = match res {
+        CompileOutput::Valid(mut data) => {
+            data.tech = tech;
+            CompileOutput::Valid(data)
+        }
+        CompileOutput::ExecErrors(mut output) => {
+            if let Some(data) = &mut output.output {
+                data.tech = tech;
+            }
+            if recheck_layers {
+                output.errors.retain(|error| {
+                    !matches!(
+                        error.kind,
+                        ExecErrorKind::IllegalLayer { .. } | ExecErrorKind::IllegalTextLayer { .. }
+                    )
+                });
+            }
+            CompileOutput::ExecErrors(output)
+        }
+        output => output,
+    };
+    if recheck_layers {
+        check_output_layers(res, tech_file)
+    } else {
+        res
     }
 }
 
@@ -850,13 +904,13 @@ fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecErro
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct VarIdTyFrame {
-    var_bindings: IndexMap<String, (VarId, Ty)>,
+    var_bindings: IndexMap<Substr, (VarId, Ty)>,
 }
 
 impl VarIdTyFrame {
     pub(crate) fn interface_fingerprint(&self) -> Vec<u8> {
         let mut bindings = self.var_bindings.iter().collect_vec();
-        bindings.sort_by(|(left, _), (right, _)| left.cmp(right));
+        bindings.sort_by_key(|(name, _)| *name);
         bincode::serialize(&bindings).expect("module interface bindings should always serialize")
     }
 }
@@ -1221,7 +1275,7 @@ impl<'a> VarIdTyPass<'a> {
             .last_mut()
             .unwrap()
             .var_bindings
-            .insert(name.to_string(), (id, ty));
+            .insert(name.clone(), (id, ty));
         id
     }
 
@@ -1334,7 +1388,7 @@ impl<'a> VarIdTyPass<'a> {
                 .last_mut()
                 .unwrap()
                 .var_bindings
-                .insert(local_name.name.to_string(), binding);
+                .insert(local_name.name.clone(), binding);
         } else {
             self.errors.push(StaticError {
                 span: self.span(use_decl.span),
@@ -2722,6 +2776,12 @@ struct CellExecKey {
     scope_name: Option<String>,
 }
 
+fn stable_hasher(domain: &[u8]) -> FnvHasher {
+    let mut hasher = FnvHasher::default();
+    hasher.write(domain);
+    hasher
+}
+
 /// Assign a deterministic ID to a semantic cell execution. Incremental
 /// artifacts can then retain their immutable compiled cells without remapping
 /// every instance edge into the next execution's allocation namespace.
@@ -2734,10 +2794,9 @@ fn stable_cell_id(key: &CellExecKey) -> CellId {
 fn stable_cell_subgraph_id(key: &CellExecKey, index: u64) -> CellId {
     let encoded =
         bincode::serialize(&(key, index)).expect("cell execution keys should always serialize");
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in b"argon-compiled-cell".iter().chain(&encoded) {
-        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-    }
+    let mut hasher = stable_hasher(b"argon-compiled-cell");
+    hasher.write(&encoded);
+    let hash = hasher.finish();
     // Zero is reserved by diagnostics as an unknown cell.
     if hash == 0 { 1 } else { hash }
 }
@@ -2765,6 +2824,13 @@ pub(crate) struct CellArtifact {
 }
 
 impl CellArtifact {
+    pub(crate) fn root_cell(&self) -> VarId {
+        self.cell_keys
+            .iter()
+            .find_map(|(key, cell)| (*cell == self.root).then_some(key.cell))
+            .expect("cell artifacts contain their root execution key")
+    }
+
     pub(crate) fn same_key(&self, other: &Self) -> bool {
         let root_key = self
             .cell_keys
@@ -2776,6 +2842,98 @@ impl CellArtifact {
             .find_map(|(key, cell)| (*cell == other.root).then_some(key));
         root_key == other_root_key
     }
+}
+
+/// A solved entry-cell execution retained immediately before emission. It can
+/// be resumed when the next typed body is an exact statement-prefix extension.
+#[derive(Clone)]
+pub(crate) struct CellContinuation {
+    key: CellExecKey,
+    cell: VarId,
+    arguments: Vec<u8>,
+    statements: Vec<Vec<u8>>,
+    global_value_limit: ValueId,
+    cell_id: CellId,
+    frame: FrameId,
+    root_scope: ScopeId,
+    next_seq_num: SeqNum,
+    error_start: usize,
+    dependencies: IndexSet<VarId>,
+    state: RootExecutionState,
+}
+
+impl CellContinuation {
+    pub(crate) fn cell(&self) -> VarId {
+        self.cell
+    }
+
+    pub(crate) fn dependencies(&self) -> &IndexSet<VarId> {
+        &self.dependencies
+    }
+
+    pub(crate) fn same_key(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+fn encoded_cell_arguments(cell: &CellDecl<Substr, VarIdTyMetadata>) -> Vec<u8> {
+    bincode::serialize(&cell.args).expect("typed cell arguments should always serialize")
+}
+
+fn encoded_cell_statements(cell: &CellDecl<Substr, VarIdTyMetadata>) -> Vec<Vec<u8>> {
+    cell.scope
+        .stmts
+        .iter()
+        .map(|statement| {
+            bincode::serialize(statement).expect("typed cell statements should always serialize")
+        })
+        .collect()
+}
+
+fn is_numeric_literal(expression: &Expr<Substr, VarIdTyMetadata>) -> bool {
+    match expression {
+        Expr::FloatLiteral(_) | Expr::IntLiteral(_) => true,
+        Expr::UnaryOp(expression) if expression.op == UnaryOp::Neg => {
+            matches!(
+                expression.operand,
+                Expr::FloatLiteral(_) | Expr::IntLiteral(_)
+            )
+        }
+        _ => false,
+    }
+}
+
+/// GUI-drawn rectangles are independent additions: all their coordinates are
+/// literals, so continuing from a solved prefix cannot constrain an old solver
+/// variable. More general suffixes deliberately take the full execution path.
+fn is_independent_emitted_rect(statement: &Statement<Substr, VarIdTyMetadata>) -> bool {
+    let Statement::LetBinding(binding) = statement else {
+        return false;
+    };
+    let Expr::Emit(emitted) = &binding.value else {
+        return false;
+    };
+    let Expr::Call(call) = &emitted.value else {
+        return false;
+    };
+    if call.metadata.0.is_some()
+        || call.func.path.len() != 1
+        || !matches!(call.func.path[0].name.as_str(), "rect" | "crect")
+        || !call
+            .args
+            .posargs
+            .iter()
+            .all(|argument| matches!(argument, Expr::StringLiteral(_)))
+    {
+        return false;
+    }
+    call.args.kwargs.iter().all(|argument| {
+        if argument.name.name == "layer" {
+            matches!(argument.value, Expr::StringLiteral(_))
+        } else {
+            is_numeric_literal(&argument.value)
+        }
+    })
 }
 
 impl From<&CellArg> for CellArgKey {
@@ -2805,42 +2963,31 @@ pub type ConstraintVarId = u64;
 /// Local bindings continue to use compact sequential IDs in the low half of
 /// the ID space.
 fn semantic_declaration_id(module: &ModPath, kind: &str, name: &str) -> VarId {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hasher = stable_hasher(b"argon-declaration");
+    hasher.write_u8(0xff);
     let mut write = |bytes: &[u8]| {
-        for byte in bytes {
-            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-        }
-        hash = (hash ^ 0xff).wrapping_mul(0x100000001b3);
+        hasher.write(bytes);
+        hasher.write_u8(0xff);
     };
-    write(b"argon-declaration");
     for component in module {
         write(component.as_bytes());
     }
     write(kind.as_bytes());
     write(name.as_bytes());
-    hash | (1_u64 << 63)
+    hasher.finish() | (1_u64 << 63)
 }
 
 /// Gives independently analyzed modules disjoint, deterministic local-ID
 /// namespaces. Top-level declarations use the high half of the ID space.
 fn semantic_local_id_start(module: &ModPath) -> VarId {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in b"argon-module-locals"
-        .iter()
-        .copied()
-        .chain(module.iter().flat_map(|component| {
-            component
-                .as_bytes()
-                .iter()
-                .copied()
-                .chain(std::iter::once(0xff))
-        }))
-    {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    let mut hasher = stable_hasher(b"argon-module-locals");
+    for component in module {
+        hasher.write(component.as_bytes());
+        hasher.write_u8(0xff);
     }
     // Reserve enough low bits for all practical local bindings in a module,
     // while keeping the declaration-ID high bit clear.
-    (hash & 0x7fff_ffff_0000_0000) | 0x0000_0000_0010_0000
+    (hasher.finish() & 0x7fff_ffff_0000_0000) | 0x0000_0000_0010_0000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2973,19 +3120,40 @@ pub struct ScopeId(u64);
 
 impl ScopeId {
     /// Build a stable ID from the semantic hierarchy rather than execution's
-    /// global allocation order. FNV-1a is deliberately spelled out so IDs do
-    /// not depend on `DefaultHasher` implementation details.
+    /// global allocation order.
     fn semantic(parent: Option<Self>, name: &str) -> Self {
-        let mut hash = 0xcbf29ce484222325_u64;
+        let mut hasher = FnvHasher::default();
         if let Some(parent) = parent {
-            for byte in parent.0.to_le_bytes() {
-                hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-            }
+            hasher.write(&parent.0.to_le_bytes());
         }
-        for byte in name.bytes() {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-        }
-        Self(hash)
+        hasher.write(name.as_bytes());
+        Self(hasher.finish())
+    }
+}
+
+#[cfg(test)]
+mod stable_id_tests {
+    use super::{
+        CellArgKey, CellExecKey, ScopeId, semantic_declaration_id, semantic_local_id_start,
+        stable_cell_id,
+    };
+
+    #[test]
+    fn stable_ids_keep_their_previous_values() {
+        let module = vec!["layout".into(), "devices".into()];
+        let key = CellExecKey {
+            cell: semantic_declaration_id(&module, "cell", "inverter"),
+            args: vec![CellArgKey::Int(3), CellArgKey::Bool(true)],
+            scope_name: Some("preview".to_owned()),
+        };
+        let root_scope = ScopeId::semantic(None, "inverter");
+        let child_scope = ScopeId::semantic(Some(root_scope), "devices");
+
+        assert_eq!(key.cell, 0xcf77_1fae_9cc0_b330);
+        assert_eq!(semantic_local_id_start(&module), 0x3256_5a86_0010_0000);
+        assert_eq!(stable_cell_id(&key), 0xd1f6_301a_5f4e_b806);
+        assert_eq!(root_scope.0, 0xd8db_071a_ec8d_0b5a);
+        assert_eq!(child_scope.0, 0x2842_7fba_437f_2a82);
     }
 }
 
@@ -3054,6 +3222,7 @@ impl Ord for FallbackConstraint {
     }
 }
 
+#[derive(Clone)]
 struct CellState {
     solve_iters: u64,
     solver: Solver,
@@ -3081,6 +3250,28 @@ impl CellState {
     }
 }
 
+#[derive(Clone)]
+struct RootExecutionState {
+    cell_states: IndexMap<CellId, CellState>,
+    values: IndexMap<ValueId, DeferValue<VarIdTyMetadata>>,
+    value_dependents: IndexMap<ValueId, IndexSet<ValueId>>,
+    frames: IndexMap<FrameId, Frame>,
+    next_id: u64,
+    partial_cells: VecDeque<CellId>,
+    compiled_cells: IndexMap<CellId, Arc<CompiledCell>>,
+    compiled_cell_value_ids: HashMap<CellId, ValueId>,
+    compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    artifacts: HashMap<CellExecKey, CellArtifact>,
+    artifact_dependency_stack: Vec<IndexSet<VarId>>,
+    dependencies: IndexSet<VarId>,
+    errors: Vec<ExecError>,
+}
+
+struct PriorSolutionSpace {
+    unsolved_vars: Option<IndexSet<Var>>,
+    basis: SseBasis,
+}
+
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
     tech: Technology,
@@ -3104,10 +3295,14 @@ struct ExecPass<'a> {
     compiled_cell_value_ids: HashMap<CellId, ValueId>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
     seed_artifacts: HashMap<CellExecKey, CellArtifact>,
+    seed_continuations: HashMap<CellExecKey, CellContinuation>,
     artifacts: HashMap<CellExecKey, CellArtifact>,
     artifact_dependency_stack: Vec<IndexSet<VarId>>,
     artifact_hits: u64,
     artifact_misses: u64,
+    continuation: Option<CellContinuation>,
+    continuation_hits: u64,
+    continuation_misses: u64,
     cancellation: Option<CancellationToken>,
     cancelled: bool,
     /// Cell declaration generated for a compiler entry point's invocation, and
@@ -3151,6 +3346,7 @@ impl<'a> ExecPass<'a> {
         tech: Technology,
         gds_imports: &[(String, PathBuf)],
         artifacts: Vec<CellArtifact>,
+        continuations: Vec<CellContinuation>,
         cancellation: Option<&CancellationToken>,
     ) -> Self {
         let gds_imports = gds_imports
@@ -3214,10 +3410,17 @@ impl<'a> ExecPass<'a> {
                     (key, artifact)
                 })
                 .collect(),
+            seed_continuations: continuations
+                .into_iter()
+                .map(|continuation| (continuation.key.clone(), continuation))
+                .collect(),
             artifacts: HashMap::new(),
             artifact_dependency_stack: Vec::new(),
             artifact_hits: 0,
             artifact_misses: 0,
+            continuation: None,
+            continuation_hits: 0,
+            continuation_misses: 0,
             cancellation: cancellation.cloned(),
             cancelled: false,
             entry_cell_var: None,
@@ -3453,8 +3656,11 @@ impl<'a> ExecPass<'a> {
             output,
             dependencies: std::mem::take(&mut self.dependencies),
             artifacts: std::mem::take(&mut self.artifacts).into_values().collect(),
+            continuation: self.continuation.take(),
             artifact_hits: self.artifact_hits,
             artifact_misses: self.artifact_misses,
+            continuation_hits: self.continuation_hits,
+            continuation_misses: self.continuation_misses,
             cancelled: self.cancelled,
         }
     }
@@ -3547,6 +3753,273 @@ impl<'a> ExecPass<'a> {
             dependencies,
             errors: self.errors[error_start..].to_vec(),
         }
+    }
+
+    fn snapshot_root_state(&self) -> RootExecutionState {
+        RootExecutionState {
+            cell_states: self.cell_states.clone(),
+            values: self.values.clone(),
+            value_dependents: self.value_dependents.clone(),
+            frames: self.frames.clone(),
+            next_id: self.next_id,
+            partial_cells: self.partial_cells.clone(),
+            compiled_cells: self.compiled_cells.clone(),
+            compiled_cell_value_ids: self.compiled_cell_value_ids.clone(),
+            compiled_cell_cache: self.compiled_cell_cache.clone(),
+            artifacts: self.artifacts.clone(),
+            artifact_dependency_stack: self.artifact_dependency_stack.clone(),
+            dependencies: self.dependencies.clone(),
+            errors: self.errors.clone(),
+        }
+    }
+
+    fn restore_root_state(
+        &mut self,
+        state: RootExecutionState,
+        global_value_limit: ValueId,
+    ) -> bool {
+        if self.next_id != global_value_limit {
+            return false;
+        }
+        let current_globals = std::mem::take(&mut self.values);
+        let current_global_frame = self
+            .frames
+            .get(&self.global_frame)
+            .expect("global frame exists after declaration")
+            .clone();
+
+        self.cell_states = state.cell_states;
+        self.values = state.values;
+        self.value_dependents = state.value_dependents;
+        self.frames = state.frames;
+        self.next_id = state.next_id;
+        self.partial_cells = state.partial_cells;
+        self.compiled_cells = state.compiled_cells;
+        self.compiled_cell_value_ids = state.compiled_cell_value_ids;
+        self.compiled_cell_cache = state.compiled_cell_cache;
+        self.artifacts = state.artifacts;
+        self.artifact_dependency_stack = state.artifact_dependency_stack;
+        self.dependencies = state.dependencies;
+        self.errors = state.errors;
+
+        // Function and cell declarations must come from the current typed AST.
+        // Their runtime value IDs are deterministic while the declaration set
+        // is unchanged, which is checked by `global_value_limit` above.
+        for (id, value) in current_globals {
+            if id < global_value_limit {
+                self.values.insert(id, value);
+            }
+        }
+        self.frames.insert(self.global_frame, current_global_frame);
+        for state in self.cell_states.values_mut() {
+            state
+                .solver
+                .replace_cancellation(self.cancellation.as_ref());
+        }
+        true
+    }
+
+    fn eval_top_level_statements(
+        &mut self,
+        cell_id: CellId,
+        frame: FrameId,
+        scope: ScopeId,
+        statements: &[Statement<Substr, VarIdTyMetadata>],
+        mut seq_num: SeqNum,
+    ) -> Result<SeqNum, ()> {
+        for statement in statements {
+            if self.cancellation_requested() {
+                return Err(());
+            }
+            let loc = DynLoc {
+                cell: cell_id,
+                frame,
+                scope,
+                seq_num,
+            };
+            match statement {
+                Statement::LetBinding(binding) => {
+                    let value = self.visit_expr(loc, &binding.value);
+                    self.frames
+                        .get_mut(&frame)
+                        .expect("cell frame exists")
+                        .bindings
+                        .insert(binding.metadata, value);
+                    self.cell_state_mut(cell_id)
+                        .fields
+                        .insert(binding.name.name.to_string(), value);
+                    self.cell_state_mut(cell_id)
+                        .scopes
+                        .get_mut(&scope)
+                        .expect("cell root scope exists")
+                        .bindings
+                        .insert(seq_num, (binding.name.name.to_string(), value));
+                    seq_num = seq_num.next();
+                }
+                Statement::Expr { value, .. } => {
+                    self.visit_expr(loc, value);
+                }
+                Statement::ForLoop(for_loop) => {
+                    self.eval_for_loop(loc, for_loop);
+                }
+            }
+        }
+        Ok(seq_num)
+    }
+
+    fn settle_cell(
+        &mut self,
+        cell_id: CellId,
+        mut prior_solution: Option<PriorSolutionSpace>,
+    ) -> Result<(), ()> {
+        while {
+            if self.cancellation_requested() {
+                return Err(());
+            }
+            let state = self.cell_state(cell_id);
+            !state.deferred.is_empty() || !state.solver.fully_solved()
+        } {
+            let mut progress = false;
+            while let Some(value) = {
+                let state = self.cell_state_mut(cell_id);
+                state.deferred.pop()
+            } {
+                if self.cancellation_requested() {
+                    return Err(());
+                }
+                progress |= self.eval_partial(cell_id, value)?;
+            }
+
+            let state = self.cell_state_mut(cell_id);
+            state.solve_iters += 1;
+            state.solver.solve();
+            if state.solver.was_cancelled() {
+                return Err(());
+            }
+            progress = !state.solver.updated_vars().is_empty() || progress;
+            let update_var_dependents = |state: &mut CellState| {
+                for var in state.solver.updated_vars().clone() {
+                    if let Some(dependents) = state.var_dependents.get(&var) {
+                        for dependent in dependents.clone() {
+                            state.deferred.insert(dependent);
+                        }
+                    }
+                }
+                state.solver.clear_updated_vars();
+            };
+            update_var_dependents(state);
+
+            if !progress {
+                let should_record_solution_space =
+                    self.cell_state(cell_id).unsolved_vars.is_none() || prior_solution.is_some();
+                if should_record_solution_space {
+                    let state = self.cell_state_mut(cell_id);
+                    let new_unsolved = state.solver.unsolved_vars().clone();
+                    let (mut unsolved, basis, already_reported) =
+                        if let Some(prior) = prior_solution.take() {
+                            let already_reported = prior.unsolved_vars.is_some();
+                            let mut unsolved = prior.unsolved_vars.unwrap_or_default();
+                            unsolved.extend(new_unsolved);
+                            let basis = match prior.basis {
+                                SseBasis::Nullspace(mut previous) => {
+                                    let Some(current) = state.solver.sparse_nullspace_vecs() else {
+                                        return Err(());
+                                    };
+                                    previous.extend(current);
+                                    SseBasis::Nullspace(previous)
+                                }
+                                SseBasis::Rowspace(mut previous) => {
+                                    previous.extend(state.solver.rowspace_vecs());
+                                    SseBasis::Rowspace(previous)
+                                }
+                            };
+                            (unsolved, basis, already_reported)
+                        } else {
+                            let basis = match state.solver.sparse_nullspace_vecs() {
+                                Some(vectors) => SseBasis::Nullspace(vectors),
+                                None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+                            };
+                            (new_unsolved, basis, false)
+                        };
+                    let span = unsolved
+                        .iter()
+                        .find_map(|var| state.var_span_map.get(var).cloned());
+                    state.unsolved_vars = Some(std::mem::take(&mut unsolved));
+                    state.sse_basis = basis;
+                    if !already_reported {
+                        self.errors.push(ExecError {
+                            span,
+                            cell: cell_id,
+                            kind: ExecErrorKind::Underconstrained,
+                        });
+                    }
+                }
+                let mut constraint_added = false;
+                let state = self.cell_state_mut(cell_id);
+                while let Some(FallbackConstraint {
+                    constraint,
+                    span,
+                    initial_condition,
+                    ..
+                }) = state.fallback_constraints.pop()
+                {
+                    if constraint.coeffs.iter().any(|(coefficient, var)| {
+                        coefficient.abs() > 1e-6 && !state.solver.is_solved(*var)
+                    }) {
+                        state.fallback_constraints_used.push(UsedFallback {
+                            constraint: constraint.clone(),
+                            span: span.clone(),
+                            initial_condition,
+                        });
+                        let constraint_id = state.solver.constrain_eq0(constraint);
+                        state.constraint_span_map.insert(constraint_id, span);
+                        constraint_added = true;
+                        break;
+                    }
+                }
+                if !constraint_added {
+                    state.solver.force_solution();
+                    update_var_dependents(state);
+                }
+            }
+        }
+
+        // A resumed suffix may add new inconsistent or off-grid values. Rebuild
+        // these diagnostics from the complete retained solver state so each
+        // constraint/variable is reported exactly once.
+        self.errors.retain(|error| {
+            error.cell != cell_id
+                || !matches!(
+                    error.kind,
+                    ExecErrorKind::InconsistentConstraint(_) | ExecErrorKind::OffGrid(_)
+                )
+        });
+        for constraint in self
+            .cell_state(cell_id)
+            .solver
+            .inconsistent_constraints()
+            .clone()
+        {
+            let span = self
+                .cell_state(cell_id)
+                .constraint_span_map
+                .get(&constraint)
+                .cloned();
+            self.errors.push(ExecError {
+                span,
+                cell: cell_id,
+                kind: ExecErrorKind::InconsistentConstraint(constraint),
+            });
+        }
+        for var in self.cell_state(cell_id).solver.off_grid_vars().clone() {
+            let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
+            self.errors.push(ExecError {
+                span,
+                cell: cell_id,
+                kind: ExecErrorKind::OffGrid(var),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn execute_cell(
@@ -3652,213 +4125,177 @@ impl<'a> ExecPass<'a> {
         }
         let root_scope_name = scope_name.unwrap_or_else(|| format!("cell {}", cell_decl.name.name));
         let root_scope_id = ScopeId::semantic(None, &root_scope_name);
-        let root_scope = ExecScope {
-            parent: None,
-            static_parent: None,
-            span: Span {
+        let cell_id = stable_cell_id(&cache_key);
+        let global_value_limit = self.next_id;
+        let arguments = encoded_cell_arguments(&cell_decl);
+        let statements = encoded_cell_statements(&cell_decl);
+        let is_root = self.partial_cells.is_empty() && self.entry_cell_var.is_none();
+        let candidate = is_root
+            .then(|| self.seed_continuations.remove(&cache_key))
+            .flatten();
+        let reusable = candidate.filter(|continuation| {
+            cell_decl.scope.tail.is_none()
+                && continuation.arguments == arguments
+                && statements.len() > continuation.statements.len()
+                && statements
+                    .iter()
+                    .zip(&continuation.statements)
+                    .all(|(current, previous)| current == previous)
+                && cell_decl.scope.stmts[continuation.statements.len()..]
+                    .iter()
+                    .all(is_independent_emitted_rect)
+        });
+
+        let resumed = reusable.and_then(|continuation| {
+            let prior_solution = PriorSolutionSpace {
+                unsolved_vars: continuation
+                    .state
+                    .cell_states
+                    .get(&continuation.cell_id)?
+                    .unsolved_vars
+                    .clone(),
+                basis: continuation
+                    .state
+                    .cell_states
+                    .get(&continuation.cell_id)?
+                    .sse_basis
+                    .clone(),
+            };
+            let old_statement_count = continuation.statements.len();
+            let frame = continuation.frame;
+            let next_seq_num = continuation.next_seq_num;
+            let error_start = continuation.error_start;
+            if continuation.cell_id != cell_id
+                || continuation.root_scope != root_scope_id
+                || !self.restore_root_state(continuation.state, continuation.global_value_limit)
+            {
+                return None;
+            }
+            self.cell_state_mut(cell_id)
+                .scopes
+                .get_mut(&root_scope_id)
+                .expect("continued root scope exists")
+                .span = Span {
                 path: cell_decl.metadata.0.clone(),
                 span: cell_decl.scope.span,
-            },
-            name: root_scope_name,
-            bindings: Default::default(),
-        };
-
-        let cell_id = stable_cell_id(&cache_key);
-        assert!(
-            !self.compiled_cells.contains_key(&cell_id),
-            "stable compiled-cell ID collision"
-        );
-        let error_start = self.errors.len();
-        self.artifact_dependency_stack
-            .push(IndexSet::from_iter([cell]));
-        if self.entry_cell_var == Some(cell) {
-            self.entry_cell = Some(cell_id);
-        }
-        self.partial_cells.push_back(cell_id);
-        assert!(
-            self.cell_states
-                .insert(
-                    cell_id,
-                    CellState {
-                        solve_iters: 0,
-                        solver: Solver::with_grid_cancellable(
-                            self.tech.grid_step(),
-                            self.cancellation.as_ref(),
-                        ),
-                        fields: Default::default(),
-                        emit: Vec::new(),
-                        object_emit: Vec::new(),
-                        deferred: Default::default(),
-                        scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
-                        fallback_constraints: Default::default(),
-                        fallback_constraints_used: Vec::new(),
-                        sse_basis: SseBasis::Nullspace(Vec::new()),
-                        root_scope: root_scope_id,
-                        unsolved_vars: Default::default(),
-                        objects: Default::default(),
-                        constraint_span_map: IndexMap::new(),
-                        var_span_map: IndexMap::new(),
-                        var_dependents: IndexMap::new(),
-                    }
-                )
-                .is_none()
-        );
-        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
-            let vid = self.value_id();
-            let val = Value::from_arg(&val);
-            self.values.insert(vid, DeferValue::Ready(val));
-            frame.bindings.insert(decl.metadata.0, vid);
-        }
-        let fid = self.frame_id();
-        self.frames.insert(fid, frame);
-
-        let mut seq_num = SeqNum::new();
-        for stmt in cell_decl.scope.stmts.iter() {
-            if self.cancellation_requested() {
-                return Err(());
-            }
-            let loc = DynLoc {
-                cell: cell_id,
-                frame: fid,
-                scope: root_scope_id,
-                seq_num,
             };
-            match stmt {
-                Statement::LetBinding(binding) => {
-                    let value = self.visit_expr(loc, &binding.value);
-                    self.frames
-                        .get_mut(&fid)
-                        .unwrap()
-                        .bindings
-                        .insert(binding.metadata, value);
-                    self.cell_states
-                        .get_mut(&cell_id)
-                        .unwrap()
-                        .fields
-                        .insert(binding.name.name.to_string(), value);
-                    self.cell_state_mut(loc.cell)
-                        .scopes
-                        .get_mut(&loc.scope)
-                        .unwrap()
-                        .bindings
-                        .insert(loc.seq_num, (binding.name.name.to_string(), value));
-                    seq_num = seq_num.next();
-                }
-                Statement::Expr { value, .. } => {
-                    self.visit_expr(loc, value);
-                }
-                Statement::ForLoop(f) => {
-                    self.eval_for_loop(loc, f);
-                }
-            }
-        }
+            Some((
+                frame,
+                next_seq_num,
+                error_start,
+                old_statement_count,
+                prior_solution,
+            ))
+        });
 
-        while {
-            if self.cancellation_requested() {
-                return Err(());
+        let (frame_id, seq_num, error_start, prior_solution) = if let Some((
+            frame_id,
+            next_seq_num,
+            error_start,
+            old_statement_count,
+            prior_solution,
+        )) = resumed
+        {
+            self.continuation_hits += 1;
+            let seq_num = self.eval_top_level_statements(
+                cell_id,
+                frame_id,
+                root_scope_id,
+                &cell_decl.scope.stmts[old_statement_count..],
+                next_seq_num,
+            )?;
+            (frame_id, seq_num, error_start, Some(prior_solution))
+        } else {
+            if is_root {
+                self.continuation_misses += 1;
             }
-            let state = self.cell_state(cell_id);
-            !state.deferred.is_empty() || !state.solver.fully_solved()
-        } {
-            let mut progress = false;
-            while let Some(vid) = {
-                let state = self.cell_state_mut(cell_id);
-                state.deferred.pop()
-            } {
-                if self.cancellation_requested() {
-                    return Err(());
-                }
-                progress |= self.eval_partial(cell_id, vid)?;
+            let root_scope = ExecScope {
+                parent: None,
+                static_parent: None,
+                span: Span {
+                    path: cell_decl.metadata.0.clone(),
+                    span: cell_decl.scope.span,
+                },
+                name: root_scope_name,
+                bindings: Default::default(),
+            };
+            assert!(
+                !self.compiled_cells.contains_key(&cell_id),
+                "stable compiled-cell ID collision"
+            );
+            let error_start = self.errors.len();
+            self.artifact_dependency_stack
+                .push(IndexSet::from_iter([cell]));
+            if self.entry_cell_var == Some(cell) {
+                self.entry_cell = Some(cell_id);
             }
-
-            let state = self.cell_state_mut(cell_id);
-            state.solve_iters += 1;
-            state.solver.solve();
-            if state.solver.was_cancelled() {
-                return Err(());
-            }
-            progress = !state.solver.updated_vars().is_empty() || progress;
-            let update_var_dependents = |state: &mut CellState| {
-                for var in state.solver.updated_vars().clone() {
-                    if let Some(deps) = state.var_dependents.get(&var) {
-                        for dep in deps.clone() {
-                            state.deferred.insert(dep);
+            self.partial_cells.push_back(cell_id);
+            assert!(
+                self.cell_states
+                    .insert(
+                        cell_id,
+                        CellState {
+                            solve_iters: 0,
+                            solver: Solver::with_grid_cancellable(
+                                self.tech.grid_step(),
+                                self.cancellation.as_ref(),
+                            ),
+                            fields: Default::default(),
+                            emit: Vec::new(),
+                            object_emit: Vec::new(),
+                            deferred: Default::default(),
+                            scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
+                            fallback_constraints: Default::default(),
+                            fallback_constraints_used: Vec::new(),
+                            sse_basis: SseBasis::Nullspace(Vec::new()),
+                            root_scope: root_scope_id,
+                            unsolved_vars: Default::default(),
+                            objects: Default::default(),
+                            constraint_span_map: IndexMap::new(),
+                            var_span_map: IndexMap::new(),
+                            var_dependents: IndexMap::new(),
                         }
-                    }
-                }
-                state.solver.clear_updated_vars();
-            };
-            update_var_dependents(state);
-
-            if !progress {
-                let state = self.cell_state_mut(cell_id);
-                if state.unsolved_vars.is_none() {
-                    let unsolved_vars = state.solver.unsolved_vars().clone();
-                    let span = unsolved_vars
-                        .iter()
-                        .find_map(|var| state.var_span_map.get(var).cloned());
-                    state.unsolved_vars = Some(unsolved_vars);
-                    state.sse_basis = match state.solver.sparse_nullspace_vecs() {
-                        Some(vectors) => SseBasis::Nullspace(vectors),
-                        None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
-                    };
-                    self.errors.push(ExecError {
-                        span,
-                        cell: cell_id,
-                        kind: ExecErrorKind::Underconstrained,
-                    });
-                }
-                let mut constraint_added = false;
-                let state = self.cell_state_mut(cell_id);
-                while let Some(FallbackConstraint {
-                    constraint,
-                    span,
-                    initial_condition,
-                    ..
-                }) = state.fallback_constraints.pop()
-                {
-                    if constraint
-                        .coeffs
-                        .iter()
-                        .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
-                    {
-                        state.fallback_constraints_used.push(UsedFallback {
-                            constraint: constraint.clone(),
-                            span: span.clone(),
-                            initial_condition,
-                        });
-                        let constraint_id = state.solver.constrain_eq0(constraint);
-                        state.constraint_span_map.insert(constraint_id, span);
-                        constraint_added = true;
-                        break;
-                    }
-                }
-                if !constraint_added {
-                    state.solver.force_solution();
-                    update_var_dependents(state);
-                }
+                    )
+                    .is_none()
+            );
+            for (value, declaration) in args.into_iter().zip(cell_decl.args.iter()) {
+                let value_id = self.value_id();
+                let value = Value::from_arg(&value);
+                self.values.insert(value_id, DeferValue::Ready(value));
+                frame.bindings.insert(declaration.metadata.0, value_id);
             }
-        }
+            let frame_id = self.frame_id();
+            self.frames.insert(frame_id, frame);
+            let seq_num = self.eval_top_level_statements(
+                cell_id,
+                frame_id,
+                root_scope_id,
+                &cell_decl.scope.stmts,
+                SeqNum::new(),
+            )?;
+            (frame_id, seq_num, error_start, None)
+        };
+        self.settle_cell(cell_id, prior_solution)?;
 
-        let state = self.cell_state_mut(cell_id);
-        for constraint in state.solver.inconsistent_constraints().clone() {
-            let span = self
-                .cell_state(cell_id)
-                .constraint_span_map
-                .get(&constraint)
-                .cloned();
-            self.errors.push(ExecError {
-                span,
-                cell: cell_id,
-                kind: ExecErrorKind::InconsistentConstraint(constraint),
-            });
-        }
-        for var in self.cell_state(cell_id).solver.off_grid_vars().clone() {
-            let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
-            self.errors.push(ExecError {
-                span,
-                cell: cell_id,
-                kind: ExecErrorKind::OffGrid(var),
+        if is_root && cell_decl.scope.tail.is_none() {
+            let dependencies = self
+                .artifact_dependency_stack
+                .last()
+                .cloned()
+                .expect("root continuation has a dependency frame");
+            self.continuation = Some(CellContinuation {
+                key: cache_key.clone(),
+                cell,
+                arguments,
+                statements,
+                global_value_limit,
+                cell_id,
+                frame: frame_id,
+                root_scope: root_scope_id,
+                next_seq_num: seq_num,
+                error_start,
+                dependencies,
+                state: self.snapshot_root_state(),
             });
         }
 

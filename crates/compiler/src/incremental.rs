@@ -4,7 +4,8 @@
 //! source of truth while retaining the existing one-shot compiler API. Changed
 //! files are reparsed as complete files, canonical syntax fingerprints retain
 //! trivia-only static results, and dynamic results remain reusable while every
-//! declaration observed by their execution is semantically unchanged.
+//! declaration and external input observed by their execution is semantically
+//! unchanged.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -12,7 +13,7 @@ use std::{
     sync::Arc,
 };
 
-use arcstr::ArcStr;
+use arcstr::{ArcStr, Substr};
 use indexmap::IndexMap;
 use serde::Serialize;
 
@@ -24,6 +25,10 @@ use crate::{
         StaticErrorCompileOutput, VarId, VarIdTyFrame, VarIdTyMetadata,
     },
     parse,
+    tech::{
+        GdsImportTechnologyFingerprint, LayerValidationTechnologyFingerprint,
+        SolverTechnologyFingerprint, Technology, TechnologyFingerprints, read_tech,
+    },
     workspace::WorkspaceConfig,
 };
 
@@ -66,15 +71,38 @@ pub struct IncrementalStats {
     pub cell_artifact_cache_hits: u64,
     pub cell_artifact_cache_misses: u64,
     pub cell_artifact_cache_evictions: u64,
+    pub cell_continuation_cache_hits: u64,
+    pub cell_continuation_cache_misses: u64,
+    pub cell_continuation_cache_evictions: u64,
 }
 
 #[derive(Clone)]
 struct StaticCache {
     revision: u64,
-    config: WorkspaceConfig,
+    environment: StaticEnvironment,
     disk_revisions: Vec<TrackedFileRevision>,
     analysis: StaticAnalysis,
     semantic: Arc<SemanticSnapshot>,
+}
+
+/// Configuration that can affect parsing or static semantics. Technology is
+/// deliberately absent: it is consumed only by dynamic execution and output
+/// validation.
+#[derive(Clone, PartialEq, Eq)]
+struct StaticEnvironment {
+    root_lib: PathBuf,
+    dependencies: Vec<(String, PathBuf)>,
+    gds_imports: Vec<(String, PathBuf)>,
+}
+
+impl From<&WorkspaceConfig> for StaticEnvironment {
+    fn from(config: &WorkspaceConfig) -> Self {
+        Self {
+            root_lib: config.root_lib.clone(),
+            dependencies: config.dependencies.clone(),
+            gds_imports: config.gds_imports.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -90,6 +118,7 @@ struct StaticUnit {
 
 const EXECUTION_CACHE_CAPACITY: usize = 32;
 const CELL_ARTIFACT_CACHE_CAPACITY: usize = 128;
+const CELL_CONTINUATION_CACHE_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CellArgKey {
@@ -126,37 +155,163 @@ enum ExecutionTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExecutionRequest {
     target: ExecutionTarget,
-    environment: ExecutionEnvironment,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedGdsImport {
+    name: String,
+    path: PathBuf,
+    revision: Option<FileRevision>,
+}
+
+#[derive(Clone)]
+struct CurrentTechnology {
+    path: PathBuf,
+    value: Technology,
+    fingerprints: TechnologyFingerprints,
+}
+
+#[derive(Clone)]
 struct ExecutionEnvironment {
-    config: WorkspaceConfig,
-    tech_revision: Option<FileRevision>,
-    gds_revisions: Vec<(PathBuf, Option<FileRevision>)>,
+    technology: Option<CurrentTechnology>,
+    gds_imports: Vec<TrackedGdsImport>,
+}
+
+struct ExecutionContext<'a> {
+    environment: &'a ExecutionEnvironment,
+    snapshot: &'a SemanticSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalDependencies {
+    solver: Option<SolverTechnologyFingerprint>,
+    gds_import: Option<GdsImportTechnologyFingerprint>,
+    gds_files: Vec<TrackedGdsImport>,
 }
 
 impl ExecutionRequest {
-    fn new(config: &WorkspaceConfig, target: ExecutionTarget) -> Self {
-        Self {
-            target,
-            environment: ExecutionEnvironment::new(config),
-        }
+    fn new(target: ExecutionTarget) -> Self {
+        Self { target }
     }
 }
 
 impl ExecutionEnvironment {
     fn new(config: &WorkspaceConfig) -> Self {
+        let technology = config.tech.as_ref().and_then(|path| {
+            let value = read_tech(path).ok()?;
+            let fingerprints = value.fingerprints();
+            Some(CurrentTechnology {
+                path: path.clone(),
+                value,
+                fingerprints,
+            })
+        });
         Self {
-            config: config.clone(),
-            tech_revision: config.tech.as_deref().and_then(file_revision),
-            gds_revisions: config
+            technology,
+            gds_imports: config
                 .gds_imports
                 .iter()
-                .map(|(_, path)| (path.clone(), file_revision(path)))
+                .map(|(name, path)| TrackedGdsImport {
+                    name: name.clone(),
+                    path: path.clone(),
+                    revision: file_revision(path),
+                })
                 .collect(),
         }
     }
+}
+
+impl ExternalDependencies {
+    fn observed(
+        environment: &ExecutionEnvironment,
+        dependencies: &[CachedDependency],
+        root: Option<&DeclarationIdentity>,
+    ) -> Option<Self> {
+        let technology = environment.technology.as_ref()?;
+        let dependency_names = dependencies
+            .iter()
+            .map(|dependency| declaration_config_name(&dependency.identity))
+            .collect::<HashSet<_>>();
+        let gds_files = environment
+            .gds_imports
+            .iter()
+            .filter(|import| dependency_names.contains(&import.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let root_is_gds = root.is_some_and(|root| {
+            let root = declaration_config_name(root);
+            environment
+                .gds_imports
+                .iter()
+                .any(|import| import.name == root)
+        });
+        let uses_solver =
+            root.map_or_else(|| dependencies.len() > gds_files.len(), |_| !root_is_gds);
+        Some(Self {
+            solver: uses_solver.then_some(technology.fingerprints.solver),
+            gds_import: (!gds_files.is_empty()).then(|| technology.fingerprints.gds_import.clone()),
+            gds_files,
+        })
+    }
+
+    fn is_current(&self, environment: &ExecutionEnvironment) -> bool {
+        let Some(technology) = &environment.technology else {
+            return false;
+        };
+        self.solver
+            .is_none_or(|solver| solver == technology.fingerprints.solver)
+            && self
+                .gds_import
+                .as_ref()
+                .is_none_or(|gds| *gds == technology.fingerprints.gds_import)
+            && self.gds_files.iter().all(|dependency| {
+                environment
+                    .gds_imports
+                    .iter()
+                    .any(|current| current == dependency)
+            })
+    }
+}
+
+fn declaration_config_name(identity: &DeclarationIdentity) -> String {
+    if identity.module.is_empty() {
+        identity.name.to_string()
+    } else {
+        format!("{}::{}", identity.module.join("::"), identity.name)
+    }
+}
+
+fn direct_zero_argument_cell(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let call = parse::parse_cell(source).ok()?;
+    if !call.args.posargs.is_empty() || !call.args.kwargs.is_empty() {
+        return None;
+    }
+    let cell = call
+        .func
+        .path
+        .iter()
+        .map(|component| component.name.to_string())
+        .collect::<Vec<_>>();
+    let name = cell.last()?;
+    let module = match cell.first().map(String::as_str) {
+        Some("std") => vec!["std".to_owned()],
+        Some("lib") => cell
+            .iter()
+            .skip(1)
+            .take(cell.len().saturating_sub(2))
+            .cloned()
+            .collect(),
+        _ => cell.iter().take(cell.len() - 1).cloned().collect(),
+    };
+    let exists = ast.get(&module).is_some_and(|module| {
+        module.ast.decls.iter().any(
+            |declaration| matches!(declaration, Decl::Cell(cell) if cell.name.name == name.as_str()),
+        )
+    });
+    exists.then_some(cell)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -170,7 +325,7 @@ enum DeclarationKind {
 struct DeclarationIdentity {
     module: ModPath,
     kind: DeclarationKind,
-    name: String,
+    name: Substr,
 }
 
 #[derive(Clone)]
@@ -198,14 +353,25 @@ struct CachedDependency {
 struct ExecutionCacheEntry {
     request: ExecutionRequest,
     dependencies: Vec<CachedDependency>,
+    external_dependencies: ExternalDependencies,
+    layer_validation: LayerValidationTechnologyFingerprint,
+    tech_path: PathBuf,
     output: CompileOutput,
 }
 
 #[derive(Clone)]
 struct CachedCellArtifact {
-    environment: ExecutionEnvironment,
+    external_dependencies: ExternalDependencies,
     dependencies: Vec<CachedDependency>,
     artifact: compile::CellArtifact,
+}
+
+#[derive(Clone)]
+struct CachedCellContinuation {
+    external_dependencies: ExternalDependencies,
+    target: DeclarationIdentity,
+    dependencies: Vec<CachedDependency>,
+    continuation: compile::CellContinuation,
 }
 
 /// Stateful compiler used by long-lived analyzer processes.
@@ -218,6 +384,7 @@ pub struct IncrementalCompiler {
     static_units: IndexMap<ModPath, StaticUnit>,
     execution_cache: VecDeque<ExecutionCacheEntry>,
     cell_artifact_cache: VecDeque<CachedCellArtifact>,
+    cell_continuation_cache: VecDeque<CachedCellContinuation>,
     stats: IncrementalStats,
 }
 
@@ -339,9 +506,10 @@ impl IncrementalCompiler {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
             return false;
         }
+        let environment = StaticEnvironment::from(config);
         if let Some(cache) = &self.static_cache
             && cache.revision == self.revision
-            && cache.config == *config
+            && cache.environment == environment
             && cache.disk_revisions == self.tracked_file_revisions(config, &cache.analysis)
         {
             self.stats.static_cache_hits += 1;
@@ -351,7 +519,7 @@ impl IncrementalCompiler {
         if self
             .static_cache
             .as_ref()
-            .is_some_and(|cache| cache.config != *config)
+            .is_some_and(|cache| cache.environment != environment)
         {
             self.static_units.clear();
         }
@@ -392,7 +560,7 @@ impl IncrementalCompiler {
         let semantic = Arc::new(SemanticSnapshot::new(&analysis));
         self.static_cache = Some(StaticCache {
             revision: self.revision,
-            config: config.clone(),
+            environment,
             disk_revisions,
             analysis,
             semantic,
@@ -567,18 +735,37 @@ impl IncrementalCompiler {
             Arc::clone(&cache.semantic)
         };
 
-        let request = ExecutionRequest::new(
-            config,
-            ExecutionTarget::Cell {
-                path: cell.to_vec(),
-                args: args.iter().map(CellArgKey::from).collect(),
-            },
-        );
-        if let Some(output) = self.cached_execution(&request, &snapshot) {
+        let environment = ExecutionEnvironment::new(config);
+        let request = ExecutionRequest::new(ExecutionTarget::Cell {
+            path: cell.to_vec(),
+            args: args.iter().map(CellArgKey::from).collect(),
+        });
+        if let Some(output) = self.cached_execution(&request, &environment, &snapshot) {
             self.stats.execution_cache_hits += 1;
             return Some(output);
         }
+        self.execute_resolved_cell(
+            config,
+            cell,
+            args,
+            request,
+            ExecutionContext {
+                environment: &environment,
+                snapshot: &snapshot,
+            },
+            cancellation,
+        )
+    }
 
+    fn execute_resolved_cell(
+        &mut self,
+        config: &WorkspaceConfig,
+        cell: &[String],
+        args: Vec<CellArg>,
+        request: ExecutionRequest,
+        context: ExecutionContext<'_>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<CompileOutput> {
         self.stats.execution_cache_misses += 1;
         let cell_refs = cell.iter().map(String::as_str).collect::<Vec<_>>();
         let ast = self
@@ -589,7 +776,8 @@ impl IncrementalCompiler {
             .typed_ast
             .as_ref()
             .expect("typed AST existence was checked");
-        let artifacts = self.reusable_cell_artifacts(&request.environment, &snapshot);
+        let artifacts = self.reusable_cell_artifacts(context.environment, context.snapshot);
+        let continuations = self.reusable_cell_continuations(context.environment, context.snapshot);
         let execution = compile::execute_cell_tracked_with_artifacts_cancellable(
             ast,
             CompileInput {
@@ -598,21 +786,34 @@ impl IncrementalCompiler {
             },
             config,
             artifacts,
+            continuations,
             cancellation,
         )?;
         self.stats.cell_artifact_cache_hits += execution.artifact_hits;
         self.stats.cell_artifact_cache_misses += execution.artifact_misses;
+        self.stats.cell_continuation_cache_hits += execution.continuation_hits;
+        self.stats.cell_continuation_cache_misses += execution.continuation_misses;
         self.store_cell_artifacts(
-            request.environment.clone(),
+            context.environment,
             execution.artifacts.clone(),
-            &snapshot,
+            context.snapshot,
         );
+        if let Some(continuation) = execution.continuation.clone() {
+            self.store_cell_continuation(context.environment, continuation, context.snapshot);
+        }
         let output = execution.output;
-        self.store_execution(request, execution.dependencies, &snapshot, &output);
+        self.store_execution(
+            request,
+            context.environment,
+            execution.dependencies,
+            context.snapshot,
+            &output,
+        );
         Some(output)
     }
 
-    /// Analyzes and executes a source-level cell invocation. The invocation is
+    /// Analyzes and executes a source-level cell invocation. A directly declared
+    /// zero-argument cell uses the cached typed AST; other invocations are
     /// spliced into a clone of the current snapshot so arbitrary argument
     /// expressions are resolved and type-checked without polluting the cached
     /// editor AST.
@@ -658,10 +859,33 @@ impl IncrementalCompiler {
             }
             Arc::clone(&cache.semantic)
         };
-        let request = ExecutionRequest::new(config, ExecutionTarget::Invocation(source.to_owned()));
-        if let Some(output) = self.cached_execution(&request, &snapshot) {
+        let environment = ExecutionEnvironment::new(config);
+        let request = ExecutionRequest::new(ExecutionTarget::Invocation(source.to_owned()));
+        if let Some(output) = self.cached_execution(&request, &environment, &snapshot) {
             self.stats.execution_cache_hits += 1;
             return Ok(Some(output));
+        }
+
+        let direct_cell = self
+            .static_cache
+            .as_ref()
+            .expect("analysis cache was populated")
+            .analysis
+            .typed_ast
+            .as_ref()
+            .and_then(|ast| direct_zero_argument_cell(ast, source));
+        if let Some(cell) = direct_cell {
+            return Ok(self.execute_resolved_cell(
+                config,
+                &cell,
+                Vec::new(),
+                request,
+                ExecutionContext {
+                    environment: &environment,
+                    snapshot: &snapshot,
+                },
+                cancellation,
+            ));
         }
 
         self.stats.execution_cache_misses += 1;
@@ -686,8 +910,7 @@ impl IncrementalCompiler {
                 errors: Vec::new(),
             };
             let invocation_snapshot = SemanticSnapshot::new(&invocation_analysis);
-            let artifacts =
-                self.reusable_cell_artifacts(&request.environment, &invocation_snapshot);
+            let artifacts = self.reusable_cell_artifacts(&environment, &invocation_snapshot);
             let Some(execution) =
                 compile::execute_cell_invocation_tracked_with_artifacts_cancellable(
                     invocation_analysis
@@ -697,6 +920,7 @@ impl IncrementalCompiler {
                     &invocation,
                     config,
                     artifacts,
+                    Vec::new(),
                     cancellation,
                 )
             else {
@@ -705,13 +929,14 @@ impl IncrementalCompiler {
             self.stats.cell_artifact_cache_hits += execution.artifact_hits;
             self.stats.cell_artifact_cache_misses += execution.artifact_misses;
             self.store_cell_artifacts(
-                request.environment.clone(),
+                &environment,
                 execution.artifacts.clone(),
                 &invocation_snapshot,
             );
             let output = execution.output;
             self.store_execution(
                 request,
+                &environment,
                 execution.dependencies,
                 &invocation_snapshot,
                 &output,
@@ -731,16 +956,36 @@ impl IncrementalCompiler {
     fn cached_execution(
         &mut self,
         request: &ExecutionRequest,
+        environment: &ExecutionEnvironment,
         snapshot: &SemanticSnapshot,
     ) -> Option<CompileOutput> {
         let index = self.execution_cache.iter().position(|entry| {
-            entry.request == *request && entry.dependencies_are_current(snapshot)
+            entry.request == *request
+                && entry.external_dependencies.is_current(environment)
+                && entry.dependencies_are_current(snapshot)
         })?;
-        let entry = self
+        let mut entry = self
             .execution_cache
             .remove(index)
             .expect("cache index came from the same deque");
-        let output = entry.remapped_output(snapshot)?;
+        let (output, spans_were_remapped) = entry.remapped_output(snapshot)?;
+        let technology = environment.technology.as_ref()?;
+        let recheck_layers = entry.layer_validation != technology.fingerprints.layer_validation
+            || entry.tech_path != technology.path;
+        let output = compile::refresh_output_technology(
+            output,
+            technology.value.clone(),
+            &technology.path,
+            recheck_layers,
+        );
+        // Updating an entry whose source spans were remapped would associate
+        // current spans with the old dependency snapshots. Technology-only
+        // changes have no remap, so cache their refreshed validation result.
+        if !spans_were_remapped {
+            entry.output = output.clone();
+            entry.layer_validation = technology.fingerprints.layer_validation.clone();
+            entry.tech_path = technology.path.clone();
+        }
         self.execution_cache.push_back(entry);
         Some(output)
     }
@@ -748,6 +993,7 @@ impl IncrementalCompiler {
     fn store_execution(
         &mut self,
         request: ExecutionRequest,
+        environment: &ExecutionEnvironment,
         dependency_vars: indexmap::IndexSet<VarId>,
         snapshot: &SemanticSnapshot,
         output: &CompileOutput,
@@ -766,8 +1012,18 @@ impl IncrementalCompiler {
         if dependencies.is_empty() {
             return;
         }
+        let Some(external_dependencies) =
+            ExternalDependencies::observed(environment, &dependencies, None)
+        else {
+            return;
+        };
+        let Some(technology) = &environment.technology else {
+            return;
+        };
         self.execution_cache.retain(|entry| {
-            entry.request != request || !entry.same_dependency_versions(&dependencies)
+            entry.request != request
+                || entry.external_dependencies != external_dependencies
+                || !entry.same_dependency_versions(&dependencies)
         });
         if self.execution_cache.len() >= EXECUTION_CACHE_CAPACITY {
             self.execution_cache.pop_front();
@@ -776,6 +1032,9 @@ impl IncrementalCompiler {
         self.execution_cache.push_back(ExecutionCacheEntry {
             request,
             dependencies,
+            external_dependencies,
+            layer_validation: technology.fingerprints.layer_validation.clone(),
+            tech_path: technology.path.clone(),
             output: output.clone(),
         });
     }
@@ -787,14 +1046,14 @@ impl IncrementalCompiler {
     ) -> Vec<compile::CellArtifact> {
         self.cell_artifact_cache
             .iter()
-            .filter(|entry| entry.environment == *environment)
+            .filter(|entry| entry.external_dependencies.is_current(environment))
             .filter_map(|entry| entry.remapped_artifact(snapshot))
             .collect()
     }
 
     fn store_cell_artifacts(
         &mut self,
-        environment: ExecutionEnvironment,
+        environment: &ExecutionEnvironment,
         artifacts: Vec<compile::CellArtifact>,
         snapshot: &SemanticSnapshot,
     ) {
@@ -806,8 +1065,16 @@ impl IncrementalCompiler {
             if dependencies.is_empty() {
                 continue;
             }
+            let Some(root) = snapshot.vars.get(&artifact.root_cell()) else {
+                continue;
+            };
+            let Some(external_dependencies) =
+                ExternalDependencies::observed(environment, &dependencies, Some(root))
+            else {
+                continue;
+            };
             self.cell_artifact_cache.retain(|entry| {
-                entry.environment != environment
+                entry.external_dependencies != external_dependencies
                     || !entry.artifact.same_key(&artifact)
                     || !entry.same_dependency_versions(&dependencies)
             });
@@ -816,11 +1083,84 @@ impl IncrementalCompiler {
                 self.stats.cell_artifact_cache_evictions += 1;
             }
             self.cell_artifact_cache.push_back(CachedCellArtifact {
-                environment: environment.clone(),
+                external_dependencies,
                 dependencies,
                 artifact,
             });
         }
+    }
+
+    fn reusable_cell_continuations(
+        &self,
+        environment: &ExecutionEnvironment,
+        snapshot: &SemanticSnapshot,
+    ) -> Vec<compile::CellContinuation> {
+        self.cell_continuation_cache
+            .iter()
+            .filter(|entry| entry.external_dependencies.is_current(environment))
+            .filter(|entry| {
+                entry.dependencies.iter().all(|dependency| {
+                    let Some(current) = snapshot.declarations.get(&dependency.identity) else {
+                        return false;
+                    };
+                    if dependency.identity == entry.target {
+                        current.source_path == dependency.snapshot.source_path
+                    } else {
+                        let generated_declaration = !dependency.snapshot.origins.is_empty()
+                            && dependency.snapshot.origins.iter().all(|origin| {
+                                origin.start() >= dependency.snapshot.source_text.len()
+                            });
+                        current.fingerprint == dependency.snapshot.fingerprint
+                            && current.source_path == dependency.snapshot.source_path
+                            && (current.origins == dependency.snapshot.origins
+                                || generated_declaration)
+                    }
+                })
+            })
+            .map(|entry| entry.continuation.clone())
+            .collect()
+    }
+
+    fn store_cell_continuation(
+        &mut self,
+        environment: &ExecutionEnvironment,
+        continuation: compile::CellContinuation,
+        snapshot: &SemanticSnapshot,
+    ) {
+        let Some(target) = snapshot.vars.get(&continuation.cell()).cloned() else {
+            return;
+        };
+        let Some(dependencies) = cached_dependencies(continuation.dependencies().clone(), snapshot)
+        else {
+            return;
+        };
+        if !dependencies
+            .iter()
+            .any(|dependency| dependency.identity == target)
+        {
+            return;
+        }
+        let Some(external_dependencies) =
+            ExternalDependencies::observed(environment, &dependencies, Some(&target))
+        else {
+            return;
+        };
+        self.cell_continuation_cache.retain(|entry| {
+            entry.external_dependencies != external_dependencies
+                || entry.target != target
+                || !entry.continuation.same_key(&continuation)
+        });
+        if self.cell_continuation_cache.len() >= CELL_CONTINUATION_CACHE_CAPACITY {
+            self.cell_continuation_cache.pop_front();
+            self.stats.cell_continuation_cache_evictions += 1;
+        }
+        self.cell_continuation_cache
+            .push_back(CachedCellContinuation {
+                external_dependencies,
+                target,
+                dependencies,
+                continuation,
+            });
     }
 
     fn tracked_file_revisions(
@@ -1050,12 +1390,12 @@ impl SemanticSnapshot {
                     Decl::Cell(declaration) => DeclarationIdentity {
                         module: module.clone(),
                         kind: DeclarationKind::Cell,
-                        name: declaration.name.name.to_string(),
+                        name: declaration.name.name.clone(),
                     },
                     Decl::Fn(declaration) => DeclarationIdentity {
                         module: module.clone(),
                         kind: DeclarationKind::Function,
-                        name: declaration.name.name.to_string(),
+                        name: declaration.name.name.clone(),
                     },
                     _ => continue,
                 };
@@ -1089,7 +1429,7 @@ impl SemanticSnapshot {
                             DeclarationIdentity {
                                 module: module.clone(),
                                 kind: DeclarationKind::Cell,
-                                name: declaration.name.name.to_string(),
+                                name: declaration.name.name.clone(),
                             },
                         ),
                         Decl::Fn(declaration) => (
@@ -1097,7 +1437,7 @@ impl SemanticSnapshot {
                             DeclarationIdentity {
                                 module: module.clone(),
                                 kind: DeclarationKind::Function,
-                                name: declaration.name.name.to_string(),
+                                name: declaration.name.name.clone(),
                             },
                         ),
                         _ => continue,
@@ -1147,16 +1487,16 @@ impl ExecutionCacheEntry {
         })
     }
 
-    fn remapped_output(&self, snapshot: &SemanticSnapshot) -> Option<CompileOutput> {
+    fn remapped_output(&self, snapshot: &SemanticSnapshot) -> Option<(CompileOutput, bool)> {
         let (changed_paths, remaps) = dependency_origin_remaps(&self.dependencies, snapshot)?;
 
         if changed_paths.is_empty() {
-            return Some(self.output.clone());
+            return Some((self.output.clone(), false));
         }
 
         let mut value = serde_json::to_value(&self.output).ok()?;
         remap_serialized_spans(&mut value, &changed_paths, &remaps).then_some(())?;
-        serde_json::from_value(value).ok()
+        Some((serde_json::from_value(value).ok()?, true))
     }
 }
 
@@ -1310,6 +1650,29 @@ fn file_revision(path: &Path) -> Option<FileRevision> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_technology(
+        dbu: f64,
+        display_unit: u64,
+        grid: u64,
+        layers: &[(&str, i16, i16, &str)],
+    ) -> String {
+        let mut text = format!("dbu = {dbu:e}\ndisplay_unit = {display_unit}\ngrid = {grid}\n");
+        for (name, gds_layer, gds_datatype, color) in layers {
+            text.push_str(&format!(
+                "\n[[layers]]\nname = \"{name}\"\ngds = [{gds_layer}, {gds_datatype}]\nfill = \"{color}\"\nborder = \"{color}\"\n"
+            ));
+        }
+        text
+    }
+
+    fn compiled_data(output: &CompileOutput) -> &compile::CompiledData {
+        match output {
+            CompileOutput::Valid(data) => data,
+            CompileOutput::ExecErrors(output) => output.output.as_ref().unwrap(),
+            output => panic!("cell should produce compiled data: {output:?}"),
+        }
+    }
 
     #[test]
     fn edits_are_sequential_and_noops_keep_the_revision() {
@@ -1470,6 +1833,380 @@ mod tests {
         ));
         assert_eq!(compiler.stats().execution_cache_misses, 1);
         assert_eq!(compiler.stats().execution_cache_hits, 1);
+    }
+
+    #[test]
+    fn presentation_changes_reuse_geometry_and_refresh_the_output_technology() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech.clone()));
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root,
+            "cell top() { let shape = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }\n",
+        );
+
+        let first = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        let before = compiler.stats();
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#abcdef")]),
+        )
+        .unwrap();
+        let second = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        assert!(Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        assert_eq!(
+            second.tech.layers[0].fill_color,
+            rgb::Rgb::new(0xab, 0xcd, 0xef)
+        );
+        assert_eq!(
+            compiler.stats().execution_cache_hits,
+            before.execution_cache_hits + 1
+        );
+        assert_eq!(
+            compiler.stats().execution_cache_misses,
+            before.execution_cache_misses
+        );
+    }
+
+    #[test]
+    fn switching_technology_files_does_not_reanalyze_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let first_tech = directory.path().join("first.tech.toml");
+        let second_tech = directory.path().join("second.tech.toml");
+        std::fs::write(
+            &first_tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        std::fs::write(
+            &second_tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#abcdef")]),
+        )
+        .unwrap();
+        let first_config = WorkspaceConfig::new(&root).with_tech(Some(first_tech));
+        let second_config = WorkspaceConfig::new(&root).with_tech(Some(second_tech));
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root,
+            "cell top() { let shape = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }\n",
+        );
+
+        let first = compiler.compile_cell(&first_config, &["top".to_owned()], Vec::new());
+        let before = compiler.stats();
+        let second = compiler.compile_cell(&second_config, &["top".to_owned()], Vec::new());
+
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        assert!(Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        assert_eq!(
+            second.tech.layers[0].fill_color,
+            rgb::Rgb::new(0xab, 0xcd, 0xef)
+        );
+        assert_eq!(
+            compiler.stats().static_cache_hits,
+            before.static_cache_hits + 1
+        );
+        assert_eq!(
+            compiler.stats().static_cache_misses,
+            before.static_cache_misses
+        );
+        assert_eq!(
+            compiler.stats().execution_cache_hits,
+            before.execution_cache_hits + 1
+        );
+    }
+
+    #[test]
+    fn deleting_a_layer_reuses_geometry_and_only_revalidates_layers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        std::fs::write(
+            &tech,
+            test_technology(
+                1e-9,
+                10,
+                1,
+                &[("met1", 1, 0, "#112233"), ("met2", 2, 0, "#445566")],
+            ),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech.clone()));
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root,
+            "cell top() { let shape = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.)!; }\n",
+        );
+
+        let first = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        assert!(matches!(first, CompileOutput::Valid(_)));
+        let before = compiler.stats();
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        let second = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+
+        let CompileOutput::ExecErrors(errors) = &second else {
+            panic!("deleted layer should be diagnosed: {second:?}");
+        };
+        assert!(errors.errors.iter().any(|error| matches!(
+            &error.kind,
+            compile::ExecErrorKind::IllegalLayer { layer, .. } if layer == "met2"
+        )));
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        assert!(Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        assert_eq!(
+            compiler.stats().execution_cache_hits,
+            before.execution_cache_hits + 1
+        );
+        assert_eq!(
+            compiler.stats().execution_cache_misses,
+            before.execution_cache_misses
+        );
+
+        // Restoring the layer removes the cached validation error without
+        // executing the cell or replacing its geometry.
+        std::fs::write(
+            &tech,
+            test_technology(
+                1e-9,
+                10,
+                1,
+                &[("met1", 1, 0, "#112233"), ("met2", 2, 0, "#445566")],
+            ),
+        )
+        .unwrap();
+        let before_restore = compiler.stats();
+        let restored = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        assert!(matches!(restored, CompileOutput::Valid(_)));
+        let restored = compiled_data(&restored);
+        assert!(Arc::ptr_eq(
+            &first.cells[&first.top],
+            &restored.cells[&restored.top]
+        ));
+        assert_eq!(
+            compiler.stats().execution_cache_hits,
+            before_restore.execution_cache_hits + 1
+        );
+    }
+
+    #[test]
+    fn effective_grid_changes_invalidate_solved_source_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech.clone()));
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root,
+            "cell top() { let shape = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }\n",
+        );
+
+        let first = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        let before = compiler.stats();
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 2, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        let second = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        assert!(!Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        assert_eq!(
+            compiler.stats().execution_cache_misses,
+            before.execution_cache_misses + 1
+        );
+        assert_eq!(
+            compiler.stats().cell_artifact_cache_hits,
+            before.cell_artifact_cache_hits
+        );
+    }
+
+    #[test]
+    fn equivalent_grid_ratios_reuse_source_geometry_across_unit_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech.clone()));
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root,
+            "cell top() { let shape = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }\n",
+        );
+
+        let first = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        let before = compiler.stats();
+        std::fs::write(
+            &tech,
+            test_technology(2e-9, 20, 2, &[("met1", 1, 0, "#112233")]),
+        )
+        .unwrap();
+        let second = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        assert!(Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        assert_eq!(second.tech.dbu, 2e-9);
+        assert_eq!(second.tech.display_unit, 20);
+        assert_eq!(
+            compiler.stats().execution_cache_hits,
+            before.execution_cache_hits + 1
+        );
+    }
+
+    #[test]
+    fn grid_changes_keep_imported_gds_artifacts_reusable() {
+        use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        let gds_path = directory.path().join("macro.gds");
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 7, 3, "#112233")]),
+        )
+        .unwrap();
+        let mut library = GdsLibrary::new("fixture");
+        let mut structure = GdsStruct::new("macro");
+        structure.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+            layer: 7,
+            datatype: 3,
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(0, 20),
+                GdsPoint::new(10, 20),
+                GdsPoint::new(10, 0),
+            ],
+            ..Default::default()
+        }));
+        library.structs.push(structure);
+        library.save(&gds_path).unwrap();
+        let config = WorkspaceConfig::new(&root)
+            .with_tech(Some(tech.clone()))
+            .with_gds_imports([("macro".to_owned(), gds_path)]);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root, "cell top() { let imported = inst(macro()); }\n");
+
+        let first = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        let before = compiler.stats();
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 2, &[("met1", 7, 3, "#112233")]),
+        )
+        .unwrap();
+        let second = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        let imported = first.cells.keys().find(|cell| **cell != first.top).unwrap();
+        assert!(Arc::ptr_eq(&first.cells[imported], &second.cells[imported]));
+        assert_eq!(
+            compiler.stats().execution_cache_misses,
+            before.execution_cache_misses + 1
+        );
+        assert!(compiler.stats().cell_artifact_cache_hits > before.cell_artifact_cache_hits);
+    }
+
+    #[test]
+    fn unrelated_gds_file_changes_do_not_invalidate_an_execution() {
+        use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech = directory.path().join("tech.toml");
+        let used_gds = directory.path().join("used.gds");
+        let unused_gds = directory.path().join("unused.gds");
+        std::fs::write(
+            &tech,
+            test_technology(1e-9, 10, 1, &[("met1", 7, 3, "#112233")]),
+        )
+        .unwrap();
+        let mut library = GdsLibrary::new("fixture");
+        let mut structure = GdsStruct::new("used");
+        structure.elems.push(GdsElement::GdsBoundary(GdsBoundary {
+            layer: 7,
+            datatype: 3,
+            xy: vec![
+                GdsPoint::new(0, 0),
+                GdsPoint::new(0, 20),
+                GdsPoint::new(10, 20),
+                GdsPoint::new(10, 0),
+            ],
+            ..Default::default()
+        }));
+        library.structs.push(structure);
+        library.save(&used_gds).unwrap();
+        std::fs::write(&unused_gds, "unused GDS revision one").unwrap();
+        let config = WorkspaceConfig::new(&root)
+            .with_tech(Some(tech))
+            .with_gds_imports([
+                ("used".to_owned(), used_gds),
+                ("unused".to_owned(), unused_gds.clone()),
+            ]);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root, "cell top() { let imported = inst(used()); }\n");
+
+        let first = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+        let before = compiler.stats();
+        std::fs::write(&unused_gds, "unused GDS revision two is different").unwrap();
+        let second = compiler.compile_cell(&config, &["top".to_owned()], Vec::new());
+
+        let first = compiled_data(&first);
+        let second = compiled_data(&second);
+        assert!(Arc::ptr_eq(
+            &first.cells[&first.top],
+            &second.cells[&second.top]
+        ));
+        assert_eq!(
+            compiler.stats().execution_cache_hits,
+            before.execution_cache_hits + 1
+        );
+        assert_eq!(
+            compiler.stats().execution_cache_misses,
+            before.execution_cache_misses
+        );
     }
 
     #[test]
@@ -1726,18 +2463,22 @@ cell bot() {
         let config = WorkspaceConfig::new(&root)
             .with_tech(Some(tech))
             .with_gds_imports([("macro".to_owned(), gds_path)]);
-        let target = vec!["top".to_owned()];
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(
             root.clone(),
             "cell top() {\n  let imported = inst(macro());\n}\n",
         );
-        let first = compiler.compile_cell(&config, &target, Vec::new());
+        let first = compiler.compile_invocation(&config, "top()").unwrap();
+        let before = compiler.stats();
         compiler.set_source_text(
             root,
-            "cell top() {\n  let marker = 1;\n  let imported = inst(macro());\n}\n",
+            "cell top() {\n  let imported = inst(macro());\n  let added = rect(\"met1\", x0i=20., y0i=20., x1i=30., y1i=30.)!;\n}\n",
         );
-        let second = compiler.compile_cell(&config, &target, Vec::new());
+        let second = compiler.compile_invocation(&config, "top()").unwrap();
+        assert_eq!(
+            compiler.stats().cell_continuation_cache_hits,
+            before.cell_continuation_cache_hits + 1
+        );
         fn data(output: &CompileOutput) -> &compile::CompiledData {
             match output {
                 CompileOutput::Valid(data) => data,
@@ -1754,6 +2495,128 @@ cell bot() {
         ));
         let imported = first.cells.keys().find(|cell| **cell != first.top).unwrap();
         assert!(Arc::ptr_eq(&first.cells[imported], &second.cells[imported]));
+    }
+
+    #[test]
+    fn appended_literal_rectangle_resumes_the_solved_cell_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech));
+        let initial =
+            "cell top() {\n  let first = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;\n}\n";
+        let appended = "cell top() {\n  let first = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;\n  let second = rect(\"met1\", x0i=20., y0i=20., x1i=30., y1i=30.)!;\n}\n";
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), initial);
+        let first = compiler.compile_invocation(&config, "top()").unwrap();
+        assert!(matches!(
+            &first,
+            CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
+        ));
+        let before = compiler.stats();
+
+        compiler.set_source_text(root.clone(), appended);
+        let incremental = compiler.compile_invocation(&config, "top()").unwrap();
+        assert_eq!(
+            compiler.stats().cell_continuation_cache_hits,
+            before.cell_continuation_cache_hits + 1
+        );
+
+        let sources = IndexMap::from([(root.clone(), ArcStr::from(appended))]);
+        let analysis = compile::analyze_workspace(parse::parse_workspace_with_config_and_sources(
+            &config, &sources,
+        ));
+        assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+        let fresh = compile::execute_cell(
+            analysis.typed_ast.as_ref().unwrap(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+            &config,
+        );
+        fn data(output: &CompileOutput) -> &compile::CompiledData {
+            match output {
+                CompileOutput::Valid(data) => data,
+                CompileOutput::ExecErrors(output) => output.output.as_ref().unwrap(),
+                output => panic!("cell should compile: {output:?}"),
+            }
+        }
+        fn rectangle<'a>(
+            output: &'a CompileOutput,
+            field: &str,
+        ) -> &'a compile::Rect<(f64, crate::solver::LinearExpr)> {
+            let data = data(output);
+            match data.cells[&data.top].field(field) {
+                Some(compile::Arrayed::Elem(compile::SolvedValue::Rect(rect))) => rect,
+                value => panic!("expected rectangle field `{field}`, found {value:?}"),
+            }
+        }
+        let old_first = rectangle(&first, "first");
+        let incremental_first = rectangle(&incremental, "first");
+        let incremental_second = rectangle(&incremental, "second");
+        let fresh_first = rectangle(&fresh, "first");
+        let fresh_second = rectangle(&fresh, "second");
+
+        assert_eq!(old_first.id, incremental_first.id);
+        assert_eq!(incremental_first.layer, fresh_first.layer);
+        assert_eq!(incremental_first.x0.0, fresh_first.x0.0);
+        assert_eq!(incremental_first.y0.0, fresh_first.y0.0);
+        assert_eq!(incremental_first.x1.0, fresh_first.x1.0);
+        assert_eq!(incremental_first.y1.0, fresh_first.y1.0);
+        assert_eq!(incremental_second.layer, fresh_second.layer);
+        assert_eq!(incremental_second.x0.0, fresh_second.x0.0);
+        assert_eq!(incremental_second.y0.0, fresh_second.y0.0);
+        assert_eq!(incremental_second.x1.0, fresh_second.x1.0);
+        assert_eq!(incremental_second.y1.0, fresh_second.y1.0);
+
+        let first_id = incremental_first.id;
+        let second_id = incremental_second.id;
+        let appended_again = "cell top() {\n  let first = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;\n  let second = rect(\"met1\", x0i=20., y0i=20., x1i=30., y1i=30.)!;\n  let third = rect(\"met1\", x0i=40., y0i=40., x1i=50., y1i=50.)!;\n}\n";
+        let before_second_append = compiler.stats();
+        compiler.set_source_text(root, appended_again);
+        let third = compiler.compile_invocation(&config, "top()").unwrap();
+        assert_eq!(
+            compiler.stats().cell_continuation_cache_hits,
+            before_second_append.cell_continuation_cache_hits + 1
+        );
+        assert_eq!(rectangle(&third, "first").id, first_id);
+        assert_eq!(rectangle(&third, "second").id, second_id);
+        assert_eq!(rectangle(&third, "third").x0.0, 40.);
+    }
+
+    #[test]
+    fn a_non_append_edit_does_not_resume_a_cell_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = WorkspaceConfig::new(&root).with_tech(Some(tech));
+        let target = vec!["top".to_owned()];
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(
+            root.clone(),
+            "cell top() {\n  let shape = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;\n}\n",
+        );
+        let _ = compiler.compile_cell(&config, &target, Vec::new());
+        let before = compiler.stats();
+
+        compiler.set_source_text(
+            root,
+            "cell top() {\n  let marker = 1;\n  let shape = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;\n}\n",
+        );
+        let _ = compiler.compile_cell(&config, &target, Vec::new());
+        let after = compiler.stats();
+
+        assert_eq!(
+            after.cell_continuation_cache_hits,
+            before.cell_continuation_cache_hits
+        );
+        assert_eq!(
+            after.cell_continuation_cache_misses,
+            before.cell_continuation_cache_misses + 1
+        );
     }
 
     #[test]
@@ -1883,12 +2746,22 @@ cell bot() {
         let start = std::time::Instant::now();
         let _ = compiler.compile_cell(&config, &cell, Vec::new());
         let edited = start.elapsed();
+
+        let append_source = format!(
+            "{}  let added = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!;\n}}\n",
+            source.strip_suffix("}\n").unwrap()
+        );
+        compiler.set_source_text(root, append_source);
+        let start = std::time::Instant::now();
+        let _ = compiler.compile_cell(&config, &cell, Vec::new());
+        let rectangle_append = start.elapsed();
         let retained = crate::bench_alloc::live().saturating_sub(retained_before);
         eprintln!(
-            "incremental,cold_ns={},warm_ns={},isolated_edit_ns={},parse_hits={},files_reparsed={},static_hits={},static_misses={},static_unit_hits={},static_unit_misses={},execution_hits={},execution_misses={},execution_evictions={},cell_artifact_hits={},cell_artifact_misses={},cell_artifact_evictions={},retained_bytes={retained}",
+            "incremental,cold_ns={},warm_ns={},isolated_edit_ns={},rectangle_append_ns={},parse_hits={},files_reparsed={},static_hits={},static_misses={},static_unit_hits={},static_unit_misses={},execution_hits={},execution_misses={},execution_evictions={},cell_artifact_hits={},cell_artifact_misses={},cell_artifact_evictions={},cell_continuation_hits={},cell_continuation_misses={},cell_continuation_evictions={},retained_bytes={retained}",
             cold.as_nanos(),
             warm.as_nanos(),
             edited.as_nanos(),
+            rectangle_append.as_nanos(),
             compiler.stats().parse_cache_hits,
             compiler.stats().files_reparsed,
             compiler.stats().static_cache_hits,
@@ -1901,6 +2774,9 @@ cell bot() {
             compiler.stats().cell_artifact_cache_hits,
             compiler.stats().cell_artifact_cache_misses,
             compiler.stats().cell_artifact_cache_evictions,
+            compiler.stats().cell_continuation_cache_hits,
+            compiler.stats().cell_continuation_cache_misses,
+            compiler.stats().cell_continuation_cache_evictions,
         );
     }
 }

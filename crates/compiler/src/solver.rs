@@ -114,6 +114,11 @@ impl Solver {
                 .is_some_and(CancellationToken::is_cancelled)
     }
 
+    pub(crate) fn replace_cancellation(&mut self, cancellation: Option<&CancellationToken>) {
+        self.cancellation = cancellation.cloned();
+        self.cancelled = false;
+    }
+
     pub fn new_var(&mut self) -> Var {
         let var = Var(self.next_var);
         self.unsolved_vars.insert(var);
@@ -1063,6 +1068,22 @@ mod tests {
         assert_relative_eq!(s.value_of(a).unwrap(), 10., epsilon = EPSILON);
         assert_relative_eq!(s.value_of(b).unwrap(), 9., epsilon = EPSILON);
         assert_relative_eq!(s.value_of(d).unwrap(), 8., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn a_new_constraint_cannot_move_a_hard_solved_variable() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let first = solver.constrain_eq0(c(vec![(1., x)], -10.));
+        solver.solve();
+        assert_relative_eq!(solver.value_of(x).unwrap(), 10., epsilon = EPSILON);
+        assert!(!solver.inconsistent_constraints().contains(&first));
+
+        let conflicting = solver.constrain_eq0(c(vec![(1., x)], -20.));
+        solver.solve();
+
+        assert_relative_eq!(solver.value_of(x).unwrap(), 10., epsilon = EPSILON);
+        assert!(solver.inconsistent_constraints().contains(&conflicting));
     }
 
     fn coupled_ring_system(

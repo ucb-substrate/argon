@@ -278,6 +278,7 @@ dependencies = [
  "const_format",
  "derive-where",
  "enumify 0.2.2 (registry+https://github.com/substrate-labs/crates-index)",
+ "fnv",
  "gds",
  "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
  "imbl",
