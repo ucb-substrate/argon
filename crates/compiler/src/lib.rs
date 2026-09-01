@@ -1430,7 +1430,16 @@ mod tests {
                     CellArg::Int(4),
                 ],
             ),
-            ("cdac_half_top", vec![]),
+            (
+                "cdac_half",
+                vec![
+                    CellArg::Int(8),
+                    CellArg::Int(7),
+                    CellArg::Float(1_805.),
+                    CellArg::Float(-24_000.),
+                    CellArg::Float(-45_000.),
+                ],
+            ),
         ] {
             let out = compile_sky130(
                 &ast,

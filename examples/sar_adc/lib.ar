@@ -80,7 +80,7 @@ fn gate_tap(fet: Any, nf: Int, y0: Float, y1: Float, ty0: Float) -> Rect {
 
     // Contact stack, concentric, using the same enclosures as sky130::inv.
     let li = rect("li1.drawing", x0=fet.poly_bbox.x0 - 90., x1=fet.poly_bbox.x1 + 90.,
-                  y0=ty0, h=li_w())!;
+        y0=ty0, h=li_w())!;
     let pbar = rect("poly.drawing", x0=li.x0, x1=li.x1, h=270.);
     eq(pbar.y0 + pbar.y1, li.y0 + li.y1);
     let npc = rect("npc.drawing", x0=fet.poly_bbox.x0 - 110., x1=fet.poly_bbox.x1 + 110., h=370.);
@@ -96,7 +96,7 @@ fn gate_tap(fet: Any, nf: Int, y0: Float, y1: Float, ty0: Float) -> Rect {
 // met1 riser tying a li1 terminal to a met2 track, both spanning x0..x1.
 fn li_riser_m2(li: Rect, trk: Rect, x0: Float, x1: Float) -> Rect {
     let p1 = rect("met1.drawing", x0=x0, x1=x1,
-                  y0=std::min(li.y0, trk.y0) - 60., y1=std::max(li.y1, trk.y1) + 60.);
+        y0=std::min(li.y0, trk.y0) - 60., y1=std::max(li.y1, trk.y1) + 60.);
     m1_over_li(li, p1);
     via1_array(p1, trk, v1_pitch());
     p1
@@ -261,8 +261,8 @@ fn logic_min_w(nbits: Int) -> Float {
     // 710 nm is the fixed overhead of one sky130::inv either side of its
     // poly array; there are nbits + 1 drivers counting the dummy.
     (drv_nf_total(nbits - 1, nbits) as Float) * poly_p()
-        + ((nbits + 1) as Float) * 710.
-        + logic_cells() / logic_h()
+    + ((nbits + 1) as Float) * 710.
+    + logic_cells() / logic_h()
 }
 
 // =====================================================================
@@ -370,15 +370,15 @@ cell cdac_row(nu: Int, na: Int, lf: Float) {
 
     // Bottom-plate rail: one node for the whole row.
     let brail_m1 = rect("met1.drawing", x0=left.bspine_m1.x0, x1=right.bspine_m1.x1,
-                        y0=left.bspine_m1.y0, y1=left.bspine_m1.y1)!;
+        y0=left.bspine_m1.y0, y1=left.bspine_m1.y1)!;
     let brail_m2 = rect("met2.drawing", x0=left.bspine_m2.x0, x1=right.bspine_m2.x1,
-                        y0=left.bspine_m2.y0, y1=left.bspine_m2.y1)!;
+        y0=left.bspine_m2.y0, y1=left.bspine_m2.y1)!;
 
     // Top-plate rail handle (the tile A spines are already contiguous).
     let arail_m1 = rect("met1.drawing", x0=left.aspine_m1.x0, x1=right.aspine_m1.x1,
-                        y0=left.aspine_m1.y0, y1=left.aspine_m1.y1)!;
+        y0=left.aspine_m1.y0, y1=left.aspine_m1.y1)!;
     let arail_m2 = rect("met2.drawing", x0=left.aspine_m2.x0, x1=right.aspine_m2.x1,
-                        y0=left.aspine_m2.y0, y1=left.aspine_m2.y1)!;
+        y0=left.aspine_m2.y0, y1=left.aspine_m2.y1)!;
 }
 
 // A `cdac_pair` is two rows mirrored about their shared bottom-plate
@@ -505,7 +505,7 @@ cell cdac_half(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
     // stops a tile pitch short of it, so the column picks up the top
     // plate and nothing else.
     let tp_m2 = rect("met2.drawing", x0=b4.brail_m2.x1 + m1_s(), x1=aw + 4. * pad_w(),
-                     y0=0., y1=atop)!;
+        y0=0., y1=atop)!;
     let tp_m3 = rect("met3.drawing", x0=tp_m2.x0, x1=tp_m2.x1, y0=tp_m2.y0, y1=tp_m2.y1);
     via2_array(tp_m2, tp_m3, 2. * pad_w());
     let tp = rect("met4.drawing", x0=tp_m2.x0, x1=tp_m2.x1, y0=ytp, y1=tp_m2.y1)!;
@@ -530,7 +530,7 @@ cell cdac_half(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
         for k in std::range(pow2(j)) {
             let p = pairs[pow2(j) - 1 + k];
             let rail = rect("met2.drawing", x0=p.bot.brail_m2.x0, x1=p.bot.brail_m2.x1,
-                            y0=p.bot.brail_m2.y0, y1=p.top.brail_m2.y1);
+                y0=p.bot.brail_m2.y0, y1=p.top.brail_m2.y1);
             msb_bus(rail, j + 2, yport);
         }
     }
@@ -540,7 +540,7 @@ cell cdac_half(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
 fn lsb_bus(rail: Rect, yport: Float) -> Rect {
     let cx = (rail.x0 + rail.x1) / 2.;
     let pad = rect("met2.drawing", x0=cx - pad_w() / 2., x1=cx + pad_w() / 2.,
-                   y0=rail.y1 - pad_w(), y1=rail.y1);
+        y0=rail.y1 - pad_w(), y1=rail.y1);
     rail_to_bus(pad, yport)
 }
 
@@ -605,19 +605,19 @@ cell cmp_latch_half(wn: Float, wp: Float, nf: Int) {
     eq(pmos.li1_bbox.y1 + 100., ntap.sdm.y0);
     eq(ntap.sdm.x0, pmos.sdm.x0);
     let nwell = rect("nwell.drawing", x0=pmos.sdm.x0 - nw_enc(), x1=pmos.sdm.x1 + nw_enc(),
-                     y0=pmos.sdm.y0 - nw_enc(), y1=ntap.sdm.y1 + nw_enc());
+        y0=pmos.sdm.y0 - nw_enc(), y1=ntap.sdm.y1 + nw_enc());
 
     // Three li1 lanes between the devices.
     let o_li_bot = rect("li1.drawing", x0=nmos.li1_bbox.x0 + poly_p(),
-                        y0=nmos.li1_bbox.y1 + li_w(), h=li_w());
+        y0=nmos.li1_bbox.y1 + li_w(), h=li_w());
     let a_li_mid = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90.,
-                        y0=o_li_bot.y1 + li_w(), h=li_w())!;
+        y0=o_li_bot.y1 + li_w(), h=li_w())!;
     let o_li_top = rect("li1.drawing", x0=o_li_bot.x0, y0=a_li_mid.y1 + li_w(), h=li_w())!;
     eq(o_li_top.y1 + li_w(), pmos.li1_bbox.y0);
 
     // Output strap, clear of the gate bar.
     let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + li_w(), w=li_w(),
-                          y0=o_li_bot.y0, y1=o_li_top.y1)!;
+        y0=o_li_bot.y0, y1=o_li_top.y1)!;
     eq(o_li_bot.x1, o_li_right.x1);
     eq(o_li_top.x1, o_li_right.x1);
 
@@ -640,7 +640,7 @@ cell cmp_latch_half(wn: Float, wp: Float, nf: Int) {
     // NMOS sources down onto a lane of their own: this is the terminal
     // that the input pair drives.
     let s_bar = rect("li1.drawing", y1=nmos.li1_bbox.y0 - li_w(), h=li_w(),
-                     x0=nmos.li1_bbox.x0, x1=nmos.li1_bbox.x1)!;
+        x0=nmos.li1_bbox.x0, x1=nmos.li1_bbox.x1)!;
     let sn = crect(layer="li1.drawing", w=li_w(), y0=s_bar.y0, y1=nmos.li1_bbox.y1, x0=0.);
     let sn_bbox = std::array(sn, nf + 1 - (nf + 1) / 2, 2. * poly_p(), 0.);
     eq(sn_bbox.x0, nmos.li1_bbox.x0);
@@ -649,7 +649,7 @@ cell cmp_latch_half(wn: Float, wp: Float, nf: Int) {
     // Shared gate: one poly array across both devices, contacted in the
     // middle lane.
     let poly = crect(layer="poly.drawing", w=poly_w(), y0=nmos.poly_bbox.y0,
-                     y1=pmos.poly_bbox.y1, x0=0.);
+        y1=pmos.poly_bbox.y1, x0=0.);
     let poly_bbox = std::array(poly, nf, poly_p(), 0.);
     eq(poly_bbox.x0, nmos.poly_bbox.x0);
     eq(poly_bbox.y0, nmos.poly_bbox.y0);
@@ -704,10 +704,10 @@ cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_r
     let vss = src_down(mclk, nf_tail, ptap.li1);
 
     let t_dn = rect("li1.drawing", y0=mclk.li1_bbox.y1 + li_w(), h=li_w(),
-                    x0=mclk.li1_bbox.x0 + poly_p(), x1=mclk.li1_bbox.x1)!;
+        x0=mclk.li1_bbox.x0 + poly_p(), x1=mclk.li1_bbox.x1)!;
     strips_up(mclk, nf_tail, true, t_dn);
     let clk_n = gate_tap(mclk, nf_tail, mclk.poly_bbox.y0, t_dn.y1 + li_w() + 250.,
-                         t_dn.y1 + li_w());
+        t_dn.y1 + li_w());
 
     // ---- input pair ----
     let tail = rect("li1.drawing", y0=clk_n.y1 + li_w(), h=li_w())!;
@@ -726,9 +726,9 @@ cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_r
 
     // ---- input drains and gates ----
     let din = rect("li1.drawing", y0=m1.li1_bbox.y1 + li_w(), h=li_w(),
-                   x0=m1.li1_bbox.x0 + poly_p(), x1=m1.li1_bbox.x1)!;
+        x0=m1.li1_bbox.x0 + poly_p(), x1=m1.li1_bbox.x1)!;
     let dip = rect("li1.drawing", y0=din.y0, y1=din.y1,
-                   x0=m2.li1_bbox.x0 + poly_p(), x1=m2.li1_bbox.x1)!;
+        x0=m2.li1_bbox.x0 + poly_p(), x1=m2.li1_bbox.x1)!;
     strips_up(m1, nf_in, true, din);
     strips_up(m2, nf_in, true, dip);
     let vip = gate_tap(m1, nf_in, m1.poly_bbox.y0, din.y1 + li_w() + 250., din.y1 + li_w());
@@ -747,7 +747,7 @@ cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_r
 
     // ---- reset PMOS pair ----
     let vdd_lane = rect("li1.drawing", y0=ln.ntap.li1.y1 + li_w(), h=li_w(),
-                        x0=ln.ntap.li1.x0, x1=lp.ntap.li1.x1)!;
+        x0=ln.ntap.li1.x0, x1=lp.ntap.li1.x1)!;
     let r7 = inst(sky130::fet1v8(false, wp, nf_rst));
     let r8 = inst(sky130::fet1v8(false, wp, nf_rst));
     eq(r7.li1_bbox.y0, vdd_lane.y1 + li_w());
@@ -758,9 +758,9 @@ cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_r
     src_down(r8, nf_rst, vdd_lane);
 
     let r7d = rect("li1.drawing", y0=r7.li1_bbox.y1 + li_w(), h=li_w(),
-                   x0=r7.li1_bbox.x0 + poly_p(), x1=r7.li1_bbox.x1)!;
+        x0=r7.li1_bbox.x0 + poly_p(), x1=r7.li1_bbox.x1)!;
     let r8d = rect("li1.drawing", y0=r7d.y0, y1=r7d.y1,
-                   x0=r8.li1_bbox.x0 + poly_p(), x1=r8.li1_bbox.x1)!;
+        x0=r8.li1_bbox.x0 + poly_p(), x1=r8.li1_bbox.x1)!;
     strips_up(r7, nf_rst, true, r7d);
     strips_up(r8, nf_rst, true, r8d);
     let clk_p7 = gate_tap(r7, nf_rst, r7.poly_bbox.y0, r7d.y1 + li_w() + 250., r7d.y1 + li_w());
@@ -770,11 +770,11 @@ cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_r
     eq(ntap2.sdm.y0, clk_p8.y1 + 300.);
     eq(ntap2.sdm.x0, r7.sdm.x0);
     let vdd2 = rect("li1.drawing", x0=ntap2.li1.x0, x1=ntap2.li1.x1,
-                    y0=ntap2.li1.y0, y1=ntap2.li1.y1)!;
+        y0=ntap2.li1.y0, y1=ntap2.li1.y1)!;
 
     // One nwell over both PMOS regions and the reset row.
     let nwell = rect("nwell.drawing", x0=ln.nwell.x0, x1=lp.nwell.x1,
-                     y0=ln.nwell.y0, y1=ntap2.sdm.y1 + nw_enc());
+        y0=ln.nwell.y0, y1=ntap2.sdm.y1 + nw_enc());
 
     // ---- cross-coupling ----
     // Two met2 tracks in the gate-lane band, one per output. They run in
@@ -784,11 +784,11 @@ cell strongarm(wn: Float, wp: Float, nf_tail: Int, nf_in: Int, nf_lat: Int, nf_r
     // Each track also has to reach under its reset device's met3 drop,
     // so its far end is the wider of the two demands.
     let outn = rect("met2.drawing", x1=lp.a_li_mid.x1,
-                    x0=std::min(ln.o_li_right.x0, r7d.x1 - pad_w()),
-                    y0=ln.a_li_mid.y0 - 65., y1=ln.a_li_mid.y1 + 65.)!;
+        x0=std::min(ln.o_li_right.x0, r7d.x1 - pad_w()),
+        y0=ln.a_li_mid.y0 - 65., y1=ln.a_li_mid.y1 + 65.)!;
     let outp = rect("met2.drawing", x0=ln.a_li_mid.x0,
-                    x1=std::max(lp.o_li_right.x1, r8d.x0 + pad_w()),
-                    y0=outn.y1 + m1_s(), y1=outn.y1 + m1_s() + 300.)!;
+        x1=std::max(lp.o_li_right.x1, r8d.x0 + pad_w()),
+        y0=outn.y1 + m1_s(), y1=outn.y1 + m1_s() + 300.)!;
 
     li_riser_m2(ln.o_li_right, outn, ln.o_li_right.x0 - 115., ln.o_li_right.x1 + 115.);
     li_riser_m2(lp.a_li_mid, outn, lp.a_li_mid.x1 - pad_w(), lp.a_li_mid.x1);
@@ -839,11 +839,11 @@ cell sampler(wn: Float, wp: Float, nfn: Int, nfp: Int, nfd: Int) {
 
     // Input lane below, sampling node above.
     let inl = rect("li1.drawing", y1=nmos.li1_bbox.y0 - li_w(), h=li_w(),
-                   x0=nmos.li1_bbox.x0, x1=pmos.li1_bbox.x1)!;
+        x0=nmos.li1_bbox.x0, x1=pmos.li1_bbox.x1)!;
     src_down(nmos, nfn, inl);
     src_down(pmos, nfp, inl);
     let outl = rect("li1.drawing", y0=nmos.li1_bbox.y1 + li_w(), h=li_w(),
-                    x0=dmy.li1_bbox.x0, x1=pmos.li1_bbox.x1)!;
+        x0=dmy.li1_bbox.x0, x1=pmos.li1_bbox.x1)!;
     strips_up(nmos, nfn, true, outl);
     strips_up(pmos, nfp, true, outl);
     // Both parities of the dummy land on the sampling node.
@@ -862,7 +862,7 @@ cell sampler(wn: Float, wp: Float, nfn: Int, nfp: Int, nfd: Int) {
     eq(ntap.sdm.y0, clksb.y1 + 300.);
     eq(ntap.sdm.x0, pmos.sdm.x0);
     let nwell = rect("nwell.drawing", x0=pmos.sdm.x0 - nw_enc(), x1=pmos.sdm.x1 + nw_enc(),
-                     y0=pmos.sdm.y0 - nw_enc(), y1=ntap.sdm.y1 + nw_enc());
+        y0=pmos.sdm.y0 - nw_enc(), y1=ntap.sdm.y1 + nw_enc());
 
     // Terminals.
     let in_pad = li_to_m3(inl, inl.x0, inl.x0 + pad_w())!;
@@ -950,11 +950,11 @@ cell sar_adc(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
     // closes the connection. The two runs share a y but never overlap in
     // x as long as the input pair is wider than the top-plate gap.
     let vipt = rect("met3.drawing", y0=cmp.vip_pad.y0, y1=cmp.vip_pad.y1,
-                    x0=std::min(hp.tp.x0, cmp.vip_pad.x0),
-                    x1=std::max(hp.tp.x1, cmp.vip_pad.x1))!;
+        x0=std::min(hp.tp.x0, cmp.vip_pad.x0),
+        x1=std::max(hp.tp.x1, cmp.vip_pad.x1))!;
     let vint = rect("met3.drawing", y0=cmp.vin_pad.y0, y1=cmp.vin_pad.y1,
-                    x0=std::min(hn.tp.x0, cmp.vin_pad.x0),
-                    x1=std::max(hn.tp.x1, cmp.vin_pad.x1))!;
+        x0=std::min(hn.tp.x0, cmp.vin_pad.x0),
+        x1=std::max(hn.tp.x1, cmp.vin_pad.x1))!;
     via3_array(vipt, hp.tp, v3_w() + v3_s());
     via3_array(vint, hn.tp, v3_w() + v3_s());
 
@@ -978,9 +978,9 @@ cell sar_adc(nbits: Int, na: Int, lf: Float, ytp: Float, yport: Float) {
     // reach from there out to a 4 um margin on each side.
     let chan = ((nbits - 5) as Float) * bus_p();
     let vss = rect("met3.drawing", x0=hp.u4.x0 - chan - 4000., x1=hn.u4.x1 + chan + 4000.,
-                   y0=yport + 6000., y1=yport + 7600.)!;
+        y0=yport + 6000., y1=yport + 7600.)!;
     let vdd = rect("met3.drawing", x0=vss.x0, x1=vss.x1,
-                   y0=vss.y1 + 2. * m3_s(), y1=vss.y1 + 2. * m3_s() + 1600.)!;
+        y0=vss.y1 + 2. * m3_s(), y1=vss.y1 + 2. * m3_s() + 1600.)!;
     tie_to_rail(cmp.ptap.li1, vss, cmp.ptap.li1.x0, cmp.ptap.li1.x0 + pad_w());
     tie_to_rail(cmp.vdd2, vdd, cmp.vdd2.x1 - pad_w(), cmp.vdd2.x1);
     tie_to_rail(sp.ptap.li1, vss, sp.ptap.li1.x0, sp.ptap.li1.x0 + pad_w());
@@ -1009,18 +1009,11 @@ fn analog_top() -> Float { -8000. }
 fn y_tp()       -> Float { -24000. }
 fn y_port()     -> Float { -45000. }
 
-cell cdac_half_top() {
-    let h = inst(cdac_half(nbits_spec(), cap_na(),
-                           cap_finger_len(cap_na(), cu_af(), c_lat_afnm()),
-                           y_tp(), y_port()),
-                 x=0., y=0.);
-}
-
 cell sar_adc_top() {
     let adc = inst(sar_adc(nbits_spec(), cap_na(),
-                           cap_finger_len(cap_na(), cu_af(), c_lat_afnm()),
-                           y_tp(), y_port()),
-                   x=0., y=0.);
+            cap_finger_len(cap_na(), cu_af(), c_lat_afnm()),
+            y_tp(), y_port()),
+        x=0., y=0.);
 }
 
 // =====================================================================
@@ -1030,13 +1023,13 @@ cell sar_adc_top() {
 // Each block is its own cell, so any of them can be opened on its own:
 //
 //   arc run --cell 'mom_unit(7, 1805.)' --gds
-//   arc run --cell 'cdac_half_top()' --gds
+//   arc run --cell 'cdac_row(16, 7, 1805.)' --gds
+//   arc run --cell 'cdac_pair(16, 7, 1805.)' --gds
+//   arc run --cell 'cdac_half(8, 7, 1805., -24000., -45000.)' --gds
+//   arc run --cell 'cmp_latch_half(1000., 1600., 2)' --gds
 //   arc run --cell 'strongarm(1000., 1600., 8, 4, 2, 2)' --gds
 //   arc run --cell 'sampler(1000., 1000., 8, 16, 4)' --gds
 //   arc run --cell 'sar_adc_top()' --gds
-//
-// `cdac_half` is wrapped because `--cell` takes only literal arguments,
-// and the two floorplan depths it needs are negative.
 //
 // The generator is parametric in resolution, tile shape, and unit
 // capacitance; 6 through 10 bits, `na` from 4 to 12, and a 2 fF unit all
