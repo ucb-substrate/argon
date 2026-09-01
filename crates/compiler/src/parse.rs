@@ -35,10 +35,8 @@ impl AstMetadata for ParseMetadata {
     type ForLoop = ();
     type IfExpr = ();
     type MatchExpr = ();
-    type BinOpExpr = ();
+    type BinaryExpr = ();
     type UnaryOpExpr = ();
-    type BoolOpExpr = ();
-    type ComparisonExpr = ();
     type FieldAccessExpr = ();
     type IndexFieldAccessExpr = ();
     type IndexExpr = ();

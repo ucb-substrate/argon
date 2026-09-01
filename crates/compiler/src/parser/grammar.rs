@@ -19,12 +19,12 @@ use std::str::FromStr;
 use cfgrammar::Span;
 
 use crate::ast::{
-    ArgDecl, Args, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, BoolOpExpr, CallExpr, CastExpr,
-    CellDecl, ComparisonExpr, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr,
-    FieldAccessExpr, FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr,
-    IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl,
-    NilLiteral, Scope, SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr,
-    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    ArgDecl, Args, ArithOp, Ast, BinaryExpr, BinaryOp, BoolLiteral, BoolOp, CallExpr, CastExpr,
+    CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr, FieldAccessExpr,
+    FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
+    IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
+    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
+    TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -45,35 +45,26 @@ const PREFIX_BP: u8 = 13;
 /// Recursion-depth guard for pathological nesting (real programs are shallow).
 const MAX_DEPTH: u32 = 256;
 
-/// An infix operator: which AST node family it builds (binary vs comparison)
-/// and the specific op. Carried alongside the binding power by `infix_op` so the
-/// operator set lives in exactly one place.
-enum InfixOp {
-    Bin(BinOp),
-    Cmp(ComparisonOp),
-    Bool(BoolOp),
-}
-
 /// The infix operator a token denotes plus its left/right binding power, or
 /// `None` if the token is not an infix operator. Single source of truth for the
 /// infix set: precedence and the AST op are defined together so they can't drift.
 #[inline]
-fn infix_op(k: TokenKind) -> Option<(InfixOp, u8, u8)> {
+fn infix_op(k: TokenKind) -> Option<(BinaryOp, u8, u8)> {
     use TokenKind::*;
     Some(match k {
-        PipePipe => (InfixOp::Bool(BoolOp::Or), 1, 2),
-        AmpAmp => (InfixOp::Bool(BoolOp::And), 3, 4),
-        EqEq => (InfixOp::Cmp(ComparisonOp::Eq), 5, 6),
-        Neq => (InfixOp::Cmp(ComparisonOp::Ne), 5, 6),
-        Geq => (InfixOp::Cmp(ComparisonOp::Geq), 5, 6),
-        Gt => (InfixOp::Cmp(ComparisonOp::Gt), 5, 6),
-        Leq => (InfixOp::Cmp(ComparisonOp::Leq), 5, 6),
-        Lt => (InfixOp::Cmp(ComparisonOp::Lt), 5, 6),
-        Plus => (InfixOp::Bin(BinOp::Add), 7, 8),
-        Minus => (InfixOp::Bin(BinOp::Sub), 7, 8),
-        Star => (InfixOp::Bin(BinOp::Mul), 9, 10),
-        Slash => (InfixOp::Bin(BinOp::Div), 9, 10),
-        Percent => (InfixOp::Bin(BinOp::Rem), 9, 10),
+        PipePipe => (BinaryOp::Bool(BoolOp::Or), 1, 2),
+        AmpAmp => (BinaryOp::Bool(BoolOp::And), 3, 4),
+        EqEq => (BinaryOp::Cmp(ComparisonOp::Eq), 5, 6),
+        Neq => (BinaryOp::Cmp(ComparisonOp::Ne), 5, 6),
+        Geq => (BinaryOp::Cmp(ComparisonOp::Geq), 5, 6),
+        Gt => (BinaryOp::Cmp(ComparisonOp::Gt), 5, 6),
+        Leq => (BinaryOp::Cmp(ComparisonOp::Leq), 5, 6),
+        Lt => (BinaryOp::Cmp(ComparisonOp::Lt), 5, 6),
+        Plus => (BinaryOp::Arith(ArithOp::Add), 7, 8),
+        Minus => (BinaryOp::Arith(ArithOp::Sub), 7, 8),
+        Star => (BinaryOp::Arith(ArithOp::Mul), 9, 10),
+        Slash => (BinaryOp::Arith(ArithOp::Div), 9, 10),
+        Percent => (BinaryOp::Arith(ArithOp::Rem), 9, 10),
         _ => return None,
     })
 }
@@ -893,35 +884,18 @@ impl<'a> Parser<'a> {
 
     fn make_infix(
         &self,
-        op: InfixOp,
+        op: BinaryOp,
         left: Expr<&'a str, Md>,
         right: Expr<&'a str, Md>,
         lhs_start: u32,
     ) -> Expr<&'a str, Md> {
-        let span = self.finish_span(lhs_start);
-        match op {
-            InfixOp::Bin(op) => Expr::BinOp(Box::new(BinOpExpr {
-                op,
-                left,
-                right,
-                span,
-                metadata: (),
-            })),
-            InfixOp::Cmp(op) => Expr::Comparison(Box::new(ComparisonExpr {
-                op,
-                left,
-                right,
-                span,
-                metadata: (),
-            })),
-            InfixOp::Bool(op) => Expr::BoolOp(Box::new(BoolOpExpr {
-                op,
-                left,
-                right,
-                span,
-                metadata: (),
-            })),
-        }
+        Expr::Binary(Box::new(BinaryExpr {
+            op,
+            left,
+            right,
+            span: self.finish_span(lhs_start),
+            metadata: (),
+        }))
     }
 
     /// Apply one suffix (`.field`, `.idx`, `[index]`, postfix `!`, `as ty`).

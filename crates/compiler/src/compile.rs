@@ -24,7 +24,7 @@ pub use result::{
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
+    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
@@ -35,8 +35,8 @@ use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
-        ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, BoolOp, BoolOpExpr, CallExpr,
-        CellDecl, ComparisonExpr, Decl, Expr, Ident, IfExpr, LetBinding, Statement,
+        ArgDecl, Ast, AstMetadata, AstTransformer, BinaryExpr, BinaryOp, BoolOp, CallExpr,
+        CellDecl, Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
     solver::{LinearExpr, Solver},
@@ -543,12 +543,12 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
     }
 
-    fn dispatch_bin_op_expr(
+    fn dispatch_binary_expr(
         &mut self,
-        _input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
+        _input: &BinaryExpr<Self::InputS, Self::InputMetadata>,
         _left: &Expr<Self::OutputS, Self::OutputMetadata>,
         _right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
+    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr {
     }
 
     fn dispatch_unary_op_expr(
@@ -556,22 +556,6 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &crate::ast::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         _operand: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
-    }
-
-    fn dispatch_bool_op_expr(
-        &mut self,
-        _input: &BoolOpExpr<Self::InputS, Self::InputMetadata>,
-        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr {
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        _input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
     }
 
     fn dispatch_cast(
@@ -1140,10 +1124,8 @@ impl AstMetadata for VarIdTyMetadata {
     type FnDecl = (PathBuf, VarId);
     type IfExpr = Ty;
     type MatchExpr = Ty;
-    type BinOpExpr = Ty;
+    type BinaryExpr = Ty;
     type UnaryOpExpr = Ty;
-    type BoolOpExpr = Ty;
-    type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
     type IndexFieldAccessExpr = Ty;
     type IndexExpr = Ty;
@@ -1418,6 +1400,141 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
+    /// `+ - * / %`: operands must agree and be numeric, and the result is the
+    /// operand type -- so this rule is the reason the families cannot share one
+    /// result type with the two `Bool`-valued ones.
+    fn check_arith(
+        &mut self,
+        span: cfgrammar::Span,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        let left_ty = left.ty();
+        let right_ty = right.ty();
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::BinOpMismatchedTypes,
+            });
+        }
+        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
+            self.errors.push(StaticError {
+                span: self.span(left.span()),
+                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
+            });
+        }
+        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(right.span()),
+                kind: StaticErrorKind::BinOpInvalidType(right_ty),
+            });
+        }
+        left_ty
+    }
+
+    /// `&& ||`: two `Bool` operands, `Bool` result.
+    ///
+    /// The result is `Bool` regardless of the operands, so one bad operand does
+    /// not cascade into every expression built on top of it.
+    fn check_bool_connective(
+        &mut self,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        for operand in [left, right] {
+            if !VarIdTyPass::is_bool_operand(&operand.ty()) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::BoolOpInvalidType,
+                });
+            }
+        }
+        Ty::Bool
+    }
+
+    /// `== != >= > <= <`: operands must agree and be an orderable or equatable
+    /// type, and the result is `Bool`.
+    fn check_comparison(
+        &mut self,
+        op: ComparisonOp,
+        span: cfgrammar::Span,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        let left_ty = left.ty();
+        let right_ty = right.ty();
+        // A mismatch here is already reported as `ComparisonMismatchedTypes`
+        // below, so an absent LUB only needs to not be `Ty::Seq`.
+        let lub_ty = left_ty.lub(&right_ty).unwrap_or(Ty::Unknown);
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::ComparisonMismatchedTypes,
+            });
+        }
+        if left_ty == Ty::Float && (op == ComparisonOp::Eq || op == ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::FloatEquality,
+            });
+        }
+        if matches!(left_ty, Ty::Enum(_)) && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::EnumsNotOrd,
+            });
+        }
+        if left_ty == Ty::Bool && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::BoolNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::Nil)
+            && matches!(right_ty, Ty::Nil)
+            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::NilNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::SeqNil)
+            && matches!(right_ty, Ty::SeqNil)
+            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::SeqNilNotOrd,
+            });
+        }
+        // A sequence may only be compared for equality/inequality against `[]`:
+        // the evaluator has no arm for two populated sequences, and none for
+        // ordering a sequence at all.
+        if matches!(lub_ty, Ty::Seq(_))
+            && !((op == ComparisonOp::Eq || op == ComparisonOp::Ne)
+                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+            });
+        }
+        for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
+            if !matches!(
+                ty,
+                Ty::Float | Ty::Int | Ty::Bool | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+            ) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::ComparisonInvalidType,
+                });
+            }
+        }
+
+        Ty::Bool
+    }
+
     /// Whether `ty` may be an operand of `&&`, `||`, or `!`.
     ///
     /// `Any` is accepted and re-checked by the evaluator, as it is for every
@@ -1608,9 +1725,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
-            Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
-            Expr::BoolOp(bool_op_expr) => bool_op_expr.metadata.clone(),
-            Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
+            Expr::Binary(binary_expr) => binary_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
@@ -1994,33 +2109,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         lub_ty.unwrap_or_default()
     }
 
-    fn dispatch_bin_op_expr(
+    /// One tree walk, three rules: the families share the node shape but agree
+    /// on nothing after that, so each keeps its own result type and operand
+    /// check (see [`BinaryOp`]).
+    fn dispatch_binary_expr(
         &mut self,
-        input: &BinOpExpr<Substr, Self::InputMetadata>,
+        input: &BinaryExpr<Substr, Self::InputMetadata>,
         left: &Expr<Substr, Self::OutputMetadata>,
         right: &Expr<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
-            });
+    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr {
+        match input.op {
+            BinaryOp::Arith(_) => self.check_arith(input.span, left, right),
+            BinaryOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
+            BinaryOp::Bool(_) => self.check_bool_connective(left, right),
         }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
-            self.errors.push(StaticError {
-                span: self.span(left.span()),
-                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
-            });
-        }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(right.span()),
-                kind: StaticErrorKind::BinOpInvalidType(right_ty),
-            });
-        }
-        left_ty
     }
 
     fn dispatch_unary_op_expr(
@@ -2050,109 +2152,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 operand_ty
             }
         }
-    }
-
-    /// `&&` and `||` take two `Bool` operands and produce a `Bool`.
-    ///
-    /// The result type is `Bool` regardless of the operands, so one bad operand
-    /// does not cascade into every expression built on top of it.
-    fn dispatch_bool_op_expr(
-        &mut self,
-        _input: &BoolOpExpr<Substr, Self::InputMetadata>,
-        left: &Expr<Substr, Self::OutputMetadata>,
-        right: &Expr<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr {
-        for operand in [left, right] {
-            if !VarIdTyPass::is_bool_operand(&operand.ty()) {
-                self.errors.push(StaticError {
-                    span: self.span(operand.span()),
-                    kind: StaticErrorKind::BoolOpInvalidType,
-                });
-            }
-        }
-        Ty::Bool
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        input: &ComparisonExpr<Substr, Self::InputMetadata>,
-        left: &Expr<Substr, Self::OutputMetadata>,
-        right: &Expr<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        // A mismatch here is already reported as `ComparisonMismatchedTypes`
-        // below, so an absent LUB only needs to not be `Ty::Seq`.
-        let lub_ty = left_ty.lub(&right_ty).unwrap_or(Ty::Unknown);
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::ComparisonMismatchedTypes,
-            });
-        }
-        if left_ty == Ty::Float && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::FloatEquality,
-            });
-        }
-        if matches!(left_ty, Ty::Enum(_))
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::EnumsNotOrd,
-            });
-        }
-        if left_ty == Ty::Bool && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BoolNotOrd,
-            });
-        }
-        if matches!(left_ty, Ty::Nil)
-            && matches!(right_ty, Ty::Nil)
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::NilNotOrd,
-            });
-        }
-        if matches!(left_ty, Ty::SeqNil)
-            && matches!(right_ty, Ty::SeqNil)
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::SeqNilNotOrd,
-            });
-        }
-        // A sequence may only be compared for equality/inequality against `[]`:
-        // the evaluator has no arm for two populated sequences, and none for
-        // ordering a sequence at all.
-        if matches!(lub_ty, Ty::Seq(_))
-            && !((input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
-                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
-            });
-        }
-        for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
-            if !matches!(
-                ty,
-                Ty::Float | Ty::Int | Ty::Bool | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
-            ) {
-                self.errors.push(StaticError {
-                    span: self.span(operand.span()),
-                    kind: StaticErrorKind::ComparisonInvalidType,
-                });
-            }
-        }
-
-        Ty::Bool
     }
 
     fn dispatch_field_access_expr(
@@ -4743,28 +4742,6 @@ impl<'a> ExecPass<'a> {
                     state: MatchExprState::Scrutinee(scrutinee),
                 }))
             }),
-            // `&&` and `||` short-circuit, so only the left operand is visited
-            // here. The right operand is an arbitrary expression that may
-            // create constraints, instantiate cells, or emit geometry, so it
-            // must not be evaluated when the left operand already decides the
-            // result -- the same reason `if` defers its branches.
-            Expr::BoolOp(b) => {
-                let left = self.visit_expr(loc, &b.left);
-                self.new_deferred_value(loc, |_| {
-                    PartialEvalState::BoolOp(Box::new(PartialBoolOpExpr {
-                        expr: (**b).clone(),
-                        state: BoolOpState::Left(left),
-                    }))
-                })
-            }
-            Expr::Comparison(comparison_expr) => self.new_deferred_value(loc, |this| {
-                let left = this.visit_expr(loc, &comparison_expr.left);
-                let right = this.visit_expr(loc, &comparison_expr.right);
-                PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
-                    expr: (**comparison_expr).clone(),
-                    state: ComparisonExprState { left, right },
-                }))
-            }),
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
@@ -4795,16 +4772,48 @@ impl<'a> ExecPass<'a> {
                     state: IndexExprState { base, index },
                 }))
             }),
-            Expr::BinOp(b) => self.new_deferred_value(loc, |this| {
-                let lhs = this.visit_expr(loc, &b.left);
-                let rhs = this.visit_expr(loc, &b.right);
-                PartialEvalState::BinOp(PartialBinOp {
-                    lhs,
-                    rhs,
-                    op: b.op,
-                    expr: b.clone(),
-                })
-            }),
+            // The one place evaluation strategy is chosen. The op family
+            // decides it here, so each partial state below carries only the
+            // narrow op it can actually act on and no state can hold an
+            // operator its arm cannot evaluate.
+            Expr::Binary(b) => match b.op {
+                BinaryOp::Arith(op) => self.new_deferred_value(loc, |this| {
+                    let left = this.visit_expr(loc, &b.left);
+                    let right = this.visit_expr(loc, &b.right);
+                    PartialEvalState::Arith(PartialArith {
+                        left,
+                        right,
+                        op,
+                        expr: b.clone(),
+                    })
+                }),
+                BinaryOp::Cmp(op) => self.new_deferred_value(loc, |this| {
+                    let left = this.visit_expr(loc, &b.left);
+                    let right = this.visit_expr(loc, &b.right);
+                    PartialEvalState::Comparison(Box::new(PartialComparison {
+                        op,
+                        expr: (**b).clone(),
+                        left,
+                        right,
+                    }))
+                }),
+                // `&&` and `||` short-circuit, so only the left operand is
+                // visited here. The right operand is an arbitrary expression
+                // that may create constraints, instantiate cells, or emit
+                // geometry, so it must not be evaluated when the left operand
+                // already decides the result -- the same reason `if` defers its
+                // branches.
+                BinaryOp::Bool(op) => {
+                    let left = self.visit_expr(loc, &b.left);
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::BoolOp(Box::new(PartialBoolOp {
+                            op,
+                            expr: (**b).clone(),
+                            state: BoolOpState::Left(left),
+                        }))
+                    })
+                }
+            },
             Expr::UnaryOp(u) => self.new_deferred_value(loc, |this| {
                 let operand = this.visit_expr(loc, &u.operand);
                 PartialEvalState::UnaryOp(PartialUnaryOp {
@@ -6020,16 +6029,16 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
-            PartialEvalState::BinOp(bin_op) => {
+            PartialEvalState::Arith(arith) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
-                    (&self.values[&bin_op.lhs], &self.values[&bin_op.rhs])
+                    (&self.values[&arith.left], &self.values[&arith.right])
                 {
                     match (vl, vr) {
                         (Value::Linear(vl), Value::Linear(vr)) => {
-                            let res = match bin_op.op {
-                                BinOp::Add => Some(vl.clone() + vr.clone()),
-                                BinOp::Sub => Some(vl.clone() - vr.clone()),
-                                BinOp::Mul => {
+                            let res = match arith.op {
+                                ArithOp::Add => Some(vl.clone() + vr.clone()),
+                                ArithOp::Sub => Some(vl.clone() - vr.clone()),
+                                ArithOp::Mul => {
                                     let res = match (
                                         state.solver.eval_expr_exact(vl),
                                         state.solver.eval_expr_exact(vr),
@@ -6048,7 +6057,7 @@ impl<'a> ExecPass<'a> {
                                     }
                                     res
                                 }
-                                BinOp::Div => {
+                                ArithOp::Div => {
                                     let res = state
                                         .solver
                                         .eval_expr_exact(vr)
@@ -6061,7 +6070,7 @@ impl<'a> ExecPass<'a> {
                                     res
                                 }
                                 _ => {
-                                    let span = self.span(&vref.loc, bin_op.expr.span);
+                                    let span = self.span(&vref.loc, arith.expr.span);
                                     self.errors.push(ExecError {
                                         span: Some(span.clone()),
                                         cell: cell_id,
@@ -6078,7 +6087,7 @@ impl<'a> ExecPass<'a> {
                                 // to `i32::MAX` in GDS, and turns `as Int` into
                                 // `i64::MAX`.
                                 if !res.is_finite() {
-                                    let span = self.span(&vref.loc, bin_op.expr.span);
+                                    let span = self.span(&vref.loc, arith.expr.span);
                                     self.errors.push(ExecError {
                                         span: Some(span),
                                         cell: cell_id,
@@ -6099,14 +6108,14 @@ impl<'a> ExecPass<'a> {
                             // but wrap silently in release -- so the same
                             // source would compute two different answers
                             // depending on how the compiler was built.
-                            if matches!(bin_op.op, BinOp::Div | BinOp::Rem) && *vr == 0 {
-                                let span = self.span(&vref.loc, bin_op.expr.span);
+                            if matches!(arith.op, ArithOp::Div | ArithOp::Rem) && *vr == 0 {
+                                let span = self.span(&vref.loc, arith.expr.span);
                                 self.errors.push(ExecError {
                                     span: Some(span),
                                     cell: cell_id,
                                     kind: ExecErrorKind::DivideByZero(
-                                        match bin_op.op {
-                                            BinOp::Div => "division",
+                                        match arith.op {
+                                            ArithOp::Div => "division",
                                             _ => "remainder",
                                         }
                                         .to_owned(),
@@ -6114,25 +6123,25 @@ impl<'a> ExecPass<'a> {
                                 });
                                 return Err(());
                             }
-                            let res = match bin_op.op {
-                                BinOp::Add => vl.checked_add(*vr),
-                                BinOp::Sub => vl.checked_sub(*vr),
-                                BinOp::Mul => vl.checked_mul(*vr),
-                                BinOp::Div => vl.checked_div(*vr),
-                                BinOp::Rem => vl.checked_rem(*vr),
+                            let res = match arith.op {
+                                ArithOp::Add => vl.checked_add(*vr),
+                                ArithOp::Sub => vl.checked_sub(*vr),
+                                ArithOp::Mul => vl.checked_mul(*vr),
+                                ArithOp::Div => vl.checked_div(*vr),
+                                ArithOp::Rem => vl.checked_rem(*vr),
                             };
                             let Some(res) = res else {
-                                let span = self.span(&vref.loc, bin_op.expr.span);
+                                let span = self.span(&vref.loc, arith.expr.span);
                                 self.errors.push(ExecError {
                                     span: Some(span),
                                     cell: cell_id,
                                     kind: ExecErrorKind::IntegerOverflow(
-                                        match bin_op.op {
-                                            BinOp::Add => "+",
-                                            BinOp::Sub => "-",
-                                            BinOp::Mul => "*",
-                                            BinOp::Div => "/",
-                                            BinOp::Rem => "%",
+                                        match arith.op {
+                                            ArithOp::Add => "+",
+                                            ArithOp::Sub => "-",
+                                            ArithOp::Mul => "*",
+                                            ArithOp::Div => "/",
+                                            ArithOp::Rem => "%",
                                         }
                                         .to_owned(),
                                     ),
@@ -6143,7 +6152,7 @@ impl<'a> ExecPass<'a> {
                             true
                         }
                         _ => {
-                            let span = self.span(&vref.loc, bin_op.expr.span);
+                            let span = self.span(&vref.loc, arith.expr.span);
                             self.errors.push(ExecError {
                                 span: Some(span.clone()),
                                 cell: cell_id,
@@ -6153,8 +6162,8 @@ impl<'a> ExecPass<'a> {
                         }
                     }
                 } else {
-                    self.add_value_dependent(bin_op.lhs, vid);
-                    self.add_value_dependent(bin_op.rhs, vid);
+                    self.add_value_dependent(arith.left, vid);
+                    self.add_value_dependent(arith.right, vid);
                     false
                 }
             }
@@ -6347,7 +6356,7 @@ impl<'a> ExecPass<'a> {
                             self.invalid_type(cell_id, &span);
                             return Err(());
                         };
-                        let decided = match bool_op.expr.op {
+                        let decided = match bool_op.op {
                             BoolOp::And => !left_val,
                             BoolOp::Or => left_val,
                         };
@@ -6387,28 +6396,27 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
-            PartialEvalState::Comparison(comparison_expr) => {
-                if let (Defer::Ready(vl), Defer::Ready(vr)) = (
-                    &self.values[&comparison_expr.state.left],
-                    &self.values[&comparison_expr.state.right],
-                ) {
+            PartialEvalState::Comparison(cmp) => {
+                if let (Defer::Ready(vl), Defer::Ready(vr)) =
+                    (&self.values[&cmp.left], &self.values[&cmp.right])
+                {
                     // `Ty::Any` satisfies the static comparison checks, so an
                     // operand pair or an operator that those checks would have
                     // rejected can still arrive here. Every combination the
                     // evaluator has no answer for is an `InvalidType`
                     // diagnostic rather than an `unreachable!`.
-                    let op = comparison_expr.expr.op;
+                    let op = cmp.op;
                     let ordered = |ord: std::cmp::Ordering| match op {
-                        crate::ast::ComparisonOp::Eq => Some(ord.is_eq()),
-                        crate::ast::ComparisonOp::Ne => Some(ord.is_ne()),
-                        crate::ast::ComparisonOp::Geq => Some(ord.is_ge()),
-                        crate::ast::ComparisonOp::Gt => Some(ord.is_gt()),
-                        crate::ast::ComparisonOp::Leq => Some(ord.is_le()),
-                        crate::ast::ComparisonOp::Lt => Some(ord.is_lt()),
+                        ComparisonOp::Eq => Some(ord.is_eq()),
+                        ComparisonOp::Ne => Some(ord.is_ne()),
+                        ComparisonOp::Geq => Some(ord.is_ge()),
+                        ComparisonOp::Gt => Some(ord.is_gt()),
+                        ComparisonOp::Leq => Some(ord.is_le()),
+                        ComparisonOp::Lt => Some(ord.is_lt()),
                     };
                     let equality = |eq: bool| match op {
-                        crate::ast::ComparisonOp::Eq => Some(eq),
-                        crate::ast::ComparisonOp::Ne => Some(!eq),
+                        ComparisonOp::Eq => Some(eq),
+                        ComparisonOp::Ne => Some(!eq),
                         // Only equality is defined for these operand types.
                         _ => None,
                     };
@@ -6428,7 +6436,7 @@ impl<'a> ExecPass<'a> {
                                 // Float equality is meaningless against a
                                 // solved value, and is rejected statically
                                 // whenever the type is known.
-                                crate::ast::ComparisonOp::Eq | crate::ast::ComparisonOp::Ne => None,
+                                ComparisonOp::Eq | ComparisonOp::Ne => None,
                                 _ => el.partial_cmp(&er).and_then(ordered),
                             }
                         }
@@ -6443,15 +6451,15 @@ impl<'a> ExecPass<'a> {
                         _ => None,
                     };
                     let Some(res) = res else {
-                        let span = self.span(&vref.loc, comparison_expr.expr.span);
+                        let span = self.span(&vref.loc, cmp.expr.span);
                         self.invalid_type(cell_id, &span);
                         return Err(());
                     };
                     self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                     true
                 } else {
-                    self.add_value_dependent(comparison_expr.state.left, vid);
-                    self.add_value_dependent(comparison_expr.state.right, vid);
+                    self.add_value_dependent(cmp.left, vid);
+                    self.add_value_dependent(cmp.right, vid);
                     false
                 }
             }
@@ -7567,9 +7575,9 @@ struct PartialEval<T: AstMetadata> {
 enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
     Match(Box<PartialMatchExpr<T>>),
-    Comparison(Box<PartialComparisonExpr<T>>),
-    BoolOp(Box<PartialBoolOpExpr<T>>),
-    BinOp(PartialBinOp<T>),
+    Arith(PartialArith<T>),
+    Comparison(Box<PartialComparison<T>>),
+    BoolOp(Box<PartialBoolOp<T>>),
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
@@ -7598,11 +7606,11 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBinOp<T: AstMetadata> {
-    lhs: ValueId,
-    rhs: ValueId,
-    op: BinOp,
-    expr: Box<BinOpExpr<Substr, T>>,
+struct PartialArith<T: AstMetadata> {
+    left: ValueId,
+    right: ValueId,
+    op: ArithOp,
+    expr: Box<BinaryExpr<Substr, T>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7650,8 +7658,9 @@ pub struct CallExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBoolOpExpr<T: AstMetadata> {
-    expr: BoolOpExpr<Substr, T>,
+struct PartialBoolOp<T: AstMetadata> {
+    op: BoolOp,
+    expr: BinaryExpr<Substr, T>,
     state: BoolOpState,
 }
 
@@ -7665,13 +7674,9 @@ pub enum BoolOpState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialComparisonExpr<T: AstMetadata> {
-    expr: ComparisonExpr<Substr, T>,
-    state: ComparisonExprState,
-}
-
-#[derive(Debug, Clone)]
-pub struct ComparisonExprState {
+struct PartialComparison<T: AstMetadata> {
+    op: ComparisonOp,
+    expr: BinaryExpr<Substr, T>,
     left: ValueId,
     right: ValueId,
 }

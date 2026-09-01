@@ -194,12 +194,12 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
-    fn dispatch_bin_op_expr(
+    fn dispatch_binary_expr(
         &mut self,
-        input: &super::BinOpExpr<Self::InputS, Self::InputMetadata>,
+        input: &super::BinaryExpr<Self::InputS, Self::InputMetadata>,
         _left: &super::Expr<Self::OutputS, Self::OutputMetadata>,
         _right: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
+    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr {
         input.metadata.clone()
     }
 
@@ -208,24 +208,6 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         _operand: &super::Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
-        input.metadata.clone()
-    }
-
-    fn dispatch_bool_op_expr(
-        &mut self,
-        input: &super::BoolOpExpr<Self::InputS, Self::InputMetadata>,
-        _left: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr {
-        input.metadata.clone()
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        input: &super::ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        _left: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
         input.metadata.clone()
     }
 

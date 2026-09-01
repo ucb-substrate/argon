@@ -436,7 +436,7 @@ fn parse_expr(&mut self, min_bp: u8) -> Expr {
             lhs = self.parse_suffix(lhs, lhs_start);
             continue;
         }
-        // infix binary / comparison / boolean
+        // infix: arithmetic / comparison / boolean
         if let Some((op, l_bp, r_bp)) = infix_op(k) {
             if l_bp < min_bp { break; }
             self.bump();
@@ -456,8 +456,8 @@ point. A top-level call passes `min_bp == 0` (anything binds).
 ### 9.1 Binding powers
 
 `infix_op(kind)` is the single source of truth for the infix operator set: it
-returns `(InfixOp, left_bp, right_bp)` or `None`. The `InfixOp` carries the AST
-operator identity (`Bin(BinOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`)
+returns `(BinaryOp, left_bp, right_bp)` or `None`. `BinaryOp` is the AST's own
+operator enum (`Arith(ArithOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`), carried
 alongside its precedence, so the two cannot drift apart.
 
 | Operators                         | (left, right) | Notes |
@@ -471,11 +471,15 @@ alongside its precedence, so the two cannot drift apart.
 | prefix unary operand `! -`        | `PREFIX_BP = 13` | see §9.4 |
 
 The boolean connectives sit below the comparisons so `a < b && c < d` reads as
-`(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust. Unlike
-the other infix operators they **short-circuit**: `&&` and `||` build a
-`BoolOpExpr`, whose right operand the evaluator visits only when the left one
-does not decide the result. Since an Argon expression can emit geometry and add
-constraints, that determines what gets built, not just how fast it runs.
+`(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust.
+
+All three families build the same node, `BinaryExpr`, so they share every tree
+walk; the `BinaryOp` variant is what the type checker and the evaluator match on
+afterwards, where they agree on nothing. Unlike the other infix operators, a
+`BinaryOp::Bool` **short-circuits**: the evaluator visits its right operand only
+when the left one does not decide the result. Since an Argon expression can emit
+geometry and add constraints, that determines what gets built, not just how fast
+it runs.
 
 Because each operator's right binding power is one greater than its left, all
 binary operators are **left-associative**: `a - b - c` parses as `(a - b) - c`

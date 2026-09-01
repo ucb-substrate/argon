@@ -45,8 +45,8 @@ pub enum StaticErrorKind {
     /// Match arms must be comprehensive.
     #[error("match arms must be comprehensive")]
     MatchArmsNotComprehensive,
-    /// The operands in a binary expression must have the same type.
-    #[error("operands of binary expression must have the same type")]
+    /// The operands in an arithmetic expression must have the same type.
+    #[error("operands of an arithmetic expression must have the same type")]
     BinOpMismatchedTypes,
     /// The operands in a comparison must have the same type.
     #[error("operands of a comparison must have the same type")]
@@ -69,8 +69,8 @@ pub enum StaticErrorKind {
     /// Sequences may only be compared with an empty sequence for equality.
     #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
     SeqMustCompareEqSeqNil,
-    /// A type cannot be used in a binary expression.
-    #[error("type cannot be used in a binary expression: {0:?}")]
+    /// A type cannot be used in an arithmetic expression.
+    #[error("type cannot be used in an arithmetic expression: {0:?}")]
     BinOpInvalidType(Ty),
     /// A type cannot be used in a unary operation.
     #[error("type cannot be used in a unary operation")]

@@ -165,33 +165,23 @@ mod tests {
     fn shape<S: std::fmt::Display, T: crate::ast::AstMetadata>(
         expr: &crate::ast::Expr<S, T>,
     ) -> String {
-        use crate::ast::{BinOp, BoolOp, ComparisonOp, Expr, UnaryOp};
+        use crate::ast::{ArithOp, BinaryOp, BoolOp, ComparisonOp, Expr, UnaryOp};
         match expr {
-            Expr::BoolOp(e) => {
+            Expr::Binary(e) => {
                 let op = match e.op {
-                    BoolOp::And => "&&",
-                    BoolOp::Or => "||",
-                };
-                format!("({} {op} {})", shape(&e.left), shape(&e.right))
-            }
-            Expr::Comparison(e) => {
-                let op = match e.op {
-                    ComparisonOp::Eq => "==",
-                    ComparisonOp::Ne => "!=",
-                    ComparisonOp::Geq => ">=",
-                    ComparisonOp::Gt => ">",
-                    ComparisonOp::Leq => "<=",
-                    ComparisonOp::Lt => "<",
-                };
-                format!("({} {op} {})", shape(&e.left), shape(&e.right))
-            }
-            Expr::BinOp(e) => {
-                let op = match e.op {
-                    BinOp::Add => "+",
-                    BinOp::Sub => "-",
-                    BinOp::Mul => "*",
-                    BinOp::Div => "/",
-                    BinOp::Rem => "%",
+                    BinaryOp::Bool(BoolOp::Or) => "||",
+                    BinaryOp::Bool(BoolOp::And) => "&&",
+                    BinaryOp::Cmp(ComparisonOp::Eq) => "==",
+                    BinaryOp::Cmp(ComparisonOp::Ne) => "!=",
+                    BinaryOp::Cmp(ComparisonOp::Geq) => ">=",
+                    BinaryOp::Cmp(ComparisonOp::Gt) => ">",
+                    BinaryOp::Cmp(ComparisonOp::Leq) => "<=",
+                    BinaryOp::Cmp(ComparisonOp::Lt) => "<",
+                    BinaryOp::Arith(ArithOp::Add) => "+",
+                    BinaryOp::Arith(ArithOp::Sub) => "-",
+                    BinaryOp::Arith(ArithOp::Mul) => "*",
+                    BinaryOp::Arith(ArithOp::Div) => "/",
+                    BinaryOp::Arith(ArithOp::Rem) => "%",
                 };
                 format!("({} {op} {})", shape(&e.left), shape(&e.right))
             }
