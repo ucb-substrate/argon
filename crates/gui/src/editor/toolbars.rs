@@ -349,31 +349,6 @@ fn sidebar_scroll_frame(
         )
 }
 
-fn sidebar_scroll_area(
-    id: &'static str,
-    content: Div,
-    scroll_handle: &ScrollHandle,
-    scroll_state: &Entity<SidebarScrollState>,
-    owner: EntityId,
-    theme: &'static Theme,
-) -> Stateful<Div> {
-    sidebar_scroll_frame(
-        id,
-        content
-            .id(SharedString::from(format!("{id}_content")))
-            .size_full()
-            .min_h_0()
-            .min_w_0()
-            .overflow_scroll()
-            .scrollbar_width(px(SIDEBAR_SCROLLBAR_WIDTH))
-            .track_scroll(scroll_handle),
-        scroll_handle,
-        scroll_state,
-        owner,
-        theme,
-    )
-}
-
 pub struct TitleBar {
     state: Entity<EditorState>,
 }
@@ -393,6 +368,26 @@ fn workspace_title(path: Option<&Path>) -> String {
     )
 }
 
+fn workspace_title_contents(path: Option<&Path>, modified: bool) -> Div {
+    let mut contents = div().flex().min_w_0().max_w_full().items_center().child(
+        div()
+            .min_w_0()
+            .overflow_hidden()
+            .text_ellipsis()
+            .child(workspace_title(path)),
+    );
+    if modified {
+        contents = contents.child(
+            div()
+                .debug_selector(|| "workspace_modified_indicator".to_owned())
+                .ml_1()
+                .flex_none()
+                .child("[+]"),
+        );
+    }
+    contents
+}
+
 impl Render for TitleBar {
     fn render(
         &mut self,
@@ -401,12 +396,6 @@ impl Render for TitleBar {
     ) -> impl gpui::IntoElement {
         let state = self.state.read(cx);
         let theme = state.theme();
-        let mut centered_title = div()
-            .relative()
-            .child(workspace_title(state.workspace_path.as_deref()));
-        if state.workspace_modified {
-            centered_title = centered_title.child(div().absolute().left_full().ml_1().child("[+]"));
-        }
         div()
             .border_color(theme.divider)
             .window_control_area(WindowControlArea::Drag)
@@ -417,15 +406,37 @@ impl Render for TitleBar {
             .justify_center()
             .overflow_hidden()
             .whitespace_nowrap()
-            .child(centered_title)
+            .child(workspace_title_contents(
+                state.workspace_path.as_deref(),
+                state.workspace_modified,
+            ))
     }
 }
 
 #[cfg(test)]
 mod title_bar_tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::workspace_title;
+    use gpui::{Context, Render, TestAppContext, Window, div, prelude::*, px};
+
+    use super::{workspace_title, workspace_title_contents};
+
+    struct TitleBarPreview {
+        path: PathBuf,
+    }
+
+    impl Render for TitleBarPreview {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .debug_selector(|| "title_bar".to_owned())
+                .w(px(180.))
+                .overflow_hidden()
+                .flex()
+                .justify_center()
+                .whitespace_nowrap()
+                .child(workspace_title_contents(Some(&self.path), true))
+        }
+    }
 
     #[test]
     fn title_shows_workspace() {
@@ -435,6 +446,18 @@ mod title_bar_tests {
             "Argon — /projects/inverter"
         );
         assert_eq!(workspace_title(None), "Argon");
+    }
+
+    #[gpui::test]
+    fn modified_indicator_stays_inside_a_narrow_title_bar(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| TitleBarPreview {
+            path: PathBuf::from("/projects/a-workspace-name-that-is-much-wider-than-the-title-bar"),
+        });
+
+        let title_bar = cx.debug_bounds("title_bar").unwrap();
+        let indicator = cx.debug_bounds("workspace_modified_indicator").unwrap();
+        assert!(indicator.left() >= title_bar.left());
+        assert!(indicator.right() <= title_bar.right());
     }
 }
 
@@ -825,6 +848,7 @@ pub struct LayerSideBar {
     name_filter: Entity<TextInput>,
     state: Entity<LayerSideBarState>,
     scroll_handle: ScrollHandle,
+    list_scroll_handle: UniformListScrollHandle,
     scroll_state: Entity<SidebarScrollState>,
     editor_state: Entity<EditorState>,
     // Retained to keep the sidebar's observations active.
@@ -842,6 +866,8 @@ impl LayerSideBar {
             cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
         let state = cx.new(|_cx| LayerSideBarState::default());
         let scroll_state = cx.new(|_cx| SidebarScrollState::default());
+        let list_scroll_handle = UniformListScrollHandle::new();
+        let scroll_handle = list_scroll_handle.0.borrow().base_handle.clone();
         let subscriptions = vec![
             cx.observe(&layers, |_, _, cx| cx.notify()),
             cx.observe(&name_filter, |_, _, cx| cx.notify()),
@@ -850,7 +876,8 @@ impl LayerSideBar {
             layers,
             name_filter,
             state,
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle,
+            list_scroll_handle,
             scroll_state,
             editor_state: editor_state.clone(),
             _subscriptions: subscriptions,
@@ -864,7 +891,25 @@ impl Render for LayerSideBar {
         _window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
-        let layers = self.layers.read(cx);
+        let filter = self.name_filter.read(cx).content.to_lowercase();
+        let used_filter = self.state.read(cx).used_filter;
+        let (layer_rows, selected_layer) = {
+            let layers = self.layers.read(cx);
+            (
+                Arc::new(
+                    layers
+                        .layers
+                        .values()
+                        .filter(|layer| {
+                            layer.name.to_lowercase().contains(&filter)
+                                && (!used_filter || layer.used)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                ),
+                layers.selected_layer.clone(),
+            )
+        };
         let editor_state = self.editor_state.read(cx);
         let theme = editor_state.theme();
         let width = self.state.read(cx).width;
@@ -879,6 +924,107 @@ impl Render for LayerSideBar {
                 .items_center()
                 .child(div().flex_1())
         };
+        let widest_row = layer_rows
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, layer)| layer.name.chars().count())
+            .map(|(index, _)| index);
+        let row_count = layer_rows.len();
+        let rows_for_render = layer_rows.clone();
+        let layers_for_render = self.layers.clone();
+        let layer_list = uniform_list(
+            "layer_rows",
+            row_count,
+            cx.processor(
+                move |_sidebar, range: std::ops::Range<usize>, _window, _cx| {
+                    let icon_div = || {
+                        div()
+                            .w(px(icon_wh + 8.))
+                            .h(px(icon_wh + 8.))
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .child(div().flex_1())
+                    };
+                    range
+                        .filter_map(|index| rows_for_render.get(index))
+                        .map(|layer| {
+                            div()
+                                .flex()
+                                .min_w_full()
+                                .flex_shrink_0()
+                                .bg(if Some(&layer.name) == selected_layer.as_ref() {
+                                    theme.selection
+                                } else {
+                                    theme.sidebar
+                                })
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("layer_select_{}", layer.z)))
+                                        .flex_grow()
+                                        .flex_shrink_0()
+                                        .child(layer.name.clone())
+                                        .on_click({
+                                            let layers = layers_for_render.clone();
+                                            let name = layer.name.clone();
+                                            move |_event, _window, cx| {
+                                                layers.update(cx, |state, cx| {
+                                                    state.selected_layer = Some(name.clone());
+                                                    cx.notify();
+                                                })
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    icon_div()
+                                        .child(
+                                            svg()
+                                                .path(if layer.visible {
+                                                    "icons/eye-solid-full.svg"
+                                                } else {
+                                                    "icons/eye-slash-solid-full.svg"
+                                                })
+                                                .w(px(icon_wh))
+                                                .h_auto()
+                                                .text_color(theme.text),
+                                        )
+                                        .child(div().flex_1())
+                                        .id(SharedString::from(format!(
+                                            "layer_control_{}",
+                                            layer.z
+                                        )))
+                                        .on_click({
+                                            let layers = layers_for_render.clone();
+                                            let name = layer.name.clone();
+                                            move |_event, _window, cx| {
+                                                layers.update(cx, |state, cx| {
+                                                    state.layers.get_mut(&name).unwrap().visible =
+                                                        !state.layers[&name].visible;
+                                                    cx.notify();
+                                                })
+                                            }
+                                        }),
+                                )
+                        })
+                        .collect::<Vec<_>>()
+                },
+            ),
+        )
+        .with_width_from_item(widest_row)
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .track_scroll(self.list_scroll_handle.clone())
+        .size_full()
+        .min_h_0()
+        .min_w_0();
+        let layer_scroll_area = sidebar_scroll_frame(
+            "layers_scroll_area",
+            layer_list,
+            &self.scroll_handle,
+            &self.scroll_state,
+            cx.entity_id(),
+            theme,
+        );
         div()
             .flex()
             .flex_col()
@@ -972,83 +1118,7 @@ impl Render for LayerSideBar {
                     ),
             )
             .child(self.name_filter.clone())
-            .child(sidebar_scroll_area(
-                "layers_scroll_area",
-                div().flex().flex_col().items_start().children(
-                    layers
-                        .layers
-                        .values()
-                        .filter(|layer| {
-                            layer
-                                .name
-                                .to_lowercase()
-                                .contains(&self.name_filter.read(cx).content.to_lowercase())
-                                && (!self.state.read(cx).used_filter || layer.used)
-                        })
-                        .map(|layer| {
-                            div()
-                                .flex()
-                                .min_w_full()
-                                .flex_shrink_0()
-                                .bg(if Some(&layer.name) == layers.selected_layer.as_ref() {
-                                    theme.selection
-                                } else {
-                                    theme.sidebar
-                                })
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("layer_select_{}", layer.z)))
-                                        .flex_grow()
-                                        .flex_shrink_0()
-                                        .child(layer.name.clone())
-                                        .on_click({
-                                            let layers = self.layers.clone();
-                                            let name = layer.name.clone();
-                                            move |_event, _window, cx| {
-                                                layers.update(cx, |state, cx| {
-                                                    state.selected_layer = Some(name.clone());
-                                                    cx.notify();
-                                                })
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    icon_div()
-                                        .child(
-                                            svg()
-                                                .path(if layer.visible {
-                                                    "icons/eye-solid-full.svg"
-                                                } else {
-                                                    "icons/eye-slash-solid-full.svg"
-                                                })
-                                                .w(px(icon_wh))
-                                                .h_auto()
-                                                .text_color(theme.text),
-                                        )
-                                        .child(div().flex_1())
-                                        .id(SharedString::from(format!(
-                                            "layer_control_{}",
-                                            layer.z
-                                        )))
-                                        .on_click({
-                                            let layers = self.layers.clone();
-                                            let name = layer.name.clone();
-                                            move |_event, _window, cx| {
-                                                layers.update(cx, |state, cx| {
-                                                    state.layers.get_mut(&name).unwrap().visible =
-                                                        !state.layers[&name].visible;
-                                                    cx.notify();
-                                                })
-                                            }
-                                        }),
-                                )
-                        }),
-                ),
-                &self.scroll_handle,
-                &self.scroll_state,
-                cx.entity_id(),
-                theme,
-            ))
+            .child(layer_scroll_area)
             .child(
                 div()
                     .id("layers_resize_handle")

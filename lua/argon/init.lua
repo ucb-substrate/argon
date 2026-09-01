@@ -5,6 +5,7 @@ local config = require('argon.config').config
 local commands = require('argon.commands')
 local focus = require('argon.focus')
 local save = require('argon.save')
+local server_status = require('argon.server_status')
 
 local function schedule_workspace_modified(client_id)
     vim.schedule(function()
@@ -332,13 +333,14 @@ M.start = function(bufnr)
     end
 
     local old_on_exit = lsp_start_config.on_exit
-    lsp_start_config.on_exit = function(...)
+    lsp_start_config.on_exit = function(code, signal, client_id, ...)
         -- on_exit runs in_fast_event
         vim.schedule(function()
-        commands.delete_argon_command()
+          commands.delete_argon_command()
+          server_status.reset_client_state(client_id)
         end)
         if type(old_on_exit) == 'function' then
-        old_on_exit(...)
+          old_on_exit(code, signal, client_id, ...)
         end
     end
 

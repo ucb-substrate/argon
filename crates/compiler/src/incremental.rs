@@ -16,6 +16,7 @@ use arcstr::ArcStr;
 use indexmap::IndexMap;
 
 use crate::{
+    ast::ModPath,
     compile::{
         self, CellArg, CompileInput, CompileOutput, StaticAnalysis, StaticErrorCompileOutput,
     },
@@ -24,7 +25,16 @@ use crate::{
     workspace::WorkspaceConfig,
 };
 
-type FileRevision = (u64, u32, u64);
+/// Identity of a file the session reads from disk: its length and a hash of
+/// its bytes.
+///
+/// Content, not modification time, decides freshness. A timestamp is neither
+/// necessary — `touch` rewrites one without changing a single build input — nor
+/// sufficient: `cp -p`, `rsync --times`, `tar -x`, and branch or snapshot
+/// restores all reproduce the original timestamp over different bytes, and a
+/// generated file that keeps its length then looks unchanged to the session
+/// while a fresh compiler sees different geometry.
+type FileRevision = (u64, u64);
 type TrackedFileRevision = (PathBuf, Option<FileRevision>);
 
 /// A byte-oriented replacement applied to the current version of a source.
@@ -383,6 +393,24 @@ impl IncrementalCompiler {
             .map(|ast| ast.path.clone())
             .filter(|path| path.extension().is_some_and(|extension| extension == "ar"))
             .collect::<Vec<_>>();
+        // The parsed files above are only the modules that won resolution, so
+        // watching them alone hides every change that moves a module from one
+        // candidate file to the other: `foo.ar` created where a module was
+        // missing silences a missing-module error, `foo.ar` created next to an
+        // existing `foo/mod.ar` raises a duplicate-module error, and deleting
+        // either one reverses the same step. Tracking both candidates for every
+        // module in the previous analysis covers all four transitions, because
+        // an absent candidate has revision `None` and gaining or losing one is
+        // a change in value.
+        for mod_path in analysis.ast.keys() {
+            let (root_lib, module) = module_library(config, mod_path);
+            let Some((name, parents)) = module.split_last() else {
+                continue;
+            };
+            let candidates = parse::mod_candidates(root_lib, parents, name);
+            files.push(candidates.direct);
+            files.push(candidates.nested);
+        }
         files.push(config.root_lib.clone());
         if let Some(parent) = config.root_lib.parent() {
             files.push(parent.join("Argon.toml"));
@@ -411,14 +439,49 @@ impl IncrementalCompiler {
     }
 }
 
+/// Splits a workspace module key into the library whose files back it and the
+/// module path within that library.
+///
+/// [`parse::parse_workspace_with_config_sources_and_cache`] merges every
+/// dependency's modules under the dependency's name, so a key's first component
+/// may name a dependency instead of a module of this workspace. A root-library
+/// module that shadows a dependency's name is attributed to the dependency and
+/// so contributes the wrong pair; its own file is still tracked through the
+/// parsed AST, which leaves that one module no worse off than tracking no
+/// candidates at all.
+fn module_library<'a>(config: &WorkspaceConfig, mod_path: &'a ModPath) -> (PathBuf, &'a [String]) {
+    if let Some((first, rest)) = mod_path.split_first()
+        && let Some((_, path)) = config.dependencies.iter().find(|(name, _)| name == first)
+    {
+        // A dependency is named either by its directory or by its library file,
+        // the same choice `parse` makes before walking it.
+        let root_lib = if path.is_dir() {
+            path.join("lib.ar")
+        } else {
+            path.clone()
+        };
+        return (root_lib, rest);
+    }
+    (config.root_lib.clone(), mod_path.as_slice())
+}
+
+/// Reads `path` and reduces it to a [`FileRevision`], or `None` when it does
+/// not exist or cannot be read. `None` is a value like any other, so a file
+/// appearing where the previous analysis found nothing invalidates the cache.
+///
+/// Screening with modification time and length and hashing only on a match
+/// would buy nothing here: [`IncrementalCompiler::ensure_analysis`] compares
+/// whole revision *values*, so the unchanged case — the one that has to be
+/// cheap — must produce the hash anyway, and the only read a screen could skip
+/// belongs to a file that is about to be reparsed regardless.
 fn file_revision(path: &Path) -> Option<FileRevision> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    Some((modified.as_secs(), modified.subsec_nanos(), metadata.len()))
+    let contents = std::fs::read(path).ok()?;
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+    // The length is implied by the hash, but carrying it costs nothing and a
+    // 64-bit hash is small enough that a same-length restriction is worth
+    // having between two revisions of the same file.
+    Some((contents.len() as u64, hasher.finish()))
 }
 
 fn execution_environment_key(tech_file: Option<&Path>, gds_imports: &[(String, PathBuf)]) -> u64 {
@@ -468,6 +531,37 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `lib.ar` into a scratch workspace, as the CLI would see it. The
+    /// directory is returned because dropping it deletes the workspace.
+    fn scratch_workspace(source: &str) -> (tempfile::TempDir, WorkspaceConfig) {
+        let dir = tempfile::tempdir().expect("create scratch workspace");
+        let lib = dir.path().join("lib.ar");
+        std::fs::write(&lib, source).expect("write scratch library");
+        (dir, WorkspaceConfig::new(lib))
+    }
+
+    /// Rewrites `path` with `source` and restores the modification time it had
+    /// beforehand, reproducing what `cp -p`, `rsync --times`, and `tar -x` do
+    /// to a file the session has already read.
+    fn write_preserving_mtime(path: &Path, source: &str) {
+        let modified = std::fs::metadata(path)
+            .expect("scratch file exists")
+            .modified()
+            .expect("platform reports modification times");
+        std::fs::write(path, source).expect("rewrite scratch file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("reopen scratch file")
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore modification time");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().modified().unwrap(),
+            modified,
+            "the fixture must reproduce the original timestamp to be a fixture"
+        );
+    }
 
     #[test]
     fn edits_are_sequential_and_noops_keep_the_revision() {
@@ -704,6 +798,86 @@ mod tests {
             bincode::serialize(&incremental).unwrap(),
             bincode::serialize(&fresh).unwrap()
         );
+    }
+
+    #[test]
+    fn a_content_change_under_an_unchanged_timestamp_is_detected() {
+        let (dir, config) = scratch_workspace("cell top() { let width = 11; }\n");
+        let mut compiler = IncrementalCompiler::new();
+        let first = compiler.analyze_workspace(&config);
+        assert!(first.errors.is_empty(), "{:?}", first.errors);
+
+        // Same length, same modification time, different program.
+        write_preserving_mtime(
+            &dir.path().join("lib.ar"),
+            "cell top() { let width = qq; }\n",
+        );
+
+        let second = compiler.analyze_workspace(&config);
+        assert!(
+            !second.errors.is_empty(),
+            "a rewritten library was served from the cache as clean"
+        );
+        assert_eq!(compiler.stats().static_cache_hits, 0);
+        assert_eq!(compiler.stats().static_cache_misses, 2);
+    }
+
+    #[test]
+    fn rewriting_a_file_with_the_same_contents_keeps_the_analysis() {
+        // The other half of deciding freshness by content: a save with no edit
+        // and a checkout that restores the same bytes both move the timestamp
+        // without changing an input, and must not cost a reparse.
+        let source = "cell top() { let width = 11; }\n";
+        let (dir, config) = scratch_workspace(source);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.analyze_workspace(&config);
+        std::fs::write(dir.path().join("lib.ar"), source).unwrap();
+        compiler.analyze_workspace(&config);
+
+        assert_eq!(compiler.stats().static_cache_hits, 1);
+        assert_eq!(compiler.stats().static_cache_misses, 1);
+    }
+
+    #[test]
+    fn creating_a_missing_module_file_invalidates_the_analysis() {
+        // `mod foo;` resolves to `foo/mod.ar` while `foo.ar` is absent, so the
+        // file the user writes to fix the error is not the file the failed
+        // parse read.
+        let (dir, config) = scratch_workspace("mod foo;\n");
+        let mut compiler = IncrementalCompiler::new();
+        let missing = compiler.analyze_workspace(&config);
+        assert!(!missing.errors.is_empty(), "the module file is absent");
+
+        std::fs::write(dir.path().join("foo.ar"), "cell bar() {}\n").unwrap();
+
+        let created = compiler.analyze_workspace(&config);
+        assert!(created.errors.is_empty(), "{:?}", created.errors);
+    }
+
+    #[test]
+    fn a_module_file_appearing_beside_mod_ar_invalidates_the_analysis() {
+        let (dir, config) = scratch_workspace("mod foo;\n");
+        std::fs::create_dir(dir.path().join("foo")).unwrap();
+        std::fs::write(dir.path().join("foo/mod.ar"), "cell bar() {}\n").unwrap();
+        let mut compiler = IncrementalCompiler::new();
+        let nested = compiler.analyze_workspace(&config);
+        assert!(nested.errors.is_empty(), "{:?}", nested.errors);
+
+        // Neither file the analysis read has changed, but the module is now
+        // ambiguous.
+        let direct = dir.path().join("foo.ar");
+        std::fs::write(&direct, "cell bar() {}\n").unwrap();
+        let ambiguous = compiler.analyze_workspace(&config);
+        assert!(
+            !ambiguous.errors.is_empty(),
+            "a module with two source files was accepted"
+        );
+
+        // Removing it again has to be as visible, or the diagnostic outlives
+        // the file that caused it.
+        std::fs::remove_file(&direct).unwrap();
+        let resolved = compiler.analyze_workspace(&config);
+        assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
     }
 
     #[test]

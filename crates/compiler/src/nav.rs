@@ -679,10 +679,7 @@ impl<'a> Builder<'a> {
                 self.scope(&if_.then);
                 self.scope(&if_.else_);
             }
-            Expr::Comparison(cmp) => {
-                self.expr(&cmp.left);
-                self.expr(&cmp.right);
-            }
+            // Comparisons are `BinOp::Cmp`, so this covers them too.
             Expr::BinOp(op) => {
                 self.expr(&op.left);
                 self.expr(&op.right);
@@ -1144,6 +1141,22 @@ cell top() {
                 "{name} should have nowhere to jump to"
             );
         }
+    }
+
+    /// `&&`, `||` and comparisons are all `Expr::BinOp`, and `!` is
+    /// `Expr::UnaryOp`, so one arm each walks their operands. Worth pinning:
+    /// a missed arm costs navigation inside a condition silently.
+    #[test]
+    fn operands_of_boolean_and_comparison_operators_are_walked() {
+        check(
+            r#"
+cell top(alpha: Float, flag: Bool) {
+    let ok = al$0pha >= 40. && !fl$0ag;
+    if o$0k { } else { };
+}
+"#,
+            &["alpha#0", "flag#0", "ok#0"],
+        );
     }
 
     #[test]

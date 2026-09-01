@@ -7,6 +7,8 @@ use ::gds::{
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use indexmap::IndexMap;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tracing::trace;
 use uniquify::Names;
 
@@ -14,6 +16,12 @@ use crate::{
     compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, SolvedValue},
     tech::{Technology, read_tech},
 };
+
+/// The most instances one imported AREF may flatten to.
+///
+/// GDSII allows 32767 x 32767, which is over a billion instances; the
+/// flattening loop has no other bound.
+const MAX_IMPORTED_ARRAY_INSTANCES: u64 = 1 << 20;
 
 pub struct GdsMap {
     layers: IndexMap<String, GdsLayerSpec>,
@@ -40,8 +48,20 @@ impl GdsExporter {
         }
     }
 
-    fn coord_to_gds(&self, coord: f64) -> i32 {
-        (coord * self.display_unit).round() as i32
+    /// Converts a source coordinate to an integer GDS database unit.
+    ///
+    /// Checked rather than a bare `as i32`, which *saturates*: an out-of-range
+    /// coordinate would otherwise be written as `2147483647` and a NaN as `0`,
+    /// with the export reporting success. `check_geometry` rejects both before
+    /// a run gets this far, so reaching the error here means the exporter was
+    /// handed output that never passed that gate -- report it rather than
+    /// inventing a number.
+    fn coord_to_gds(&self, coord: f64) -> Result<i32> {
+        let dbu = (coord * self.display_unit).round();
+        if !dbu.is_finite() || dbu < f64::from(i32::MIN) || dbu > f64::from(i32::MAX) {
+            bail!("coordinate {coord} cannot be represented in this technology's database units");
+        }
+        Ok(dbu as i32)
     }
 }
 
@@ -143,12 +163,78 @@ pub(crate) fn import_gds(
     import_gds_with_tech(path, declared_name, tech)
 }
 
+/// GDSII data-type code for an ASCII string record.
+const GDS_DTYPE_ASCII: u8 = 6;
+
+/// Bytes of record header preceding a record's payload.
+const GDS_HEADER_LEN: u64 = 4;
+
+/// Rejects the record shapes that make the GDS reader panic or fail opaquely,
+/// naming the offending byte offset.
+///
+/// The reader strips an optional trailing NUL with `data[len - 1]`, which
+/// underflows on a zero-length string record -- an empty `STRNAME`,
+/// `LIBNAME`, or text `STRING` is enough -- and it decodes strings with
+/// `from_utf8`, so one Latin-1 byte in a vendor file rejects the file as a
+/// whole. A compiler should never panic on file content it did not produce,
+/// and a malformed input deserves a diagnostic that says which file and where.
+fn validate_gds_records(path: &Path) -> Result<()> {
+    use std::io::{BufReader, Read, Seek, SeekFrom};
+
+    let mut reader = BufReader::new(
+        std::fs::File::open(path)
+            .with_context(|| format!("could not open imported GDS `{}`", path.display()))?,
+    );
+    let mut offset = 0u64;
+    let mut header = [0u8; GDS_HEADER_LEN as usize];
+    loop {
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            // A truncated trailing header is left to the reader, which reports
+            // it as a read error.
+            Err(_) => return Ok(()),
+        }
+        let len = u64::from(u16::from_be_bytes([header[0], header[1]]));
+        let dtype = header[3];
+        // GDSII records are at least a header long and always even. Framing
+        // errors are the reader's to report; scanning past one would only
+        // misalign this walk and produce a misleading offset.
+        if len < GDS_HEADER_LEN || len % 2 != 0 {
+            return Ok(());
+        }
+        let payload = len - GDS_HEADER_LEN;
+        if dtype == GDS_DTYPE_ASCII {
+            if payload == 0 {
+                bail!(
+                    "imported GDS `{}` has an empty string record at byte {offset}",
+                    path.display()
+                );
+            }
+            let mut data = vec![0u8; payload as usize];
+            if reader.read_exact(&mut data).is_err() {
+                return Ok(());
+            }
+            if std::str::from_utf8(&data).is_err() {
+                bail!(
+                    "imported GDS `{}` has a non-UTF-8 string record at byte {offset}; \
+                     the GDS reader cannot decode it",
+                    path.display()
+                );
+            }
+        } else if reader.seek(SeekFrom::Current(payload as i64)).is_err() {
+            return Ok(());
+        }
+        offset += len;
+    }
+}
+
 fn import_gds_with_tech(
     path: &Path,
     declared_name: &str,
     tech: &Technology,
 ) -> Result<ImportedGdsLibrary> {
     let map = GdsMap::from_technology(tech);
+    validate_gds_records(path)?;
     let library = GdsLibrary::load(path)
         .map_err(|error| anyhow!("{error}"))
         .with_context(|| format!("could not read imported GDS `{}`", path.display()))?;
@@ -504,26 +590,42 @@ fn import_array(
     if array.cols <= 0 || array.rows <= 0 {
         bail!("imported GDS `{}` contains an empty array", path.display());
     }
+    // The array is flattened into one instance per element, so a legal
+    // 32767 x 32767 AREF is 1.07e9 instances -- tens of gigabytes from a
+    // few-hundred-byte input. Bound it with a diagnostic instead.
+    let count = u64::from(array.cols.unsigned_abs()) * u64::from(array.rows.unsigned_abs());
+    if count > MAX_IMPORTED_ARRAY_INSTANCES {
+        bail!(
+            "imported GDS `{}` contains a {} x {} array, which flattens to {count} instances \
+             (the maximum is {MAX_IMPORTED_ARRAY_INSTANCES})",
+            path.display(),
+            array.cols,
+            array.rows,
+        );
+    }
+    // Widen before subtracting: an array spanning more than `i32::MAX`
+    // database units wraps the difference negative, silently mirroring the
+    // array in release builds (and panicking in debug).
     let dx = (
-        f64::from(array.xy[1].x - array.xy[0].x) / f64::from(array.cols),
-        f64::from(array.xy[1].y - array.xy[0].y) / f64::from(array.cols),
+        (f64::from(array.xy[1].x) - f64::from(array.xy[0].x)) / f64::from(array.cols),
+        (f64::from(array.xy[1].y) - f64::from(array.xy[0].y)) / f64::from(array.cols),
     );
     let dy = (
-        f64::from(array.xy[2].x - array.xy[0].x) / f64::from(array.rows),
-        f64::from(array.xy[2].y - array.xy[0].y) / f64::from(array.rows),
+        (f64::from(array.xy[2].x) - f64::from(array.xy[0].x)) / f64::from(array.rows),
+        (f64::from(array.xy[2].y) - f64::from(array.xy[0].y)) / f64::from(array.rows),
     );
+    let cell = names.get(array.name.as_str()).copied().ok_or_else(|| {
+        anyhow!(
+            "imported GDS `{}` references missing structure `{}`",
+            path.display(),
+            array.name
+        )
+    })?;
+    let (angle, reflect) = import_transform(path, array.strans.as_ref())?;
     for row in 0..array.rows {
         for col in 0..array.cols {
             let x = f64::from(array.xy[0].x) + f64::from(col) * dx.0 + f64::from(row) * dy.0;
             let y = f64::from(array.xy[0].y) + f64::from(col) * dx.1 + f64::from(row) * dy.1;
-            let cell = names.get(array.name.as_str()).copied().ok_or_else(|| {
-                anyhow!(
-                    "imported GDS `{}` references missing structure `{}`",
-                    path.display(),
-                    array.name
-                )
-            })?;
-            let (angle, reflect) = import_transform(path, array.strans.as_ref())?;
             elements.push(ImportedGdsElement::Instance {
                 cell,
                 x: x * scale,
@@ -571,10 +673,25 @@ impl CompileOutput {
         {
             let mut exporter = GdsExporter::new("TOP", &output.tech);
             output.cell_to_gds(&mut exporter, output.top)?;
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            exporter.lib.save(out_path).map_err(|e| anyhow!("{e}"))?;
+            let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            // Write through a sibling temporary file and rename on success.
+            // `GdsLibrary::save` streams records, so a write that fails partway
+            // -- an over-long record, a full disk -- otherwise leaves a
+            // truncated `.gds` at the real path, next to a `.bin` that was
+            // written earlier in the run and looks perfectly valid.
+            let mut builder = tempfile::Builder::new();
+            builder.prefix(".argon-gds").suffix(".tmp");
+            // A temporary file is created 0600 so its contents are never
+            // briefly world-readable. That is the wrong mode for a build
+            // artifact, so give the finished file the permissions
+            // `File::create` would have.
+            #[cfg(unix)]
+            builder.permissions(std::fs::Permissions::from_mode(0o644));
+            let temp = builder.tempfile_in(parent)?;
+            exporter.lib.save(temp.path()).map_err(|e| anyhow!("{e}"))?;
+            temp.persist(out_path)
+                .map_err(|e| anyhow!("could not finalize `{}`: {e}", out_path.display()))?;
         }
 
         Ok(())
@@ -585,22 +702,31 @@ impl CompiledData {
     fn cell_to_gds(&self, exporter: &mut GdsExporter, id: CellId) -> Result<()> {
         trace!("Exporting cell {id}");
         let cell = &self.cells[&id];
-        let name = &cell.scopes[&cell.root].name;
-        let name = parse_cell_name(name)?;
-        let name = exporter.names.assign_name(id, name);
+        let name = gds_struct_name(&cell.name);
+        if name != cell.name {
+            // Keep the output traceable: a reader can only map a struct back
+            // to its source cell if the rewrite is recorded somewhere.
+            trace!("Cell `{}` exported as GDS struct `{name}`", cell.name);
+        }
+        let name = exporter.names.assign_name(id, &name);
         let mut ocell = GdsStruct::new(name.to_string());
         for (_, obj) in &cell.objects {
+            // Shared with `bbox`, so the two cannot disagree about which
+            // geometry exists.
+            if !obj.is_layout() {
+                continue;
+            }
             match obj {
-                SolvedValue::Rect(rect) if !rect.construction => {
+                SolvedValue::Rect(rect) => {
                     if let Some(layer) = &rect.layer {
                         let GdsLayerSpec {
                             layer,
                             xtype: datatype,
                         } = exporter.map[layer];
-                        let x0 = exporter.coord_to_gds(rect.x0.0);
-                        let x1 = exporter.coord_to_gds(rect.x1.0);
-                        let y0 = exporter.coord_to_gds(rect.y0.0);
-                        let y1 = exporter.coord_to_gds(rect.y1.0);
+                        let x0 = exporter.coord_to_gds(rect.x0.0)?;
+                        let x1 = exporter.coord_to_gds(rect.x1.0)?;
+                        let y0 = exporter.coord_to_gds(rect.y0.0)?;
+                        let y1 = exporter.coord_to_gds(rect.y1.0)?;
                         ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                             layer,
                             datatype,
@@ -624,9 +750,12 @@ impl CompiledData {
                         .points
                         .iter()
                         .map(|(x, y)| {
-                            GdsPoint::new(exporter.coord_to_gds(x.0), exporter.coord_to_gds(y.0))
+                            Ok(GdsPoint::new(
+                                exporter.coord_to_gds(x.0)?,
+                                exporter.coord_to_gds(y.0)?,
+                            ))
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                     points.push(points[0].clone());
                     ocell.elems.push(GdsElement::GdsBoundary(GdsBoundary {
                         layer,
@@ -640,9 +769,11 @@ impl CompiledData {
                         layer,
                         xtype: datatype,
                     } = exporter.map[&path.layer];
-                    let width = exporter.coord_to_gds(path.width.0.abs());
-                    let begin_extension = exporter.coord_to_gds(path.begin_extension.0);
-                    let end_extension = exporter.coord_to_gds(path.end_extension.0);
+                    // `check_geometry` has already rejected a negative width,
+                    // so the absolute value only normalizes `-0.`.
+                    let width = exporter.coord_to_gds(path.width.0.abs())?;
+                    let begin_extension = exporter.coord_to_gds(path.begin_extension.0)?;
+                    let end_extension = exporter.coord_to_gds(path.end_extension.0)?;
                     let (path_type, begin_extn, end_extn) =
                         if begin_extension == 0 && end_extension == 0 {
                             (None, None, None)
@@ -664,12 +795,12 @@ impl CompiledData {
                             .points
                             .iter()
                             .map(|(x, y)| {
-                                GdsPoint::new(
-                                    exporter.coord_to_gds(x.0),
-                                    exporter.coord_to_gds(y.0),
-                                )
+                                Ok(GdsPoint::new(
+                                    exporter.coord_to_gds(x.0)?,
+                                    exporter.coord_to_gds(y.0)?,
+                                ))
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                         ..Default::default()
                     }));
                 }
@@ -678,8 +809,8 @@ impl CompiledData {
                         layer,
                         xtype: texttype,
                     } = exporter.map[&text.layer];
-                    let x = exporter.coord_to_gds(text.x);
-                    let y = exporter.coord_to_gds(text.y);
+                    let x = exporter.coord_to_gds(text.x)?;
+                    let y = exporter.coord_to_gds(text.y)?;
                     ocell.elems.push(GdsElement::GdsTextElem(GdsTextElem {
                         string: ArcStr::from(&text.text),
                         layer,
@@ -688,13 +819,13 @@ impl CompiledData {
                         ..Default::default()
                     }));
                 }
-                SolvedValue::Instance(i) if !i.construction => {
+                SolvedValue::Instance(i) => {
                     if exporter.names.name(&i.cell).is_none() {
                         self.cell_to_gds(exporter, i.cell)?;
                     }
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
                         name: exporter.names.name(&i.cell).unwrap().clone(),
-                        xy: GdsPoint::new(exporter.coord_to_gds(i.x), exporter.coord_to_gds(i.y)),
+                        xy: GdsPoint::new(exporter.coord_to_gds(i.x)?, exporter.coord_to_gds(i.y)?),
                         strans: Some(GdsStrans {
                             reflected: i.reflect,
                             abs_mag: false,
@@ -713,11 +844,40 @@ impl CompiledData {
     }
 }
 
-fn parse_cell_name(name: &str) -> Result<&str> {
-    name.rsplit("cell ")
-        .next()
-        .and_then(|suffix| suffix.split_whitespace().next())
-        .ok_or_else(|| anyhow!("parse error"))
+/// The longest GDSII structure name the spec allows.
+const MAX_GDS_NAME_LEN: usize = 32;
+
+/// Converts a cell's identity into a name that is legal in GDSII.
+///
+/// GDSII names are at most [`MAX_GDS_NAME_LEN`] characters from
+/// `[A-Za-z0-9_?$]`. Argon identities are module-qualified, so `sub::inner`
+/// would otherwise emit a `:` that KLayout tolerates but Virtuoso and older
+/// readers do not. Collisions introduced by sanitizing or truncating are
+/// resolved by the caller's uniquifier, exactly as collisions between
+/// same-named cells in different modules already are.
+fn gds_struct_name(identity: &str) -> String {
+    let mut name: String = identity
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '?' | '$') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Keep the tail: the cell's own name is the distinguishing part of a
+    // module-qualified identity.
+    if name.chars().count() > MAX_GDS_NAME_LEN {
+        name = name
+            .chars()
+            .skip(name.chars().count() - MAX_GDS_NAME_LEN)
+            .collect();
+    }
+    if name.is_empty() {
+        name.push('_');
+    }
+    name
 }
 
 #[cfg(test)]
@@ -866,8 +1026,19 @@ mod tests {
         )
         .unwrap();
         let exporter = GdsExporter::new("test", &tech);
-        assert_eq!(exporter.coord_to_gds(1.25), 1250);
+        assert_eq!(exporter.coord_to_gds(1.25).unwrap(), 1250);
         assert_eq!(exporter.lib.units.db_unit(), 1e-9);
+
+        // `f64 as i32` saturates, so an unchecked conversion turns any of
+        // these into `i32::MAX` (or `0`, for NaN) and writes it as a real
+        // coordinate. `check_geometry` rejects them before the exporter runs;
+        // this is the backstop for an output that skipped that gate.
+        for coord in [1e9, -1e9, f64::INFINITY, f64::NAN] {
+            assert!(
+                exporter.coord_to_gds(coord).is_err(),
+                "{coord} must not saturate"
+            );
+        }
     }
 
     #[test]
@@ -926,5 +1097,143 @@ mod tests {
         assert_eq!(argon_ident("1V8"), "_1V8");
         assert_eq!(argon_ident("in"), "in_");
         assert_eq!(argon_ident("x"), "x_");
+    }
+
+    fn array_ref(cols: i16, rows: i16, xy: [GdsPoint; 3]) -> GdsArrayRef {
+        GdsArrayRef {
+            name: "child".into(),
+            xy,
+            cols,
+            rows,
+            strans: None,
+            elflags: None,
+            plex: None,
+            properties: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn wide_array_pitch_does_not_wrap() {
+        // The span exceeds `i32::MAX`, so subtracting before widening would
+        // wrap the difference negative and mirror the array.
+        let mut elements = Vec::new();
+        import_array(
+            Path::new("array.gds"),
+            &IndexMap::from_iter([("child".to_owned(), 0usize)]),
+            &array_ref(
+                2,
+                1,
+                [
+                    GdsPoint::new(-2_000_000_000, 0),
+                    GdsPoint::new(2_000_000_000, 0),
+                    GdsPoint::new(-2_000_000_000, 0),
+                ],
+            ),
+            1.,
+            &mut elements,
+        )
+        .expect("wide array should import");
+
+        let xs = elements
+            .iter()
+            .map(|element| match element {
+                ImportedGdsElement::Instance { x, .. } => *x,
+                _ => panic!("array should flatten to instances"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(xs, [-2_000_000_000., 0.]);
+    }
+
+    #[test]
+    fn oversized_array_is_rejected() {
+        let mut elements = Vec::new();
+        let error = import_array(
+            Path::new("array.gds"),
+            &IndexMap::from_iter([("child".to_owned(), 0usize)]),
+            &array_ref(
+                32767,
+                32767,
+                [
+                    GdsPoint::new(0, 0),
+                    GdsPoint::new(32767, 0),
+                    GdsPoint::new(0, 32767),
+                ],
+            ),
+            1.,
+            &mut elements,
+        )
+        .expect_err("a billion-instance array should be rejected");
+        assert!(error.to_string().contains("flattens to"), "{error}");
+        assert!(elements.is_empty());
+    }
+
+    /// Writes `library` to a scratch file, runs `check`, then removes it.
+    fn with_saved_library(name: &str, library: &GdsLibrary, check: impl FnOnce(&Path)) {
+        let path = std::env::temp_dir().join(format!(
+            "argon-{name}-{}-{}.gds",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        library.save(&path).unwrap();
+        check(&path);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn empty_string_record_is_reported_not_panicked() {
+        let mut library = GdsLibrary::new("fixture");
+        library.structs.push(GdsStruct::new("top"));
+        with_saved_library("empty-strname", &library, |path| {
+            // Blank out the STRNAME payload, which the reader would index
+            // out of bounds while stripping a trailing NUL.
+            let original = std::fs::read(path).unwrap();
+            let mut patched = Vec::with_capacity(original.len());
+            let mut offset = 0;
+            while offset < original.len() {
+                let len = u16::from_be_bytes([original[offset], original[offset + 1]]) as usize;
+                if original[offset + 2] == 0x06 {
+                    patched.extend_from_slice(&[0, 4, 0x06, 0x06]);
+                } else {
+                    patched.extend_from_slice(&original[offset..offset + len]);
+                }
+                offset += len;
+            }
+            std::fs::write(path, patched).unwrap();
+
+            let error = validate_gds_records(path).expect_err("empty STRNAME should be reported");
+            assert!(error.to_string().contains("empty string record"), "{error}");
+        });
+    }
+
+    #[test]
+    fn gds_struct_names_are_sanitized_and_bounded() {
+        // Module separators are illegal in GDSII, so they are rewritten rather
+        // than scraped away -- `sub::inner` and `other::inner` stay distinct.
+        assert_eq!(gds_struct_name("sub::inner"), "sub__inner");
+        assert_eq!(gds_struct_name("other::inner"), "other__inner");
+        // An imported struct name with spaces keeps all of its words.
+        assert_eq!(gds_struct_name("my cell foo"), "my_cell_foo");
+        assert_eq!(gds_struct_name("x y"), "x_y");
+        assert_eq!(gds_struct_name("x z"), "x_z");
+        // A name of only illegal characters still yields a usable name.
+        assert_eq!(gds_struct_name("   "), "___");
+        assert_eq!(gds_struct_name(""), "_");
+        // Over-long names are truncated to the tail, which carries the cell's
+        // own name.
+        let long = gds_struct_name("a::really_long_module::path_and_then_a_cell_name");
+        assert_eq!(long.chars().count(), MAX_GDS_NAME_LEN);
+        assert!(long.ends_with("path_and_then_a_cell_name"), "{long}");
+    }
+
+    #[test]
+    fn valid_library_passes_record_validation() {
+        let mut library = GdsLibrary::new("fixture");
+        library.structs.push(GdsStruct::new("top"));
+        with_saved_library("valid-records", &library, |path| {
+            validate_gds_records(path).expect("a library this crate wrote must validate");
+        });
     }
 }

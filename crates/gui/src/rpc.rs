@@ -2,7 +2,10 @@ use std::{
     fmt::Display,
     future::Future,
     net::{Ipv4Addr, SocketAddr, TcpListener},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -30,9 +33,13 @@ use tarpc::{
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
-use crate::{editor::Editor, editor_window_options, focus};
+use crate::{
+    editor::{Editor, prepare_compilation_snapshot},
+    editor_window_options, focus,
+};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_SNAPSHOT_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| {
@@ -435,10 +442,49 @@ pub struct GuiServer {
 }
 
 impl Gui for GuiServer {
-    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
+    async fn compilation_started(mut self, _: context::Context, activity_id: u64) {
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                let _ = cx.update(|cx| editor.update_cell(cx, snapshot));
+                let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, true));
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn compilation_finished(mut self, _: context::Context, activity_id: u64) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, false));
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn update_cell(mut self, _: context::Context, snapshot: CompilationSnapshot) {
+        let preparation_id = NEXT_SNAPSHOT_PREPARATION_ID.fetch_add(1, Ordering::Relaxed);
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, app| {
+                let context = app
+                    .update(|cx| editor.begin_snapshot_preparation(cx, preparation_id))
+                    .ok();
+                let _ = sender.send(context);
+            }))
+            .await
+            .unwrap();
+        let Ok(Some(preparation_context)) = receiver.await else {
+            return;
+        };
+
+        // Scope paths, bounding boxes, and layer usage can be expensive for a
+        // large cell. This RPC future runs on GPUI's background executor, so
+        // prepare the immutable presentation data here instead of blocking the
+        // UI thread and freezing its activity animation.
+        let snapshot = prepare_compilation_snapshot(snapshot, preparation_context);
+        self.to_exec
+            .send(Box::new(move |editor, app| {
+                let _ = app
+                    .update(|cx| editor.finish_snapshot_preparation(cx, preparation_id, snapshot));
             }))
             .await
             .unwrap();

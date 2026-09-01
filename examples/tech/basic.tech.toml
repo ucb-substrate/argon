@@ -25,7 +25,7 @@ animation = 0
 
 [[layers]]
 name = "via1"
-gds = [235, 4]
+gds = [236, 4]
 fill = "#5e00e6"
 border = "#5e00e6"
 
@@ -45,7 +45,7 @@ animation = 0
 
 [[layers]]
 name = "met2"
-gds = [235, 4]
+gds = [237, 4]
 fill = "#ff00ff"
 border = "#ff00ff"
 
@@ -65,7 +65,7 @@ animation = 0
 
 [[layers]]
 name = "via2"
-gds = [235, 4]
+gds = [238, 4]
 fill = "#ff8000"
 border = "#ff8000"
 
@@ -85,7 +85,7 @@ animation = 0
 
 [[layers]]
 name = "met3"
-gds = [235, 4]
+gds = [239, 4]
 fill = "#00ffff"
 border = "#00ffff"
 
@@ -105,7 +105,7 @@ animation = 0
 
 [[layers]]
 name = "via3"
-gds = [235, 4]
+gds = [240, 4]
 fill = "#268c6b"
 border = "#268c6b"
 
@@ -125,7 +125,7 @@ animation = 0
 
 [[layers]]
 name = "met4"
-gds = [235, 4]
+gds = [241, 4]
 fill = "#5e00e6"
 border = "#5e00e6"
 

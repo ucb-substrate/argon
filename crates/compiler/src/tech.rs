@@ -319,10 +319,28 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
     if layers.is_empty() {
         bail!("technology file must define at least one layer");
     }
+    // A technology file has to map layer names and GDS specs bijectively.
+    // Unique names keep export deterministic, and unique specs are what make
+    // import unambiguous: `GdsMap::layer_name` reverse-maps an imported
+    // layer/datatype pair by taking the first layer that declares it, so two
+    // layers sharing one spec would silently relabel every imported shape with
+    // whichever name was listed first, destroying layer identity with no
+    // diagnostic. Rejecting the collision here is cheaper than teaching every
+    // consumer of the reverse lookup to disambiguate.
     let mut layer_names = IndexSet::new();
+    let mut layer_specs = IndexMap::new();
     for layer in &layers {
         if !layer_names.insert(layer.name.as_str()) {
             bail!("duplicate layer name `{}`", layer.name);
+        }
+        let spec = (layer.gds_layer, layer.gds_datatype);
+        if let Some(previous) = layer_specs.insert(spec, layer.name.as_str()) {
+            bail!(
+                "duplicate GDS spec {}/{} on layers `{previous}` and `{}`",
+                layer.gds_layer,
+                layer.gds_datatype,
+                layer.name
+            );
         }
     }
 
@@ -455,6 +473,30 @@ border = "#445566"
         assert_relative_eq!(tech.snap(1.13), 1.25, epsilon = 1e-12);
         assert_eq!(tech.snap(-0.01).to_bits(), 0_f64.to_bits());
         assert_eq!(snap(0.26, 0.1), 0.3);
+    }
+
+    #[test]
+    fn rejects_layers_sharing_one_gds_spec() {
+        // Import resolves a GDS layer/datatype pair back to the first layer
+        // declaring it, so a shared spec would quietly rename shapes instead of
+        // failing. The message has to name both layers for the author to know
+        // which declaration to change.
+        let error = parse_tech(&TECH.replace("gds = [68, 5]", "gds = [68, 16]"))
+            .expect_err("layers sharing a GDS spec should be rejected")
+            .to_string();
+        assert!(error.contains("68/16"), "{error}");
+        assert!(error.contains("met1.pin"), "{error}");
+        assert!(error.contains("met1.label"), "{error}");
+    }
+
+    #[test]
+    fn accepts_layers_sharing_only_a_gds_layer_number() {
+        // Only the full pair has to be unique. Real technologies subdivide one
+        // drawing layer into pin, label, and blockage layers by datatype, so
+        // checking the layer number alone would reject valid PDKs.
+        let tech = parse_tech(&TECH.replace("gds = [68, 5]", "gds = [68, 44]")).unwrap();
+        assert_eq!(tech.layers[0].gds_layer, tech.layers[1].gds_layer);
+        assert_eq!(tech.layers[1].gds_datatype, 44);
     }
 
     #[test]

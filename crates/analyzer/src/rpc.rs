@@ -131,6 +131,8 @@ pub trait LangServer {
 
 #[tarpc::service]
 pub trait Gui {
+    async fn compilation_started(activity_id: u64);
+    async fn compilation_finished(activity_id: u64);
     async fn update_cell(snapshot: CompilationSnapshot);
     async fn show_message(typ: MessageType, message: String);
     async fn fit();

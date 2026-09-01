@@ -168,6 +168,16 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("0", Zero, Some(CANVAS_CONTEXT)),
         KeyBinding::new("1", One, Some(CANVAS_CONTEXT)),
         KeyBinding::new("*", All, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("left", PanLeft, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("right", PanRight, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("up", PanUp, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("down", PanDown, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("cmd-=", ZoomIn, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("cmd-+", ZoomIn, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("cmd--", ZoomOut, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("ctrl-=", ZoomIn, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("ctrl-+", ZoomIn, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("ctrl--", ZoomOut, Some(CANVAS_CONTEXT)),
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
         KeyBinding::new("ctrl-shift-d", ShowDiagnostics, None),
         KeyBinding::new("ctrl-shift-m", ShowMessages, None),
@@ -229,6 +239,9 @@ mod tests {
         show_diagnostics_count: usize,
         show_messages_count: usize,
         save_count: usize,
+        pan_count: usize,
+        zoom_in_count: usize,
+        zoom_out_count: usize,
         zero_count: usize,
         one_count: usize,
         all_count: usize,
@@ -241,6 +254,12 @@ mod tests {
                 .on_action(cx.listener(|view, _: &Save, _, _| view.save_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
                 .on_action(cx.listener(|view, _: &DrawPolygon, _, _| view.draw_polygon_count += 1))
+                .on_action(cx.listener(|view, _: &PanLeft, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &PanRight, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &PanUp, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &PanDown, _, _| view.pan_count += 1))
+                .on_action(cx.listener(|view, _: &ZoomIn, _, _| view.zoom_in_count += 1))
+                .on_action(cx.listener(|view, _: &ZoomOut, _, _| view.zoom_out_count += 1))
                 .on_action(cx.listener(|view, _: &Zero, _, _| view.zero_count += 1))
                 .on_action(cx.listener(|view, _: &One, _, _| view.one_count += 1))
                 .on_action(cx.listener(|view, _: &All, _, _| view.all_count += 1))
@@ -295,6 +314,9 @@ mod tests {
                     show_diagnostics_count: 0,
                     show_messages_count: 0,
                     save_count: 0,
+                    pan_count: 0,
+                    zoom_in_count: 0,
+                    zoom_out_count: 0,
                     zero_count: 0,
                     one_count: 0,
                     all_count: 0,
@@ -308,7 +330,7 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(
             *window,
-            "u r p i o 0 1 * ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+            "u r p i o 0 1 * left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
         );
         window
             .update(cx, |view, _, _| {
@@ -325,6 +347,9 @@ mod tests {
                 assert_eq!(view.show_diagnostics_count, 1);
                 assert_eq!(view.show_messages_count, 1);
                 assert_eq!(view.save_count, 1);
+                assert_eq!(view.pan_count, 0);
+                assert_eq!(view.zoom_in_count, 0);
+                assert_eq!(view.zoom_out_count, 0);
             })
             .unwrap();
 
@@ -333,7 +358,7 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(
             *window,
-            "u r p i o 0 1 * ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+            "u r p i o 0 1 * left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
         );
         window
             .update(cx, |view, _, _| {
@@ -350,6 +375,9 @@ mod tests {
                 assert_eq!(view.show_diagnostics_count, 2);
                 assert_eq!(view.show_messages_count, 2);
                 assert_eq!(view.save_count, 2);
+                assert_eq!(view.pan_count, 4);
+                assert_eq!(view.zoom_in_count, 4);
+                assert_eq!(view.zoom_out_count, 2);
             })
             .unwrap();
     }

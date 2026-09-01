@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
@@ -10,7 +11,7 @@ use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
     bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
 };
-use canvas::{LayoutCanvas, ShapeFill};
+use canvas::{LayoutCanvas, ShapeFill, StipplePattern};
 use futures::StreamExt;
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -84,6 +85,10 @@ pub struct EditorState {
     pub font_size: Option<f32>,
     pub workspace_path: Option<PathBuf>,
     pub workspace_modified: bool,
+    pub compilation_activities: IndexSet<u64>,
+    snapshot_preparations: IndexSet<u64>,
+    latest_snapshot_preparation: Option<u64>,
+    pub rendering: bool,
     pub compilation_revision: Option<u64>,
     pub compilation_error: Option<EditorMessage>,
     pub fatal_error: Option<EditorMessage>,
@@ -118,6 +123,16 @@ fn compilation_error_message(output: &CompileOutput) -> Option<EditorMessage> {
     })
 }
 
+fn activity_status_label(is_compiling: bool, is_rendering: bool) -> Option<&'static str> {
+    if is_compiling {
+        Some("Compiling")
+    } else if is_rendering {
+        Some("Rendering")
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Editor {
     pub state: Entity<EditorState>,
@@ -132,12 +147,26 @@ fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
     rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
 }
 
-fn shape_fill(dither_pattern: &str) -> ShapeFill {
+fn shape_fill(
+    dither_pattern: &str,
+    custom_patterns: &[argonc::tech::CustomDitherPattern],
+) -> ShapeFill {
     match dither_pattern {
         "I0" => ShapeFill::Solid,
         "I1" => ShapeFill::Hollow,
-        // Built-in and custom patterns are retained by the technology model.
-        // Until the renderer implements each bitmap, use its existing stipple.
+        reference if reference.starts_with('C') => reference[1..]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| custom_patterns.get(index))
+            .and_then(|pattern| StipplePattern::from_lines(&pattern.lines))
+            .map(|pattern| match pattern.coverage() {
+                0. => ShapeFill::Hollow,
+                1. => ShapeFill::Solid,
+                _ => ShapeFill::Pattern(pattern),
+            })
+            .unwrap_or(ShapeFill::Stippling),
+        // KLayout built-ins other than solid and clear do not carry their
+        // bitmap in the technology file, so retain the legacy slash fallback.
         _ => ShapeFill::Stippling,
     }
 }
@@ -147,6 +176,26 @@ struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
     state: IndexMap<ScopePath, ScopeState>,
     scope_paths: IndexMap<ScopeAddress, ScopePath>,
+}
+
+pub(crate) struct CompilationPreparationContext {
+    layers: IndexMap<SharedString, LayerState>,
+    selected_scope: Option<ScopePath>,
+    scope_state: Option<Arc<IndexMap<ScopePath, ScopeState>>>,
+}
+
+struct PreparedCompileOutput {
+    layers: IndexMap<SharedString, LayerState>,
+    selected_scope: ScopePath,
+    state: IndexMap<ScopePath, ScopeState>,
+    scope_paths: IndexMap<ScopeAddress, ScopePath>,
+}
+
+pub(crate) struct PreparedCompilationSnapshot {
+    pub(crate) revision: u64,
+    pub(crate) output: CompileOutput,
+    compilation_error: Option<EditorMessage>,
+    prepared_output: Option<PreparedCompileOutput>,
 }
 
 fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
@@ -192,12 +241,11 @@ impl EditorState {
         }
     }
     fn process_scope(
-        &self,
-        cx: &App,
         solved_cell: &CompiledData,
         scope: ScopeAddress,
         state: &mut ProcessScopeState,
         parent: Option<ScopeAddress>,
+        old_scope_state: Option<&IndexMap<ScopePath, ScopeState>>,
     ) {
         let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
         let mut scope_path = if let Some(parent) = &parent {
@@ -272,7 +320,13 @@ impl EditorState {
                         scope: solved_cell.cells[&inst.cell].root,
                         cell: inst.cell,
                     };
-                    self.process_scope(cx, solved_cell, inst_address, state, Some(scope));
+                    Self::process_scope(
+                        solved_cell,
+                        inst_address,
+                        state,
+                        Some(scope),
+                        old_scope_state,
+                    );
                     bbox = bbox_union(
                         bbox,
                         state.state[&state.scope_paths[&inst_address]]
@@ -314,18 +368,21 @@ impl EditorState {
                 scope: *child,
                 cell: scope.cell,
             };
-            self.process_scope(cx, solved_cell, scope_address, state, Some(scope));
+            Self::process_scope(
+                solved_cell,
+                scope_address,
+                state,
+                Some(scope),
+                old_scope_state,
+            );
             bbox = bbox_union(
                 bbox,
                 state.state[&state.scope_paths[&scope_address]].bbox.clone(),
             );
         }
 
-        let visible = self
-            .solved_cell
-            .read(cx)
-            .as_ref()
-            .and_then(|cell| Some(cell.state.get(&scope_path)?.visible))
+        let visible = old_scope_state
+            .and_then(|state| state.get(&scope_path).map(|scope| scope.visible))
             .unwrap_or(true);
         state.state.insert(
             scope_path,
@@ -360,8 +417,34 @@ impl EditorState {
         true
     }
 
+    fn compilation_preparation_context(&self, cx: &App) -> CompilationPreparationContext {
+        let old_cell = self.solved_cell.read(cx);
+        CompilationPreparationContext {
+            layers: self.layers.read(cx).layers.clone(),
+            selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope.clone()),
+            scope_state: old_cell.as_ref().map(|cell| cell.state.clone()),
+        }
+    }
+
     pub fn update(&mut self, cx: &mut App, output: CompileOutput) {
-        let compilation_error = compilation_error_message(&output);
+        let context = self.compilation_preparation_context(cx);
+        let prepared = prepare_compilation_snapshot(
+            CompilationSnapshot {
+                revision: self.compilation_revision.unwrap_or_default(),
+                output,
+            },
+            context,
+        );
+        self.apply_prepared_output(cx, prepared);
+    }
+
+    fn apply_prepared_output(&mut self, cx: &mut App, prepared: PreparedCompilationSnapshot) {
+        let PreparedCompilationSnapshot {
+            output,
+            compilation_error,
+            prepared_output,
+            ..
+        } = prepared;
         // Compilation status belongs to the accepted snapshot, rather than to
         // the general message queue. In particular, a valid snapshot must
         // always remove a banner left by an earlier failed compilation.
@@ -379,41 +462,15 @@ impl EditorState {
             }
             _ => return,
         };
-        let root_scope = ScopeAddress {
-            scope: solved_cell.cells[&solved_cell.top].root,
-            cell: solved_cell.top,
-        };
-        let root_scope_name = &solved_cell.cells[&root_scope.cell].scopes[&root_scope.scope]
-            .name
-            .clone();
-        let mut state = ProcessScopeState::default();
-        let old_layers = self.layers.read(cx);
-        for layer in &solved_cell.tech.layers {
-            let name = SharedString::from(layer.name.clone());
-            let visible = old_layers
-                .layers
-                .get(&name)
-                .map(|layer| layer.visible)
-                .unwrap_or(layer.style.visible);
-            state.layers.insert(
-                name.clone(),
-                LayerState {
-                    name,
-                    color: rgb_to_rgba(layer.fill_color),
-                    fill: shape_fill(&layer.style.dither_pattern),
-                    border_color: rgb_to_rgba(layer.border_color),
-                    visible,
-                    used: false,
-                    z: state.layers.len(),
-                },
-            );
-        }
-        self.process_scope(cx, &solved_cell, root_scope, &mut state, None);
-        let ProcessScopeState {
+        let Some(PreparedCompileOutput {
             layers,
+            selected_scope,
             state,
             scope_paths,
-        } = state;
+        }) = prepared_output
+        else {
+            return;
+        };
         self.layers.update(cx, |old_layers, cx| {
             old_layers.layers = layers;
             if old_layers
@@ -429,20 +486,89 @@ impl EditorState {
         self.solved_cell.update(cx, |old_cell, cx| {
             *old_cell = Some(CompileOutputState {
                 output: Arc::new(solved_cell),
-                selected_scope: old_cell
-                    .as_ref()
-                    .and_then(|cell| {
-                        state
-                            .contains_key(&cell.selected_scope)
-                            .then(|| cell.selected_scope.clone())
-                    })
-                    .unwrap_or_else(|| vec![root_scope_name.clone()]),
+                selected_scope,
                 state: Arc::new(state),
                 scope_paths: Arc::new(scope_paths),
             });
             cx.notify();
         });
         self.message = None;
+    }
+}
+
+pub(crate) fn prepare_compilation_snapshot(
+    snapshot: CompilationSnapshot,
+    context: CompilationPreparationContext,
+) -> PreparedCompilationSnapshot {
+    let compilation_error = compilation_error_message(&snapshot.output);
+    let solved_cell = match &snapshot.output {
+        CompileOutput::Valid(data) => Some(data),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            output: Some(data),
+            errors,
+        }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => Some(data),
+        _ => None,
+    };
+    let prepared_output = solved_cell.map(|solved_cell| {
+        let root_scope = ScopeAddress {
+            scope: solved_cell.cells[&solved_cell.top].root,
+            cell: solved_cell.top,
+        };
+        let root_scope_name = solved_cell.cells[&root_scope.cell].scopes[&root_scope.scope]
+            .name
+            .clone();
+        let mut state = ProcessScopeState::default();
+        for layer in &solved_cell.tech.layers {
+            let name = SharedString::from(layer.name.clone());
+            let visible = context
+                .layers
+                .get(&name)
+                .map(|layer| layer.visible)
+                .unwrap_or(layer.style.visible);
+            state.layers.insert(
+                name.clone(),
+                LayerState {
+                    name,
+                    color: rgb_to_rgba(layer.fill_color),
+                    fill: shape_fill(
+                        &layer.style.dither_pattern,
+                        &solved_cell.tech.custom_dither_patterns,
+                    ),
+                    border_color: rgb_to_rgba(layer.border_color),
+                    visible,
+                    used: false,
+                    z: state.layers.len(),
+                },
+            );
+        }
+        EditorState::process_scope(
+            solved_cell,
+            root_scope,
+            &mut state,
+            None,
+            context.scope_state.as_deref(),
+        );
+        let ProcessScopeState {
+            layers,
+            state,
+            scope_paths,
+        } = state;
+        let selected_scope = context
+            .selected_scope
+            .filter(|selected_scope| state.contains_key(selected_scope))
+            .unwrap_or_else(|| vec![root_scope_name]);
+        PreparedCompileOutput {
+            layers,
+            selected_scope,
+            state,
+            scope_paths,
+        }
+    });
+    PreparedCompilationSnapshot {
+        revision: snapshot.revision,
+        output: snapshot.output,
+        compilation_error,
+        prepared_output,
     }
 }
 
@@ -475,6 +601,10 @@ impl Editor {
                 font_size: None,
                 workspace_path: None,
                 workspace_modified: false,
+                compilation_activities: IndexSet::new(),
+                snapshot_preparations: IndexSet::new(),
+                latest_snapshot_preparation: None,
+                rendering: false,
                 compilation_revision: None,
                 compilation_error: None,
                 fatal_error: None,
@@ -536,7 +666,7 @@ impl Editor {
         editor
     }
 
-    fn apply_snapshot(&self, cx: &mut App, snapshot: CompilationSnapshot) -> bool {
+    fn apply_snapshot(&self, cx: &mut App, snapshot: PreparedCompilationSnapshot) -> bool {
         if self
             .state
             .read(cx)
@@ -548,7 +678,12 @@ impl Editor {
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
             state.compilation_revision = Some(snapshot.revision);
-            state.update(cx, snapshot.output);
+            if snapshot.prepared_output.is_some() {
+                // Keep the status animation alive between hierarchy preparation
+                // and the first raster worker started by the next paint.
+                state.rendering = true;
+            }
+            state.apply_prepared_output(cx, snapshot);
             cx.notify();
         });
         self.canvas
@@ -563,7 +698,58 @@ impl Editor {
         });
     }
 
-    pub fn update_cell(&self, cx: &mut App, snapshot: CompilationSnapshot) {
+    pub fn set_compilation_active(&self, cx: &mut App, activity_id: u64, active: bool) {
+        self.state.update(cx, |state, cx| {
+            if active {
+                state.compilation_activities.insert(activity_id);
+            } else {
+                state.compilation_activities.shift_remove(&activity_id);
+            }
+            cx.notify();
+        });
+    }
+
+    pub(crate) fn begin_snapshot_preparation(
+        &self,
+        cx: &mut App,
+        preparation_id: u64,
+    ) -> CompilationPreparationContext {
+        let context = self.state.read(cx).compilation_preparation_context(cx);
+        self.state.update(cx, |state, cx| {
+            state.snapshot_preparations.insert(preparation_id);
+            state.latest_snapshot_preparation = Some(
+                state
+                    .latest_snapshot_preparation
+                    .map_or(preparation_id, |latest| latest.max(preparation_id)),
+            );
+            cx.notify();
+        });
+        context
+    }
+
+    pub(crate) fn finish_snapshot_preparation(
+        &self,
+        cx: &mut App,
+        preparation_id: u64,
+        snapshot: PreparedCompilationSnapshot,
+    ) {
+        let is_latest = self.state.update(cx, |state, cx| {
+            state
+                .snapshot_preparations
+                .retain(|pending| *pending > preparation_id);
+            let is_latest = state.latest_snapshot_preparation == Some(preparation_id);
+            if is_latest {
+                state.latest_snapshot_preparation = None;
+            }
+            cx.notify();
+            is_latest
+        });
+        if is_latest {
+            self.update_cell(cx, snapshot);
+        }
+    }
+
+    fn update_cell(&self, cx: &mut App, snapshot: PreparedCompilationSnapshot) {
         if self.canvas.read(cx).is_sse_dragging() {
             self.canvas
                 .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
@@ -574,17 +760,18 @@ impl Editor {
         }
         let state = self.state.clone();
         self.hierarchy_sidebar.update(cx, move |sidebar, cx| {
-            let scope_paths: IndexSet<_> = state
+            let scope_state = state
                 .read(cx)
                 .solved_cell
                 .read(cx)
                 .as_ref()
-                .map(|cell| cell.state.keys().cloned().collect())
-                .unwrap_or_default();
+                .map(|cell| cell.state.clone());
             sidebar.state.update(cx, |state, _cx| {
-                state
-                    .expanded_scopes
-                    .retain(|path| scope_paths.contains(path));
+                state.expanded_scopes.retain(|path| {
+                    scope_state
+                        .as_ref()
+                        .is_some_and(|scope_state| scope_state.contains_key(path))
+                });
                 state.context_menu = None;
             });
             cx.notify();
@@ -635,12 +822,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // This root listener also receives moves from the canvas itself and
-        // keeps drags alive when the pointer leaves its bounds. Registering the
-        // same handler on LayoutCanvas would process every in-canvas move twice.
+        // This root listener keeps drags alive after the pointer leaves the
+        // canvas, but toolbar/sidebar motion must not enter layout hit testing.
+        if !self
+            .canvas
+            .read(cx)
+            .should_handle_pointer_move(event.position)
+        {
+            return;
+        }
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
-        cx.notify();
     }
 
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -769,26 +961,45 @@ impl Render for Editor {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
         let font_size = self.state.read(cx).font_size;
-        let displayed_status = {
+        let (displayed_status, activity_label) = {
             let state = self.state.read(cx);
-            state
-                .connection_error
-                .clone()
-                .map(|error| {
-                    (
-                        EditorMessage {
-                            typ: MessageType::ERROR,
-                            text: error,
-                            details: MessageDetails::Messages,
-                        },
-                        true,
-                    )
-                })
-                .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
-                .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
-                .or_else(|| state.message.clone().map(|message| (message, false)))
+            (
+                state
+                    .connection_error
+                    .clone()
+                    .map(|error| {
+                        (
+                            EditorMessage {
+                                typ: MessageType::ERROR,
+                                text: error,
+                                details: MessageDetails::Messages,
+                            },
+                            true,
+                        )
+                    })
+                    .or_else(|| state.compilation_error.clone().map(|error| (error, false)))
+                    .or_else(|| state.fatal_error.clone().map(|error| (error, false)))
+                    .or_else(|| state.message.clone().map(|message| (message, false))),
+                activity_status_label(
+                    !state.compilation_activities.is_empty(),
+                    state.rendering || !state.snapshot_preparations.is_empty(),
+                ),
+            )
         };
-        let status_bar = displayed_status.map(|(message, is_connection_error)| {
+        let mut status_fills_space = false;
+        let mut status_bar = div()
+            .id("status_bar")
+            .border_t_1()
+            .border_color(theme.divider)
+            .bg(theme.bg)
+            .px_2()
+            .py_1()
+            .min_h(px(27.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2();
+        if let Some((message, is_connection_error)) = displayed_status {
             let details = message.details;
             let is_compilation_error = details == MessageDetails::Diagnostics;
             let title = if is_compilation_error {
@@ -819,18 +1030,9 @@ impl Render for Editor {
                 .child(status_text);
             if !is_compilation_error {
                 status_message = status_message.flex_1();
+                status_fills_space = true;
             }
-            div()
-                .id("status_bar")
-                .border_t_1()
-                .border_color(theme.divider)
-                .bg(theme.bg)
-                .px_2()
-                .py_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
+            status_bar = status_bar
                 .child(
                     svg()
                         .path("icons/circle-exclamation-solid-full.svg")
@@ -856,8 +1058,39 @@ impl Render for Editor {
                                 editor.open_invoking_command(Some("messages<CR>"), false, cx);
                             }
                         })),
-                )
-        });
+                );
+        }
+        if let Some(activity_label) = activity_label {
+            if !status_fills_space {
+                status_bar = status_bar.child(div().flex_1());
+            }
+            status_bar = status_bar.child(
+                div()
+                    .id("compilation_status")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_color(theme.subtext)
+                    .child(
+                        svg()
+                            .path("icons/arrow-rotate-right-solid-full.svg")
+                            .w(px(14.))
+                            .h_auto()
+                            .text_color(theme.subtext)
+                            .with_animation(
+                                "compilation_spinner",
+                                Animation::new(Duration::from_millis(800)).repeat(),
+                                |icon, delta| {
+                                    icon.with_transformation(Transformation::rotate(percentage(
+                                        delta,
+                                    )))
+                                },
+                            ),
+                    )
+                    .child(activity_label),
+            );
+        }
         let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
@@ -902,7 +1135,7 @@ impl Render for Editor {
                     )
                     .child(self.layer_sidebar.clone()),
             )
-            .children(status_bar);
+            .child(status_bar);
         root = if let Some(font_size) = font_size {
             root.text_size(px(font_size))
         } else {
@@ -924,7 +1157,18 @@ mod tests {
         compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
     };
 
-    use super::{MessageDetails, compilation_error_message};
+    use argonc::tech::CustomDitherPattern;
+
+    use super::{
+        MessageDetails, ShapeFill, activity_status_label, compilation_error_message, shape_fill,
+    };
+
+    #[test]
+    fn compilation_status_hands_off_to_rendering_without_an_idle_state() {
+        assert_eq!(activity_status_label(true, true), Some("Compiling"));
+        assert_eq!(activity_status_label(false, true), Some("Rendering"));
+        assert_eq!(activity_status_label(false, false), None);
+    }
 
     #[test]
     fn compilation_error_message_does_not_embed_individual_diagnostics() {
@@ -972,5 +1216,64 @@ mod tests {
         );
         assert!(matches!(&valid, CompileOutput::Valid(_)));
         assert!(compilation_error_message(&valid).is_none());
+    }
+
+    #[test]
+    fn custom_dither_references_use_technology_array_positions() {
+        let patterns = vec![
+            CustomDitherPattern {
+                lines: vec!["........".to_owned(); 8],
+                order: 90,
+                name: "blank".to_owned(),
+            },
+            CustomDitherPattern {
+                lines: vec!["********".to_owned(); 8],
+                order: 10,
+                name: "solid".to_owned(),
+            },
+            CustomDitherPattern {
+                lines: (0..8)
+                    .map(|y| {
+                        let mut row = [b'.'; 8];
+                        row[y] = b'*';
+                        String::from_utf8(row.to_vec()).unwrap()
+                    })
+                    .collect(),
+                order: 1,
+                name: "diagonal".to_owned(),
+            },
+        ];
+
+        assert_eq!(shape_fill("C0", &patterns), ShapeFill::Hollow);
+        assert_eq!(shape_fill("C1", &patterns), ShapeFill::Solid);
+        assert!(matches!(shape_fill("C2", &patterns), ShapeFill::Pattern(_)));
+        assert_eq!(
+            shape_fill("C9", &patterns),
+            ShapeFill::Stippling,
+            "missing custom references retain the legacy fallback"
+        );
+    }
+
+    #[test]
+    fn every_sky130_custom_dither_reference_resolves_to_its_bitmap() {
+        let tech = argonc::tech::read_tech(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdks/sky130/sky130.tech.toml"),
+        )
+        .unwrap();
+        let custom_layers = tech
+            .layers
+            .iter()
+            .filter(|layer| layer.style.dither_pattern.starts_with('C'))
+            .collect::<Vec<_>>();
+
+        assert!(!custom_layers.is_empty());
+        for layer in custom_layers {
+            assert_ne!(
+                shape_fill(&layer.style.dither_pattern, &tech.custom_dither_patterns,),
+                ShapeFill::Stippling,
+                "{} references an unavailable custom bitmap",
+                layer.name
+            );
+        }
     }
 }

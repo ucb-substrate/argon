@@ -26,6 +26,8 @@ pub enum OutputKind {
 
 #[derive(Debug)]
 pub enum GuiEvent {
+    CompilationStarted(u64),
+    CompilationFinished(u64),
     UpdateCell {
         revision: u64,
         kind: OutputKind,
@@ -47,6 +49,18 @@ struct HeadlessGui {
 }
 
 impl Gui for HeadlessGui {
+    async fn compilation_started(self, _: context::Context, activity_id: u64) {
+        self.events
+            .send(GuiEvent::CompilationStarted(activity_id))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn compilation_finished(self, _: context::Context, activity_id: u64) {
+        self.events
+            .send(GuiEvent::CompilationFinished(activity_id))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
     async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
         let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
         self.events
@@ -282,7 +296,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
+    use std::{collections::HashSet, future::Future};
 
     use argonc::compile::BasicRect;
 
@@ -317,15 +331,31 @@ mod tests {
             let mut saw_workspace_modified = false;
             let mut saw_workspace_path = false;
             let mut saw_fit = false;
+            let mut active_compilations = HashSet::new();
+            let mut saw_compilation_update = false;
+            let mut saw_compilation_finish = false;
             let mut opened_revision = None;
-            while !(saw_editor_update && saw_workspace_modified && saw_workspace_path && saw_fit) {
+            while !(saw_editor_update
+                && saw_workspace_modified
+                && saw_workspace_path
+                && saw_fit
+                && saw_compilation_update
+                && saw_compilation_finish)
+            {
                 match session.next_event().await {
+                    GuiEvent::CompilationStarted(activity_id) => {
+                        active_compilations.insert(activity_id);
+                    }
+                    GuiEvent::CompilationFinished(activity_id) => {
+                        saw_compilation_finish |= active_compilations.remove(&activity_id);
+                    }
                     GuiEvent::UpdateCell {
                         revision,
                         kind: OutputKind::Data,
                         scope,
                         rect_count,
                     } if !drew_rect => {
+                        saw_compilation_update |= !active_compilations.is_empty();
                         let scope = scope.expect("compiled top cell should expose its root scope");
                         let inserted = analyzer
                             .draw_rect(
@@ -354,6 +384,7 @@ mod tests {
                         rect_count: 1,
                         ..
                     } => {
+                        saw_compilation_update |= !active_compilations.is_empty();
                         assert!(Some(revision) > opened_revision);
                         std::fs::write(&session.gui_edit_ack, "ok\n")
                             .expect("acknowledge compiled GUI edit");
@@ -362,7 +393,10 @@ mod tests {
                         kind: OutputKind::Data,
                         rect_count,
                         ..
-                    } if rect_count >= 2 => saw_editor_update = true,
+                    } if rect_count >= 2 => {
+                        saw_compilation_update |= !active_compilations.is_empty();
+                        saw_editor_update = true;
+                    }
                     GuiEvent::Fit => saw_fit = true,
                     GuiEvent::WorkspacePath(Some(path)) => {
                         assert_eq!(

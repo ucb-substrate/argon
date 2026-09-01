@@ -17,6 +17,28 @@ wait_for('Argon language server', function()
     and vim.fn.exists(':Argon') == 2
 end)
 
+local compilation_tokens = {}
+local compilation_begins = 0
+local compilation_ends = 0
+vim.api.nvim_create_autocmd('LspProgress', {
+  callback = function(args)
+    local client = vim.lsp.get_client_by_id(args.data.client_id)
+    local params = args.data.params
+    local value = params.value
+    if not client or client.name ~= 'argon' or type(value) ~= 'table' then
+      return
+    end
+    local token = type(params.token) .. ':' .. tostring(params.token)
+    if value.kind == 'begin' and value.title == 'Argon compilation' then
+      compilation_tokens[token] = true
+      compilation_begins = compilation_begins + 1
+    elseif value.kind == 'end' and compilation_tokens[token] then
+      compilation_tokens[token] = nil
+      compilation_ends = compilation_ends + 1
+    end
+  end,
+})
+
 if vim.env.ARGON_TEST_MODE ~= 'rpc_errors' then
   vim.cmd('Argon openCell top()')
 end
@@ -162,6 +184,10 @@ end
 
 wait_for('headless GUI acknowledgement', function()
   return vim.uv.fs_stat(vim.env.ARGON_TEST_ACK) ~= nil
+end)
+
+wait_for('Argon compilation progress to finish', function()
+  return compilation_begins > 0 and compilation_ends == compilation_begins
 end)
 
 assert(#vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) == 1)
