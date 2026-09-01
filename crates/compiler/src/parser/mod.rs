@@ -159,9 +159,7 @@ mod tests {
         }
     }
 
-    /// Renders an expression fully parenthesized, so a precedence or
-    /// associativity change shows up as a diff rather than as a subtly
-    /// different tree that still type checks.
+    /// Renders an expression fully parenthesized.
     fn shape<S: std::fmt::Display, T: crate::ast::AstMetadata>(
         expr: &crate::ast::Expr<S, T>,
     ) -> String {

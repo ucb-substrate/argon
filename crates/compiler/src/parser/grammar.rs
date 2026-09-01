@@ -10,8 +10,8 @@
 //! (validated against the generated `expr_rec`/`precpred`): prefix unary binds
 //! tightest for its operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`,
 //! `as`) binds tighter than the binary operators; `* / %` > `+ -` > comparisons;
-//! all binary operators are left-associative. The boolean connectives postdate
-//! that reference grammar and sit below the comparisons, as in Rust:
+//! all binary operators are left-associative. Boolean operations are lower precedence
+//! than comparisons, as in Rust:
 //! comparisons > `&&` > `||`.
 
 use std::str::FromStr;

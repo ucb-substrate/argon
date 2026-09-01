@@ -1400,9 +1400,6 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
-    /// `+ - * / %`: operands must agree and be numeric, and the result is the
-    /// operand type -- so this rule is the reason the families cannot share one
-    /// result type with the two `Bool`-valued ones.
     fn check_arith(
         &mut self,
         span: cfgrammar::Span,
@@ -1432,11 +1429,7 @@ impl<'a> VarIdTyPass<'a> {
         left_ty
     }
 
-    /// `&& ||`: two `Bool` operands, `Bool` result.
-    ///
-    /// The result is `Bool` regardless of the operands, so one bad operand does
-    /// not cascade into every expression built on top of it.
-    fn check_bool_connective(
+    fn check_bool_expr(
         &mut self,
         left: &Expr<Substr, VarIdTyMetadata>,
         right: &Expr<Substr, VarIdTyMetadata>,
@@ -2121,7 +2114,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         match input.op {
             BinOp::Arith(_) => self.check_arith(input.span, left, right),
             BinOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
-            BinOp::Bool(_) => self.check_bool_connective(left, right),
+            BinOp::Bool(_) => self.check_bool_expr(left, right),
         }
     }
 

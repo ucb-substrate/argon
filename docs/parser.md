@@ -470,7 +470,7 @@ alongside its precedence, so the two cannot drift apart.
 | suffix cluster `. [] ! as`        | `SUFFIX_BP = 11` | tighter than any binary op |
 | prefix unary operand `! -`        | `PREFIX_BP = 13` | see §9.4 |
 
-The boolean connectives sit below the comparisons so `a < b && c < d` reads as
+The boolean operations sit below the comparisons so `a < b && c < d` reads as
 `(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust.
 
 All three families build the same node, `BinOpExpr` (the binary counterpart of
