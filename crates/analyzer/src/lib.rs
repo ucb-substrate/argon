@@ -26,6 +26,7 @@ use argonc::{
         self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
         VarIdTyMetadata,
     },
+    diagnostics,
     nav::NavIndex,
     parse::{self, CellInvocation, WorkspaceParseAst},
 };
@@ -406,7 +407,27 @@ fn is_gui_disconnected(error: &tarpc::client::RpcError) -> bool {
 /// Execution diagnostics may still contain usable output (most notably an
 /// underconstrained cell with initial-condition fallbacks), so those are
 /// published as diagnostics without also claiming that the cell did not open.
+/// Most error messages folded into one editor popup.
+///
+/// The popup is a single line, and a broken file reports an error per
+/// remaining token, so the whole list would otherwise arrive as one
+/// multi-megabyte notification.
+const MAX_POPUP_MESSAGES: usize = 10;
+
 fn blocking_compile_error_messages(output: &CompileOutput) -> Vec<String> {
+    let mut messages = blocking_compile_error_messages_uncapped(output);
+    if messages.len() > MAX_POPUP_MESSAGES {
+        let dropped = messages.len() - MAX_POPUP_MESSAGES;
+        messages.truncate(MAX_POPUP_MESSAGES);
+        messages.push(format!(
+            "... and {dropped} more error{}",
+            if dropped == 1 { "" } else { "s" }
+        ));
+    }
+    messages
+}
+
+fn blocking_compile_error_messages_uncapped(output: &CompileOutput) -> Vec<String> {
     match output {
         CompileOutput::FatalParseErrors => {
             vec!["fatal parse errors encountered, unable to compile".to_string()]
@@ -511,7 +532,7 @@ fn diagnostics(
 ) -> IndexMap<Uri, Vec<Diagnostic>> {
     let mut diagnostics: IndexMap<Uri, Vec<Diagnostic>> = IndexMap::new();
     if let Some(o) = output {
-        let errs = match o {
+        let mut errs = match o {
             CompileOutput::FatalParseErrors => {
                 vec![(
                     Span {
@@ -539,6 +560,22 @@ fn diagnostics(
                 .collect(),
             CompileOutput::Valid(_) => vec![],
         };
+        // The same bound the CLI applies. One unbalanced delimiter reports an
+        // error per remaining token -- thousands for a 36 KB file -- and this
+        // list is rebuilt and published on every keystroke.
+        let dropped = diagnostics::condense_spanned(&mut errs);
+        if dropped > 0 {
+            errs.push((
+                Span {
+                    path: root_dir.join("lib.ar"),
+                    span: cfgrammar::Span::new(0, 0),
+                },
+                format!(
+                    "... and {dropped} more error{}",
+                    if dropped == 1 { "" } else { "s" }
+                ),
+            ));
+        }
         let mut ranger = SpanRanger::new(ast, encoding);
         for (span, message) in errs {
             if let Some(range) = ranger.range(&span)

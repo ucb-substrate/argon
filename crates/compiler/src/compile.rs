@@ -82,6 +82,19 @@ const MAX_EVAL_DEPTH: u32 = 4096;
 /// the writer can never fail partway through a file.
 pub(crate) const MAX_TEXT_LEN: usize = 512;
 
+/// Field names an instance already answers, so a cell's top-level `let` may
+/// not shadow one.
+///
+/// A cell's public fields are exactly its top-level `let` bindings, and
+/// `inst.x` / `inst.y` are the instance's position. The reserved-name check,
+/// the `Ty::Inst` field-access arm, and `gds::argon_ident` (which escapes a
+/// scraped GDS label before it becomes a top-level `let`) all read this list.
+///
+/// The evaluator's `ValueRef::Inst` field dispatch is the fourth site and
+/// cannot: each name maps to a different field of the instance, so it matches
+/// the literals directly and must be updated alongside this constant.
+pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
+
 pub const BUILTINS: [&str; 15] = [
     "list",
     "cons",
@@ -1044,6 +1057,56 @@ fn polygon_coordinate(name: &str) -> Option<PolygonCoordinate> {
     })
 }
 
+/// Renders a type the way a user writes it.
+///
+/// Cell and instance types print as the *name* of the cell they came from.
+/// `Debug` cannot: it expands the `Arc`-shared `CellTy` DAG back into a tree,
+/// so a `{:?}` type in a diagnostic is exponential in hierarchy depth -- the
+/// very explosion the `Arc` on `CellFnTy::cell` exists to prevent. A depth-8
+/// binary hierarchy produced a 30 KB single-line error, a depth-20 one 122 MB.
+impl std::fmt::Display for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ty::Unknown => write!(f, "?"),
+            Ty::Any => write!(f, "Any"),
+            Ty::Bool => write!(f, "Bool"),
+            Ty::Float => write!(f, "Float"),
+            Ty::Int => write!(f, "Int"),
+            Ty::Rect => write!(f, "Rect"),
+            Ty::Polygon => write!(f, "Polygon"),
+            Ty::Path => write!(f, "Path"),
+            Ty::Point => write!(f, "Point"),
+            Ty::String => write!(f, "String"),
+            Ty::Nil => write!(f, "()"),
+            Ty::SeqNil => write!(f, "[]"),
+            Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
+            Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
+            Ty::CellFn(cell_fn) => write!(
+                f,
+                "cell {}({})",
+                cell_fn.cell.name,
+                cell_fn.args.iter().format(", ")
+            ),
+            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.args.iter().format(", "), func.ret),
+            // The name is what distinguishes two same-shaped enums: `EnumTy`
+            // equality keys on `id`, so without it a mismatch renders as
+            // `expected enum {A, B}, found enum {A, B}`.
+            Ty::Enum(e) => write!(f, "enum {} {{{}}}", e.name, e.variants.iter().format(", ")),
+            Ty::Seq(inner) => write!(f, "[{inner}]"),
+            Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
+        }
+    }
+}
+
+/// Whether an instance of `cell` would answer `field`.
+///
+/// A cell's public fields are its top-level `let` bindings plus
+/// [`RESERVED_CELL_FIELDS`]; a GDS-backed cell publishes its geometry at
+/// execution time, so it answers anything.
+fn cell_has_field(cell: &CellTy, field: &str) -> bool {
+    cell.dynamic_fields || cell.data.contains_key(field) || RESERVED_CELL_FIELDS.contains(&field)
+}
+
 impl Ty {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -1108,6 +1171,20 @@ impl Ty {
             (a, b) => (a == b).then(|| a.clone()),
         }
     }
+
+    /// Whether this type satisfies every static check.
+    ///
+    /// `Any` does so by definition. `Unknown` does so for the opposite reason:
+    /// it marks an expression that was *already* diagnosed, and its whole
+    /// purpose is to suppress checking of dependent properties, so comparing
+    /// it structurally turns one error into two. `Ty::lub` has always treated
+    /// it this way.
+    ///
+    /// Every predicate that admits `Any` must go through this, or the
+    /// already-diagnosed expression grows a second, spurious `.. found ?`.
+    pub(crate) fn is_wildcard(&self) -> bool {
+        matches!(self, Ty::Any | Ty::Unknown)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1131,6 +1208,14 @@ pub struct CellFnTy {
 
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct CellTy {
+    /// The name the cell was declared with, carried solely so that a
+    /// diagnostic can say `Inst(inverter)` instead of dumping the field map.
+    ///
+    /// Deliberately excluded from `PartialEq`: cell types are *structural*, so
+    /// two identically shaped cells are the same type regardless of what they
+    /// are called, and `is_eq_ty` falls through to `==`. Including the name
+    /// here would silently make that check nominal.
+    name: String,
     pub(crate) data: IndexMap<String, Ty>,
     /// GDS-backed cells publish geometry fields at execution time. Their
     /// generated source declaration is intentionally only a signature, so
@@ -1148,13 +1233,35 @@ pub struct CellTy {
 
 impl PartialEq for CellTy {
     fn eq(&self, other: &Self) -> bool {
-        self.data == other.data && self.dynamic_fields == other.dynamic_fields
+        // Destructured rather than field-by-field so that a field added later
+        // has to be named here, instead of being silently excluded from
+        // structural equality.
+        let Self {
+            name: _,
+            data,
+            dynamic_fields,
+            def: _,
+        } = self;
+        let Self {
+            name: _,
+            data: other_data,
+            dynamic_fields: other_dynamic_fields,
+            def: _,
+        } = other;
+        data == other_data && dynamic_fields == other_dynamic_fields
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumTy {
     pub(crate) id: EnumId,
+    /// The name the enum was declared with, module-qualified, carried solely
+    /// so a diagnostic can distinguish two same-shaped enums.
+    ///
+    /// Redundant for equality -- `id` is already unique per declaration -- but
+    /// without it `Display` renders both sides of a mismatch as
+    /// `enum {N, S}`, which is the defect `Display` exists to remove.
+    name: String,
     pub(crate) variants: IndexSet<String>,
 }
 
@@ -1194,6 +1301,20 @@ impl<'a> VarIdTyPass<'a> {
             path: self.ast.path.clone(),
             span,
         }
+    }
+
+    /// The name a diagnostic should use for a declaration in this module.
+    ///
+    /// Cell and enum types are structural, so two same-named declarations in
+    /// different modules are different types that a bare name renders
+    /// identically: `expected type Inst(child), found Inst(child)`. Matches
+    /// the qualification `ExecPass` records for the GDS exporter.
+    fn qualified_name(&self, name: &str) -> String {
+        self.current_path
+            .iter()
+            .map(String::as_str)
+            .chain([name])
+            .join("::")
     }
 
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
@@ -1398,6 +1519,7 @@ impl<'a> VarIdTyPass<'a> {
         }
         let ty = Ty::Enum(EnumTy {
             id: self.alloc_id(),
+            name: self.qualified_name(&input.name.name),
             variants,
         });
         self.alloc(&input.name.name, ty);
@@ -1431,7 +1553,7 @@ impl<'a> VarIdTyPass<'a> {
             span: self.span(field.span),
             kind: StaticErrorKind::NoFieldOnTy {
                 field: field.name.to_string(),
-                ty,
+                ty: ty.to_string(),
             },
         });
         Ty::Unknown
@@ -1440,7 +1562,7 @@ impl<'a> VarIdTyPass<'a> {
     fn cannot_index<M: AstMetadata>(&mut self, base: &Expr<Substr, M>, ty: Ty) -> Ty {
         self.errors.push(StaticError {
             span: self.span(base.span()),
-            kind: StaticErrorKind::CannotIndex { ty },
+            kind: StaticErrorKind::CannotIndex { ty: ty.to_string() },
         });
         Ty::Unknown
     }
@@ -1459,16 +1581,16 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::ArithMismatchedTypes,
             });
         }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
+        if !(matches!(left_ty, Ty::Float | Ty::Int) || left_ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(left.span()),
-                kind: StaticErrorKind::ArithInvalidType(left_ty.clone()),
+                kind: StaticErrorKind::ArithInvalidType(left_ty.to_string()),
             });
         }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
+        if !(matches!(right_ty, Ty::Float | Ty::Int) || right_ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(right.span()),
-                kind: StaticErrorKind::ArithInvalidType(right_ty),
+                kind: StaticErrorKind::ArithInvalidType(right_ty.to_string()),
             });
         }
         left_ty
@@ -1556,10 +1678,21 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::SeqMustCompareEqSeqNil,
             });
         }
+        // `Ty::Any` is deliberately *not* admitted here: the evaluator has no
+        // comparison arm for a string, so `1. < any` has to be rejected
+        // statically. `Ty::Unknown` is admitted, because the expression that
+        // produced it was already diagnosed.
         for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
             if !matches!(
                 ty,
-                Ty::Float | Ty::Int | Ty::Bool | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+                Ty::Float
+                    | Ty::Int
+                    | Ty::Bool
+                    | Ty::Enum(_)
+                    | Ty::Seq(_)
+                    | Ty::Nil
+                    | Ty::SeqNil
+                    | Ty::Unknown
             ) {
                 self.errors.push(StaticError {
                     span: self.span(operand.span()),
@@ -1577,7 +1710,7 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
-        if *a == Ty::Any || *b == Ty::Any {
+        if a.is_wildcard() || b.is_wildcard() {
             return true;
         }
 
@@ -1614,19 +1747,19 @@ impl<'a> VarIdTyPass<'a> {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
-                    found: found.clone(),
-                    expected: expected.clone(),
+                    found: found.to_string(),
+                    expected: expected.to_string(),
                 },
             });
         }
     }
 
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+        if !(matches!(ty, Ty::Cell(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.clone(),
+                    found: ty.to_string(),
                     expected: "Cell".into(),
                 },
             });
@@ -1634,11 +1767,11 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Enum(_) | Ty::Any) {
+        if !(matches!(ty, Ty::Enum(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.clone(),
+                    found: ty.to_string(),
                     expected: "Enum".into(),
                 },
             });
@@ -1731,7 +1864,7 @@ impl<'a> VarIdTyPass<'a> {
                 ty => {
                     self.errors.push(StaticError {
                         span: self.span(call_span),
-                        kind: StaticErrorKind::CannotCall(ty),
+                        kind: StaticErrorKind::CannotCall(ty.to_string()),
                     });
                     (None, Ty::Unknown)
                 }
@@ -1961,10 +2094,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .iter()
             .filter_map(|stmt| {
                 if let Statement::LetBinding(lt) = stmt {
-                    if ["x", "y"].contains(&lt.name.name.as_str()) {
+                    if RESERVED_CELL_FIELDS.contains(&lt.name.name.as_str()) {
                         self.errors.push(StaticError {
                             span: self.span(lt.name.span),
-                            kind: StaticErrorKind::RedeclarationOfBuiltin,
+                            kind: StaticErrorKind::ReservedCellField {
+                                name: lt.name.name.to_string(),
+                            },
                         });
                     }
                     Some((lt.name.name.to_string(), lt.value.ty()))
@@ -1990,6 +2125,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             cell: Arc::new(CellTy {
+                name: self.qualified_name(&input.name.name),
                 data,
                 dynamic_fields,
                 def: (!dynamic_fields).then_some(cell_id),
@@ -2051,7 +2187,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let cond_ty = cond.ty();
         let then_ty = then.metadata.clone();
         let else_ty = else_.metadata.clone();
-        if cond_ty != Ty::Bool {
+        // `Unknown` marks an expression that was already diagnosed, so it must
+        // not produce a second `if conditions must have type bool`. `Any` is
+        // still rejected: the evaluator has no fallback for a non-bool
+        // condition.
+        if cond_ty != Ty::Bool && !matches!(cond_ty, Ty::Unknown) {
             self.errors.push(StaticError {
                 span: self.span(cond.span()),
                 kind: StaticErrorKind::IfCondNotBool,
@@ -2092,6 +2232,26 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Enum(_) => Some(scrutinee_ty.clone()),
             _ => pattern_ty,
         };
+
+        // Neither the scrutinee nor any arm pattern names an enum, so there is
+        // nothing to check the arms against. Falling through to
+        // `Ty::Unknown` silently was harmless only while `is_eq_ty` compared
+        // `Unknown` structurally; it now satisfies every downstream check, so
+        // an unsayable match type has to be reported here or `--check`
+        // accepts a program the evaluator refuses.
+        if expected_ty.is_none() {
+            let already_diagnosed = matches!(scrutinee_ty, Ty::Unknown)
+                || arms
+                    .iter()
+                    .any(|arm| matches!(arm.pattern.metadata.1, Ty::Unknown));
+            if !already_diagnosed {
+                self.errors.push(StaticError {
+                    span: self.span(scrutinee.span()),
+                    kind: StaticErrorKind::NotAnEnum,
+                });
+            }
+            return Ty::Unknown;
+        }
 
         if let Some(Ty::Enum(ref e)) = expected_ty {
             let mut covered = IndexSet::new();
@@ -2168,7 +2328,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
             UnaryOp::Neg => {
                 let operand_ty = operand.ty();
-                if ![Ty::Float, Ty::Int, Ty::Any].contains(&operand_ty) {
+                if !(matches!(operand_ty, Ty::Float | Ty::Int) || operand_ty.is_wildcard()) {
                     self.errors.push(StaticError {
                         span: self.span(operand.span()),
                         kind: StaticErrorKind::UnaryOpInvalidType,
@@ -2214,7 +2374,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
             Ty::Inst(ref c) => match field.name.as_str() {
-                "x" | "y" => Ty::Float,
+                name if RESERVED_CELL_FIELDS.contains(&name) => Ty::Float,
                 name => c.data.get(name).cloned().unwrap_or_else(|| {
                     if c.dynamic_fields {
                         Ty::Any
@@ -2223,6 +2383,35 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     }
                 }),
             },
+            // A cell's coordinates are only determined relative to a
+            // placement, so reading its geometry before `inst(...)` is
+            // meaningless -- and the evaluator already refuses it. Saying so
+            // beats the generic no-field error, which used to assert that a
+            // field was missing while printing the map that contained it.
+            //
+            // Only when the field exists, though: telling someone who
+            // misspelled a field to place the cell first is advice that
+            // cannot help, so an unknown name still gets the no-field error.
+            Ty::Cell(ref c) if cell_has_field(c, field.name.as_str()) => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CellFieldBeforePlacement {
+                        cell: c.name.clone(),
+                        field: field.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            }
+            Ty::CellFn(ref c) if cell_has_field(&c.cell, &field.name) => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CellFnFieldAccess {
+                        cell: c.cell.name.clone(),
+                        field: field.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            }
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
@@ -2261,7 +2450,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(field.span),
-                    kind: StaticErrorKind::CannotIndexFieldAccess { ty: base_ty },
+                    kind: StaticErrorKind::CannotIndexFieldAccess {
+                        ty: base_ty.to_string(),
+                    },
                 });
                 Ty::Unknown
             }
@@ -2393,8 +2584,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
-                                    found: tailty,
-                                    expected: seqty.clone(),
+                                    found: tailty.to_string(),
+                                    expected: seqty.to_string(),
                                 },
                             });
                         }
@@ -2424,8 +2615,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                     self.errors.push(StaticError {
                                         span: self.span(arg.span()),
                                         kind: StaticErrorKind::IncorrectTy {
-                                            expected: elem_ty.clone(),
-                                            found: arg_ty,
+                                            expected: elem_ty.to_string(),
+                                            found: arg_ty.to_string(),
                                         },
                                     });
                                     elem_ty = Ty::Unknown;
@@ -2454,7 +2645,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                 self.errors.push(StaticError {
                                     span: self.span(input.span),
                                     kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty,
+                                        found: argty.to_string(),
                                         expected: "Seq".to_string(),
                                     },
                                 });
@@ -2478,7 +2669,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                 self.errors.push(StaticError {
                                     span: self.span(input.span),
                                     kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty,
+                                        found: argty.to_string(),
                                         expected: "Seq".to_string(),
                                     },
                                 });
@@ -2500,7 +2691,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             self.errors.push(StaticError {
                                 span: self.span(input.span),
                                 kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: argty,
+                                    found: argty.to_string(),
                                     expected: "Cell/Inst".to_string(),
                                 },
                             });
@@ -2591,7 +2782,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         ) {
             self.errors.push(StaticError {
                 span: self.span(value.span()),
-                kind: StaticErrorKind::CannotEmit(ty.clone()),
+                kind: StaticErrorKind::CannotEmit(ty.to_string()),
             });
         }
         ty
@@ -2617,8 +2808,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             | (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Int)
             | (Ty::Float, Ty::Float) => (),
-            (_, Ty::Unknown) => (),
-            (Ty::Any, _) | (_, Ty::Any) => (),
+            // Either side being a wildcard suppresses the check: `Any` by
+            // definition, `Unknown` because the expression that produced it
+            // was already diagnosed. The source side used to admit only
+            // `Any`, so an undeclared name reported a second `invalid type
+            // cast`.
+            (source, target) if source.is_wildcard() || target.is_wildcard() => (),
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
@@ -2701,7 +2896,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.seq.span()),
-                    kind: StaticErrorKind::CannotIterate { ty: seq_ty },
+                    kind: StaticErrorKind::CannotIterate {
+                        ty: seq_ty.to_string(),
+                    },
                 });
                 Ty::Unknown
             }
@@ -3099,6 +3296,19 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
+    /// Values the *compiler* defaults when nothing else determines them, as
+    /// `(expr = 0, span)`, in source order.
+    ///
+    /// Distinct from `fallback_constraints`, which hold author-written initial
+    /// conditions (`x0i=`): those deliberately leave the cell underconstrained
+    /// and say so, and they rank *above* everything here. A default is the
+    /// last thing tried, so it can only ever pin a value nothing in the source
+    /// reached.
+    ///
+    /// The underconstrained check does not see that order: it is measured on a
+    /// trial solve with these applied, so a path extension nobody constrained
+    /// is not counted as a degree of freedom the author introduced.
+    compiler_defaults: VecDeque<(LinearExpr, Span)>,
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
@@ -3483,7 +3693,7 @@ impl<'a> ExecPass<'a> {
         // Reject a non-cell invocation statically, so the error lands on what
         // the caller wrote rather than surfacing from the executor.
         let ty = value.ty();
-        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+        if !(matches!(ty, Ty::Cell(_)) || ty.is_wildcard()) {
             return CompileOutput::StaticErrors(StaticErrorCompileOutput {
                 errors: vec![StaticError {
                     span: Span {
@@ -3491,7 +3701,7 @@ impl<'a> ExecPass<'a> {
                         span: value.span(),
                     },
                     kind: StaticErrorKind::IncorrectTyCategory {
-                        found: ty,
+                        found: ty.to_string(),
                         expected: "Cell".into(),
                     },
                 }],
@@ -3551,6 +3761,61 @@ impl<'a> ExecPass<'a> {
                 output: Some(data),
             })
         }
+    }
+
+    /// Records the cell's degrees of freedom and reports them, once.
+    ///
+    /// Measured on a trial solve with every pending compiler default applied:
+    /// a path extension nobody constrained is not a degree of freedom the
+    /// author introduced, and counting it would report every path without an
+    /// extension kwarg as underconstrained. The trial is rolled back rather
+    /// than kept, because those defaults rank below the author's fallbacks and
+    /// none of those have been applied yet.
+    ///
+    /// A trial that solves everything means the only freedom was the
+    /// compiler's own, which is not something to report.
+    fn report_underconstrained(&mut self, cell_id: CellId) {
+        let state = self.cell_state_mut(cell_id);
+        if state.unsolved_vars.is_some() {
+            return;
+        }
+        let snapshot = state.solver.clone();
+        let mut index = 0;
+        while index < state.compiler_defaults.len() {
+            let constraint = state.compiler_defaults[index].0.clone();
+            if state.solver.has_unsolved_var(&constraint) {
+                state.solver.constrain_eq0(constraint);
+                state.solver.solve();
+            }
+            index += 1;
+        }
+        let unsolved_vars = state.solver.unsolved_vars().clone();
+        let spans = unsolved_vars
+            .iter()
+            .filter_map(|var| state.var_span_map.get(var).cloned())
+            .collect::<IndexSet<_>>();
+        state.sse_basis = match state.solver.sparse_nullspace_vecs() {
+            Some(vectors) => SseBasis::Nullspace(vectors),
+            None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+        };
+        // The trial's constraint ids roll back with it, so nothing above
+        // recorded a span for one.
+        state.solver = snapshot;
+        let underconstrained = !unsolved_vars.is_empty();
+        state.unsolved_vars = Some(unsolved_vars);
+        if !underconstrained {
+            return;
+        }
+        let spans = if spans.is_empty() {
+            vec![None]
+        } else {
+            spans.into_iter().map(Some).collect()
+        };
+        self.errors.extend(spans.into_iter().map(|span| ExecError {
+            span,
+            cell: cell_id,
+            kind: ExecErrorKind::Underconstrained,
+        }));
     }
 
     pub(crate) fn execute_cell(
@@ -3642,7 +3907,7 @@ impl<'a> ExecPass<'a> {
                 cell: 0,
                 kind: ExecErrorKind::InvalidCellArgumentType {
                     index: index + 1,
-                    expected: decl.metadata.1.clone(),
+                    expected: decl.metadata.1.to_string(),
                     found: arg.ty_name().to_string(),
                 },
             });
@@ -3686,6 +3951,7 @@ impl<'a> ExecPass<'a> {
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
+                        compiler_defaults: VecDeque::new(),
                         sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
@@ -3787,65 +4053,73 @@ impl<'a> ExecPass<'a> {
             update_var_dependents(state);
 
             if !progress {
-                let underconstrained_spans = {
-                    let state = self.cell_state_mut(cell_id);
-                    if state.unsolved_vars.is_some() {
-                        None
-                    } else {
-                        let unsolved_vars = state.solver.unsolved_vars().clone();
-                        let spans = unsolved_vars
-                            .iter()
-                            .filter_map(|var| state.var_span_map.get(var).cloned())
-                            .collect::<IndexSet<_>>();
-                        state.unsolved_vars = Some(unsolved_vars);
-                        state.sse_basis = match state.solver.sparse_nullspace_vecs() {
-                            Some(vectors) => SseBasis::Nullspace(vectors),
-                            None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
-                        };
-                        Some(spans)
-                    }
-                };
-                if let Some(spans) = underconstrained_spans {
-                    let spans = if spans.is_empty() {
-                        vec![None]
-                    } else {
-                        spans.into_iter().map(Some).collect()
-                    };
-                    self.errors.extend(spans.into_iter().map(|span| ExecError {
-                        span,
-                        cell: cell_id,
-                        kind: ExecErrorKind::Underconstrained,
-                    }));
-                }
-                let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);
-                while let Some(FallbackConstraint {
-                    constraint,
-                    span,
-                    initial_condition,
-                    ..
-                }) = state.fallback_constraints.pop()
-                {
-                    if constraint
-                        .coeffs
-                        .iter()
-                        .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
-                    {
-                        state.fallback_constraints_used.push(UsedFallback {
-                            constraint: constraint.clone(),
-                            span: span.clone(),
-                            initial_condition,
-                        });
-                        let constraint_id = state.solver.constrain_eq0(constraint);
-                        state.constraint_span_map.insert(constraint_id, span);
-                        constraint_added = true;
+                // The highest-priority author fallback that still determines
+                // something. Ones whose variables another constraint has since
+                // solved are moot, and dropped.
+                let mut chosen = None;
+                while let Some(fallback) = state.fallback_constraints.pop() {
+                    if state.solver.has_unsolved_var(&fallback.constraint) {
+                        chosen = Some(fallback);
                         break;
                     }
                 }
-                if !constraint_added {
-                    state.solver.force_solution();
-                    update_var_dependents(state);
+                let mut constraint_added = false;
+                if chosen.is_none() {
+                    // Compiler defaults rank below every author-written
+                    // fallback: they say what a value is when *nothing* in the
+                    // source determines it. Applying one before the fallbacks
+                    // had their turn let a compiler zero propagate through the
+                    // author's own constraints and determine the variable an
+                    // `x0i=` was waiting for, which was then skipped as moot.
+                    //
+                    // Exactly one per iteration, so that `solve()` runs between
+                    // any two: applying the batch tested each default against
+                    // solver state that had not yet seen the others, so a
+                    // system with fewer degrees of freedom than defaults was
+                    // over-constrained and reported as inconsistent even when
+                    // it was satisfiable.
+                    while let Some((constraint, span)) = state.compiler_defaults.pop_front() {
+                        if state.solver.has_unsolved_var(&constraint) {
+                            let id = state.solver.constrain_eq0(constraint);
+                            state.constraint_span_map.insert(id, span);
+                            constraint_added = true;
+                            break;
+                        }
+                    }
                 }
+                if !constraint_added {
+                    // Either an author fallback is about to be applied or
+                    // nothing is left to apply at all. Both are the moment to
+                    // measure the cell's degrees of freedom: every compiler
+                    // default has had its turn, and no fallback -- which is an
+                    // author saying "leave this free" -- has been taken up yet.
+                    self.report_underconstrained(cell_id);
+                    let state = self.cell_state_mut(cell_id);
+                    match chosen {
+                        Some(FallbackConstraint {
+                            constraint,
+                            span,
+                            initial_condition,
+                            ..
+                        }) => {
+                            state.fallback_constraints_used.push(UsedFallback {
+                                constraint: constraint.clone(),
+                                span: span.clone(),
+                                initial_condition,
+                            });
+                            let id = state.solver.constrain_eq0(constraint);
+                            state.constraint_span_map.insert(id, span);
+                        }
+                        None => state.solver.force_solution(),
+                    }
+                }
+                let state = self.cell_state_mut(cell_id);
+                // `constrain_eq0` and `force_solution` can solve variables
+                // outright. Values blocked on one are re-queued only here, so
+                // skipping this let the loop exit with a value still deferred
+                // and `emit` panic on it.
+                update_var_dependents(state);
             }
         }
 
@@ -3906,6 +4180,11 @@ impl<'a> ExecPass<'a> {
             self.cell_state(cell_id)
                 .emit
                 .iter()
+                // A poisoned value has no object to emit, but it already
+                // reported why. Adding `CannotEmit` on top would be the second
+                // error for one mistake, and the `Err` below would then throw
+                // away the layout the rest of the cell produced.
+                .filter(|emit| !self.is_poisoned(emit.value))
                 .filter(|emit| {
                     !self.values[&emit.value]
                         .get_ready()
@@ -3943,7 +4222,12 @@ impl<'a> ExecPass<'a> {
                 self.errors.push(ExecError {
                     span: None,
                     cell: 0,
-                    kind: ExecErrorKind::InvalidGds(error.to_string()),
+                    // `{:#}` walks the whole `anyhow` chain. `to_string()`
+                    // renders only the outermost context, so a missing file, a
+                    // truncated one, and a malformed record all arrived as the
+                    // same "could not read imported GDS `..`" with the cause
+                    // discarded.
+                    kind: ExecErrorKind::InvalidGds(format!("{error:#}")),
                 });
                 return Err(());
             }
@@ -4370,6 +4654,15 @@ impl<'a> ExecPass<'a> {
 
         let mut emitted = IndexSet::new();
         for emit in state.emit.iter() {
+            // A poisoned value reported its own diagnostic and never became an
+            // object. Skipping it is what lets the rest of the cell reach the
+            // GUI instead of the whole compile returning no layout at all.
+            if matches!(
+                self.values[&emit.value].as_ref().into_ready(),
+                Some(Value::Poison)
+            ) {
+                continue;
+            }
             let obj_id = emit_value(emit.value)
                 .expect("failed to emit")
                 .into_elem()
@@ -4943,6 +5236,10 @@ impl<'a> ExecPass<'a> {
                 }
                 Some(CellArg::Seq(args))
             }
+            // Already reported when it was poisoned. The caller turns this
+            // `Err` into poison of its own rather than a second diagnostic
+            // naming a type the value never had.
+            Value::Poison => return Err(()),
             v => {
                 self.errors.push(ExecError {
                     span: None,
@@ -4952,6 +5249,32 @@ impl<'a> ExecPass<'a> {
                 return Err(());
             }
         })
+    }
+
+    /// Whether `vid` errored and said so. See [`Value::Poison`].
+    fn is_poisoned(&self, vid: ValueId) -> bool {
+        matches!(
+            self.values.get(&vid).and_then(Defer::get_ready),
+            Some(Value::Poison)
+        )
+    }
+
+    /// Marks `vid` as poisoned, having already reported the diagnostic for it,
+    /// and re-queues whatever was waiting on it.
+    ///
+    /// Returns `Ok(true)`: poisoning is progress. The alternative -- reporting
+    /// and returning `Err(())` -- unwinds out of `execute_cell` entirely, which
+    /// suppressed every other diagnostic in the cell and left
+    /// `ExecErrorCompileOutput::output` as `None`, so the GUI reported the cell
+    /// as failing to open over a single bad field read.
+    fn poison(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
+        self.values.insert(vid, Defer::Ready(Value::Poison));
+        if let Some(deps) = self.value_dependents.get(&vid) {
+            for dep_vid in deps.clone() {
+                self.cell_state_mut(cell_id).deferred.insert(dep_vid);
+            }
+        }
+        Ok(true)
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -4972,6 +5295,18 @@ impl<'a> ExecPass<'a> {
             Defer::Deferred(v) => v.clone(),
         };
         let cell_id = vref.loc.cell;
+        // Poison propagates here rather than at each read: a value built from
+        // one whose diagnostic was already reported would otherwise raise a
+        // second, derived error at every level of the expression tree it
+        // appears in.
+        if vref
+            .state
+            .inputs()
+            .iter()
+            .any(|input| matches!(self.values.get(input), Some(Defer::Ready(Value::Poison))))
+        {
+            return self.poison(cell_id, vid);
+        }
         let state = self.cell_states.get_mut(&cell_id).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
@@ -4998,7 +5333,7 @@ impl<'a> ExecPass<'a> {
                             match self.typed_string(arg_vid, vid, cell_id, &span) {
                                 Typed::Ready(layer) => Some(Some(layer)),
                                 Typed::Pending => None,
-                                Typed::Invalid => return Err(()),
+                                Typed::Invalid => return self.poison(cell_id, vid),
                             }
                         }
                     };
@@ -5122,7 +5457,7 @@ impl<'a> ExecPass<'a> {
                         {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => return Ok(false),
-                            Typed::Invalid => return Err(()),
+                            Typed::Invalid => return self.poison(cell_id, vid),
                         };
                         let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
                             Value::Int(count) => {
@@ -5132,7 +5467,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 };
                                 if count < 3 {
                                     self.errors.push(ExecError {
@@ -5140,7 +5475,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 if count > MAX_SHAPE_POINTS {
                                     self.errors.push(ExecError {
@@ -5151,7 +5486,7 @@ impl<'a> ExecPass<'a> {
                                             limit: MAX_SHAPE_POINTS,
                                         },
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 let state = self.cell_state_mut(cell_id);
                                 (0..count)
@@ -5169,7 +5504,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         if points.len() < 3 {
@@ -5178,7 +5513,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPolygon,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                         for kwarg in &c.expr.args.kwargs {
                             let coordinate = polygon_coordinate(kwarg.name.name.as_str())
@@ -5189,7 +5524,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         }
 
@@ -5269,7 +5604,7 @@ impl<'a> ExecPass<'a> {
                         ) {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => return Ok(false),
-                            Typed::Invalid => return Err(()),
+                            Typed::Invalid => return self.poison(cell_id, vid),
                         };
                         let point_spec = &self.values[&c.state.posargs[1]];
                         let count = match point_spec.as_ref().unwrap_ready().as_ref() {
@@ -5280,7 +5615,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         let Some(count) = count.filter(|count| *count >= 2) else {
@@ -5289,7 +5624,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPath,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         if count > MAX_SHAPE_POINTS {
                             self.errors.push(ExecError {
@@ -5300,7 +5635,7 @@ impl<'a> ExecPass<'a> {
                                     limit: MAX_SHAPE_POINTS,
                                 },
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                         for kwarg in &c.expr.args.kwargs {
                             let name = kwarg.name.name.as_str();
@@ -5312,7 +5647,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         }
 
@@ -5329,16 +5664,28 @@ impl<'a> ExecPass<'a> {
                         });
                         let state = self.cell_state_mut(cell_id);
                         let width = state.new_solver_var(&span).into();
-                        let begin_extension = if has_begin_extension {
-                            state.new_solver_var(&span).into()
-                        } else {
-                            LinearExpr::from(0.)
+                        // Extensions are free variables even when no kwarg
+                        // names them, exactly as `width` always is. Making
+                        // them conditional meant `eq(p.begin_extension, 5.)`
+                        // degenerated to `0 - 5 = 0` and reported a bare
+                        // "inconsistent constraint" with nothing to say the
+                        // extension had never become a variable.
+                        //
+                        // The default of zero is a *fallback*, so it applies
+                        // only if nothing else determines the extension: a
+                        // path that ignores extensions still solves to zero,
+                        // and one that constrains them now works.
+                        let extension = |state: &mut CellState, named: bool| {
+                            let var = state.new_solver_var(&span);
+                            if !named {
+                                state
+                                    .compiler_defaults
+                                    .push_back((var.into(), span.clone()));
+                            }
+                            LinearExpr::from(var)
                         };
-                        let end_extension = if has_end_extension {
-                            state.new_solver_var(&span).into()
-                        } else {
-                            LinearExpr::from(0.)
-                        };
+                        let begin_extension = extension(state, has_begin_extension);
+                        let end_extension = extension(state, has_end_extension);
                         let points = (0..count)
                             .map(|_| {
                                 (
@@ -5466,7 +5813,7 @@ impl<'a> ExecPass<'a> {
                             args[3].get_linear().cloned(),
                         ) else {
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -5535,7 +5882,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         if let Some(r) = r {
@@ -5611,7 +5958,7 @@ impl<'a> ExecPass<'a> {
                         let (Some(vl), Some(vr)) = (vl.get_linear(), vr.get_linear()) else {
                             let span = self.span(&vref.loc, c.expr.span);
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let expr = vl.clone() - vr.clone();
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -5657,7 +6004,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(Value::Seq(val)));
@@ -5713,7 +6060,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::ZeroRangeStep,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             let mut seq = Seq::new();
                             let mut i = *start;
@@ -5728,7 +6075,7 @@ impl<'a> ExecPass<'a> {
                                             limit: MAX_SEQ_LEN,
                                         },
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 seq.push_back(Value::Int(i));
                                 // A wrapping `i` would reverse the comparison
@@ -5748,7 +6095,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     } else {
                         self.add_value_dependent(c.state.posargs[0], vid);
@@ -5767,7 +6114,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::HeadEmptyList,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             Value::Seq(s) => {
                                 if let Some(s) = s.front() {
@@ -5779,7 +6126,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::HeadEmptyList,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             }
                             _ => {
@@ -5789,7 +6136,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(val));
@@ -5809,7 +6156,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::TailEmptyList,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             Value::Seq(s) => {
                                 if !s.is_empty() {
@@ -5826,7 +6173,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::TailEmptyList,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             }
                             _ => {
@@ -5836,7 +6183,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(val));
@@ -5867,7 +6214,7 @@ impl<'a> ExecPass<'a> {
                             .collect::<Option<Vec<_>>>();
                         let (Some(horiz), Some(linears)) = (horiz, linears) else {
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         // Positional order is (p, n, value, coord, pstop, nstop).
                         let [p, n, value, coord, pstop, nstop] =
@@ -5943,8 +6290,14 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                     };
-                    let refl = read_bool(self, reflect_arg)?;
-                    let construction = read_bool(self, construction_arg)?;
+                    let refl = match read_bool(self, reflect_arg) {
+                        Ok(value) => value,
+                        Err(()) => return self.poison(cell_id, vid),
+                    };
+                    let construction = match read_bool(self, construction_arg) {
+                        Ok(value) => value,
+                        Err(()) => return self.poison(cell_id, vid),
+                    };
                     let angle = match angle_arg {
                         None => None,
                         Some((kwarg, arg_vid)) => {
@@ -5970,7 +6323,7 @@ impl<'a> ExecPass<'a> {
                                     pending = true;
                                     None
                                 }
-                                Typed::Invalid => return Err(()),
+                                Typed::Invalid => return self.poison(cell_id, vid),
                             }
                         }
                     };
@@ -6049,9 +6402,12 @@ impl<'a> ExecPass<'a> {
                     for arg_vid in c.state.posargs.iter() {
                         match self.values[arg_vid].clone() {
                             Defer::Ready(v) => {
-                                match self.cell_arg_from_value(cell_id, *arg_vid, &v)? {
-                                    Some(arg) => arg_vals.push(arg),
-                                    None => unready.push(*arg_vid),
+                                match self.cell_arg_from_value(cell_id, *arg_vid, &v) {
+                                    Ok(Some(arg)) => arg_vals.push(arg),
+                                    Ok(None) => unready.push(*arg_vid),
+                                    // The diagnostic is already recorded, here
+                                    // or when the argument was poisoned.
+                                    Err(()) => return self.poison(cell_id, vid),
                                 }
                             }
                             _ => unready.push(*arg_vid),
@@ -6124,7 +6480,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             if let Some(res) = res {
@@ -6141,7 +6497,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::NonFiniteValue,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 self.values
                                     .insert(vid, DeferValue::Ready(Value::Linear(res)));
@@ -6169,7 +6525,7 @@ impl<'a> ExecPass<'a> {
                                         .to_owned(),
                                     ),
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             let res = match arith.op {
                                 ArithOp::Add => vl.checked_add(*vr),
@@ -6194,7 +6550,7 @@ impl<'a> ExecPass<'a> {
                                         .to_owned(),
                                     ),
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
@@ -6206,7 +6562,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6235,7 +6591,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values
@@ -6248,7 +6604,7 @@ impl<'a> ExecPass<'a> {
                                 UnaryOp::Neg => {
                                     let span = self.span(&vref.loc, unary_op.expr.span);
                                     self.invalid_type(cell_id, &span);
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
@@ -6265,7 +6621,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IntegerOverflow("-".to_owned()),
                                         });
-                                        return Err(());
+                                        return self.poison(cell_id, vid);
                                     };
                                     res
                                 }
@@ -6276,7 +6632,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
@@ -6289,7 +6645,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6363,7 +6719,7 @@ impl<'a> ExecPass<'a> {
                         let Some(variant) = val.get_enum_value() else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let arm = match_
                             .expr
@@ -6373,7 +6729,7 @@ impl<'a> ExecPass<'a> {
                         let Some(arm) = arm else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let value = self.visit_expr(vref.loc, &arm.expr);
                         match_.state = MatchExprState::Value(value);
@@ -6402,7 +6758,7 @@ impl<'a> ExecPass<'a> {
                         let Some(left_val) = val.get_bool().copied() else {
                             let span = self.span(&vref.loc, bool_op.expr.left.span());
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         // Whether or not this expression should short-circuit.
                         let decided = match bool_op.op {
@@ -6431,7 +6787,7 @@ impl<'a> ExecPass<'a> {
                         let Some(res) = val.get_bool().copied() else {
                             let span = self.span(&vref.loc, bool_op.expr.right.span());
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                         true
@@ -6498,7 +6854,7 @@ impl<'a> ExecPass<'a> {
                     let Some(res) = res else {
                         let span = self.span(&vref.loc, cmp.expr.span);
                         self.invalid_type(cell_id, &span);
-                        return Err(());
+                        return self.poison(cell_id, vid);
                     };
                     self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                     true
@@ -6520,18 +6876,26 @@ impl<'a> ExecPass<'a> {
                                 "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
                                 "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
                                 "layer" => {
-                                    if let Some(layer) = rect.layer.clone() {
-                                        Value::String(layer)
-                                    } else {
+                                    let Some(layer) = rect.layer.clone() else {
+                                        // A construction rect has no layer.
+                                        // Returning a fabricated `""` here
+                                        // used to add a second, unrelated
+                                        // error about the empty-string layer
+                                        // being absent from the technology
+                                        // file; failing the read reports the
+                                        // one thing that actually went wrong.
                                         let span =
                                             self.span(&vref.loc, field_access_expr.expr.span);
                                         self.errors.push(ExecError {
                                             span: Some(span),
                                             cell: cell_id,
-                                            kind: ExecErrorKind::InvalidRotation,
+                                            kind: ExecErrorKind::EmptyField {
+                                                field: "layer".to_string(),
+                                            },
                                         });
-                                        Value::String("".to_string())
-                                    }
+                                        return self.poison(cell_id, vid);
+                                    };
+                                    Value::String(layer)
                                 }
                                 _ => {
                                     let span = self.span(&vref.loc, field_access_expr.expr.span);
@@ -6540,7 +6904,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6570,7 +6934,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IndexOutOfBounds,
                                         });
-                                        return Err(());
+                                        return self.poison(cell_id, vid);
                                     };
                                     Value::Linear(match coordinate.axis {
                                         PolygonAxis::X => point.0.clone(),
@@ -6585,7 +6949,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6617,7 +6981,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IndexOutOfBounds,
                                         });
-                                        return Err(());
+                                        return self.poison(cell_id, vid);
                                     };
                                     Value::Linear(match coordinate.axis {
                                         PolygonAxis::X => point.0.clone(),
@@ -6632,7 +6996,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6650,7 +7014,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6669,7 +7033,7 @@ impl<'a> ExecPass<'a> {
                                             let span =
                                                 self.span(&vref.loc, field_access_expr.expr.span);
                                             self.invalid_type(cell_id, &span);
-                                            return Err(());
+                                            return self.poison(cell_id, vid);
                                         };
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
@@ -6685,10 +7049,12 @@ impl<'a> ExecPass<'a> {
                                                         field_access_expr.expr.span,
                                                     )),
                                                     cell: cell_id,
-                                                    // TODO: More descriptive error
-                                                    kind: ExecErrorKind::EmptyBbox,
+                                                    kind: ExecErrorKind::NoFieldOnInstance {
+                                                        field: field.to_string(),
+                                                        cell: cell.name.clone(),
+                                                    },
                                                 });
-                                                return Err(());
+                                                return self.poison(cell_id, vid);
                                             };
                                         let obj_id = &mut self.next_id;
                                         let cell_state =
@@ -6862,7 +7228,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6887,7 +7253,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         }
                         _ => {
@@ -6897,7 +7263,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6921,7 +7287,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         } else {
                             let span = self.span(&vref.loc, index_expr.expr.index.span());
@@ -6930,7 +7296,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     } else {
                         let span = self.span(&vref.loc, index_expr.expr.base.span());
@@ -6939,7 +7305,7 @@ impl<'a> ExecPass<'a> {
                             cell: cell_id,
                             kind: ExecErrorKind::InvalidType,
                         });
-                        return Err(());
+                        return self.poison(cell_id, vid);
                     }
                 } else {
                     self.add_value_dependent(index_expr.state.base, vid);
@@ -6957,7 +7323,7 @@ impl<'a> ExecPass<'a> {
                     let (Some(lhs), Some(rhs)) = (vl.get_linear(), vr.get_linear()) else {
                         let span = c.span.clone();
                         self.invalid_type(cell_id, &span);
-                        return Err(());
+                        return self.poison(cell_id, vid);
                     };
                     let expr = lhs.clone() - rhs.clone();
                     let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -7000,7 +7366,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::NonFiniteValue,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             let res = state
                                 .solver
@@ -7021,7 +7387,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidCast,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     };
                     if let Some(value) = value {
@@ -7068,7 +7434,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     };
                     for (i, elem) in seq.iter().enumerate() {
@@ -7216,6 +7582,16 @@ pub enum Value {
     Tuple(Vec<Value>),
     SeqNil,
     Nil,
+    /// A value whose diagnostic has already been reported.
+    ///
+    /// Evaluation continues past the error instead of abandoning the cell, so
+    /// the rest of its diagnostics are still collected and the GUI still has a
+    /// layout to draw. Anything built from a poisoned value is poisoned in
+    /// turn, silently, so one mistake produces one error rather than one per
+    /// expression that reads it.
+    ///
+    /// Poison never reaches the emitted layout: [`ExecPass::emit`] skips it.
+    Poison,
 }
 
 impl Value {
@@ -7259,6 +7635,10 @@ impl Value {
             Self::Seq(_) | Self::SeqNil => "sequence",
             Self::Tuple(_) => "tuple",
             Self::Nil => "nil",
+            // Matches `Ty::Unknown`'s rendering. Reaching a diagnostic that
+            // names a poisoned value means one was not suppressed upstream;
+            // `?` at least does not claim a type the value never had.
+            Self::Poison => "?",
         }
     }
 
@@ -7632,6 +8012,45 @@ enum PartialEvalState<T: AstMetadata> {
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
     ForLoop(Box<PartialForLoop<T>>),
+}
+
+impl<T: AstMetadata> PartialEvalState<T> {
+    /// The values this state reads to make its next step.
+    ///
+    /// `If` and `Match` hold only the branch evaluation has reached, so an
+    /// arm that was never taken is not an input and cannot poison the result.
+    fn inputs(&self) -> Vec<ValueId> {
+        match self {
+            Self::If(e) => match e.state {
+                IfExprState::Cond(v) | IfExprState::Then(v) | IfExprState::Else(v) => vec![v],
+            },
+            Self::Match(e) => match e.state {
+                MatchExprState::Scrutinee(v) | MatchExprState::Value(v) => vec![v],
+            },
+            Self::Arith(e) => vec![e.left, e.right],
+            Self::Comparison(e) => vec![e.left, e.right],
+            // One operand at a time, so a short-circuited `&&`/`||` never
+            // reads -- and so is never poisoned by -- the operand it skipped.
+            Self::BoolOp(e) => match e.state {
+                BoolOpState::Left(v) | BoolOpState::Right(v) => vec![v],
+            },
+            Self::UnaryOp(e) => vec![e.operand],
+            Self::Call(e) => e
+                .state
+                .posargs
+                .iter()
+                .chain(e.state.kwargs.iter())
+                .copied()
+                .collect(),
+            Self::FieldAccess(e) => vec![e.state.base],
+            Self::IndexFieldAccess(e) => vec![e.state.base],
+            Self::Index(e) => vec![e.state.base, e.state.index],
+            Self::Constraint(c) => vec![c.lhs, c.rhs],
+            Self::Cast(e) => vec![e.state.value],
+            Self::Tuple(e) => e.items.clone(),
+            Self::ForLoop(f) => vec![f.seq],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
