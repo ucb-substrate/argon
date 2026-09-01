@@ -173,6 +173,8 @@ impl<'a> Lexer<'a> {
             b'>' if peek2(1) == b'=' => (TokenKind::Geq, 2),
             b'<' if peek2(1) == b'=' => (TokenKind::Leq, 2),
             b'-' if peek2(1) == b'>' => (TokenKind::Arrow, 2),
+            b'&' if peek2(1) == b'&' => (TokenKind::AmpAmp, 2),
+            b'|' if peek2(1) == b'|' => (TokenKind::PipePipe, 2),
             b':' => (TokenKind::Colon, 1),
             b'=' => (TokenKind::Eq, 1),
             b'!' => (TokenKind::Bang, 1),

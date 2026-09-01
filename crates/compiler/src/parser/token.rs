@@ -41,6 +41,8 @@ pub enum TokenKind {
     Geq,      // >=
     Leq,      // <=
     Arrow,    // ->
+    AmpAmp,   // &&
+    PipePipe, // ||
 
     // Single-character operators / punctuation.
     Lt,      // <
@@ -102,6 +104,8 @@ impl TokenKind {
             Geq => "'>='",
             Leq => "'<='",
             Arrow => "'->'",
+            AmpAmp => "'&&'",
+            PipePipe => "'||'",
             Lt => "'<'",
             Gt => "'>'",
             Eq => "'='",

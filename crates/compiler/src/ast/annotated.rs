@@ -19,6 +19,13 @@ pub struct AnnotatedAst<T: AstMetadata> {
     /// Number of generated declarations stored at the front of `ast.decls`
     /// while their backing text remains appended to `text`.
     pub generated_declarations: usize,
+    /// Whether `ast` came from a successful parse.
+    ///
+    /// The parser reports a failure rather than a partial tree, so a file that
+    /// does not parse is represented by an empty declaration list — exactly
+    /// what a file whose contents are entirely commented out produces. Tooling
+    /// that has to tell "nothing here" from "nothing readable here" reads this.
+    pub parsed: bool,
     pub ast: Ast<Substr, T>,
     pub path: PathBuf,
     pub span2scope: IndexMap<Span, Scope<Substr, T>>,
@@ -78,6 +85,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             source_text: pass.text.clone(),
             text: pass.text,
             generated_declarations: 0,
+            parsed: true,
             ast: Ast {
                 decls,
                 span: ast.span,
@@ -229,15 +237,6 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<'_, S, T> {
         input: &super::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         _operand: &super::Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
-        input.metadata.clone()
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        input: &super::ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        _left: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
         input.metadata.clone()
     }
 

@@ -3,6 +3,7 @@
 //! Pass 1: import resolution
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
+use std::cell::RefCell;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::Hasher;
 use std::path::{Path as FsPath, PathBuf};
@@ -25,7 +26,7 @@ pub use result::{
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
+    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
     Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
@@ -37,12 +38,52 @@ use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
-        ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
+        ArgDecl, Ast, AstMetadata, AstTransformer, BinOp, BinOpExpr, BoolOp, CallExpr, CellDecl,
         Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
     solver::{LinearExpr, Solver},
 };
+
+/// The most vertices a single `polygon` or centerline points a single `path`
+/// may declare.
+///
+/// The count is under user control and each point allocates two solver
+/// variables, so an unbounded count aborts the process on allocation failure,
+/// bypassing the diagnostic system entirely. The limit is far above GDSII's own
+/// 8192-vertex boundary limit, so it only ever rejects counts that were going
+/// to fail anyway.
+const MAX_SHAPE_POINTS: usize = 1 << 16;
+
+/// The most elements a single sequence-producing builtin may construct.
+///
+/// `range_full` is eager, so `std::range(n)` allocates all `n` elements up
+/// front; without a ceiling a one-line program exhausts memory.
+const MAX_SEQ_LEN: usize = 1 << 24;
+
+/// The most outer solve iterations one cell may take.
+///
+/// Each iteration must make progress (a value resolved or a variable solved) or
+/// the loop exits, so this only bounds pathological inputs -- but without it a
+/// cell that neither progresses nor terminates has no diagnostic and no exit.
+const MAX_SOLVE_ITERS: u64 = 1 << 24;
+
+/// The most levels of eagerly-inlined `fn` calls and nested cell
+/// instantiations one evaluation may descend through.
+///
+/// Both recurse natively, so exceeding the native stack aborts the process
+/// (SIGABRT) rather than unwinding, which no `catch_unwind` can turn back into
+/// a diagnostic. The limit is chosen to stay well inside the stack that
+/// [`crate::run_with_stack`] reserves.
+const MAX_EVAL_DEPTH: u32 = 4096;
+
+/// The longest text label a GDSII `STRING` record may carry, in bytes.
+///
+/// The format itself only bounds a record at `u16::MAX`, but the GDSII
+/// specification caps a text string at 512, and every tool in the flow assumes
+/// it. Checking against the spec limit rather than the format limit also means
+/// the writer can never fail partway through a file.
+pub(crate) const MAX_TEXT_LEN: usize = 512;
 
 pub const BUILTINS: [&str; 15] = [
     "list",
@@ -61,6 +102,34 @@ pub const BUILTINS: [&str; 15] = [
     "inst",
     "bbox",
 ];
+
+/// The module that the leading segments of a qualified `path` name.
+///
+/// `std::…` is absolute into the standard library, `lib::…` is absolute from
+/// the workspace root, and anything else is relative to `current`. `items` is
+/// how many trailing segments name the thing being resolved rather than its
+/// module: one for a `use` or a call, two for an `Enum::Variant`.
+///
+/// Which of the three forms a path takes is decided by its *first* segment, so
+/// the trailing item segments are dropped only after that: `use lib;` names the
+/// workspace root, not a child of the current module.
+pub(crate) fn module_prefix<'a>(
+    current: &ModPath,
+    path: impl IntoIterator<Item = &'a str>,
+    items: usize,
+) -> ModPath {
+    let path: Vec<&str> = path.into_iter().collect();
+    let prefix = &path[..path.len().saturating_sub(items)];
+    match path.first().copied() {
+        Some("std") => vec!["std".to_string()],
+        Some("lib") => prefix.iter().skip(1).map(|name| name.to_string()).collect(),
+        _ => current
+            .iter()
+            .cloned()
+            .chain(prefix.iter().map(|name| name.to_string()))
+            .collect(),
+    }
+}
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
@@ -191,7 +260,7 @@ pub(crate) fn execute_cell_tracked_with_artifacts_cancellable(
     if execution.cancelled {
         return None;
     }
-    execution.output = check_output_layers(execution.output, tech_file);
+    execution.output = check_output(execution.output, tech_file);
     Some(execution)
 }
 
@@ -266,7 +335,7 @@ pub(crate) fn execute_cell_invocation_tracked_with_artifacts_cancellable(
     if execution.cancelled {
         return None;
     }
-    execution.output = check_output_layers(execution.output, tech_file);
+    execution.output = check_output(execution.output, tech_file);
     Some(execution)
 }
 
@@ -321,7 +390,23 @@ fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> Co
     })
 }
 
+fn check_output(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
+    check_output_with(res, |data, errors| {
+        check_layers(data, tech_file, errors);
+        check_geometry(data, errors);
+    })
+}
+
+/// The layer half of [`check_output`], for a cached result whose geometry has
+/// already been validated against an unchanged grid.
 fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
+    check_output_with(res, |data, errors| check_layers(data, tech_file, errors))
+}
+
+fn check_output_with(
+    res: CompileOutput,
+    check: impl FnOnce(&CompiledData, &mut Vec<ExecError>),
+) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -333,7 +418,7 @@ fn check_output_layers(res: CompileOutput, tech_file: &FsPath) -> CompileOutput 
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, tech_file, &mut errors);
+    check(&data, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -545,28 +630,11 @@ impl<'a> ImportPass<'a> {
     }
 
     fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        match use_decl.path[0].name.as_str() {
-            "std" => vec!["std".to_string()],
-            "lib" => use_decl
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(1)
-                .map(|ident| ident.name.to_string())
-                .collect(),
-            _ => self
-                .current_path
-                .iter()
-                .cloned()
-                .chain(
-                    use_decl
-                        .path
-                        .iter()
-                        .dropping_back(1)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect(),
-        }
+        module_prefix(
+            self.current_path,
+            use_decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        )
     }
 
     pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
@@ -721,14 +789,6 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &crate::ast::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         _operand: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        _input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
     }
 
     fn dispatch_cast(
@@ -899,6 +959,156 @@ fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecErro
                 _ => {}
             }
         }
+    }
+}
+
+/// Validates geometry that only becomes checkable once every coordinate has a
+/// number: the range a GDS database unit can hold, the snap grid for values
+/// that never passed through the solver, and dimensions whose sign the
+/// exporter would otherwise quietly discard.
+///
+/// This runs before any output is written, so a rejected design produces a
+/// diagnostic with a span instead of a `.gds` full of `i32::MAX`.
+fn check_geometry(data: &CompiledData, errs: &mut Vec<ExecError>) {
+    let tech = &data.tech;
+    for (cell_id, cell) in data.cells.iter() {
+        let cell_id = *cell_id;
+        for (_, obj) in cell.objects.iter() {
+            match obj {
+                SolvedValue::Rect(r) => {
+                    let coords = [r.x0.0, r.y0.0, r.x1.0, r.y1.0];
+                    check_coordinates(coords, tech, cell_id, &r.span, errs);
+                }
+                SolvedValue::Polygon(p) => {
+                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]);
+                    check_coordinates(coords, tech, cell_id, &p.span, errs);
+                }
+                SolvedValue::Path(p) => {
+                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]).chain([
+                        p.width.0,
+                        p.begin_extension.0,
+                        p.end_extension.0,
+                    ]);
+                    check_coordinates(coords, tech, cell_id, &p.span, errs);
+                    check_path_dimensions(p, cell_id, errs);
+                }
+                SolvedValue::Instance(i) => {
+                    let span = Some(i.span.clone());
+                    check_coordinates([i.x, i.y], tech, cell_id, &span, errs);
+                }
+                SolvedValue::Text(t) => {
+                    check_coordinates([t.x, t.y], tech, cell_id, &t.span, errs);
+                    check_text(t, cell_id, errs);
+                }
+                SolvedValue::Dimension(_) => {}
+            }
+        }
+    }
+}
+
+/// Applies [`check_coordinate`] to every coordinate of one shape, all of which
+/// share the shape's span.
+fn check_coordinates(
+    values: impl IntoIterator<Item = f64>,
+    tech: &Technology,
+    cell: CellId,
+    span: &Option<Span>,
+    errs: &mut Vec<ExecError>,
+) {
+    for value in values {
+        check_coordinate(value, tech, cell, span, errs);
+    }
+}
+
+/// Rejects a coordinate that cannot be written as a GDS database unit.
+///
+/// `f64 as i32` saturates rather than wrapping or trapping, so an unchecked
+/// out-of-range coordinate lands on `i32::MAX` and the run still exits 0 --
+/// two edges of a rectangle collapse onto the same point and the shape
+/// silently vanishes.
+fn check_coordinate(
+    value: f64,
+    tech: &Technology,
+    cell: CellId,
+    span: &Option<Span>,
+    errs: &mut Vec<ExecError>,
+) {
+    if !value.is_finite() {
+        errs.push(ExecError {
+            span: span.clone(),
+            cell,
+            kind: ExecErrorKind::NonFiniteValue,
+        });
+        return;
+    }
+    let dbu = value * tech.display_unit as f64;
+    if dbu < f64::from(i32::MIN) || dbu > f64::from(i32::MAX) {
+        errs.push(ExecError {
+            span: span.clone(),
+            cell,
+            kind: ExecErrorKind::CoordinateOutOfRange {
+                value,
+                min: tech.dbu_to_display(i32::MIN),
+                max: tech.dbu_to_display(i32::MAX),
+            },
+        });
+    }
+}
+
+/// Rejects negative path widths and extensions.
+///
+/// The exporter used to absolutize the width and pass the extensions straight
+/// through, so `width=-10.` silently became a 10-unit-wide wire and a negative
+/// extension became a negative `BGNEXTN` that no downstream tool agrees on.
+/// Neither has a meaning worth guessing at.
+fn check_path_dimensions(path: &Path<(f64, LinearExpr)>, cell: CellId, errs: &mut Vec<ExecError>) {
+    if path.width.0 < 0. {
+        errs.push(ExecError {
+            span: path.span.clone(),
+            cell,
+            kind: ExecErrorKind::NegativePathWidth(path.width.0),
+        });
+    }
+    for (end, value) in [
+        ("begin", path.begin_extension.0),
+        ("end", path.end_extension.0),
+    ] {
+        if value < 0. {
+            errs.push(ExecError {
+                span: path.span.clone(),
+                cell,
+                kind: ExecErrorKind::NegativePathExtension {
+                    end: end.to_owned(),
+                    value,
+                },
+            });
+        }
+    }
+}
+
+/// Rejects text a GDS `STRING` record cannot represent.
+///
+/// The record is a byte string with no encoding negotiation, so raw UTF-8 is
+/// mojibake in every viewer, and its length is counted in bytes rather than
+/// characters. Checking here rather than at write time means an over-long
+/// label is a diagnostic instead of a half-written file.
+fn check_text(text: &Text<f64>, cell: CellId, errs: &mut Vec<ExecError>) {
+    if let Some(character) = text.text.chars().find(|c| !c.is_ascii()) {
+        errs.push(ExecError {
+            span: text.span.clone(),
+            cell,
+            kind: ExecErrorKind::NonAsciiText { character },
+        });
+    }
+    if text.text.len() > MAX_TEXT_LEN {
+        errs.push(ExecError {
+            span: text.span.clone(),
+            cell,
+            kind: ExecErrorKind::TextTooLong {
+                len: text.text.len(),
+                limit: MAX_TEXT_LEN,
+            },
+        });
     }
 }
 
@@ -1129,32 +1339,58 @@ impl Ty {
         }
     }
 
+    /// The source spelling of a primitive type, for the names that can appear
+    /// as an identifier.
+    ///
+    /// The inverse of [`Self::from_name`], so that anything reporting what a
+    /// type annotation resolved to reads the same table the annotation was
+    /// resolved against. `()` and `[]` are spellings the grammar produces
+    /// rather than identifiers, so they have no name here.
+    pub fn primitive_name(&self) -> Option<&'static str> {
+        Some(match self {
+            Ty::Bool => "Bool",
+            Ty::Int => "Int",
+            Ty::Float => "Float",
+            Ty::Rect => "Rect",
+            Ty::Polygon => "Polygon",
+            Ty::Path => "Path",
+            Ty::Point => "Point",
+            Ty::Any => "Any",
+            Ty::String => "String",
+            _ => return None,
+        })
+    }
+
     /// Computes the least upper bound (LUB) of self and other.
     /// For use in type promotion.
-    pub fn lub(&self, other: &Self) -> Self {
+    ///
+    /// Returns `None` when the two types have no common supertype. Callers must
+    /// report that as an error rather than widening: `Ty::Any` satisfies every
+    /// downstream check (`is_eq_ty` short-circuits on it), so promoting a
+    /// genuine mismatch to `Any` suppresses all further checking and defers the
+    /// failure to an evaluator `unwrap`. `Ty::Any` must only ever come from an
+    /// explicit `Any` annotation, never from inference giving up.
+    pub fn lub(&self, other: &Self) -> Option<Self> {
         match (self, other) {
-            // Unknown promotes to any type.
-            (Ty::Unknown, other) | (other, Ty::Unknown) => other.clone(),
+            // Unknown promotes to any type. It already marks an earlier error,
+            // so it suppresses cascades instead of producing new ones.
+            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
             // At least one Any results in Any.
-            (Ty::Any, _) | (_, Ty::Any) => Ty::Any,
+            (Ty::Any, _) | (_, Ty::Any) => Some(Ty::Any),
             // SeqNil promotes to any sequence type.
-            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => Ty::Seq(inner.clone()),
-            // Mismatched types promote to any.
-            (a, b) => {
-                if a == b {
-                    a.clone()
-                } else {
-                    Ty::Any
-                }
+            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => {
+                Some(Ty::Seq(inner.clone()))
             }
+            // Mismatched types have no LUB.
+            (a, b) => (a == b).then(|| a.clone()),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
-    args: Vec<Ty>,
-    ret: Ty,
+    pub(crate) args: Vec<Ty>,
+    pub(crate) ret: Ty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1167,40 +1403,54 @@ pub struct CellFnTy {
     /// keeps the type representation a DAG rather than a tree: a cell that
     /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
     /// type size stays linear in hierarchy depth instead of doubling per level.
-    cell: Arc<CellTy>,
+    pub(crate) cell: Arc<CellTy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct CellTy {
-    data: IndexMap<String, Ty>,
+    pub(crate) data: IndexMap<String, Ty>,
     /// GDS-backed cells publish geometry fields at execution time. Their
     /// generated source declaration is intentionally only a signature, so
     /// field names cannot be enumerated by the source type pass.
     dynamic_fields: bool,
+    /// The declaring cell's [`VarId`], for navigation from a field access back
+    /// to the `let` that declared the field.
+    ///
+    /// Identity, not structure: cell typing is structural, so two cells with
+    /// the same fields must stay interchangeable. [`PartialEq`] therefore
+    /// ignores this field, and it is `None` for the generated signature of a
+    /// GDS-backed cell.
+    pub(crate) def: Option<VarId>,
+}
+
+impl PartialEq for CellTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data && self.dynamic_fields == other.dynamic_fields
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumTy {
-    id: EnumId,
-    variants: IndexSet<String>,
+    pub(crate) id: EnumId,
+    pub(crate) variants: IndexSet<String>,
 }
 
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type IdentPath = (Option<VarId>, Ty);
-    type EnumDecl = ();
+    /// `None` when the name was rejected before it could be bound.
+    type EnumDecl = Option<(VarId, EnumId)>;
     type StructDecl = ();
     type StructField = ();
     type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
     type ForLoop = VarId; // the var ID of the var Ident
-    type FnDecl = (PathBuf, VarId);
+    type FnDecl = (PathBuf, VarId, Ty);
     type IfExpr = Ty;
     type MatchExpr = Ty;
     type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
-    type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
     type IndexFieldAccessExpr = Ty;
     type IndexExpr = Ty;
@@ -1260,22 +1510,28 @@ impl<'a> VarIdTyPass<'a> {
         id
     }
 
-    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
-        let id = self.alloc_id();
-        self.bind(name, id, ty)
-    }
-
-    fn alloc_declaration(&mut self, kind: &str, name: &Substr, ty: Ty) -> VarId {
-        let id = semantic_declaration_id(self.current_path, kind, name);
-        self.bind(name, id, ty)
-    }
-
-    fn bind(&mut self, name: &Substr, id: VarId, ty: Ty) -> VarId {
+    /// Binds `name` to an id allocated earlier by [`Self::alloc_id`] or by
+    /// [`semantic_declaration_id`].
+    ///
+    /// Split out of [`Self::alloc`] for declarations whose type embeds their
+    /// own id, which have to know it before the type can be built.
+    fn bind(&mut self, name: &Substr, id: VarId, ty: Ty) {
         self.bindings
             .last_mut()
             .unwrap()
             .var_bindings
             .insert(name.clone(), (id, ty));
+    }
+
+    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
+        let id = self.alloc_id();
+        self.bind(name, id, ty);
+        id
+    }
+
+    fn alloc_declaration(&mut self, kind: &str, name: &Substr, ty: Ty) -> VarId {
+        let id = semantic_declaration_id(self.current_path, kind, name);
+        self.bind(name, id, ty);
         id
     }
 
@@ -1336,39 +1592,28 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
 
-        AnnotatedAst::new(
+        let mut annotated = AnnotatedAst::new(
             self.ast.text.clone(),
             &Ast {
                 decls,
                 span: self.ast.ast.span,
             },
             self.ast.path.clone(),
-        )
+        );
+        // Re-annotating starts from a clean slate; carry over what describes
+        // the file rather than the declarations that were just transformed.
+        annotated.source_text = self.ast.source_text.clone();
+        annotated.generated_declarations = self.ast.generated_declarations;
+        annotated.parsed = self.ast.parsed;
+        annotated
     }
 
     fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        match use_decl.path[0].name.as_str() {
-            "std" => vec!["std".to_string()],
-            "lib" => use_decl
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(1)
-                .map(|ident| ident.name.to_string())
-                .collect(),
-            _ => self
-                .current_path
-                .iter()
-                .cloned()
-                .chain(
-                    use_decl
-                        .path
-                        .iter()
-                        .dropping_back(1)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect(),
-        }
+        module_prefix(
+            self.current_path,
+            use_decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        )
     }
 
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
@@ -1494,6 +1739,137 @@ impl<'a> VarIdTyPass<'a> {
             kind: StaticErrorKind::CannotIndex { ty },
         });
         Ty::Unknown
+    }
+
+    fn check_arith(
+        &mut self,
+        span: cfgrammar::Span,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        let left_ty = left.ty();
+        let right_ty = right.ty();
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::ArithMismatchedTypes,
+            });
+        }
+        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
+            self.errors.push(StaticError {
+                span: self.span(left.span()),
+                kind: StaticErrorKind::ArithInvalidType(left_ty.clone()),
+            });
+        }
+        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(right.span()),
+                kind: StaticErrorKind::ArithInvalidType(right_ty),
+            });
+        }
+        left_ty
+    }
+
+    fn check_bool_expr(
+        &mut self,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        for operand in [left, right] {
+            if !VarIdTyPass::is_bool_operand(&operand.ty()) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::BoolOpInvalidType,
+                });
+            }
+        }
+        Ty::Bool
+    }
+
+    fn check_comparison(
+        &mut self,
+        op: ComparisonOp,
+        span: cfgrammar::Span,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        let left_ty = left.ty();
+        let right_ty = right.ty();
+        // A mismatch here is already reported as `ComparisonMismatchedTypes`
+        // below, so an absent LUB only needs to not be `Ty::Seq`.
+        let lub_ty = left_ty.lub(&right_ty).unwrap_or(Ty::Unknown);
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::ComparisonMismatchedTypes,
+            });
+        }
+        if left_ty == Ty::Float && (op == ComparisonOp::Eq || op == ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::FloatEquality,
+            });
+        }
+        if matches!(left_ty, Ty::Enum(_)) && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::EnumsNotOrd,
+            });
+        }
+        if left_ty == Ty::Bool && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::BoolNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::Nil)
+            && matches!(right_ty, Ty::Nil)
+            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::NilNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::SeqNil)
+            && matches!(right_ty, Ty::SeqNil)
+            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::SeqNilNotOrd,
+            });
+        }
+        // A sequence may only be compared for equality/inequality against `[]`:
+        // the evaluator has no arm for two populated sequences, and none for
+        // ordering a sequence at all.
+        if matches!(lub_ty, Ty::Seq(_))
+            && !((op == ComparisonOp::Eq || op == ComparisonOp::Ne)
+                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+            });
+        }
+        for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
+            if !matches!(
+                ty,
+                Ty::Float | Ty::Int | Ty::Bool | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+            ) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::ComparisonInvalidType,
+                });
+            }
+        }
+
+        Ty::Bool
+    }
+
+    /// Whether `ty` may be an operand of `&&`, `||`, or `!`.
+    fn is_bool_operand(ty: &Ty) -> bool {
+        matches!(ty, Ty::Bool | Ty::Any | Ty::Unknown)
     }
 
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
@@ -1673,11 +2049,10 @@ impl<'a> VarIdTyPass<'a> {
 }
 
 impl<S> Expr<S, VarIdTyMetadata> {
-    fn ty(&self) -> Ty {
+    pub(crate) fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
-            Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
@@ -1782,30 +2157,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         } else {
             // look up enum
-            let path = match input.path[0].name.as_str() {
-                "std" => {
-                    vec!["std".to_string()]
-                }
-                "lib" => input
-                    .path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(2)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec(),
-                _ => self
-                    .current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        input
-                            .path
-                            .iter()
-                            .dropping_back(2)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec(),
-            };
+            let path = module_prefix(
+                self.current_path,
+                input.path.iter().map(|ident| ident.name.as_str()),
+                2,
+            );
             let enum_ = &input.path[input.path.len() - 2];
             let lookup = if path.is_empty() || &path == self.current_path {
                 self.lookup(&enum_.name)
@@ -1847,9 +2203,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     fn dispatch_enum_decl(
         &mut self,
         _input: &crate::ast::EnumDecl<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
         _variants: &[Ident<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+        // `declare_enum_decl` hoisted this binding before any body was walked,
+        // so it normally resolves. A name that collided with a builtin was
+        // rejected there and never bound, and there is no id to report: a
+        // shared placeholder would make every such enum in the workspace look
+        // like the same declaration.
+        match self.lookup(&name.name) {
+            Some((var_id, Ty::Enum(enum_ty))) => Some((var_id, enum_ty.id)),
+            _ => None,
+        }
     }
 
     fn dispatch_cell_decl(
@@ -1865,13 +2230,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_fn_decl(
         &mut self,
-        _input: &FnDecl<Substr, Self::InputMetadata>,
+        input: &FnDecl<Substr, Self::InputMetadata>,
         name: &Ident<Substr, Self::OutputMetadata>,
         _args: &[ArgDecl<Substr, Self::OutputMetadata>],
-        _return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
-        _scope: &Scope<Substr, Self::OutputMetadata>,
+        return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
+        scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
-        (self.ast.path.clone(), self.lookup(&name.name).unwrap().0)
+        let (var_id, ty) = self.lookup(&name.name).unwrap();
+        if let Ty::Fn(fn_ty) = &ty {
+            let span = match (scope.tail.as_ref(), return_ty.as_ref()) {
+                (Some(tail), _) => tail.span(),
+                // Without a tail there is no expression to mark as the source of the error,
+                // so point at the declared return type.
+                (None, Some(spec)) => spec.span,
+                (None, None) => input.span,
+            };
+            self.assert_eq_ty(span, &scope.metadata, &fn_ty.ret);
+        }
+        (self.ast.path.clone(), var_id, ty)
     }
 
     fn transform_fn_decl(
@@ -1952,14 +2328,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .any(|decl| {
                 matches!(decl, Decl::Cell(cell) if cell.span == input.span && cell.name.name == input.name.name)
             });
+        // The cell's type embeds its own id so that a field access on an
+        // instance can be traced back to the declaring cell. A GDS-backed cell
+        // has no declared fields to trace back to, so it records none and
+        // field accesses on it fall through to the builtin geometry fields.
+        let cell_id = semantic_declaration_id(self.current_path, "cell", &input.name.name);
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             cell: Arc::new(CellTy {
                 data,
                 dynamic_fields,
+                def: (!dynamic_fields).then_some(cell_id),
             }),
         }));
-        self.alloc_declaration("cell", &input.name.name, ty);
+        self.bind(&input.name.name, cell_id, ty);
         let name = self.transform_ident(&input.name);
         let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
@@ -2007,7 +2389,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_if_expr(
         &mut self,
-        _input: &IfExpr<Substr, Self::InputMetadata>,
+        input: &IfExpr<Substr, Self::InputMetadata>,
         cond: &Expr<Substr, Self::OutputMetadata>,
         then: &Scope<Substr, Self::OutputMetadata>,
         else_: &Scope<Substr, Self::OutputMetadata>,
@@ -2021,7 +2403,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
-        then_ty.lub(&else_ty)
+        let Some(lub_ty) = then_ty.lub(&else_ty) else {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::BranchesDifferentTypes,
+            });
+            return Ty::Unknown;
+        };
+        lub_ty
     }
 
     fn dispatch_match_expr(
@@ -2034,12 +2423,30 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
         let mut lub_ty: Option<Ty> = None;
 
-        if let Ty::Enum(ref e) = scrutinee_ty {
+        // The scrutinee type is only known statically when it is a declared
+        // enum. `Any` is the common case in practice, because cell and instance
+        // types cannot be named, so arms must be checked against the enum the
+        // *patterns* name instead. The evaluator has no fallback for an arm set
+        // that does not cover the runtime variant, so the checks below are what
+        // keep it from reaching a `find(..).unwrap()`.
+        let pattern_ty = arms
+            .iter()
+            .map(|arm| &arm.pattern.metadata.1)
+            .find(|ty| matches!(ty, Ty::Enum(_)))
+            .cloned();
+        let expected_ty = match scrutinee_ty {
+            Ty::Enum(_) => Some(scrutinee_ty.clone()),
+            _ => pattern_ty,
+        };
+
+        if let Some(Ty::Enum(ref e)) = expected_ty {
             let mut covered = IndexSet::new();
             let mut remaining = e.variants.clone();
             for arm in arms.iter() {
                 let arm_ty = &arm.pattern.metadata.1;
-                self.assert_eq_ty(arm.pattern.span, arm_ty, &scrutinee_ty);
+                // All arms must belong to the same enum, whether or not the
+                // scrutinee's own type pinned that enum down.
+                self.assert_eq_ty(arm.pattern.span, arm_ty, expected_ty.as_ref().unwrap());
 
                 let variant = arm.pattern.path.last().unwrap().name.clone();
                 remaining.swap_remove(variant.as_str());
@@ -2050,11 +2457,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     });
                 }
 
-                if let Some(ref inner) = lub_ty {
-                    lub_ty = Some(inner.lub(&arm.expr.ty()));
-                } else {
-                    lub_ty = Some(arm.expr.ty());
-                }
+                lub_ty = match lub_ty {
+                    Some(inner) => match inner.lub(&arm.expr.ty()) {
+                        Some(lub) => Some(lub),
+                        None => {
+                            self.errors.push(StaticError {
+                                span: self.span(arm.expr.span()),
+                                kind: StaticErrorKind::BranchesDifferentTypes,
+                            });
+                            return Ty::Unknown;
+                        }
+                    },
+                    None => Some(arm.expr.ty()),
+                };
             }
 
             if !remaining.is_empty() {
@@ -2074,27 +2489,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         left: &Expr<Substr, Self::OutputMetadata>,
         right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
-            });
+        match input.op {
+            BinOp::Arith(_) => self.check_arith(input.span, left, right),
+            BinOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
+            BinOp::Bool(_) => self.check_bool_expr(left, right),
         }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
-            self.errors.push(StaticError {
-                span: self.span(left.span()),
-                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
-            });
-        }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(right.span()),
-                kind: StaticErrorKind::BinOpInvalidType(right_ty),
-            });
-        }
-        left_ty
     }
 
     fn dispatch_unary_op_expr(
@@ -2104,10 +2503,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::Unimplemented,
-                });
+                let operand_ty = operand.ty();
+                if !VarIdTyPass::is_bool_operand(&operand_ty) {
+                    self.errors.push(StaticError {
+                        span: self.span(operand.span()),
+                        kind: StaticErrorKind::BoolOpInvalidType,
+                    });
+                }
                 Ty::Bool
             }
             UnaryOp::Neg => {
@@ -2121,69 +2523,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 operand_ty
             }
         }
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        input: &ComparisonExpr<Substr, Self::InputMetadata>,
-        left: &Expr<Substr, Self::OutputMetadata>,
-        right: &Expr<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        let lub_ty = left_ty.lub(&right_ty);
-        if left_ty == Ty::Float && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::FloatEquality,
-            });
-        }
-        if matches!(left_ty, Ty::Enum(_))
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::EnumsNotOrd,
-            });
-        }
-        if matches!(left_ty, Ty::Nil)
-            && matches!(right_ty, Ty::Nil)
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::NilNotOrd,
-            });
-        }
-        if matches!(left_ty, Ty::SeqNil)
-            && matches!(right_ty, Ty::SeqNil)
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::SeqNilNotOrd,
-            });
-        }
-        if matches!(lub_ty, Ty::Seq(_))
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-            && !(left_ty == Ty::SeqNil || right_ty == Ty::SeqNil)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
-            });
-        }
-        if !matches!(
-            left_ty,
-            Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
-        ) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::ComparisonInvalidType,
-            });
-        }
-
-        Ty::Bool
     }
 
     fn dispatch_field_access_expr(
@@ -2419,12 +2758,26 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         });
                         (None, Ty::Nil)
                     } else {
-                        let elem_ty = args
-                            .posargs
-                            .iter()
-                            .map(Expr::ty)
-                            .reduce(|acc, e| acc.lub(&e))
-                            .unwrap();
+                        // Fold pairwise rather than widening a mismatch to
+                        // `[Any]`, which would satisfy every downstream check
+                        // and defer the failure to an evaluator `unwrap`.
+                        let mut elem_ty = args.posargs[0].ty();
+                        for arg in &args.posargs[1..] {
+                            let arg_ty = arg.ty();
+                            match elem_ty.lub(&arg_ty) {
+                                Some(lub) => elem_ty = lub,
+                                None => {
+                                    self.errors.push(StaticError {
+                                        span: self.span(arg.span()),
+                                        kind: StaticErrorKind::IncorrectTy {
+                                            expected: elem_ty.clone(),
+                                            found: arg_ty,
+                                        },
+                                    });
+                                    elem_ty = Ty::Unknown;
+                                }
+                            }
+                        }
                         (None, Ty::Seq(Box::new(elem_ty)))
                     }
                 }
@@ -2485,15 +2838,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
                 "bbox" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    let argty = args.posargs[0].ty();
-                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
-                        self.errors.push(StaticError {
-                            span: self.span(input.span),
-                            kind: StaticErrorKind::IncorrectTyCategory {
-                                found: argty,
-                                expected: "Cell/Inst".to_string(),
-                            },
-                        });
+                    // `assert_eq_arity` only records a diagnostic, so the argument
+                    // must still be fetched fallibly, as the sibling builtins do.
+                    if let Some(arg) = args.posargs.first() {
+                        let argty = arg.ty();
+                        if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                            self.errors.push(StaticError {
+                                span: self.span(input.span),
+                                kind: StaticErrorKind::IncorrectTyCategory {
+                                    found: argty,
+                                    expected: "Cell/Inst".to_string(),
+                                },
+                            });
+                        }
                     }
                     (None, Ty::Rect)
                 }
@@ -2550,29 +2907,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 name => self.typecheck_call(name, self.lookup(name), input.span, args, true),
             }
         } else {
-            let path = match func.path[0].name.as_str() {
-                "std" => {
-                    vec!["std".to_string()]
-                }
-                "lib" => func
-                    .path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(1)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec(),
-                _ => self
-                    .current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        func.path
-                            .iter()
-                            .dropping_back(1)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec(),
-            };
+            let path = module_prefix(
+                self.current_path,
+                func.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
             let name = &func.path.last().unwrap().name;
             let lookup = self
                 .mod_bindings
@@ -2588,7 +2927,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _input: &crate::ast::EmitExpr<Substr, Self::InputMetadata>,
         value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
-        value.ty()
+        let ty = value.ty();
+        // Emission collects a single layout element per `!`. `Any` and
+        // `Unknown` are deferred to the runtime `CannotEmit` check, since the
+        // static type says nothing about what the value will be.
+        if !matches!(
+            ty,
+            Ty::Rect | Ty::Polygon | Ty::Path | Ty::Inst(_) | Ty::Any | Ty::Unknown
+        ) {
+            self.errors.push(StaticError {
+                span: self.span(value.span()),
+                kind: StaticErrorKind::CannotEmit(ty.clone()),
+            });
+        }
+        ty
     }
 
     fn dispatch_args(
@@ -3018,6 +3370,57 @@ pub fn format_initial_condition(value: f64, grid: f64) -> String {
 }
 
 #[cfg(test)]
+mod module_prefix_tests {
+    use super::module_prefix;
+
+    fn current() -> Vec<String> {
+        vec!["nested".to_owned()]
+    }
+
+    #[test]
+    fn a_relative_path_hangs_off_the_current_module() {
+        assert_eq!(
+            module_prefix(&current(), ["inner", "item"], 1),
+            ["nested", "inner"]
+        );
+        assert_eq!(module_prefix(&current(), ["item"], 1), ["nested"]);
+    }
+
+    #[test]
+    fn lib_and_std_are_absolute() {
+        assert_eq!(
+            module_prefix(&current(), ["lib", "utils", "item"], 1),
+            ["utils"]
+        );
+        assert_eq!(
+            module_prefix(&current(), ["std", "shapes", "item"], 1),
+            ["std"]
+        );
+    }
+
+    /// The leading segment decides which of the three forms a path takes, so
+    /// it has to be read before the item segments are dropped: `use lib;`
+    /// names the workspace root, not a `lib` child of the current module.
+    #[test]
+    fn a_single_segment_absolute_path_is_still_absolute() {
+        assert_eq!(module_prefix(&current(), ["lib"], 1), [] as [String; 0]);
+        assert_eq!(module_prefix(&current(), ["std"], 1), ["std"]);
+    }
+
+    #[test]
+    fn an_enum_variant_drops_both_its_item_segments() {
+        assert_eq!(
+            module_prefix(&current(), ["lib", "kinds", "Kind", "Variant"], 2),
+            ["kinds"]
+        );
+        assert_eq!(
+            module_prefix(&current(), ["Kind", "Variant"], 2),
+            ["nested"]
+        );
+    }
+}
+
+#[cfg(test)]
 mod initial_condition_format_tests {
     use super::format_initial_condition;
 
@@ -3053,6 +3456,10 @@ pub struct Polygon<T> {
     pub layer: String,
     pub id: ObjectId,
     pub points: Vec<(T, T)>,
+    /// Geometry that exists only to constrain the layout, and is therefore
+    /// excluded from both `bbox` and the GDS exporter. See
+    /// [`SolvedValue::is_layout`].
+    pub construction: bool,
     pub span: Option<Span>,
 }
 
@@ -3068,6 +3475,10 @@ pub struct Path<T> {
     /// These retain the geometry of imported GDS path types 0, 2, and 4.
     pub begin_extension: T,
     pub end_extension: T,
+    /// Geometry that exists only to constrain the layout, and is therefore
+    /// excluded from both `bbox` and the GDS exporter. See
+    /// [`SolvedValue::is_layout`].
+    pub construction: bool,
     pub span: Option<Span>,
 }
 
@@ -3224,6 +3635,8 @@ impl Ord for FallbackConstraint {
 
 #[derive(Clone)]
 struct CellState {
+    /// See [`CompiledCell::name`].
+    name: String,
     solve_iters: u64,
     solver: Solver,
     fields: IndexMap<String, ValueId>,
@@ -3240,6 +3653,14 @@ struct CellState {
     constraint_span_map: IndexMap<ConstraintId, Span>,
     var_span_map: IndexMap<Var, Span>,
     var_dependents: IndexMap<Var, IndexSet<ValueId>>,
+    /// Objects built by reading a shape out of a placed instance.
+    ///
+    /// A proxy is a view of geometry the instance's `SREF` already draws, so
+    /// it is construction geometry by default. `!` on such a value is an
+    /// explicit request to flatten that one shape into the parent as well;
+    /// [`ExecPass::mark_emitted_proxies_as_layout`] uses this set to tell the
+    /// two apart once the emission list has been resolved to object IDs.
+    proxy_objects: IndexSet<ObjectId>,
 }
 
 impl CellState {
@@ -3313,7 +3734,52 @@ struct ExecPass<'a> {
     entry_cell: Option<CellId>,
     /// Global cell and function declarations observed by this execution.
     dependencies: IndexSet<VarId>,
+    /// Module-qualified source name of every declared cell, by declaration.
+    /// See [`CompiledCell::name`].
+    cell_names: HashMap<VarId, String>,
+    /// Memoized `bbox` results, keyed by cell. See [`ExecPass::bbox`].
+    bbox_cache: RefCell<HashMap<CellId, Option<Rect<f64>>>>,
+    /// Native recursion depth of `visit_expr`, guarded by [`MAX_EVAL_DEPTH`].
+    ///
+    /// `if` and `match` branches are deferred onto the worklist and so cost no
+    /// native stack, but a `fn` call is inlined eagerly and recursively, and a
+    /// cell instantiation recurses through `execute_cell`. Both descend until
+    /// the stack dies -- an abort `catch_unwind` cannot intercept -- so they
+    /// need an explicit limit rather than relying on the trampoline.
+    eval_depth: u32,
     errors: Vec<ExecError>,
+}
+
+/// Promotes a proxy the author explicitly emitted to real layout geometry.
+///
+/// Reading a shape out of a placed instance builds a *proxy* of the child's
+/// geometry in the parent's frame, so `inst.member.x0` has something to name.
+/// The instance's own `SREF` already draws that shape, so a proxy is
+/// construction geometry: drawing it would put a phantom boundary exactly on
+/// top of the instance. Applying `!` to one is an explicit request to flatten
+/// that single shape into the parent as well, so it becomes layout.
+///
+/// This has to run after the emission lists are resolved rather than where the
+/// proxy is built: `!` can be applied to a value that *selects* a proxy built
+/// earlier -- `elem(inst.arr)!` -- so only the resolved object ID identifies
+/// which one the author meant.
+fn mark_emitted_proxies_as_layout(
+    cell: &mut CompiledCell,
+    proxies: &IndexSet<ObjectId>,
+    emitted: &IndexSet<ObjectId>,
+) {
+    for id in proxies.intersection(emitted) {
+        let Some(object) = cell.objects.get_mut(id) else {
+            continue;
+        };
+        match object {
+            SolvedValue::Rect(rect) => rect.construction = false,
+            SolvedValue::Polygon(polygon) => polygon.construction = false,
+            SolvedValue::Path(path) => path.construction = false,
+            SolvedValue::Instance(instance) => instance.construction = false,
+            SolvedValue::Text(_) | SolvedValue::Dimension(_) => {}
+        }
+    }
 }
 
 fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &ExecScope) {
@@ -3426,6 +3892,9 @@ impl<'a> ExecPass<'a> {
             entry_cell_var: None,
             entry_cell: None,
             dependencies: IndexSet::new(),
+            cell_names: HashMap::new(),
+            bbox_cache: RefCell::default(),
+            eval_depth: 0,
             errors: Vec::new(),
         }
     }
@@ -3450,6 +3919,88 @@ impl<'a> ExecPass<'a> {
             self.cancelled = true;
         }
         self.cancelled
+    }
+
+    /// Records that a runtime value did not have the concrete type its builtin
+    /// requires.
+    ///
+    /// `Ty::Any` satisfies every static check (`is_eq_ty` short-circuits on
+    /// it), and cell and instance types cannot be named, so `Any` is
+    /// load-bearing rather than an escape hatch. Every builtin that reads a
+    /// concrete runtime type therefore has to report through here instead of
+    /// unwrapping: the static checker cannot have proven the type.
+    fn invalid_type(&mut self, cell_id: CellId, span: &Span) {
+        self.errors.push(ExecError {
+            span: Some(span.clone()),
+            cell: cell_id,
+            kind: ExecErrorKind::InvalidType,
+        });
+    }
+
+    /// Reads `arg` as a `String`, registering `dependent` if it is not ready.
+    fn typed_string(
+        &mut self,
+        arg: ValueId,
+        dependent: ValueId,
+        cell_id: CellId,
+        span: &Span,
+    ) -> Typed<String> {
+        let Some(value) = self.values[&arg]
+            .get_ready()
+            .map(|v| v.get_string().cloned())
+        else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        match value {
+            Some(value) => Typed::Ready(value),
+            None => {
+                self.invalid_type(cell_id, span);
+                Typed::Invalid
+            }
+        }
+    }
+
+    /// Reads `arg` as a `Bool`, registering `dependent` if it is not ready.
+    fn typed_bool(
+        &mut self,
+        arg: ValueId,
+        dependent: ValueId,
+        cell_id: CellId,
+        span: &Span,
+    ) -> Typed<bool> {
+        let Some(value) = self.values[&arg].get_ready().map(|v| v.get_bool().copied()) else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        match value {
+            Some(value) => Typed::Ready(value),
+            None => {
+                self.invalid_type(cell_id, span);
+                Typed::Invalid
+            }
+        }
+    }
+
+    /// Reads `arg` as an `Int`, registering `dependent` if it is not ready.
+    fn typed_int(
+        &mut self,
+        arg: ValueId,
+        dependent: ValueId,
+        cell_id: CellId,
+        span: &Span,
+    ) -> Typed<i64> {
+        let Some(value) = self.values[&arg].get_ready().map(|v| v.get_int().copied()) else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        match value {
+            Some(value) => Typed::Ready(value),
+            None => {
+                self.invalid_type(cell_id, span);
+                Typed::Invalid
+            }
+        }
     }
 
     pub(crate) fn lookup(&self, frame: FrameId, var: VarId) -> Option<ValueId> {
@@ -3892,6 +4443,19 @@ impl<'a> ExecPass<'a> {
 
             let state = self.cell_state_mut(cell_id);
             state.solve_iters += 1;
+            // Re-borrowed below: recording the diagnostic needs `self`.
+            if state.solve_iters > MAX_SOLVE_ITERS {
+                self.errors.push(ExecError {
+                    span: None,
+                    cell: cell_id,
+                    kind: ExecErrorKind::LimitExceeded {
+                        what: "solver iterations".to_owned(),
+                        limit: MAX_SOLVE_ITERS as usize,
+                    },
+                });
+                return Err(());
+            }
+            let state = self.cell_state_mut(cell_id);
             state.solver.solve();
             if state.solver.was_cancelled() {
                 return Err(());
@@ -3941,17 +4505,23 @@ impl<'a> ExecPass<'a> {
                             };
                             (new_unsolved, basis, false)
                         };
-                    let span = unsolved
+                    let spans = unsolved
                         .iter()
-                        .find_map(|var| state.var_span_map.get(var).cloned());
+                        .filter_map(|var| state.var_span_map.get(var).cloned())
+                        .collect::<IndexSet<_>>();
                     state.unsolved_vars = Some(std::mem::take(&mut unsolved));
                     state.sse_basis = basis;
                     if !already_reported {
-                        self.errors.push(ExecError {
+                        let spans = if spans.is_empty() {
+                            vec![None]
+                        } else {
+                            spans.into_iter().map(Some).collect()
+                        };
+                        self.errors.extend(spans.into_iter().map(|span| ExecError {
                             span,
                             cell: cell_id,
                             kind: ExecErrorKind::Underconstrained,
-                        });
+                        }));
                     }
                 }
                 let mut constraint_added = false;
@@ -3991,7 +4561,7 @@ impl<'a> ExecPass<'a> {
             error.cell != cell_id
                 || !matches!(
                     error.kind,
-                    ExecErrorKind::InconsistentConstraint(_) | ExecErrorKind::OffGrid(_)
+                    ExecErrorKind::InconsistentConstraint(_) | ExecErrorKind::OffGrid { .. }
                 )
         });
         for constraint in self
@@ -4011,12 +4581,17 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::InconsistentConstraint(constraint),
             });
         }
-        for var in self.cell_state(cell_id).solver.off_grid_vars().clone() {
+        let grid = self.cell_state(cell_id).solver.grid();
+        for (var, value) in self.cell_state(cell_id).solver.off_grid_vars().clone() {
             let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
             self.errors.push(ExecError {
                 span,
                 cell: cell_id,
-                kind: ExecErrorKind::OffGrid(var),
+                kind: ExecErrorKind::OffGrid {
+                    value,
+                    snapped: crate::tech::snap(value, grid),
+                    grid,
+                },
             });
         }
         Ok(())
@@ -4053,6 +4628,33 @@ impl<'a> ExecPass<'a> {
         if self.entry_cell_var != Some(cell) {
             self.artifact_misses += 1;
         }
+        // Cell instantiation recurses natively between here and
+        // `eval_partial`, so a hierarchy deeper than the stack allows aborts
+        // the process. Charge it to the same budget as inlined `fn` calls.
+        self.eval_depth += 1;
+        if self.eval_depth > MAX_EVAL_DEPTH {
+            self.eval_depth -= 1;
+            self.errors.push(ExecError {
+                span: None,
+                cell: 0,
+                kind: ExecErrorKind::RecursionLimitExceeded {
+                    limit: MAX_EVAL_DEPTH,
+                },
+            });
+            return Err(());
+        }
+        let result = self.execute_cell_inner(cache_key, cell, args, scope_name);
+        self.eval_depth -= 1;
+        result
+    }
+
+    fn execute_cell_inner(
+        &mut self,
+        cache_key: CellExecKey,
+        cell: VarId,
+        args: Vec<CellArg>,
+        scope_name: Option<String>,
+    ) -> Result<CellId, ()> {
         if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
             if !args.is_empty() {
                 self.errors.push(ExecError {
@@ -4123,6 +4725,11 @@ impl<'a> ExecPass<'a> {
             });
             return Err(());
         }
+        let cell_name = self
+            .cell_names
+            .get(&cell)
+            .cloned()
+            .unwrap_or_else(|| cell_decl.name.name.to_string());
         let root_scope_name = scope_name.unwrap_or_else(|| format!("cell {}", cell_decl.name.name));
         let root_scope_id = ScopeId::semantic(None, &root_scope_name);
         let cell_id = stable_cell_id(&cache_key);
@@ -4235,6 +4842,7 @@ impl<'a> ExecPass<'a> {
                     .insert(
                         cell_id,
                         CellState {
+                            name: cell_name,
                             solve_iters: 0,
                             solver: Solver::with_grid_cancellable(
                                 self.tech.grid_step(),
@@ -4254,6 +4862,7 @@ impl<'a> ExecPass<'a> {
                             constraint_span_map: IndexMap::new(),
                             var_span_map: IndexMap::new(),
                             var_dependents: IndexMap::new(),
+                            proxy_objects: IndexSet::new(),
                         }
                     )
                     .is_none()
@@ -4302,6 +4911,51 @@ impl<'a> ExecPass<'a> {
         self.partial_cells
             .pop_back()
             .expect("failed to pop cell id");
+
+        // `emit` has no way to report a diagnostic, so the two invariants it
+        // asserts are checked here instead. Checking after the worklist has
+        // settled, rather than inside the `inst` builtin and the `!` operator,
+        // keeps objects in source emission order.
+        //
+        // `inst`'s argument is only `Any` statically, so its parent is not
+        // known to be a cell...
+        let mut invalid = Vec::new();
+        invalid.extend(
+            self.cell_state(cell_id)
+                .objects
+                .values()
+                .filter_map(|object| object.get_inst())
+                .filter(|inst| {
+                    !self.values[&inst.cell]
+                        .get_ready()
+                        .is_some_and(Value::is_cell)
+                })
+                .map(|inst| (inst.span.clone(), ExecErrorKind::InvalidType)),
+        );
+        // ...and `!` on an `Any` value is likewise unproven, as is `!` on a
+        // sequence, which has no single element to emit.
+        invalid.extend(
+            self.cell_state(cell_id)
+                .emit
+                .iter()
+                .filter(|emit| {
+                    !self.values[&emit.value]
+                        .get_ready()
+                        .and_then(Value::obj_ids)
+                        .is_some_and(|ids| ids.is_elem())
+                })
+                .map(|emit| (emit.span.clone(), ExecErrorKind::CannotEmit)),
+        );
+        if !invalid.is_empty() {
+            for (span, kind) in invalid {
+                self.errors.push(ExecError {
+                    span: Some(span),
+                    cell: cell_id,
+                    kind,
+                });
+            }
+            return Err(());
+        }
 
         let compiled_cell = Arc::new(self.emit(cell_id));
         assert!(self.compiled_cells.insert(cell_id, compiled_cell).is_none());
@@ -4353,12 +5007,13 @@ impl<'a> ExecPass<'a> {
         let top_id = cell_ids[imported.top];
         for (structure_index, structure) in imported.structs.into_iter().enumerate() {
             let cell_id = cell_ids[structure_index];
+            let structure_name = structure.name.clone();
             let root_name = if structure_index == imported.top {
                 scope_name
                     .clone()
                     .unwrap_or_else(|| format!("cell {declared_name}"))
             } else {
-                format!("cell {}", structure.name)
+                format!("cell {structure_name}")
             };
             let root = ScopeId::semantic(None, &root_name);
             let span = Span {
@@ -4403,6 +5058,7 @@ impl<'a> ExecPass<'a> {
                                 .into_iter()
                                 .map(|(x, y)| ((x, LinearExpr::from(x)), (y, LinearExpr::from(y))))
                                 .collect(),
+                            construction: false,
                             span: None,
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_polygon_{element_index}"))),
@@ -4425,6 +5081,7 @@ impl<'a> ExecPass<'a> {
                                 .collect(),
                             begin_extension: (begin_extension, LinearExpr::from(begin_extension)),
                             end_extension: (end_extension, LinearExpr::from(end_extension)),
+                            construction: false,
                             span: None,
                         }),
                         Some(name.unwrap_or_else(|| format!("gds_path_{element_index}"))),
@@ -4497,6 +5154,7 @@ impl<'a> ExecPass<'a> {
                 },
             )]);
             let cell = CompiledCell {
+                name: structure_name,
                 scopes,
                 root,
                 fields,
@@ -4576,6 +5234,7 @@ impl<'a> ExecPass<'a> {
                             )
                         })
                         .collect(),
+                    construction: polygon.construction,
                     span: polygon.span.clone(),
                 }),
                 Object::Path(path) => SolvedValue::Path(Path {
@@ -4618,16 +5277,46 @@ impl<'a> ExecPass<'a> {
                             .expect("path end extension not solved"),
                         path.end_extension.clone(),
                     ),
+                    construction: path.construction,
                     span: path.span.clone(),
                 }),
-                Object::Text(text) => SolvedValue::Text(Text {
-                    id: text.id,
-                    text: text.text.clone(),
-                    layer: text.layer.clone(),
-                    x: state.solver.eval_expr(&text.x).expect("text x not solved"),
-                    y: state.solver.eval_expr(&text.y).expect("text x not solved"),
-                    span: text.span.clone(),
-                }),
+                Object::Text(text) => {
+                    // A text position can be built entirely from constants, so
+                    // unlike every other coordinate it need not pass through a
+                    // solver variable -- and the solver's grid check only ever
+                    // looks at variables. Compare the exact value against the
+                    // snapped one here, or a label silently moves on export.
+                    let grid = state.solver.grid();
+                    let mut snap_coord = |expr: &LinearExpr, what: &str| {
+                        let exact = state
+                            .solver
+                            .eval_expr_exact(expr)
+                            .unwrap_or_else(|| panic!("text {what} not solved"));
+                        let snapped = crate::tech::snap(exact, grid);
+                        if snapped != exact {
+                            self.errors.push(ExecError {
+                                span: text.span.clone(),
+                                cell,
+                                kind: ExecErrorKind::OffGrid {
+                                    value: exact,
+                                    snapped,
+                                    grid,
+                                },
+                            });
+                        }
+                        snapped
+                    };
+                    let x = snap_coord(&text.x, "x");
+                    let y = snap_coord(&text.y, "y");
+                    SolvedValue::Text(Text {
+                        id: text.id,
+                        text: text.text.clone(),
+                        layer: text.layer.clone(),
+                        x,
+                        y,
+                        span: text.span.clone(),
+                    })
+                }
                 Object::Dimension(dim) => SolvedValue::Dimension(Dimension {
                     id: dim.id,
                     p: (
@@ -4701,6 +5390,7 @@ impl<'a> ExecPass<'a> {
         };
 
         let mut ccell = CompiledCell {
+            name: state.name.clone(),
             scopes: IndexMap::new(),
             root: state.root_scope,
             fields: IndexMap::new(),
@@ -4718,11 +5408,13 @@ impl<'a> ExecPass<'a> {
             ccell.objects.insert(*id, emit_obj(obj));
         }
 
+        let mut emitted = IndexSet::new();
         for emit in state.emit.iter() {
             let obj_id = emit_value(emit.value)
                 .expect("failed to emit")
                 .into_elem()
                 .expect("emitted non-element object");
+            emitted.insert(obj_id);
             ccell
                 .scopes
                 .get_mut(&emit.scope)
@@ -4737,6 +5429,7 @@ impl<'a> ExecPass<'a> {
         }
 
         for emit in state.object_emit.iter() {
+            emitted.insert(emit.object);
             ccell
                 .scopes
                 .get_mut(&emit.scope)
@@ -4749,6 +5442,8 @@ impl<'a> ExecPass<'a> {
                     },
                 ));
         }
+
+        mark_emitted_proxies_as_layout(&mut ccell, &state.proxy_objects, &emitted);
 
         for (id, scope) in state.scopes.iter() {
             for (seq_num, (name, value)) in scope.bindings.iter() {
@@ -4802,7 +5497,7 @@ impl<'a> ExecPass<'a> {
     }
 
     fn declare_globals(&mut self) {
-        for ast in self.ast.values() {
+        for (mod_path, ast) in self.ast.iter() {
             for decl in &ast.ast.decls {
                 if self.cancellation_requested() {
                     return;
@@ -4812,7 +5507,7 @@ impl<'a> ExecPass<'a> {
                         let vid = self.value_id();
                         assert!(
                             self.values
-                                .insert(vid, DeferValue::Ready(Value::Fn(f.clone())))
+                                .insert(vid, DeferValue::Ready(Value::Fn(Box::new(f.clone()))))
                                 .is_none()
                         );
                         assert!(
@@ -4826,9 +5521,18 @@ impl<'a> ExecPass<'a> {
                     }
                     Decl::Cell(c) => {
                         let vid = self.value_id();
+                        // Record the module-qualified identity now, while the
+                        // module path is in hand; the GDS exporter needs it and
+                        // `CellDecl` alone does not carry it.
+                        let qualified = mod_path
+                            .iter()
+                            .map(String::as_str)
+                            .chain([c.name.name.as_str()])
+                            .join("::");
+                        self.cell_names.insert(c.metadata.1, qualified);
                         assert!(
                             self.values
-                                .insert(vid, DeferValue::Ready(Value::CellFn(c.clone())))
+                                .insert(vid, DeferValue::Ready(Value::CellFn(Box::new(c.clone()))),)
                                 .is_none()
                         );
                         assert!(
@@ -5085,7 +5789,26 @@ impl<'a> ExecPass<'a> {
                             );
                             let fid = self.frame_id();
                             self.frames.insert(fid, call_frame);
-                            self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope)
+                            // A `fn` body is inlined here and now, unlike an
+                            // `if`/`match` branch, so a recursive call that is
+                            // not inside one descends natively with no
+                            // terminating case.
+                            self.eval_depth += 1;
+                            if self.eval_depth > MAX_EVAL_DEPTH {
+                                self.eval_depth -= 1;
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&loc, c.span)),
+                                    cell: loc.cell,
+                                    kind: ExecErrorKind::RecursionLimitExceeded {
+                                        limit: MAX_EVAL_DEPTH,
+                                    },
+                                });
+                                return self.nil_value;
+                            }
+                            let value =
+                                self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope);
+                            self.eval_depth -= 1;
+                            value
                         }
                         ValueRef::CellFn(_) => self.new_deferred_value(loc, |this| {
                             PartialEvalState::Call(Box::new(PartialCallExpr {
@@ -5128,14 +5851,6 @@ impl<'a> ExecPass<'a> {
                     state: MatchExprState::Scrutinee(scrutinee),
                 }))
             }),
-            Expr::Comparison(comparison_expr) => self.new_deferred_value(loc, |this| {
-                let left = this.visit_expr(loc, &comparison_expr.left);
-                let right = this.visit_expr(loc, &comparison_expr.right);
-                PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
-                    expr: (**comparison_expr).clone(),
-                    state: ComparisonExprState { left, right },
-                }))
-            }),
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
@@ -5166,16 +5881,38 @@ impl<'a> ExecPass<'a> {
                     state: IndexExprState { base, index },
                 }))
             }),
-            Expr::BinOp(b) => self.new_deferred_value(loc, |this| {
-                let lhs = this.visit_expr(loc, &b.left);
-                let rhs = this.visit_expr(loc, &b.right);
-                PartialEvalState::BinOp(PartialBinOp {
-                    lhs,
-                    rhs,
-                    op: b.op,
-                    expr: b.clone(),
-                })
-            }),
+            Expr::BinOp(b) => match b.op {
+                BinOp::Arith(op) => self.new_deferred_value(loc, |this| {
+                    let left = this.visit_expr(loc, &b.left);
+                    let right = this.visit_expr(loc, &b.right);
+                    PartialEvalState::Arith(PartialArith {
+                        left,
+                        right,
+                        op,
+                        expr: b.clone(),
+                    })
+                }),
+                BinOp::Cmp(op) => self.new_deferred_value(loc, |this| {
+                    let left = this.visit_expr(loc, &b.left);
+                    let right = this.visit_expr(loc, &b.right);
+                    PartialEvalState::Comparison(Box::new(PartialComparison {
+                        op,
+                        expr: (**b).clone(),
+                        left,
+                        right,
+                    }))
+                }),
+                BinOp::Bool(op) => {
+                    let left = self.visit_expr(loc, &b.left);
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::BoolOp(Box::new(PartialBoolOp {
+                            op,
+                            expr: (**b).clone(),
+                            state: BoolOpState::Left(left),
+                        }))
+                    })
+                }
+            },
             Expr::UnaryOp(u) => self.new_deferred_value(loc, |this| {
                 let operand = this.visit_expr(loc, &u.operand);
                 PartialEvalState::UnaryOp(PartialUnaryOp {
@@ -5293,35 +6030,31 @@ impl<'a> ExecPass<'a> {
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
                 f @ "crect" | f @ "rect" => {
-                    let layer = if f == "crect" {
+                    let layer_arg = if f == "crect" {
                         c.expr
                             .args
                             .kwargs
                             .iter()
                             .zip(c.state.kwargs.iter())
                             .find(|(k, _)| k.name.name == "layer")
-                            .map(|(_, arg_vid)| {
-                                if let Defer::Ready(layer) = &self.values[arg_vid] {
-                                    Some(layer.as_ref().unwrap_string().clone())
-                                } else {
-                                    self.add_value_dependent(*arg_vid, vid);
-                                    None
-                                }
-                            })
+                            .map(|(_, arg_vid)| *arg_vid)
                     } else {
-                        c.state.posargs.first().map(|arg_vid| {
-                            if let Defer::Ready(layer) = &self.values[arg_vid] {
-                                Some(layer.as_ref().unwrap_string().clone())
-                            } else {
-                                self.add_value_dependent(*arg_vid, vid);
-                                None
-                            }
-                        })
+                        c.state.posargs.first().copied()
                     };
-                    let layer = match layer {
+                    // `None` means the call has no layer at all (a `crect`
+                    // without the kwarg), which is legal; `Some(..)` still has
+                    // to be read fallibly because an `Any` argument reaches
+                    // here without the static checker having proven it a string.
+                    let layer = match layer_arg {
                         None => Some(None),
-                        Some(None) => None,
-                        Some(Some(l)) => Some(Some(l)),
+                        Some(arg_vid) => {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            match self.typed_string(arg_vid, vid, cell_id, &span) {
+                                Typed::Ready(layer) => Some(Some(layer)),
+                                Typed::Pending => None,
+                                Typed::Invalid => return Err(()),
+                            }
+                        }
                     };
                     if let Some(layer) = layer {
                         let id = self.object_id();
@@ -5433,13 +6166,18 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "polygon" => {
-                    if let (Defer::Ready(layer), Defer::Ready(point_spec)) = (
+                    if let (Defer::Ready(_), Defer::Ready(point_spec)) = (
                         &self.values[&c.state.posargs[0]],
                         &self.values[&c.state.posargs[1]],
                     ) {
-                        let layer = layer.as_ref().unwrap_string().clone();
                         let point_spec = point_spec.clone();
                         let span = self.span(&vref.loc, c.expr.span);
+                        let layer = match self.typed_string(c.state.posargs[0], vid, cell_id, &span)
+                        {
+                            Typed::Ready(layer) => layer,
+                            Typed::Pending => return Ok(false),
+                            Typed::Invalid => return Err(()),
+                        };
                         let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
                             Value::Int(count) => {
                                 let Ok(count) = usize::try_from(count) else {
@@ -5455,6 +6193,17 @@ impl<'a> ExecPass<'a> {
                                         span: Some(self.span(&vref.loc, c.expr.span)),
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
+                                    });
+                                    return Err(());
+                                }
+                                if count > MAX_SHAPE_POINTS {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, c.expr.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::LimitExceeded {
+                                            what: "polygon vertex count".to_owned(),
+                                            limit: MAX_SHAPE_POINTS,
+                                        },
                                     });
                                     return Err(());
                                 }
@@ -5503,6 +6252,7 @@ impl<'a> ExecPass<'a> {
                             id,
                             layer,
                             points,
+                            construction: false,
                             span: Some(span.clone()),
                         };
                         let state = self.cell_state_mut(cell_id);
@@ -5560,12 +6310,23 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "path" => {
-                    if let (Defer::Ready(layer), Defer::Ready(point_spec)) = (
+                    if let (Defer::Ready(_), Defer::Ready(_)) = (
                         &self.values[&c.state.posargs[0]],
                         &self.values[&c.state.posargs[1]],
                     ) {
-                        let layer = layer.as_ref().unwrap_string().clone();
-                        let count = match point_spec.as_ref() {
+                        let layer_span = self.span(&vref.loc, c.expr.span);
+                        let layer = match self.typed_string(
+                            c.state.posargs[0],
+                            vid,
+                            cell_id,
+                            &layer_span,
+                        ) {
+                            Typed::Ready(layer) => layer,
+                            Typed::Pending => return Ok(false),
+                            Typed::Invalid => return Err(()),
+                        };
+                        let point_spec = &self.values[&c.state.posargs[1]];
+                        let count = match point_spec.as_ref().unwrap_ready().as_ref() {
                             ValueRef::Int(count) => usize::try_from(*count).ok(),
                             _ => {
                                 self.errors.push(ExecError {
@@ -5584,6 +6345,17 @@ impl<'a> ExecPass<'a> {
                             });
                             return Err(());
                         };
+                        if count > MAX_SHAPE_POINTS {
+                            self.errors.push(ExecError {
+                                span: Some(self.span(&vref.loc, c.expr.span)),
+                                cell: cell_id,
+                                kind: ExecErrorKind::LimitExceeded {
+                                    what: "path point count".to_owned(),
+                                    limit: MAX_SHAPE_POINTS,
+                                },
+                            });
+                            return Err(());
+                        }
                         for kwarg in &c.expr.args.kwargs {
                             let name = kwarg.name.name.as_str();
                             if let Some(coordinate) = polygon_coordinate(name)
@@ -5636,6 +6408,7 @@ impl<'a> ExecPass<'a> {
                             points,
                             begin_extension,
                             end_extension,
+                            construction: false,
                             span: Some(span.clone()),
                         };
                         state.objects.insert(id, path.clone().into());
@@ -5726,7 +6499,7 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "text" => {
-                    let (mut args, unready): (Vec<_>, Vec<_>) =
+                    let (args, unready): (Vec<_>, Vec<_>) =
                         c.state.posargs.iter().partition_map(|v| {
                             if let Defer::Ready(v) = &self.values[v] {
                                 Either::Left(v)
@@ -5736,13 +6509,21 @@ impl<'a> ExecPass<'a> {
                         });
                     if unready.is_empty() {
                         assert_eq!(args.len(), 4);
-                        let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
+                        // Each argument has to be re-read fallibly: `Any`
+                        // satisfies the static signature, so none of these
+                        // types has actually been proven.
+                        let (Some(text_val), Some(layer), Some(x), Some(y)) = (
+                            args[0].get_string().cloned(),
+                            args[1].get_string().cloned(),
+                            args[2].get_linear().cloned(),
+                            args[3].get_linear().cloned(),
+                        ) else {
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
-                        let y = args.pop().unwrap().as_ref().unwrap_linear().clone();
-                        let x = args.pop().unwrap().as_ref().unwrap_linear().clone();
-                        let layer = args.pop().unwrap().as_ref().unwrap_string().clone();
-                        let text_val = args.pop().unwrap().as_ref().unwrap_string().clone();
                         let text = Text {
                             id,
                             text: text_val,
@@ -5879,8 +6660,15 @@ impl<'a> ExecPass<'a> {
                         &self.values[&c.state.posargs[0]],
                         &self.values[&c.state.posargs[1]],
                     ) {
-                        let expr = vl.as_ref().unwrap_linear().clone()
-                            - vr.as_ref().unwrap_linear().clone();
+                        // `eq(a, b)` accepts `Any` statically, so neither
+                        // operand is known to be a solver expression here.
+                        let (Some(vl), Some(vr)) = (vl.get_linear(), vr.get_linear()) else {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        let expr = vl.clone() - vr.clone();
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let constraint = state.solver.constrain_eq0(expr);
 
                         state.constraint_span_map.insert(
@@ -5969,15 +6757,44 @@ impl<'a> ExecPass<'a> {
                             // Build the whole `[Int]` in one O(n) pass (O(log n) pushes),
                             // avoiding the per-element interpreter overhead (frame, scope,
                             // deferred value) of the old recursive `cons` definition.
+                            // A zero step never reaches `stop`, so there is
+                            // no sequence it could mean; it used to fall
+                            // through the `> 0` test and yield an empty one,
+                            // as a descending range did.
+                            if step == 0 {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::ZeroRangeStep,
+                                });
+                                return Err(());
+                            }
                             let mut seq = Seq::new();
-                            if step > 0 {
-                                let mut i = start;
-                                while i < stop {
-                                    if self.cancellation_requested() {
-                                        return Err(());
-                                    }
-                                    seq.push_back(Value::Int(i));
-                                    i += step;
+                            let mut i = start;
+                            while if step > 0 { i < stop } else { i > stop } {
+                                if self.cancellation_requested() {
+                                    return Err(());
+                                }
+                                if seq.len() >= MAX_SEQ_LEN {
+                                    let span = self.span(&vref.loc, c.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::LimitExceeded {
+                                            what: "sequence length".to_owned(),
+                                            limit: MAX_SEQ_LEN,
+                                        },
+                                    });
+                                    return Err(());
+                                }
+                                seq.push_back(Value::Int(i));
+                                // A wrapping `i` would reverse the comparison
+                                // and loop forever; the correct result is
+                                // simply the elements produced so far.
+                                match i.checked_add(step) {
+                                    Some(next) => i = next,
+                                    None => break,
                                 }
                             }
                             self.values.insert(vid, Defer::Ready(Value::Seq(seq)));
@@ -6088,7 +6905,7 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "dimension" => {
-                    let (mut args, unready): (Vec<_>, Vec<_>) =
+                    let (args, unready): (Vec<_>, Vec<_>) =
                         c.state.posargs.iter().partition_map(|v| {
                             if let Defer::Ready(v) = &self.values[v] {
                                 Either::Left(v)
@@ -6098,13 +6915,24 @@ impl<'a> ExecPass<'a> {
                         });
                     if unready.is_empty() {
                         assert_eq!(args.len(), 7);
-                        let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
+                        // `Any` satisfies the static signature, so the runtime
+                        // types still have to be checked here.
+                        let horiz = args[6].get_bool().copied();
+                        let linears = args[..6]
+                            .iter()
+                            .map(|arg| arg.get_linear().cloned())
+                            .collect::<Option<Vec<_>>>();
+                        let (Some(horiz), Some(linears)) = (horiz, linears) else {
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        // Positional order is (p, n, value, coord, pstop, nstop).
+                        let [p, n, value, coord, pstop, nstop] =
+                            <[LinearExpr; 6]>::try_from(linears)
+                                .expect("dimension takes six solver expressions");
+                        let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
-                        let horiz = *args.pop().unwrap().as_ref().unwrap_bool();
-                        let mut arg = || args.pop().unwrap().as_ref().unwrap_linear().clone();
-                        let (nstop, pstop, coord, value, n, p) =
-                            (arg(), arg(), arg(), arg(), arg(), arg());
                         let expr = p.clone() - n.clone() - value.clone();
                         let constraint = state.solver.constrain_eq0(expr);
                         let dim = Dimension {
@@ -6136,40 +6964,52 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 "inst" => {
-                    let refl = c
-                        .expr
-                        .args
-                        .kwargs
-                        .iter()
-                        .zip(c.state.kwargs.iter())
-                        .find_map(|(kwarg, arg_vid)| {
-                            if kwarg.name.name == "reflect" {
-                                Some(if let Defer::Ready(refl) = &self.values[arg_vid] {
-                                    Some(*refl.as_ref().unwrap_bool())
-                                } else {
-                                    self.add_value_dependent(*arg_vid, vid);
-                                    None
-                                })
-                            } else {
-                                None
-                            }
-                        });
-                    let refl = match refl {
-                        None => Some(None),
-                        Some(None) => None,
-                        Some(Some(l)) => Some(Some(l)),
+                    // Every kwarg here is optional, and every one of them can
+                    // arrive as `Any`, so absence and a wrong runtime type are
+                    // distinct outcomes: absence falls back to the default,
+                    // a wrong type is an `InvalidType` diagnostic.
+                    let kwarg_vid = |name: &str| {
+                        c.expr
+                            .args
+                            .kwargs
+                            .iter()
+                            .zip(c.state.kwargs.iter())
+                            .find_map(|(kwarg, arg_vid)| {
+                                (kwarg.name.name == name).then_some((kwarg, *arg_vid))
+                            })
                     };
-                    let angle = c
-                        .expr
-                        .args
-                        .kwargs
-                        .iter()
-                        .zip(c.state.kwargs.iter())
-                        .find_map(|(kwarg, arg_vid)| {
-                            if kwarg.name.name == "angle" {
-                                let span = self.span(&vref.loc, kwarg.value.span());
-                                Some(if let Defer::Ready(refl) = &self.values[arg_vid] {
-                                    Some(match ((*refl.as_ref().unwrap_int() % 360) + 360) % 360 {
+                    let reflect_arg = kwarg_vid("reflect");
+                    let angle_arg = kwarg_vid("angle");
+                    let construction_arg = kwarg_vid("construction");
+
+                    let mut pending = false;
+                    let mut read_bool = |this: &mut Self,
+                                         arg: Option<(
+                        &KwArgValue<Substr, VarIdTyMetadata>,
+                        ValueId,
+                    )>| match arg {
+                        None => Ok(None),
+                        Some((kwarg, arg_vid)) => {
+                            let span = this.span(&vref.loc, kwarg.value.span());
+                            match this.typed_bool(arg_vid, vid, cell_id, &span) {
+                                Typed::Ready(v) => Ok(Some(v)),
+                                Typed::Pending => {
+                                    pending = true;
+                                    Ok(None)
+                                }
+                                Typed::Invalid => Err(()),
+                            }
+                        }
+                    };
+                    let refl = read_bool(self, reflect_arg)?;
+                    let construction = read_bool(self, construction_arg)?;
+                    let angle = match angle_arg {
+                        None => None,
+                        Some((kwarg, arg_vid)) => {
+                            let span = self.span(&vref.loc, kwarg.value.span());
+                            match self.typed_int(arg_vid, vid, cell_id, &span) {
+                                Typed::Ready(degrees) => {
+                                    Some(match ((degrees % 360) + 360) % 360 {
                                         0 => Rotation::R0,
                                         90 => Rotation::R90,
                                         180 => Rotation::R180,
@@ -6183,45 +7023,16 @@ impl<'a> ExecPass<'a> {
                                             Rotation::R0
                                         }
                                     })
-                                } else {
-                                    self.add_value_dependent(*arg_vid, vid);
+                                }
+                                Typed::Pending => {
+                                    pending = true;
                                     None
-                                })
-                            } else {
-                                None
+                                }
+                                Typed::Invalid => return Err(()),
                             }
-                        });
-                    let angle = match angle {
-                        None => Some(None),
-                        Some(None) => None,
-                        Some(Some(l)) => Some(Some(l)),
+                        }
                     };
-                    let construction = c
-                        .expr
-                        .args
-                        .kwargs
-                        .iter()
-                        .zip(c.state.kwargs.iter())
-                        .find_map(|(kwarg, arg_vid)| {
-                            if kwarg.name.name == "construction" {
-                                Some(if let Defer::Ready(v) = &self.values[arg_vid] {
-                                    Some(*v.as_ref().unwrap_bool())
-                                } else {
-                                    self.add_value_dependent(*arg_vid, vid);
-                                    None
-                                })
-                            } else {
-                                None
-                            }
-                        });
-                    let construction = match construction {
-                        None => Some(None),
-                        Some(None) => None,
-                        Some(Some(v)) => Some(Some(v)),
-                    };
-                    if let (Some(refl), Some(angle), Some(construction)) =
-                        (refl, angle, construction)
-                    {
+                    if !pending {
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -6325,19 +7136,19 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
-            PartialEvalState::BinOp(bin_op) => {
+            PartialEvalState::Arith(arith) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
-                    (&self.values[&bin_op.lhs], &self.values[&bin_op.rhs])
+                    (&self.values[&arith.left], &self.values[&arith.right])
                 {
                     match (vl, vr) {
                         (Value::Linear(vl), Value::Linear(vr)) => {
-                            let res = match bin_op.op {
-                                BinOp::Add => Some(vl.clone() + vr.clone()),
-                                BinOp::Sub => Some(vl.clone() - vr.clone()),
-                                BinOp::Mul => {
+                            let res = match arith.op {
+                                ArithOp::Add => Some(vl.clone() + vr.clone()),
+                                ArithOp::Sub => Some(vl.clone() - vr.clone()),
+                                ArithOp::Mul => {
                                     let res = match (
-                                        state.solver.eval_expr(vl),
-                                        state.solver.eval_expr(vr),
+                                        state.solver.eval_expr_exact(vl),
+                                        state.solver.eval_expr_exact(vr),
                                     ) {
                                         (Some(vl), Some(vr)) => Some((vl * vr).into()),
                                         (Some(vl), None) => Some(vr.clone() * vl),
@@ -6353,9 +7164,11 @@ impl<'a> ExecPass<'a> {
                                     }
                                     res
                                 }
-                                BinOp::Div => {
-                                    let res =
-                                        state.solver.eval_expr(vr).map(|rhs| vl.clone() / rhs);
+                                ArithOp::Div => {
+                                    let res = state
+                                        .solver
+                                        .eval_expr_exact(vr)
+                                        .map(|rhs| vl.clone() / rhs);
                                     if res.is_none() {
                                         for (_, var) in vr.coeffs.clone() {
                                             self.add_var_dependent(cell_id, var, vid);
@@ -6364,7 +7177,7 @@ impl<'a> ExecPass<'a> {
                                     res
                                 }
                                 _ => {
-                                    let span = self.span(&vref.loc, bin_op.expr.span);
+                                    let span = self.span(&vref.loc, arith.expr.span);
                                     self.errors.push(ExecError {
                                         span: Some(span.clone()),
                                         cell: cell_id,
@@ -6374,6 +7187,21 @@ impl<'a> ExecPass<'a> {
                                 }
                             };
                             if let Some(res) = res {
+                                // Division by zero is the realistic source. A
+                                // non-finite coefficient must be rejected here,
+                                // at the point it is created: downstream it
+                                // hangs the dense SVD (uncatchable), saturates
+                                // to `i32::MAX` in GDS, and turns `as Int` into
+                                // `i64::MAX`.
+                                if !res.is_finite() {
+                                    let span = self.span(&vref.loc, arith.expr.span);
+                                    self.errors.push(ExecError {
+                                        span: Some(span),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::NonFiniteValue,
+                                    });
+                                    return Err(());
+                                }
                                 self.values
                                     .insert(vid, DeferValue::Ready(Value::Linear(res)));
                                 true
@@ -6382,18 +7210,56 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                         (Value::Int(vl), Value::Int(vr)) => {
-                            let res = match bin_op.op {
-                                BinOp::Add => vl + vr,
-                                BinOp::Sub => vl - vr,
-                                BinOp::Mul => vl * vr,
-                                BinOp::Div => vl / vr,
-                                BinOp::Rem => vl % vr,
+                            // Raw operators would panic on a zero divisor in
+                            // every profile and, on overflow, panic in debug
+                            // but wrap silently in release -- so the same
+                            // source would compute two different answers
+                            // depending on how the compiler was built.
+                            if matches!(arith.op, ArithOp::Div | ArithOp::Rem) && *vr == 0 {
+                                let span = self.span(&vref.loc, arith.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::DivideByZero(
+                                        match arith.op {
+                                            ArithOp::Div => "division",
+                                            _ => "remainder",
+                                        }
+                                        .to_owned(),
+                                    ),
+                                });
+                                return Err(());
+                            }
+                            let res = match arith.op {
+                                ArithOp::Add => vl.checked_add(*vr),
+                                ArithOp::Sub => vl.checked_sub(*vr),
+                                ArithOp::Mul => vl.checked_mul(*vr),
+                                ArithOp::Div => vl.checked_div(*vr),
+                                ArithOp::Rem => vl.checked_rem(*vr),
+                            };
+                            let Some(res) = res else {
+                                let span = self.span(&vref.loc, arith.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::IntegerOverflow(
+                                        match arith.op {
+                                            ArithOp::Add => "+",
+                                            ArithOp::Sub => "-",
+                                            ArithOp::Mul => "*",
+                                            ArithOp::Div => "/",
+                                            ArithOp::Rem => "%",
+                                        }
+                                        .to_owned(),
+                                    ),
+                                });
+                                return Err(());
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
                         }
                         _ => {
-                            let span = self.span(&vref.loc, bin_op.expr.span);
+                            let span = self.span(&vref.loc, arith.expr.span);
                             self.errors.push(ExecError {
                                 span: Some(span.clone()),
                                 cell: cell_id,
@@ -6403,8 +7269,8 @@ impl<'a> ExecPass<'a> {
                         }
                     }
                 } else {
-                    self.add_value_dependent(bin_op.lhs, vid);
-                    self.add_value_dependent(bin_op.rhs, vid);
+                    self.add_value_dependent(arith.left, vid);
+                    self.add_value_dependent(arith.right, vid);
                     false
                 }
             }
@@ -6435,9 +7301,33 @@ impl<'a> ExecPass<'a> {
                                 .insert(vid, DeferValue::Ready(Value::Linear(res)));
                             true
                         }
+                        Value::Bool(v) => {
+                            let res = match unary_op.op {
+                                UnaryOp::Not => !*v,
+                                UnaryOp::Neg => {
+                                    let span = self.span(&vref.loc, unary_op.expr.span);
+                                    self.invalid_type(cell_id, &span);
+                                    return Err(());
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
                         Value::Int(v) => {
                             let res = match unary_op.op {
-                                UnaryOp::Neg => -v,
+                                // `-i64::MIN` has no `Int` representation.
+                                UnaryOp::Neg => {
+                                    let Some(res) = v.checked_neg() else {
+                                        let span = self.span(&vref.loc, unary_op.expr.span);
+                                        self.errors.push(ExecError {
+                                            span: Some(span),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::IntegerOverflow("-".to_owned()),
+                                        });
+                                        return Err(());
+                                    };
+                                    res
+                                }
                                 _ => {
                                     let span = self.span(&vref.loc, unary_op.expr.span);
                                     self.errors.push(ExecError {
@@ -6526,13 +7416,24 @@ impl<'a> ExecPass<'a> {
             PartialEvalState::Match(match_) => match match_.state {
                 MatchExprState::Scrutinee(scrutinee) => {
                     if let Defer::Ready(val) = &self.values[&scrutinee] {
-                        let variant = val.as_ref().unwrap_enum_value();
+                        // A scrutinee typed `Any` was never proven to be an
+                        // enum value, and even a genuine enum value may belong
+                        // to a different enum than the arms name.
+                        let Some(variant) = val.get_enum_value() else {
+                            let span = self.span(&vref.loc, match_.expr.scrutinee.span());
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
                         let arm = match_
                             .expr
                             .arms
                             .iter()
-                            .find(|arm| *variant == arm.pattern.path.last().unwrap().name)
-                            .unwrap();
+                            .find(|arm| *variant == arm.pattern.path.last().unwrap().name);
+                        let Some(arm) = arm else {
+                            let span = self.span(&vref.loc, match_.expr.scrutinee.span());
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
                         let value = self.visit_expr(vref.loc, &arm.expr);
                         match_.state = MatchExprState::Value(value);
                         self.values.insert(vid, Defer::Deferred(vref));
@@ -6553,92 +7454,116 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
-            PartialEvalState::Comparison(comparison_expr) => {
-                if let (Defer::Ready(vl), Defer::Ready(vr)) = (
-                    &self.values[&comparison_expr.state.left],
-                    &self.values[&comparison_expr.state.right],
-                ) {
-                    match (vl, vr) {
+            PartialEvalState::BoolOp(bool_op) => match bool_op.state {
+                BoolOpState::Left(left) => {
+                    if let Defer::Ready(val) = &self.values[&left] {
+                        // An operand typed `Any` was never proven to be a bool.
+                        let Some(left_val) = val.get_bool().copied() else {
+                            let span = self.span(&vref.loc, bool_op.expr.left.span());
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        // Whether or not this expression should short-circuit.
+                        let decided = match bool_op.op {
+                            BoolOp::And => !left_val,
+                            BoolOp::Or => left_val,
+                        };
+                        if decided {
+                            self.values
+                                .insert(vid, DeferValue::Ready(Value::Bool(left_val)));
+                        } else {
+                            let right = self.visit_expr(vref.loc, &bool_op.expr.right);
+                            bool_op.state = BoolOpState::Right(right);
+                            self.values.insert(vid, Defer::Deferred(vref));
+                            self.cell_state_mut(cell_id).deferred.insert(vid);
+                        }
+                        true
+                    } else {
+                        self.add_value_dependent(left, vid);
+                        false
+                    }
+                }
+                BoolOpState::Right(right) => {
+                    if let Defer::Ready(val) = &self.values[&right] {
+                        // The result is the right operand's value, so it has to
+                        // be a bool as well.
+                        let Some(res) = val.get_bool().copied() else {
+                            let span = self.span(&vref.loc, bool_op.expr.right.span());
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                        true
+                    } else {
+                        self.add_value_dependent(right, vid);
+                        false
+                    }
+                }
+            },
+            PartialEvalState::Comparison(cmp) => {
+                if let (Defer::Ready(vl), Defer::Ready(vr)) =
+                    (&self.values[&cmp.left], &self.values[&cmp.right])
+                {
+                    // `Ty::Any` satisfies the static comparison checks, so an
+                    // operand pair or an operator that those checks would have
+                    // rejected can still arrive here. Every combination the
+                    // evaluator has no answer for is an `InvalidType`
+                    // diagnostic rather than an `unreachable!`.
+                    let op = cmp.op;
+                    let ordered = |ord: std::cmp::Ordering| match op {
+                        ComparisonOp::Eq => Some(ord.is_eq()),
+                        ComparisonOp::Ne => Some(ord.is_ne()),
+                        ComparisonOp::Geq => Some(ord.is_ge()),
+                        ComparisonOp::Gt => Some(ord.is_gt()),
+                        ComparisonOp::Leq => Some(ord.is_le()),
+                        ComparisonOp::Lt => Some(ord.is_lt()),
+                    };
+                    let equality = |eq: bool| match op {
+                        ComparisonOp::Eq => Some(eq),
+                        ComparisonOp::Ne => Some(!eq),
+                        // Only equality is defined for these operand types.
+                        _ => None,
+                    };
+                    let res = match (vl, vr) {
                         (Value::Linear(vl), Value::Linear(vr)) => {
-                            if let (Some(vl), Some(vr)) =
+                            let (Some(el), Some(er)) =
                                 (state.solver.eval_expr(vl), state.solver.eval_expr(vr))
-                            {
-                                let res = match comparison_expr.expr.op {
-                                    crate::ast::ComparisonOp::Eq => {
-                                        unreachable!("cannot check equality between floats")
-                                    }
-                                    crate::ast::ComparisonOp::Ne => {
-                                        unreachable!("cannot check inequality between floats")
-                                    }
-                                    crate::ast::ComparisonOp::Geq => vl >= vr,
-                                    crate::ast::ComparisonOp::Gt => vl > vr,
-                                    crate::ast::ComparisonOp::Leq => vl <= vr,
-                                    crate::ast::ComparisonOp::Lt => vl < vr,
-                                };
-                                self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                                true
-                            } else {
+                            else {
                                 for (_, var) in
                                     vl.coeffs.clone().into_iter().chain(vr.coeffs.clone())
                                 {
                                     self.add_var_dependent(cell_id, var, vid);
                                 }
-                                false
+                                return Ok(false);
+                            };
+                            match op {
+                                // Float equality is meaningless against a
+                                // solved value, and is rejected statically
+                                // whenever the type is known.
+                                ComparisonOp::Eq | ComparisonOp::Ne => None,
+                                _ => el.partial_cmp(&er).and_then(ordered),
                             }
                         }
-                        (Value::Int(vl), Value::Int(vr)) => {
-                            let res = match comparison_expr.expr.op {
-                                crate::ast::ComparisonOp::Eq => vl == vr,
-                                crate::ast::ComparisonOp::Ne => vl != vr,
-                                crate::ast::ComparisonOp::Geq => vl >= vr,
-                                crate::ast::ComparisonOp::Gt => vl > vr,
-                                crate::ast::ComparisonOp::Leq => vl <= vr,
-                                crate::ast::ComparisonOp::Lt => vl < vr,
-                            };
-                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                            true
-                        }
-                        (Value::EnumValue(vl), Value::EnumValue(vr)) => {
-                            let res = match comparison_expr.expr.op {
-                                crate::ast::ComparisonOp::Eq => vl == vr,
-                                crate::ast::ComparisonOp::Ne => vl != vr,
-                                _ => unreachable!(),
-                            };
-                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                            true
-                        }
-                        (Value::Nil, Value::Nil) => {
-                            let res = match comparison_expr.expr.op {
-                                crate::ast::ComparisonOp::Eq => true,
-                                crate::ast::ComparisonOp::Ne => false,
-                                _ => unreachable!(),
-                            };
-                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                            true
-                        }
-                        (Value::SeqNil, Value::SeqNil) => {
-                            let res = match comparison_expr.expr.op {
-                                crate::ast::ComparisonOp::Eq => true,
-                                crate::ast::ComparisonOp::Ne => false,
-                                _ => unreachable!(),
-                            };
-                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                            true
-                        }
+                        (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
+                        (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
+                        (Value::EnumValue(vl), Value::EnumValue(vr)) => equality(vl == vr),
+                        (Value::Nil, Value::Nil) => equality(true),
+                        (Value::SeqNil, Value::SeqNil) => equality(true),
                         (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => {
-                            let res = match comparison_expr.expr.op {
-                                crate::ast::ComparisonOp::Eq => x.is_empty(),
-                                crate::ast::ComparisonOp::Ne => !x.is_empty(),
-                                _ => unreachable!(),
-                            };
-                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
-                            true
+                            equality(x.is_empty())
                         }
-                        _ => unreachable!(),
-                    }
+                        _ => None,
+                    };
+                    let Some(res) = res else {
+                        let span = self.span(&vref.loc, cmp.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return Err(());
+                    };
+                    self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                    true
                 } else {
-                    self.add_value_dependent(comparison_expr.state.left, vid);
-                    self.add_value_dependent(comparison_expr.state.right, vid);
+                    self.add_value_dependent(cmp.left, vid);
+                    self.add_value_dependent(cmp.right, vid);
                     false
                 }
             }
@@ -6796,7 +7721,15 @@ impl<'a> ExecPass<'a> {
                                 "y" => Some(Value::Linear(inst.y.clone())),
                                 field => {
                                     if let Defer::Ready(cell) = &self.values[&inst.cell] {
-                                        let inst_cell_id = *cell.as_ref().unwrap_cell();
+                                        // The instance may have been built by
+                                        // `inst` on an `Any` argument, so its
+                                        // parent is not known to be a cell.
+                                        let Some(inst_cell_id) = cell.get_cell().copied() else {
+                                            let span =
+                                                self.span(&vref.loc, field_access_expr.expr.span);
+                                            self.invalid_type(cell_id, &span);
+                                            return Err(());
+                                        };
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
@@ -6818,11 +7751,10 @@ impl<'a> ExecPass<'a> {
                                             };
                                         let compiled_cell_value_ids = &self.compiled_cell_value_ids;
                                         let obj_id = &mut self.next_id;
-                                        let objects = &mut self
-                                            .cell_states
-                                            .get_mut(&cell_id)
-                                            .unwrap()
-                                            .objects;
+                                        let cell_state =
+                                            self.cell_states.get_mut(&cell_id).unwrap();
+                                        let proxies = &mut cell_state.proxy_objects;
+                                        let objects = &mut cell_state.objects;
                                         let transformed = Value::from_array(field_value.map(
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
@@ -6849,9 +7781,14 @@ impl<'a> ExecPass<'a> {
                                                             rect.y1,
                                                             inst.y.clone(),
                                                         ),
-                                                        construction: rect.construction,
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: rect.span.clone(),
                                                     };
+                                                    proxies.insert(xrect.id);
                                                     objects.insert(xrect.id, xrect.clone().into());
                                                     Value::Rect(xrect)
                                                 }
@@ -6879,8 +7816,14 @@ impl<'a> ExecPass<'a> {
                                                                 )
                                                             })
                                                             .collect(),
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: polygon.span.clone(),
                                                     };
+                                                    proxies.insert(polygon.id);
                                                     objects
                                                         .insert(polygon.id, polygon.clone().into());
                                                     Value::Polygon(polygon)
@@ -6916,8 +7859,14 @@ impl<'a> ExecPass<'a> {
                                                         end_extension: LinearExpr::from(
                                                             path.end_extension.0,
                                                         ),
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: path.span.clone(),
                                                     };
+                                                    proxies.insert(path.id);
                                                     objects.insert(path.id, path.clone().into());
                                                     Value::Path(path)
                                                 }
@@ -6938,9 +7887,14 @@ impl<'a> ExecPass<'a> {
                                                         y: LinearExpr::add(inst.y.clone(), cy),
                                                         angle,
                                                         reflect,
-                                                        construction: cinst.construction,
+                                                        // A view of geometry the instance already draws, so it
+                                                        // is construction geometry -- drawing it again would put a
+                                                        // phantom shape on top of the SREF. `!` opts back in; see
+                                                        // `mark_emitted_proxies_as_layout`.
+                                                        construction: true,
                                                         span: cinst.span.clone(),
                                                     };
+                                                    proxies.insert(oinst.id);
                                                     objects.insert(oinst.id, oinst.clone().into());
                                                     Value::Inst(oinst)
                                                 }
@@ -7057,9 +8011,16 @@ impl<'a> ExecPass<'a> {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
                     (&self.values[&c.lhs], &self.values[&c.rhs])
                 {
-                    let lhs = vl.as_ref().unwrap_linear();
-                    let rhs = vr.as_ref().unwrap_linear();
+                    // A kwarg constraint such as `x0=v` accepts `Any`
+                    // statically, so `v` is not known to be a solver
+                    // expression until it is read here.
+                    let (Some(lhs), Some(rhs)) = (vl.get_linear(), vr.get_linear()) else {
+                        let span = c.span.clone();
+                        self.invalid_type(cell_id, &span);
+                        return Err(());
+                    };
                     let expr = lhs.clone() - rhs.clone();
+                    let state = self.cell_states.get_mut(&cell_id).unwrap();
                     if c.fallback {
                         state.fallback_constraints.push(FallbackConstraint {
                             priority: c.priority,
@@ -7087,6 +8048,20 @@ impl<'a> ExecPass<'a> {
                         }
                         (x @ Value::Int(_), Ty::Int) => Some(x.clone()),
                         (Value::Linear(expr), Ty::Int) => {
+                            // `f64 as i64` saturates rather than failing, so a
+                            // non-finite input would silently become
+                            // `i64::MAX` and feed unbounded allocation.
+                            if let Some(val) = state.solver.eval_expr(expr)
+                                && !val.is_finite()
+                            {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::NonFiniteValue,
+                                });
+                                return Err(());
+                            }
                             let res = state
                                 .solver
                                 .eval_expr(expr)
@@ -7200,11 +8175,25 @@ impl<'a> ExecPass<'a> {
         Ok(progress)
     }
 
-    /// The bounding box of `cell`'s geometry, in `cell`'s own coordinate frame.
+    /// The bounding box of `cell`'s exported geometry, in `cell`'s own
+    /// coordinate frame.
+    ///
+    /// Memoized per cell. The hierarchy is a DAG -- each cell is compiled and
+    /// cached once -- but without a cache this walks every instance *path*, so
+    /// a doubling hierarchy costs 2^depth: measured 5.5 s at 26 levels and
+    /// tens of minutes not far beyond that. A cell's extent in its own frame
+    /// does not depend on where it is instantiated, so one result per cell can
+    /// be transformed per instance, turning O(paths) into O(cells).
     pub fn bbox(&self, cell: CellId) -> Option<Rect<f64>> {
+        if let Some(cached) = self.bbox_cache.borrow().get(&cell) {
+            return cached.clone();
+        }
         let mut bbox = None;
-        let cell = &self.compiled_cells[&cell];
-        for (_, o) in cell.objects.iter() {
+        for (_, o) in self.compiled_cells[&cell].objects.iter() {
+            // Construction geometry is excluded, matching the exporter.
+            if !o.is_layout() {
+                continue;
+            }
             match o {
                 SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
                 SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
@@ -7218,6 +8207,7 @@ impl<'a> ExecPass<'a> {
                 _ => (),
             }
         }
+        self.bbox_cache.borrow_mut().insert(cell, bbox.clone());
         bbox
     }
 }
@@ -7244,7 +8234,10 @@ pub enum Value {
     Path(Path<LinearExpr>),
     Point((LinearExpr, LinearExpr)),
     Bool(bool),
-    Fn(FnDecl<Substr, VarIdTyMetadata>),
+    /// Boxed: an inline `FnDecl` is by far the largest variant, and `Value` is
+    /// stored per sequence element, so unboxing it would make every element of
+    /// every sequence pay for an inline AST declaration.
+    Fn(Box<FnDecl<Substr, VarIdTyMetadata>>),
     /// A cell generator.
     ///
     /// Example:
@@ -7255,7 +8248,7 @@ pub enum Value {
     /// ```
     ///
     /// `mycell` is a value of type `CellFn`.
-    CellFn(CellDecl<Substr, VarIdTyMetadata>),
+    CellFn(Box<CellDecl<Substr, VarIdTyMetadata>>),
     /// A particular parameterization of a cell.
     ///
     /// Example:
@@ -7501,6 +8494,12 @@ pub enum SseBasis {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledCell {
+    /// The cell's identity: its module-qualified source name, or the struct
+    /// name for a cell imported from GDS.
+    ///
+    /// Carried as structured data so consumers -- the GDS exporter above all
+    /// -- do not have to recover it by scraping a human-readable scope name.
+    pub name: String,
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
     pub fields: IndexMap<String, Arrayed<ObjectId>>,
@@ -7545,6 +8544,25 @@ impl CompiledCell {
         self.fields
             .get(name)
             .map(|o| o.map(&mut |id| &self.objects[id]))
+    }
+}
+
+impl SolvedValue {
+    /// Whether this object is part of the layout, rather than construction
+    /// geometry that only exists to constrain it.
+    ///
+    /// `bbox` and the GDS exporter must agree on this: if `bbox` reports the
+    /// extent of geometry the exporter drops, a placement computed from it is
+    /// wrong in a way that still looks right in the GUI. Keeping the predicate
+    /// in one place is what stops the two from drifting apart again.
+    pub fn is_layout(&self) -> bool {
+        match self {
+            SolvedValue::Rect(rect) => !rect.construction,
+            SolvedValue::Polygon(polygon) => !polygon.construction,
+            SolvedValue::Path(path) => !path.construction,
+            SolvedValue::Instance(inst) => !inst.construction,
+            SolvedValue::Text(_) | SolvedValue::Dimension(_) => true,
+        }
     }
 }
 
@@ -7645,6 +8663,18 @@ enum Defer<R, D> {
     Deferred(D),
 }
 
+/// The outcome of reading a builtin argument that must have a concrete runtime
+/// type.
+///
+/// Distinguishes "not evaluated yet" (retry once the dependency is ready) from
+/// "evaluated to the wrong type" (an `InvalidType` diagnostic has already been
+/// recorded), which the panicking `unwrap_*` accessors cannot.
+enum Typed<T> {
+    Ready(T),
+    Pending,
+    Invalid,
+}
+
 type DeferValue<T> = Defer<Value, PartialEval<T>>;
 
 #[derive(Debug, Clone)]
@@ -7657,8 +8687,9 @@ struct PartialEval<T: AstMetadata> {
 enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
     Match(Box<PartialMatchExpr<T>>),
-    Comparison(Box<PartialComparisonExpr<T>>),
-    BinOp(PartialBinOp<T>),
+    Arith(PartialArith<T>),
+    Comparison(Box<PartialComparison<T>>),
+    BoolOp(Box<PartialBoolOp<T>>),
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
@@ -7687,10 +8718,10 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBinOp<T: AstMetadata> {
-    lhs: ValueId,
-    rhs: ValueId,
-    op: BinOp,
+struct PartialArith<T: AstMetadata> {
+    left: ValueId,
+    right: ValueId,
+    op: ArithOp,
     expr: Box<BinOpExpr<Substr, T>>,
 }
 
@@ -7739,13 +8770,27 @@ pub struct CallExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialComparisonExpr<T: AstMetadata> {
-    expr: ComparisonExpr<Substr, T>,
-    state: ComparisonExprState,
+struct PartialBoolOp<T: AstMetadata> {
+    op: BoolOp,
+    expr: BinOpExpr<Substr, T>,
+    state: BoolOpState,
+}
+
+/// State of boolean operation.
+#[derive(Debug, Clone)]
+pub enum BoolOpState {
+    /// Evaluating the left operand.
+    Left(ValueId),
+    /// Evaluating the right operand.
+    ///
+    /// Indicates that the expression did not short-circuit.
+    Right(ValueId),
 }
 
 #[derive(Debug, Clone)]
-pub struct ComparisonExprState {
+struct PartialComparison<T: AstMetadata> {
+    op: ComparisonOp,
+    expr: BinOpExpr<Substr, T>,
     left: ValueId,
     right: ValueId,
 }

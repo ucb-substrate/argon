@@ -5,6 +5,7 @@ pub mod compile;
 pub mod diagnostics;
 pub mod gds;
 pub mod incremental;
+pub mod nav;
 pub mod parse;
 mod parser;
 pub mod solver;
@@ -12,6 +13,29 @@ pub mod tech;
 pub mod workspace;
 
 pub use workspace::WorkspaceConfig;
+
+/// Native stack reserved for compilation.
+///
+/// The evaluator recurses natively for inlined `fn` calls and for nested cell
+/// instantiation, and both overflow the default stack well before
+/// `compile::MAX_EVAL_DEPTH`. A stack overflow aborts the process rather than
+/// unwinding, so no `catch_unwind` can turn it into a diagnostic: the stack
+/// has to be large enough that the depth limit is what stops the descent.
+pub const COMPILE_STACK_SIZE: usize = 1024 * 1024 * 1024;
+
+/// Runs `f` on a thread with [`COMPILE_STACK_SIZE`] of stack, propagating a
+/// panic to the caller so `catch_unwind` still sees it.
+pub fn run_with_stack<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let handle = std::thread::Builder::new()
+        .name(name.to_owned())
+        .stack_size(COMPILE_STACK_SIZE)
+        .spawn(f)
+        .expect("spawn compilation thread");
+    match handle.join() {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
 
 /// A global allocator that tracks live and peak heap usage so that the scaling
 /// benchmarks in the test module can report memory consumption alongside
@@ -99,7 +123,8 @@ mod tests {
 
     use crate::{
         compile::{
-            ExecErrorKind, RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
+            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RectInitialCondition, SolvedValue,
+            StaticErrorKind, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -1362,6 +1387,19 @@ mod tests {
     }
 
     #[test]
+    fn argon_sky130_technology_uses_klayout_units() {
+        let tech = crate::tech::read_tech(SKY130_TECH).unwrap();
+
+        // SKY130.lyt uses a 0.001 micron DBU, while the technology LEF uses a
+        // 0.005 micron manufacturing grid. Argon keeps source coordinates in
+        // nm, so those become one DBU per display unit and five DBUs per grid.
+        assert_relative_eq!(tech.dbu, 1e-9, epsilon = f64::EPSILON);
+        assert_eq!(tech.display_unit, 1);
+        assert_eq!(tech.grid, 5);
+        assert_relative_eq!(tech.grid_step(), 5., epsilon = f64::EPSILON);
+    }
+
+    #[test]
     fn argon_sky130_inverter() {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
@@ -1494,7 +1532,7 @@ mod tests {
         let cells = cells.unwrap_exec_errors();
         assert_eq!(cells.errors.len(), 1);
         let error = cells.errors.first().unwrap();
-        assert!(matches!(error.kind, ExecErrorKind::OffGrid(_)));
+        assert!(matches!(error.kind, ExecErrorKind::OffGrid { .. }));
         let span = error
             .span
             .as_ref()
@@ -1881,6 +1919,52 @@ mod tests {
     }
 
     #[test]
+    fn underconstrained_errors_point_to_each_source_expression() {
+        let source = r#"
+            cell top() {
+                let first = rect("met1");
+                let second = rect("met1");
+            }
+        "#;
+        let path = PathBuf::from("/virtual/lib.ar");
+        let root = parse_source_text(source, path.clone()).unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+
+        let errors = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_exec_errors()
+        .errors
+        .into_iter()
+        .filter(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+        .collect::<Vec<_>>();
+
+        assert_eq!(errors.len(), 2);
+        let spans = errors
+            .iter()
+            .map(|error| error.span.as_ref().expect("error should point to a value"))
+            .collect::<Vec<_>>();
+        assert!(spans.iter().all(|span| span.path == path));
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| &source[span.span.start()..span.span.end()])
+                .collect::<Vec<_>>(),
+            vec!["rect(\"met1\")", "rect(\"met1\")"]
+        );
+        assert_ne!(spans[0], spans[1]);
+    }
+
+    #[test]
     fn argon_invalid_cast() {
         let o = parse_workspace_with_std(ARGON_INVALID_CAST);
         assert!(o.static_errors().is_empty());
@@ -2092,6 +2176,199 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    fn static_errors(source: &str) -> Vec<crate::compile::StaticError> {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        output.errors
+    }
+
+    /// Cell typing is structural. `CellTy` carries the declaring cell's `VarId`
+    /// so that a field access can be navigated back to its `let`, and that id
+    /// is deliberately excluded from `PartialEq`: if it were not, two cells
+    /// with identical fields would stop being interchangeable and a branch
+    /// over them would silently widen to `Ty::Any`.
+    #[test]
+    fn structurally_identical_cells_remain_interchangeable() {
+        let source = |field: &str| {
+            format!(
+                r#"
+                cell left() {{
+                    let met = rect("met1", x0=0., y0=0., x1=10., y1=10.);
+                }}
+
+                cell right() {{
+                    let met = rect("met1", x0=0., y0=0., x1=20., y1=20.);
+                }}
+
+                cell top(pick: Bool) {{
+                    let chosen = if pick {{ left() }} else {{ right() }};
+                    let placed = inst(chosen);
+                    eq(placed.{field}.x0, 0.);
+                }}
+                "#
+            )
+        };
+
+        // The branches share a cell type, so the common field type-checks.
+        let errors = static_errors(&source("met"));
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        // And the type is still a cell rather than `Ty::Any`: an unknown field
+        // is caught. Were the declaring cell's id part of `CellTy` equality,
+        // the two branches would no longer unify, `Ty::lub` would widen the
+        // branch to `Ty::Any`, and this error would silently disappear.
+        let errors = static_errors(&source("missing"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, StaticErrorKind::NoFieldOnTy { .. })),
+            "{errors:#?}"
+        );
+    }
+
+    fn comparison_source(comparison: &str) -> String {
+        format!(
+            r#"
+                enum E {{ A, B }}
+                fn ident(value: Any) -> Any {{ value }}
+                cell top() {{
+                    let r = rect("met1", x0=0., y0=0., y1=10.);
+                    let e = E::A;
+                    let anything = ident(3);
+                    let s = cons(1, []);
+                    let t = cons(2, []);
+                    let empty = [];
+                    if {comparison} {{ eq(r.x1, 100.); }} else {{ eq(r.x1, 200.); }};
+                }}
+            "#
+        )
+    }
+
+    #[test]
+    fn comparison_checks_both_operands() {
+        // Each of these used to pass `arc check` and then hit an `unreachable!()`
+        // in the evaluator, because only the left operand was type checked.
+        for comparison in [
+            "1. < 2",
+            "1 < 2.",
+            "1 == E::A",
+            r#"1 == "x""#,
+            "1 < r",
+            "1. == anything",
+            "1. < anything",
+        ] {
+            let errors = static_errors(&comparison_source(comparison));
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error.kind,
+                    StaticErrorKind::ComparisonMismatchedTypes
+                        | StaticErrorKind::ComparisonInvalidType
+                )),
+                "`{comparison}` should be rejected as a comparison: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequences_only_compare_for_equality_against_seq_nil() {
+        // The evaluator has no arm for two populated sequences, and none for
+        // ordering a sequence, so everything but `seq == []` must be rejected.
+        for comparison in ["s == t", "s != t", "s < t", "s < []", "[] > s"] {
+            let errors = static_errors(&comparison_source(comparison));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error.kind, StaticErrorKind::SeqMustCompareEqSeqNil)),
+                "`{comparison}` should be rejected as a sequence comparison: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comparison_accepts_matching_operands() {
+        for comparison in [
+            "1 < 2",
+            "1. < 2.",
+            "e == E::A",
+            "s == []",
+            "[] != s",
+            "empty == []",
+        ] {
+            let errors = static_errors(&comparison_source(comparison));
+            assert!(
+                errors.is_empty(),
+                "`{comparison}` should type check: {errors:?}"
+            );
+        }
+    }
+
+    fn fn_decl_source(decl: &str) -> String {
+        format!(
+            r#"
+                enum E {{ A, B }}
+                {decl}
+                cell top() {{
+                    let r = rect("met1", x0=0., y0=0., x1=1., y1=2.)!;
+                }}
+            "#
+        )
+    }
+
+    #[test]
+    fn fn_body_must_match_declared_return_ty() {
+        // Each of these used to pass `arc check`, then abort the evaluator: callers
+        // trust the declared return type, so the body's value reaches an `unwrap_*`
+        // expecting the declared representation.
+        for decl in [
+            "fn f() -> Float { }",
+            "fn f() -> Bool { 1 }",
+            "fn f() -> Float { 1 }",
+            "fn f() -> Int { 1. }",
+            "fn f() -> Int { E::A }",
+            "fn f() -> [Int] { 1 }",
+            "fn f() -> (Int, Int) { 1 }",
+            "fn f() -> [Int] { cons(1., []) }",
+            "fn f(x: Int) { x }",
+        ] {
+            let errors = static_errors(&fn_decl_source(decl));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error.kind, StaticErrorKind::IncorrectTy { .. })),
+                "`{decl}` should be rejected: its body does not return the declared type: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fn_body_matching_declared_return_ty_is_accepted() {
+        for decl in [
+            "fn f() { }",
+            "fn f() -> Float { 1. }",
+            "fn f() -> Int { 1 }",
+            "fn f() -> Bool { true }",
+            "fn f() -> E { E::A }",
+            "fn f(x: Int) -> Int { x }",
+            "fn f() -> [Int] { cons(1, []) }",
+            // An empty sequence inhabits every sequence type, as `is_eq_ty` allows.
+            "fn f() -> [Int] { [] }",
+            "fn f() -> (Int, Float) { (1, 2.,) }",
+            // A trailing semicolon makes the body's value `()`, matching no return type.
+            "fn f() { let x = 1; }",
+            "fn f() -> Any { 1 }",
+            "fn f(x: Any) -> Int { x }",
+        ] {
+            let errors = static_errors(&fn_decl_source(decl));
+            assert!(errors.is_empty(), "`{decl}` should type check: {errors:?}");
+        }
     }
 
     #[test]
@@ -2438,6 +2715,727 @@ mod tests {
         })
         .expect("failed to run drc");
         assert!(data.rule_checks.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for inputs that used to abort the compiler.
+    //
+    // Every case below reached a panic, a stack overflow, an allocation abort,
+    // or a non-terminating solve from source that `--check` accepted. They are
+    // grouped here because the invariant they share is the point: a user's
+    // source must never take down the compiler, only produce a diagnostic.
+
+    /// Writes `source` to a scratch library and parses it with the standard
+    /// library, as the CLI does.
+    fn scratch_workspace(
+        name: &str,
+        source: &str,
+    ) -> (tempfile::TempDir, crate::parse::ParseOutput) {
+        let dir = tempfile::tempdir().expect("create scratch workspace");
+        let lib = dir.path().join("lib.ar");
+        std::fs::write(&lib, source).expect("write scratch library");
+        let _ = name;
+        let output = parse_workspace_with_std(&lib);
+        (dir, output)
+    }
+
+    /// The static errors `--check` would report for `source`.
+    fn check_source(source: &str) -> Vec<StaticErrorKind> {
+        let (_dir, output) = scratch_workspace("check", source);
+        let parse_errors = output.static_errors();
+        if !parse_errors.is_empty() {
+            return parse_errors.into_iter().map(|error| error.kind).collect();
+        }
+        let (_, errors) = static_compile(&output.ast()).expect("source must parse");
+        errors.errors.into_iter().map(|error| error.kind).collect()
+    }
+
+    /// Executes `top()` in `source` and returns the execution errors, which is
+    /// empty when the cell compiles cleanly.
+    fn run_source(source: &str) -> Vec<ExecErrorKind> {
+        let (_dir, output) = scratch_workspace("run", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "source must parse to exercise the evaluator: {:#?}",
+            output.static_errors()
+        );
+        let compiled = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        match compiled {
+            CompileOutput::ExecErrors(errors) => {
+                errors.errors.into_iter().map(|error| error.kind).collect()
+            }
+            CompileOutput::StaticErrors(errors) => {
+                panic!("source must check cleanly to exercise the evaluator: {errors:#?}")
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn assert_reports(errors: &[ExecErrorKind], predicate: impl Fn(&ExecErrorKind) -> bool) {
+        assert!(
+            errors.iter().any(predicate),
+            "expected a diagnostic, got {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn bbox_without_arguments_reports_arity_instead_of_panicking() {
+        // Indexing the argument slice after `assert_eq_arity` merely records a
+        // diagnostic made a one-token typo crash `--check`, the path the
+        // language server runs on every keystroke.
+        let errors = check_source("cell top() { let b = bbox(); }");
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::CallIncorrectPositionalArity {
+                    expected: 1,
+                    found: 0
+                }
+            )),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn mismatched_branch_types_are_rejected() {
+        // `Ty::lub` used to widen a mismatch to `Ty::Any`, which satisfies
+        // every later check and deferred the failure to an evaluator `unwrap`.
+        for source in [
+            "cell top() { let a = float(); let n = if a < 1. { 1 } else { 2. }; eq(a, n); }",
+            "enum E { A, B }
+             cell top() { let v = E::A; let n = match v { E::A => 1, E::B => 2., }; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BranchesDifferentTypes)),
+                "{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn heterogeneous_list_elements_are_rejected() {
+        let errors = check_source("cell top() { let a = list(1., 2); }");
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::IncorrectTy { .. })),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn match_on_any_still_checks_its_arms() {
+        // The arm checks used to be conditional on a statically known enum
+        // scrutinee, which `Any` never is -- and `Any` is the common case,
+        // because cell and instance types cannot be named.
+        let non_exhaustive = check_source(
+            "enum E { A, B }
+             cell top(v: Any) { let n = match v { E::A => 1, }; }",
+        );
+        assert!(
+            non_exhaustive
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::MatchArmsNotComprehensive)),
+            "{non_exhaustive:#?}"
+        );
+
+        let duplicated = check_source(
+            "enum E { A, B }
+             cell top(v: Any) { let n = match v { E::A => 1, E::A => 2, E::B => 3, }; }",
+        );
+        assert!(
+            duplicated
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::DuplicateMatchArm)),
+            "{duplicated:#?}"
+        );
+    }
+
+    #[test]
+    fn only_layout_elements_can_be_emitted() {
+        // `!` imposed no type restriction, while the evaluator asserted the
+        // value was a single element.
+        for source in [
+            "cell top() { let v = 1!; }",
+            "cell top() { let v = \"hi\"!; }",
+            "cell bot() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+             cell top() { let v = bot()!; }",
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
+                 let b = rect(\"met2\", x0=0., y0=0., x1=1., y1=1.);
+                 let s = list(a, b)!;
+             }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::CannotEmit(_))),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_arithmetic_is_checked() {
+        // Raw operators panicked on a zero divisor in every profile and, on
+        // overflow, panicked in debug but wrapped silently in release.
+        assert_reports(&run_source("cell top() { let n = 1 / 0; }"), |error| {
+            matches!(error, ExecErrorKind::DivideByZero(_))
+        });
+        assert_reports(&run_source("cell top() { let n = 5 % 0; }"), |error| {
+            matches!(error, ExecErrorKind::DivideByZero(_))
+        });
+        assert_reports(
+            &run_source("cell top() { let n = 9223372036854775807 + 1; }"),
+            |error| matches!(error, ExecErrorKind::IntegerOverflow(_)),
+        );
+        assert_reports(
+            &run_source("cell top() { let n = -(-9223372036854775807 - 1); }"),
+            |error| matches!(error, ExecErrorKind::IntegerOverflow(_)),
+        );
+    }
+
+    #[test]
+    fn non_finite_values_are_rejected_before_the_solver() {
+        // A non-finite coefficient reaching the dense SVD fallback never
+        // converges: `Matrix::svd` passes `max_niter = 0`, which that loop
+        // treats as no limit at all. A hang is not catchable, so the value has
+        // to be rejected where it is created.
+        assert_reports(
+            &run_source(
+                "cell top() {
+                     let a = rect(\"met1\", x0=0., y0=0., y1=1.);
+                     eq(a.x1, 1. / 0.);
+                 }",
+            ),
+            |error| matches!(error, ExecErrorKind::NonFiniteValue),
+        );
+    }
+
+    #[test]
+    fn shape_point_counts_are_bounded() {
+        // The count had only a lower bound, so a large one aborted the process
+        // on allocation failure, bypassing diagnostics entirely.
+        assert_reports(
+            &run_source(
+                "cell top() { let p = polygon(\"met1\", 1000000000000000, x0=0., y0=0.)!; }",
+            ),
+            |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
+        );
+        assert_reports(
+            &run_source(
+                "cell top() { let p = path(\"met1\", 1000000000000000, width=1., x0=0., y0=0.)!; }",
+            ),
+            |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
+        );
+    }
+
+    #[test]
+    fn eager_function_recursion_reports_a_limit() {
+        // `if`/`match` branches are deferred onto the worklist, but a `fn` call
+        // is inlined eagerly, so a recursive call outside a branch has no
+        // terminating case and used to abort the process.
+        //
+        // Run on a compilation-sized stack, as the CLI and the analyzer worker
+        // do: the depth limit is what must stop the descent, and the default
+        // test-thread stack is too small to reach it.
+        let errors = crate::run_with_stack("argon-compile", || {
+            run_source(
+                "fn f(n: Int) -> Int { let m = f(n-1); if n <= 0 { 0 } else { m } }
+                 cell top() { let k = f(3); }",
+            )
+        });
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::RecursionLimitExceeded { .. })
+        });
+    }
+
+    #[test]
+    fn any_typed_arguments_report_a_type_error_rather_than_panicking() {
+        // `Ty::Any` satisfies every static check, so each builtin has to test
+        // the runtime type itself.
+        for source in [
+            "fn mk() -> Any { 3 }
+             cell top() { text(mk(), \"met1.label\", 0., 0.); }",
+            "fn e(a: Any, b: Any) { eq(a, b); }
+             cell top() { e(1, 2); }",
+            "fn mk() -> Any { 3 }
+             cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=mk(), y1=1.)!; }",
+            "fn f(c: Any) -> Any { inst(c) }
+             cell top() { let i = f(5.); }",
+            "fn f(c: Any) -> Any { inst(c) }
+             cell top() { let i = f(5.); let v = i.foo; }",
+        ] {
+            assert_reports(&run_source(source), |error| {
+                matches!(error, ExecErrorKind::InvalidType)
+            });
+        }
+    }
+
+    #[test]
+    fn flat_operator_chains_are_depth_limited() {
+        // The parser's depth guard only covered *nested* input. A flat chain is
+        // folded iteratively, so it kept `self.depth` at 1 while building an
+        // arbitrarily deep tree that the post-parse AST walks then recursed
+        // over -- an uncatchable stack overflow at around 900 terms.
+        for source in [
+            format!("cell top() {{ let v = {}; }}", vec!["1"; 2000].join("+")),
+            format!("cell top() {{ let v = {}; }}", vec!["1"; 2000].join("*")),
+            format!(
+                "cell top() {{ let a = rect(\"met1\"); let v = a{}; }}",
+                ".f".repeat(2000)
+            ),
+        ] {
+            let (_dir, output) = scratch_workspace("chain", &source);
+            assert!(
+                output
+                    .static_errors()
+                    .iter()
+                    .any(|error| error.kind.to_string().contains("nesting too deep")),
+                "{:#?}",
+                output.static_errors()
+            );
+        }
+    }
+
+    #[test]
+    fn bbox_excludes_construction_geometry() {
+        // `bbox` used to include construction geometry that the GDS exporter
+        // drops, so a placement computed from it did not match the output.
+        let source = "cell bot() {
+                          let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;
+                          let c = crect(layer=\"met2\", x0=-500., y0=-500., x1=500., y1=500.);
+                      }
+                      cell top() {
+                          let b = bot();
+                          let bb = bbox(b);
+                          let m = rect(\"met3\", x0=bb.x0, y0=bb.y0, x1=bb.x1, y1=bb.y1)!;
+                      }";
+        let (_dir, output) = scratch_workspace("bbox", source);
+        assert!(output.static_errors().is_empty());
+        let compiled = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        let data = compiled.unwrap_valid();
+        let top = &data.cells[&data.top];
+        let drawn = top
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) if !rect.construction => Some(rect),
+                _ => None,
+            })
+            .expect("top emits one drawn rectangle");
+        assert_relative_eq!(drawn.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(drawn.y0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
+        assert_relative_eq!(drawn.y1.0, 10., epsilon = EPSILON);
+    }
+
+    /// Every layout object in `cell`, in the order the exporter would walk it.
+    fn layout_objects(data: &CompiledData, cell: CellId) -> Vec<&SolvedValue> {
+        data.cells[&cell]
+            .objects
+            .values()
+            .filter(|object| object.is_layout())
+            .collect()
+    }
+
+    fn compile_top(source: &str) -> CompiledData {
+        let (_dir, output) = scratch_workspace("layout", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:#?}",
+            output.static_errors()
+        );
+        compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid()
+    }
+
+    #[test]
+    fn reading_a_coordinate_through_an_instance_does_not_duplicate_geometry() {
+        // `inst.member` builds a transformed proxy of the child's shape in the
+        // parent so the coordinate has something to name. The proxy landed in
+        // the parent's object map but never in its emission list, so the GUI
+        // (which walks emissions) looked right while the exporter (which walks
+        // objects) drew a phantom shape on top of every SREF -- once per
+        // field-access expression, so the multiplicity grew with coding style
+        // rather than with the design.
+        let data = compile_top(
+            "cell bot() {
+                 let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
+                 let p = polygon(\"met2\", 3, x0=0., y0=0., x1=10., y1=0., x2=5., y2=10.);
+                 let q = path(\"met3\", 2, width=10., begin_extension=0., end_extension=0.,
+                              x0=0., y0=0., x1=50., y1=0.);
+             }
+             cell top() {
+                 let i = inst(bot(), x=0., y=0.);
+                 let r0 = rect(\"met4\", x0=i.m.x0, y0=200., x1=i.m.x1, y1=250.);
+                 let r1 = rect(\"met4\", x0=i.p.points[0].x, y0=300., x1=i.p.points[1].x, y1=350.);
+                 let r2 = rect(\"met4\", x0=i.q.points[0].x, y0=400., x1=i.q.points[1].x, y1=450.);
+             }",
+        );
+        let objects = layout_objects(&data, data.top);
+        let rects = objects
+            .iter()
+            .filter(|object| matches!(object, SolvedValue::Rect(_)))
+            .count();
+        let instances = objects
+            .iter()
+            .filter(|object| matches!(object, SolvedValue::Instance(_)))
+            .count();
+        assert_eq!(rects, 3, "only the three declared rects are layout");
+        assert_eq!(instances, 1);
+        assert_eq!(
+            objects.len(),
+            4,
+            "no proxy polygon or path is drawn in the parent: {objects:#?}"
+        );
+    }
+
+    #[test]
+    fn a_construction_instance_contributes_no_geometry_through_a_projection() {
+        // The strictly worse variant: the instance itself is suppressed, so a
+        // proxy of its geometry appeared in the parent with no corresponding
+        // struct anywhere in the file.
+        let data = compile_top(
+            "cell bot() { let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=50.); }
+             cell top() {
+                 let i = inst(bot(), x=1000., y=0., construction=true);
+                 let r = rect(\"met2\", x0=i.m.x0, y0=0., x1=i.m.x1, y1=1.);
+             }",
+        );
+        assert_eq!(layout_objects(&data, data.top).len(), 1);
+    }
+
+    #[test]
+    fn emitting_a_projection_flattens_that_one_shape_into_the_parent() {
+        // `!` on a projection is an explicit request to draw the child's shape
+        // in the parent as well, so it opts back out of construction. The
+        // second case goes through a function that *selects* a proxy built
+        // earlier rather than building one, which is why the decision is made
+        // from the resolved emission list rather than where the proxy is
+        // constructed.
+        let data = compile_top(
+            "fn second(lst: [Any]) -> Any { head(tail(lst)) }
+             cell bot() {
+                 let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
+                 let n = rect(\"met1\", x0=200., y0=0., x1=300., y1=100.);
+                 let both = list(m, n);
+             }
+             cell top() {
+                 let i = inst(bot(), x=1000., y=0.);
+                 i.m!;
+                 second(i.both)!;
+                 let unused = i.n.x0;
+             }",
+        );
+        let drawn = layout_objects(&data, data.top)
+            .iter()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x0.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // `i.m!` and `second(i.both)!` are drawn; the bare `i.n.x0` read is not.
+        assert_eq!(drawn.len(), 2, "{drawn:?}");
+        assert!(drawn.contains(&1000.), "{drawn:?}");
+        assert!(drawn.contains(&1200.), "{drawn:?}");
+    }
+
+    #[test]
+    fn out_of_range_coordinates_are_rejected_rather_than_saturated() {
+        // `f64 as i32` saturates, so an unchecked coordinate became
+        // `2147483647` in the GDS -- collapsing both edges of this rect onto
+        // one point -- while the run still reported success.
+        let errors = run_source(
+            "cell top() { let a = rect(\"met1\", x0=3000000000., y0=0., x1=4000000000., y1=10.); }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::CoordinateOutOfRange { .. })
+        });
+    }
+
+    #[test]
+    fn text_coordinates_are_checked_against_the_grid() {
+        // A text position can be built entirely from constants, so it is the
+        // one coordinate that never becomes a solver variable -- and the
+        // solver's grid check only looks at variables. The label used to be
+        // snapped silently on export.
+        let errors = run_source(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 text(\"t\", \"met1\", 0.04, 0.06);
+             }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::OffGrid { .. })
+        });
+        assert!(
+            run_source(
+                "cell top() {
+                     let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                     text(\"t\", \"met1\", 0.1, 5.);
+                 }"
+            )
+            .is_empty(),
+            "an on-grid label still compiles"
+        );
+    }
+
+    #[test]
+    fn off_grid_diagnostics_carry_the_value_and_where_it_snapped_to() {
+        // Rounding each variable in isolation can break a constraint coupling
+        // them; the bare "invalid rounding" text gave an author no way to tell
+        // floating-point noise from an unrepresentable layout.
+        let errors = run_source(
+            "cell top() {
+                 let a = rect(\"met1\", y0=0., y1=10., x0=0.);
+                 let b = rect(\"met2\", y0=0., y1=10., x0=0.);
+                 eq(a.x1 + b.x1, 1.);
+                 eq(a.x1 - b.x1, 0.9);
+             }",
+        );
+        let reported = errors
+            .iter()
+            .find_map(|error| match error {
+                ExecErrorKind::OffGrid {
+                    value,
+                    snapped,
+                    grid,
+                } => Some((*value, *snapped, *grid)),
+                _ => None,
+            })
+            .expect("the coupled solution rounds off grid");
+        let (value, snapped, grid) = reported;
+        assert_relative_eq!(grid, 0.1, epsilon = EPSILON);
+        assert_relative_eq!(value, 0.05, epsilon = 1e-9);
+        assert_relative_eq!(snapped, 0., epsilon = EPSILON);
+    }
+
+    #[test]
+    fn negative_path_dimensions_are_rejected() {
+        // The width was silently absolutized and the extensions passed
+        // straight through as a negative BGNEXTN/ENDEXTN.
+        let errors = run_source(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=-10., begin_extension=0., end_extension=0.,
+                              x0=0., y0=0., x1=100., y1=0.);
+             }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::NegativePathWidth(_))
+        });
+        let errors = run_source(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=10., begin_extension=-5., end_extension=-5.,
+                              x0=0., y0=0., x1=100., y1=0.);
+             }",
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| matches!(error, ExecErrorKind::NegativePathExtension { .. }))
+                .count(),
+            2,
+            "both ends are reported: {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn text_outside_the_gds_character_set_or_length_is_rejected() {
+        // A GDS STRING record is a byte string with no encoding negotiation,
+        // and its length limit is counted in bytes, not characters.
+        let errors = run_source(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 text(\"héllo\", \"met1\", 0., 5.);
+             }",
+        );
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::NonAsciiText { character: 'é' })
+        });
+        let long = "a".repeat(MAX_TEXT_LEN + 1);
+        let errors = run_source(&format!(
+            "cell top() {{
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 text(\"{long}\", \"met1\", 0., 5.);
+             }}"
+        ));
+        assert_reports(&errors, |error| {
+            matches!(error, ExecErrorKind::TextTooLong { .. })
+        });
+    }
+
+    #[test]
+    fn a_descending_range_counts_down_and_a_zero_step_is_rejected() {
+        // `range_full`'s loop was guarded by `if step > 0` with no `else`, so
+        // the natural descending range silently produced an empty sequence.
+        let data = compile_top(
+            "cell top() {
+                 for i in range_full(3, 0, -1) {
+                     rect(\"met1\", x0=(i as Float) * 10., y0=0., x1=(i as Float) * 10. + 5., y1=5.);
+                 }
+             }",
+        );
+        let mut lefts = layout_objects(&data, data.top)
+            .iter()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x0.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        lefts.sort_by(f64::total_cmp);
+        assert_eq!(lefts, vec![10., 20., 30.]);
+
+        assert_reports(
+            &run_source("cell top() { for i in range_full(0, 3, 0) { float(); } }"),
+            |error| matches!(error, ExecErrorKind::ZeroRangeStep),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Boolean operators: `&&`, `||`, and `!`.
+
+    #[test]
+    fn boolean_operators_check_and_evaluate() {
+        assert!(check_source("cell top() { let a = !true && (false || true); }").is_empty());
+
+        // Every condition below must hold. If one does not, the `else` branch
+        // adds a second constraint on `x` that contradicts the first, and the
+        // solve fails -- so a wrong truth value cannot pass silently.
+        for cond in [
+            "true && true",
+            "!(true && false)",
+            "!(false && true)",
+            "!(false && false)",
+            "true || true",
+            "true || false",
+            "false || true",
+            "!(false || false)",
+            "!false",
+            "!!true",
+            "true == true",
+            "true != false",
+            "!(true == false)",
+            "p > 2. && p < 4.",
+            "p < 2. || p > 2.5",
+        ] {
+            let source = format!(
+                "cell top() {{
+                     let p = float();
+                     eq(p, 3.);
+                     let q = float();
+                     eq(q, 1.);
+                     if {cond} {{ }} else {{ eq(q, 2.); }};
+                 }}"
+            );
+            assert!(
+                run_source(&source).is_empty(),
+                "`{cond}` should evaluate to true"
+            );
+            // The negation must fail, or the check above proves nothing.
+            let negated = source.replace(&format!("if {cond}"), &format!("if !({cond})"));
+            assert!(
+                !run_source(&negated).is_empty(),
+                "`!({cond})` should evaluate to false"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_short_circuit() {
+        // The right operand is an arbitrary expression that may divide by zero,
+        // create constraints, or emit geometry, so it must not be evaluated
+        // when the left operand already decides the result -- the same reason
+        // `if` defers its branches.
+        assert!(run_source("cell top() { let a = false && (1 / 0 == 1); }").is_empty());
+        assert!(run_source("cell top() { let a = true || (1 / 0 == 1); }").is_empty());
+        assert_reports(
+            &run_source("cell top() { let a = true && (1 / 0 == 1); }"),
+            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
+        );
+        assert_reports(
+            &run_source("cell top() { let a = false || (1 / 0 == 1); }"),
+            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
+        );
+
+        // A short-circuited operand emits no geometry either.
+        let emits = "(rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!.x1 > 0.)";
+        for (cond, drawn) in [
+            (format!("false && {emits}"), 0),
+            (format!("true && {emits}"), 1),
+            (format!("true || {emits}"), 0),
+            (format!("false || {emits}"), 1),
+        ] {
+            let data = compile_top(&format!("cell top() {{ let a = {cond}; }}"));
+            assert_eq!(
+                layout_objects(&data, data.top).len(),
+                drawn,
+                "`{cond}` should emit {drawn} shape(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_reject_non_bool_operands() {
+        // `!` used to parse and then report `unimplemented`; `&&` and `||` did
+        // not lex at all.
+        for source in [
+            "cell top() { let a = 1 && true; }",
+            "cell top() { let a = true && 1; }",
+            "cell top() { let a = true || 2.; }",
+            "cell top() { let a = !1; }",
+            "cell top() { let a = !\"s\"; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BoolOpInvalidType)),
+                "{source}: {errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn booleans_compare_for_equality_only() {
+        // `Ty::Bool` was missing from the comparison whitelist, so even
+        // `true == false` was rejected.
+        assert!(check_source("cell top() { let a = true == false; }").is_empty());
+        assert!(check_source("cell top() { let a = true != false; }").is_empty());
+        for source in [
+            "cell top() { let a = true < false; }",
+            "cell top() { let a = true >= false; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BoolNotOrd)),
+                "{source}: {errors:#?}"
+            );
+        }
     }
 }
 pub mod cli;
