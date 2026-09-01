@@ -228,13 +228,18 @@ fn validate_gds_records(path: &Path) -> Result<()> {
     }
 }
 
-/// Renders a reader failure as a sentence.
+/// Renders a reader or writer failure as a sentence.
 ///
 /// `GdsError`'s own `Display` delegates to the derived `Debug`, so an
 /// unexpected end of file surfaces as
 /// `Boxed(Error { kind: UnexpectedEof, message: ".." })`. Unwrapping the
 /// boxed cause and naming the record position is what distinguishes a
 /// truncated file from a malformed one at the point of use.
+///
+/// Deliberately exhaustive: a catch-all arm would silently hand the two
+/// remaining variants -- and any variant the upstream crate adds -- back to
+/// that same `Debug` rendering, and `GdsError::Unsupported` carries a whole
+/// `GdsRecord`, whose `Debug` is an unbounded coordinate dump.
 fn describe_gds_error(error: GdsError) -> anyhow::Error {
     match error {
         GdsError::Boxed(cause) => anyhow!("{cause}"),
@@ -242,13 +247,20 @@ fn describe_gds_error(error: GdsError) -> anyhow::Error {
         GdsError::RecordLen(len) => anyhow!("invalid record length {len}"),
         GdsError::InvalidDataType(code) => anyhow!("invalid record data type {code}"),
         GdsError::InvalidRecordType(code) => anyhow!("invalid record type {code}"),
+        GdsError::RecordDecode(record, data, len) => {
+            anyhow!("invalid {record:?} record: data type {data:?}, length {len}")
+        }
+        // The record itself is dropped: its `Debug` is the unbounded dump.
+        GdsError::Unsupported(_, Some(context)) => {
+            anyhow!("unsupported GDS feature in {context:?}")
+        }
+        GdsError::Unsupported(_, None) => anyhow!("unsupported GDS feature"),
         GdsError::Parse {
             msg,
             recordnum,
             bytepos,
             ..
         } => anyhow!("{msg} (record {recordnum} at byte {bytepos})"),
-        other => anyhow!("{other}"),
     }
 }
 
@@ -554,26 +566,28 @@ fn argon_ident(label: &str) -> String {
     if ident.is_empty() || ident.as_bytes()[0].is_ascii_digit() {
         ident.insert(0, '_');
     }
-    if matches!(
-        ident.as_str(),
-        "x" | "y"
-            | "fn"
-            | "if"
-            | "as"
-            | "in"
-            | "let"
-            | "for"
-            | "mod"
-            | "use"
-            | "enum"
-            | "cell"
-            | "true"
-            | "else"
-            | "match"
-            | "const"
-            | "false"
-            | "struct"
-    ) {
+    // A scraped label becomes a top-level `let` in the generated cell, so it
+    // must clear the reserved instance fields as well as the keywords.
+    if crate::compile::RESERVED_CELL_FIELDS.contains(&ident.as_str())
+        || matches!(
+            ident.as_str(),
+            "fn" | "if"
+                | "as"
+                | "in"
+                | "let"
+                | "for"
+                | "mod"
+                | "use"
+                | "enum"
+                | "cell"
+                | "true"
+                | "else"
+                | "match"
+                | "const"
+                | "false"
+                | "struct"
+        )
+    {
         ident.push('_');
     }
     ident
@@ -713,7 +727,7 @@ impl CompileOutput {
             #[cfg(unix)]
             builder.permissions(std::fs::Permissions::from_mode(0o644));
             let temp = builder.tempfile_in(parent)?;
-            exporter.lib.save(temp.path()).map_err(|e| anyhow!("{e}"))?;
+            exporter.lib.save(temp.path()).map_err(describe_gds_error)?;
             temp.persist(out_path)
                 .map_err(|e| anyhow!("could not finalize `{}`: {e}", out_path.display()))?;
         }
@@ -1222,14 +1236,23 @@ mod tests {
             custom_line_styles: Vec::new(),
             pin_layers: IndexMap::new(),
         };
-        let dir = std::env::temp_dir().join(format!("argon-gds-cause-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // `tempfile` cleans up on unwind; a hand-rolled directory removed by a
+        // trailing statement leaks on every assertion failure.
+        let dir = tempfile::tempdir().unwrap();
 
-        let missing = dir.join("missing.gds");
+        let missing = dir.path().join("missing.gds");
         let error = import_gds(&missing, "top", &tech).expect_err("a missing file should fail");
-        assert!(format!("{error:#}").contains("No such file"), "{error:#}");
+        // The OS supplies the wording, so match on the classification rather
+        // than on `strerror` text that differs per platform.
+        assert!(
+            error
+                .chain()
+                .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                .any(|cause| cause.kind() == std::io::ErrorKind::NotFound),
+            "{error:#}"
+        );
 
-        let truncated = dir.join("truncated.gds");
+        let truncated = dir.path().join("truncated.gds");
         std::fs::write(&truncated, [0u8, 6, 0, 2]).unwrap();
         let error = import_gds(&truncated, "top", &tech).expect_err("a truncated file should fail");
         let rendered = format!("{error:#}");
@@ -1241,8 +1264,6 @@ mod tests {
             rendered.contains("fill whole buffer"),
             "the reader's own cause must survive: {rendered}"
         );
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

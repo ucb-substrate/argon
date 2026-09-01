@@ -2954,6 +2954,11 @@ mod tests {
         // dependent properties", but `is_eq_ty` special-cased only `Ty::Any`
         // and fell through to `==` for `Unknown`, so every already-diagnosed
         // expression produced a second `expected .., found Unknown`.
+        //
+        // Six predicates encode "this type satisfies every check". Teaching
+        // only `is_eq_ty`, `assert_ty_is_cell` and `assert_ty_is_enum` about
+        // `Unknown` left the other three still reporting a second error, so
+        // they all go through `Ty::is_wildcard` now and all are covered here.
         for source in [
             "cell top() {
                  let a = float();
@@ -2961,17 +2966,109 @@ mod tests {
                  let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=a)!;
              }",
             "cell top() { let c = missing_cell(); let i = inst(c); }",
+            "cell top() { let a = undeclared_thing + 1.; }",
+            "cell top() { let a = 1. + undeclared_thing; }",
+            "cell top() { let a = -undeclared_thing; }",
+            "cell top() { let a = undeclared_thing < 1.; }",
+            "cell top() { let a = if undeclared_thing { 1. } else { 2. }; }",
+            "cell top() { let a = undeclared_thing as Int; }",
         ] {
             let errors = check_source(source);
+            assert_eq!(
+                errors.len(),
+                1,
+                "an already-diagnosed name must not cascade\n{source}\n{errors:#?}"
+            );
             assert!(
-                !errors.iter().any(|error| matches!(
-                    error,
-                    StaticErrorKind::IncorrectTy { .. }
-                        | StaticErrorKind::IncorrectTyCategory { .. }
-                )),
+                matches!(errors[0], StaticErrorKind::UndeclaredVar { .. }),
                 "{source}\n{errors:#?}"
             );
         }
+    }
+
+    #[test]
+    fn a_match_that_names_no_enum_is_reported() {
+        // `dispatch_match_expr` returned `lub_ty.unwrap_or_default()` --
+        // `Ty::Unknown` -- with no diagnostic when neither the scrutinee nor
+        // any arm pattern resolved to an enum. That was survivable only while
+        // `is_eq_ty` compared `Unknown` structurally; once `Unknown` satisfies
+        // every check it silently suppressed the caller's checks too, and
+        // `--check` accepted a program the evaluator refuses.
+        let errors = check_source(
+            "enum E { A, B }
+             fn pick(v: Any, k: Float) -> Float { match v { k => 1., } }
+             cell top() {
+                 let n = pick(E::A, 2.);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=n, y1=1.)!;
+             }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::NotAnEnum)),
+            "{errors:#?}"
+        );
+
+        // A match that does name an enum still type checks.
+        assert!(
+            check_source(
+                "enum E { A, B }
+                 cell top() {
+                     let e = E::A;
+                     let w = match e { E::A => 1., E::B => 2., };
+                     let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=1.)!;
+                 }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn same_named_declarations_render_distinctly() {
+        // `Display for Ty` printed a cell's bare declared name and an enum's
+        // variants alone, but `CellTy` equality excludes the name and `EnumTy`
+        // equality keys on `id` -- so a mismatch between two distinct types
+        // rendered as `expected type Inst(child), found Inst(child)`, a
+        // message that refutes itself.
+        let errors = check_source(
+            "enum Dir { N, S }
+             enum Side { N, S }
+             fn takes_side(s: Side) -> Side { s }
+             cell top() { let d = takes_side(Dir::N); }",
+        );
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::IncorrectTy { expected, found } if expected != found
+            )),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_field_on_a_cell_is_not_a_placement_problem() {
+        // The `Ty::Cell`/`Ty::CellFn` arms fired without consulting the field
+        // map, so a typo was reported as "place it with `inst(...)` first" --
+        // advice that cannot help, because placing the cell reports the typo.
+        let errors = check_source(
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+             cell top() {
+                 let c = child();
+                 text(\"t\", \"text.label\", c.nonexistent.x0, 0.);
+             }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::NoFieldOnTy { field, .. } if field == "nonexistent")),
+            "{errors:#?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::CellFieldBeforePlacement { .. })),
+            "{errors:#?}"
+        );
     }
 
     #[test]
@@ -3133,6 +3230,28 @@ mod tests {
             "{:#?}",
             data.cells[&data.top].unsolved_vars
         );
+    }
+
+    #[test]
+    fn a_value_waiting_on_a_defaulted_extension_is_still_evaluated() {
+        // Applying the compiler defaults and `continue`ing skipped
+        // `update_var_dependents`, so a value blocked on an extension the
+        // default had just solved was never re-queued. The solver was then
+        // fully solved with `deferred` empty, the loop exited, and `emit`
+        // panicked on the still-deferred value -- an internal compiler error
+        // on a program that compiled before extensions became variables.
+        let data = compile_top(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 let z = 1. / (p.begin_extension + 1.);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=z, y1=1.)!;
+             }",
+        );
+        let rect = layout_objects(&data, data.top)
+            .into_iter()
+            .find_map(SolvedValue::get_rect)
+            .expect("top should contain a rect");
+        assert_eq!(rect.x1.0, 1.);
     }
 
     #[test]
@@ -3486,6 +3605,163 @@ mod tests {
         assert_reports(
             &run_source("cell top() { for i in range_full(0, 3, 0) { float(); } }"),
             |error| matches!(error, ExecErrorKind::ZeroRangeStep),
+        );
+    }
+
+    /// Compiles `source`, keeping the layout even when the cell is
+    /// underconstrained -- which an `x0i=` initial condition makes it by
+    /// design.
+    fn compile_top_underconstrained(source: &str) -> CompiledData {
+        let (_dir, output) = scratch_workspace("layout", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:#?}",
+            output.static_errors()
+        );
+        match compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        ) {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(output) => {
+                assert!(
+                    output
+                        .errors
+                        .iter()
+                        .all(|error| matches!(error.kind, ExecErrorKind::Underconstrained)),
+                    "{:#?}",
+                    output.errors
+                );
+                output.output.expect("underconstrained cells still emit")
+            }
+            output => panic!("should compile: {output:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_defaults_do_not_over_constrain_a_satisfiable_system() {
+        // Every applicable default was applied in one batch, each tested
+        // against solver state that had not yet seen the others. These two
+        // paths have four extension variables, rank-2 author constraints and
+        // so two degrees of freedom; applying all four zeroes contradicted
+        // `... = 40.` and reported `inconsistent constraint` on a system that
+        // is satisfiable at 20 per path.
+        let data = compile_top(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 let q = path(\"met1\", 2, width=1., x0=0., y0=5., x1=10., y1=5.);
+                 eq(p.begin_extension + p.end_extension
+                    + q.begin_extension + q.end_extension, 40.);
+                 eq(p.begin_extension + p.end_extension,
+                    q.begin_extension + q.end_extension);
+             }",
+        );
+        let sums = layout_objects(&data, data.top)
+            .iter()
+            .filter_map(|object| match object {
+                SolvedValue::Path(path) => Some(path.begin_extension.0 + path.end_extension.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sums, vec![20., 20.]);
+    }
+
+    #[test]
+    fn an_initial_condition_outranks_a_compiler_default() {
+        // Defaults drained at the first stall, before the fallback heap was
+        // popped, so the compiler's zero for `p.begin_extension` propagated
+        // through `eq` and determined `r.x0`. The author's `x0i=5.` was then
+        // skipped as moot: the rect emitted at 0, and because the fallback
+        // never fired it never reached `fallback_constraints_used`, which is
+        // what the GUI writes a drag back to source through.
+        let data = compile_top_underconstrained(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 let r = rect(\"met1\", x0i=5., y0=0., x1=10., y1=10.);
+                 eq(p.begin_extension, r.x0);
+             }",
+        );
+        let x0 = layout_objects(&data, data.top)
+            .iter()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x0.0),
+                _ => None,
+            })
+            .expect("compiled rect");
+        assert_eq!(x0, 5.);
+        assert!(
+            !data.cells[&data.top].fallback_constraints_used.is_empty(),
+            "the initial condition must be recorded for the GUI write-back"
+        );
+    }
+    #[test]
+    fn an_execution_error_does_not_suppress_the_rest_of_the_cell() {
+        // Reporting and returning `Err(())` unwound out of `execute_cell`, so
+        // one bad field read hid every other diagnostic in the cell and left
+        // `output` as `None` -- which the analyzer reads as "the cell would
+        // not open", blanking the GUI canvas over a single typo.
+        let (_dir, output) = scratch_workspace(
+            "run",
+            "cell top() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let r = rect(c.layer, x0=0., y0=0., x1=10., y1=10.)!;
+                 let bad = rect(\"no_such_layer\", x0=0., y0=0., x1=1., y1=1.)!;
+                 let free = rect(\"met1\", x0=0., y0=0., y1=1.)!;
+             }",
+        );
+        let CompileOutput::ExecErrors(output) = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        ) else {
+            panic!("the cell has errors to report");
+        };
+        assert!(
+            output.output.is_some(),
+            "the layout must survive so the GUI still draws it"
+        );
+        let kinds = output
+            .errors
+            .iter()
+            .map(|error| error.kind.clone())
+            .collect::<Vec<_>>();
+        assert_reports(
+            &kinds,
+            |kind| matches!(kind, ExecErrorKind::EmptyField { field } if field == "layer"),
+        );
+        assert_reports(&kinds, |kind| {
+            matches!(kind, ExecErrorKind::Underconstrained)
+        });
+        assert_reports(
+            &kinds,
+            |kind| matches!(kind, ExecErrorKind::IllegalLayer { layer, .. } if layer == "no_such_layer"),
+        );
+    }
+
+    #[test]
+    fn a_poisoned_value_reports_once_however_often_it_is_read() {
+        // Poison propagates silently: the three rects below each read a value
+        // whose diagnostic was already recorded, and a second error from any
+        // of them would be noise about a mistake the author has already been
+        // told about.
+        let errors = run_source(
+            "cell top() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let l = c.layer;
+                 let r1 = rect(l, x0=0., y0=0., x1=1., y1=1.)!;
+                 let r2 = rect(l, x0=2., y0=0., x1=3., y1=1.)!;
+                 let r3 = rect(l, x0=4., y0=0., x1=5., y1=1.)!;
+             }",
+        );
+        assert_eq!(errors.len(), 1, "one mistake, one diagnostic: {errors:#?}");
+        assert!(
+            matches!(&errors[0], ExecErrorKind::EmptyField { field } if field == "layer"),
+            "{errors:#?}"
         );
     }
 }

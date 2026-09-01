@@ -483,6 +483,19 @@ impl Solver {
         self.solved_vars.contains_key(&var)
     }
 
+    /// Whether `expr` still mentions a variable this solver has not determined.
+    ///
+    /// Both kinds of deferred constraint -- author-written initial conditions
+    /// and compiler defaults -- use this to decide whether applying themselves
+    /// would still change anything. The tolerance is looser than [`EPSILON`]
+    /// on purpose: a coefficient that small cannot pin its variable, so
+    /// treating it as absent avoids adding a constraint that only adds noise.
+    pub fn has_unsolved_var(&self, expr: &LinearExpr) -> bool {
+        expr.coeffs
+            .iter()
+            .any(|(coeff, var)| coeff.abs() > 1e-6 && !self.is_solved(*var))
+    }
+
     /// Whether every constraint in a component is free of non-finite values.
     fn component_is_finite(&self, constraints: &[ConstraintId]) -> bool {
         constraints

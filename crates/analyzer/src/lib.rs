@@ -5,6 +5,7 @@ pub mod rpc;
 pub mod cli;
 
 use std::{
+    collections::HashMap,
     env, fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -24,6 +25,7 @@ use argonc::{
         self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
         VarIdTyMetadata,
     },
+    diagnostics,
     parse::{self, CellInvocation, WorkspaceParseAst},
 };
 use futures::prelude::*;
@@ -391,7 +393,27 @@ fn is_gui_disconnected(error: &tarpc::client::RpcError) -> bool {
 /// Execution diagnostics may still contain usable output (most notably an
 /// underconstrained cell with initial-condition fallbacks), so those are
 /// published as diagnostics without also claiming that the cell did not open.
+/// Most error messages folded into one editor popup.
+///
+/// The popup is a single line, and a broken file reports an error per
+/// remaining token, so the whole list would otherwise arrive as one
+/// multi-megabyte notification.
+const MAX_POPUP_MESSAGES: usize = 10;
+
 fn blocking_compile_error_messages(output: &CompileOutput) -> Vec<String> {
+    let mut messages = blocking_compile_error_messages_uncapped(output);
+    if messages.len() > MAX_POPUP_MESSAGES {
+        let dropped = messages.len() - MAX_POPUP_MESSAGES;
+        messages.truncate(MAX_POPUP_MESSAGES);
+        messages.push(format!(
+            "... and {dropped} more error{}",
+            if dropped == 1 { "" } else { "s" }
+        ));
+    }
+    messages
+}
+
+fn blocking_compile_error_messages_uncapped(output: &CompileOutput) -> Vec<String> {
     match output {
         CompileOutput::FatalParseErrors => {
             vec!["fatal parse errors encountered, unable to compile".to_string()]
@@ -446,7 +468,7 @@ fn diagnostics(
 ) -> IndexMap<Uri, Vec<Diagnostic>> {
     let mut diagnostics: IndexMap<Uri, Vec<Diagnostic>> = IndexMap::new();
     if let Some(o) = output {
-        let errs = match o {
+        let mut errs = match o {
             CompileOutput::FatalParseErrors => {
                 vec![(
                     Span {
@@ -474,6 +496,26 @@ fn diagnostics(
                 .collect(),
             CompileOutput::Valid(_) => vec![],
         };
+        // The same bound the CLI applies. One unbalanced delimiter reports an
+        // error per remaining token -- thousands for a 36 KB file -- and this
+        // list is rebuilt and published on every keystroke.
+        let dropped = diagnostics::condense_spanned(&mut errs);
+        if dropped > 0 {
+            errs.push((
+                Span {
+                    path: root_dir.join("lib.ar"),
+                    span: cfgrammar::Span::new(0, 0),
+                },
+                format!(
+                    "... and {dropped} more error{}",
+                    if dropped == 1 { "" } else { "s" }
+                ),
+            ));
+        }
+        // One line index per file rather than per diagnostic: `Document::new`
+        // scans the whole source, and thousands of diagnostics on one file
+        // otherwise rebuild it thousands of times.
+        let mut documents: HashMap<&Path, Document> = HashMap::new();
         for (span, message) in errs {
             // Generated entry declarations are beyond the editor-visible
             // source. Their diagnostics are reported as analyzer messages.
@@ -481,7 +523,9 @@ fn diagnostics(
                 && span.span.start() <= ast.source_text.len()
                 && let Some(url) = Uri::from_file_path(&span.path)
             {
-                let doc = Document::new(&ast.source_text, 0);
+                let doc = documents
+                    .entry(ast.path.as_path())
+                    .or_insert_with(|| Document::new(&ast.source_text, 0));
                 diagnostics.entry(url).or_default().push(Diagnostic {
                     range: Range {
                         start: doc.offset_to_pos(span.span.start()),
