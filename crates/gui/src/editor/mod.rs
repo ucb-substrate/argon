@@ -11,7 +11,7 @@ use argonc::compile::{
     CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
     bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
 };
-use canvas::{LayoutCanvas, ShapeFill};
+use canvas::{LayoutCanvas, ShapeFill, StipplePattern};
 use futures::StreamExt;
 use geometry::transform::TransformationMatrix;
 use gpui::*;
@@ -147,12 +147,26 @@ fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
     rgb(((color.r as u32) << 16) | ((color.g as u32) << 8) | color.b as u32)
 }
 
-fn shape_fill(dither_pattern: &str) -> ShapeFill {
+fn shape_fill(
+    dither_pattern: &str,
+    custom_patterns: &[argonc::tech::CustomDitherPattern],
+) -> ShapeFill {
     match dither_pattern {
         "I0" => ShapeFill::Solid,
         "I1" => ShapeFill::Hollow,
-        // Built-in and custom patterns are retained by the technology model.
-        // Until the renderer implements each bitmap, use its existing stipple.
+        reference if reference.starts_with('C') => reference[1..]
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| custom_patterns.get(index))
+            .and_then(|pattern| StipplePattern::from_lines(&pattern.lines))
+            .map(|pattern| match pattern.coverage() {
+                0. => ShapeFill::Hollow,
+                1. => ShapeFill::Solid,
+                _ => ShapeFill::Pattern(pattern),
+            })
+            .unwrap_or(ShapeFill::Stippling),
+        // KLayout built-ins other than solid and clear do not carry their
+        // bitmap in the technology file, so retain the legacy slash fallback.
         _ => ShapeFill::Stippling,
     }
 }
@@ -516,7 +530,10 @@ pub(crate) fn prepare_compilation_snapshot(
                 LayerState {
                     name,
                     color: rgb_to_rgba(layer.fill_color),
-                    fill: shape_fill(&layer.style.dither_pattern),
+                    fill: shape_fill(
+                        &layer.style.dither_pattern,
+                        &solved_cell.tech.custom_dither_patterns,
+                    ),
                     border_color: rgb_to_rgba(layer.border_color),
                     visible,
                     used: false,
@@ -805,12 +822,17 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // This root listener also receives moves from the canvas itself and
-        // keeps drags alive when the pointer leaves its bounds. Registering the
-        // same handler on LayoutCanvas would process every in-canvas move twice.
+        // This root listener keeps drags alive after the pointer leaves the
+        // canvas, but toolbar/sidebar motion must not enter layout hit testing.
+        if !self
+            .canvas
+            .read(cx)
+            .should_handle_pointer_move(event.position)
+        {
+            return;
+        }
         self.canvas
             .update(cx, |canvas, cx| canvas.on_mouse_move(event, window, cx));
-        cx.notify();
     }
 
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -964,113 +986,111 @@ impl Render for Editor {
                 ),
             )
         };
-        let status_bar = (displayed_status.is_some() || activity_label.is_some()).then(|| {
-            let mut status_fills_space = false;
-            let mut bar = div()
-                .id("status_bar")
-                .border_t_1()
-                .border_color(theme.divider)
-                .bg(theme.bg)
-                .px_2()
-                .py_1()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2();
-            if let Some((message, is_connection_error)) = displayed_status {
-                let details = message.details;
-                let is_compilation_error = details == MessageDetails::Diagnostics;
-                let title = if is_compilation_error {
-                    "Compilation errors"
-                } else if is_connection_error {
-                    "Connection error"
-                } else if message.typ == MessageType::ERROR {
-                    "Error"
-                } else if message.typ == MessageType::WARNING {
-                    "Warning"
-                } else {
-                    "Message"
-                };
-                let status_text = if is_compilation_error {
-                    SharedString::from(title)
-                } else {
-                    SharedString::from(format!("{title}: {}", message.text))
-                };
-                let action_label = if is_compilation_error {
-                    "Open diagnostics (Ctrl-Shift-D)"
-                } else {
-                    "View messages (Ctrl-Shift-M)"
-                };
-                let mut status_message = div()
-                    .overflow_x_hidden()
-                    .text_ellipsis()
-                    .text_color(theme.error)
-                    .child(status_text);
-                if !is_compilation_error {
-                    status_message = status_message.flex_1();
-                    status_fills_space = true;
-                }
-                bar = bar
+        let mut status_fills_space = false;
+        let mut status_bar = div()
+            .id("status_bar")
+            .border_t_1()
+            .border_color(theme.divider)
+            .bg(theme.bg)
+            .px_2()
+            .py_1()
+            .min_h(px(27.))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2();
+        if let Some((message, is_connection_error)) = displayed_status {
+            let details = message.details;
+            let is_compilation_error = details == MessageDetails::Diagnostics;
+            let title = if is_compilation_error {
+                "Compilation errors"
+            } else if is_connection_error {
+                "Connection error"
+            } else if message.typ == MessageType::ERROR {
+                "Error"
+            } else if message.typ == MessageType::WARNING {
+                "Warning"
+            } else {
+                "Message"
+            };
+            let status_text = if is_compilation_error {
+                SharedString::from(title)
+            } else {
+                SharedString::from(format!("{title}: {}", message.text))
+            };
+            let action_label = if is_compilation_error {
+                "Open diagnostics (Ctrl-Shift-D)"
+            } else {
+                "View messages (Ctrl-Shift-M)"
+            };
+            let mut status_message = div()
+                .overflow_x_hidden()
+                .text_ellipsis()
+                .text_color(theme.error)
+                .child(status_text);
+            if !is_compilation_error {
+                status_message = status_message.flex_1();
+                status_fills_space = true;
+            }
+            status_bar = status_bar
+                .child(
+                    svg()
+                        .path("icons/circle-exclamation-solid-full.svg")
+                        .w(px(14.))
+                        .h_auto()
+                        .text_color(theme.error),
+                )
+                .child(status_message)
+                .child(
+                    div()
+                        .id("show_status_details")
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .child(action_label)
+                        .on_click(cx.listener(move |editor, _, _, cx| {
+                            if details == MessageDetails::Diagnostics {
+                                editor.open_invoking_command(
+                                    Some("Argon diagnostics<CR>"),
+                                    false,
+                                    cx,
+                                );
+                            } else {
+                                editor.open_invoking_command(Some("messages<CR>"), false, cx);
+                            }
+                        })),
+                );
+        }
+        if let Some(activity_label) = activity_label {
+            if !status_fills_space {
+                status_bar = status_bar.child(div().flex_1());
+            }
+            status_bar = status_bar.child(
+                div()
+                    .id("compilation_status")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .text_color(theme.subtext)
                     .child(
                         svg()
-                            .path("icons/circle-exclamation-solid-full.svg")
+                            .path("icons/arrow-rotate-right-solid-full.svg")
                             .w(px(14.))
                             .h_auto()
-                            .text_color(theme.error),
+                            .text_color(theme.subtext)
+                            .with_animation(
+                                "compilation_spinner",
+                                Animation::new(Duration::from_millis(800)).repeat(),
+                                |icon, delta| {
+                                    icon.with_transformation(Transformation::rotate(percentage(
+                                        delta,
+                                    )))
+                                },
+                            ),
                     )
-                    .child(status_message)
-                    .child(
-                        div()
-                            .id("show_status_details")
-                            .text_color(theme.text)
-                            .cursor_pointer()
-                            .child(action_label)
-                            .on_click(cx.listener(move |editor, _, _, cx| {
-                                if details == MessageDetails::Diagnostics {
-                                    editor.open_invoking_command(
-                                        Some("Argon diagnostics<CR>"),
-                                        false,
-                                        cx,
-                                    );
-                                } else {
-                                    editor.open_invoking_command(Some("messages<CR>"), false, cx);
-                                }
-                            })),
-                    );
-            }
-            if let Some(activity_label) = activity_label {
-                if !status_fills_space {
-                    bar = bar.child(div().flex_1());
-                }
-                bar = bar.child(
-                    div()
-                        .id("compilation_status")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_1()
-                        .text_color(theme.subtext)
-                        .child(
-                            svg()
-                                .path("icons/arrow-rotate-right-solid-full.svg")
-                                .w(px(14.))
-                                .h_auto()
-                                .text_color(theme.subtext)
-                                .with_animation(
-                                    "compilation_spinner",
-                                    Animation::new(Duration::from_millis(800)).repeat(),
-                                    |icon, delta| {
-                                        icon.with_transformation(Transformation::rotate(
-                                            percentage(delta),
-                                        ))
-                                    },
-                                ),
-                        )
-                        .child(activity_label),
-                );
-            }
-            bar
-        });
+                    .child(activity_label),
+            );
+        }
         let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
@@ -1115,7 +1135,7 @@ impl Render for Editor {
                     )
                     .child(self.layer_sidebar.clone()),
             )
-            .children(status_bar);
+            .child(status_bar);
         root = if let Some(font_size) = font_size {
             root.text_size(px(font_size))
         } else {
@@ -1137,7 +1157,11 @@ mod tests {
         compile::{CompileOutput, StaticError, StaticErrorCompileOutput, StaticErrorKind},
     };
 
-    use super::{MessageDetails, activity_status_label, compilation_error_message};
+    use argonc::tech::CustomDitherPattern;
+
+    use super::{
+        MessageDetails, ShapeFill, activity_status_label, compilation_error_message, shape_fill,
+    };
 
     #[test]
     fn compilation_status_hands_off_to_rendering_without_an_idle_state() {
@@ -1192,5 +1216,64 @@ mod tests {
         );
         assert!(matches!(&valid, CompileOutput::Valid(_)));
         assert!(compilation_error_message(&valid).is_none());
+    }
+
+    #[test]
+    fn custom_dither_references_use_technology_array_positions() {
+        let patterns = vec![
+            CustomDitherPattern {
+                lines: vec!["........".to_owned(); 8],
+                order: 90,
+                name: "blank".to_owned(),
+            },
+            CustomDitherPattern {
+                lines: vec!["********".to_owned(); 8],
+                order: 10,
+                name: "solid".to_owned(),
+            },
+            CustomDitherPattern {
+                lines: (0..8)
+                    .map(|y| {
+                        let mut row = [b'.'; 8];
+                        row[y] = b'*';
+                        String::from_utf8(row.to_vec()).unwrap()
+                    })
+                    .collect(),
+                order: 1,
+                name: "diagonal".to_owned(),
+            },
+        ];
+
+        assert_eq!(shape_fill("C0", &patterns), ShapeFill::Hollow);
+        assert_eq!(shape_fill("C1", &patterns), ShapeFill::Solid);
+        assert!(matches!(shape_fill("C2", &patterns), ShapeFill::Pattern(_)));
+        assert_eq!(
+            shape_fill("C9", &patterns),
+            ShapeFill::Stippling,
+            "missing custom references retain the legacy fallback"
+        );
+    }
+
+    #[test]
+    fn every_sky130_custom_dither_reference_resolves_to_its_bitmap() {
+        let tech = argonc::tech::read_tech(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../pdks/sky130/sky130.tech.toml"),
+        )
+        .unwrap();
+        let custom_layers = tech
+            .layers
+            .iter()
+            .filter(|layer| layer.style.dither_pattern.starts_with('C'))
+            .collect::<Vec<_>>();
+
+        assert!(!custom_layers.is_empty());
+        for layer in custom_layers {
+            assert_ne!(
+                shape_fill(&layer.style.dither_pattern, &tech.custom_dither_patterns,),
+                ShapeFill::Stippling,
+                "{} references an unavailable custom bitmap",
+                layer.name
+            );
+        }
     }
 }

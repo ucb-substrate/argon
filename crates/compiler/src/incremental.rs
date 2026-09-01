@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use arcstr::ArcStr;
@@ -19,6 +20,7 @@ use crate::{
     compile::{
         self, CellArg, CompileInput, CompileOutput, StaticAnalysis, StaticErrorCompileOutput,
     },
+    nav::NavIndex,
     parse,
     workspace::WorkspaceConfig,
 };
@@ -72,6 +74,12 @@ struct StaticCache {
     key: u64,
     disk_revisions: Vec<TrackedFileRevision>,
     analysis: StaticAnalysis,
+    /// Built lazily, because only editor sessions ask for it.
+    ///
+    /// The outer `Option` records whether the build has been attempted, so an
+    /// index that was built and then judged unusable is not rebuilt from the
+    /// whole typed AST on every request until the next edit.
+    nav: Option<Option<Arc<NavIndex>>>,
 }
 
 /// Stateful compiler used by long-lived analyzer processes.
@@ -83,6 +91,10 @@ pub struct IncrementalCompiler {
     static_cache: Option<StaticCache>,
     execution_cache: HashMap<u64, CompileOutput>,
     execution_environment: Option<u64>,
+    /// The most recent navigation index that had content. Retained so that
+    /// editor navigation keeps answering while the workspace does not
+    /// type-check, which is most of the time while someone is typing.
+    last_good_nav: Option<Arc<NavIndex>>,
     stats: IncrementalStats,
 }
 
@@ -167,6 +179,50 @@ impl IncrementalCompiler {
         self.revision
     }
 
+    /// Navigation index for the current sources.
+    ///
+    /// Falls back to the most recent index that had content, so that a
+    /// half-written edit does not take go-to-definition away. Returned behind
+    /// an `Arc` because the analyzer shares one index across requests and
+    /// `StaticAnalysis` is cloned on every analysis.
+    pub fn nav(&mut self, config: &WorkspaceConfig) -> Option<Arc<NavIndex>> {
+        self.ensure_analysis(config);
+        let cache = self.static_cache.as_mut().expect("analysis cache");
+        let built = match &cache.nav {
+            Some(nav) => nav.clone(),
+            None => {
+                let built = cache.analysis.typed_ast.as_ref().and_then(|typed| {
+                    // Decided before building, so an index that will not be
+                    // kept is never built: that is the common case while
+                    // someone is typing.
+                    let coverage = NavIndex::coverage(typed);
+                    // An import error or a missing root module yields an empty
+                    // typed AST, which is a compile failure rather than a
+                    // workspace with nothing in it. Note that it also leaves
+                    // `tracked` empty, which would make the coverage check
+                    // below vacuously true.
+                    if coverage.is_empty() {
+                        return None;
+                    }
+                    let tracked = typed.values().map(|module| module.path.as_path()).collect();
+                    let usable = match &self.last_good_nav {
+                        Some(previous) => previous.covered_by(&coverage, &tracked),
+                        // Nothing better to fall back to.
+                        None => true,
+                    };
+                    usable.then(|| Arc::new(NavIndex::build(typed)))
+                });
+                cache.nav = Some(built.clone());
+                built
+            }
+        };
+        if let Some(nav) = built {
+            self.last_good_nav = Some(nav.clone());
+            return Some(nav);
+        }
+        self.last_good_nav.clone()
+    }
+
     pub fn analyze_workspace(&mut self, config: &WorkspaceConfig) -> StaticAnalysis {
         self.ensure_analysis(config);
         self.static_cache
@@ -203,6 +259,7 @@ impl IncrementalCompiler {
             key,
             disk_revisions,
             analysis,
+            nav: None,
         });
     }
 
@@ -548,6 +605,121 @@ mod tests {
         let second = compiler.analyze_workspace(&config);
         assert!(!second.errors.is_empty());
         assert_eq!(compiler.stats().static_cache_hits, 1);
+    }
+
+    #[test]
+    fn navigation_survives_an_edit_that_does_not_compile() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/argon_library/lib.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), source.clone());
+
+        let good = compiler
+            .nav(&config)
+            .expect("a workspace that compiles is indexed");
+        let cell = source.find("cell test").unwrap() + "cell ".len();
+        assert!(good.definition_at(&root, cell).is_some());
+
+        // A syntax error leaves nothing to index. The previous index is served
+        // instead, so navigation does not disappear mid-keystroke.
+        compiler.set_source_text(root.clone(), "cell broken( {".to_owned());
+        let stale = compiler
+            .nav(&config)
+            .expect("the last good index is retained");
+        assert!(stale.definition_at(&root, cell).is_some());
+
+        compiler.set_source_text(root.clone(), source);
+        assert!(compiler.nav(&config).is_some());
+    }
+
+    /// An unresolvable import empties the typed AST, which is a compile
+    /// failure rather than a workspace with nothing in it.
+    #[test]
+    fn an_unresolvable_import_keeps_the_previous_index() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/argon_library/lib.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), source.clone());
+
+        let cell = source.find("cell test").unwrap() + "cell ".len();
+        assert!(
+            compiler
+                .nav(&config)
+                .unwrap()
+                .definition_at(&root, cell)
+                .is_some()
+        );
+
+        // Half a module path is what an import looks like while it is being
+        // typed. It reports an import error, so nothing type-checks and there
+        // is nothing to index — but the workspace is not empty.
+        compiler.set_source_text(root.clone(), format!("use lib::uti::test;\n{source}"));
+        let stale = compiler
+            .nav(&config)
+            .expect("the last good index is retained");
+        assert!(stale.definition_at(&root, cell).is_some());
+    }
+
+    /// A `mod` declaration that resolves to no module of its own leaves a
+    /// stand-in behind that borrows the root's path. It must not be mistaken
+    /// for the root's own source.
+    #[test]
+    fn a_module_that_resolves_to_nothing_does_not_blank_the_root() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/argon_library/lib.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), source.clone());
+        assert!(compiler.nav(&config).is_some());
+
+        // `mod lib;` names the root's own file.
+        let circular = format!("mod lib;\n{source}");
+        compiler.set_source_text(root.clone(), circular.clone());
+        let index = compiler.nav(&config).expect("an index");
+        assert_eq!(index.source(&root).map(ArcStr::as_str), Some(&*circular));
+        let cell = circular.find("cell test").unwrap() + "cell ".len();
+        assert!(index.definition_at(&root, cell).is_some());
+    }
+
+    /// A file with nothing left in it still parses, so it must not be mistaken
+    /// for one that stopped parsing and pin the index to a stale copy.
+    #[test]
+    fn commenting_out_a_whole_file_still_reindexes_the_workspace() {
+        let directory =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/argon_library");
+        let root = directory.join("lib.ar");
+        let utils = directory.join("utils.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root);
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), source.clone());
+        compiler.set_source_text(utils.clone(), std::fs::read_to_string(&utils).unwrap());
+        assert!(compiler.nav(&config).is_some());
+
+        compiler.set_source_text(utils.clone(), "// fn test() -> Float { 15. }\n".to_owned());
+        let index = compiler.nav(&config).expect("an index");
+        assert!(
+            index.source(&utils).is_some(),
+            "the commented-out file is still covered"
+        );
+
+        // The index is the fresh one, not the retained copy: a rename made
+        // alongside the comment-out is reflected in it. The stale index would
+        // still answer here — with the old name, at the old offsets.
+        let renamed = source.replace("cell test()", "cell renamed()");
+        compiler.set_source_text(root.clone(), renamed.clone());
+        let index = compiler.nav(&config).expect("an index");
+        let offset = renamed.find("renamed").unwrap();
+        let definition = index
+            .definition_at(&root, offset)
+            .expect("the renamed cell resolves");
+        assert_eq!(definition.name, "renamed");
+        assert_eq!(index.source(&root).map(ArcStr::as_str), Some(&*renamed));
     }
 
     #[test]

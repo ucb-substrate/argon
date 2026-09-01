@@ -1,5 +1,6 @@
 mod compiler_worker;
 pub mod document;
+mod navigation;
 pub mod rpc;
 
 pub mod cli;
@@ -26,6 +27,7 @@ use argonc::{
         VarIdTyMetadata,
     },
     diagnostics,
+    nav::NavIndex,
     parse::{self, CellInvocation, WorkspaceParseAst},
 };
 use futures::prelude::*;
@@ -49,7 +51,7 @@ use tracing_subscriber::{
 };
 
 use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
-use crate::document::{Document, DocumentChange};
+use crate::document::{Document, DocumentChange, PositionEncoding};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
@@ -161,30 +163,34 @@ impl Default for LogConfig {
     }
 }
 
-pub fn argon_config_path() -> Option<PathBuf> {
-    env::var_os("XDG_CONFIG_HOME")
+/// Argon's own subdirectory of one XDG base directory.
+///
+/// `variable` is the XDG environment variable naming the base directory, and
+/// `home_fallback` the path relative to the home directory that the XDG
+/// specification falls back to when it is unset or empty.
+fn argon_xdg_dir(variable: &str, home_fallback: &str) -> Option<PathBuf> {
+    env::var_os(variable)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             homedir::my_home()
                 .ok()
                 .flatten()
-                .map(|home| home.join(".config"))
+                .map(|home| home.join(home_fallback))
         })
-        .map(|directory| directory.join("argon/config.toml"))
+        .map(|directory| directory.join("argon"))
+}
+
+pub fn argon_config_path() -> Option<PathBuf> {
+    argon_xdg_dir("XDG_CONFIG_HOME", ".config").map(|directory| directory.join("config.toml"))
 }
 
 pub fn argon_state_dir() -> Option<PathBuf> {
-    env::var_os("XDG_STATE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            homedir::my_home()
-                .ok()
-                .flatten()
-                .map(|home| home.join(".local/state"))
-        })
-        .map(|directory| directory.join("argon"))
+    argon_xdg_dir("XDG_STATE_HOME", ".local/state")
+}
+
+pub fn argon_cache_dir() -> Option<PathBuf> {
+    argon_xdg_dir("XDG_CACHE_HOME", ".cache")
 }
 
 pub fn argon_log_path() -> Option<PathBuf> {
@@ -357,6 +363,14 @@ impl SourceState {
 pub(crate) struct PublishedState {
     pub(crate) config: WorkspaceConfig,
     pub(crate) ast: Arc<WorkspaceParseAst>,
+    /// Latest usable navigation index.
+    ///
+    /// This can be older than `ast`: the compiler keeps serving the last index
+    /// that covered the workspace so navigation survives a broken edit, and
+    /// decides on its own when that index is superseded. The index carries the
+    /// sources its offsets are into, so a stale one stays readable without
+    /// retaining the parse it came from.
+    pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
 }
@@ -461,10 +475,60 @@ fn compile_open_cell(
     compile::execute_cell_invocation(ast, invocation, config)
 }
 
+/// Ranges compiler spans against the workspace files they came from.
+///
+/// Building a [`Document`] indexes every line of a file, so the one built for
+/// a file is kept for the rest of the batch: a single compile routinely
+/// reports many errors against the same handful of files.
+struct SpanRanger<'a> {
+    ast: &'a WorkspaceParseAst,
+    encoding: PositionEncoding,
+    documents: HashMap<PathBuf, Option<Document>>,
+}
+
+impl<'a> SpanRanger<'a> {
+    fn new(ast: &'a WorkspaceParseAst, encoding: PositionEncoding) -> Self {
+        Self {
+            ast,
+            encoding,
+            documents: HashMap::new(),
+        }
+    }
+
+    /// Range of `span` within the editor-visible text of the file that produced
+    /// it.
+    ///
+    /// Returns `None` when the file is not part of the compiled workspace or
+    /// when the span starts beyond the editor-visible source. Generated
+    /// declarations (GDS import stubs, spliced entry cells) are appended past
+    /// that boundary, so this is what keeps them from being reported at a
+    /// position no buffer has.
+    fn range(&mut self, span: &Span) -> Option<Range> {
+        let ast = self.ast;
+        let encoding = self.encoding;
+        let document = self
+            .documents
+            .entry(span.path.clone())
+            .or_insert_with(|| {
+                let module = ast.values().find(|module| module.path == span.path)?;
+                Some(Document::new(&module.source_text, 0, encoding))
+            })
+            .as_ref()?;
+        if span.span.start() > document.contents().len() {
+            return None;
+        }
+        Some(Range {
+            start: document.offset_to_pos(span.span.start()),
+            end: document.offset_to_pos(span.span.end()),
+        })
+    }
+}
+
 fn diagnostics(
     root_dir: &Path,
     ast: &WorkspaceParseAst,
     output: Option<&CompileOutput>,
+    encoding: PositionEncoding,
 ) -> IndexMap<Uri, Vec<Diagnostic>> {
     let mut diagnostics: IndexMap<Uri, Vec<Diagnostic>> = IndexMap::new();
     if let Some(o) = output {
@@ -512,25 +576,13 @@ fn diagnostics(
                 ),
             ));
         }
-        // One line index per file rather than per diagnostic: `Document::new`
-        // scans the whole source, and thousands of diagnostics on one file
-        // otherwise rebuild it thousands of times.
-        let mut documents: HashMap<&Path, Document> = HashMap::new();
+        let mut ranger = SpanRanger::new(ast, encoding);
         for (span, message) in errs {
-            // Generated entry declarations are beyond the editor-visible
-            // source. Their diagnostics are reported as analyzer messages.
-            if let Some(ast) = ast.values().find(|ast| ast.path == span.path)
-                && span.span.start() <= ast.source_text.len()
+            if let Some(range) = ranger.range(&span)
                 && let Some(url) = Uri::from_file_path(&span.path)
             {
-                let doc = documents
-                    .entry(ast.path.as_path())
-                    .or_insert_with(|| Document::new(&ast.source_text, 0));
                 diagnostics.entry(url).or_default().push(Diagnostic {
-                    range: Range {
-                        start: doc.offset_to_pos(span.span.start()),
-                        end: doc.offset_to_pos(span.span.end()),
-                    },
+                    range,
                     severity: Some(DiagnosticSeverity::ERROR),
                     message,
                     ..Default::default()
@@ -546,6 +598,15 @@ pub struct State {
     server_addr: SocketAddr,
     editor_client: Client,
     root_dir: Arc<OnceLock<PathBuf>>,
+    /// Negotiated in `initialize`; UTF-16 until the client tells us otherwise.
+    position_encoding: Arc<OnceLock<PositionEncoding>>,
+    /// The embedded standard library, written to disk on first use so the
+    /// editor can open it. `None` if it could not be written.
+    ///
+    /// An async cell because writing it is filesystem work that has to happen
+    /// off the runtime's worker threads, and because requests arriving while
+    /// the write is in flight should await it rather than repeat it.
+    std_file: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
@@ -564,6 +625,8 @@ impl State {
             server_addr,
             editor_client,
             root_dir: Default::default(),
+            position_encoding: Default::default(),
+            std_file: Default::default(),
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
@@ -579,6 +642,16 @@ impl State {
 
     fn config(&self) -> ArgonConfig {
         read_unpoisoned(&self.app_config).clone()
+    }
+
+    pub(crate) fn position_encoding(&self) -> PositionEncoding {
+        self.position_encoding.get().copied().unwrap_or_default()
+    }
+
+    /// A read-only document over compiled source text, for converting spans
+    /// into client-facing ranges. The version is meaningless for these.
+    pub(crate) fn document(&self, contents: impl Into<arcstr::ArcStr>) -> Document {
+        Document::new(contents, 0, self.position_encoding())
     }
 
     async fn is_latest_compile_request(&self, identity: &CompileIdentity) -> bool {
@@ -812,8 +885,12 @@ impl Backend {
         if !self.state.is_latest_compile_request(&identity).await {
             return None;
         }
-        let mut current_diagnostics =
-            diagnostics(&result.root_dir, &result.ast, result.output.as_ref());
+        let mut current_diagnostics = diagnostics(
+            &result.root_dir,
+            &result.ast,
+            result.output.as_ref(),
+            self.state.position_encoding(),
+        );
         // The compiled GDS can contain millions of geometry values. Move it
         // into the RPC snapshot after diagnostics have borrowed it instead of
         // deep-cloning the complete layout immediately before serialization.
@@ -836,6 +913,13 @@ impl Backend {
             }
             compiled.config = result.config;
             compiled.ast = Arc::new(result.ast);
+            // The compiler only ever answers `None` before the workspace has
+            // type-checked once, or on a path that never asked it (a manifest
+            // that would not load, an internal compiler error). None of those
+            // is a reason to throw away an index that is still good.
+            if let Some(nav) = result.nav {
+                compiled.nav = Some(nav);
+            }
             compiled.compiled_revision = identity.revision;
         }
 
@@ -990,6 +1074,14 @@ impl Notification for FocusEditor {
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let encoding = PositionEncoding::negotiate(
+            params
+                .capabilities
+                .general
+                .as_ref()
+                .and_then(|general| general.position_encodings.as_deref()),
+        );
+        let _ = self.state.position_encoding.set(encoding);
         let root_uri = params
             .workspace_folders
             .and_then(|folders| folders.into_iter().next())
@@ -1007,6 +1099,9 @@ impl LanguageServer for Backend {
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: Some(encoding.kind()),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -1031,7 +1126,11 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let doc = Document::new(params.text_document.text, params.text_document.version);
+        let doc = Document::new(
+            params.text_document.text,
+            params.text_document.version,
+            self.state.position_encoding(),
+        );
         let uri = params.text_document.uri;
         if let Some(path) = uri.to_file_path().map(|path| path.into_owned()) {
             self.state
@@ -1100,6 +1199,30 @@ impl LanguageServer for Backend {
         } else {
             self.compile_after_debounce(identity);
         }
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let position = params.text_document_position_params;
+        Ok(self
+            .state
+            .definition(&position.text_document.uri, position.position)
+            .await
+            .map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let position = params.text_document_position;
+        Ok(self
+            .state
+            .references(
+                &position.text_document.uri,
+                position.position,
+                params.context.include_declaration,
+            )
+            .await)
     }
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {
@@ -1386,7 +1509,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.state.document(&ast.source_text);
         let scope = &ast.span2scope[&scope_span];
         let preview_binding = (0..)
             .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
