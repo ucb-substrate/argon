@@ -121,8 +121,8 @@ mod tests {
 
     use crate::{
         compile::{
-            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RectInitialCondition, SolvedValue,
-            StaticErrorKind, static_compile,
+            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RESERVED_CELL_FIELDS,
+            RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -2138,10 +2138,8 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(output.errors.iter().any(|error| matches!(
-            error.kind,
-            StaticErrorKind::CannotIndexFieldAccess {
-                ty: crate::compile::Ty::Point
-            }
+            &error.kind,
+            StaticErrorKind::CannotIndexFieldAccess { ty } if ty == "Point"
         )));
     }
 
@@ -2168,11 +2166,8 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(output.errors.iter().any(|error| matches!(
-            error.kind,
-            StaticErrorKind::IncorrectTy {
-                expected: crate::compile::Ty::Int,
-                ..
-            }
+            &error.kind,
+            StaticErrorKind::IncorrectTy { expected, .. } if expected == "Int"
         )));
     }
 
@@ -2912,6 +2907,232 @@ mod tests {
         assert_reports(&errors, |error| {
             matches!(error, ExecErrorKind::RecursionLimitExceeded { .. })
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Diagnostics-quality regressions. Each case produced a message that was
+    // unusable rather than merely imperfect: unbounded in size, naming the
+    // wrong thing, or contradicting itself.
+
+    #[test]
+    fn hierarchical_type_errors_stay_readable() {
+        // `Ty` had no `Display`, so nine `#[error]` strings formatted it with
+        // `{:?}` -- and `Debug` re-expands the `Arc`-shared `CellTy` DAG into a
+        // tree, making one message exponential in hierarchy depth. A depth-8
+        // binary hierarchy produced 30 KB, depth 20 produced 122 MB, and the
+        // analyzer pushed the whole string into an LSP diagnostic on every
+        // keystroke.
+        let depth = 16;
+        let mut source =
+            String::from("cell h0() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }\n");
+        for k in 1..=depth {
+            source.push_str(&format!(
+                "cell h{k}() {{ let p = inst(h{}()); let q = inst(h{}()); }}\n",
+                k - 1,
+                k - 1
+            ));
+        }
+        source.push_str(&format!(
+            "fn takes_float(v: Float) -> Float {{ v }}
+             cell top() {{ let a = inst(h{depth}()); let b = takes_float(a); }}"
+        ));
+
+        let errors = check_source(&source);
+        let message = errors
+            .iter()
+            .find_map(|error| match error {
+                StaticErrorKind::IncorrectTy { found, .. } => Some(found.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{errors:#?}"));
+        assert_eq!(message, format!("Inst(h{depth})"));
+    }
+
+    #[test]
+    fn an_undeclared_name_reports_one_error() {
+        // `Ty::Unknown` documents that it "suppresses type checking of
+        // dependent properties", but `is_eq_ty` special-cased only `Ty::Any`
+        // and fell through to `==` for `Unknown`, so every already-diagnosed
+        // expression produced a second `expected .., found Unknown`.
+        for source in [
+            "cell top() {
+                 let a = float();
+                 eq(a, undeclared_thing);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=a)!;
+             }",
+            "cell top() { let c = missing_cell(); let i = inst(c); }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                !errors.iter().any(|error| matches!(
+                    error,
+                    StaticErrorKind::IncorrectTy { .. }
+                        | StaticErrorKind::IncorrectTyCategory { .. }
+                )),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_a_field_of_an_unplaced_cell_says_so() {
+        // `dispatch_field_access_expr` had no `Ty::Cell` arm, so this fell
+        // through to the generic no-field error -- which, because `Ty` printed
+        // with `{:?}`, asserted that `r` was missing while printing the field
+        // map `{"r": Rect}` that contained it. The evaluator refuses the same
+        // read, so the type checker now agrees with it.
+        let errors = check_source(
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+             cell top() {
+                 let c = child();
+                 text(\"t\", \"text.label\", c.r.x0, 0.);
+             }",
+        );
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::CellFieldBeforePlacement { cell, field }
+                    if cell == "child" && field == "r"
+            )),
+            "{errors:#?}"
+        );
+
+        // The same read on an uncalled cell function names the call it needs.
+        let errors = check_source(
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+             cell top() { text(\"t\", \"text.label\", child.r.x0, 0.); }",
+        );
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::CellFnFieldAccess { cell, .. } if cell == "child"
+            )),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn a_cell_field_named_x_reports_the_real_reason() {
+        // The check hardcoded `["x", "y"]` a second time and reported
+        // `RedeclarationOfBuiltin` -- but neither name is in `BUILTINS`, so
+        // the message pointed at a builtin that does not exist. `x` and `y`
+        // are among the most natural names in a layout language.
+        for name in RESERVED_CELL_FIELDS {
+            let errors = check_source(&format!("cell top() {{ let {name} = 1.; }}"));
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    StaticErrorKind::ReservedCellField { name: n } if n == name
+                )),
+                "{errors:#?}"
+            );
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::RedeclarationOfBuiltin)),
+                "{errors:#?}"
+            );
+        }
+
+        // A nested `let` never becomes a cell field, so it stays legal, as do
+        // the other binding forms -- `x` is only reserved where it would
+        // publish a field.
+        for source in [
+            "cell top() { let w = if true { let x = 1.; x } else { 2. }; }",
+            "fn f(x: Float) -> Float { x + 1. }",
+            "cell top(x: Float) { let r = rect(\"met1\", x0=x, y0=0., x1=1., y1=1.)!; }",
+            "cell top() { for x in std::range(3) { float(); } }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::ReservedCellField { .. })),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_instance_field_names_the_field() {
+        // Reported `empty bbox`, carrying the repo's own
+        // `// TODO: More descriptive error`. Instances are normally passed as
+        // `Any` (cell types cannot be named), so this is where an ordinary
+        // misspelling lands.
+        assert_reports(
+            &run_source(
+                "fn left_edge(i: Any) -> Any { i.wdie.x0 }
+                 cell child() { let wide = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }
+                 cell top() {
+                     let i = inst(child());
+                     eq(i.x, 0.); eq(i.y, 0.);
+                     let r = rect(\"met1\", x0=left_edge(i), y0=0., x1=10., y1=10.);
+                 }",
+            ),
+            |error| {
+                matches!(error, ExecErrorKind::NoFieldOnInstance { field, cell }
+                if field == "wdie" && cell == "child")
+            },
+        );
+    }
+
+    #[test]
+    fn reading_the_layer_of_a_construction_rect_reports_one_error() {
+        // Used `InvalidRotation` -- a copy-paste, reported as "non-Manhattan
+        // rotation" -- and then continued with a fabricated `Value::String("")`
+        // that produced a second, unrelated error about the empty-string layer
+        // being absent from the technology file.
+        let errors = run_source(
+            "cell top() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let r = rect(c.layer, x0=0., y0=0., x1=10., y1=10.)!;
+             }",
+        );
+        assert_reports(
+            &errors,
+            |error| matches!(error, ExecErrorKind::EmptyField { field } if field == "layer"),
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error, ExecErrorKind::IllegalLayer { .. })),
+            "the fabricated empty layer must not cascade: {errors:#?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error, ExecErrorKind::InvalidRotation)),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn path_extensions_are_constrainable() {
+        // Extensions became solver variables only when a kwarg named them,
+        // unlike `width`, which always does. `eq(p.begin_extension, 5.)`
+        // therefore degenerated to `0 - 5 = 0` and reported a bare
+        // "inconsistent constraint" with nothing to say the extension had
+        // never become a variable.
+        let data = compile_top(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 eq(p.begin_extension, 5.);
+             }",
+        );
+        let path = layout_objects(&data, data.top)
+            .into_iter()
+            .find_map(SolvedValue::get_path)
+            .expect("top should contain a path");
+        assert_eq!(path.begin_extension.0, 5.);
+        // The unnamed extension still defaults to zero, and because that
+        // default is the compiler's rather than the author's it must not make
+        // the cell underconstrained.
+        assert_eq!(path.end_extension.0, 0.);
+        assert!(
+            data.cells[&data.top].unsolved_vars.is_empty(),
+            "{:#?}",
+            data.cells[&data.top].unsolved_vars
+        );
     }
 
     #[test]

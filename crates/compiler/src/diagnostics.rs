@@ -91,6 +91,72 @@ pub fn remap_invocation(diagnostics: &mut Vec<Diagnostic>, invocation: &CellInvo
     }
 }
 
+/// Most diagnostics rendered for one invocation.
+///
+/// A single unbalanced delimiter can put the parser into a state that reports
+/// an error per remaining token; 36 KB of source produced 7,742 of them.
+const MAX_DIAGNOSTICS: usize = 100;
+
+/// Longest source line rendered under a diagnostic, in characters.
+///
+/// Each diagnostic re-renders its whole line, so the two limits multiply: the
+/// same 36 KB input wrote 542 MB to stderr.
+const MAX_SOURCE_LINE: usize = 200;
+
+/// Drops duplicates and caps the count, appending a summary when anything was
+/// dropped.
+///
+/// Duplicates are common rather than exceptional: one `a && b` reports five
+/// errors across two adjacent spans.
+pub fn condense(diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen = std::collections::HashSet::new();
+    diagnostics.retain(|diagnostic| {
+        seen.insert((
+            diagnostic.path.clone(),
+            diagnostic.start,
+            diagnostic.end,
+            diagnostic.message.clone(),
+        ))
+    });
+    if diagnostics.len() > MAX_DIAGNOSTICS {
+        let dropped = diagnostics.len() - MAX_DIAGNOSTICS;
+        diagnostics.truncate(MAX_DIAGNOSTICS);
+        diagnostics.push(Diagnostic::error(format!(
+            "... and {dropped} more error{}",
+            if dropped == 1 { "" } else { "s" }
+        )));
+    }
+}
+
+/// Elides the middle of an over-long source line, keeping `column` visible.
+///
+/// Returns the text to render and the column it now sits at.
+fn elide_line(line: &str, column: usize, underline: usize) -> (String, usize) {
+    const ELLIPSIS: &str = "...";
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() <= MAX_SOURCE_LINE {
+        return (line.to_string(), column);
+    }
+    // Centre the window on the underlined span so the caret stays on screen.
+    let caret = column.saturating_sub(1);
+    let want = MAX_SOURCE_LINE.saturating_sub(2 * ELLIPSIS.len());
+    let start = caret
+        .saturating_add(underline / 2)
+        .saturating_sub(want / 2)
+        .min(chars.len().saturating_sub(want));
+    let end = (start + want).min(chars.len());
+    let mut text = String::new();
+    if start > 0 {
+        text.push_str(ELLIPSIS);
+    }
+    text.extend(&chars[start..end]);
+    if end < chars.len() {
+        text.push_str(ELLIPSIS);
+    }
+    let prefix = if start > 0 { ELLIPSIS.len() } else { 0 };
+    (text, caret.saturating_sub(start) + prefix + 1)
+}
+
 pub fn from_compile_output(output: &CompileOutput) -> Vec<Diagnostic> {
     match output {
         CompileOutput::FatalParseErrors => {
@@ -152,6 +218,8 @@ pub fn render(writer: &mut impl Write, diagnostic: &Diagnostic, color: bool) -> 
         .unwrap_or((1, 1, None, 1));
     writeln!(writer, "  --> {}:{line}:{column}", path.display())?;
     if let Some(line_text) = line_text {
+        let underline = underline.clamp(1, MAX_SOURCE_LINE);
+        let (line_text, column) = elide_line(line_text, column, underline);
         let gutter = line.to_string().len().max(1);
         writeln!(writer, "{:gutter$} |", "")?;
         writeln!(writer, "{line:>gutter$} | {line_text}")?;
@@ -160,7 +228,7 @@ pub fn render(writer: &mut impl Write, diagnostic: &Diagnostic, color: bool) -> 
             "{:gutter$} | {}{open}{}{close}",
             "",
             " ".repeat(column.saturating_sub(1)),
-            "^".repeat(underline.max(1))
+            "^".repeat(underline)
         )?;
     }
     Ok(())
@@ -188,7 +256,81 @@ mod tests {
         parse::{STD_PATH, STD_SOURCE},
     };
 
-    use super::{Diagnostic, Level, render, source_location};
+    use super::{
+        Diagnostic, Level, MAX_DIAGNOSTICS, MAX_SOURCE_LINE, condense, render, source_location,
+    };
+
+    fn at(message: &str, start: usize) -> Diagnostic {
+        Diagnostic::at(
+            Level::Error,
+            message,
+            &Span {
+                path: PathBuf::from("/virtual/lib.ar"),
+                span: cfgrammar::Span::new(start, start + 1),
+            },
+        )
+    }
+
+    #[test]
+    fn condense_drops_duplicates_and_caps_the_count() {
+        // One unbalanced delimiter reports an error per remaining token: 36 KB
+        // of source produced 7,742 diagnostics, and one `a && b` produces five
+        // for a single construct.
+        let mut diagnostics = vec![at("same", 0), at("same", 0), at("same", 4)];
+        condense(&mut diagnostics);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+
+        let mut diagnostics = (0..MAX_DIAGNOSTICS + 50)
+            .map(|i| at("distinct", i))
+            .collect::<Vec<_>>();
+        condense(&mut diagnostics);
+        assert_eq!(diagnostics.len(), MAX_DIAGNOSTICS + 1);
+        assert_eq!(
+            diagnostics.last().expect("summary").message,
+            "... and 50 more errors"
+        );
+    }
+
+    #[test]
+    fn renders_a_bounded_excerpt_of_a_long_line() {
+        // Each diagnostic re-renders its whole source line, so a long line and
+        // a high error count multiplied: 36 KB of source wrote 542 MB.
+        let line = "x".repeat(5_000);
+        let source = format!("cell top() {{ {line} }}\n");
+        let caret = source.find('x').expect("line content") + 4_000;
+        let diagnostic = Diagnostic {
+            source: Some(source.clone()),
+            ..Diagnostic::at(
+                Level::Error,
+                "long line",
+                &Span {
+                    path: PathBuf::from("/virtual/lib.ar"),
+                    span: cfgrammar::Span::new(caret, caret + 1),
+                },
+            )
+        };
+        let mut output = Vec::new();
+        render(&mut output, &diagnostic, false).expect("diagnostic should render");
+        let output = String::from_utf8(output).expect("diagnostic should be UTF-8");
+        assert!(
+            output.len() < 4 * MAX_SOURCE_LINE,
+            "rendered {} bytes:\n{output}",
+            output.len()
+        );
+        // The caret still lands under the excerpt rather than past its end.
+        let excerpt = output
+            .lines()
+            .find(|line| line.starts_with("1 | "))
+            .expect("source line");
+        let caret_line = output
+            .lines()
+            .find(|line| line.contains('^'))
+            .expect("caret");
+        assert!(
+            caret_line.find('^').expect("caret column") < excerpt.chars().count(),
+            "{output}"
+        );
+    }
 
     #[test]
     fn computes_source_location() {

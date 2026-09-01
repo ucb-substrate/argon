@@ -256,6 +256,9 @@ fn compile_failed(
     if let Some(invocation) = invocation {
         diagnostics::remap_invocation(&mut diagnostics, invocation);
     }
+    // After remapping, so that diagnostics the invocation splice moves onto a
+    // common span are deduplicated too.
+    diagnostics::condense(&mut diagnostics);
     Failed(format, diagnostics)
 }
 

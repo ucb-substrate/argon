@@ -82,6 +82,15 @@ const MAX_EVAL_DEPTH: u32 = 4096;
 /// the writer can never fail partway through a file.
 pub(crate) const MAX_TEXT_LEN: usize = 512;
 
+/// Field names an instance already answers, so a cell's top-level `let` may
+/// not shadow one.
+///
+/// A cell's public fields are exactly its top-level `let` bindings, and
+/// `inst.x` / `inst.y` are the instance's position. Both the reserved-name
+/// check and the `Ty::Inst` field-access arm read this list, so the two cannot
+/// drift apart.
+pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
+
 pub const BUILTINS: [&str; 15] = [
     "list",
     "cons",
@@ -1041,6 +1050,75 @@ fn polygon_coordinate(name: &str) -> Option<PolygonCoordinate> {
     })
 }
 
+/// Renders a type the way a user writes it.
+///
+/// Cell and instance types print as the *name* of the cell they came from.
+/// `Debug` cannot: it expands the `Arc`-shared `CellTy` DAG back into a tree,
+/// so a `{:?}` type in a diagnostic is exponential in hierarchy depth -- the
+/// very explosion the `Arc` on `CellFnTy::cell` exists to prevent. A depth-8
+/// binary hierarchy produced a 30 KB single-line error, a depth-20 one 122 MB.
+impl std::fmt::Display for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ty::Unknown => write!(f, "?"),
+            Ty::Any => write!(f, "Any"),
+            Ty::Bool => write!(f, "Bool"),
+            Ty::Float => write!(f, "Float"),
+            Ty::Int => write!(f, "Int"),
+            Ty::Rect => write!(f, "Rect"),
+            Ty::Polygon => write!(f, "Polygon"),
+            Ty::Path => write!(f, "Path"),
+            Ty::Point => write!(f, "Point"),
+            Ty::String => write!(f, "String"),
+            Ty::Nil => write!(f, "()"),
+            Ty::SeqNil => write!(f, "[]"),
+            Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
+            Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
+            Ty::CellFn(cell_fn) => {
+                write!(f, "cell {}(", cell_fn.cell.name)?;
+                for (i, arg) in cell_fn.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
+            Ty::Fn(func) => {
+                write!(f, "fn(")?;
+                for (i, arg) in func.args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ") -> {}", func.ret)
+            }
+            Ty::Enum(e) => {
+                write!(f, "enum {{")?;
+                for (i, variant) in e.variants.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{variant}")?;
+                }
+                write!(f, "}}")
+            }
+            Ty::Seq(inner) => write!(f, "[{inner}]"),
+            Ty::Tuple(elements) => {
+                write!(f, "(")?;
+                for (i, element) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{element}")?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
 impl Ty {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -1104,13 +1182,27 @@ pub struct CellFnTy {
     cell: Arc<CellTy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct CellTy {
+    /// The name the cell was declared with, carried solely so that a
+    /// diagnostic can say `Inst(inverter)` instead of dumping the field map.
+    ///
+    /// Deliberately excluded from `PartialEq`: cell types are *structural*, so
+    /// two identically shaped cells are the same type regardless of what they
+    /// are called, and `is_eq_ty` falls through to `==`. Including the name
+    /// here would silently make that check nominal.
+    name: String,
     data: IndexMap<String, Ty>,
     /// GDS-backed cells publish geometry fields at execution time. Their
     /// generated source declaration is intentionally only a signature, so
     /// field names cannot be enumerated by the source type pass.
     dynamic_fields: bool,
+}
+
+impl PartialEq for CellTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data && self.dynamic_fields == other.dynamic_fields
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1395,7 +1487,7 @@ impl<'a> VarIdTyPass<'a> {
             span: self.span(field.span),
             kind: StaticErrorKind::NoFieldOnTy {
                 field: field.name.to_string(),
-                ty,
+                ty: ty.to_string(),
             },
         });
         Ty::Unknown
@@ -1404,13 +1496,19 @@ impl<'a> VarIdTyPass<'a> {
     fn cannot_index<M: AstMetadata>(&mut self, base: &Expr<Substr, M>, ty: Ty) -> Ty {
         self.errors.push(StaticError {
             span: self.span(base.span()),
-            kind: StaticErrorKind::CannotIndex { ty },
+            kind: StaticErrorKind::CannotIndex { ty: ty.to_string() },
         });
         Ty::Unknown
     }
 
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
-        if *a == Ty::Any || *b == Ty::Any {
+        // `Any` satisfies every check by definition. `Unknown` does so for the
+        // opposite reason: it marks an expression that was *already*
+        // diagnosed, and its whole purpose is to suppress checking of
+        // dependent properties. Comparing it structurally instead made every
+        // undeclared name produce a second, spurious `expected .., found ?`.
+        // `Ty::lub` has always treated it this way.
+        if matches!(a, Ty::Any | Ty::Unknown) || matches!(b, Ty::Any | Ty::Unknown) {
             return true;
         }
 
@@ -1447,19 +1545,21 @@ impl<'a> VarIdTyPass<'a> {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
-                    found: found.clone(),
-                    expected: expected.clone(),
+                    found: found.to_string(),
+                    expected: expected.to_string(),
                 },
             });
         }
     }
 
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+        // `Unknown` marks an expression that has already been diagnosed, so
+        // it is accepted here for the same reason `is_eq_ty` accepts it.
+        if !matches!(ty, Ty::Cell(_) | Ty::Any | Ty::Unknown) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.clone(),
+                    found: ty.to_string(),
                     expected: "Cell".into(),
                 },
             });
@@ -1467,11 +1567,11 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Enum(_) | Ty::Any) {
+        if !matches!(ty, Ty::Enum(_) | Ty::Any | Ty::Unknown) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.clone(),
+                    found: ty.to_string(),
                     expected: "Enum".into(),
                 },
             });
@@ -1564,7 +1664,7 @@ impl<'a> VarIdTyPass<'a> {
                 ty => {
                     self.errors.push(StaticError {
                         span: self.span(call_span),
-                        kind: StaticErrorKind::CannotCall(ty),
+                        kind: StaticErrorKind::CannotCall(ty.to_string()),
                     });
                     (None, Ty::Unknown)
                 }
@@ -1805,10 +1905,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .iter()
             .filter_map(|stmt| {
                 if let Statement::LetBinding(lt) = stmt {
-                    if ["x", "y"].contains(&lt.name.name.as_str()) {
+                    if RESERVED_CELL_FIELDS.contains(&lt.name.name.as_str()) {
                         self.errors.push(StaticError {
                             span: self.span(lt.name.span),
-                            kind: StaticErrorKind::RedeclarationOfBuiltin,
+                            kind: StaticErrorKind::ReservedCellField {
+                                name: lt.name.name.to_string(),
+                            },
                         });
                     }
                     Some((lt.name.name.to_string(), lt.value.ty()))
@@ -1829,6 +1931,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let ty = Ty::CellFn(Box::new(CellFnTy {
             args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
             cell: Arc::new(CellTy {
+                name: input.name.name.to_string(),
                 data,
                 dynamic_fields,
             }),
@@ -1992,13 +2095,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
             self.errors.push(StaticError {
                 span: self.span(left.span()),
-                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
+                kind: StaticErrorKind::BinOpInvalidType(left_ty.to_string()),
             });
         }
         if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
             self.errors.push(StaticError {
                 span: self.span(right.span()),
-                kind: StaticErrorKind::BinOpInvalidType(right_ty),
+                kind: StaticErrorKind::BinOpInvalidType(right_ty.to_string()),
             });
         }
         left_ty
@@ -2141,7 +2244,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
             Ty::Inst(ref c) => match field.name.as_str() {
-                "x" | "y" => Ty::Float,
+                name if RESERVED_CELL_FIELDS.contains(&name) => Ty::Float,
                 name => c.data.get(name).cloned().unwrap_or_else(|| {
                     if c.dynamic_fields {
                         Ty::Any
@@ -2150,6 +2253,31 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     }
                 }),
             },
+            // A cell's coordinates are only determined relative to a
+            // placement, so reading its geometry before `inst(...)` is
+            // meaningless -- and the evaluator already refuses it. Saying so
+            // beats the generic no-field error, which used to assert that a
+            // field was missing while printing the map that contained it.
+            Ty::Cell(ref c) => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CellFieldBeforePlacement {
+                        cell: c.name.clone(),
+                        field: field.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            }
+            Ty::CellFn(ref c) => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CellFnFieldAccess {
+                        cell: c.cell.name.clone(),
+                        field: field.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            }
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
@@ -2188,7 +2316,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(field.span),
-                    kind: StaticErrorKind::CannotIndexFieldAccess { ty: base_ty },
+                    kind: StaticErrorKind::CannotIndexFieldAccess {
+                        ty: base_ty.to_string(),
+                    },
                 });
                 Ty::Unknown
             }
@@ -2320,8 +2450,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
-                                    found: tailty,
-                                    expected: seqty.clone(),
+                                    found: tailty.to_string(),
+                                    expected: seqty.to_string(),
                                 },
                             });
                         }
@@ -2351,8 +2481,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                     self.errors.push(StaticError {
                                         span: self.span(arg.span()),
                                         kind: StaticErrorKind::IncorrectTy {
-                                            expected: elem_ty.clone(),
-                                            found: arg_ty,
+                                            expected: elem_ty.to_string(),
+                                            found: arg_ty.to_string(),
                                         },
                                     });
                                     elem_ty = Ty::Unknown;
@@ -2381,7 +2511,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                 self.errors.push(StaticError {
                                     span: self.span(input.span),
                                     kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty,
+                                        found: argty.to_string(),
                                         expected: "Seq".to_string(),
                                     },
                                 });
@@ -2405,7 +2535,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                 self.errors.push(StaticError {
                                     span: self.span(input.span),
                                     kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty,
+                                        found: argty.to_string(),
                                         expected: "Seq".to_string(),
                                     },
                                 });
@@ -2427,7 +2557,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             self.errors.push(StaticError {
                                 span: self.span(input.span),
                                 kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: argty,
+                                    found: argty.to_string(),
                                     expected: "Cell/Inst".to_string(),
                                 },
                             });
@@ -2536,7 +2666,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         ) {
             self.errors.push(StaticError {
                 span: self.span(value.span()),
-                kind: StaticErrorKind::CannotEmit(ty.clone()),
+                kind: StaticErrorKind::CannotEmit(ty.to_string()),
             });
         }
         ty
@@ -2646,7 +2776,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.seq.span()),
-                    kind: StaticErrorKind::CannotIterate { ty: seq_ty },
+                    kind: StaticErrorKind::CannotIterate {
+                        ty: seq_ty.to_string(),
+                    },
                 });
                 Ty::Unknown
             }
@@ -2993,6 +3125,16 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
+    /// Values the *compiler* defaults when nothing else determines them, as
+    /// `(expr = 0, span)`.
+    ///
+    /// Distinct from `fallback_constraints`, which hold author-written initial
+    /// conditions (`x0i=`): those deliberately leave the cell underconstrained
+    /// and say so. A compiler default was never asked for, so it is applied
+    /// before the underconstrained check rather than after it -- otherwise
+    /// giving path extensions their zero default would report every path
+    /// without an extension kwarg as underconstrained.
+    compiler_defaults: Vec<(LinearExpr, Span)>,
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
@@ -3385,7 +3527,7 @@ impl<'a> ExecPass<'a> {
                         span: value.span(),
                     },
                     kind: StaticErrorKind::IncorrectTyCategory {
-                        found: ty,
+                        found: ty.to_string(),
                         expected: "Cell".into(),
                     },
                 }],
@@ -3536,7 +3678,7 @@ impl<'a> ExecPass<'a> {
                 cell: 0,
                 kind: ExecErrorKind::InvalidCellArgumentType {
                     index: index + 1,
-                    expected: decl.metadata.1.clone(),
+                    expected: decl.metadata.1.to_string(),
                     found: arg.ty_name().to_string(),
                 },
             });
@@ -3580,6 +3722,7 @@ impl<'a> ExecPass<'a> {
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
+                        compiler_defaults: Vec::new(),
                         sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
@@ -3681,6 +3824,31 @@ impl<'a> ExecPass<'a> {
             update_var_dependents(state);
 
             if !progress {
+                // A compiler default is not an initial condition: the author
+                // never asked for the value to be free, so it must not make
+                // the cell underconstrained. Applying every applicable one and
+                // re-solving before the check below keeps the diagnostic about
+                // degrees of freedom the author actually introduced.
+                let state = self.cell_state_mut(cell_id);
+                let mut defaults = std::mem::take(&mut state.compiler_defaults);
+                let mut applied = false;
+                defaults.retain(|(constraint, span)| {
+                    let unsolved = constraint
+                        .coeffs
+                        .iter()
+                        .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v));
+                    if unsolved {
+                        let id = state.solver.constrain_eq0(constraint.clone());
+                        state.constraint_span_map.insert(id, span.clone());
+                        applied = true;
+                    }
+                    false
+                });
+                state.compiler_defaults = defaults;
+                if applied {
+                    continue;
+                }
+
                 let underconstrained_spans = {
                     let state = self.cell_state_mut(cell_id);
                     if state.unsolved_vars.is_some() {
@@ -3837,7 +4005,12 @@ impl<'a> ExecPass<'a> {
                 self.errors.push(ExecError {
                     span: None,
                     cell: 0,
-                    kind: ExecErrorKind::InvalidGds(error.to_string()),
+                    // `{:#}` walks the whole `anyhow` chain. `to_string()`
+                    // renders only the outermost context, so a missing file, a
+                    // truncated one, and a malformed record all arrived as the
+                    // same "could not read imported GDS `..`" with the cause
+                    // discarded.
+                    kind: ExecErrorKind::InvalidGds(format!("{error:#}")),
                 });
                 return Err(());
             }
@@ -5209,16 +5382,26 @@ impl<'a> ExecPass<'a> {
                         });
                         let state = self.cell_state_mut(cell_id);
                         let width = state.new_solver_var(&span).into();
-                        let begin_extension = if has_begin_extension {
-                            state.new_solver_var(&span).into()
-                        } else {
-                            LinearExpr::from(0.)
+                        // Extensions are free variables even when no kwarg
+                        // names them, exactly as `width` always is. Making
+                        // them conditional meant `eq(p.begin_extension, 5.)`
+                        // degenerated to `0 - 5 = 0` and reported a bare
+                        // "inconsistent constraint" with nothing to say the
+                        // extension had never become a variable.
+                        //
+                        // The default of zero is a *fallback*, so it applies
+                        // only if nothing else determines the extension: a
+                        // path that ignores extensions still solves to zero,
+                        // and one that constrains them now works.
+                        let extension = |state: &mut CellState, named: bool| {
+                            let var = state.new_solver_var(&span);
+                            if !named {
+                                state.compiler_defaults.push((var.into(), span.clone()));
+                            }
+                            LinearExpr::from(var)
                         };
-                        let end_extension = if has_end_extension {
-                            state.new_solver_var(&span).into()
-                        } else {
-                            LinearExpr::from(0.)
-                        };
+                        let begin_extension = extension(state, has_begin_extension);
+                        let end_extension = extension(state, has_end_extension);
                         let points = (0..count)
                             .map(|_| {
                                 (
@@ -6342,18 +6525,26 @@ impl<'a> ExecPass<'a> {
                                 "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
                                 "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
                                 "layer" => {
-                                    if let Some(layer) = rect.layer.clone() {
-                                        Value::String(layer)
-                                    } else {
+                                    let Some(layer) = rect.layer.clone() else {
+                                        // A construction rect has no layer.
+                                        // Returning a fabricated `""` here
+                                        // used to add a second, unrelated
+                                        // error about the empty-string layer
+                                        // being absent from the technology
+                                        // file; failing the read reports the
+                                        // one thing that actually went wrong.
                                         let span =
                                             self.span(&vref.loc, field_access_expr.expr.span);
                                         self.errors.push(ExecError {
                                             span: Some(span),
                                             cell: cell_id,
-                                            kind: ExecErrorKind::InvalidRotation,
+                                            kind: ExecErrorKind::EmptyField {
+                                                field: "layer".to_string(),
+                                            },
                                         });
-                                        Value::String("".to_string())
-                                    }
+                                        return Err(());
+                                    };
+                                    Value::String(layer)
                                 }
                                 _ => {
                                     let span = self.span(&vref.loc, field_access_expr.expr.span);
@@ -6507,8 +6698,10 @@ impl<'a> ExecPass<'a> {
                                                         field_access_expr.expr.span,
                                                     )),
                                                     cell: cell_id,
-                                                    // TODO: More descriptive error
-                                                    kind: ExecErrorKind::EmptyBbox,
+                                                    kind: ExecErrorKind::NoFieldOnInstance {
+                                                        field: field.to_string(),
+                                                        cell: cell.name.clone(),
+                                                    },
                                                 });
                                                 return Err(());
                                             };

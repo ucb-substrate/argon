@@ -1,8 +1,8 @@
 use std::{ops::Deref, path::Path};
 
 use ::gds::{
-    GdsArrayRef, GdsBoundary, GdsElement, GdsLayerSpec, GdsLibrary, GdsPath, GdsPoint, GdsStrans,
-    GdsStruct, GdsStructRef, GdsTextElem, GdsUnits,
+    GdsArrayRef, GdsBoundary, GdsElement, GdsError, GdsLayerSpec, GdsLibrary, GdsPath, GdsPoint,
+    GdsStrans, GdsStruct, GdsStructRef, GdsTextElem, GdsUnits,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
@@ -228,6 +228,30 @@ fn validate_gds_records(path: &Path) -> Result<()> {
     }
 }
 
+/// Renders a reader failure as a sentence.
+///
+/// `GdsError`'s own `Display` delegates to the derived `Debug`, so an
+/// unexpected end of file surfaces as
+/// `Boxed(Error { kind: UnexpectedEof, message: ".." })`. Unwrapping the
+/// boxed cause and naming the record position is what distinguishes a
+/// truncated file from a malformed one at the point of use.
+fn describe_gds_error(error: GdsError) -> anyhow::Error {
+    match error {
+        GdsError::Boxed(cause) => anyhow!("{cause}"),
+        GdsError::Str(message) => anyhow!("{message}"),
+        GdsError::RecordLen(len) => anyhow!("invalid record length {len}"),
+        GdsError::InvalidDataType(code) => anyhow!("invalid record data type {code}"),
+        GdsError::InvalidRecordType(code) => anyhow!("invalid record type {code}"),
+        GdsError::Parse {
+            msg,
+            recordnum,
+            bytepos,
+            ..
+        } => anyhow!("{msg} (record {recordnum} at byte {bytepos})"),
+        other => anyhow!("{other}"),
+    }
+}
+
 fn import_gds_with_tech(
     path: &Path,
     declared_name: &str,
@@ -236,7 +260,7 @@ fn import_gds_with_tech(
     let map = GdsMap::from_technology(tech);
     validate_gds_records(path)?;
     let library = GdsLibrary::load(path)
-        .map_err(|error| anyhow!("{error}"))
+        .map_err(describe_gds_error)
         .with_context(|| format!("could not read imported GDS `{}`", path.display()))?;
     let names = library
         .structs
@@ -1180,6 +1204,45 @@ mod tests {
         library.save(&path).unwrap();
         check(&path);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_failed_gds_import_names_its_cause() {
+        // The caller rendered this `anyhow::Error` with `to_string()`, which
+        // shows only the outermost context -- so a missing file, a truncated
+        // one, and a malformed one all reached the user as the same
+        // "could not read imported GDS `..`" with the cause dropped.
+        let tech = Technology {
+            dbu: 1e-10,
+            display_unit: 10,
+            grid: 1,
+            style_name: None,
+            layers: Vec::new(),
+            custom_dither_patterns: Vec::new(),
+            custom_line_styles: Vec::new(),
+            pin_layers: IndexMap::new(),
+        };
+        let dir = std::env::temp_dir().join(format!("argon-gds-cause-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let missing = dir.join("missing.gds");
+        let error = import_gds(&missing, "top", &tech).expect_err("a missing file should fail");
+        assert!(format!("{error:#}").contains("No such file"), "{error:#}");
+
+        let truncated = dir.join("truncated.gds");
+        std::fs::write(&truncated, [0u8, 6, 0, 2]).unwrap();
+        let error = import_gds(&truncated, "top", &tech).expect_err("a truncated file should fail");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("could not read imported GDS"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("fill whole buffer"),
+            "the reader's own cause must survive: {rendered}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
