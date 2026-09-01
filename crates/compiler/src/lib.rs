@@ -3267,5 +3267,131 @@ mod tests {
             |error| matches!(error, ExecErrorKind::ZeroRangeStep),
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Boolean operators: `&&`, `||`, and `!`.
+
+    #[test]
+    fn boolean_operators_check_and_evaluate() {
+        assert!(check_source("cell top() { let a = !true && (false || true); }").is_empty());
+
+        // Every condition below must hold. If one does not, the `else` branch
+        // adds a second constraint on `x` that contradicts the first, and the
+        // solve fails -- so a wrong truth value cannot pass silently.
+        for cond in [
+            "true && true",
+            "!(true && false)",
+            "!(false && true)",
+            "!(false && false)",
+            "true || true",
+            "true || false",
+            "false || true",
+            "!(false || false)",
+            "!false",
+            "!!true",
+            "true == true",
+            "true != false",
+            "!(true == false)",
+            // Operands the solver has to resolve first, which is the case the
+            // deferred evaluation path exists for.
+            "p > 2. && p < 4.",
+            "p < 2. || p > 2.5",
+        ] {
+            let source = format!(
+                "cell top() {{
+                     let p = float();
+                     eq(p, 3.);
+                     let q = float();
+                     eq(q, 1.);
+                     if {cond} {{ }} else {{ eq(q, 2.); }};
+                 }}"
+            );
+            assert!(
+                run_source(&source).is_empty(),
+                "`{cond}` should evaluate to true"
+            );
+            // The negation must fail, or the check above proves nothing.
+            let negated = source.replace(&format!("if {cond}"), &format!("if !({cond})"));
+            assert!(
+                !run_source(&negated).is_empty(),
+                "`!({cond})` should evaluate to false"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_short_circuit() {
+        // The right operand is an arbitrary expression that may divide by zero,
+        // create constraints, or emit geometry, so it must not be evaluated
+        // when the left operand already decides the result -- the same reason
+        // `if` defers its branches.
+        assert!(run_source("cell top() { let a = false && (1 / 0 == 1); }").is_empty());
+        assert!(run_source("cell top() { let a = true || (1 / 0 == 1); }").is_empty());
+        assert_reports(
+            &run_source("cell top() { let a = true && (1 / 0 == 1); }"),
+            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
+        );
+        assert_reports(
+            &run_source("cell top() { let a = false || (1 / 0 == 1); }"),
+            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
+        );
+
+        // A short-circuited operand emits no geometry either.
+        let emits = "(rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!.x1 > 0.)";
+        for (cond, drawn) in [
+            (format!("false && {emits}"), 0),
+            (format!("true && {emits}"), 1),
+            (format!("true || {emits}"), 0),
+            (format!("false || {emits}"), 1),
+        ] {
+            let data = compile_top(&format!("cell top() {{ let a = {cond}; }}"));
+            assert_eq!(
+                layout_objects(&data, data.top).len(),
+                drawn,
+                "`{cond}` should emit {drawn} shape(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_reject_non_bool_operands() {
+        // `!` used to parse and then report `unimplemented`; `&&` and `||` did
+        // not lex at all.
+        for source in [
+            "cell top() { let a = 1 && true; }",
+            "cell top() { let a = true && 1; }",
+            "cell top() { let a = true || 2.; }",
+            "cell top() { let a = !1; }",
+            "cell top() { let a = !\"s\"; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BoolOpInvalidType)),
+                "{source}: {errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn booleans_compare_for_equality_only() {
+        // `Ty::Bool` was missing from the comparison whitelist, so even
+        // `true == false` was rejected.
+        assert!(check_source("cell top() { let a = true == false; }").is_empty());
+        assert!(check_source("cell top() { let a = true != false; }").is_empty());
+        for source in [
+            "cell top() { let a = true < false; }",
+            "cell top() { let a = true >= false; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BoolNotOrd)),
+                "{source}: {errors:#?}"
+            );
+        }
+    }
 }
 pub mod cli;

@@ -215,6 +215,15 @@ pub enum UnaryOp {
     Neg,
 }
 
+/// A short-circuiting boolean connective. Kept separate from [`BinOp`] because
+/// it evaluates its right operand conditionally and always yields `Bool`,
+/// whereas every [`BinOp`] is arithmetic, eager, and numeric-typed.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BoolOp {
+    And,
+    Or,
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOp {
     Eq,
@@ -230,6 +239,7 @@ pub enum Expr<S, T: AstMetadata> {
     If(Box<IfExpr<S, T>>),
     Match(Box<MatchExpr<S, T>>),
     Comparison(Box<ComparisonExpr<S, T>>),
+    BoolOp(Box<BoolOpExpr<S, T>>),
     BinOp(Box<BinOpExpr<S, T>>),
     UnaryOp(Box<UnaryOpExpr<S, T>>),
     Call(CallExpr<S, T>),
@@ -290,6 +300,20 @@ pub struct UnaryOpExpr<S, T: AstMetadata> {
     pub operand: Expr<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::UnaryOpExpr,
+}
+
+/// `left && right` or `left || right`.
+///
+/// `right` is only evaluated when `left` does not already decide the result,
+/// so it is stored unevaluated and visited lazily (see the evaluator's
+/// `BoolOpState`).
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct BoolOpExpr<S, T: AstMetadata> {
+    pub op: BoolOp,
+    pub left: Expr<S, T>,
+    pub right: Expr<S, T>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::BoolOpExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -386,6 +410,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::If(x) => x.span,
             Self::Match(x) => x.span,
             Self::Comparison(x) => x.span,
+            Self::BoolOp(x) => x.span,
             Self::BinOp(x) => x.span,
             Self::UnaryOp(x) => x.span,
             Self::Call(x) => x.span,
@@ -422,6 +447,7 @@ pub trait AstMetadata {
     type MatchExpr: Debug + Clone + Serialize + DeserializeOwned;
     type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type BoolOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
     type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IndexFieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -516,6 +542,12 @@ pub trait AstTransformer {
         input: &UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         operand: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr;
+    fn dispatch_bool_op_expr(
+        &mut self,
+        input: &BoolOpExpr<Self::InputS, Self::InputMetadata>,
+        left: &Expr<Self::OutputS, Self::OutputMetadata>,
+        right: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr;
     fn dispatch_comparison_expr(
         &mut self,
         input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
@@ -857,6 +889,21 @@ pub trait AstTransformer {
             operand,
         }
     }
+    fn transform_bool_op_expr(
+        &mut self,
+        input: &BoolOpExpr<Self::InputS, Self::InputMetadata>,
+    ) -> BoolOpExpr<Self::OutputS, Self::OutputMetadata> {
+        let left = self.transform_expr(&input.left);
+        let right = self.transform_expr(&input.right);
+        let metadata = self.dispatch_bool_op_expr(input, &left, &right);
+        BoolOpExpr {
+            op: input.op,
+            span: input.span,
+            metadata,
+            left,
+            right,
+        }
+    }
     fn transform_comparison_expr(
         &mut self,
         input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
@@ -1080,6 +1127,9 @@ pub trait AstTransformer {
             }
             Expr::UnaryOp(unary_op_expr) => {
                 Expr::UnaryOp(Box::new(self.transform_unary_op_expr(unary_op_expr)))
+            }
+            Expr::BoolOp(bool_op_expr) => {
+                Expr::BoolOp(Box::new(self.transform_bool_op_expr(bool_op_expr)))
             }
             Expr::Comparison(comparison_expr) => {
                 Expr::Comparison(Box::new(self.transform_comparison_expr(comparison_expr)))

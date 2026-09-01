@@ -211,6 +211,15 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_bool_op_expr(
+        &mut self,
+        input: &super::BoolOpExpr<Self::InputS, Self::InputMetadata>,
+        _left: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+        _right: &super::Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr {
+        input.metadata.clone()
+    }
+
     fn dispatch_comparison_expr(
         &mut self,
         input: &super::ComparisonExpr<Self::InputS, Self::InputMetadata>,

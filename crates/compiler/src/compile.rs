@@ -35,8 +35,8 @@ use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
-        ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
-        Decl, Expr, Ident, IfExpr, LetBinding, Statement,
+        ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, BoolOp, BoolOpExpr, CallExpr,
+        CellDecl, ComparisonExpr, Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
     solver::{LinearExpr, Solver},
@@ -556,6 +556,14 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &crate::ast::UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         _operand: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
+    }
+
+    fn dispatch_bool_op_expr(
+        &mut self,
+        _input: &BoolOpExpr<Self::InputS, Self::InputMetadata>,
+        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
+        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr {
     }
 
     fn dispatch_comparison_expr(
@@ -1134,6 +1142,7 @@ impl AstMetadata for VarIdTyMetadata {
     type MatchExpr = Ty;
     type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
+    type BoolOpExpr = Ty;
     type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
     type IndexFieldAccessExpr = Ty;
@@ -1409,6 +1418,15 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Unknown
     }
 
+    /// Whether `ty` may be an operand of `&&`, `||`, or `!`.
+    ///
+    /// `Any` is accepted and re-checked by the evaluator, as it is for every
+    /// other operator; `Unknown` already marks an error reported elsewhere, so
+    /// accepting it keeps one mistake from producing a second diagnostic.
+    fn is_bool_operand(ty: &Ty) -> bool {
+        matches!(ty, Ty::Bool | Ty::Any | Ty::Unknown)
+    }
+
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
         if *a == Ty::Any || *b == Ty::Any {
             return true;
@@ -1591,6 +1609,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::If(if_expr) => if_expr.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
             Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
+            Expr::BoolOp(bool_op_expr) => bool_op_expr.metadata.clone(),
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
@@ -2011,10 +2030,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::Unimplemented,
-                });
+                let operand_ty = operand.ty();
+                if !VarIdTyPass::is_bool_operand(&operand_ty) {
+                    self.errors.push(StaticError {
+                        span: self.span(operand.span()),
+                        kind: StaticErrorKind::BoolOpInvalidType,
+                    });
+                }
                 Ty::Bool
             }
             UnaryOp::Neg => {
@@ -2028,6 +2050,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 operand_ty
             }
         }
+    }
+
+    /// `&&` and `||` take two `Bool` operands and produce a `Bool`.
+    ///
+    /// The result type is `Bool` regardless of the operands, so one bad operand
+    /// does not cascade into every expression built on top of it.
+    fn dispatch_bool_op_expr(
+        &mut self,
+        _input: &BoolOpExpr<Substr, Self::InputMetadata>,
+        left: &Expr<Substr, Self::OutputMetadata>,
+        right: &Expr<Substr, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::BoolOpExpr {
+        for operand in [left, right] {
+            if !VarIdTyPass::is_bool_operand(&operand.ty()) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::BoolOpInvalidType,
+                });
+            }
+        }
+        Ty::Bool
     }
 
     fn dispatch_comparison_expr(
@@ -2059,6 +2102,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::EnumsNotOrd,
+            });
+        }
+        if left_ty == Ty::Bool && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::BoolNotOrd,
             });
         }
         if matches!(left_ty, Ty::Nil)
@@ -2094,7 +2143,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
             if !matches!(
                 ty,
-                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
+                Ty::Float | Ty::Int | Ty::Bool | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
             ) {
                 self.errors.push(StaticError {
                     span: self.span(operand.span()),
@@ -4694,6 +4743,20 @@ impl<'a> ExecPass<'a> {
                     state: MatchExprState::Scrutinee(scrutinee),
                 }))
             }),
+            // `&&` and `||` short-circuit, so only the left operand is visited
+            // here. The right operand is an arbitrary expression that may
+            // create constraints, instantiate cells, or emit geometry, so it
+            // must not be evaluated when the left operand already decides the
+            // result -- the same reason `if` defers its branches.
+            Expr::BoolOp(b) => {
+                let left = self.visit_expr(loc, &b.left);
+                self.new_deferred_value(loc, |_| {
+                    PartialEvalState::BoolOp(Box::new(PartialBoolOpExpr {
+                        expr: (**b).clone(),
+                        state: BoolOpState::Left(left),
+                    }))
+                })
+            }
             Expr::Comparison(comparison_expr) => self.new_deferred_value(loc, |this| {
                 let left = this.visit_expr(loc, &comparison_expr.left);
                 let right = this.visit_expr(loc, &comparison_expr.right);
@@ -6122,6 +6185,18 @@ impl<'a> ExecPass<'a> {
                                 .insert(vid, DeferValue::Ready(Value::Linear(res)));
                             true
                         }
+                        Value::Bool(v) => {
+                            let res = match unary_op.op {
+                                UnaryOp::Not => !*v,
+                                UnaryOp::Neg => {
+                                    let span = self.span(&vref.loc, unary_op.expr.span);
+                                    self.invalid_type(cell_id, &span);
+                                    return Err(());
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                            true
+                        }
                         Value::Int(v) => {
                             let res = match unary_op.op {
                                 // `-i64::MIN` has no `Int` representation.
@@ -6263,6 +6338,55 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
+            PartialEvalState::BoolOp(bool_op) => match bool_op.state {
+                BoolOpState::Left(left) => {
+                    if let Defer::Ready(val) = &self.values[&left] {
+                        // An operand typed `Any` was never proven to be a bool.
+                        let Some(left_val) = val.get_bool().copied() else {
+                            let span = self.span(&vref.loc, bool_op.expr.left.span());
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        let decided = match bool_op.expr.op {
+                            BoolOp::And => !left_val,
+                            BoolOp::Or => left_val,
+                        };
+                        if decided {
+                            // `false && _` is `false` and `true || _` is `true`:
+                            // the result is the left operand itself, and the
+                            // right operand is never visited -- so nothing it
+                            // would have built is built.
+                            self.values
+                                .insert(vid, DeferValue::Ready(Value::Bool(left_val)));
+                        } else {
+                            let right = self.visit_expr(vref.loc, &bool_op.expr.right);
+                            bool_op.state = BoolOpState::Right(right);
+                            self.values.insert(vid, Defer::Deferred(vref));
+                            self.cell_state_mut(cell_id).deferred.insert(vid);
+                        }
+                        true
+                    } else {
+                        self.add_value_dependent(left, vid);
+                        false
+                    }
+                }
+                BoolOpState::Right(right) => {
+                    if let Defer::Ready(val) = &self.values[&right] {
+                        // The result is the right operand's value, so it has to
+                        // be a bool as well.
+                        let Some(res) = val.get_bool().copied() else {
+                            let span = self.span(&vref.loc, bool_op.expr.right.span());
+                            self.invalid_type(cell_id, &span);
+                            return Err(());
+                        };
+                        self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                        true
+                    } else {
+                        self.add_value_dependent(right, vid);
+                        false
+                    }
+                }
+            },
             PartialEvalState::Comparison(comparison_expr) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) = (
                     &self.values[&comparison_expr.state.left],
@@ -6309,6 +6433,7 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                         (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
+                        (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
                         (Value::EnumValue(vl), Value::EnumValue(vr)) => equality(vl == vr),
                         (Value::Nil, Value::Nil) => equality(true),
                         (Value::SeqNil, Value::SeqNil) => equality(true),
@@ -7443,6 +7568,7 @@ enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
     Match(Box<PartialMatchExpr<T>>),
     Comparison(Box<PartialComparisonExpr<T>>),
+    BoolOp(Box<PartialBoolOpExpr<T>>),
     BinOp(PartialBinOp<T>),
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
@@ -7521,6 +7647,21 @@ struct PartialCallExpr<T: AstMetadata> {
 pub struct CallExprState {
     posargs: Vec<ValueId>,
     kwargs: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone)]
+struct PartialBoolOpExpr<T: AstMetadata> {
+    expr: BoolOpExpr<Substr, T>,
+    state: BoolOpState,
+}
+
+/// Where a `&&`/`||` has got to. `Left` is waiting on the left operand; `Right`
+/// means the left operand did not decide the result, so the right operand has
+/// been visited and is being waited on.
+#[derive(Debug, Clone)]
+pub enum BoolOpState {
+    Left(ValueId),
+    Right(ValueId),
 }
 
 #[derive(Debug, Clone)]

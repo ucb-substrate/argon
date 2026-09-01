@@ -139,7 +139,7 @@ is irrelevant for Argon.)
 - **Keywords** — `enum struct match const cell mod if fn else let for in as
   true false` (15 of them).
 - **Names & literals** — `Ident`, `IntLit`, `StrLit`.
-- **Multi-character operators** — `:: => == != >= <= ->`.
+- **Multi-character operators** — `:: => == != >= <= -> && ||`.
 - **Single-character operators / punctuation** — `< > = ! + - * / % ( ) { } [ ]
   . : ; ,`.
 - **`Eof`** — the empty range `[len, len)`.
@@ -211,7 +211,9 @@ Notes on individual rules:
   closing quote produces an `Error` token spanning what was consumed.
 - **`lex_operator`** uses **maximal munch**: two-character operators are matched
   before their one-character prefixes (`::` before `:`, `==`/`=>` before `=`,
-  `->` before `-`, etc.).
+  `->` before `-`, etc.). `&&` and `||` are the exception with no one-character
+  form: Argon has no bitwise operators, so a lone `&` or `|` is an `Error`
+  token like any other unrecognized byte.
 
 ### Error tokens and UTF-8
 
@@ -434,7 +436,7 @@ fn parse_expr(&mut self, min_bp: u8) -> Expr {
             lhs = self.parse_suffix(lhs, lhs_start);
             continue;
         }
-        // infix binary / comparison
+        // infix binary / comparison / boolean
         if let Some((op, l_bp, r_bp)) = infix_op(k) {
             if l_bp < min_bp { break; }
             self.bump();
@@ -455,21 +457,30 @@ point. A top-level call passes `min_bp == 0` (anything binds).
 
 `infix_op(kind)` is the single source of truth for the infix operator set: it
 returns `(InfixOp, left_bp, right_bp)` or `None`. The `InfixOp` carries the AST
-operator identity (`Bin(BinOp)` or `Cmp(ComparisonOp)`) alongside its
-precedence, so the two cannot drift apart.
+operator identity (`Bin(BinOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`)
+alongside its precedence, so the two cannot drift apart.
 
 | Operators                         | (left, right) | Notes |
 |-----------------------------------|---------------|-------|
-| `== != >= > <= <`  (comparison)   | `(1, 2)`      | lowest |
-| `+ -`  (additive)                 | `(3, 4)`      | |
-| `* / %`  (multiplicative)         | `(5, 6)`      | |
-| suffix cluster `. [] ! as`        | `SUFFIX_BP = 7` | tighter than any binary op |
-| prefix unary operand `! -`        | `PREFIX_BP = 9` | see §9.4 |
+| `\|\|`  (logical or)              | `(1, 2)`      | lowest |
+| `&&`  (logical and)               | `(3, 4)`      | |
+| `== != >= > <= <`  (comparison)   | `(5, 6)`      | |
+| `+ -`  (additive)                 | `(7, 8)`      | |
+| `* / %`  (multiplicative)         | `(9, 10)`     | |
+| suffix cluster `. [] ! as`        | `SUFFIX_BP = 11` | tighter than any binary op |
+| prefix unary operand `! -`        | `PREFIX_BP = 13` | see §9.4 |
+
+The boolean connectives sit below the comparisons so `a < b && c < d` reads as
+`(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust. Unlike
+the other infix operators they **short-circuit**: `&&` and `||` build a
+`BoolOpExpr`, whose right operand the evaluator visits only when the left one
+does not decide the result. Since an Argon expression can emit geometry and add
+constraints, that determines what gets built, not just how fast it runs.
 
 Because each operator's right binding power is one greater than its left, all
 binary operators are **left-associative**: `a - b - c` parses as `(a - b) - c`
-(when the loop returns from parsing `b` at `r_bp = 4`, the next `-` has
-`l_bp = 3 < 4`, so it does not bind to the right and instead folds at the outer
+(when the loop returns from parsing `b` at `r_bp = 8`, the next `-` has
+`l_bp = 7 < 8`, so it does not bind to the right and instead folds at the outer
 level).
 
 ### 9.2 Prefixes, primaries, and suffixes
@@ -531,7 +542,7 @@ excludes the `(`; but ANTLR (and the rest of the compiler) expects the enclosing
 operator to span from the `(`. Using the lexical start of the first token gets
 this right.
 
-A consequence of `PREFIX_BP (9) > SUFFIX_BP (7)` is that a prefix operator's
+A consequence of `PREFIX_BP (13) > SUFFIX_BP (11)` is that a prefix operator's
 operand is a bare primary — suffixes do **not** bind inside it. So `-a.b` parses
 as `(-a).b` (`FieldAccess(Neg(a), b)`), and `-a!` as `(-a)!`. The suffix cluster
 binds tighter than the binary operators, but a prefix operator grabs only its

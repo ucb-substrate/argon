@@ -10,19 +10,21 @@
 //! (validated against the generated `expr_rec`/`precpred`): prefix unary binds
 //! tightest for its operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`,
 //! `as`) binds tighter than the binary operators; `* / %` > `+ -` > comparisons;
-//! all binary operators are left-associative.
+//! all binary operators are left-associative. The boolean connectives postdate
+//! that reference grammar and sit below the comparisons, as in Rust:
+//! comparisons > `&&` > `||`.
 
 use std::str::FromStr;
 
 use cfgrammar::Span;
 
 use crate::ast::{
-    ArgDecl, Args, Ast, BinOp, BinOpExpr, BoolLiteral, CallExpr, CastExpr, CellDecl,
-    ComparisonExpr, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr, FieldAccessExpr,
-    FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
-    IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
-    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
-    TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    ArgDecl, Args, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, BoolOpExpr, CallExpr, CastExpr,
+    CellDecl, ComparisonExpr, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr,
+    FieldAccessExpr, FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr,
+    IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl,
+    NilLiteral, Scope, SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr,
+    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -34,11 +36,11 @@ use super::token::{Token, TokenKind};
 type Md = ParseMetadata;
 
 // Binding powers for the Pratt loop. Higher binds tighter. The numbers only
-// need to preserve the ANTLR ordering; the absolute values are arbitrary.
-//   comparisons: 1/2   additive: 3/4   multiplicative: 5/6
-//   suffix cluster: 7   prefix unary operand: 9
-const SUFFIX_BP: u8 = 7;
-const PREFIX_BP: u8 = 9;
+// need to preserve the ordering; the absolute values are arbitrary.
+//   `||`: 1/2   `&&`: 3/4   comparisons: 5/6   additive: 7/8
+//   multiplicative: 9/10   suffix cluster: 11   prefix unary operand: 13
+const SUFFIX_BP: u8 = 11;
+const PREFIX_BP: u8 = 13;
 
 /// Recursion-depth guard for pathological nesting (real programs are shallow).
 const MAX_DEPTH: u32 = 256;
@@ -49,6 +51,7 @@ const MAX_DEPTH: u32 = 256;
 enum InfixOp {
     Bin(BinOp),
     Cmp(ComparisonOp),
+    Bool(BoolOp),
 }
 
 /// The infix operator a token denotes plus its left/right binding power, or
@@ -58,17 +61,19 @@ enum InfixOp {
 fn infix_op(k: TokenKind) -> Option<(InfixOp, u8, u8)> {
     use TokenKind::*;
     Some(match k {
-        EqEq => (InfixOp::Cmp(ComparisonOp::Eq), 1, 2),
-        Neq => (InfixOp::Cmp(ComparisonOp::Ne), 1, 2),
-        Geq => (InfixOp::Cmp(ComparisonOp::Geq), 1, 2),
-        Gt => (InfixOp::Cmp(ComparisonOp::Gt), 1, 2),
-        Leq => (InfixOp::Cmp(ComparisonOp::Leq), 1, 2),
-        Lt => (InfixOp::Cmp(ComparisonOp::Lt), 1, 2),
-        Plus => (InfixOp::Bin(BinOp::Add), 3, 4),
-        Minus => (InfixOp::Bin(BinOp::Sub), 3, 4),
-        Star => (InfixOp::Bin(BinOp::Mul), 5, 6),
-        Slash => (InfixOp::Bin(BinOp::Div), 5, 6),
-        Percent => (InfixOp::Bin(BinOp::Rem), 5, 6),
+        PipePipe => (InfixOp::Bool(BoolOp::Or), 1, 2),
+        AmpAmp => (InfixOp::Bool(BoolOp::And), 3, 4),
+        EqEq => (InfixOp::Cmp(ComparisonOp::Eq), 5, 6),
+        Neq => (InfixOp::Cmp(ComparisonOp::Ne), 5, 6),
+        Geq => (InfixOp::Cmp(ComparisonOp::Geq), 5, 6),
+        Gt => (InfixOp::Cmp(ComparisonOp::Gt), 5, 6),
+        Leq => (InfixOp::Cmp(ComparisonOp::Leq), 5, 6),
+        Lt => (InfixOp::Cmp(ComparisonOp::Lt), 5, 6),
+        Plus => (InfixOp::Bin(BinOp::Add), 7, 8),
+        Minus => (InfixOp::Bin(BinOp::Sub), 7, 8),
+        Star => (InfixOp::Bin(BinOp::Mul), 9, 10),
+        Slash => (InfixOp::Bin(BinOp::Div), 9, 10),
+        Percent => (InfixOp::Bin(BinOp::Rem), 9, 10),
         _ => return None,
     })
 }
@@ -903,6 +908,13 @@ impl<'a> Parser<'a> {
                 metadata: (),
             })),
             InfixOp::Cmp(op) => Expr::Comparison(Box::new(ComparisonExpr {
+                op,
+                left,
+                right,
+                span,
+                metadata: (),
+            })),
+            InfixOp::Bool(op) => Expr::BoolOp(Box::new(BoolOpExpr {
                 op,
                 left,
                 right,

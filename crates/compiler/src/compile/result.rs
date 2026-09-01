@@ -57,6 +57,9 @@ pub enum StaticErrorKind {
     /// Enum values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on enum values")]
     EnumsNotOrd,
+    /// Boolean values cannot be ordered.
+    #[error("cannot perform greater/less than comparisons on booleans")]
+    BoolNotOrd,
     /// Nil values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
@@ -72,6 +75,9 @@ pub enum StaticErrorKind {
     /// A type cannot be used in a unary operation.
     #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,
+    /// A type cannot be used as an operand of `&&`, `||`, or `!`.
+    #[error("type cannot be used in a boolean expression; `&&`, `||`, and `!` require Bool")]
+    BoolOpInvalidType,
     /// A type cannot be used in a comparison expression.
     #[error("type cannot be used in comparison expression")]
     ComparisonInvalidType,
