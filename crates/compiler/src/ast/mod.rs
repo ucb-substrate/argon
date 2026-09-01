@@ -200,7 +200,7 @@ pub struct ForLoop<S, T: AstMetadata> {
     pub span: cfgrammar::Span,
 }
 
-/// An eager, numeric-typed arithmetic operator.
+/// A numeric arithmetic operation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ArithOp {
     Add,
@@ -216,13 +216,14 @@ pub enum UnaryOp {
     Neg,
 }
 
-/// A short-circuiting boolean connective.
+/// A boolean operation (short-circuiting).
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BoolOp {
     And,
     Or,
 }
 
+/// A comparison operation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOp {
     Eq,
@@ -233,22 +234,11 @@ pub enum ComparisonOp {
     Lt,
 }
 
-/// Every infix operator, grouped by the rule that governs it.
-///
-/// The three families are one AST node ([`BinaryExpr`]) because they have the
-/// same shape -- an operator and two operand expressions -- and so share every
-/// tree walk. They stay distinct *variants* because nothing downstream of the
-/// walk treats them alike: each family has its own result type (operand LUB,
-/// `Bool`, `Bool`), its own operand rule, and, for [`BinaryOp::Bool`], its own
-/// evaluation strategy. Matching on this enum is what makes those differences
-/// explicit rather than hiding them behind a flag.
+/// A binary operation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BinaryOp {
-    /// `+ - * / %` -- eager, operands and result numeric.
+pub enum BinOp {
     Arith(ArithOp),
-    /// `== != >= > <= <` -- eager, result `Bool`.
     Cmp(ComparisonOp),
-    /// `&& ||` -- short-circuiting, operands and result `Bool`.
     Bool(BoolOp),
 }
 
@@ -256,7 +246,7 @@ pub enum BinaryOp {
 pub enum Expr<S, T: AstMetadata> {
     If(Box<IfExpr<S, T>>),
     Match(Box<MatchExpr<S, T>>),
-    Binary(Box<BinaryExpr<S, T>>),
+    BinOp(Box<BinOpExpr<S, T>>),
     UnaryOp(Box<UnaryOpExpr<S, T>>),
     Call(CallExpr<S, T>),
     Emit(Box<EmitExpr<S, T>>),
@@ -301,18 +291,14 @@ pub struct MatchArm<S, T: AstMetadata> {
     pub span: cfgrammar::Span,
 }
 
-/// `left <op> right`, for every infix operator.
-///
-/// `right` is a plain sub-expression, not a pre-evaluated value: a
-/// [`BinaryOp::Bool`] operator only evaluates it when `left` does not already
-/// decide the result (see the evaluator's `BoolOpState`).
+/// A binary operation expression.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
-pub struct BinaryExpr<S, T: AstMetadata> {
-    pub op: BinaryOp,
+pub struct BinOpExpr<S, T: AstMetadata> {
+    pub op: BinOp,
     pub left: Expr<S, T>,
     pub right: Expr<S, T>,
     pub span: cfgrammar::Span,
-    pub metadata: T::BinaryExpr,
+    pub metadata: T::BinOpExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -407,7 +393,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
         match self {
             Self::If(x) => x.span,
             Self::Match(x) => x.span,
-            Self::Binary(x) => x.span,
+            Self::BinOp(x) => x.span,
             Self::UnaryOp(x) => x.span,
             Self::Call(x) => x.span,
             Self::Emit(x) => x.span,
@@ -441,7 +427,7 @@ pub trait AstMetadata {
     type ForLoop: Debug + Clone + Serialize + DeserializeOwned;
     type IfExpr: Debug + Clone + Serialize + DeserializeOwned;
     type MatchExpr: Debug + Clone + Serialize + DeserializeOwned;
-    type BinaryExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IndexFieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -525,12 +511,12 @@ pub trait AstTransformer {
         scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
         arms: &[MatchArm<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr;
-    fn dispatch_binary_expr(
+    fn dispatch_bin_op_expr(
         &mut self,
-        input: &BinaryExpr<Self::InputS, Self::InputMetadata>,
+        input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
         left: &Expr<Self::OutputS, Self::OutputMetadata>,
         right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr;
+    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr;
     fn dispatch_unary_op_expr(
         &mut self,
         input: &UnaryOpExpr<Self::InputS, Self::InputMetadata>,
@@ -844,14 +830,14 @@ pub trait AstTransformer {
             metadata,
         }
     }
-    fn transform_binary_expr(
+    fn transform_bin_op_expr(
         &mut self,
-        input: &BinaryExpr<Self::InputS, Self::InputMetadata>,
-    ) -> BinaryExpr<Self::OutputS, Self::OutputMetadata> {
+        input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
+    ) -> BinOpExpr<Self::OutputS, Self::OutputMetadata> {
         let left = self.transform_expr(&input.left);
         let right = self.transform_expr(&input.right);
-        let metadata = self.dispatch_binary_expr(input, &left, &right);
-        BinaryExpr {
+        let metadata = self.dispatch_bin_op_expr(input, &left, &right);
+        BinOpExpr {
             op: input.op,
             span: input.span,
             metadata,
@@ -1079,8 +1065,8 @@ pub trait AstTransformer {
             Expr::UnaryOp(unary_op_expr) => {
                 Expr::UnaryOp(Box::new(self.transform_unary_op_expr(unary_op_expr)))
             }
-            Expr::Binary(binary_expr) => {
-                Expr::Binary(Box::new(self.transform_binary_expr(binary_expr)))
+            Expr::BinOp(bin_op_expr) => {
+                Expr::BinOp(Box::new(self.transform_bin_op_expr(bin_op_expr)))
             }
             Expr::Call(call_expr) => Expr::Call(self.transform_call_expr(call_expr)),
             Expr::Emit(emit_expr) => Expr::Emit(Box::new(self.transform_emit_expr(emit_expr))),

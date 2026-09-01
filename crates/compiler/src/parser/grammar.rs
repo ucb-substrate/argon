@@ -19,7 +19,7 @@ use std::str::FromStr;
 use cfgrammar::Span;
 
 use crate::ast::{
-    ArgDecl, Args, ArithOp, Ast, BinaryExpr, BinaryOp, BoolLiteral, BoolOp, CallExpr, CastExpr,
+    ArgDecl, Args, ArithOp, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, CallExpr, CastExpr,
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr, FieldAccessExpr,
     FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
     IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
@@ -49,22 +49,22 @@ const MAX_DEPTH: u32 = 256;
 /// `None` if the token is not an infix operator. Single source of truth for the
 /// infix set: precedence and the AST op are defined together so they can't drift.
 #[inline]
-fn infix_op(k: TokenKind) -> Option<(BinaryOp, u8, u8)> {
+fn infix_op(k: TokenKind) -> Option<(BinOp, u8, u8)> {
     use TokenKind::*;
     Some(match k {
-        PipePipe => (BinaryOp::Bool(BoolOp::Or), 1, 2),
-        AmpAmp => (BinaryOp::Bool(BoolOp::And), 3, 4),
-        EqEq => (BinaryOp::Cmp(ComparisonOp::Eq), 5, 6),
-        Neq => (BinaryOp::Cmp(ComparisonOp::Ne), 5, 6),
-        Geq => (BinaryOp::Cmp(ComparisonOp::Geq), 5, 6),
-        Gt => (BinaryOp::Cmp(ComparisonOp::Gt), 5, 6),
-        Leq => (BinaryOp::Cmp(ComparisonOp::Leq), 5, 6),
-        Lt => (BinaryOp::Cmp(ComparisonOp::Lt), 5, 6),
-        Plus => (BinaryOp::Arith(ArithOp::Add), 7, 8),
-        Minus => (BinaryOp::Arith(ArithOp::Sub), 7, 8),
-        Star => (BinaryOp::Arith(ArithOp::Mul), 9, 10),
-        Slash => (BinaryOp::Arith(ArithOp::Div), 9, 10),
-        Percent => (BinaryOp::Arith(ArithOp::Rem), 9, 10),
+        PipePipe => (BinOp::Bool(BoolOp::Or), 1, 2),
+        AmpAmp => (BinOp::Bool(BoolOp::And), 3, 4),
+        EqEq => (BinOp::Cmp(ComparisonOp::Eq), 5, 6),
+        Neq => (BinOp::Cmp(ComparisonOp::Ne), 5, 6),
+        Geq => (BinOp::Cmp(ComparisonOp::Geq), 5, 6),
+        Gt => (BinOp::Cmp(ComparisonOp::Gt), 5, 6),
+        Leq => (BinOp::Cmp(ComparisonOp::Leq), 5, 6),
+        Lt => (BinOp::Cmp(ComparisonOp::Lt), 5, 6),
+        Plus => (BinOp::Arith(ArithOp::Add), 7, 8),
+        Minus => (BinOp::Arith(ArithOp::Sub), 7, 8),
+        Star => (BinOp::Arith(ArithOp::Mul), 9, 10),
+        Slash => (BinOp::Arith(ArithOp::Div), 9, 10),
+        Percent => (BinOp::Arith(ArithOp::Rem), 9, 10),
         _ => return None,
     })
 }
@@ -884,12 +884,12 @@ impl<'a> Parser<'a> {
 
     fn make_infix(
         &self,
-        op: BinaryOp,
+        op: BinOp,
         left: Expr<&'a str, Md>,
         right: Expr<&'a str, Md>,
         lhs_start: u32,
     ) -> Expr<&'a str, Md> {
-        Expr::Binary(Box::new(BinaryExpr {
+        Expr::BinOp(Box::new(BinOpExpr {
             op,
             left,
             right,

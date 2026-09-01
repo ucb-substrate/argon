@@ -35,8 +35,8 @@ use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
-        ArgDecl, Ast, AstMetadata, AstTransformer, BinaryExpr, BinaryOp, BoolOp, CallExpr,
-        CellDecl, Decl, Expr, Ident, IfExpr, LetBinding, Statement,
+        ArgDecl, Ast, AstMetadata, AstTransformer, BinOp, BinOpExpr, BoolOp, CallExpr, CellDecl,
+        Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
     parse::ParseMetadata,
     solver::{LinearExpr, Solver},
@@ -543,12 +543,12 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
     }
 
-    fn dispatch_binary_expr(
+    fn dispatch_bin_op_expr(
         &mut self,
-        _input: &BinaryExpr<Self::InputS, Self::InputMetadata>,
+        _input: &BinOpExpr<Self::InputS, Self::InputMetadata>,
         _left: &Expr<Self::OutputS, Self::OutputMetadata>,
         _right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr {
+    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
     }
 
     fn dispatch_unary_op_expr(
@@ -1124,7 +1124,7 @@ impl AstMetadata for VarIdTyMetadata {
     type FnDecl = (PathBuf, VarId);
     type IfExpr = Ty;
     type MatchExpr = Ty;
-    type BinaryExpr = Ty;
+    type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
     type FieldAccessExpr = Ty;
     type IndexFieldAccessExpr = Ty;
@@ -1414,19 +1414,19 @@ impl<'a> VarIdTyPass<'a> {
         if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
             self.errors.push(StaticError {
                 span: self.span(span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
+                kind: StaticErrorKind::ArithMismatchedTypes,
             });
         }
         if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
             self.errors.push(StaticError {
                 span: self.span(left.span()),
-                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
+                kind: StaticErrorKind::ArithInvalidType(left_ty.clone()),
             });
         }
         if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
             self.errors.push(StaticError {
                 span: self.span(right.span()),
-                kind: StaticErrorKind::BinOpInvalidType(right_ty),
+                kind: StaticErrorKind::ArithInvalidType(right_ty),
             });
         }
         left_ty
@@ -1725,7 +1725,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
-            Expr::Binary(binary_expr) => binary_expr.metadata.clone(),
+            Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
             Expr::IdentPath(path) => path.metadata.1.clone(),
@@ -2111,17 +2111,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     /// One tree walk, three rules: the families share the node shape but agree
     /// on nothing after that, so each keeps its own result type and operand
-    /// check (see [`BinaryOp`]).
-    fn dispatch_binary_expr(
+    /// check (see [`BinOp`]).
+    fn dispatch_bin_op_expr(
         &mut self,
-        input: &BinaryExpr<Substr, Self::InputMetadata>,
+        input: &BinOpExpr<Substr, Self::InputMetadata>,
         left: &Expr<Substr, Self::OutputMetadata>,
         right: &Expr<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr {
+    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         match input.op {
-            BinaryOp::Arith(_) => self.check_arith(input.span, left, right),
-            BinaryOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
-            BinaryOp::Bool(_) => self.check_bool_connective(left, right),
+            BinOp::Arith(_) => self.check_arith(input.span, left, right),
+            BinOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
+            BinOp::Bool(_) => self.check_bool_connective(left, right),
         }
     }
 
@@ -4776,8 +4776,8 @@ impl<'a> ExecPass<'a> {
             // decides it here, so each partial state below carries only the
             // narrow op it can actually act on and no state can hold an
             // operator its arm cannot evaluate.
-            Expr::Binary(b) => match b.op {
-                BinaryOp::Arith(op) => self.new_deferred_value(loc, |this| {
+            Expr::BinOp(b) => match b.op {
+                BinOp::Arith(op) => self.new_deferred_value(loc, |this| {
                     let left = this.visit_expr(loc, &b.left);
                     let right = this.visit_expr(loc, &b.right);
                     PartialEvalState::Arith(PartialArith {
@@ -4787,7 +4787,7 @@ impl<'a> ExecPass<'a> {
                         expr: b.clone(),
                     })
                 }),
-                BinaryOp::Cmp(op) => self.new_deferred_value(loc, |this| {
+                BinOp::Cmp(op) => self.new_deferred_value(loc, |this| {
                     let left = this.visit_expr(loc, &b.left);
                     let right = this.visit_expr(loc, &b.right);
                     PartialEvalState::Comparison(Box::new(PartialComparison {
@@ -4803,7 +4803,7 @@ impl<'a> ExecPass<'a> {
                 // geometry, so it must not be evaluated when the left operand
                 // already decides the result -- the same reason `if` defers its
                 // branches.
-                BinaryOp::Bool(op) => {
+                BinOp::Bool(op) => {
                     let left = self.visit_expr(loc, &b.left);
                     self.new_deferred_value(loc, |_| {
                         PartialEvalState::BoolOp(Box::new(PartialBoolOp {
@@ -7610,7 +7610,7 @@ struct PartialArith<T: AstMetadata> {
     left: ValueId,
     right: ValueId,
     op: ArithOp,
-    expr: Box<BinaryExpr<Substr, T>>,
+    expr: Box<BinOpExpr<Substr, T>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7660,7 +7660,7 @@ pub struct CallExprState {
 #[derive(Debug, Clone)]
 struct PartialBoolOp<T: AstMetadata> {
     op: BoolOp,
-    expr: BinaryExpr<Substr, T>,
+    expr: BinOpExpr<Substr, T>,
     state: BoolOpState,
 }
 
@@ -7676,7 +7676,7 @@ pub enum BoolOpState {
 #[derive(Debug, Clone)]
 struct PartialComparison<T: AstMetadata> {
     op: ComparisonOp,
-    expr: BinaryExpr<Substr, T>,
+    expr: BinOpExpr<Substr, T>,
     left: ValueId,
     right: ValueId,
 }

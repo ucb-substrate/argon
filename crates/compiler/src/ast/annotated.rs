@@ -194,12 +194,12 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
-    fn dispatch_binary_expr(
+    fn dispatch_bin_op_expr(
         &mut self,
-        input: &super::BinaryExpr<Self::InputS, Self::InputMetadata>,
+        input: &super::BinOpExpr<Self::InputS, Self::InputMetadata>,
         _left: &super::Expr<Self::OutputS, Self::OutputMetadata>,
         _right: &super::Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::BinaryExpr {
+    ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         input.metadata.clone()
     }
 

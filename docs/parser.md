@@ -456,8 +456,8 @@ point. A top-level call passes `min_bp == 0` (anything binds).
 ### 9.1 Binding powers
 
 `infix_op(kind)` is the single source of truth for the infix operator set: it
-returns `(BinaryOp, left_bp, right_bp)` or `None`. `BinaryOp` is the AST's own
-operator enum (`Arith(ArithOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`), carried
+returns `(BinOp, left_bp, right_bp)` or `None`. `BinOp` is the AST's own operator
+enum (`Arith(ArithOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`), carried
 alongside its precedence, so the two cannot drift apart.
 
 | Operators                         | (left, right) | Notes |
@@ -473,13 +473,13 @@ alongside its precedence, so the two cannot drift apart.
 The boolean connectives sit below the comparisons so `a < b && c < d` reads as
 `(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust.
 
-All three families build the same node, `BinaryExpr`, so they share every tree
-walk; the `BinaryOp` variant is what the type checker and the evaluator match on
-afterwards, where they agree on nothing. Unlike the other infix operators, a
-`BinaryOp::Bool` **short-circuits**: the evaluator visits its right operand only
-when the left one does not decide the result. Since an Argon expression can emit
-geometry and add constraints, that determines what gets built, not just how fast
-it runs.
+All three families build the same node, `BinOpExpr` (the binary counterpart of
+`UnaryOpExpr`), so they share every tree walk; the `BinOp` variant is what the
+type checker and the evaluator match on afterwards, where they agree on nothing.
+Unlike the other infix operators, a `BinOp::Bool` **short-circuits**: the
+evaluator visits its right operand only when the left one does not decide the
+result. Since an Argon expression can emit geometry and add constraints, that
+determines what gets built, not just how fast it runs.
 
 Because each operator's right binding power is one greater than its left, all
 binary operators are **left-associative**: `a - b - c` parses as `(a - b) - c`

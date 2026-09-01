@@ -47,7 +47,7 @@ pub enum StaticErrorKind {
     MatchArmsNotComprehensive,
     /// The operands in an arithmetic expression must have the same type.
     #[error("operands of an arithmetic expression must have the same type")]
-    BinOpMismatchedTypes,
+    ArithMismatchedTypes,
     /// The operands in a comparison must have the same type.
     #[error("operands of a comparison must have the same type")]
     ComparisonMismatchedTypes,
@@ -71,7 +71,7 @@ pub enum StaticErrorKind {
     SeqMustCompareEqSeqNil,
     /// A type cannot be used in an arithmetic expression.
     #[error("type cannot be used in an arithmetic expression: {0:?}")]
-    BinOpInvalidType(Ty),
+    ArithInvalidType(Ty),
     /// A type cannot be used in a unary operation.
     #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,

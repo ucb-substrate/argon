@@ -165,23 +165,23 @@ mod tests {
     fn shape<S: std::fmt::Display, T: crate::ast::AstMetadata>(
         expr: &crate::ast::Expr<S, T>,
     ) -> String {
-        use crate::ast::{ArithOp, BinaryOp, BoolOp, ComparisonOp, Expr, UnaryOp};
+        use crate::ast::{ArithOp, BinOp, BoolOp, ComparisonOp, Expr, UnaryOp};
         match expr {
-            Expr::Binary(e) => {
+            Expr::BinOp(e) => {
                 let op = match e.op {
-                    BinaryOp::Bool(BoolOp::Or) => "||",
-                    BinaryOp::Bool(BoolOp::And) => "&&",
-                    BinaryOp::Cmp(ComparisonOp::Eq) => "==",
-                    BinaryOp::Cmp(ComparisonOp::Ne) => "!=",
-                    BinaryOp::Cmp(ComparisonOp::Geq) => ">=",
-                    BinaryOp::Cmp(ComparisonOp::Gt) => ">",
-                    BinaryOp::Cmp(ComparisonOp::Leq) => "<=",
-                    BinaryOp::Cmp(ComparisonOp::Lt) => "<",
-                    BinaryOp::Arith(ArithOp::Add) => "+",
-                    BinaryOp::Arith(ArithOp::Sub) => "-",
-                    BinaryOp::Arith(ArithOp::Mul) => "*",
-                    BinaryOp::Arith(ArithOp::Div) => "/",
-                    BinaryOp::Arith(ArithOp::Rem) => "%",
+                    BinOp::Bool(BoolOp::Or) => "||",
+                    BinOp::Bool(BoolOp::And) => "&&",
+                    BinOp::Cmp(ComparisonOp::Eq) => "==",
+                    BinOp::Cmp(ComparisonOp::Ne) => "!=",
+                    BinOp::Cmp(ComparisonOp::Geq) => ">=",
+                    BinOp::Cmp(ComparisonOp::Gt) => ">",
+                    BinOp::Cmp(ComparisonOp::Leq) => "<=",
+                    BinOp::Cmp(ComparisonOp::Lt) => "<",
+                    BinOp::Arith(ArithOp::Add) => "+",
+                    BinOp::Arith(ArithOp::Sub) => "-",
+                    BinOp::Arith(ArithOp::Mul) => "*",
+                    BinOp::Arith(ArithOp::Div) => "/",
+                    BinOp::Arith(ArithOp::Rem) => "%",
                 };
                 format!("({} {op} {})", shape(&e.left), shape(&e.right))
             }
