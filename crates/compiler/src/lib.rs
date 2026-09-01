@@ -3292,8 +3292,6 @@ mod tests {
             "true == true",
             "true != false",
             "!(true == false)",
-            // Operands the solver has to resolve first, which is the case the
-            // deferred evaluation path exists for.
             "p > 2. && p < 4.",
             "p < 2. || p > 2.5",
         ] {

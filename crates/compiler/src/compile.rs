@@ -1445,8 +1445,6 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Bool
     }
 
-    /// `== != >= > <= <`: operands must agree and be an orderable or equatable
-    /// type, and the result is `Bool`.
     fn check_comparison(
         &mut self,
         op: ComparisonOp,
@@ -1529,10 +1527,6 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     /// Whether `ty` may be an operand of `&&`, `||`, or `!`.
-    ///
-    /// `Any` is accepted and re-checked by the evaluator, as it is for every
-    /// other operator; `Unknown` already marks an error reported elsewhere, so
-    /// accepting it keeps one mistake from producing a second diagnostic.
     fn is_bool_operand(ty: &Ty) -> bool {
         matches!(ty, Ty::Bool | Ty::Any | Ty::Unknown)
     }
@@ -2102,9 +2096,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         lub_ty.unwrap_or_default()
     }
 
-    /// One tree walk, three rules: the families share the node shape but agree
-    /// on nothing after that, so each keeps its own result type and operand
-    /// check (see [`BinOp`]).
     fn dispatch_bin_op_expr(
         &mut self,
         input: &BinOpExpr<Substr, Self::InputMetadata>,
@@ -4765,10 +4756,6 @@ impl<'a> ExecPass<'a> {
                     state: IndexExprState { base, index },
                 }))
             }),
-            // The one place evaluation strategy is chosen. The op family
-            // decides it here, so each partial state below carries only the
-            // narrow op it can actually act on and no state can hold an
-            // operator its arm cannot evaluate.
             Expr::BinOp(b) => match b.op {
                 BinOp::Arith(op) => self.new_deferred_value(loc, |this| {
                     let left = this.visit_expr(loc, &b.left);
@@ -4790,12 +4777,6 @@ impl<'a> ExecPass<'a> {
                         right,
                     }))
                 }),
-                // `&&` and `||` short-circuit, so only the left operand is
-                // visited here. The right operand is an arbitrary expression
-                // that may create constraints, instantiate cells, or emit
-                // geometry, so it must not be evaluated when the left operand
-                // already decides the result -- the same reason `if` defers its
-                // branches.
                 BinOp::Bool(op) => {
                     let left = self.visit_expr(loc, &b.left);
                     self.new_deferred_value(loc, |_| {
@@ -6349,15 +6330,12 @@ impl<'a> ExecPass<'a> {
                             self.invalid_type(cell_id, &span);
                             return Err(());
                         };
+                        // Whether or not this expression should short-circuit.
                         let decided = match bool_op.op {
                             BoolOp::And => !left_val,
                             BoolOp::Or => left_val,
                         };
                         if decided {
-                            // `false && _` is `false` and `true || _` is `true`:
-                            // the result is the left operand itself, and the
-                            // right operand is never visited -- so nothing it
-                            // would have built is built.
                             self.values
                                 .insert(vid, DeferValue::Ready(Value::Bool(left_val)));
                         } else {
@@ -7657,12 +7635,14 @@ struct PartialBoolOp<T: AstMetadata> {
     state: BoolOpState,
 }
 
-/// Where a `&&`/`||` has got to. `Left` is waiting on the left operand; `Right`
-/// means the left operand did not decide the result, so the right operand has
-/// been visited and is being waited on.
+/// State of boolean operation.
 #[derive(Debug, Clone)]
 pub enum BoolOpState {
+    /// Evaluating the left operand.
     Left(ValueId),
+    /// Evaluating the right operand.
+    ///
+    /// Indicates that the expression did not short-circuit.
     Right(ValueId),
 }
 
