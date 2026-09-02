@@ -1,8 +1,11 @@
 pub mod artifact;
 pub mod ast;
+pub mod cellcache;
 pub mod compile;
 pub mod diagnostics;
+pub mod fingerprint;
 pub mod gds;
+pub mod gdscache;
 pub mod incremental;
 pub mod nav;
 pub mod parse;
@@ -235,6 +238,8 @@ mod tests {
     const ARGON_STRESS_CONSTRAINTS: &str = concatcp!(EXAMPLES_DIR, "/stress_constraints/lib.ar");
     const ARGON_STRESS_INSTANCES: &str = concatcp!(EXAMPLES_DIR, "/stress_instances/lib.ar");
     const ARGON_STRESS_HIERARCHY: &str = concatcp!(EXAMPLES_DIR, "/stress_hierarchy/lib.ar");
+    const ARGON_STRESS_FALLBACKS: &str = concatcp!(EXAMPLES_DIR, "/stress_fallbacks/lib.ar");
+    const ARGON_STRESS_FREE: &str = concatcp!(EXAMPLES_DIR, "/stress_free/lib.ar");
 
     use crate::compile::CompileOutput;
 
@@ -610,6 +615,99 @@ mod tests {
         write_bench_csv("constraints", &rows);
     }
 
+    /// Axis 2b: number of pending *fallback* (initial-condition) constraints.
+    ///
+    /// This is the shape the GUI writes. `LangServer::draw_rect` emits every
+    /// coordinate as `x0i`/`y0i`/`x1i`/`y1i` so a later drag can rewrite the
+    /// literal in place, so a GUI-authored cell is made almost entirely of
+    /// fallbacks -- and the fixpoint loop in `execute_cell_inner` applies
+    /// exactly one of them per round, with a full `Solver::solve()` between
+    /// any two. Every other axis here misses this: none of the other
+    /// `stress_*` examples uses an `i`-suffixed kwarg, and `bench_shapes`,
+    /// `bench_shapes_loop`, `bench_instances`, and `bench_hierarchy` never
+    /// execute `solve()`'s body at all, because their kwargs are one-variable
+    /// constraints that `constrain_eq0` back-substitutes at insertion.
+    ///
+    /// The cell is *underconstrained* by construction, which is the point:
+    /// `report_underconstrained` runs its trial solve with compiler defaults
+    /// but deliberately without author fallbacks, so geometry determined only
+    /// by `x0i=` is reported as underconstrained -- the dashed-edge state the
+    /// tutorial describes, and the state every layout passes through while it
+    /// is being drawn. So this axis asserts that output was produced, not that
+    /// the compile was `Valid`.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_fallbacks() {
+        let _g = bench_guard();
+        let o = parse_workspace_with_std(ARGON_STRESS_FALLBACKS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes("ARGON_BENCH_FALLBACKS", &[125, 250, 500, 1000, 2000]) {
+            let (dt, mem, out) = measure(1, || {
+                compile(
+                    &ast,
+                    CompileInput {
+                        cell: &["fallbacks"],
+                        args: vec![CellArg::Int(n)],
+                    },
+                )
+            });
+            let nobj = count_objects(&out);
+            assert_eq!(nobj, n as usize, "fallbacks(n={n}) lost geometry");
+            eprintln!(
+                "fallbacks     n={n:>6} objects={nobj:>6} time={dt:>11.3?} peak={:>8.2} MiB",
+                mem as f64 / (1usize << 20) as f64
+            );
+            rows.push((n as f64, dt.as_secs_f64(), mem, nobj));
+        }
+        write_bench_csv("fallbacks", &rows);
+    }
+
+    /// Axis 2c: degrees of freedom the source leaves for the solver to pin.
+    ///
+    /// `crect` with relative dimensions and no absolute anchor is what
+    /// handwritten geometry looks like before it is finished, and it leaves one
+    /// degree of freedom per axis per shape. Nothing in the source and no
+    /// compiler default says where any of them goes, so the fixpoint loop falls
+    /// through to `Solver::force_solution` -- which used to pin one variable per
+    /// whole-system `solve()`, making it `O(n)` rounds against an `O(n)` solve.
+    ///
+    /// Reports the solver's share of the compile directly, which is what makes
+    /// this axis worth keeping: it is the one regime where the solve dominates
+    /// evaluation rather than the other way round.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_free() {
+        let _g = bench_guard();
+        let o = parse_workspace_with_std(ARGON_STRESS_FREE);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes("ARGON_BENCH_FREE", &[250, 500, 1000, 2000, 4000]) {
+            crate::solver::solve_stats::reset();
+            let (dt, mem, out) = measure(1, || {
+                compile(
+                    &ast,
+                    CompileInput {
+                        cell: &["free_shapes"],
+                        args: vec![CellArg::Int(n)],
+                    },
+                )
+            });
+            let nobj = count_objects(&out);
+            assert_eq!(nobj, n as usize, "free_shapes(n={n}) lost geometry");
+            let (calls, body, nanos) = crate::solver::solve_stats::read();
+            eprintln!(
+                "free          n={n:>6} objects={nobj:>6} time={dt:>11.3?} peak={:>8.2} MiB solve_calls={calls} solve_body={body} solve={:>8.3?}",
+                mem as f64 / (1usize << 20) as f64,
+                std::time::Duration::from_nanos(nanos as u64),
+            );
+            rows.push((n as f64, dt.as_secs_f64(), mem, nobj));
+        }
+        write_bench_csv("free", &rows);
+    }
+
     /// Axis 3: number of instances of a single (cached) leaf cell.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
@@ -785,6 +883,210 @@ mod tests {
             out.is_valid(),
             "constraints ring should be fully determined: {out:?}"
         );
+    }
+
+    /// Fallbacks that share a connected component must still be applied one
+    /// per round, in priority order, with a solve between them.
+    ///
+    /// `apply_independent_fallbacks` batches only across *disjoint* components,
+    /// and this is the case that pins that restriction: `x0i` and `x1i` are
+    /// coupled by the `eq`, so applying both in one round would assert
+    /// `x1 = 50` on top of an `x1` that `x0i` has already determined to be
+    /// `15`, and report a satisfiable cell as inconsistent. Applying them in
+    /// order instead makes `x1i` moot, which is what a lower-priority initial
+    /// condition is supposed to be.
+    #[test]
+    fn coupled_fallbacks_are_not_batched() {
+        let root = parse_source_text(
+            "cell top() {\n\
+             let a = rect(\"met1\", x0i = 5., x1i = 50., y0i = 0., y1i = 8.);\n\
+             eq(a.x1, a.x0 + 10.);\n\
+             }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let out = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        // Determined only by initial conditions, so it reports as
+        // underconstrained while still producing geometry -- see
+        // `stress_fallbacks_smoke`.
+        let errors = out.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+            "expected only underconstrained diagnostics: {:?}",
+            errors.errors
+        );
+        let d = errors
+            .output
+            .as_ref()
+            .expect("geometry despite diagnostics");
+        let cell = &d.cells[&d.top];
+        let rect = cell
+            .objects
+            .values()
+            .find_map(|o| match o {
+                SolvedValue::Rect(r) => Some(r),
+                _ => None,
+            })
+            .expect("the cell emits one rectangle");
+        assert_relative_eq!(rect.x0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(
+            rect.x1.0,
+            15.,
+            epsilon = EPSILON,
+            // 50. would mean `x1i` was applied alongside `x0i` rather than
+            // being made moot by it.
+        );
+        assert!(
+            cell.inconsistent_constraints.is_empty(),
+            "coupled initial conditions must not over-constrain the cell"
+        );
+        // Only the three that actually determined something were recorded;
+        // `x1i` was dropped as moot, and the GUI reads this list to decide
+        // which literals a drag may rewrite.
+        assert_eq!(cell.fallback_constraints_used.len(), 3);
+    }
+
+    /// `geometry_digest` must actually discriminate, or the shadow-execution
+    /// check (`ARGON_VERIFY_CELL_CACHE`) would pass vacuously.
+    #[test]
+    fn geometry_digest_distinguishes_what_a_user_can_see() {
+        let compile_source = |source: &str| {
+            let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+            let std = parse_source_text(
+                crate::parse::STD_SOURCE,
+                PathBuf::from(crate::parse::STD_PATH),
+            )
+            .unwrap();
+            let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["top"],
+                    args: Vec::new(),
+                },
+            )
+            .unwrap_valid()
+            .geometry_digest()
+        };
+
+        let base = "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
+        assert_eq!(compile_source(base), compile_source(base), "stable");
+        assert_ne!(
+            compile_source(base),
+            compile_source("cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=11., y1=10.); }"),
+            "a moved edge must change the digest"
+        );
+        assert_ne!(
+            compile_source(base),
+            compile_source("cell top() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); }"),
+            "a different layer must change the digest"
+        );
+        assert_ne!(
+            compile_source(base),
+            compile_source(
+                "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 let s = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.); }"
+            ),
+            "an extra shape must change the digest"
+        );
+    }
+
+    #[test]
+    fn stress_free_smoke() {
+        let o = parse_workspace_with_std(ARGON_STRESS_FREE);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let out = compile(
+            &ast,
+            CompileInput {
+                cell: &["free_shapes"],
+                args: vec![CellArg::Int(32)],
+            },
+        );
+        // Nothing anchors the geometry, so the cell reports as underconstrained
+        // and `force_solution` supplies the rest.
+        let errors = out.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+            "expected only underconstrained diagnostics: {:?}",
+            errors.errors
+        );
+        let d = errors
+            .output
+            .as_ref()
+            .expect("geometry despite diagnostics");
+        let rects = d
+            .cells
+            .values()
+            .flat_map(|c| c.objects.values())
+            .filter(|o| matches!(o, SolvedValue::Rect(_)))
+            .count();
+        assert_eq!(rects, 32);
+        // Every shape keeps the width and height the source did constrain,
+        // wherever `force_solution` decided to put it.
+        for object in d.cells.values().flat_map(|c| c.objects.values()) {
+            let SolvedValue::Rect(r) = object else {
+                continue;
+            };
+            assert_relative_eq!(r.x1.0 - r.x0.0, 10., epsilon = EPSILON);
+            assert_relative_eq!(r.y1.0 - r.y0.0, 8., epsilon = EPSILON);
+        }
+    }
+
+    #[test]
+    fn stress_fallbacks_smoke() {
+        let o = parse_workspace_with_std(ARGON_STRESS_FALLBACKS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let out = compile(
+            &ast,
+            CompileInput {
+                cell: &["fallbacks"],
+                args: vec![CellArg::Int(32)],
+            },
+        );
+        // Determined only by author fallbacks, so it reports as
+        // underconstrained while still producing every rectangle. Both halves
+        // matter: the diagnostic is what makes this a distinct axis from
+        // `stress_shapes`, and the geometry is what the benchmark measures.
+        let errors = out.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+            "expected only underconstrained diagnostics: {:?}",
+            errors.errors
+        );
+        let d = errors
+            .output
+            .as_ref()
+            .expect("geometry despite diagnostics");
+        let nrects = d
+            .cells
+            .values()
+            .flat_map(|c| c.objects.values())
+            .filter(|o| matches!(o, SolvedValue::Rect(r) if !r.construction))
+            .count();
+        assert_eq!(nrects, 32, "fallbacks should emit 32 rectangles");
     }
 
     #[test]

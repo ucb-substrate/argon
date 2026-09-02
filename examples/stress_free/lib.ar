@@ -1,0 +1,24 @@
+fn emit_free(n: Int) {
+    // Emit `n` rectangles whose edges are coupled to each other but anchored
+    // to nothing. Each contributes a two-variable constraint in x and another
+    // in y, so every rectangle is its own pair of connected components with
+    // one degree of freedom apiece -- and nothing in the source, and no
+    // compiler default, says where any of them goes.
+    //
+    // That is what reaches `Solver::force_solution`: the fixpoint loop runs
+    // out of author fallbacks and compiler defaults while the system is still
+    // underdetermined, and the solver pins the remainder itself.
+    if n <= 0 {
+    } else {
+        let r = crect(layer = "met1");
+        eq(r.x1, r.x0 + 10.);
+        eq(r.y1, r.y0 + 8.);
+        emit_free(n - 1);
+    }
+}
+
+// Stress axis: number of independent degrees of freedom left for
+// `force_solution` to pin.
+cell free_shapes(n: Int) {
+    emit_free(n);
+}
