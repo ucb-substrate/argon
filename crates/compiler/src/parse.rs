@@ -703,8 +703,7 @@ pub fn parse_source_text(
 /// Wrap a cell-body snippet (a single statement, written without its trailing
 /// `;`) into a complete program by placing it in a throwaway cell:
 /// `cell __dummy__() { <input>; }`. The result is intended for the whole-file
-/// parser `parser::parse_ast` — e.g. to parse/annotate a snippet in the context
-/// of a full program.
+/// parser — e.g. to parse/annotate a snippet in the context of a full program.
 ///
 /// This is **not** a preprocessing step for `parse_cell`: that function parses a
 /// bare invocation directly and would reject the `cell { ... }` wrapper.
