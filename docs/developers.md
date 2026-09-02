@@ -37,7 +37,8 @@ intra-doc links among them -- are declared in `[workspace.lints.rustdoc]` in the
 root `Cargo.toml`, so they apply to any `cargo doc` invocation:
 
 ```bash
-cargo doc --workspace --no-deps --lib --document-private-items
+RUSTDOCFLAGS="-D warnings" \
+  cargo doc --workspace --no-deps --lib --document-private-items
 ```
 
 `--document-private-items` is not optional here. Most of this workspace is

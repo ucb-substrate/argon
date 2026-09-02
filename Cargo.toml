@@ -18,18 +18,13 @@ unfulfilled_lint_expectations = "forbid"
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 
-# Documentation correctness, enforced by the `rustdoc` CI job. That job passes
-# `--document-private-items`, which is what makes these lints meaningful here:
-# most of this workspace is private, and rustdoc skips private items -- and the
-# links inside their doc comments -- without it.
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
 invalid_codeblock_attributes = "deny"
+invalid_rust_codeblocks = "deny"
 invalid_html_tags = "deny"
 bare_urls = "deny"
 redundant_explicit_links = "deny"
-# Not denied: `private_intra_doc_links` fires only because we document private
-# items, and the links it flags resolve correctly in exactly that mode.
 private_intra_doc_links = "allow"
 
 [workspace.package]

@@ -97,18 +97,12 @@ jobs:
       - name: Run tests
         run: cargo test --release --workspace
 
-  # Documentation link checking, split in two so a docs-only change gets fast
-  # feedback instead of waiting on a full workspace build.
   markdown-links:
     name: Markdown Links
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      # Validates relative file and image paths and in-page `#heading` anchors
-      # across every Markdown file. Settings live in `lychee.toml` so that a
-      # local `lychee --config lychee.toml '**/*.md'` reproduces this exactly.
-      # External http(s) links are intentionally not checked -- see that file.
       - name: Check Markdown links
         uses: lycheeverse/lychee-action@v2
         with:
@@ -135,19 +129,10 @@ jobs:
         with:
           cache-on-failure: true
 
-      # Enforces `[workspace.lints.rustdoc]` from Cargo.toml, which denies
-      # broken intra-doc links among others. Two flags matter here:
-      #   --document-private-items  most of this workspace is private, and
-      #                             without it rustdoc skips those items and
-      #                             their doc links entirely, checking almost
-      #                             nothing.
-      #   --lib                     skips the `argon` package's four one-line
-      #                             bin wrappers, whose target names collide
-      #                             with the libraries they re-export
-      #                             (rust-lang/cargo#6313). They carry no doc
-      #                             comments, so no coverage is lost.
       - name: Check Rust doc links
         run: cargo doc --workspace --no-deps --lib --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   # Checks if dependencies have incompatible licenses or known vulnerabilties
   audit:
