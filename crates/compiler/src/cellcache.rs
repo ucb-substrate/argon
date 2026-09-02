@@ -1,19 +1,15 @@
 //! Compiled cells retained across source edits.
 //!
 //! A cell's compiled form depends on its own text, on everything it refers to,
-//! on its arguments, and on the technology it was compiled against -- and on
-//! nothing else. An edit that changes none of those cannot change the cell, so
-//! it can be handed back rather than recomputed. That is worth doing because
-//! the cost of a design is usually not in the cell being edited: in
-//! `examples/multi_stress_shapes`, `multi_shapes()` is two instantiations over
-//! two children of ten thousand rectangles each, and drawing one rectangle in
-//! it re-executed both children -- essentially the whole compile.
+//! on its arguments, and on the technology it was compiled against, and on
+//! nothing else, so an edit that changes none of those can reuse the compiled
+//! cell as is.
 //!
-//! What identifies an entry is the content [`CellId`] from
-//! [`crate::gdscache::source_cell_id`], which already folds in the fingerprint,
-//! the arguments and the scope name. Entries survive edits; they are dropped
-//! only when the execution environment changes, which is what tracks the
-//! technology file and the imported GDS libraries.
+//! Entries are keyed by the content [`CellId`] from
+//! `gdscache::source_cell_id`, which folds in the fingerprint, the arguments
+//! and the scope name. They survive edits, and are dropped only when the
+//! execution environment changes, which is what tracks the technology file and
+//! the imported GDS libraries.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -29,22 +25,15 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct CachedCell {
     pub cell: Arc<CompiledCell>,
-    /// Cells this one instantiates. Reinstating means reinstating all of them:
-    /// `SolvedValue::Instance::cell` and `ExecPass::bbox` both follow the
-    /// hierarchy through the compiled map, so a parent whose child was evicted
-    /// would name a cell that is not there.
+    /// Cells this one instantiates. Reinstating a cell means reinstating all
+    /// of them, since a compiled cell names its children by [`CellId`].
     pub children: Vec<CellId>,
-    /// Diagnostics this cell produced.
-    ///
-    /// `execute_cell_inner` can return `Ok` having reported that a cell is
-    /// underconstrained, off-grid, inconsistent, or has flipped rectangle
-    /// edges. The intra-run cache already reports each of those once per
-    /// distinct instantiation; replaying them is what keeps cross-edit reuse
-    /// from quietly deleting a diagnostic the user is looking at.
+    /// Diagnostics this cell produced, replayed on a hit so that reuse does
+    /// not drop a diagnostic the user is looking at.
     pub errors: Vec<ExecError>,
     /// How many ids a fresh execution of this cell consumed, replayed on a hit
     /// so that ids allocated afterwards do not depend on whether the cell was
-    /// cached. See [`crate::gdscache::GdsImportEntry::ids_consumed`].
+    /// cached.
     pub ids_consumed: u64,
     /// Declaration placements the cell's spans were recorded against.
     pub items: Arc<ItemIndex>,
@@ -56,8 +45,8 @@ pub struct CellCacheStats {
     pub misses: u64,
     /// Entries whose spans had to be shifted because a declaration moved.
     pub rebased: u64,
-    /// Entries dropped because a span could not be translated. Always zero; a
-    /// nonzero value means a dependency edge is missing from the fingerprint.
+    /// Entries dropped because a span could not be translated. A nonzero value
+    /// means a dependency edge is missing from the fingerprint.
     pub rebase_failures: u64,
     pub entries: u64,
 }
@@ -87,8 +76,7 @@ impl CellCache {
     /// translated onto `items`.
     ///
     /// A miss for any reason -- an evicted child, a span that cannot be
-    /// translated -- returns `None` and the caller executes the cell. That
-    /// keeps eviction policy-free: dropping any entry can only cost time.
+    /// translated -- returns `None`, and the caller then executes the cell.
     pub(crate) fn reinstate(
         &mut self,
         id: CellId,
@@ -159,10 +147,7 @@ impl CellCache {
     ///
     /// Emitted in post-order over each cell's instantiation list, which is the
     /// order a fresh execution leaves `compiled_cells` in: a cell is emitted
-    /// only once every cell it instantiates has been. A depth-first *preorder*
-    /// reversed is not enough -- with a child shared between a cell and one of
-    /// that cell's own ancestors it puts the ancestor first -- and the order
-    /// reaches the GDS exporter and the serialized artifact.
+    /// only once every cell it instantiates has been.
     fn closure(&self, id: CellId) -> Option<Vec<(CellId, CachedCell)>> {
         let mut closure = Vec::new();
         let mut emitted = HashSet::new();

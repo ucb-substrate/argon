@@ -193,10 +193,6 @@ pub struct StaticAnalysis {
 }
 
 /// State a compilation session carries between compiles.
-///
-/// Bundled rather than passed as separate parameters because these travel
-/// together: each is meaningless without the fingerprints that name what the
-/// others hold, and a one-shot compile supplies none of them.
 pub struct SessionCaches<'a> {
     /// Fingerprints naming the declarations in the tree being executed.
     pub items: &'a Arc<ItemIndex>,
@@ -204,10 +200,8 @@ pub struct SessionCaches<'a> {
     pub cells: &'a mut CellCache,
     /// Per-cell layer and geometry verdicts.
     pub checks: &'a mut CheckCache,
-    /// The parsed technology, when the session already has it.
-    ///
-    /// Reading it here would re-parse the file on every execution -- 2.5 ms for
-    /// a real PDK, on a path that is otherwise measured in tens.
+    /// The parsed technology, when the session already has it, so that the
+    /// technology file is not re-read and re-parsed on every execution.
     pub tech: Option<&'a Technology>,
 }
 
@@ -240,7 +234,7 @@ pub fn execute_cell(
     )
 }
 
-/// [`execute_cell`], reusing GDS imports retained in `gds_cache`.
+/// [`execute_cell`], reusing the caches in `session`.
 pub fn execute_cell_cached(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
@@ -295,7 +289,7 @@ pub fn execute_cell_invocation(
     )
 }
 
-/// [`execute_cell_invocation`], reusing GDS imports retained in `gds_cache`.
+/// [`execute_cell_invocation`], reusing the caches in `session`.
 pub fn execute_cell_invocation_cached(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     invocation: &CellInvocation,
@@ -794,13 +788,11 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-/// Layer and geometry diagnostics for one cell, retained across compiles.
+/// Per-cell layer and geometry diagnostics, retained across compiles.
 ///
-/// Both checks walk every object of every cell, which for a GDS-backed design
-/// is hundreds of thousands of objects on a compile that otherwise reused all
-/// of them. They are pure functions of a cell's objects and the technology,
-/// and a reused cell is the *same* `Arc` as the one already checked, so the
-/// verdict is too.
+/// Both checks walk every object of every cell, and both are pure functions of
+/// a cell's objects and the technology, so a cell that is reused keeps its
+/// verdicts.
 #[derive(Debug, Default, Clone)]
 pub struct CheckCache {
     entries: HashMap<CellId, CellChecks>,
@@ -823,10 +815,6 @@ impl CheckCache {
 }
 
 /// Runs both output checks, reusing per-cell verdicts where they are known.
-///
-/// The two checks stay separate passes rather than being fused per cell: they
-/// append to one error list, and interleaving them would reorder diagnostics
-/// that are serialized into the compiled output.
 fn run_output_checks(
     data: &CompiledData,
     tech_file: &FsPath,
@@ -3532,24 +3520,16 @@ struct ExecPass<'a> {
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
     compiled_cells: IndexMap<CellId, Arc<CompiledCell>>,
-    /// The ready `Value::Cell` naming each compiled cell.
-    ///
-    /// A proxy of a child instance's geometry needs a value to point its
-    /// `Instance::cell` at, and that value is always `Value::Cell(cell)` for
-    /// the cell being instantiated. Recording it per cell -- rather than
-    /// carrying the `ValueId` inside `SolvedInstance`, which is compiled
-    /// output that can outlive the pass that allocated it -- keeps the
-    /// mapping where the values themselves live.
+    /// The ready `Value::Cell` naming each compiled cell, which is what a
+    /// proxy of a child instance's geometry points its `Instance::cell` at.
     cell_values: HashMap<CellId, ValueId>,
-    /// Imported GDS hierarchies retained across source edits, when the caller
-    /// is a compilation session rather than a one-shot compile.
+    /// Imported GDS hierarchies retained across source edits. `None` for a
+    /// one-shot compile, which has nothing to reuse across.
     gds_cache: Option<&'a mut GdsCache>,
-    /// Content fingerprints for the workspace's declarations.
-    ///
-    /// Optional only so that `ExecPass` can be constructed before one is
-    /// built; every public entry point supplies one, so that the same source
-    /// names its cells identically whether it was compiled by `argonc`, by
-    /// `arc`, or by an editor session.
+    /// Content fingerprints for the workspace's declarations, which name cells
+    /// by content rather than by allocation order. Supplied by every public
+    /// entry point, so that the same source names its cells identically
+    /// however it was compiled.
     items: Option<&'a ItemIndex>,
     /// The same index behind an `Arc`, so a cache entry can record which
     /// revision its spans were written against without cloning it.
@@ -3975,35 +3955,19 @@ impl<'a> ExecPass<'a> {
     /// Applies every pending author fallback that is independent of the ones
     /// already applied this round, in strict priority order.
     ///
-    /// The loop used to apply exactly one per round so that `solve()` ran
-    /// between any two, because applying them as an undifferentiated batch
-    /// tested each against solver state that had not yet seen the others: a
-    /// system with fewer degrees of freedom than pending constraints was then
-    /// over-constrained and reported inconsistent even when it was
-    /// satisfiable. That interaction is real, but it is confined to a
-    /// *connected component* of the live constraint graph -- pinning a
-    /// variable can only change the solved-ness of variables a chain of live
-    /// constraints reaches. So two fallbacks whose variables carry disjoint
-    /// component labels cannot affect each other's `has_unsolved_var` test or
-    /// each other's back-substitution, and applying both in one round is
-    /// indistinguishable from applying them in two.
+    /// Fallbacks whose variables lie in disjoint components of the live
+    /// constraint graph cannot affect each other's `has_unsolved_var` test or
+    /// each other's back-substitution, so applying them in one round is
+    /// indistinguishable from applying them one at a time with a `solve()`
+    /// between each.
     ///
-    /// This matters because the GUI writes every coordinate it draws as an
-    /// initial condition (`LangServer::draw_rect` emits `x0i`/`y0i`/`x1i`/
-    /// `y1i` so a later drag can rewrite the literal in place), so a
-    /// GUI-authored cell is made almost entirely of fallbacks. One per round
-    /// against a whole-system `solve()` per round made that `O(n^2)`: see
-    /// `bench_fallbacks`, which measured `n^1.9` and 73x `bench_shapes` at
-    /// 2 000 rectangles before this batched.
-    ///
-    /// Order is preserved exactly. Candidates are inspected with `peek` and
-    /// popped only when they are applied, so nothing is ever pushed back onto
-    /// the heap -- which matters because `FallbackConstraint`'s ordering
-    /// compares only `priority`, leaving ties to `BinaryHeap` internals. The
-    /// first candidate that collides with a claimed component stops the round
-    /// rather than being skipped over, so `fallback_constraints_used` -- which
-    /// the GUI reads to rewrite source after a drag -- is byte-identical to
-    /// what one-at-a-time produced.
+    /// Candidates are inspected with `peek` and popped only when they are
+    /// applied, so nothing is ever pushed back onto the heap -- which matters
+    /// because `FallbackConstraint`'s ordering compares only `priority`,
+    /// leaving ties to `BinaryHeap` internals. The first candidate that
+    /// collides with a claimed component ends the round rather than being
+    /// skipped over, which is what keeps `fallback_constraints_used` in
+    /// priority order.
     fn apply_independent_fallbacks(state: &mut CellState) {
         let labels = state.solver.unsolved_var_components();
         let mut claimed = IndexSet::new();
@@ -4038,9 +4002,10 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    /// The compiler-default counterpart of [`Self::apply_independent_fallbacks`],
-    /// with the same component-disjointness rule and the same order guarantee.
-    /// Returns whether anything was applied.
+    /// The compiler-default counterpart of
+    /// [`Self::apply_independent_fallbacks`], with the same
+    /// component-disjointness rule and the same order guarantee. Returns
+    /// whether anything was applied.
     fn apply_independent_defaults(state: &mut CellState) -> bool {
         let labels = state.solver.unsolved_var_components();
         let mut claimed = IndexSet::new();
@@ -4600,8 +4565,7 @@ impl<'a> ExecPass<'a> {
     }
 
     /// Retains imported GDS hierarchies in `cache` instead of re-importing
-    /// them. Only a long-lived session passes one; a one-shot compile has
-    /// nothing to reuse across.
+    /// them.
     fn with_gds_cache(mut self, cache: &'a mut GdsCache) -> Self {
         self.gds_cache = Some(cache);
         self
@@ -4623,10 +4587,10 @@ impl<'a> ExecPass<'a> {
 
     /// The id for a cell about to be executed from source.
     ///
-    /// The generated entry cell a compiler invocation splices in is
-    /// deliberately excluded: its text differs per invocation, it is not part
-    /// of the workspace, and `execute_invocation` reads its `CellState`, which
-    /// a reinstated cell would not have.
+    /// `None` for the generated entry cell a compiler invocation splices in,
+    /// which is not part of the workspace and is never reused: its text
+    /// differs per invocation, and `execute_invocation` reads its `CellState`,
+    /// which a reinstated cell would not have.
     fn source_cell_id(&self, cell: VarId, key: &CellExecKey) -> Option<CellId> {
         if self.entry_cell_var == Some(cell) {
             return None;
@@ -8331,12 +8295,10 @@ impl CompiledData {
     /// A digest of everything a consumer can observe: the geometry, the layers
     /// it lands on, and the shape of the instance graph.
     ///
-    /// Deliberately excludes ids. They are internal handles allocated as
-    /// execution proceeds, and reusing a cell does not reproduce the exact
-    /// allocation sequence that first produced it, so two compiles that agree
-    /// on every value a user can see still serialize to different bytes.
-    /// Comparing digests is what makes "the cache changed nothing" a checkable
-    /// claim; see `ARGON_VERIFY_CELL_CACHE`.
+    /// Excludes ids, which are internal handles whose values depend on
+    /// allocation order rather than on anything observable. Comparing digests
+    /// is what makes "the cache changed nothing" checkable; see
+    /// `ARGON_VERIFY_CELL_CACHE`.
     pub fn geometry_digest(&self) -> u64 {
         let mut cells = self
             .cells
@@ -8438,8 +8400,7 @@ impl CompiledCell {
     ///
     /// Every field is named explicitly rather than matched with `..`, so that a
     /// `Span` added to any of these types later fails to compile here instead
-    /// of being silently left stale -- which would make the GUI rewrite the
-    /// wrong bytes after a drag.
+    /// of being silently left stale.
     pub fn rebase_spans(&mut self, rebase: &SpanRebase) -> Result<(), RebaseError> {
         let Self {
             name: _,
@@ -8597,14 +8558,10 @@ pub fn bbox_dim_union(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledData {
-    /// Compiled cells, shared rather than owned.
-    ///
-    /// A cell is immutable once compiled, and the hierarchies that make these
-    /// large are the ones a compilation session wants to hand out repeatedly:
-    /// a GDS import alone can contribute ten thousand cells and hundreds of
-    /// thousands of objects, and cloning those by value costs more than a
-    /// hundred milliseconds -- most of an interactive frame budget -- every
-    /// time an output is handed back.
+    /// Compiled cells, shared rather than owned so that a session can hand the
+    /// same hierarchy out repeatedly without cloning it. A cell is immutable
+    /// once compiled, and a GDS import alone can contribute ten thousand cells
+    /// and hundreds of thousands of objects.
     pub cells: IndexMap<CellId, Arc<CompiledCell>>,
     pub top: CellId,
     pub tech: crate::tech::Technology,

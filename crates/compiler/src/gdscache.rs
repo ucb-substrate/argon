@@ -1,23 +1,14 @@
 //! Compiled cells imported from GDS, retained across source edits.
 //!
-//! A GDS import is by far the most expensive thing a compilation can do and
-//! the one thing a source edit provably cannot change. Importing a 45 MB
-//! library takes over three seconds and yields ten thousand cells; the Argon
-//! cell that instantiates it is three lines long. Without this cache, drawing
-//! one rectangle beside that instance re-decodes the whole library, so the
-//! edit costs seconds instead of milliseconds.
+//! A GDS import is the most expensive thing a compilation can do and the one
+//! thing a source edit cannot change: importing a 45 MB library takes seconds
+//! and yields ten thousand cells, while the Argon cell that instantiates it is
+//! three lines long.
 //!
-//! Two properties make this the safe part of the cache to build first:
-//!
-//! * Imported cells carry no Argon source spans. Every span in one names the
-//!   `.gds` file at offset `0..0` (see `ExecPass::execute_gds_cell`), so an
-//!   entry reinstated after an edit cannot carry a stale offset into a `.ar`
-//!   file -- which is the failure mode that would otherwise let the GUI
-//!   rewrite the wrong bytes of someone's source.
-//! * Their identity does not depend on the program. A structure is named by
-//!   the import it came from and its index within that import, so a
-//!   content-derived [`CellId`] means the same thing in every run and nothing
-//!   has to be renumbered on reuse.
+//! An imported cell carries no Argon source spans: every span in one names the
+//! `.gds` file at offset `0..0` (see `ExecPass::execute_gds_cell`). Its
+//! identity depends only on the import it came from and its index within that
+//! import, so a content-derived [`CellId`] means the same thing in every run.
 //!
 //! Freshness of the `.gds` file itself is not checked here. The session drops
 //! the whole cache when its execution environment changes, and that key
@@ -36,8 +27,7 @@ use crate::compile::{CellArgKey, CellId, CompiledCell};
 /// `ExecPass::alloc_id`.
 ///
 /// The allocator is a counter starting at a small integer, so reserving the
-/// top bit keeps the two spaces disjoint by construction rather than by the
-/// improbability of a collision.
+/// top bit keeps the two spaces disjoint by construction.
 pub(crate) const CONTENT_ID_BIT: u64 = 1 << 63;
 
 /// Whether a [`CellId`] was derived from content rather than allocated.
@@ -49,9 +39,8 @@ pub(crate) fn is_content_id(id: CellId) -> bool {
 /// under which scope name.
 ///
 /// `scope_name` is part of the key because it becomes the imported top cell's
-/// root scope name, and therefore its [`crate::compile::ScopeId`]. Only the
-/// top cell is affected by it, so the structures beneath are keyed without it
-/// and shared across scope names.
+/// root scope name. Only the top cell is affected by it, so the structures
+/// beneath are keyed without it and shared across scope names.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GdsImportKey {
     pub declared_name: String,
@@ -61,11 +50,8 @@ pub(crate) struct GdsImportKey {
 
 /// One import's compiled cells, in the order a fresh run inserts them.
 ///
-/// Order is retained rather than recovered from a map because
-/// `CompiledData::cells` is an `IndexMap` whose iteration order reaches the
-/// GDS exporter and the serialized artifact; reinstating in a different order
-/// than a fresh import would change compiled output that is otherwise
-/// identical.
+/// Order is retained because `CompiledData::cells` is an `IndexMap` whose
+/// iteration order reaches the GDS exporter and the serialized artifact.
 #[derive(Clone, Debug)]
 pub(crate) struct GdsImportEntry {
     pub top: CellId,
@@ -73,13 +59,9 @@ pub(crate) struct GdsImportEntry {
     /// How many ids a fresh import of this entry consumed from
     /// `ExecPass::next_id`.
     ///
-    /// A hit allocates a value per cell but no object ids, so without this the
-    /// counter would sit lower than after a fresh import and every id handed
-    /// out afterwards -- including the ids of the cell the user is editing --
-    /// would differ between a cached and an uncached compile. Nothing
-    /// *observable* depends on an id's value, but replaying the same
-    /// consumption keeps a cached compile byte-identical to a fresh one, which
-    /// is what makes the two comparable in a test.
+    /// Replayed on a hit, which allocates a value per cell but no object ids,
+    /// so that every id handed out afterwards is the one a fresh import would
+    /// have handed out.
     pub ids_consumed: u64,
 }
 
@@ -141,12 +123,9 @@ impl GdsCache {
     }
 }
 
-/// The [`CellId`] of a cell executed from source, derived from what it is
-/// rather than from when it was allocated.
-///
-/// The arguments are already normalized by [`CellArgKey`] -- floats by their
-/// bits, so that two calls agreeing on every bit agree on the id -- and the
-/// scope name is included because it becomes the cell's root scope name.
+/// The [`CellId`] of a cell executed from source, derived from the cell's
+/// fingerprint, its arguments and its scope name rather than from when it was
+/// allocated.
 ///
 /// Two calls that agree on all three produce the same cell, which is exactly
 /// the condition under which one may be reused for the other.
@@ -212,7 +191,7 @@ fn hash_cell_arg_key(hasher: &mut fnv::FnvHasher, arg: &CellArgKey) {
 ///
 /// `top_scope_name` is mixed in only for the structure that becomes the
 /// import's top cell, so that two scope names share every structure beneath
-/// it instead of duplicating the whole hierarchy.
+/// it.
 pub(crate) fn gds_cell_id(
     declared_name: &str,
     path: &Path,

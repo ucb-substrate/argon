@@ -88,8 +88,8 @@ struct StaticCache {
     /// index that was built and then judged unusable is not rebuilt from the
     /// whole typed AST on every request until the next edit.
     nav: Option<Option<Arc<NavIndex>>>,
-    /// Content fingerprints for this analysis, built lazily for the same
-    /// reason `nav` is: only a session needs them.
+    /// Content fingerprints for this analysis, built lazily since only a
+    /// session needs them.
     items: Option<Arc<ItemIndex>>,
 }
 
@@ -108,10 +108,10 @@ pub struct IncrementalCompiler {
     last_good_nav: Option<Arc<NavIndex>>,
     /// Compiled cells imported from GDS.
     ///
-    /// Deliberately *not* cleared by [`Self::invalidate`]: an import is named
-    /// by a `.gds` file and its own contents, so no edit to an Argon source
-    /// file can change it. It is dropped only when the execution environment
-    /// changes, which is the key that tracks those files.
+    /// Not cleared by [`Self::invalidate`]: an import is named by a `.gds`
+    /// file and its own contents, so no edit to an Argon source file can
+    /// change it. It is dropped only when the execution environment changes,
+    /// which is the key that tracks those files.
     gds_cache: GdsCache,
     /// Compiled cells from source. Like `gds_cache`, kept across edits: an
     /// entry is named by content, so an edit that does not change a cell
@@ -123,8 +123,8 @@ pub struct IncrementalCompiler {
     /// describe.
     check_cache: compile::CheckCache,
     /// The parsed technology, kept so that it is not re-read and re-parsed on
-    /// every execution. Retired with the caches when the environment changes,
-    /// which is the key that tracks the technology file's contents.
+    /// every execution. Retired with the caches when the execution environment
+    /// changes, which is the key that tracks the technology file's contents.
     tech: Option<crate::tech::Technology>,
     stats: IncrementalStats,
 }
@@ -504,14 +504,10 @@ impl IncrementalCompiler {
     /// Recompiles the same cell with empty caches and asserts the two agree,
     /// when `ARGON_VERIFY_CELL_CACHE` is set in the environment.
     ///
-    /// The fingerprint walker is the part of this design that fails silently:
-    /// a dependency edge it does not collect produces a cell that is reused
-    /// when it should have been re-executed, and the result is stale geometry
-    /// with no diagnostic attached to point at it. Executing the cell anyway
-    /// and comparing turns that into a loud failure. It costs exactly what the
-    /// cache saves, which is why it is opt-in -- but it is cheap to run over
-    /// the corpus, and it is the only check that covers the walker's blind
-    /// spots rather than the ones already thought of.
+    /// A dependency edge the fingerprint walker does not collect produces
+    /// stale geometry with no diagnostic attached to point at it, and this is
+    /// the check that turns that into a loud failure. It costs exactly what
+    /// the cache saves, which is why it is opt-in.
     fn verify_against_uncached(
         &self,
         output: &CompileOutput,
@@ -659,25 +655,17 @@ fn file_revision(path: &Path) -> Option<FileRevision> {
 /// Content digests for the external files an execution environment names,
 /// screened by length and modification time.
 ///
-/// The environment key has to be recomputed on every execution, because it is
-/// what decides whether the caches are still valid -- and computing it meant
-/// reading and hashing every declared GDS library every time. For a workspace
-/// declaring 82 MB of libraries that was 37 ms per keystroke, most of an edit's
-/// latency, spent proving that files nobody touched had not changed. Worse, it
-/// scaled with *declared* bytes rather than used ones, so adding a library
-/// nothing instantiates slowed every edit down.
+/// The environment key decides whether the caches are still valid, so it is
+/// recomputed on every execution; hashing every declared GDS library each time
+/// costs tens of milliseconds per keystroke for a workspace declaring tens of
+/// megabytes, and scales with *declared* bytes rather than used ones.
 ///
-/// This screens on `(length, modification time)` and only re-reads when one of
-/// them moves. That is deliberately weaker than hashing, and deliberately not
-/// what [`IncrementalCompiler::tracked_file_revisions`] does for `.ar` files:
-/// the comment on [`FileRevision`] rejects timestamps because `cp -p`,
-/// `rsync --times`, `tar -x` and branch restores all reproduce one over
-/// different bytes. That reasoning is about source files, which tools rewrite
-/// constantly and cheaply. A multi-megabyte GDS library is a build artifact
-/// replaced wholesale, and re-reading one on every keystroke to defend against
-/// a same-length same-timestamp rewrite costs more than the defence is worth.
-/// The digest itself is still content-derived; only the decision to *recompute*
-/// it is screened.
+/// Screening on `(length, modification time)` and re-reading only when one of
+/// them moves is weaker than the content hashing
+/// [`IncrementalCompiler::tracked_file_revisions`] does for `.ar` files: a
+/// multi-megabyte GDS library is a build artifact replaced wholesale rather
+/// than a source file that tools rewrite in place. The digest itself is still
+/// content-derived; only the decision to *recompute* it is screened.
 #[derive(Debug, Default, Clone)]
 struct ExternalDigests {
     entries: HashMap<PathBuf, ScreenedDigest>,
@@ -1168,11 +1156,9 @@ mod tests {
 
     /// Solved geometry, keyed by cell name, with every id dropped.
     ///
-    /// Ids are internal handles: a cache hit does not reproduce the exact
-    /// allocation sequence a fresh import performs, so two compiles that agree
-    /// on every observable value still serialize to different bytes. What has
-    /// to match is the geometry and the shape of the instance graph, so that
-    /// is what this compares.
+    /// Ids depend on allocation order, which a cache hit does not reproduce,
+    /// so what has to match is the geometry and the shape of the instance
+    /// graph.
     fn geometry(output: &CompileOutput) -> Vec<String> {
         let data = match output {
             CompileOutput::Valid(data) => data,
@@ -1255,11 +1241,6 @@ mod tests {
 
     /// Rebasing a cell compiled against one revision onto another makes every
     /// one of its spans point at the same *text* it originally pointed at.
-    ///
-    /// This is the property the whole reuse scheme depends on for safety: the
-    /// GUI reads `UsedFallback::span` to decide which literal a drag rewrites,
-    /// so a span that survives an edit pointing at the wrong offset corrupts
-    /// the user's source silently.
     #[test]
     fn rebasing_moves_spans_onto_identical_text() {
         use crate::fingerprint::{ItemIndex, SpanRebase};
@@ -1336,12 +1317,6 @@ mod tests {
 
     /// A cell served from the cache must report its diagnostics exactly once,
     /// however many times the compile instantiates it.
-    ///
-    /// The intra-run `compiled_cell_cache` is what collapses repeated
-    /// instantiations on the fresh path, so the reuse path has to populate it
-    /// too: without that, each iteration of the loop below walks the closure
-    /// again and replays the child's `Underconstrained` diagnostic, and the
-    /// user sees one per instance.
     #[test]
     fn reuse_reports_a_cells_diagnostics_once() {
         let source = "cell child() {\n    let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
@@ -1380,12 +1355,8 @@ mod tests {
         );
     }
 
-    /// Reinstating leaves `CompiledData::cells` in the order a fresh
-    /// execution would: children before the cells that instantiate them.
-    ///
-    /// The order is not cosmetic -- it reaches the GDS exporter and the
-    /// serialized artifact -- and `geometry_digest` sorts, so
-    /// `ARGON_VERIFY_CELL_CACHE` cannot see a difference here.
+    /// Reinstating leaves `CompiledData::cells` in the order a fresh execution
+    /// would: children before the cells that instantiate them.
     #[test]
     fn reinstated_cells_keep_a_fresh_compiles_order() {
         let source = "cell b() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
@@ -1449,11 +1420,8 @@ mod tests {
         assert!(SpanRebase::new(&items, &appended).is_none());
     }
 
-    /// A declaration that only moved keeps its `CellId`.
-    ///
-    /// This is the property the whole reuse scheme rests on: ids are derived
-    /// from what a cell *is*, so text shifting down a file leaves them alone,
-    /// and a cell compiled in one revision is still recognisable in the next.
+    /// A declaration that only moved keeps its `CellId`, so a cell compiled in
+    /// one revision is still recognisable in the next.
     #[test]
     fn moving_a_declaration_preserves_its_cell_id() {
         let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
@@ -1501,9 +1469,9 @@ mod tests {
 
     /// Every cell reached from a named entry point is named by content, and so
     /// carries the marker bit that keeps content ids disjoint from the ones
-    /// `alloc_id` hands out. (A compiler *invocation* additionally wraps the
-    /// call in a generated entry cell, which is deliberately excluded --
-    /// see `ExecPass::source_cell_id`.)
+    /// `alloc_id` hands out. A compiler *invocation* wraps the call in a
+    /// generated entry cell, which is excluded -- see
+    /// `ExecPass::source_cell_id`.
     #[test]
     fn source_cells_are_named_by_content() {
         let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
@@ -1684,11 +1652,8 @@ mod tests {
     }
 
     /// A same-length rewrite is still detected, because the screen also
-    /// compares modification time.
-    ///
-    /// This is the boundary of the weakening documented on [`ExternalDigests`]:
-    /// what it gives up is a rewrite that keeps *both* the length and the
-    /// timestamp, not one that keeps only the length.
+    /// compares modification time. What [`ExternalDigests`] gives up is a
+    /// rewrite that keeps *both* the length and the timestamp.
     #[test]
     fn a_same_length_gds_rewrite_is_still_detected() {
         use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
@@ -1786,8 +1751,7 @@ mod tests {
     /// an import: `examples/multi_stress_shapes`'s `multi_shapes()` has a
     /// two-line body over two children of ten thousand rectangles each.
     ///
-    /// This is the case the GDS cache cannot help with. Both children are
-    /// unchanged by an edit to the parent, but they live in the same file, so
+    /// Both children live in the same file as the parent being edited, so
     /// reusing them needs per-declaration fingerprints rather than a
     /// file-granular check. The child timings are reported alongside so the
     /// share of the edit that is reusable is visible directly.

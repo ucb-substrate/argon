@@ -1,12 +1,11 @@
 //! Content fingerprints for top-level declarations.
 //!
-//! A compiled cell can only be reused across an edit if something names it that
-//! survives the edit, and `VarId` does not: it comes from one workspace-global
-//! counter threaded across modules (`execute_var_id_ty_pass`), so editing an
-//! early module renumbers every declaration after it. A fingerprint names a
-//! declaration by what it *is* -- its own text, and the fingerprints of
-//! everything it refers to -- so two revisions of a workspace agree on it
-//! exactly when the declaration means the same thing in both.
+//! A fingerprint names a declaration by what it *is* -- its own text, and the
+//! fingerprints of everything it refers to -- so two revisions of a workspace
+//! agree on it exactly when the declaration means the same thing in both. That
+//! is what lets a compiled cell be recognised across an edit, which `VarId`
+//! cannot do: ids come from one workspace-global counter threaded across
+//! modules, so editing an early module renumbers every declaration after it.
 //!
 //! ```text
 //! self_hash(item) = H( kind, file, module, name, body )
@@ -14,19 +13,13 @@
 //! fp(item)        = H( fp(scc(item)), self_hash(item) )
 //! ```
 //!
-//! The strongly-connected-component step is not defensive: `fn`s really do
-//! recurse. `VarIdTyPass::execute` declares every function *signature* before
-//! transforming any body, so functions may call each other in any order, and
-//! `emit_shapes` in `examples/stress_shapes` calls itself. Cells cannot today --
-//! `transform_cell_decl` binds a cell's name only after walking its body, which
-//! is what produces `UseBeforeDeclaration` -- but they are expected to be able
-//! to, so the condensation deliberately does not care which kind of declaration
-//! it is looking at.
+//! Declarations are condensed into strongly-connected components first, since
+//! functions may refer to one another in any order and may recurse.
 //!
-//! Fingerprints are *conservative*: a formatting change inside a declaration
-//! changes its text and so invalidates it. What must never happen is the
-//! reverse -- two different meanings sharing a fingerprint -- so anything the
-//! walker cannot account for has to make the fingerprint differ.
+//! Fingerprints are *conservative*: a formatting change invalidates a
+//! declaration whose meaning is unchanged. Two different meanings sharing a
+//! fingerprint must never happen, so anything the walker cannot account for
+//! has to make the fingerprint differ.
 
 use std::{
     collections::HashMap,
@@ -50,13 +43,11 @@ pub type Fingerprint = u64;
 
 /// The kinds of declaration a compiled cell's output can depend on.
 ///
-/// `mod` and `use` are absent deliberately: neither can be called or named as a
-/// type, and `use` installs the imported declaration's own `VarId`, so a
-/// reference through an alias already resolves to the original. `struct` and
-/// `const` are absent only because `parser::check_unsupported` rejects both
-/// before they reach here; a `const` a cell reads would be a genuine dependency,
-/// so the matches over [`Decl`] below are written exhaustively to make
-/// implementing either a compile error here rather than a silently stale cell.
+/// `mod` and `use` are absent because neither can be called or named as a type,
+/// and a reference through an alias resolves to the original declaration's own
+/// `VarId`. `struct` and `const` are absent because `parser::check_unsupported`
+/// rejects both; the matches over [`Decl`] below are exhaustive so that
+/// supporting either becomes a compile error here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ItemKind {
     Cell,
@@ -84,8 +75,8 @@ pub struct ItemSite {
     /// is what every `cfgrammar::Span` in that module indexes.
     ///
     /// An `enum` declaration carries no span of its own, so its name's span
-    /// stands in. Nothing is lost by that: an enum body contains no executable
-    /// code, so no compiled span can ever fall inside one.
+    /// stands in; an enum body contains no executable code, so no compiled
+    /// span can fall inside one.
     pub span: Range<usize>,
 }
 
@@ -140,11 +131,9 @@ struct Builder {
     items: IndexMap<VarId, Item>,
     /// The `VarId` an enum's name is bound to, by the id carried in its [`Ty`].
     ///
-    /// Required, not a convenience: a reference to an enum *variant* is a
-    /// multi-segment path, and `dispatch_ident_path` gives those
-    /// `(None, ty)` -- there is no `VarId` on them at all. Without this map,
-    /// adding a variant would change nothing any dependent fingerprints, and
-    /// stale cells would be served.
+    /// A reference to an enum *variant* is a multi-segment path, which
+    /// `dispatch_ident_path` reports as `(None, ty)` with no `VarId` at all,
+    /// so this map is the only way such a reference reaches a fingerprint.
     enums: HashMap<EnumId, VarId>,
 }
 
@@ -543,9 +532,8 @@ impl Builder {
 /// The declarations a module actually contains.
 ///
 /// Generated declarations -- the entry cell a compiler invocation splices in --
-/// sit at the front of the list with their text appended past the
-/// editor-visible source. They are not part of the workspace, and their text
-/// changes with every invocation, so they are skipped.
+/// sit at the front of the list and are skipped: they are not part of the
+/// workspace, and their text changes with every invocation.
 fn declarations(
     annotated: &AnnotatedAst<VarIdTyMetadata>,
 ) -> impl Iterator<Item = &Decl<arcstr::Substr, VarIdTyMetadata>> {
@@ -667,8 +655,7 @@ impl ItemIndex {
     /// Declaration extents in one file, ordered by position.
     ///
     /// Extents never overlap or nest within a file, so an offset identifies at
-    /// most one declaration. Used by span rebasing to find the declaration a
-    /// recorded span falls inside.
+    /// most one declaration.
     pub fn sites_in(&self, path: &Path) -> Vec<&ItemSite> {
         let mut sites = self
             .sites
@@ -859,9 +846,8 @@ fn takes(m: Mode) -> Float { 1. }
     }
 
     /// Two declarations with byte-identical bodies in different modules must
-    /// not share a fingerprint: `CompiledCell::name` becomes the exported GDS
-    /// structure name, so sharing an entry would export one under the other's
-    /// name.
+    /// not share a fingerprint, since `CompiledCell::name` becomes the exported
+    /// GDS structure name.
     #[test]
     fn identical_bodies_in_different_modules_differ() {
         let root = parse_source_text(
@@ -895,9 +881,7 @@ fn takes(m: Mode) -> Float { 1. }
 
     /// Every example in the corpus indexes without panicking or diverging, and
     /// yields extents that are in bounds, disjoint, and distinctly
-    /// fingerprinted. The recursive and mutually-referential fixtures
-    /// (`stress_shapes`, `stress_hierarchy`, `multi_stress_shapes`) are the
-    /// ones that would expose a non-terminating condensation.
+    /// fingerprinted.
     #[test]
     fn corpus_fingerprints_are_well_formed() {
         use crate::parse::parse_workspace_with_std;
@@ -981,16 +965,10 @@ fn takes(m: Mode) -> Float { 1. }
 /// Translates spans recorded against one revision of a workspace onto another.
 ///
 /// A compiled cell is only reused when every declaration it can reach has the
-/// same content, so the text each of its spans points into is byte-identical;
-/// all that can differ is where in the file that text begins. Locating the
+/// same content, so the text each of its spans points into is byte-identical
+/// and all that can differ is where in the file that text begins. Locating the
 /// declaration a span falls inside and shifting by the difference in start
-/// offsets is therefore *exact*, unlike `analyzer::navigation`'s `Alignment`,
-/// which has to approximate because it aligns two genuinely different texts.
-///
-/// This is not an optimization. Every geometry object carries a span, the GUI
-/// identifies the selected object by span, and after a solution-space drag it
-/// rewrites the source text at `UsedFallback::span`. A reused cell carrying a
-/// stale offset would silently rewrite the wrong bytes of someone's file.
+/// offsets is therefore exact.
 pub struct SpanRebase {
     /// Declaration extents in the revision the spans were recorded against,
     /// per file and ordered by position, with the fingerprint that names each.
@@ -1002,12 +980,11 @@ pub struct SpanRebase {
 /// A span that could not be translated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseError {
-    /// The span fell inside a declaration that is no longer present. A cell is
-    /// only reused when its whole closure is unchanged, so this means the
-    /// closure was computed wrongly.
+    /// The span fell inside a declaration that is no longer present, which
+    /// means the reused cell's closure was computed wrongly.
     UnknownDeclaration,
     /// The declaration is present but its extent changed length, so the text
-    /// the span points into is not the text it was recorded against. Two
+    /// the span points into is not the text it was recorded against: two
     /// different declarations hashed alike.
     LengthChanged,
 }
@@ -1015,10 +992,6 @@ pub enum RebaseError {
 impl SpanRebase {
     /// A translation from `from` to `to`, or `None` when no declaration moved
     /// and every span is already correct.
-    ///
-    /// The common interactive edit — typing inside the cell being viewed, with
-    /// nothing declared after it — moves nothing, so this is the case worth
-    /// making free.
     pub fn new(from: &ItemIndex, to: &ItemIndex) -> Option<Self> {
         let mut moved = false;
         let mut by_fingerprint = HashMap::with_capacity(to.len());
@@ -1051,8 +1024,7 @@ impl SpanRebase {
     /// Translates one span in place.
     ///
     /// A span in a file with no declarations at all is left alone: that is the
-    /// GDS-import case, whose spans name a `.gds` file at offset `0..0` and
-    /// have nothing to rebase against.
+    /// GDS-import case, whose spans name a `.gds` file at offset `0..0`.
     pub fn rebase(&self, span: &mut crate::ast::Span) -> Result<(), RebaseError> {
         let Some(extents) = self.from.get(&span.path) else {
             return Ok(());

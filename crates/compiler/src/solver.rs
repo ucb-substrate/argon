@@ -153,16 +153,13 @@ impl Solver {
     ///
     /// Two variables share a label exactly when a chain of live constraints
     /// connects them, so pinning one can only ever change the solved-ness of
-    /// variables carrying the same label. That is what lets a caller apply
-    /// several pending constraints in one round instead of one per round: as
-    /// long as their variables carry disjoint labels, the batch is
-    /// indistinguishable from applying them one at a time with a `solve()`
-    /// between each. A variable in no live constraint is its own label, which
-    /// is the trivially-independent case.
+    /// variables carrying the same label; a variable in no live constraint is
+    /// its own label. That is what lets a caller apply several pending
+    /// constraints in one round, as long as their variables carry disjoint
+    /// labels.
     ///
-    /// This is deliberately lighter than [`Self::constraint_components`],
-    /// which also collects each component's constraint list because the solver
-    /// then factors it. Callers here only need the partition.
+    /// Lighter than `constraint_components`, which also collects each
+    /// component's constraint list so that the solver can factor it.
     pub fn unsolved_var_components(&self) -> IndexMap<Var, Var> {
         let mut labels = IndexMap::with_capacity(self.unsolved_vars.len());
         let mut queue = VecDeque::new();
@@ -214,18 +211,11 @@ impl Solver {
     /// Pins whatever the source left free, so that a cell nobody finished
     /// constraining still produces a layout.
     ///
-    /// One variable per *connected component* per round, rather than one
-    /// variable per round. Components are independent by construction -- see
-    /// [`Self::unsolved_var_components`] -- so pinning one variable in each
-    /// cannot change the solved-ness of any variable in another, and the fixed
-    /// point reached is the same one pinning them singly reaches.
-    ///
-    /// This matters because a whole-system [`Self::solve`] ran between any two
-    /// pins. Geometry with relative dimensions but no absolute anchor -- a
-    /// rectangle whose width is constrained but whose position is not, which
-    /// is what handwritten layout looks like before it is finished -- leaves
-    /// one degree of freedom per shape, so the old loop was `O(n)` rounds
-    /// against an `O(n)` solve. Measured at `n^1.9` before batching.
+    /// Pins one variable per *connected component* per round, so a
+    /// whole-system [`Self::solve`] runs once per round rather than once per
+    /// pinned variable. Components are independent by construction -- see
+    /// [`Self::unsolved_var_components`] -- so the fixed point reached is the
+    /// same one pinning them singly reaches.
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
             let labels = self.unsolved_var_components();
@@ -1069,8 +1059,7 @@ impl From<f64> for LinearExpr {
 mod tests {
     /// `unsolved_var_components` must join exactly the variables a chain of
     /// *live* constraints reaches, and leave everything else in its own
-    /// singleton -- that partition is what licenses applying several pending
-    /// constraints in one round.
+    /// singleton.
     #[test]
     fn unsolved_var_components_partitions_by_live_constraints() {
         let mut solver = Solver::new();

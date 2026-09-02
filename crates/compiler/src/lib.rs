@@ -617,24 +617,16 @@ mod tests {
 
     /// Axis 2b: number of pending *fallback* (initial-condition) constraints.
     ///
-    /// This is the shape the GUI writes. `LangServer::draw_rect` emits every
+    /// This is the shape the GUI writes: `LangServer::draw_rect` emits every
     /// coordinate as `x0i`/`y0i`/`x1i`/`y1i` so a later drag can rewrite the
-    /// literal in place, so a GUI-authored cell is made almost entirely of
-    /// fallbacks -- and the fixpoint loop in `execute_cell_inner` applies
-    /// exactly one of them per round, with a full `Solver::solve()` between
-    /// any two. Every other axis here misses this: none of the other
-    /// `stress_*` examples uses an `i`-suffixed kwarg, and `bench_shapes`,
-    /// `bench_shapes_loop`, `bench_instances`, and `bench_hierarchy` never
-    /// execute `solve()`'s body at all, because their kwargs are one-variable
-    /// constraints that `constrain_eq0` back-substitutes at insertion.
+    /// literal in place, making a GUI-authored cell almost entirely fallbacks.
+    /// No other axis here covers that, since the other `stress_*` examples use
+    /// kwargs that `constrain_eq0` back-substitutes at insertion.
     ///
-    /// The cell is *underconstrained* by construction, which is the point:
+    /// The cell is *underconstrained* by construction, because
     /// `report_underconstrained` runs its trial solve with compiler defaults
-    /// but deliberately without author fallbacks, so geometry determined only
-    /// by `x0i=` is reported as underconstrained -- the dashed-edge state the
-    /// tutorial describes, and the state every layout passes through while it
-    /// is being drawn. So this axis asserts that output was produced, not that
-    /// the compile was `Valid`.
+    /// but without author fallbacks, so this axis asserts that output was
+    /// produced rather than that the compile was `Valid`.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_fallbacks() {
@@ -666,16 +658,14 @@ mod tests {
 
     /// Axis 2c: degrees of freedom the source leaves for the solver to pin.
     ///
-    /// `crect` with relative dimensions and no absolute anchor is what
-    /// handwritten geometry looks like before it is finished, and it leaves one
-    /// degree of freedom per axis per shape. Nothing in the source and no
-    /// compiler default says where any of them goes, so the fixpoint loop falls
-    /// through to `Solver::force_solution` -- which used to pin one variable per
-    /// whole-system `solve()`, making it `O(n)` rounds against an `O(n)` solve.
+    /// `crect` with relative dimensions and no absolute anchor leaves one
+    /// degree of freedom per axis per shape, and nothing in the source or in
+    /// the compiler defaults says where any of them goes, so the fixpoint loop
+    /// falls through to `Solver::force_solution`.
     ///
-    /// Reports the solver's share of the compile directly, which is what makes
-    /// this axis worth keeping: it is the one regime where the solve dominates
-    /// evaluation rather than the other way round.
+    /// Reports the solver's share of the compile directly, since this is the
+    /// one regime where the solve dominates evaluation rather than the other
+    /// way round.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_free() {
@@ -888,13 +878,10 @@ mod tests {
     /// Fallbacks that share a connected component must still be applied one
     /// per round, in priority order, with a solve between them.
     ///
-    /// `apply_independent_fallbacks` batches only across *disjoint* components,
-    /// and this is the case that pins that restriction: `x0i` and `x1i` are
-    /// coupled by the `eq`, so applying both in one round would assert
-    /// `x1 = 50` on top of an `x1` that `x0i` has already determined to be
-    /// `15`, and report a satisfiable cell as inconsistent. Applying them in
-    /// order instead makes `x1i` moot, which is what a lower-priority initial
-    /// condition is supposed to be.
+    /// `x0i` and `x1i` are coupled by the `eq`, so applying both in one round
+    /// would assert `x1 = 50` on top of an `x1` that `x0i` has already
+    /// determined to be `15`, and report a satisfiable cell as inconsistent.
+    /// Applying them in order instead makes `x1i` moot.
     #[test]
     fn coupled_fallbacks_are_not_batched() {
         let root = parse_source_text(
