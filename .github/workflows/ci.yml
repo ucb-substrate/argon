@@ -16,12 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -93,7 +93,7 @@ jobs:
         with:
           shared-key: ${{ runner.os }}-${{ matrix.rust }}
           cache-on-failure: true
-      
+
       - name: Run tests
         run: cargo test --release --workspace
 
@@ -129,10 +129,16 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Check public Rust doc links
+        run: cargo doc --workspace --no-deps --lib
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Check Rust doc links
         run: cargo doc --workspace --no-deps --lib --document-private-items
         env:
           RUSTDOCFLAGS: -D warnings
+
 
   # Checks if dependencies have incompatible licenses or known vulnerabilties
   audit:
@@ -140,10 +146,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      
+
       - name: Install security tools
         run: cargo install cargo-audit cargo-deny --locked
-      
+
       - name: Run security audit
         run: cargo audit
 

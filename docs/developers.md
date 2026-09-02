@@ -36,17 +36,6 @@ Rust doc comments are checked by rustdoc itself. The denied lints -- broken
 intra-doc links among them -- are declared in `[workspace.lints.rustdoc]` in the
 root `Cargo.toml`, so they apply to any `cargo doc` invocation:
 
-```bash
-RUSTDOCFLAGS="-D warnings" \
-  cargo doc --workspace --no-deps --lib --document-private-items
-```
-
-`--document-private-items` is not optional here. Most of this workspace is
-private, and without it rustdoc skips those items and the links inside their doc
-comments entirely, which checks almost nothing. `--lib` skips the `argon`
-package's four one-line bin wrappers, whose target names collide with the
-libraries they re-export.
-
 Markdown files are checked by [lychee](https://lychee.cli.rs), which validates
 relative file and image paths and in-page `#heading` anchors:
 

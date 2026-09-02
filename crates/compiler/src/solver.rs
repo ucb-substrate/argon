@@ -157,9 +157,6 @@ impl Solver {
     /// its own label. That is what lets a caller apply several pending
     /// constraints in one round, as long as their variables carry disjoint
     /// labels.
-    ///
-    /// Lighter than `constraint_components`, which also collects each
-    /// component's constraint list so that the solver can factor it.
     pub fn unsolved_var_components(&self) -> IndexMap<Var, Var> {
         let mut labels = IndexMap::with_capacity(self.unsolved_vars.len());
         let mut queue = VecDeque::new();
@@ -635,9 +632,7 @@ impl Solver {
     ///
     /// Both kinds of deferred constraint -- author-written initial conditions
     /// and compiler defaults -- use this to decide whether applying themselves
-    /// would still change anything. The tolerance is looser than [`EPSILON`]
-    /// on purpose: a coefficient that small cannot pin its variable, so
-    /// treating it as absent avoids adding a constraint that only adds noise.
+    /// would still change anything.
     pub fn has_unsolved_var(&self, expr: &LinearExpr) -> bool {
         expr.coeffs
             .iter()

@@ -18,11 +18,9 @@ pub use workspace::WorkspaceConfig;
 
 /// Native stack reserved for compilation.
 ///
-/// The evaluator recurses natively for inlined `fn` calls and for nested cell
-/// instantiation, and both overflow the default stack well before
-/// `compile::MAX_EVAL_DEPTH`. A stack overflow aborts the process rather than
-/// unwinding, so no `catch_unwind` can turn it into a diagnostic: the stack
-/// has to be large enough that the depth limit is what stops the descent.
+/// A stack overflow aborts the process rather than unwinding, so no
+/// `catch_unwind` can turn it into a diagnostic: the stack has to be large
+/// enough that the depth limit is what stops the descent.
 pub const COMPILE_STACK_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Runs `f` on a thread with [`COMPILE_STACK_SIZE`] of stack, propagating a

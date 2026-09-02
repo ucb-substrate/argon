@@ -25,7 +25,7 @@ invalid_rust_codeblocks = "deny"
 invalid_html_tags = "deny"
 bare_urls = "deny"
 redundant_explicit_links = "deny"
-private_intra_doc_links = "allow"
+private_intra_doc_links = "deny"
 
 [workspace.package]
 license = "BSD-3-Clause"

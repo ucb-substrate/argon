@@ -90,11 +90,10 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// not shadow one.
 ///
 /// A cell's public fields are exactly its top-level `let` bindings, and
-/// `inst.x` / `inst.y` are the instance's position. The reserved-name check,
-/// the `Ty::Inst` field-access arm, and `gds::argon_ident` (which escapes a
-/// scraped GDS label before it becomes a top-level `let`) all read this list.
+/// `inst.x` / `inst.y` are the instance's position. The reserved-name check
+/// and the `Ty::Inst` field-access arm both read this list.
 ///
-/// The evaluator's `ValueRef::Inst` field dispatch is the fourth site and
+/// The evaluator's `ValueRef::Inst` field dispatch is the third site and
 /// cannot: each name maps to a different field of the instance, so it matches
 /// the literals directly and must be updated alongside this constant.
 pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
@@ -1320,10 +1319,10 @@ impl Ty {
     ///
     /// Returns `None` when the two types have no common supertype. Callers must
     /// report that as an error rather than widening: `Ty::Any` satisfies every
-    /// downstream check (`is_eq_ty` short-circuits on it), so promoting a
-    /// genuine mismatch to `Any` suppresses all further checking and defers the
-    /// failure to an evaluator `unwrap`. `Ty::Any` must only ever come from an
-    /// explicit `Any` annotation, never from inference giving up.
+    /// downstream check, so promoting a genuine mismatch to `Any` suppresses
+    /// all further checking and defers the failure to an evaluator `unwrap`.
+    /// `Ty::Any` must only ever come from an explicit `Any` annotation, never
+    /// from inference giving up.
     pub fn lub(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             // Unknown promotes to any type. It already marks an earlier error,
@@ -8028,8 +8027,6 @@ pub enum Value {
     /// layout to draw. Anything built from a poisoned value is poisoned in
     /// turn, silently, so one mistake produces one error rather than one per
     /// expression that reads it.
-    ///
-    /// Poison never reaches the emitted layout: [`ExecPass::emit`] skips it.
     Poison,
 }
 
