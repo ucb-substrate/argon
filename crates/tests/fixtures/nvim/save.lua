@@ -20,14 +20,18 @@ local first, first_path = buffer('first.ar', 'argon', 'first unsaved')
 local second, second_path = buffer('second.ar', 'argon', 'second unsaved')
 local unrelated, unrelated_path = buffer('unrelated.ar', 'argon', 'unrelated unsaved')
 local non_argon, non_argon_path = buffer('notes.txt', 'text', 'notes unsaved')
-local buffers = { first, second, unrelated, non_argon }
 
-local old_get_buffers = vim.lsp.get_buffers_by_client_id
 local old_is_attached = vim.lsp.buf_is_attached
 local old_get_client = vim.lsp.get_client_by_id
 local notification
 local fake_client = {
   name = 'argon',
+  attached_buffers = {
+    [first] = 'argon',
+    [second] = 'argon',
+    [unrelated] = 'argon',
+    [non_argon] = 'text',
+  },
   initialized = false,
   stopped = false,
   is_stopped = function(self)
@@ -37,10 +41,6 @@ local fake_client = {
     notification = { method = method, params = params }
   end,
 }
-vim.lsp.get_buffers_by_client_id = function(id)
-  assert(id == client_id)
-  return buffers
-end
 vim.lsp.buf_is_attached = function(bufnr, id)
   return id == client_id and bufnr ~= unrelated
 end
@@ -76,7 +76,6 @@ vim.api.nvim_buf_set_lines(first, 0, -1, false, { 'modified after stop' })
 save.notify_workspace_modified(client_id)
 assert(notification == nil)
 
-vim.lsp.get_buffers_by_client_id = old_get_buffers
 vim.lsp.buf_is_attached = old_is_attached
 vim.lsp.get_client_by_id = old_get_client
 vim.fn.delete(directory, 'rf')

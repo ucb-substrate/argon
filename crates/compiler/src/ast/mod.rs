@@ -200,8 +200,9 @@ pub struct ForLoop<S, T: AstMetadata> {
     pub span: cfgrammar::Span,
 }
 
+/// A numeric arithmetic operation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub enum BinOp {
+pub enum ArithOp {
     Add,
     Sub,
     Mul,
@@ -215,6 +216,14 @@ pub enum UnaryOp {
     Neg,
 }
 
+/// A boolean operation (short-circuiting).
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BoolOp {
+    And,
+    Or,
+}
+
+/// A comparison operation.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ComparisonOp {
     Eq,
@@ -225,11 +234,18 @@ pub enum ComparisonOp {
     Lt,
 }
 
+/// A binary operation.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BinOp {
+    Arith(ArithOp),
+    Cmp(ComparisonOp),
+    Bool(BoolOp),
+}
+
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub enum Expr<S, T: AstMetadata> {
     If(Box<IfExpr<S, T>>),
     Match(Box<MatchExpr<S, T>>),
-    Comparison(Box<ComparisonExpr<S, T>>),
     BinOp(Box<BinOpExpr<S, T>>),
     UnaryOp(Box<UnaryOpExpr<S, T>>),
     Call(CallExpr<S, T>),
@@ -275,6 +291,7 @@ pub struct MatchArm<S, T: AstMetadata> {
     pub span: cfgrammar::Span,
 }
 
+/// A binary operation expression.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct BinOpExpr<S, T: AstMetadata> {
     pub op: BinOp,
@@ -290,15 +307,6 @@ pub struct UnaryOpExpr<S, T: AstMetadata> {
     pub operand: Expr<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::UnaryOpExpr,
-}
-
-#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
-pub struct ComparisonExpr<S, T: AstMetadata> {
-    pub op: ComparisonOp,
-    pub left: Expr<S, T>,
-    pub right: Expr<S, T>,
-    pub span: cfgrammar::Span,
-    pub metadata: T::ComparisonExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -385,7 +393,6 @@ impl<S, T: AstMetadata> Expr<S, T> {
         match self {
             Self::If(x) => x.span,
             Self::Match(x) => x.span,
-            Self::Comparison(x) => x.span,
             Self::BinOp(x) => x.span,
             Self::UnaryOp(x) => x.span,
             Self::Call(x) => x.span,
@@ -422,7 +429,6 @@ pub trait AstMetadata {
     type MatchExpr: Debug + Clone + Serialize + DeserializeOwned;
     type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
     type UnaryOpExpr: Debug + Clone + Serialize + DeserializeOwned;
-    type ComparisonExpr: Debug + Clone + Serialize + DeserializeOwned;
     type FieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IndexFieldAccessExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IndexExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -522,12 +528,7 @@ pub trait AstTransformer {
         input: &UnaryOpExpr<Self::InputS, Self::InputMetadata>,
         operand: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr;
-    fn dispatch_comparison_expr(
-        &mut self,
-        input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr;
+
     fn dispatch_cast(
         &mut self,
         input: &CastExpr<Self::InputS, Self::InputMetadata>,
@@ -863,21 +864,7 @@ pub trait AstTransformer {
             operand,
         }
     }
-    fn transform_comparison_expr(
-        &mut self,
-        input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
-    ) -> ComparisonExpr<Self::OutputS, Self::OutputMetadata> {
-        let left = self.transform_expr(&input.left);
-        let right = self.transform_expr(&input.right);
-        let metadata = self.dispatch_comparison_expr(input, &left, &right);
-        ComparisonExpr {
-            op: input.op,
-            span: input.span,
-            metadata,
-            left,
-            right,
-        }
-    }
+
     fn transform_field_access_expr(
         &mut self,
         input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -1085,14 +1072,11 @@ pub trait AstTransformer {
         match input {
             Expr::If(if_expr) => Expr::If(Box::new(self.transform_if_expr(if_expr))),
             Expr::Match(match_expr) => Expr::Match(Box::new(self.transform_match_expr(match_expr))),
-            Expr::BinOp(bin_op_expr) => {
-                Expr::BinOp(Box::new(self.transform_bin_op_expr(bin_op_expr)))
-            }
             Expr::UnaryOp(unary_op_expr) => {
                 Expr::UnaryOp(Box::new(self.transform_unary_op_expr(unary_op_expr)))
             }
-            Expr::Comparison(comparison_expr) => {
-                Expr::Comparison(Box::new(self.transform_comparison_expr(comparison_expr)))
+            Expr::BinOp(bin_op_expr) => {
+                Expr::BinOp(Box::new(self.transform_bin_op_expr(bin_op_expr)))
             }
             Expr::Call(call_expr) => Expr::Call(self.transform_call_expr(call_expr)),
             Expr::Emit(emit_expr) => Expr::Emit(Box::new(self.transform_emit_expr(emit_expr))),

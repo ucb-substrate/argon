@@ -116,6 +116,12 @@ pub enum LangServerAction {
     Redo,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusEditorParams {
+    pub command: Option<String>,
+    pub return_to_gui: bool,
+}
+
 #[tarpc::service]
 pub trait LangServer {
     async fn register(addr: SocketAddr);
@@ -138,11 +144,13 @@ pub trait LangServer {
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
-    async fn focus_editor(command: Option<String>);
+    async fn focus_editor(params: FocusEditorParams);
 }
 
 #[tarpc::service]
 pub trait Gui {
+    async fn compilation_started(activity_id: u64);
+    async fn compilation_finished(activity_id: u64);
     /// Returns whether the snapshot was accepted. A rejected delta is retried
     /// as a full snapshot so reconnects and deferred UI updates self-heal.
     async fn update_cell(snapshot: CompilationSnapshot) -> bool;
@@ -193,7 +201,9 @@ fn leading_indentation(line: &str) -> &str {
 
 fn indentation_at_offset(document: &Document, offset: usize) -> String {
     let position = document.offset_to_pos(offset);
-    let prefix = document.substr(Position::new(position.line, 0)..position);
+    let prefix = document
+        .substr(Position::new(position.line, 0)..position)
+        .unwrap_or_default();
     let indentation = leading_indentation(prefix);
     if indentation.len() == prefix.len() {
         indentation.to_owned()
@@ -231,11 +241,15 @@ fn scope_body_indentation(
 
     let start = document.offset_to_pos(scope_span.start());
     let stop = document.offset_to_pos(scope_span.end());
-    let closing_line = document.substr(Position::new(stop.line, 0)..stop);
+    let closing_line = document
+        .substr(Position::new(stop.line, 0)..stop)
+        .unwrap_or_default();
     let closing_indentation = leading_indentation(closing_line);
 
     if start.line + 1 < stop.line {
-        let body = document.substr(Position::new(start.line + 1, 0)..Position::new(stop.line, 0));
+        let body = document
+            .substr(Position::new(start.line + 1, 0)..Position::new(stop.line, 0))
+            .unwrap_or_default();
         if let Some(indentation) = body
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -273,7 +287,9 @@ pub(crate) fn insert_statement(
     } else {
         let start = document.offset_to_pos(scope_span.start());
         let stop = document.offset_to_pos(scope_span.end());
-        let line = document.substr(Position::new(stop.line, 0)..stop);
+        let line = document
+            .substr(Position::new(stop.line, 0)..stop)
+            .unwrap_or_default();
         let closing_indentation = leading_indentation(line);
         (
             scope_span.end() - 1,
@@ -559,7 +575,7 @@ impl LangServer for State {
         // TODO: check that vim file is in sync with GUI file.
         let compiled = self.published_state.lock().await;
         if let Some(ast) = compiled.ast.values().find(|ast| ast.path == span.path) {
-            let doc = Document::new(&ast.source_text, 0);
+            let doc = self.document(&ast.source_text);
             let Some(url) = Uri::from_file_path(&span.path) else {
                 return;
             };
@@ -600,7 +616,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let grid = self.technology_grid().await;
         let expression = format!(
             "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
@@ -654,7 +670,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let expression = polygon_expression(&polygon);
         let prefix = format!("let {var_name} = ");
         let constraints = segment_constraint_statements(&var_name, &polygon.constraints);
@@ -698,7 +714,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let expression = path_expression(&path);
         let prefix = format!("let {var_name} = ");
         let constraints = segment_constraint_statements(&var_name, &path.constraints);
@@ -740,7 +756,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let names = scope
             .stmts
             .iter()
@@ -795,7 +811,7 @@ impl LangServer for State {
             .values()
             .find(|ast| ast.path == scope_span.path)?;
         let scope = ast.span2scope.get(&scope_span)?;
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let expression = format!(
             "dimension({}, {}, {}, {}, {}, {}, {})",
             params.p,
@@ -841,7 +857,7 @@ impl LangServer for State {
         let ast = workspace_ast.values().find(|ast| ast.path == span.path)?;
         let call = ast.span2call.get(&span)?;
         let old_value = call.args.posargs.get(2)?;
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let edit = TextEdit {
             range: Range::new(
                 document.offset_to_pos(old_value.span().start()),
@@ -973,7 +989,7 @@ impl LangServer for State {
             if let Some(ast) = workspace_ast.values().find(|ast| ast.path == span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
             {
-                let doc = Document::new(&ast.source_text, 0);
+                let doc = self.document(&ast.source_text);
                 let start = doc.offset_to_pos(span.span.start());
                 let stop = doc.offset_to_pos(span.span.end());
                 pending.entry(uri).or_default().push((
@@ -1028,7 +1044,7 @@ impl LangServer for State {
         let Some(scope) = ast.span2scope.get(&scope_span) else {
             return;
         };
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.document(&ast.source_text);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -1068,9 +1084,9 @@ impl LangServer for State {
         }
     }
 
-    async fn focus_editor(self, _: tarpc::context::Context, command: Option<String>) {
+    async fn focus_editor(self, _: tarpc::context::Context, params: FocusEditorParams) {
         self.editor_client
-            .send_notification::<crate::FocusEditor>(command)
+            .send_notification::<crate::FocusEditor>(params)
             .await;
     }
 }
@@ -1086,7 +1102,7 @@ mod tests {
         instance_placement_expression, missing_initial_condition_edit, path_expression,
         polygon_expression, segment_constraint_statements, source_edit_error,
     };
-    use crate::{PublishedState, SourceState};
+    use crate::{PublishedState, SourceState, document::PositionEncoding};
 
     #[test]
     fn generated_gds_declarations_do_not_make_editor_buffers_stale() {
@@ -1105,7 +1121,7 @@ mod tests {
         let mut source_state = SourceState::default();
         source_state
             .editor_files
-            .insert(uri, Document::new(source, 1));
+            .insert(uri, Document::new(source, 1, PositionEncoding::Utf8));
 
         assert!(editor_buffers_are_current(&source_state, &compiled));
 
@@ -1147,9 +1163,10 @@ mod tests {
             ..Default::default()
         };
         let mut source_state = SourceState::default();
-        source_state
-            .editor_files
-            .insert(uri.clone(), Document::new("cell top() { rect(); }\n", 2));
+        source_state.editor_files.insert(
+            uri.clone(),
+            Document::new("cell top() { rect(); }\n", 2, PositionEncoding::Utf8),
+        );
         assert!(!editor_buffers_are_current(&source_state, &compiled));
 
         source_state.pending_workspace_edits.insert(uri, 1);
@@ -1271,7 +1288,7 @@ mod tests {
         let statement = "let r = rect()!;";
         let expression_start = "let r = ".len();
         let insertion = insert_statement(
-            &Document::new(source, 0),
+            &Document::new(source, 0, PositionEncoding::Utf8),
             cfgrammar::Span::new(scope_start, scope_end),
             Some(tail_start),
             statement,
@@ -1297,7 +1314,7 @@ mod tests {
         let scope_start = source.find('{').expect("scope should start");
         let closing_brace = source.find('}').expect("scope should end");
         let insertion = insert_statement(
-            &Document::new(source, 0),
+            &Document::new(source, 0, PositionEncoding::Utf8),
             cfgrammar::Span::new(scope_start, closing_brace + 1),
             None,
             "eq(x, y);",
@@ -1314,7 +1331,7 @@ mod tests {
         let scope_start = source.find('{').expect("scope should start");
         let closing_brace = source.find('}').expect("scope should end");
         let insertion = insert_statement(
-            &Document::new(source, 0),
+            &Document::new(source, 0, PositionEncoding::Utf8),
             cfgrammar::Span::new(scope_start, closing_brace + 1),
             None,
             "let r = rect()!;",
@@ -1334,7 +1351,7 @@ mod tests {
         let scope_start = source.rfind('{').expect("scope should start");
         let closing_brace = source.rfind('}').expect("scope should end");
         let insertion = insert_statement(
-            &Document::new(source, 0),
+            &Document::new(source, 0, PositionEncoding::Utf8),
             cfgrammar::Span::new(scope_start, closing_brace + 1),
             None,
             "eq(x, y);",
@@ -1350,7 +1367,7 @@ mod tests {
         let scope_start = source.find('{').expect("scope should start");
         let closing_brace = source.find('}').expect("scope should end");
         let insertion = insert_statement(
-            &Document::new(source, 0),
+            &Document::new(source, 0, PositionEncoding::Utf8),
             cfgrammar::Span::new(scope_start, closing_brace + 1),
             None,
             "let p = polygon(\n        points\n    )!;",

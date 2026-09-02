@@ -21,11 +21,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_gui_command_returns_focus_to_gui() {
+    async fn gui_commands_respect_return_focus_configuration() {
         let mut command = crate::nvim_command();
         command
             .arg("-l")
             .arg(crate::repository_root().join("crates/tests/fixtures/nvim/focus.lua"));
+        let child = command.spawn().expect("start headless Neovim");
+        crate::finish_nvim(child).await;
+    }
+
+    #[tokio::test]
+    async fn compilation_status_renders_and_cleans_up_progress() {
+        let mut command = crate::nvim_command();
+        command
+            .arg("-l")
+            .arg(crate::repository_root().join("crates/tests/fixtures/nvim/server_status.lua"));
         let child = command.spawn().expect("start headless Neovim");
         crate::finish_nvim(child).await;
     }

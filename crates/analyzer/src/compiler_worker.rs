@@ -1,4 +1,5 @@
 use std::{
+    panic::{self, AssertUnwindSafe},
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -6,13 +7,15 @@ use std::{
 
 use arc::Library;
 use argonc::{
-    WorkspaceConfig,
+    COMPILE_STACK_SIZE, WorkspaceConfig,
     cancellation::CancellationToken,
     compile::{CompileOutput, StaticErrorCompileOutput},
     incremental::IncrementalCompiler,
+    nav::NavIndex,
     parse::WorkspaceParseAst,
 };
 use tokio::sync::oneshot;
+use tracing::error;
 
 use crate::workspace_config;
 
@@ -34,6 +37,12 @@ pub(crate) struct CompileResult {
     pub(crate) root_dir: PathBuf,
     pub(crate) config: WorkspaceConfig,
     pub(crate) ast: WorkspaceParseAst,
+    /// Position-indexed definitions and references. `None` until the workspace
+    /// has type-checked once — after that the session keeps serving the last
+    /// index that had content — and on the paths that answer without reaching
+    /// the compiler at all: a manifest that would not load, or an internal
+    /// compiler error. None of those means "there is no index".
+    pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) output: Option<CompileOutput>,
     pub(crate) messages: Vec<String>,
 }
@@ -53,23 +62,37 @@ enum Command {
 
 /// A serial command queue whose dedicated thread exclusively owns the
 /// process-local incremental compilation session.
+///
+/// The thread is respawned if it dies. A compiler panic would otherwise end
+/// compilation for the rest of the editor session: the receiver would drop,
+/// and every later send fails silently, so the editor would simply stop
+/// getting diagnostics with no indication why.
 #[derive(Clone, Debug)]
 pub(crate) struct CompilerWorker {
-    commands: mpsc::Sender<Command>,
+    commands: Arc<Mutex<mpsc::Sender<Command>>>,
     active_cancellation: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl CompilerWorker {
     pub(crate) fn new() -> Self {
-        let (commands, receiver) = mpsc::channel();
-        thread::Builder::new()
-            .name("argon-compiler".to_owned())
-            .spawn(move || run(receiver))
-            .expect("spawn incremental compiler worker");
         Self {
-            commands,
+            commands: Arc::new(Mutex::new(spawn_worker())),
             active_cancellation: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Sends `command`, respawning the worker once if the current one has died.
+    fn send(&self, command: Command) -> bool {
+        let mut commands = match self.commands.lock() {
+            Ok(commands) => commands,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Err(returned) = commands.send(command) else {
+            return true;
+        };
+        error!("incremental compiler worker died; restarting it");
+        *commands = spawn_worker();
+        commands.send(returned.0).is_ok()
     }
 
     fn cancel_active(&self) {
@@ -85,12 +108,12 @@ impl CompilerWorker {
 
     pub(crate) fn set_source_text(&self, path: PathBuf, contents: String) {
         self.cancel_active();
-        let _ = self.commands.send(Command::SetSource { path, contents });
+        self.send(Command::SetSource { path, contents });
     }
 
     pub(crate) fn remove_source(&self, path: PathBuf) {
         self.cancel_active();
-        let _ = self.commands.send(Command::RemoveSource(path));
+        self.send(Command::RemoveSource(path));
     }
 
     pub(crate) async fn compile(&self, request: CompileRequest) -> Option<CompileResult> {
@@ -104,15 +127,28 @@ impl CompilerWorker {
         {
             previous.cancel();
         }
-        self.commands
-            .send(Command::Compile {
-                request,
-                cancellation,
-                response,
-            })
-            .ok()?;
+        if !self.send(Command::Compile {
+            request,
+            cancellation,
+            response,
+        }) {
+            return None;
+        }
         result.await.ok()
     }
+}
+
+fn spawn_worker() -> mpsc::Sender<Command> {
+    let (commands, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("argon-compiler".to_owned())
+        // Compilation recurses natively for inlined `fn` calls and nested cell
+        // instantiation; on the default stack a deep hierarchy aborts the whole
+        // language server rather than reporting a recursion-limit diagnostic.
+        .stack_size(COMPILE_STACK_SIZE)
+        .spawn(move || run(receiver))
+        .expect("spawn incremental compiler worker");
+    commands
 }
 
 fn run(commands: mpsc::Receiver<Command>) {
@@ -130,7 +166,40 @@ fn run(commands: mpsc::Receiver<Command>) {
                 cancellation,
                 response,
             } => {
-                if let Some(result) = compile(&mut compiler, request, &cancellation) {
+                // An internal compiler error must fail one request, not the
+                // session: the panic is reported as a message on this result
+                // and the worker keeps its incremental state.
+                let identity = request.identity.clone();
+                let root_dir = request.root_dir.clone();
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    compile(&mut compiler, request, &cancellation)
+                }))
+                .unwrap_or_else(|_| {
+                    error!("internal compiler error while compiling {root_dir:?}");
+                    // The panic may have left the incremental session
+                    // half-updated, so start a fresh one: losing the caches
+                    // costs a rebuild, keeping poisoned state costs
+                    // correctness.
+                    compiler = IncrementalCompiler::new();
+                    Some(CompileResult {
+                        identity,
+                        config: WorkspaceConfig::new(root_dir.join("lib.ar")),
+                        root_dir,
+                        ast: WorkspaceParseAst::default(),
+                        // The fresh session has no index yet, and this
+                        // request never got far enough to ask for one.
+                        // Publishing treats that as "nothing to say"
+                        // rather than as an index to clear.
+                        nav: None,
+                        output: None,
+                        messages: vec![
+                            "internal compiler error; see the Argon log for details".to_owned(),
+                        ],
+                    })
+                });
+                // A cancelled compilation yields no result: the caller is
+                // already superseded by the request that cancelled it.
+                if let Some(result) = result {
                     let _ = response.send(result);
                 }
             }
@@ -154,6 +223,7 @@ fn compile(
                     config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                     root_dir,
                     ast: WorkspaceParseAst::default(),
+                    nav: None,
                     output: None,
                     messages: vec![error.to_string()],
                 });
@@ -164,6 +234,7 @@ fn compile(
     };
     let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
     let analysis = compiler.analyze_workspace_cancellable(&workspace, cancellation)?;
+    let nav = compiler.nav(&workspace);
     let ast = analysis.ast;
     let mut messages = Vec::new();
 
@@ -191,6 +262,7 @@ fn compile(
                     root_dir,
                     config: workspace,
                     ast,
+                    nav,
                     output: None,
                     messages,
                 });
@@ -215,6 +287,7 @@ fn compile(
         root_dir,
         config: workspace,
         ast,
+        nav,
         output,
         messages,
     })

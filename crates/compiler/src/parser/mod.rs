@@ -145,6 +145,12 @@ mod tests {
             "let r = rect(\"met1\", x0=0., y0=0., x1=400.)!;",
             "for i in range(3) { eq(i, i); }",
             "match k { A => 1, B => 2, }",
+            "let x = a && b;",
+            "let x = a || b;",
+            "let x = !a && !b;",
+            "let x = a && b!;",
+            "let x = a < b && c >= d || !e;",
+            "if a && b {} else {}",
         ];
         for body in valid {
             assert!(snippet_ok(body), "should parse: `{body}`");
@@ -166,6 +172,94 @@ mod tests {
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+    }
+
+    /// Renders an expression fully parenthesized.
+    fn shape<S: std::fmt::Display, T: crate::ast::AstMetadata>(
+        expr: &crate::ast::Expr<S, T>,
+    ) -> String {
+        use crate::ast::{ArithOp, BinOp, BoolOp, ComparisonOp, Expr, UnaryOp};
+        match expr {
+            Expr::BinOp(e) => {
+                let op = match e.op {
+                    BinOp::Bool(BoolOp::Or) => "||",
+                    BinOp::Bool(BoolOp::And) => "&&",
+                    BinOp::Cmp(ComparisonOp::Eq) => "==",
+                    BinOp::Cmp(ComparisonOp::Ne) => "!=",
+                    BinOp::Cmp(ComparisonOp::Geq) => ">=",
+                    BinOp::Cmp(ComparisonOp::Gt) => ">",
+                    BinOp::Cmp(ComparisonOp::Leq) => "<=",
+                    BinOp::Cmp(ComparisonOp::Lt) => "<",
+                    BinOp::Arith(ArithOp::Add) => "+",
+                    BinOp::Arith(ArithOp::Sub) => "-",
+                    BinOp::Arith(ArithOp::Mul) => "*",
+                    BinOp::Arith(ArithOp::Div) => "/",
+                    BinOp::Arith(ArithOp::Rem) => "%",
+                };
+                format!("({} {op} {})", shape(&e.left), shape(&e.right))
+            }
+            Expr::UnaryOp(e) => {
+                let op = match e.op {
+                    UnaryOp::Not => "!",
+                    UnaryOp::Neg => "-",
+                };
+                format!("({op}{})", shape(&e.operand))
+            }
+            Expr::Emit(e) => format!("({}!)", shape(&e.value)),
+            Expr::IdentPath(p) => p
+                .path
+                .iter()
+                .map(|ident| ident.name.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+            Expr::BoolLiteral(b) => b.value.to_string(),
+            Expr::IntLiteral(i) => i.value.to_string(),
+            other => panic!(
+                "shape() does not render this expression kind (span {:?})",
+                other.span()
+            ),
+        }
+    }
+
+    /// Parses `let x = <expr>;` in a cell body and renders the expression.
+    fn expr_shape(expr: &str) -> String {
+        use crate::ast::{Decl, Statement};
+
+        let src = format!("cell __t__() {{ let x = {expr}; }}");
+        let mut parser = super::grammar::Parser::new(&src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "`{expr}`: {:?}", parser.errors);
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell decl");
+        };
+        let Statement::LetBinding(binding) = &cell.scope.stmts[0] else {
+            panic!("expected a let binding");
+        };
+        shape(&binding.value)
+    }
+
+    #[test]
+    fn boolean_operator_precedence_and_associativity() {
+        // `||` binds loosest, then `&&`, then the comparisons, then the
+        // arithmetic operators -- as in Rust. All are left-associative.
+        for (expr, expected) in [
+            ("a || b && c", "(a || (b && c))"),
+            ("a && b || c", "((a && b) || c)"),
+            ("a && b && c", "((a && b) && c)"),
+            ("a || b || c", "((a || b) || c)"),
+            ("a == b && c != d", "((a == b) && (c != d))"),
+            ("a < b || c >= d", "((a < b) || (c >= d))"),
+            ("a + b < c && d", "(((a + b) < c) && d)"),
+            // Prefix `!` takes only its operand, so it binds tighter than
+            // every infix operator but does not absorb a suffix.
+            ("!a && b", "((!a) && b)"),
+            ("!(a && b)", "(!(a && b))"),
+            ("!a || !b && !c", "((!a) || ((!b) && (!c)))"),
+            ("a && b!", "(a && (b!))"),
+            ("!a!", "((!a)!)"),
+        ] {
+            assert_eq!(expr_shape(expr), expected, "parsing `{expr}`");
         }
     }
 

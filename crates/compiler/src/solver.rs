@@ -34,7 +34,11 @@ pub struct Solver {
     updated_vars: IndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: IndexSet<ConstraintId>,
-    off_grid_vars: IndexSet<Var>,
+    /// Variables whose solved value missed the grid, with the value the
+    /// solver computed. Rounding each variable in isolation can break a
+    /// constraint that couples several of them, so the diagnostic needs the
+    /// number, not just the fact that a miss happened.
+    off_grid_vars: IndexMap<Var, f64>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
@@ -63,7 +67,7 @@ impl Default for Solver {
             updated_vars: IndexSet::new(),
             back_substitute_stack: Vec::new(),
             inconsistent_constraints: IndexSet::new(),
-            off_grid_vars: IndexSet::new(),
+            off_grid_vars: IndexMap::new(),
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
@@ -159,8 +163,15 @@ impl Solver {
     }
 
     #[inline]
-    pub fn off_grid_vars(&self) -> &IndexSet<Var> {
+    pub fn off_grid_vars(&self) -> &IndexMap<Var, f64> {
         &self.off_grid_vars
+    }
+
+    /// The snap-grid spacing this solver rounds solved values to, in source
+    /// coordinate units.
+    #[inline]
+    pub fn grid(&self) -> f64 {
+        self.grid
     }
 
     pub fn unsolved_vars(&self) -> &IndexSet<Var> {
@@ -220,7 +231,7 @@ impl Solver {
             } else {
                 let rounded_val = crate::tech::snap(val, self.grid);
                 if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(var);
+                    self.off_grid_vars.insert(var, val);
                 }
                 self.solve_var(var, rounded_val);
             }
@@ -437,7 +448,7 @@ impl Solver {
         }
         let rounded = crate::tech::snap(val, self.grid);
         if is_off_grid(val, rounded, self.grid) {
-            self.off_grid_vars.insert(var);
+            self.off_grid_vars.insert(var, val);
         }
         self.solve_var(var, rounded);
     }
@@ -520,20 +531,46 @@ impl Solver {
         self.solved_vars.contains_key(&var)
     }
 
-    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
-        Some(crate::tech::snap(
+    /// Whether every constraint in a component is free of non-finite values.
+    fn component_is_finite(&self, constraints: &[ConstraintId]) -> bool {
+        constraints
+            .iter()
+            .all(|id| self.constraints[id].is_finite())
+    }
+
+    /// Evaluates `expr` against the solved variables, without snapping.
+    ///
+    /// Use this wherever the result is a plain scalar rather than a coordinate
+    /// that will be emitted -- notably the operands of `*` and `/`. The
+    /// manufacturing grid quantizes *positions*, so applying it to a scalar is
+    /// a category error: on a 5 DBU grid the literal `2.` snaps to `0.`, which
+    /// silently turns `(a + b)/2.` into a division by zero and poisons the
+    /// constraint with `inf` coefficients.
+    pub fn eval_expr_exact(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(
             expr.coeffs
                 .iter()
                 .map(|(coeff, var)| self.value_of(*var).map(|val| val * coeff))
                 .fold_options(0., |a, b| a + b)?
                 + expr.constant,
-            self.grid,
-        ))
+        )
+    }
+
+    /// Evaluates `expr` as a coordinate, snapped to the manufacturing grid.
+    pub fn eval_expr(&self, expr: &LinearExpr) -> Option<f64> {
+        Some(crate::tech::snap(self.eval_expr_exact(expr)?, self.grid))
     }
 
     fn solve_component(&mut self, vars: &IndexSet<Var>, constraints: &[ConstraintId]) {
         let n_vars = vars.len();
         if n_vars == 0 || constraints.is_empty() {
+            return;
+        }
+        // The sparse solver rejects non-finite input, which is exactly what
+        // routes a component here; the dense fallback has no such guard and
+        // would never converge. Leave the component unsolved instead, so it
+        // surfaces as an ordinary diagnostic.
+        if !self.component_is_finite(constraints) {
             return;
         }
         if self.try_solve_sparse_component(vars, constraints) {
@@ -579,7 +616,7 @@ impl Solver {
                 let val = sol[(i, 0)];
                 let rounded_val = crate::tech::snap(val, self.grid);
                 if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(*var);
+                    self.off_grid_vars.insert(*var, val);
                 }
                 self.solve_var(*var, rounded_val);
             }
@@ -643,6 +680,10 @@ impl Solver {
     ) -> Vec<Vec<(f64, Var)>> {
         let n_vars = vars.len();
         if n_vars == 0 || constraints.is_empty() {
+            return Vec::new();
+        }
+        // See `solve_component`: a non-finite entry hangs the dense SVD.
+        if !self.component_is_finite(constraints) {
             return Vec::new();
         }
         let var_indices: IndexMap<Var, usize> =
@@ -775,6 +816,17 @@ pub struct LinearExpr {
 impl LinearExpr {
     pub fn add(lhs: impl Into<LinearExpr>, rhs: impl Into<LinearExpr>) -> Self {
         lhs.into() + rhs.into()
+    }
+
+    /// Whether every coefficient and the constant term are finite.
+    ///
+    /// A NaN or infinite coefficient reaching the dense `nalgebra` fallback
+    /// makes its Golub-Kahan iteration run forever: `Matrix::svd` passes
+    /// `max_niter = 0`, which that loop treats as *no* limit rather than as an
+    /// immediate stop. A hang is not catchable, so non-finite values must be
+    /// kept out of the linear algebra entirely.
+    pub fn is_finite(&self) -> bool {
+        self.constant.is_finite() && self.coeffs.iter().all(|(coeff, _)| coeff.is_finite())
     }
 
     /// Substitutes variables in `table` and removes entries with coefficient 0.
@@ -1047,8 +1099,8 @@ mod tests {
 
         assert_relative_eq!(s.value_of(on_grid).unwrap(), 1.25, epsilon = EPSILON);
         assert_relative_eq!(s.value_of(off_grid).unwrap(), 1.25, epsilon = EPSILON);
-        assert!(!s.off_grid_vars().contains(&on_grid));
-        assert!(s.off_grid_vars().contains(&off_grid));
+        assert!(!s.off_grid_vars().contains_key(&on_grid));
+        assert!(s.off_grid_vars().contains_key(&off_grid));
     }
 
     /// Variables eliminated in an earlier `solve()` (before the closing constraint

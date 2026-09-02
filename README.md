@@ -172,6 +172,20 @@ vim.pack.add({
 The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
 
+Errors are reported as you type; `:Argon diagnostics` opens them in a list.
+Code navigation works on variables, function and cell names, enums and their
+variants, module paths, and the fields of an instance:
+
+| Mapping | Action |
+|---|---|
+| `gd`, `<C-]>` | Go to definition |
+| `grr` | List references |
+
+Navigation crosses files, follows path dependencies into other libraries, and
+jumps into the standard library, which is written to `~/.cache/argon` the
+first time you navigate into it. It keeps working while the workspace has
+errors, answering from the last version that type-checked.
+
 From an Argon project directory, start Neovim and the GUI together:
 
 ```bash
@@ -292,6 +306,21 @@ hierarchy sidebar, press `i`, enter a cell invocation such as
 `inset_rect(150., 150.)`, and press `Enter`. Move the instance outline to the
 desired location and click to insert it. The placement tool remains active so
 you can click again to insert more copies; press `Esc` when finished.
+
+## Configuration
+
+Argon's configuration file is `~/.config/argon/config.toml`, or
+`$XDG_CONFIG_HOME/argon/config.toml` when `XDG_CONFIG_HOME` is set. The GUI's
+font and icon sizes can be overridden in logical pixels:
+
+```toml
+[gui]
+font_size = 14
+icon_size = 18
+```
+
+Both values are optional and must be between 1 and 256. Omit them to use the
+built-in sizes. Run `:Argon reload` after editing the file.
 
 ## Logs
 

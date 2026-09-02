@@ -1,15 +1,20 @@
 mod compiler_worker;
 pub mod document;
+mod navigation;
 pub mod rpc;
 
 pub mod cli;
 
 use std::{
+    collections::HashMap,
     env, fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{
+        Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -21,6 +26,7 @@ use argonc::{
         self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
         VarIdTyMetadata,
     },
+    nav::NavIndex,
     parse::{self, CellInvocation, WorkspaceParseAst},
 };
 use futures::prelude::*;
@@ -38,14 +44,16 @@ use tokio::{
 };
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{notification::Notification, request::Request, *};
-use tower_lsp_server::{Client, LanguageServer, LspService, Server};
+use tower_lsp_server::{
+    Client, LanguageServer, LspService, NotCancellable, OngoingProgress, Server, Unbounded,
+};
 use tracing::{error, info};
 use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
 use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
-use crate::document::{Document, DocumentChange};
+use crate::document::{Document, DocumentChange, PositionEncoding};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
@@ -95,6 +103,12 @@ pub struct GuiConfig {
     pub dark_mode: bool,
     /// Maximum rendered hierarchy depth. Omitted means unlimited.
     pub hierarchy_depth: Option<usize>,
+    /// Global GUI icon-size override in logical pixels.
+    #[serde(default, deserialize_with = "deserialize_gui_size")]
+    pub icon_size: Option<f32>,
+    /// Global GUI font-size override in logical pixels.
+    #[serde(default, deserialize_with = "deserialize_gui_size")]
+    pub font_size: Option<f32>,
 }
 
 impl Default for GuiConfig {
@@ -102,8 +116,39 @@ impl Default for GuiConfig {
         Self {
             dark_mode: true,
             hierarchy_depth: None,
+            icon_size: None,
+            font_size: None,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HumanReadableGuiSize {
+    Integer(u16),
+    Float(f32),
+    None(()),
+}
+
+fn deserialize_gui_size<'de, D>(deserializer: D) -> std::result::Result<Option<f32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let size = if deserializer.is_human_readable() {
+        match HumanReadableGuiSize::deserialize(deserializer)? {
+            HumanReadableGuiSize::Integer(size) => Some(f32::from(size)),
+            HumanReadableGuiSize::Float(size) => Some(size),
+            HumanReadableGuiSize::None(()) => None,
+        }
+    } else {
+        Option::<f32>::deserialize(deserializer)?
+    };
+    if size.is_some_and(|size| !size.is_finite() || !(1.0..=256.0).contains(&size)) {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "GUI sizes must be between 1 and 256 logical pixels",
+        ));
+    }
+    Ok(size)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,30 +165,34 @@ impl Default for LogConfig {
     }
 }
 
-pub fn argon_config_path() -> Option<PathBuf> {
-    env::var_os("XDG_CONFIG_HOME")
+/// Argon's own subdirectory of one XDG base directory.
+///
+/// `variable` is the XDG environment variable naming the base directory, and
+/// `home_fallback` the path relative to the home directory that the XDG
+/// specification falls back to when it is unset or empty.
+fn argon_xdg_dir(variable: &str, home_fallback: &str) -> Option<PathBuf> {
+    env::var_os(variable)
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             homedir::my_home()
                 .ok()
                 .flatten()
-                .map(|home| home.join(".config"))
+                .map(|home| home.join(home_fallback))
         })
-        .map(|directory| directory.join("argon/config.toml"))
+        .map(|directory| directory.join("argon"))
+}
+
+pub fn argon_config_path() -> Option<PathBuf> {
+    argon_xdg_dir("XDG_CONFIG_HOME", ".config").map(|directory| directory.join("config.toml"))
 }
 
 pub fn argon_state_dir() -> Option<PathBuf> {
-    env::var_os("XDG_STATE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            homedir::my_home()
-                .ok()
-                .flatten()
-                .map(|home| home.join(".local/state"))
-        })
-        .map(|directory| directory.join("argon"))
+    argon_xdg_dir("XDG_STATE_HOME", ".local/state")
+}
+
+pub fn argon_cache_dir() -> Option<PathBuf> {
+    argon_xdg_dir("XDG_CACHE_HOME", ".cache")
 }
 
 pub fn argon_log_path() -> Option<PathBuf> {
@@ -316,6 +365,14 @@ impl SourceState {
 pub(crate) struct PublishedState {
     pub(crate) config: WorkspaceConfig,
     pub(crate) ast: Arc<WorkspaceParseAst>,
+    /// Latest usable navigation index.
+    ///
+    /// This can be older than `ast`: the compiler keeps serving the last index
+    /// that covered the workspace so navigation survives a broken edit, and
+    /// decides on its own when that index is superseded. The index carries the
+    /// sources its offsets are into, so a stale one stays readable without
+    /// retaining the parse it came from.
+    pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
 }
@@ -401,6 +458,12 @@ fn compilation_update(
     })
 }
 
+struct CompilationActivity {
+    id: u64,
+    gui_connection: Option<GuiConnection>,
+    editor_progress: OngoingProgress<Unbounded, NotCancellable>,
+}
+
 fn is_gui_disconnected(error: &tarpc::client::RpcError) -> bool {
     matches!(
         error,
@@ -462,10 +525,60 @@ fn compile_open_cell(
     compile::execute_cell_invocation(ast, invocation, config)
 }
 
+/// Ranges compiler spans against the workspace files they came from.
+///
+/// Building a [`Document`] indexes every line of a file, so the one built for
+/// a file is kept for the rest of the batch: a single compile routinely
+/// reports many errors against the same handful of files.
+struct SpanRanger<'a> {
+    ast: &'a WorkspaceParseAst,
+    encoding: PositionEncoding,
+    documents: HashMap<PathBuf, Option<Document>>,
+}
+
+impl<'a> SpanRanger<'a> {
+    fn new(ast: &'a WorkspaceParseAst, encoding: PositionEncoding) -> Self {
+        Self {
+            ast,
+            encoding,
+            documents: HashMap::new(),
+        }
+    }
+
+    /// Range of `span` within the editor-visible text of the file that produced
+    /// it.
+    ///
+    /// Returns `None` when the file is not part of the compiled workspace or
+    /// when the span starts beyond the editor-visible source. Generated
+    /// declarations (GDS import stubs, spliced entry cells) are appended past
+    /// that boundary, so this is what keeps them from being reported at a
+    /// position no buffer has.
+    fn range(&mut self, span: &Span) -> Option<Range> {
+        let ast = self.ast;
+        let encoding = self.encoding;
+        let document = self
+            .documents
+            .entry(span.path.clone())
+            .or_insert_with(|| {
+                let module = ast.values().find(|module| module.path == span.path)?;
+                Some(Document::new(&module.source_text, 0, encoding))
+            })
+            .as_ref()?;
+        if span.span.start() > document.contents().len() {
+            return None;
+        }
+        Some(Range {
+            start: document.offset_to_pos(span.span.start()),
+            end: document.offset_to_pos(span.span.end()),
+        })
+    }
+}
+
 fn diagnostics(
     root_dir: &Path,
     ast: &WorkspaceParseAst,
     output: Option<&CompileOutput>,
+    encoding: PositionEncoding,
 ) -> IndexMap<Uri, Vec<Diagnostic>> {
     let mut diagnostics: IndexMap<Uri, Vec<Diagnostic>> = IndexMap::new();
     if let Some(o) = output {
@@ -497,19 +610,13 @@ fn diagnostics(
                 .collect(),
             CompileOutput::Valid(_) => vec![],
         };
+        let mut ranger = SpanRanger::new(ast, encoding);
         for (span, message) in errs {
-            // Generated entry declarations are beyond the editor-visible
-            // source. Their diagnostics are reported as analyzer messages.
-            if let Some(ast) = ast.values().find(|ast| ast.path == span.path)
-                && span.span.start() <= ast.source_text.len()
+            if let Some(range) = ranger.range(&span)
                 && let Some(url) = Uri::from_file_path(&span.path)
             {
-                let doc = Document::new(&ast.source_text, 0);
                 diagnostics.entry(url).or_default().push(Diagnostic {
-                    range: Range {
-                        start: doc.offset_to_pos(span.span.start()),
-                        end: doc.offset_to_pos(span.span.end()),
-                    },
+                    range,
                     severity: Some(DiagnosticSeverity::ERROR),
                     message,
                     ..Default::default()
@@ -525,10 +632,20 @@ pub struct State {
     server_addr: SocketAddr,
     editor_client: Client,
     root_dir: Arc<OnceLock<PathBuf>>,
+    /// Negotiated in `initialize`; UTF-16 until the client tells us otherwise.
+    position_encoding: Arc<OnceLock<PositionEncoding>>,
+    /// The embedded standard library, written to disk on first use so the
+    /// editor can open it. `None` if it could not be written.
+    ///
+    /// An async cell because writing it is filesystem work that has to happen
+    /// off the runtime's worker threads, and because requests arriving while
+    /// the write is in flight should await it rather than repeat it.
+    std_file: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
     gui: Arc<Mutex<GuiState>>,
+    next_compilation_activity_id: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
 }
 
@@ -542,10 +659,13 @@ impl State {
             server_addr,
             editor_client,
             root_dir: Default::default(),
+            position_encoding: Default::default(),
+            std_file: Default::default(),
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
             gui: Default::default(),
+            next_compilation_activity_id: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
         }
     }
@@ -558,6 +678,16 @@ impl State {
         read_unpoisoned(&self.app_config).clone()
     }
 
+    pub(crate) fn position_encoding(&self) -> PositionEncoding {
+        self.position_encoding.get().copied().unwrap_or_default()
+    }
+
+    /// A read-only document over compiled source text, for converting spans
+    /// into client-facing ranges. The version is meaningless for these.
+    pub(crate) fn document(&self, contents: impl Into<arcstr::ArcStr>) -> Document {
+        Document::new(contents, 0, self.position_encoding())
+    }
+
     async fn is_latest_compile_request(&self, identity: &CompileIdentity) -> bool {
         let source = self.source_state.lock().await;
         source.compile_identity() == *identity
@@ -565,6 +695,62 @@ impl State {
 
     async fn gui_connection(&self) -> Option<GuiConnection> {
         self.gui.lock().await.connection.clone()
+    }
+
+    async fn begin_compilation(&self, identity: &CompileIdentity) -> CompilationActivity {
+        let id = self
+            .next_compilation_activity_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let gui_connection = self.gui_connection().await;
+        if let Some(connection) = &gui_connection
+            && let Err(error) = connection
+                .client
+                .compilation_started(context::current(), id)
+                .await
+            && is_gui_disconnected(&error)
+        {
+            self.clear_gui_connection(connection.id).await;
+        }
+
+        let token = ProgressToken::String(format!("argon-compilation-{id}"));
+        // This is server-initiated progress, so reserve the token before
+        // publishing its begin notification. Older clients may reject the
+        // request but can still consume the standard $/progress messages.
+        let _ = self
+            .editor_client
+            .create_work_done_progress(token.clone())
+            .await;
+        let message = identity.cell.as_deref().map_or_else(
+            || "Compiling workspace".to_owned(),
+            |cell| format!("Compiling {cell}"),
+        );
+        let editor_progress = self
+            .editor_client
+            .progress(token, "Argon compilation")
+            .with_message(message)
+            .begin()
+            .await;
+        CompilationActivity {
+            id,
+            gui_connection,
+            editor_progress,
+        }
+    }
+
+    async fn finish_compilation(&self, activity: CompilationActivity) {
+        activity.editor_progress.finish().await;
+        let Some(connection) = activity.gui_connection else {
+            return;
+        };
+        if let Err(error) = connection
+            .client
+            .compilation_finished(context::current(), activity.id)
+            .await
+            && is_gui_disconnected(&error)
+        {
+            self.clear_gui_connection(connection.id).await;
+        }
     }
 
     async fn install_gui_connection(&self, client: GuiClient) -> GuiConnection {
@@ -775,8 +961,12 @@ impl Backend {
         if !self.state.is_latest_compile_request(&identity).await {
             return None;
         }
-        let mut current_diagnostics =
-            diagnostics(&result.root_dir, &result.ast, result.output.as_ref());
+        let mut current_diagnostics = diagnostics(
+            &result.root_dir,
+            &result.ast,
+            result.output.as_ref(),
+            self.state.position_encoding(),
+        );
         // The compiled GDS can contain millions of geometry values. Move it
         // into the RPC snapshot after diagnostics have borrowed it instead of
         // deep-cloning the complete layout immediately before serialization.
@@ -799,6 +989,13 @@ impl Backend {
             }
             compiled.config = result.config;
             compiled.ast = Arc::new(result.ast);
+            // The compiler only ever answers `None` before the workspace has
+            // type-checked once, or on a path that never asked it (a manifest
+            // that would not load, an internal compiler error). None of those
+            // is a reason to throw away an index that is still good.
+            if let Some(nav) = result.nav {
+                compiled.nav = Some(nav);
+            }
             compiled.compiled_revision = identity.revision;
         }
 
@@ -897,8 +1094,14 @@ impl Backend {
     }
 
     async fn update_cell(&self, identity: CompileIdentity) -> Option<GuiConnection> {
-        let snapshot = self.compile_snapshot(identity.clone()).await?;
-        self.send_cell_update(&identity, snapshot).await
+        let activity = self.state.begin_compilation(&identity).await;
+        let result = async {
+            let snapshot = self.compile_snapshot(identity.clone()).await?;
+            self.send_cell_update(&identity, snapshot).await
+        }
+        .await;
+        self.state.finish_compilation(activity).await;
+        result
     }
 
     async fn open_cell_view(&self, identity: CompileIdentity) {
@@ -958,13 +1161,21 @@ impl Request for Save {
 struct FocusEditor;
 
 impl Notification for FocusEditor {
-    type Params = Option<String>;
+    type Params = rpc::FocusEditorParams;
 
     const METHOD: &'static str = "custom/focusEditor";
 }
 
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        let encoding = PositionEncoding::negotiate(
+            params
+                .capabilities
+                .general
+                .as_ref()
+                .and_then(|general| general.position_encodings.as_deref()),
+        );
+        let _ = self.state.position_encoding.set(encoding);
         let root_uri = params
             .workspace_folders
             .and_then(|folders| folders.into_iter().next())
@@ -982,6 +1193,9 @@ impl LanguageServer for Backend {
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                position_encoding: Some(encoding.kind()),
+                definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -1006,7 +1220,11 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let doc = Document::new(params.text_document.text, params.text_document.version);
+        let doc = Document::new(
+            params.text_document.text,
+            params.text_document.version,
+            self.state.position_encoding(),
+        );
         let uri = params.text_document.uri;
         if let Some(path) = uri.to_file_path().map(|path| path.into_owned()) {
             self.state
@@ -1075,6 +1293,30 @@ impl LanguageServer for Backend {
         } else {
             self.compile_after_debounce(identity);
         }
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let position = params.text_document_position_params;
+        Ok(self
+            .state
+            .definition(&position.text_document.uri, position.position)
+            .await
+            .map(GotoDefinitionResponse::Scalar))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let position = params.text_document_position;
+        Ok(self
+            .state
+            .references(
+                &position.text_document.uri,
+                position.position,
+                params.context.include_declaration,
+            )
+            .await)
     }
 
     async fn did_save(&self, _: DidSaveTextDocumentParams) {
@@ -1155,13 +1397,13 @@ impl Backend {
         if let Some(connection) = self.state.gui_connection().await {
             self.state
                 .editor_client
-                .show_message(MessageType::LOG, "Attempting to contact existing GUI...")
+                .log_message(MessageType::INFO, "Attempting to contact existing GUI...")
                 .await;
             match connection.client.activate(context::current()).await {
                 Ok(()) => {
                     self.state
                         .editor_client
-                        .show_message(MessageType::LOG, "Connected to existing GUI!")
+                        .log_message(MessageType::INFO, "Connected to existing GUI!")
                         .await;
                     return Ok(true);
                 }
@@ -1169,7 +1411,7 @@ impl Backend {
                     self.state.clear_gui_connection(connection.id).await;
                     self.state
                         .editor_client
-                        .show_message(MessageType::LOG, "Failed to contact existing GUI.")
+                        .log_message(MessageType::INFO, "Failed to contact existing GUI.")
                         .await;
                 }
                 Err(error) => {
@@ -1191,7 +1433,7 @@ impl Backend {
 
         self.state
             .editor_client
-            .show_message(MessageType::LOG, "Starting the GUI...")
+            .log_message(MessageType::INFO, "Starting the GUI...")
             .await;
         let state = self.state.clone();
 
@@ -1375,7 +1617,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let document = Document::new(&ast.source_text, 0);
+        let document = self.state.document(&ast.source_text);
         let scope = &ast.span2scope[&scope_span];
         let preview_binding = (0..)
             .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
@@ -1754,7 +1996,7 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, CompiledSnapshot, DEFAULT_LOG_LEVEL, SentCompilation, SourceState,
+        ArgonConfig, CompiledSnapshot, DEFAULT_LOG_LEVEL, GuiConfig, SentCompilation, SourceState,
         compilation_update, config_with_key, is_gui_disconnected, parse_config,
         preview_instance_cell, read_unpoisoned, write_config, write_unpoisoned,
     };
@@ -1862,13 +2104,37 @@ mod tests {
     fn runtime_configuration_is_loaded_from_toml() {
         let config = parse_config(
             "[analyzer]\ncompile_debounce_ms = 0\n\
-             [gui]\ndark_mode = false\nhierarchy_depth = 3\n",
+             [gui]\ndark_mode = false\nhierarchy_depth = 3\nicon_size = 18\nfont_size = 15.5\n",
         )
         .expect("valid runtime configuration");
         assert_eq!(config.analyzer.compile_debounce_ms, 0);
         assert!(!config.gui.dark_mode);
         assert_eq!(config.gui.hierarchy_depth, Some(3));
+        assert_eq!(config.gui.icon_size, Some(18.));
+        assert_eq!(config.gui.font_size, Some(15.5));
         assert!(parse_config("[gui]\nunknown = true\n").is_err());
+        assert!(parse_config("[gui]\nicon_size = 0\n").is_err());
+        assert!(parse_config("[gui]\nfont_size = 257\n").is_err());
+    }
+
+    #[test]
+    fn runtime_configuration_round_trips_through_rpc_encoding() {
+        for config in [
+            ArgonConfig::default(),
+            ArgonConfig {
+                gui: GuiConfig {
+                    icon_size: Some(18.),
+                    font_size: Some(15.5),
+                    ..GuiConfig::default()
+                },
+                ..ArgonConfig::default()
+            },
+        ] {
+            let encoded = bincode::serialize(&config).unwrap();
+            let decoded: ArgonConfig = bincode::deserialize(&encoded).unwrap();
+            assert_eq!(decoded.gui.icon_size, config.gui.icon_size);
+            assert_eq!(decoded.gui.font_size, config.gui.font_size);
+        }
     }
 
     #[test]
@@ -1876,10 +2142,14 @@ mod tests {
         let config = ArgonConfig::default();
         let config = config_with_key(&config, "gui.hierarchy_depth", Some("3")).unwrap();
         let config = config_with_key(&config, "gui.dark_mode", Some("false")).unwrap();
+        let config = config_with_key(&config, "gui.icon_size", Some("22")).unwrap();
+        let config = config_with_key(&config, "gui.font_size", Some("13.5")).unwrap();
         let config = config_with_key(&config, "log.level", Some("analyzer=debug")).unwrap();
 
         assert_eq!(config.gui.hierarchy_depth, Some(3));
         assert!(!config.gui.dark_mode);
+        assert_eq!(config.gui.icon_size, Some(22.));
+        assert_eq!(config.gui.font_size, Some(13.5));
         assert_eq!(config.log.level, "analyzer=debug");
         assert_eq!(config.analyzer.compile_debounce_ms, 150);
     }
@@ -1892,6 +2162,8 @@ mod tests {
         assert_eq!(config.gui.hierarchy_depth, None);
         assert!(config_with_key(&config, "gui.unknown", Some("true")).is_err());
         assert!(config_with_key(&config, "gui.dark_mode", Some("2")).is_err());
+        assert!(config_with_key(&config, "gui.icon_size", Some("0")).is_err());
+        assert!(config_with_key(&config, "gui.font_size", Some("300")).is_err());
         assert!(config_with_key(&config, "gui..dark_mode", Some("true")).is_err());
     }
 

@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
@@ -60,16 +61,44 @@ struct Args {
 pub fn run() -> ExitCode {
     let args = Args::parse();
     let format = args.error_format;
+    // The default hook would print an unformatted panic to stderr alongside
+    // the diagnostic, so it is replaced -- but the message and location are
+    // captured rather than discarded: without them an ICE reaches the user as
+    // one opaque string with nothing to report or debug from.
+    let panic_detail: Arc<Mutex<Option<String>>> = Arc::default();
     let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(args)));
+    std::panic::set_hook({
+        let panic_detail = Arc::clone(&panic_detail);
+        Box::new(move |info| {
+            // `PanicHookInfo`'s own rendering already carries both the message
+            // and the location; flatten it so it fits a one-line diagnostic.
+            let detail = info.to_string().replace('\n', " ");
+            if let Ok(mut slot) = panic_detail.lock() {
+                *slot = Some(detail);
+            }
+        })
+    });
+    // Compilation recurses natively for inlined `fn` calls and nested cell
+    // instantiation, so it needs more stack than the default main thread has;
+    // otherwise a deep hierarchy aborts the process instead of hitting the
+    // evaluator's depth limit and reporting it.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::run_with_stack("argon-compile", move || execute(args))
+    }));
     std::panic::set_hook(previous_hook);
     let result = match result {
         Ok(result) => result,
-        Err(_) => Err(fail(
-            format,
-            "internal compiler error: compilation aborted unexpectedly",
-        )),
+        Err(_) => {
+            let detail = panic_detail
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone())
+                .unwrap_or_else(|| "no panic message available".to_owned());
+            Err(fail(
+                format,
+                format!("internal compiler error: compilation aborted unexpectedly: {detail}"),
+            ))
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
