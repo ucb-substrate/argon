@@ -5,6 +5,7 @@
 //! Pass 3: solving
 use std::cell::RefCell;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::hash::Hasher;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
@@ -38,6 +39,9 @@ use crate::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOp, BinOpExpr, BoolOp, CallExpr, CellDecl,
         Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
+    cellcache::{CachedCell, CellCache},
+    fingerprint::{ItemIndex, RebaseError, SpanRebase},
+    gdscache::{self, GdsCache, GdsImportEntry, GdsImportKey, gds_cell_id, is_content_id},
     parse::ParseMetadata,
     solver::{LinearExpr, Solver},
 };
@@ -188,23 +192,75 @@ pub struct StaticAnalysis {
     pub errors: Vec<StaticError>,
 }
 
+/// State a compilation session carries between compiles.
+pub struct SessionCaches<'a> {
+    /// Fingerprints naming the declarations in the tree being executed.
+    pub items: &'a Arc<ItemIndex>,
+    pub gds: &'a mut GdsCache,
+    pub cells: &'a mut CellCache,
+    /// Per-cell layer and geometry verdicts.
+    pub checks: &'a mut CheckCache,
+    /// The parsed technology, when the session already has it, so that the
+    /// technology file is not re-read and re-parsed on every execution.
+    pub tech: Option<&'a Technology>,
+}
+
 /// Executes a cell using workspace-wide external inputs from `config`.
 pub fn execute_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
+    // Caches that die with the call, and an index built rather than skipped.
+    // They exist so that a one-shot compile names its cells exactly as a
+    // session does: mixing the two schemes would mean the same source produced
+    // different ids depending on which tool compiled it, and GDS-imported
+    // cells are content-addressed on both paths regardless.
+    let mut gds = GdsCache::new();
+    let mut cells = CellCache::new();
+    let mut checks = CheckCache::new();
+    let items = Arc::new(ItemIndex::build(ast));
+    execute_cell_cached(
+        ast,
+        input,
+        config,
+        Some(SessionCaches {
+            items: &items,
+            gds: &mut gds,
+            cells: &mut cells,
+            checks: &mut checks,
+            tech: None,
+        }),
+    )
+}
+
+/// [`execute_cell`], reusing the caches in `session`.
+pub fn execute_cell_cached(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+    config: &WorkspaceConfig,
+    session: Option<SessionCaches<'_>>,
+) -> CompileOutput {
     let Some(tech_file) = config.tech.as_deref() else {
         return missing_tech_output();
     };
-    let tech = match read_tech(tech_file) {
-        Ok(tech) => tech,
-        Err(error) => return invalid_tech_output(ast, error.to_string()),
+    let tech = match session.as_ref().and_then(|session| session.tech) {
+        Some(tech) => tech.clone(),
+        None => match read_tech(tech_file) {
+            Ok(tech) => tech,
+            Err(error) => return invalid_tech_output(ast, error.to_string()),
+        },
     };
-    check_output(
-        ExecPass::new(ast, tech, &config.gds_imports).execute(input),
-        tech_file,
-    )
+    let mut pass = ExecPass::new(ast, tech, &config.gds_imports);
+    let mut checks = None;
+    if let Some(session) = session {
+        pass = pass
+            .with_gds_cache(session.gds)
+            .with_items(session.items)
+            .with_cell_cache(session.cells, session.items.clone());
+        checks = Some(session.checks);
+    }
+    check_output(pass.execute(input), tech_file, checks)
 }
 
 /// Executes a cell invocation spliced into `ast` by
@@ -215,17 +271,51 @@ pub fn execute_cell_invocation(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
+    let mut gds = GdsCache::new();
+    let mut cells = CellCache::new();
+    let mut checks = CheckCache::new();
+    let items = Arc::new(ItemIndex::build(ast));
+    execute_cell_invocation_cached(
+        ast,
+        invocation,
+        config,
+        Some(SessionCaches {
+            items: &items,
+            gds: &mut gds,
+            cells: &mut cells,
+            checks: &mut checks,
+            tech: None,
+        }),
+    )
+}
+
+/// [`execute_cell_invocation`], reusing the caches in `session`.
+pub fn execute_cell_invocation_cached(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+    session: Option<SessionCaches<'_>>,
+) -> CompileOutput {
     let Some(tech_file) = config.tech.as_deref() else {
         return missing_tech_output();
     };
-    let tech = match read_tech(tech_file) {
-        Ok(tech) => tech,
-        Err(error) => return invalid_tech_output(ast, error.to_string()),
+    let tech = match session.as_ref().and_then(|session| session.tech) {
+        Some(tech) => tech.clone(),
+        None => match read_tech(tech_file) {
+            Ok(tech) => tech,
+            Err(error) => return invalid_tech_output(ast, error.to_string()),
+        },
     };
-    check_output(
-        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation(invocation),
-        tech_file,
-    )
+    let mut pass = ExecPass::new(ast, tech, &config.gds_imports);
+    let mut checks = None;
+    if let Some(session) = session {
+        pass = pass
+            .with_gds_cache(session.gds)
+            .with_items(session.items)
+            .with_cell_cache(session.cells, session.items.clone());
+        checks = Some(session.checks);
+    }
+    check_output(pass.execute_invocation(invocation), tech_file, checks)
 }
 
 fn missing_tech_output() -> CompileOutput {
@@ -251,7 +341,11 @@ fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> Co
     })
 }
 
-fn check_output(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
+fn check_output(
+    res: CompileOutput,
+    tech_file: &FsPath,
+    checks: Option<&mut CheckCache>,
+) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -263,8 +357,7 @@ fn check_output(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, tech_file, &mut errors);
-    check_geometry(&data, &mut errors);
+    run_output_checks(&data, tech_file, checks, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -695,60 +788,134 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecError>) {
+/// Per-cell layer and geometry diagnostics, retained across compiles.
+///
+/// Both checks walk every object of every cell, and both are pure functions of
+/// a cell's objects and the technology, so a cell that is reused keeps its
+/// verdicts.
+#[derive(Debug, Default, Clone)]
+pub struct CheckCache {
+    entries: HashMap<CellId, CellChecks>,
+}
+
+#[derive(Debug, Clone)]
+struct CellChecks {
+    layers: Vec<ExecError>,
+    geometry: Vec<ExecError>,
+}
+
+impl CheckCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Runs both output checks, reusing per-cell verdicts where they are known.
+fn run_output_checks(
+    data: &CompiledData,
+    tech_file: &FsPath,
+    checks: Option<&mut CheckCache>,
+    errs: &mut Vec<ExecError>,
+) {
     let mut layers = IndexSet::new();
     for layer in &data.tech.layers {
         layers.insert(layer.name.clone());
     }
+    let Some(checks) = checks else {
+        for (cell_id, cell) in data.cells.iter() {
+            check_cell_layers(*cell_id, cell, &layers, tech_file, errs);
+        }
+        for (cell_id, cell) in data.cells.iter() {
+            check_cell_geometry(*cell_id, cell, &data.tech, errs);
+        }
+        return;
+    };
+
     for (cell_id, cell) in data.cells.iter() {
-        for (_, obj) in cell.objects.iter() {
-            match obj {
-                SolvedValue::Rect(r) => {
-                    if let Some(layer) = &r.layer
-                        && !layers.contains(layer)
-                    {
-                        errs.push(ExecError {
-                            span: r.span.clone(),
-                            cell: *cell_id,
-                            kind: ExecErrorKind::IllegalLayer {
-                                layer: layer.clone(),
-                                tech: tech_file.display().to_string(),
-                            },
-                        });
-                    }
-                }
-                SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+        if checks.entries.contains_key(cell_id) {
+            continue;
+        }
+        let mut cell_layers = Vec::new();
+        let mut cell_geometry = Vec::new();
+        check_cell_layers(*cell_id, cell, &layers, tech_file, &mut cell_layers);
+        check_cell_geometry(*cell_id, cell, &data.tech, &mut cell_geometry);
+        checks.entries.insert(
+            *cell_id,
+            CellChecks {
+                layers: cell_layers,
+                geometry: cell_geometry,
+            },
+        );
+    }
+    // Appended as two passes over the cells, matching the order the uncached
+    // path produces: all layer diagnostics, then all geometry ones. Fusing
+    // them per cell would reorder diagnostics that reach the compiled output.
+    for cell_id in data.cells.keys() {
+        errs.extend(checks.entries[cell_id].layers.iter().cloned());
+    }
+    for cell_id in data.cells.keys() {
+        errs.extend(checks.entries[cell_id].geometry.iter().cloned());
+    }
+}
+
+fn check_cell_layers(
+    cell_id: CellId,
+    cell: &CompiledCell,
+    layers: &IndexSet<String>,
+    tech_file: &FsPath,
+    errs: &mut Vec<ExecError>,
+) {
+    for (_, obj) in cell.objects.iter() {
+        match obj {
+            SolvedValue::Rect(r) => {
+                if let Some(layer) = &r.layer
+                    && !layers.contains(layer)
+                {
                     errs.push(ExecError {
-                        span: polygon.span.clone(),
-                        cell: *cell_id,
+                        span: r.span.clone(),
+                        cell: cell_id,
                         kind: ExecErrorKind::IllegalLayer {
-                            layer: polygon.layer.clone(),
+                            layer: layer.clone(),
                             tech: tech_file.display().to_string(),
                         },
                     });
                 }
-                SolvedValue::Path(path) if !layers.contains(&path.layer) => {
-                    errs.push(ExecError {
-                        span: path.span.clone(),
-                        cell: *cell_id,
-                        kind: ExecErrorKind::IllegalLayer {
-                            layer: path.layer.clone(),
-                            tech: tech_file.display().to_string(),
-                        },
-                    });
-                }
-                SolvedValue::Text(text) if !layers.contains(&text.layer) => {
-                    errs.push(ExecError {
-                        span: text.span.clone(),
-                        cell: *cell_id,
-                        kind: ExecErrorKind::IllegalTextLayer {
-                            layer: text.layer.clone(),
-                            tech: tech_file.display().to_string(),
-                        },
-                    });
-                }
-                _ => {}
             }
+            SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+                errs.push(ExecError {
+                    span: polygon.span.clone(),
+                    cell: cell_id,
+                    kind: ExecErrorKind::IllegalLayer {
+                        layer: polygon.layer.clone(),
+                        tech: tech_file.display().to_string(),
+                    },
+                });
+            }
+            SolvedValue::Path(path) if !layers.contains(&path.layer) => {
+                errs.push(ExecError {
+                    span: path.span.clone(),
+                    cell: cell_id,
+                    kind: ExecErrorKind::IllegalLayer {
+                        layer: path.layer.clone(),
+                        tech: tech_file.display().to_string(),
+                    },
+                });
+            }
+            SolvedValue::Text(text) if !layers.contains(&text.layer) => {
+                errs.push(ExecError {
+                    span: text.span.clone(),
+                    cell: cell_id,
+                    kind: ExecErrorKind::IllegalTextLayer {
+                        layer: text.layer.clone(),
+                        tech: tech_file.display().to_string(),
+                    },
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -760,39 +927,40 @@ fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecErro
 ///
 /// This runs before any output is written, so a rejected design produces a
 /// diagnostic with a span instead of a `.gds` full of `i32::MAX`.
-fn check_geometry(data: &CompiledData, errs: &mut Vec<ExecError>) {
-    let tech = &data.tech;
-    for (cell_id, cell) in data.cells.iter() {
-        let cell_id = *cell_id;
-        for (_, obj) in cell.objects.iter() {
-            match obj {
-                SolvedValue::Rect(r) => {
-                    let coords = [r.x0.0, r.y0.0, r.x1.0, r.y1.0];
-                    check_coordinates(coords, tech, cell_id, &r.span, errs);
-                }
-                SolvedValue::Polygon(p) => {
-                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]);
-                    check_coordinates(coords, tech, cell_id, &p.span, errs);
-                }
-                SolvedValue::Path(p) => {
-                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]).chain([
-                        p.width.0,
-                        p.begin_extension.0,
-                        p.end_extension.0,
-                    ]);
-                    check_coordinates(coords, tech, cell_id, &p.span, errs);
-                    check_path_dimensions(p, cell_id, errs);
-                }
-                SolvedValue::Instance(i) => {
-                    let span = Some(i.span.clone());
-                    check_coordinates([i.x, i.y], tech, cell_id, &span, errs);
-                }
-                SolvedValue::Text(t) => {
-                    check_coordinates([t.x, t.y], tech, cell_id, &t.span, errs);
-                    check_text(t, cell_id, errs);
-                }
-                SolvedValue::Dimension(_) => {}
+fn check_cell_geometry(
+    cell_id: CellId,
+    cell: &CompiledCell,
+    tech: &crate::tech::Technology,
+    errs: &mut Vec<ExecError>,
+) {
+    for (_, obj) in cell.objects.iter() {
+        match obj {
+            SolvedValue::Rect(r) => {
+                let coords = [r.x0.0, r.y0.0, r.x1.0, r.y1.0];
+                check_coordinates(coords, tech, cell_id, &r.span, errs);
             }
+            SolvedValue::Polygon(p) => {
+                let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]);
+                check_coordinates(coords, tech, cell_id, &p.span, errs);
+            }
+            SolvedValue::Path(p) => {
+                let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]).chain([
+                    p.width.0,
+                    p.begin_extension.0,
+                    p.end_extension.0,
+                ]);
+                check_coordinates(coords, tech, cell_id, &p.span, errs);
+                check_path_dimensions(p, cell_id, errs);
+            }
+            SolvedValue::Instance(i) => {
+                let span = Some(i.span.clone());
+                check_coordinates([i.x, i.y], tech, cell_id, &span, errs);
+            }
+            SolvedValue::Text(t) => {
+                check_coordinates([t.x, t.y], tech, cell_id, &t.span, errs);
+                check_text(t, cell_id, errs);
+            }
+            SolvedValue::Dimension(_) => {}
         }
     }
 }
@@ -2980,7 +3148,7 @@ struct CellExecKey {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum CellArgKey {
+pub(crate) enum CellArgKey {
     Float(u64),
     Int(i64),
     Bool(bool),
@@ -3351,7 +3519,23 @@ struct ExecPass<'a> {
     // The first element of this stack is the root cell.
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
-    compiled_cells: IndexMap<CellId, CompiledCell>,
+    compiled_cells: IndexMap<CellId, Arc<CompiledCell>>,
+    /// The ready `Value::Cell` naming each compiled cell, which is what a
+    /// proxy of a child instance's geometry points its `Instance::cell` at.
+    cell_values: HashMap<CellId, ValueId>,
+    /// Imported GDS hierarchies retained across source edits. `None` for a
+    /// one-shot compile, which has nothing to reuse across.
+    gds_cache: Option<&'a mut GdsCache>,
+    /// Content fingerprints for the workspace's declarations, which name cells
+    /// by content rather than by allocation order. Supplied by every public
+    /// entry point, so that the same source names its cells identically
+    /// however it was compiled.
+    items: Option<&'a ItemIndex>,
+    /// The same index behind an `Arc`, so a cache entry can record which
+    /// revision its spans were written against without cloning it.
+    items_arc: Option<Arc<ItemIndex>>,
+    /// Compiled cells retained across source edits.
+    cell_cache: Option<&'a mut CellCache>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
     /// Cell declaration generated for a compiler entry point's invocation, and
     /// the cell it executed as. A call made directly by that cell is the
@@ -3485,6 +3669,11 @@ impl<'a> ExecPass<'a> {
             next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            cell_values: HashMap::new(),
+            gds_cache: None,
+            items: None,
+            items_arc: None,
+            cell_cache: None,
             compiled_cell_cache: HashMap::new(),
             entry_cell_var: None,
             entry_cell: None,
@@ -3763,6 +3952,85 @@ impl<'a> ExecPass<'a> {
         }
     }
 
+    /// Applies every pending author fallback that is independent of the ones
+    /// already applied this round, in strict priority order.
+    ///
+    /// Fallbacks whose variables lie in disjoint components of the live
+    /// constraint graph cannot affect each other's `has_unsolved_var` test or
+    /// each other's back-substitution, so applying them in one round is
+    /// indistinguishable from applying them one at a time with a `solve()`
+    /// between each.
+    ///
+    /// Candidates are inspected with `peek` and popped only when they are
+    /// applied, so nothing is ever pushed back onto the heap -- which matters
+    /// because `FallbackConstraint`'s ordering compares only `priority`,
+    /// leaving ties to `BinaryHeap` internals. The first candidate that
+    /// collides with a claimed component ends the round rather than being
+    /// skipped over, which is what keeps `fallback_constraints_used` in
+    /// priority order.
+    fn apply_independent_fallbacks(state: &mut CellState) {
+        let labels = state.solver.unsolved_var_components();
+        let mut claimed = IndexSet::new();
+        while let Some(fallback) = state.fallback_constraints.peek() {
+            if !state.solver.has_unsolved_var(&fallback.constraint) {
+                state.fallback_constraints.pop();
+                continue;
+            }
+            let components = state
+                .solver
+                .unsolved_component_labels(&fallback.constraint, &labels);
+            if components.iter().any(|label| claimed.contains(label)) {
+                break;
+            }
+            claimed.extend(components);
+            let FallbackConstraint {
+                constraint,
+                span,
+                initial_condition,
+                ..
+            } = state
+                .fallback_constraints
+                .pop()
+                .expect("peeked a fallback just above");
+            state.fallback_constraints_used.push(UsedFallback {
+                constraint: constraint.clone(),
+                span: span.clone(),
+                initial_condition,
+            });
+            let id = state.solver.constrain_eq0(constraint);
+            state.constraint_span_map.insert(id, span);
+        }
+    }
+
+    /// The compiler-default counterpart of
+    /// [`Self::apply_independent_fallbacks`], with the same
+    /// component-disjointness rule and the same order guarantee. Returns
+    /// whether anything was applied.
+    fn apply_independent_defaults(state: &mut CellState) -> bool {
+        let labels = state.solver.unsolved_var_components();
+        let mut claimed = IndexSet::new();
+        let mut applied = false;
+        while let Some((constraint, _)) = state.compiler_defaults.front() {
+            if !state.solver.has_unsolved_var(constraint) {
+                state.compiler_defaults.pop_front();
+                continue;
+            }
+            let components = state.solver.unsolved_component_labels(constraint, &labels);
+            if components.iter().any(|label| claimed.contains(label)) {
+                break;
+            }
+            claimed.extend(components);
+            let (constraint, span) = state
+                .compiler_defaults
+                .pop_front()
+                .expect("peeked a default just above");
+            let id = state.solver.constrain_eq0(constraint);
+            state.constraint_span_map.insert(id, span);
+            applied = true;
+        }
+        applied
+    }
+
     /// Records the cell's degrees of freedom and reports them, once.
     ///
     /// Measured on a trial solve with every pending compiler default applied:
@@ -3832,6 +4100,9 @@ impl<'a> ExecPass<'a> {
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
         }
+        if let Some(cell_id) = self.reinstate_cell(cell, &cache_key) {
+            return Ok(cell_id);
+        }
         // Cell instantiation recurses natively between here and
         // `eval_partial`, so a hierarchy deeper than the stack allows aborts
         // the process. Charge it to the same budget as inlined `fn` calls.
@@ -3859,6 +4130,10 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        // Watermarks for what this cell costs: the diagnostics it reports and
+        // the ids it consumes, both of which a cache hit has to reproduce.
+        let cell_errors_start = self.errors.len();
+        let ids_start = self.next_id;
         if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
             if !args.is_empty() {
                 self.errors.push(ExecError {
@@ -3931,7 +4206,9 @@ impl<'a> ExecPass<'a> {
             bindings: Default::default(),
         };
 
-        let cell_id = self.alloc_id();
+        let cell_id = self
+            .source_cell_id(cell, &cache_key)
+            .unwrap_or_else(|| self.alloc_id());
         if self.entry_cell_var == Some(cell) {
             self.entry_cell = Some(cell_id);
         }
@@ -4054,18 +4331,18 @@ impl<'a> ExecPass<'a> {
 
             if !progress {
                 let state = self.cell_state_mut(cell_id);
-                // The highest-priority author fallback that still determines
-                // something. Ones whose variables another constraint has since
-                // solved are moot, and dropped.
-                let mut chosen = None;
-                while let Some(fallback) = state.fallback_constraints.pop() {
+                // Drop fallbacks another constraint has since made moot, so
+                // that what remains on top -- if anything -- is the
+                // highest-priority one that still determines something.
+                while let Some(fallback) = state.fallback_constraints.peek() {
                     if state.solver.has_unsolved_var(&fallback.constraint) {
-                        chosen = Some(fallback);
                         break;
                     }
+                    state.fallback_constraints.pop();
                 }
+                let has_fallback = !state.fallback_constraints.is_empty();
                 let mut constraint_added = false;
-                if chosen.is_none() {
+                if !has_fallback {
                     // Compiler defaults rank below every author-written
                     // fallback: they say what a value is when *nothing* in the
                     // source determines it. Applying one before the fallbacks
@@ -4073,20 +4350,10 @@ impl<'a> ExecPass<'a> {
                     // author's own constraints and determine the variable an
                     // `x0i=` was waiting for, which was then skipped as moot.
                     //
-                    // Exactly one per iteration, so that `solve()` runs between
-                    // any two: applying the batch tested each default against
-                    // solver state that had not yet seen the others, so a
-                    // system with fewer degrees of freedom than defaults was
-                    // over-constrained and reported as inconsistent even when
-                    // it was satisfiable.
-                    while let Some((constraint, span)) = state.compiler_defaults.pop_front() {
-                        if state.solver.has_unsolved_var(&constraint) {
-                            let id = state.solver.constrain_eq0(constraint);
-                            state.constraint_span_map.insert(id, span);
-                            constraint_added = true;
-                            break;
-                        }
-                    }
+                    // Within one round they are applied as a batch, but only
+                    // across *independent* components -- see
+                    // `apply_independent_defaults`.
+                    constraint_added = Self::apply_independent_defaults(state);
                 }
                 if !constraint_added {
                     // Either an author fallback is about to be applied or
@@ -4096,22 +4363,10 @@ impl<'a> ExecPass<'a> {
                     // author saying "leave this free" -- has been taken up yet.
                     self.report_underconstrained(cell_id);
                     let state = self.cell_state_mut(cell_id);
-                    match chosen {
-                        Some(FallbackConstraint {
-                            constraint,
-                            span,
-                            initial_condition,
-                            ..
-                        }) => {
-                            state.fallback_constraints_used.push(UsedFallback {
-                                constraint: constraint.clone(),
-                                span: span.clone(),
-                                initial_condition,
-                            });
-                            let id = state.solver.constrain_eq0(constraint);
-                            state.constraint_span_map.insert(id, span);
-                        }
-                        None => state.solver.force_solution(),
+                    if has_fallback {
+                        Self::apply_independent_fallbacks(state);
+                    } else {
+                        state.solver.force_solution();
                     }
                 }
                 let state = self.cell_state_mut(cell_id);
@@ -4205,9 +4460,147 @@ impl<'a> ExecPass<'a> {
         }
 
         let cell = self.emit(cell_id);
-        assert!(self.compiled_cells.insert(cell_id, cell).is_none());
+        assert!(
+            self.compiled_cells
+                .insert(cell_id, Arc::new(cell))
+                .is_none()
+        );
+        // Every compiled cell has a ready `Value::Cell`, so a proxy built from
+        // one of its nested instances can name it without allocating a value
+        // from inside the borrow split in `eval_partial`.
+        self.cell_value(cell_id);
         self.compiled_cell_cache.insert(cache_key, cell_id);
+        self.retain_cell(cell_id, cell_errors_start, ids_start);
         Ok(cell_id)
+    }
+
+    /// Serves a cell from the session cache, if it is there and still valid.
+    fn reinstate_cell(&mut self, cell: VarId, key: &CellExecKey) -> Option<CellId> {
+        let id = self.source_cell_id(cell, key)?;
+        let items = self.items_arc.clone()?;
+        self.cell_cache.as_ref()?;
+        // Already materialized this run -- by an instantiation under a
+        // different key, or as part of another cell's closure. A fresh
+        // execution would have served this from `compiled_cell_cache` without
+        // re-reporting anything, so neither the diagnostics nor the id
+        // consumption may be replayed a second time.
+        if self.compiled_cells.contains_key(&id) {
+            self.compiled_cell_cache.insert(key.clone(), id);
+            return Some(id);
+        }
+        let ids_start = self.next_id;
+        let closure = self.cell_cache.as_deref_mut()?.reinstate(id, &items)?;
+        let mut consumed = 0;
+        for (cell_id, entry) in closure {
+            consumed = consumed.max(entry.ids_consumed);
+            self.compiled_cells.insert(cell_id, entry.cell);
+            self.cell_value(cell_id);
+            if cell_id == id {
+                // Only the cell that was asked for replays its diagnostics.
+                // Its children's were folded into it when it was compiled,
+                // exactly as the intra-run cache reports them once per
+                // distinct instantiation.
+                self.errors.extend(entry.errors);
+            }
+        }
+        self.next_id = ids_start + consumed;
+        // Record the intra-run mapping the fresh path records, so a second
+        // instantiation with the same key is a plain lookup rather than
+        // another closure walk that replays this cell's diagnostics.
+        self.compiled_cell_cache.insert(key.clone(), id);
+        Some(id)
+    }
+
+    /// Records a freshly compiled cell for reuse in a later revision.
+    fn retain_cell(&mut self, id: CellId, errors_start: usize, ids_start: u64) {
+        // A cell is named by content only when the session supplied
+        // fingerprints, and the generated entry cell is never named at all.
+        if self.items_arc.is_none() || !is_content_id(id) {
+            return;
+        }
+        // A depth failure is charged against the *ambient* evaluation depth,
+        // not against anything about this cell, so a cell that hit one is not
+        // a fact about the program: its geometry is truncated by wherever it
+        // happened to be instantiated from. Never retain one.
+        let errors = self.errors[errors_start..].to_vec();
+        if errors
+            .iter()
+            .any(|error| matches!(error.kind, ExecErrorKind::RecursionLimitExceeded { .. }))
+        {
+            return;
+        }
+        let Some(cell) = self.compiled_cells.get(&id).cloned() else {
+            return;
+        };
+        let children = cell
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                SolvedValue::Instance(inst) => Some(inst.cell),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Retaining a parent whose children are not retained would guarantee a
+        // miss on every future lookup, since `reinstate` requires the whole
+        // closure. GDS-imported children live in their own cache.
+        let items = self.items_arc.clone().expect("checked above");
+        if let Some(cache) = self.cell_cache.as_deref_mut() {
+            if children
+                .iter()
+                .any(|child| is_content_id(*child) && !cache.contains(*child))
+            {
+                return;
+            }
+            cache.insert(
+                id,
+                CachedCell {
+                    cell,
+                    children,
+                    errors,
+                    ids_consumed: self.next_id - ids_start,
+                    items,
+                },
+            );
+        }
+    }
+
+    /// Retains imported GDS hierarchies in `cache` instead of re-importing
+    /// them.
+    fn with_gds_cache(mut self, cache: &'a mut GdsCache) -> Self {
+        self.gds_cache = Some(cache);
+        self
+    }
+
+    /// Names cells by content instead of by allocation order, so that a cell
+    /// compiled in one revision can be recognised in the next.
+    fn with_items(mut self, items: &'a ItemIndex) -> Self {
+        self.items = Some(items);
+        self
+    }
+
+    /// Retains compiled cells in `cache` across source edits.
+    fn with_cell_cache(mut self, cache: &'a mut CellCache, items: Arc<ItemIndex>) -> Self {
+        self.cell_cache = Some(cache);
+        self.items_arc = Some(items);
+        self
+    }
+
+    /// The id for a cell about to be executed from source.
+    ///
+    /// `None` for the generated entry cell a compiler invocation splices in,
+    /// which is not part of the workspace and is never reused: its text
+    /// differs per invocation, and `execute_invocation` reads its `CellState`,
+    /// which a reinstated cell would not have.
+    fn source_cell_id(&self, cell: VarId, key: &CellExecKey) -> Option<CellId> {
+        if self.entry_cell_var == Some(cell) {
+            return None;
+        }
+        let fingerprint = self.items?.fingerprint(cell)?;
+        Some(gdscache::source_cell_id(
+            fingerprint,
+            &key.args,
+            key.scope_name.as_deref(),
+        ))
     }
 
     fn execute_gds_cell(
@@ -4216,6 +4609,24 @@ impl<'a> ExecPass<'a> {
         path: &FsPath,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        let ids_start = self.next_id;
+        let key = GdsImportKey {
+            declared_name: declared_name.to_owned(),
+            path: path.to_path_buf(),
+            scope_name: scope_name.clone(),
+        };
+        if let Some(cache) = self.gds_cache.as_deref_mut()
+            && let Some(entry) = cache.get(&key)
+        {
+            // Reinstated wholesale and in import order, so `compiled_cells`
+            // ends up exactly as a fresh import would leave it.
+            for (cell_id, cell) in entry.cells {
+                self.compiled_cells.insert(cell_id, cell);
+                self.cell_value(cell_id);
+            }
+            self.next_id = ids_start + entry.ids_consumed;
+            return Ok(entry.top);
+        }
         let imported = match import_gds(path, declared_name, &self.tech) {
             Ok(imported) => imported,
             Err(error) => {
@@ -4232,20 +4643,22 @@ impl<'a> ExecPass<'a> {
                 return Err(());
             }
         };
+        // Only the import's top cell takes its scope name from the caller, so
+        // only its id depends on it; the structures beneath are shared between
+        // scope names rather than duplicated.
+        let top_scope_name = |index: usize| {
+            (index == imported.top)
+                .then_some(scope_name.as_deref())
+                .flatten()
+        };
         let cell_ids = (0..imported.structs.len())
-            .map(|_| self.alloc_id())
+            .map(|index| gds_cell_id(declared_name, path, index, top_scope_name(index)))
             .collect::<Vec<_>>();
         // Imported hierarchy has no source-level cell calls, but field access
         // through a child instance still needs a ready cell value.
-        let cell_vids = cell_ids
-            .iter()
-            .map(|cell_id| {
-                let vid = self.value_id();
-                self.values
-                    .insert(vid, DeferValue::Ready(Value::Cell(*cell_id)));
-                vid
-            })
-            .collect::<Vec<_>>();
+        for cell_id in &cell_ids {
+            self.cell_value(*cell_id);
+        }
         let top_id = cell_ids[imported.top];
         for (structure_index, structure) in imported.structs.into_iter().enumerate() {
             let cell_id = cell_ids[structure_index];
@@ -4357,7 +4770,6 @@ impl<'a> ExecPass<'a> {
                             construction: false,
                             cell: cell_ids[cell],
                             span: span.clone(),
-                            cell_vid: cell_vids[cell],
                         }),
                         Some(format!("gds_inst_{element_index}")),
                     ),
@@ -4397,7 +4809,7 @@ impl<'a> ExecPass<'a> {
             )]);
             self.compiled_cells.insert(
                 cell_id,
-                CompiledCell {
+                Arc::new(CompiledCell {
                     name: structure_name,
                     scopes,
                     root,
@@ -4407,6 +4819,20 @@ impl<'a> ExecPass<'a> {
                     fallback_constraints_used: Vec::new(),
                     unsolved_vars: IndexSet::new(),
                     inconsistent_constraints: IndexSet::new(),
+                }),
+            );
+        }
+        if let Some(cache) = self.gds_cache.as_deref_mut() {
+            let cells = cell_ids
+                .iter()
+                .map(|cell_id| (*cell_id, self.compiled_cells[cell_id].clone()))
+                .collect();
+            cache.insert(
+                key,
+                GdsImportEntry {
+                    top: top_id,
+                    cells,
+                    ids_consumed: self.next_id - ids_start,
                 },
             );
         }
@@ -4620,7 +5046,6 @@ impl<'a> ExecPass<'a> {
                         .into_cell()
                         .expect("inst parent not a cell"),
                     span: inst.span.clone(),
-                    cell_vid: inst.cell,
                 }),
             }
         };
@@ -4719,6 +5144,18 @@ impl<'a> ExecPass<'a> {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// The ready `Value::Cell` for `cell`, created on first use.
+    fn cell_value(&mut self, cell: CellId) -> ValueId {
+        if let Some(vid) = self.cell_values.get(&cell) {
+            return *vid;
+        }
+        let vid = self.value_id();
+        self.values
+            .insert(vid, DeferValue::Ready(Value::Cell(cell)));
+        self.cell_values.insert(cell, vid);
+        vid
     }
 
     fn frame_id(&mut self) -> FrameId {
@@ -6424,6 +6861,7 @@ impl<'a> ExecPass<'a> {
                         let cell =
                             self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
+                        self.cell_values.insert(cell, vid);
                         true
                     } else {
                         for arg_vid in unready {
@@ -7056,6 +7494,7 @@ impl<'a> ExecPass<'a> {
                                                 });
                                                 return self.poison(cell_id, vid);
                                             };
+                                        let cell_values = &self.cell_values;
                                         let obj_id = &mut self.next_id;
                                         let cell_state =
                                             self.cell_states.get_mut(&cell_id).unwrap();
@@ -7188,7 +7627,7 @@ impl<'a> ExecPass<'a> {
                                                     let id = object_id(obj_id);
                                                     let oinst = Instance {
                                                         id,
-                                                        cell: cinst.cell_vid,
+                                                        cell: cell_values[&cinst.cell],
                                                         x: LinearExpr::add(inst.x.clone(), cx),
                                                         y: LinearExpr::add(inst.y.clone(), cy),
                                                         angle,
@@ -7688,10 +8127,6 @@ pub struct SolvedInstance {
     pub construction: bool,
     pub cell: CellId,
     pub span: Span,
-    /// The value ID of the cell being instantiated.
-    ///
-    /// For compiler internal use only.
-    cell_vid: ValueId,
 }
 
 #[enumify]
@@ -7856,7 +8291,166 @@ impl<T> Arrayed<T> {
     }
 }
 
+impl CompiledData {
+    /// A digest of everything a consumer can observe: the geometry, the layers
+    /// it lands on, and the shape of the instance graph.
+    ///
+    /// Excludes ids, which are internal handles whose values depend on
+    /// allocation order rather than on anything observable. Comparing digests
+    /// is what makes "the cache changed nothing" checkable; see
+    /// `ARGON_VERIFY_CELL_CACHE`.
+    pub fn geometry_digest(&self) -> u64 {
+        let mut cells = self
+            .cells
+            .values()
+            .map(|cell| {
+                let mut hasher = fnv::FnvHasher::default();
+                hash_str(&mut hasher, &cell.name);
+                for object in cell.objects.values() {
+                    hash_solved_value(&mut hasher, object, &self.cells);
+                }
+                for fallback in &cell.fallback_constraints_used {
+                    hash_str(&mut hasher, &fallback.span.path.to_string_lossy());
+                    hasher.write_u32(fallback.span.span.start() as u32);
+                    hasher.write_u32(fallback.span.span.end() as u32);
+                }
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+        // Sorted because the map's order is an allocation detail.
+        cells.sort_unstable();
+        let mut hasher = fnv::FnvHasher::default();
+        for cell in cells {
+            hasher.write_u64(cell);
+        }
+        hash_str(&mut hasher, &self.cells[&self.top].name);
+        hasher.finish()
+    }
+}
+
+fn hash_str(hasher: &mut fnv::FnvHasher, value: &str) {
+    hasher.write_usize(value.len());
+    hasher.write(value.as_bytes());
+}
+
+fn hash_solved_value(
+    hasher: &mut fnv::FnvHasher,
+    value: &SolvedValue,
+    cells: &IndexMap<CellId, Arc<CompiledCell>>,
+) {
+    fn coord(hasher: &mut fnv::FnvHasher, v: f64) {
+        hasher.write_u64(v.to_bits());
+    }
+    match value {
+        SolvedValue::Rect(r) => {
+            hasher.write_u8(0);
+            for v in [r.x0.0, r.y0.0, r.x1.0, r.y1.0] {
+                coord(hasher, v);
+            }
+            hasher.write_u8(u8::from(r.construction));
+            hash_str(hasher, r.layer.as_deref().unwrap_or(""));
+        }
+        SolvedValue::Polygon(p) => {
+            hasher.write_u8(1);
+            for (x, y) in &p.points {
+                coord(hasher, x.0);
+                coord(hasher, y.0);
+            }
+            hash_str(hasher, &p.layer);
+        }
+        SolvedValue::Path(p) => {
+            hasher.write_u8(2);
+            coord(hasher, p.width.0);
+            for (x, y) in &p.points {
+                coord(hasher, x.0);
+                coord(hasher, y.0);
+            }
+            hash_str(hasher, &p.layer);
+        }
+        SolvedValue::Text(t) => {
+            hasher.write_u8(3);
+            coord(hasher, t.x);
+            coord(hasher, t.y);
+            hash_str(hasher, &t.text);
+            hash_str(hasher, &t.layer);
+        }
+        SolvedValue::Dimension(d) => {
+            hasher.write_u8(4);
+            coord(hasher, d.value.0);
+            coord(hasher, d.coord.0);
+        }
+        SolvedValue::Instance(i) => {
+            hasher.write_u8(5);
+            coord(hasher, i.x);
+            coord(hasher, i.y);
+            hasher.write_u8(i.angle as u8);
+            hasher.write_u8(u8::from(i.reflect));
+            // By name, because the referenced id is itself allocation-dependent.
+            hash_str(
+                hasher,
+                cells.get(&i.cell).map(|c| c.name.as_str()).unwrap_or(""),
+            );
+        }
+    }
+}
+
 impl CompiledCell {
+    /// Translates every source span in this cell onto another revision of the
+    /// workspace.
+    ///
+    /// Every field is named explicitly rather than matched with `..`, so that a
+    /// `Span` added to any of these types later fails to compile here instead
+    /// of being silently left stale.
+    pub fn rebase_spans(&mut self, rebase: &SpanRebase) -> Result<(), RebaseError> {
+        let Self {
+            name: _,
+            scopes,
+            root: _,
+            fields: _,
+            sse_basis: _,
+            objects,
+            fallback_constraints_used,
+            unsolved_vars: _,
+            inconsistent_constraints: _,
+        } = self;
+
+        for scope in scopes.values_mut() {
+            let CompiledScope {
+                static_parent: _,
+                bindings: _,
+                children: _,
+                name: _,
+                span,
+                emit,
+            } = scope;
+            rebase.rebase(span)?;
+            for (_, CompiledEmit { span }) in emit.iter_mut() {
+                rebase.rebase(span)?;
+            }
+        }
+
+        for object in objects.values_mut() {
+            match object {
+                SolvedValue::Rect(Rect { span, .. })
+                | SolvedValue::Polygon(Polygon { span, .. })
+                | SolvedValue::Path(Path { span, .. })
+                | SolvedValue::Text(Text { span, .. })
+                | SolvedValue::Dimension(Dimension { span, .. }) => rebase.rebase_opt(span)?,
+                SolvedValue::Instance(SolvedInstance { span, .. }) => rebase.rebase(span)?,
+            }
+        }
+
+        for fallback in fallback_constraints_used.iter_mut() {
+            let UsedFallback {
+                constraint: _,
+                span,
+                initial_condition: _,
+            } = fallback;
+            rebase.rebase(span)?;
+        }
+        Ok(())
+    }
+
     pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
         self.fields
             .get(name)
@@ -7964,7 +8558,11 @@ pub fn bbox_dim_union(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledData {
-    pub cells: IndexMap<CellId, CompiledCell>,
+    /// Compiled cells, shared rather than owned so that a session can hand the
+    /// same hierarchy out repeatedly without cloning it. A cell is immutable
+    /// once compiled, and a GDS import alone can contribute ten thousand cells
+    /// and hundreds of thousands of objects.
+    pub cells: IndexMap<CellId, Arc<CompiledCell>>,
     pub top: CellId,
     pub tech: crate::tech::Technology,
 }

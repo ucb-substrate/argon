@@ -6,6 +6,55 @@ use serde::{Deserialize, Serialize};
 use sparse_linear_solver::{analyze as analyze_sparse_system, nullspace as sparse_nullspace};
 use std::collections::VecDeque;
 
+/// Cumulative `solve()` accounting, for attributing compile time between
+/// evaluation and the linear solver.
+///
+/// A thread-local rather than a field on [`Solver`], because each cell owns its
+/// own solver and the question being asked is about a whole compile.
+#[cfg(test)]
+pub mod solve_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+        static BODY_CALLS: Cell<u64> = const { Cell::new(0) };
+        static NANOS: Cell<u128> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        CALLS.set(0);
+        BODY_CALLS.set(0);
+        NANOS.set(0);
+    }
+
+    /// `(calls, calls that got past the early return, nanoseconds)`.
+    pub fn read() -> (u64, u64, u128) {
+        (CALLS.get(), BODY_CALLS.get(), NANOS.get())
+    }
+
+    pub(super) fn record(entered_body: bool, nanos: u128) {
+        CALLS.set(CALLS.get() + 1);
+        if entered_body {
+            BODY_CALLS.set(BODY_CALLS.get() + 1);
+        }
+        NANOS.set(NANOS.get() + nanos);
+    }
+}
+
+/// Records one `solve()` call on drop, so an early return is still counted.
+#[cfg(test)]
+struct SolveAccounting {
+    started: std::time::Instant,
+    entered_body: bool,
+}
+
+#[cfg(test)]
+impl Drop for SolveAccounting {
+    fn drop(&mut self) {
+        solve_stats::record(self.entered_body, self.started.elapsed().as_nanos());
+    }
+}
+
 const EPSILON: f64 = 1e-8;
 const DEFAULT_GRID: f64 = 0.1;
 
@@ -99,11 +148,102 @@ impl Solver {
         self.unsolved_vars.is_empty()
     }
 
+    /// Labels every unsolved variable with a representative of its connected
+    /// component in the *live* constraint graph.
+    ///
+    /// Two variables share a label exactly when a chain of live constraints
+    /// connects them, so pinning one can only ever change the solved-ness of
+    /// variables carrying the same label; a variable in no live constraint is
+    /// its own label. That is what lets a caller apply several pending
+    /// constraints in one round, as long as their variables carry disjoint
+    /// labels.
+    ///
+    /// Lighter than `constraint_components`, which also collects each
+    /// component's constraint list so that the solver can factor it.
+    pub fn unsolved_var_components(&self) -> IndexMap<Var, Var> {
+        let mut labels = IndexMap::with_capacity(self.unsolved_vars.len());
+        let mut queue = VecDeque::new();
+        for &root in &self.unsolved_vars {
+            if labels.contains_key(&root) {
+                continue;
+            }
+            labels.insert(root, root);
+            queue.clear();
+            queue.push_back(root);
+            while let Some(var) = queue.pop_front() {
+                let Some(constraints) = self.var_to_constraints.get(&var) else {
+                    continue;
+                };
+                for constraint_id in constraints {
+                    // `var_to_constraints` is not unlinked when a constraint is
+                    // consumed by back-substitution, so it can name ids that
+                    // are no longer live. Only live constraints connect.
+                    let Some(constraint) = self.constraints.get(constraint_id) else {
+                        continue;
+                    };
+                    for &(_, next) in &constraint.coeffs {
+                        if self.unsolved_vars.contains(&next) && labels.insert(next, root).is_none()
+                        {
+                            queue.push_back(next);
+                        }
+                    }
+                }
+            }
+        }
+        labels
+    }
+
+    /// The component labels of `expr`'s unsolved variables, using the same
+    /// coefficient threshold as [`Self::has_unsolved_var`] so that the two
+    /// always agree on which variables an expression actually determines.
+    pub fn unsolved_component_labels(
+        &self,
+        expr: &LinearExpr,
+        labels: &IndexMap<Var, Var>,
+    ) -> Vec<Var> {
+        expr.coeffs
+            .iter()
+            .filter(|(coeff, var)| coeff.abs() > 1e-6 && !self.is_solved(*var))
+            .map(|(_, var)| labels.get(var).copied().unwrap_or(*var))
+            .collect()
+    }
+
+    /// Pins whatever the source left free, so that a cell nobody finished
+    /// constraining still produces a layout.
+    ///
+    /// Pins one variable per *connected component* per round, so a
+    /// whole-system [`Self::solve`] runs once per round rather than once per
+    /// pinned variable. Components are independent by construction -- see
+    /// [`Self::unsolved_var_components`] -- so the fixed point reached is the
+    /// same one pinning them singly reaches.
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
-            // Find any unsolved variable and constrain it to equal 0.
-            let v = self.unsolved_vars.first().unwrap();
-            self.constrain_eq0(LinearExpr::from(*v));
+            let labels = self.unsolved_var_components();
+            let mut claimed = IndexSet::new();
+            let mut pinned = false;
+            // Collected rather than cloning the `IndexSet`, which would
+            // rebuild its hash table for a list this only iterates.
+            let candidates = self.unsolved_vars.iter().copied().collect::<Vec<_>>();
+            for var in candidates {
+                // `constrain_eq0` back-substitutes eagerly, so pinning one
+                // variable can solve others in the same component before this
+                // loop reaches them.
+                if self.is_solved(var) {
+                    continue;
+                }
+                let label = labels.get(&var).copied().unwrap_or(var);
+                if !claimed.insert(label) {
+                    continue;
+                }
+                self.constrain_eq0(LinearExpr::from(var));
+                pinned = true;
+            }
+            // Every remaining variable belonged to a component already pinned
+            // this round; without this the loop could not make progress and
+            // would spin.
+            if !pinned {
+                break;
+            }
             self.solve();
         }
     }
@@ -215,7 +355,15 @@ impl Solver {
     ///
     /// Constraints should be simplified before this function is invoked.
     pub fn solve(&mut self) {
-        if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        let entered_body = !(self.unsolved_vars.is_empty() || self.constraints.is_empty());
+        #[cfg(test)]
+        let _guard = SolveAccounting {
+            started,
+            entered_body,
+        };
+        if !entered_body {
             return;
         }
         // Sparsity-exploiting pre-pass: peel off variables that are uniquely defined
@@ -909,6 +1057,40 @@ impl From<f64> for LinearExpr {
 
 #[cfg(test)]
 mod tests {
+    /// `unsolved_var_components` must join exactly the variables a chain of
+    /// *live* constraints reaches, and leave everything else in its own
+    /// singleton.
+    #[test]
+    fn unsolved_var_components_partitions_by_live_constraints() {
+        let mut solver = Solver::new();
+        let (a, b, c, d, lone) = (
+            solver.new_var(),
+            solver.new_var(),
+            solver.new_var(),
+            solver.new_var(),
+            solver.new_var(),
+        );
+        // Two disjoint chains, plus a variable in no constraint at all.
+        solver.constrain_eq0(LinearExpr::from(a) - LinearExpr::from(b));
+        solver.constrain_eq0(LinearExpr::from(c) - LinearExpr::from(d));
+
+        let labels = solver.unsolved_var_components();
+        assert_eq!(labels[&a], labels[&b], "a chain joins its variables");
+        assert_eq!(labels[&c], labels[&d]);
+        assert_ne!(labels[&a], labels[&c], "disjoint chains stay disjoint");
+        assert_eq!(labels[&lone], lone, "an unconstrained variable is its own");
+
+        // A one-variable constraint is consumed by back-substitution at
+        // insertion, so it never joins anything: `a` and `b` are solved and
+        // drop out of the partition entirely.
+        solver.constrain_eq0(LinearExpr::from(a) - 3.);
+        solver.solve();
+        let labels = solver.unsolved_var_components();
+        assert!(!labels.contains_key(&a), "solved variables are excluded");
+        assert!(!labels.contains_key(&b));
+        assert_eq!(labels[&c], labels[&d], "the other chain is untouched");
+    }
+
     use super::*;
     use approx::assert_relative_eq;
 
