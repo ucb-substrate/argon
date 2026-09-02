@@ -482,7 +482,7 @@ struct ToolTip {
 }
 
 impl ToolTip {
-    /// Builds the tooltip view handed to [`InteractiveElement::tooltip`].
+    /// Builds the tooltip view handed to [`StatefulInteractiveElement::tooltip`].
     fn build(
         label: &'static str,
         hotkey: Option<SharedString>,

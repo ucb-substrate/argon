@@ -3319,7 +3319,7 @@ struct CellState {
     /// A proxy is a view of geometry the instance's `SREF` already draws, so
     /// it is construction geometry by default. `!` on such a value is an
     /// explicit request to flatten that one shape into the parent as well;
-    /// [`ExecPass::mark_emitted_proxies_as_layout`] uses this set to tell the
+    /// [`mark_emitted_proxies_as_layout`] uses this set to tell the
     /// two apart once the emission list has been resolved to object IDs.
     proxy_objects: IndexSet<ObjectId>,
 }
