@@ -1,0 +1,3 @@
+cell argon_sram() {
+    let inst0 = inst(sram22_512x32m4w8());
+}
