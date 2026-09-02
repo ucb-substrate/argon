@@ -232,7 +232,7 @@ dependencies = [
  "arc",
  "arcstr",
  "argonc",
- "bincode",
+ "bincode 3.0.0",
  "bytes",
  "cfgrammar",
  "clap",
@@ -273,7 +273,7 @@ dependencies = [
  "anyhow",
  "approx",
  "arcstr",
- "bincode",
+ "bincode 3.0.0",
  "cfgrammar",
  "clap",
  "const_format",
@@ -867,6 +867,12 @@ checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
 
 [[package]]
 name = "bindgen"
@@ -8241,7 +8247,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf600e7036b17782571dd44fa0a5cea3c82f60db5137f774a325a76a0d6852b"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "bytes",
  "educe",
  "futures-core",
