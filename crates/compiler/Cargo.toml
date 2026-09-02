@@ -16,6 +16,7 @@ gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main"
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }
 itertools = { workspace = true }
+fnv = { workspace = true }
 enumify = { workspace = true }
 arcstr = { workspace = true }
 serde = { workspace = true }

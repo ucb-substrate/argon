@@ -16,6 +16,8 @@ The Argon sources that are swept live in [`../examples/`](../examples):
 | `examples/stress_shapes`         | `shapes_loop(n)`        | the same geometry generated with a `for` loop over `std::range` (also stresses the functional list representation) |
 | `examples/stress_constraints`    | `constraints(n)`        | a ring of `n+1` rectangles whose edges are mutually coupled, forcing the general (dense) linear solver |
 | `examples/stress_instances`      | `instances(n)`          | `n` instances of a single cached leaf cell |
+| `examples/stress_fallbacks`      | `fallbacks(n)`          | `n` rectangles whose coordinates are *initial conditions* (`x0i`), each coupled by an `eq` — the shape the GUI writes |
+| `examples/stress_free`           | `free_shapes(n)`        | `n` rectangles with relative dimensions and no absolute anchor, leaving one degree of freedom per axis for `force_solution` to pin |
 | `examples/stress_hierarchy`      | `h0 .. h8`              | a chain of cells `h{k}` each instantiating `h{k-1}`; compiling `h{k}` exercises `k` levels of hierarchy |
 
 The benchmark *drivers* are the `bench_*` tests in
@@ -109,7 +111,10 @@ test writes `bench/results/<axis>.csv` with columns
 library to print the summary table; `matplotlib` is required to draw the figure.
 The kernel-only `sparse_solver.csv` and `sparse_sse.csv` are retained as
 benchmark data but omitted from the figure, which covers end-to-end compiler
-scaling axes.
+scaling axes. `fallbacks.csv` is also omitted for now even though it is
+end-to-end: adding a series means editing `SERIES`, `MARKERS`, and `PALETTE` in
+`plot_scaling.py` together and regenerating the camera-ready figure, which is an
+editorial decision about the paper rather than a benchmarking one.
 The figure is drawn for the ACM `acmart` `sigconf` camera-ready format: it is
 sized to the full two-column text width (~7 in, i.e. a `figure*`), uses a
 colorblind-safe palette with distinct markers (legible in grayscale), and
@@ -131,6 +136,8 @@ how an axis scales — without editing any source. Pass a comma-separated list:
 | `ARGON_BENCH_SHAPES_LOOP`   | shapes (`for` loop)  | `500,1000,2000,4000,8000,16000,32000` |
 | `ARGON_BENCH_INSTANCES`     | instances            | `500,…,64000` |
 | `ARGON_BENCH_CONSTRAINTS`   | coupled constraints  | `32,64,128,256,512,1024,2048,4096,8192,16384` |
+| `ARGON_BENCH_FALLBACKS`     | fallback constraints | `125,250,500,1000,2000` |
+| `ARGON_BENCH_FREE`          | unanchored degrees of freedom | `250,500,1000,2000,4000` |
 | `ARGON_BENCH_SPARSE_SOLVER` | sparse solver variables | `256,512,1024,2048,4096,8192,16384` |
 | `ARGON_BENCH_SPARSE_SSE`    | sparse SSE variables | `256,512,1024,2048,4096,8192,16384` |
 | `ARGON_BENCH_HIER_SINGLE`   | hierarchy (1 ref)    | `4,8,16,32,64,128,256,512,1024,2048` |
@@ -173,6 +180,8 @@ parameter; "peak" is peak heap allocated during compilation.
 | Hierarchy, 1 child ref       | depth 2048     | 0.15 s  | 160 MiB  | **linear** in depth |
 | Coupled constraints          | 16 384 rects   | 1.37 s  | 0.59 GiB | **~linear** (time `∝ n^1.0`, mem `∝ n^0.90`) |
 | Shapes (`for`-loop)          | 32 000 rects   | 1.06 s  | 0.85 GiB | **~linear** (time `∝ n^1.2`, mem `∝ n^1.0`) |
+| Fallback constraints         | 2 000 rects    | 0.095 s | 44 MiB   | **~linear** (time `∝ n^1.0`, mem `∝ n^1.0`; was `n^1.9`) |
+| Unanchored degrees of freedom | 4 000 rects   | 0.181 s | 84 MiB   | **~linear** (time `∝ n^1.0`, mem `∝ n^1.0`; was `n^1.9`) |
 | Hierarchy, 2 child refs      | depth 2048     | 0.14 s  | 163 MiB  | **linear** in depth (was exponential before the shared-type fix) |
 
 ### Interpretation
@@ -220,6 +229,72 @@ parameter; "peak" is peak heap allocated during compilation.
   runs this axis on a 512 MiB stack (reaching a few thousand levels), and lifting
   the cap entirely would mean turning that recursion into an explicit work-stack.
 
+- **Fallback (initial-condition) constraints now scale linearly.** This axis is
+  the one the GUI actually exercises, and it did not scale until recently.
+  `LangServer::draw_rect` writes every coordinate it draws as `x0i`/`y0i`/
+  `x1i`/`y1i`, so a later drag can rewrite the literal in place; a GUI-authored
+  cell is therefore made almost entirely of fallbacks. The fixpoint loop in
+  `execute_cell_inner` applied **exactly one** pending fallback per round, with
+  a full `Solver::solve()` between any two — and `solve()` is not incremental:
+  `eliminate_definitional` reseeds its worklist with every live constraint on
+  each call, and `resolve_substitutions` re-materializes every substitution
+  that did not become ground. With `2n` fallbacks against `O(n)` live
+  constraints that was `Θ(n²)` in solving against `Θ(n)` in evaluation, measured
+  at `n^1.9` with memory flat at `n^1.0` — redundant recomputation, not blowup.
+
+  The one-at-a-time discipline was deliberate: applying pending constraints as
+  an undifferentiated batch tested each against solver state that had not yet
+  seen the others, so a system with fewer degrees of freedom than constraints
+  was over-constrained and reported inconsistent even when it was satisfiable.
+  But that interaction is confined to a **connected component** of the live
+  constraint graph — pinning a variable can only change the solved-ness of
+  variables a chain of live constraints reaches. `apply_independent_fallbacks`
+  (and its `apply_independent_defaults` counterpart) therefore applies a
+  *prefix* of the pending queue whose components are pairwise disjoint, which
+  is indistinguishable from applying them one at a time. Priority order is
+  preserved exactly — candidates are inspected with `peek` and popped only when
+  applied, and the first collision ends the round rather than being skipped —
+  so `fallback_constraints_used`, which the GUI reads to rewrite source after a
+  drag, is byte-identical.
+
+  The axis went from `n^1.92` to `n^0.99`: at `n = 2000` the same 2 000
+  rectangles cost **0.095 s** against **5.19 s** before, a 50x reduction that
+  grows with `n`. Output is byte-for-byte identical across every
+  fallback-exercising example.
+
+  Two properties worth remembering when reading this fixture. A lone
+  one-variable fallback is back-substituted by `constrain_eq0` at insertion and
+  never reaches `solve()`'s body, so a pile of *unconstrained* rectangles never
+  had the problem; it needs pending fallbacks coexisting with live
+  multi-variable constraints, which is what a *dimensioned* layout is. And the
+  cell is reported underconstrained by construction — `report_underconstrained`
+  runs its trial solve with compiler defaults but deliberately without author
+  fallbacks — which is the dashed-edge state the top-level README's tutorial
+  describes, and the state every layout passes through while being drawn. So
+  this axis asserts that geometry was produced, not that the compile was
+  `Valid`.
+
+- **Unanchored geometry now scales linearly too, and the solver's share is
+  measurable.** `Solver::force_solution` supplies values for whatever the
+  source left free, and it pinned **one variable per whole-system `solve()`**.
+  A `crect` with a constrained width but no position — handwritten layout
+  before it is finished — leaves one degree of freedom per axis per shape, so
+  that was `O(n)` rounds against an `O(n)` solve.
+
+  Components of the live constraint graph are independent, so pinning one
+  variable in each per round reaches the same fixed point as pinning them
+  singly; `force_solution` now does that. The `solve_stats` counters make the
+  effect legible: at `n = 800`, **1 602 `solve()` calls costing 896 ms became 3
+  calls costing 2 ms**, and the whole compile went from 928 ms to 32 ms. End to
+  end through `arc`, `free_shapes(1600)` went from 3.52 s to 0.094 s.
+  `CompiledData::geometry_digest` is identical at every size.
+
+  Those counters also answer the "how much of a compile is the solver?"
+  question directly, and the answer depends entirely on the regime: **97%**
+  before this change on this axis, **5-6%** after, and effectively 0% on
+  `shapes`/`instances`/`hierarchy`, whose one-variable constraints never reach
+  `solve()`'s body at all.
+
 - **Recursion and iteration now scale identically.** `shapes` and `shapes_loop`
   emit identical geometry; the only difference is that `shapes_loop` builds and
   iterates a `std::range` list. That list path used to be quadratic — emitting
@@ -235,7 +310,8 @@ parameter; "peak" is peak heap allocated during compilation.
   avoids the per-element recursion overhead of `emit_shapes`.
 
 The takeaways for the paper: editable-object count, instance count, hierarchy
-depth, and now coupled-constraint count all scale linearly. The dense general
+depth, coupled-constraint count, fallback count, and unanchored degrees of
+freedom all scale linearly. The dense general
 solver is no longer a practical limit for sparse-but-coupled systems — the
 elimination pre-pass reduces them first — and remains the fallback only for
 irreducible dense constraint blocks with no ≤2-variable pivot, which lines up
