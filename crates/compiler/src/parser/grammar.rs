@@ -525,18 +525,25 @@ impl<'a> Parser<'a> {
     }
 
     /// `argDecls : (argDecl (COMMA argDecl)* COMMA?)?`
+    ///
+    /// Default values number their scopes from zero, like a brace scope.
     fn parse_arg_decls(&mut self) -> Vec<ArgDecl<&'a str, Md>> {
-        self.separated_list(TokenKind::RParen, |p| p.parse_arg_decl())
+        self.scope_orders.push(0);
+        let args = self.separated_list(TokenKind::RParen, |p| p.parse_arg_decl());
+        self.scope_orders.pop();
+        args
     }
 
-    /// `argDecl : ident COLON tySpec`
+    /// `argDecl : ident COLON tySpec (EQ expr)?`
     fn parse_arg_decl(&mut self) -> ArgDecl<&'a str, Md> {
         let name = self.ident();
         self.expect(TokenKind::Colon);
         let ty = self.parse_ty_spec();
+        let default = self.eat(TokenKind::Eq).then(|| self.parse_expr(0));
         ArgDecl {
             name,
             ty,
+            default,
             metadata: (),
         }
     }

@@ -597,6 +597,20 @@ mod tests {
     }
 
     #[test]
+    fn execution_accepts_keyword_cell_arguments() {
+        let source = temp_source(
+            "kwargs",
+            "cell top(w: Float = 100., h: Float = w) {\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=h);\n\
+             }\n",
+        );
+        let rect = compiled_rect("kwargs-default", source.clone(), "top()");
+        assert_eq!((rect.x1.0, rect.y1.0), (100., 100.));
+        let rect = compiled_rect("kwargs-explicit", source, "top(w=300.)");
+        assert_eq!((rect.x1.0, rect.y1.0), (300., 300.));
+    }
+
+    #[test]
     fn out_of_range_cell_argument_is_reported_cleanly() {
         let source = temp_source("out-of-range-arg", "cell top(n: Int) {}\n");
         let diagnostic = render_failed(failed(execution_args(

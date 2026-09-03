@@ -70,6 +70,27 @@ arc run --cell 'top(pitch * 4., -width / 2.)'
 arc run --cell 'array(cons(250., cons(350., [])), Mode::Fast)'
 ```
 
+Parameters declared with a default value are keyword parameters. They are
+passed by name, may be omitted, and must follow the positional parameters. A
+default is an ordinary expression evaluated at each call; it may refer to the
+parameters declared before it and to module-level items, and its type must match
+the declared type exactly:
+
+```rust
+cell via(layer: String, w: Float, h: Float = w, n: Int = 1) {
+    // ...
+}
+
+cell top() {
+    let square = inst(via("met1", 100.));
+    let stack = inst(via("met1", 100., h=300., n=3));
+}
+```
+
+Positional parameters cannot be passed by name, and keyword parameters cannot be
+passed positionally. Keyword arguments also work in cell invocations:
+`arc run --cell 'via("met1", 100., n=3)'`.
+
 GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
 `use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,

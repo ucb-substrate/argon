@@ -771,6 +771,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+        _default: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
@@ -1248,13 +1249,8 @@ impl std::fmt::Display for Ty {
             Ty::SeqNil => write!(f, "[]"),
             Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
-            Ty::CellFn(cell_fn) => write!(
-                f,
-                "cell {}({})",
-                cell_fn.cell.name,
-                cell_fn.args.iter().format(", ")
-            ),
-            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.args.iter().format(", "), func.ret),
+            Ty::CellFn(cell_fn) => write!(f, "cell {}({})", cell_fn.cell.name, cell_fn.sig),
+            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.sig, func.ret),
             // The name is what distinguishes two same-shaped enums: `EnumTy`
             // equality keys on `id`, so without it a mismatch renders as
             // `expected enum {A, B}, found enum {A, B}`.
@@ -1354,22 +1350,122 @@ impl Ty {
     }
 }
 
+/// The parameters a call must supply: positional types in order, then keyword
+/// parameters by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    pub(crate) args: Vec<Ty>,
+    pub(crate) kwargs: IndexMap<String, Ty>,
+}
+
+impl Signature {
+    /// A signature with only positional parameters.
+    fn positional(args: impl IntoIterator<Item = Ty>) -> Self {
+        Self {
+            args: args.into_iter().collect(),
+            kwargs: IndexMap::new(),
+        }
+    }
+
+    /// Adds keyword parameters.
+    fn keywords<'s>(mut self, kwargs: impl IntoIterator<Item = (&'s str, Ty)>) -> Self {
+        self.kwargs
+            .extend(kwargs.into_iter().map(|(name, ty)| (name.to_owned(), ty)));
+        self
+    }
+}
+
+/// Builds a signature from typed parameter declarations: parameters without a
+/// default are positional, the rest are keyword parameters.
+impl<'a, M: AstMetadata> FromIterator<(&'a ArgDecl<Substr, M>, Ty)> for Signature {
+    fn from_iter<I: IntoIterator<Item = (&'a ArgDecl<Substr, M>, Ty)>>(params: I) -> Self {
+        let mut sig = Self::default();
+        for (arg, ty) in params {
+            match arg.default {
+                Some(_) => {
+                    sig.kwargs.insert(arg.name.name.to_string(), ty);
+                }
+                None => sig.args.push(ty),
+            }
+        }
+        sig
+    }
+}
+
+impl std::fmt::Display for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let args = self.args.iter().map(ToString::to_string);
+        let kwargs = self.kwargs.iter().map(|(name, ty)| format!("{name}: {ty}"));
+        write!(f, "{}", args.chain(kwargs).format(", "))
+    }
+}
+
+/// Signatures of the builtins whose parameters do not depend on the call.
+/// Built once rather than per call site, since every keyword name is owned.
+mod builtin_sig {
+    use std::sync::LazyLock;
+
+    use super::{Signature, Ty};
+
+    /// The coordinate keywords every rectangle constructor accepts.
+    fn coordinates() -> impl Iterator<Item = (&'static str, Ty)> {
+        ["x0", "x1", "y0", "y1", "x0i", "x1i", "y0i", "y1i", "w", "h"]
+            .into_iter()
+            .map(|name| (name, Ty::Float))
+    }
+
+    pub(super) static CRECT: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::default().keywords(coordinates().chain([("layer", Ty::String)]))
+    });
+    pub(super) static RECT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String]).keywords(coordinates()));
+    pub(super) static TEXT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String, Ty::String, Ty::Float, Ty::Float]));
+    pub(super) static RANGE_FULL: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Int, Ty::Int, Ty::Int]));
+    pub(super) static EQ: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
+    pub(super) static DIMENSION: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Bool,
+        ])
+    });
+    /// The single positional parameter is a cell, which has no nameable type;
+    /// `Ty::Any` checks the arity and leaves the category to
+    /// `assert_ty_is_cell`.
+    pub(super) static INST: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::Any]).keywords([
+            ("reflect", Ty::Bool),
+            ("angle", Ty::Int),
+            ("x", Ty::Float),
+            ("y", Ty::Float),
+            ("xi", Ty::Float),
+            ("yi", Ty::Float),
+            ("construction", Ty::Bool),
+        ])
+    });
+    /// A builtin that takes no arguments, and the empty keyword set that
+    /// builtins with variadic positional arguments check against.
+    pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
-    pub(crate) args: Vec<Ty>,
+    pub(crate) sig: Signature,
     pub(crate) ret: Ty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
-    args: Vec<Ty>,
-    /// The structural type produced when this cell function is called.
-    ///
-    /// Stored behind an `Arc` so that every caller (and every `inst` of the
-    /// resulting cell) shares one allocation instead of deep-copying it. This
-    /// keeps the type representation a DAG rather than a tree: a cell that
-    /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
-    /// type size stays linear in hierarchy depth instead of doubling per level.
+    sig: Signature,
+    /// The structural type produced when this cell function is called, shared
+    /// with every caller and every `inst` of the result.
     pub(crate) cell: Arc<CellTy>,
 }
 
@@ -1647,16 +1743,17 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
-        let args: Vec<_> = input
+        self.check_params(&input.args);
+        let sig = input
             .args
             .iter()
             .map(|arg| {
                 let ty_spec = self.transform_ty_spec(&arg.ty);
-                self.ty_from_spec(&ty_spec)
+                (arg, self.ty_from_spec(&ty_spec))
             })
             .collect();
         let ty = Ty::Fn(Box::new(FnTy {
-            args,
+            sig,
             ret: if let Some(return_ty) = &input.return_ty {
                 self.ty_from_spec(return_ty)
             } else {
@@ -1957,33 +2054,26 @@ impl<'a> VarIdTyPass<'a> {
     fn typecheck_kwargs(
         &mut self,
         kwargs: &[KwArgValue<Substr, VarIdTyMetadata>],
-        kwarg_defs: IndexMap<&str, Ty>,
+        defs: &IndexMap<String, Ty>,
     ) {
-        let mut defined = IndexSet::new();
+        let mut seen = IndexSet::new();
         for kwarg in kwargs {
-            let mut cont = false;
-            if !kwarg_defs.contains_key(&kwarg.name.name.as_str()) {
+            let name = kwarg.name.name.as_str();
+            let Some(expected) = defs.get(name) else {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::InvalidKwArg,
                 });
-                cont = true;
-            }
-            if defined.contains(&&kwarg.name.name) {
+                continue;
+            };
+            if !seen.insert(name) {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::DuplicateKwArg,
                 });
-                cont = true;
+                continue;
             }
-            defined.insert(&kwarg.name.name);
-            if !cont {
-                self.assert_eq_ty(
-                    kwarg.value.span(),
-                    &kwarg.value.ty(),
-                    kwarg_defs.get(&kwarg.name.name.as_str()).unwrap(),
-                );
-            }
+            self.assert_eq_ty(kwarg.value.span(), &kwarg.value.ty(), expected);
         }
     }
 
@@ -1999,15 +2089,40 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Checks a call's arguments against the callee's signature.
     fn typecheck_args(
         &mut self,
         call_span: cfgrammar::Span,
         args: &crate::ast::Args<Substr, VarIdTyMetadata>,
-        arg_defs: &[Ty],
-        kwarg_defs: IndexMap<&str, Ty>,
+        sig: &Signature,
     ) {
-        self.typecheck_posargs(call_span, &args.posargs, arg_defs);
-        self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+        self.typecheck_posargs(call_span, &args.posargs, &sig.args);
+        self.typecheck_kwargs(&args.kwargs, &sig.kwargs);
+    }
+
+    /// Rejects repeated parameter names and positional parameters declared
+    /// after keyword parameters.
+    fn check_params<M: AstMetadata>(&mut self, args: &[ArgDecl<Substr, M>]) {
+        let mut seen = IndexSet::new();
+        let mut keyword_seen = false;
+        for arg in args {
+            if !seen.insert(arg.name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(arg.name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            match arg.default {
+                Some(_) => keyword_seen = true,
+                None if keyword_seen => self.errors.push(StaticError {
+                    span: self.span(arg.name.span),
+                    kind: StaticErrorKind::PositionalParamAfterDefault {
+                        name: arg.name.name.to_string(),
+                    },
+                }),
+                None => {}
+            }
+        }
     }
 
     fn typecheck_call(
@@ -2021,11 +2136,11 @@ impl<'a> VarIdTyPass<'a> {
         if let Some((varid, ty)) = lookup {
             match ty {
                 Ty::Fn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    self.typecheck_args(call_span, args, &ty.sig);
                     (Some(varid), ty.ret.clone())
                 }
                 Ty::CellFn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    self.typecheck_args(call_span, args, &ty.sig);
                     (Some(varid), Ty::Cell(ty.cell.clone()))
                 }
                 ty => {
@@ -2242,6 +2357,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
+        self.check_params(&input.args);
         self.enter_scope(&input.scope);
         let args: Vec<_> = input
             .args
@@ -2290,7 +2406,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         // field accesses on it fall through to the builtin geometry fields.
         let cell_id = self.alloc_id();
         let ty = Ty::CellFn(Box::new(CellFnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            sig: args
+                .iter()
+                .map(|arg| (arg, arg.metadata.1.clone()))
+                .collect(),
             cell: Arc::new(CellTy {
                 name: self.qualified_name(&input.name.name),
                 data,
@@ -2652,94 +2771,44 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
-                    let kwarg_defs = if name == "crect" {
-                        self.typecheck_posargs(input.span, &args.posargs, &[]);
-                        IndexMap::from_iter([
-                            ("x0", Ty::Float),
-                            ("x1", Ty::Float),
-                            ("y0", Ty::Float),
-                            ("y1", Ty::Float),
-                            ("x0i", Ty::Float),
-                            ("x1i", Ty::Float),
-                            ("y0i", Ty::Float),
-                            ("y1i", Ty::Float),
-                            ("w", Ty::Float),
-                            ("h", Ty::Float),
-                            ("layer", Ty::String),
-                        ])
+                    let sig = if name == "crect" {
+                        &builtin_sig::CRECT
                     } else {
-                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
-                        IndexMap::from_iter([
-                            ("x0", Ty::Float),
-                            ("x1", Ty::Float),
-                            ("y0", Ty::Float),
-                            ("y1", Ty::Float),
-                            ("x0i", Ty::Float),
-                            ("x1i", Ty::Float),
-                            ("y0i", Ty::Float),
-                            ("y1i", Ty::Float),
-                            ("w", Ty::Float),
-                            ("h", Ty::Float),
-                        ])
+                        &builtin_sig::RECT
                     };
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    self.typecheck_args(input.span, args, sig);
                     (None, Ty::Rect)
                 }
                 "polygon" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if let Some(layer) = args.posargs.first() {
-                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
-                    }
-                    if let Some(points) = args.posargs.get(1) {
-                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
-                    }
-                    let kwarg_defs = args
-                        .kwargs
-                        .iter()
-                        .filter_map(|kwarg| {
-                            polygon_coordinate(kwarg.name.name.as_str())
-                                .map(|_| (kwarg.name.name.as_str(), Ty::Float))
-                        })
-                        .collect();
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    let coordinates = args.kwargs.iter().filter_map(|kwarg| {
+                        let name = kwarg.name.name.as_str();
+                        polygon_coordinate(name).map(|_| (name, Ty::Float))
+                    });
+                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
+                    self.typecheck_args(input.span, args, &sig);
                     (None, Ty::Polygon)
                 }
                 "path" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if let Some(layer) = args.posargs.first() {
-                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
-                    }
-                    if let Some(points) = args.posargs.get(1) {
-                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
-                    }
-                    let kwarg_defs = args
-                        .kwargs
-                        .iter()
-                        .filter_map(|kwarg| {
-                            let name = kwarg.name.name.as_str();
-                            (matches!(
-                                name,
-                                "width"
-                                    | "widthi"
-                                    | "begin_extension"
-                                    | "begin_extensioni"
-                                    | "end_extension"
-                                    | "end_extensioni"
-                            ) || polygon_coordinate(name).is_some())
-                            .then_some((name, Ty::Float))
-                        })
-                        .collect();
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    let keywords = args.kwargs.iter().filter_map(|kwarg| {
+                        let name = kwarg.name.name.as_str();
+                        (matches!(
+                            name,
+                            "width"
+                                | "widthi"
+                                | "begin_extension"
+                                | "begin_extensioni"
+                                | "end_extension"
+                                | "end_extensioni"
+                        ) || polygon_coordinate(name).is_some())
+                        .then_some((name, Ty::Float))
+                    });
+                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
+                    self.typecheck_args(input.span, args, &sig);
                     (None, Ty::Path)
                 }
                 "text" => {
                     // text, layer, x, y
-                    self.typecheck_posargs(
-                        input.span,
-                        &args.posargs,
-                        &[Ty::String, Ty::String, Ty::Float, Ty::Float],
-                    );
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_args(input.span, args, &builtin_sig::TEXT);
                     (None, Ty::Nil)
                 }
                 "cons" => {
@@ -2762,7 +2831,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     }
                 }
                 "list" => {
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::NONE.kwargs);
                     if args.posargs.is_empty() {
                         self.errors.push(StaticError {
                             span: self.span(input.span),
@@ -2796,8 +2865,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "range_full" => {
                     // Native builtin backing `std::range`/`std::range_full`: builds the
                     // whole `[Int]` in one pass instead of recursive `cons`.
-                    self.typecheck_posargs(input.span, &args.posargs, &[Ty::Int, Ty::Int, Ty::Int]);
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_args(input.span, args, &builtin_sig::RANGE_FULL);
                     (None, Ty::Seq(Box::new(Ty::Int)))
                 }
                 "head" => {
@@ -2867,44 +2935,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     (None, Ty::Rect)
                 }
                 "float" => {
-                    self.typecheck_args(input.span, args, &[], IndexMap::new());
+                    self.typecheck_args(input.span, args, &builtin_sig::NONE);
                     (None, Ty::Float)
                 }
                 "eq" => {
-                    self.typecheck_args(input.span, args, &[Ty::Float, Ty::Float], IndexMap::new());
+                    self.typecheck_args(input.span, args, &builtin_sig::EQ);
                     (None, Ty::Nil)
                 }
                 "dimension" => {
-                    self.typecheck_args(
-                        input.span,
-                        args,
-                        &[
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Bool,
-                        ],
-                        IndexMap::new(),
-                    );
+                    self.typecheck_args(input.span, args, &builtin_sig::DIMENSION);
                     (None, Ty::Nil)
                 }
                 "inst" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    self.typecheck_kwargs(
-                        &args.kwargs,
-                        IndexMap::from_iter([
-                            ("reflect", Ty::Bool),
-                            ("angle", Ty::Int),
-                            ("x", Ty::Float),
-                            ("y", Ty::Float),
-                            ("xi", Ty::Float),
-                            ("yi", Ty::Float),
-                            ("construction", Ty::Bool),
-                        ]),
-                    );
+                    self.typecheck_args(input.span, args, &builtin_sig::INST);
                     if let Some(ty) = args.posargs.first() {
                         self.assert_ty_is_cell(ty.span(), &ty.ty());
                         match ty.ty() {
@@ -3013,8 +3056,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         input: &ArgDecl<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
         _ty: &TySpec<Substr, Self::OutputMetadata>,
+        default: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         let ty = self.ty_from_spec(&input.ty);
+        if let Some(default) = default {
+            self.assert_eq_ty(default.span(), &default.ty(), &ty);
+        }
         (self.alloc(&input.name.name, ty.clone()), ty)
     }
 
@@ -5347,6 +5394,88 @@ impl<'a> ExecPass<'a> {
             .unwrap_or(self.nil_value)
     }
 
+    /// Creates an empty frame whose parent is the global frame.
+    fn new_call_frame(&mut self) -> FrameId {
+        let fid = self.frame_id();
+        self.frames.insert(
+            fid,
+            Frame {
+                bindings: Default::default(),
+                parent: Some(self.global_frame),
+            },
+        );
+        fid
+    }
+
+    /// Evaluates a call's explicit arguments in the caller's context: one slot
+    /// per parameter in declaration order, `None` where the default applies.
+    fn explicit_args(
+        &mut self,
+        loc: DynLoc,
+        call: &CallExpr<Substr, VarIdTyMetadata>,
+        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+    ) -> Vec<Option<ValueId>> {
+        params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                let arg = match call.args.posargs.get(index) {
+                    Some(arg) => arg,
+                    None => {
+                        let kwarg = call
+                            .args
+                            .kwargs
+                            .iter()
+                            .find(|kwarg| kwarg.name.name == param.name.name)?;
+                        &kwarg.value
+                    }
+                };
+                Some(self.visit_expr(loc, arg))
+            })
+            .collect()
+    }
+
+    /// Binds every parameter in `loc.frame` and returns the bound values in
+    /// declaration order. A parameter without an explicit argument gets its
+    /// default, evaluated in a scope of its own under `loc.scope` once the
+    /// parameters before it are bound.
+    fn bind_args(
+        &mut self,
+        loc: DynLoc,
+        call_order: u64,
+        path: &FsPath,
+        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+        explicit: Vec<Option<ValueId>>,
+    ) -> Vec<ValueId> {
+        params
+            .iter()
+            .zip(explicit)
+            .map(|(param, explicit)| {
+                let value = match (explicit, &param.default) {
+                    (Some(value), _) => value,
+                    (None, Some(default)) => {
+                        let scope = self.create_exec_scope_at_loc(
+                            loc,
+                            format!("{call_order} default {}", param.name.name),
+                            Span {
+                                path: path.to_path_buf(),
+                                span: default.span(),
+                            },
+                        );
+                        self.visit_expr(DynLoc { scope, ..loc }, default)
+                    }
+                    (None, None) => unreachable!("a parameter without an argument has a default"),
+                };
+                self.frames
+                    .get_mut(&loc.frame)
+                    .unwrap()
+                    .bindings
+                    .insert(param.metadata.0, value);
+                value
+            })
+            .collect()
+    }
+
     fn new_ready_value(&mut self, val: Value) -> ValueId {
         let vid = self.value_id();
         self.values.insert(vid, Defer::Ready(val));
@@ -5424,33 +5553,19 @@ impl<'a> ExecPass<'a> {
                         }))
                     })
                 } else {
-                    let arg_vals = c
-                        .args
-                        .posargs
-                        .iter()
-                        .map(|arg| self.visit_expr(loc, arg))
-                        .collect_vec();
-                    let val = &self.values[&self
+                    let callee = self
                         .lookup(
                             loc.frame,
                             c.metadata
                                 .0
                                 .expect("no var ID assigned to function being called"),
                         )
-                        .unwrap()]
-                        .as_ref()
-                        .unwrap_ready()
-                        .as_ref();
-                    match val {
+                        .unwrap();
+                    match self.values[&callee].as_ref().unwrap_ready().as_ref() {
                         ValueRef::Fn(val) => {
-                            let mut call_frame = Frame {
-                                bindings: Default::default(),
-                                parent: Some(self.global_frame),
-                            };
-                            for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
-                                call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
-                            }
-                            let new_scope = val.scope.clone();
+                            let (params, body, path) =
+                                (val.args.clone(), val.scope.clone(), val.metadata.0.clone());
+                            let explicit = self.explicit_args(loc, c, &params);
                             let scope = self.create_exec_scope(
                                 loc.cell,
                                 loc.scope,
@@ -5461,12 +5576,11 @@ impl<'a> ExecPass<'a> {
                                     c.func.path.iter().map(|ident| &ident.name).join("::")
                                 ),
                                 Span {
-                                    path: val.metadata.0.clone(),
-                                    span: val.scope.span,
+                                    path: path.clone(),
+                                    span: body.span,
                                 },
                             );
-                            let fid = self.frame_id();
-                            self.frames.insert(fid, call_frame);
+                            let fid = self.new_call_frame();
                             // A `fn` body is inlined here and now, unlike an
                             // `if`/`match` branch, so a recursive call that is
                             // not inside one descends natively with no
@@ -5483,25 +5597,34 @@ impl<'a> ExecPass<'a> {
                                 });
                                 return self.nil_value;
                             }
-                            let value =
-                                self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope);
+                            let callee_loc = DynLoc {
+                                cell: loc.cell,
+                                frame: fid,
+                                scope,
+                                seq_num: SeqNum::new(),
+                            };
+                            self.bind_args(callee_loc, c.scope_order, &path, &params, explicit);
+                            let value = self.visit_scope_expr_inner(loc.cell, fid, scope, &body);
                             self.eval_depth -= 1;
                             value
                         }
-                        ValueRef::CellFn(_) => self.new_deferred_value(loc, |this| {
-                            PartialEvalState::Call(Box::new(PartialCallExpr {
-                                expr: c.clone(),
-                                state: CallExprState {
-                                    posargs: arg_vals,
-                                    kwargs: c
-                                        .args
-                                        .kwargs
-                                        .iter()
-                                        .map(|arg| this.visit_expr(loc, &arg.value))
-                                        .collect(),
-                                },
-                            }))
-                        }),
+                        ValueRef::CellFn(val) => {
+                            let (params, path) = (val.args.clone(), val.metadata.0.clone());
+                            let explicit = self.explicit_args(loc, c, &params);
+                            let fid = self.new_call_frame();
+                            let callee_loc = DynLoc { frame: fid, ..loc };
+                            let posargs =
+                                self.bind_args(callee_loc, c.scope_order, &path, &params, explicit);
+                            self.new_deferred_value(loc, |_| {
+                                PartialEvalState::Call(Box::new(PartialCallExpr {
+                                    expr: c.clone(),
+                                    state: CallExprState {
+                                        posargs,
+                                        kwargs: Vec::new(),
+                                    },
+                                }))
+                            })
+                        }
                         _ => {
                             self.errors.push(ExecError {
                                 span: Some(self.span(&loc, c.span)),

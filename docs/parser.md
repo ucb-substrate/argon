@@ -345,14 +345,16 @@ while !self.at(Eof) {
 |----------|---------------------|---------------|-------|
 | `enum`   | `parse_enum_decl`   | `EnumDecl`    | `enum Name { ident, … }` |
 | `struct` | `parse_struct_decl` | `StructDecl`  | `struct Name { field: Ty, … }` |
-| `cell`   | `parse_cell_decl`   | `CellDecl`    | `cell Name(args) scope` |
-| `fn`     | `parse_fn_decl`     | `FnDecl`      | `fn Name(args) (-> Ty)? scope` |
+| `cell`   | `parse_cell_decl`   | `CellDecl`    | `cell Name(argDecls) scope` |
+| `fn`     | `parse_fn_decl`     | `FnDecl`      | `fn Name(argDecls) (-> Ty)? scope` |
 | `const`  | `parse_const_decl`  | `ConstantDecl`| `const Name: Ty = expr;` |
 | `mod`    | `parse_mod_decl`    | `ModDecl`     | `mod Name;` |
 
-Argument declarations (`argDecl : ident COLON tySpec`) and enum variants /
-struct fields are comma-separated lists parsed by the shared `separated_list`
-helper (§8).
+Argument declarations (`argDecl : ident COLON tySpec (EQ expr)?`) and enum
+variants / struct fields are comma-separated lists parsed by the shared
+`separated_list` helper (§8). A parameter with a default value is a keyword
+parameter; `parse_arg_decls` gives the parameter list its own scope-ordinal
+counter (§10) so scopes opened inside default values are numbered from zero.
 
 ---
 

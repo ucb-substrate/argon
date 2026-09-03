@@ -86,8 +86,7 @@ pub enum Builtin {
     Type(&'static str),
     /// A field of a primitive type, such as `Rect::x0`.
     Field(String),
-    /// A keyword argument. Argon only permits these on builtin calls, so a
-    /// keyword argument never names a parameter declared in source.
+    /// A keyword argument of a builtin call.
     KwArg(String),
 }
 
@@ -244,6 +243,8 @@ struct Builder<'a> {
     enums: HashMap<EnumId, VarId>,
     /// Cell `VarId` to field name to the `VarId` of the `let` declaring it.
     cell_fields: HashMap<VarId, HashMap<String, VarId>>,
+    /// Fn or cell `VarId` to parameter name to the parameter's `VarId`.
+    params: HashMap<VarId, HashMap<String, VarId>>,
     /// Module currently being walked.
     current: &'a ModPath,
     path: &'a Path,
@@ -251,6 +252,13 @@ struct Builder<'a> {
     /// appended past this point.
     visible: usize,
     index: NavIndex,
+}
+
+/// Parameter names to the `VarId` each is bound to.
+fn params(args: &[ArgDecl<arcstr::Substr, VarIdTyMetadata>]) -> HashMap<String, VarId> {
+    args.iter()
+        .map(|arg| (arg.name.name.to_string(), arg.metadata.0))
+        .collect()
 }
 
 /// Whether a module is real source rather than something the compiler
@@ -281,6 +289,7 @@ impl<'a> Builder<'a> {
             ast,
             enums: HashMap::new(),
             cell_fields: HashMap::new(),
+            params: HashMap::new(),
             current: const { &Vec::new() },
             path: Path::new(""),
             visible: 0,
@@ -290,10 +299,9 @@ impl<'a> Builder<'a> {
         builder
     }
 
-    /// Records what the reference walk needs to have seen already: which
-    /// `VarId` each enum's name holds, and which `let` declares each of a
-    /// cell's fields. Both can be referred to from a module that is walked
-    /// earlier.
+    /// Records what the reference walk may need before it reaches the
+    /// declaring module: each enum's `VarId`, each cell's field bindings, and
+    /// each fn's or cell's parameters.
     fn collect_declarations(&mut self) {
         for (module, ast) in self.ast.iter() {
             if !is_navigable(&ast.path) {
@@ -327,10 +335,27 @@ impl<'a> Builder<'a> {
                             })
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
+                        self.params.insert(decl.metadata.1, params(&decl.args));
+                    }
+                    Decl::Fn(decl) => {
+                        self.params.insert(decl.metadata.1, params(&decl.args));
                     }
                     _ => {}
                 }
             }
+        }
+    }
+
+    /// What a keyword argument names: a parameter of the callee bound to
+    /// `callee`, or a builtin's keyword when the callee is a builtin.
+    fn kwarg_target(&self, callee: Option<VarId>, name: &str) -> Target {
+        match callee {
+            None => Target::Builtin(Builtin::KwArg(name.to_owned())),
+            Some(callee) => self
+                .params
+                .get(&callee)
+                .and_then(|params| params.get(name))
+                .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id))),
         }
     }
 
@@ -543,6 +568,10 @@ impl<'a> Builder<'a> {
     }
 
     fn arg_decl(&mut self, arg: &'a ArgDecl<arcstr::Substr, VarIdTyMetadata>) {
+        // The default is evaluated before the parameter is bound.
+        if let Some(default) = &arg.default {
+            self.expr(default);
+        }
         self.define(
             DefKey::Var(arg.metadata.0),
             SymbolKind::Parameter,
@@ -649,10 +678,8 @@ impl<'a> Builder<'a> {
                     self.expr(arg);
                 }
                 for kwarg in &call.args.kwargs {
-                    self.record(
-                        kwarg.name.span,
-                        Target::Builtin(Builtin::KwArg(kwarg.name.name.to_string())),
-                    );
+                    let target = self.kwarg_target(call.metadata.0, &kwarg.name.name);
+                    self.record(kwarg.name.span, target);
                     self.expr(&kwarg.value);
                 }
             }
@@ -1173,6 +1200,28 @@ cell top(w: Flo$0at) {
                 r#"Builtin(Function("rect"))"#,
                 r#"Builtin(KwArg("x0"))"#,
                 r#"Builtin(Field("x0"))"#,
+            ],
+        );
+    }
+
+    #[test]
+    fn keyword_arguments_resolve_to_parameters() {
+        check(
+            r#"
+fn grow(base: Float, fac$0tor: Float = 2., shift: Float = ba$0se) -> Float {
+    base * factor + shift
+}
+cell top() {
+    let a = grow(1., fac$0tor=3., shi$0ft=0.);
+    let r = rect("met1", x$00=a, y0=0., x1=1., y1=1.);
+}
+"#,
+            &[
+                "factor#0",
+                "base#0",
+                "factor#0",
+                "shift#0",
+                r#"Builtin(KwArg("x0"))"#,
             ],
         );
     }

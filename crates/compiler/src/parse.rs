@@ -528,9 +528,6 @@ impl EntryCell {
         invocation: &str,
     ) -> Result<Self, anyhow::Error> {
         let call = parse_cell(invocation)?;
-        if !call.args.kwargs.is_empty() {
-            bail!("cells take positional arguments only; keyword arguments are not supported");
-        }
         // Splice the call expression itself rather than the raw argument:
         // trailing trivia such as a line comment would otherwise swallow the
         // generated `;`.

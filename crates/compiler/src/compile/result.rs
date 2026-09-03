@@ -135,6 +135,9 @@ pub enum StaticErrorKind {
     /// A call supplies the same keyword argument more than once.
     #[error("duplicate keyword argument")]
     DuplicateKwArg,
+    /// A parameter without a default is declared after a parameter with one.
+    #[error("positional parameter `{name}` cannot follow a parameter with a default value")]
+    PositionalParamAfterDefault { name: String },
     /// An identifier was used without being declared in the current scope.
     #[error("`{name}` is not declared in this scope")]
     UndeclaredVar { name: String },

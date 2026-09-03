@@ -1,0 +1,21 @@
+// Cells take keyword parameters too. Omitted keywords are filled from their
+// defaults at the call site, so `child(w)` and `child(w, h=w)` receive the same
+// arguments.
+cell child(w: Float, h: Float = w, layer: String = "met1") {
+    let body = rect(layer, x0=0., y0=0., x1=w, y1=h);
+}
+
+cell top(w: Float = 100.) {
+    let square = inst(child(w));
+    let tall = inst(child(w, h=200.));
+    let same = inst(child(w, h=w));
+    let met2 = inst(child(50., layer="met2"));
+    eq(square.x, 0.);
+    eq(square.y, 0.);
+    eq(tall.x, 200.);
+    eq(tall.y, 0.);
+    eq(same.x, 400.);
+    eq(same.y, 0.);
+    eq(met2.x, 600.);
+    eq(met2.y, 0.);
+}

@@ -291,11 +291,13 @@ impl Builder {
         }
     }
 
-    /// A parameter's dependencies come from its *checked* type, not its
-    /// written one: a `TySpec`'s identifier carries no metadata, so the
-    /// declaration it names is only recoverable from `ArgDecl`'s `Ty`.
+    /// A parameter depends on the declarations its checked type and its
+    /// default value refer to.
     fn arg_decl(&self, arg: &ArgDecl<arcstr::Substr, VarIdTyMetadata>, out: &mut IndexSet<VarId>) {
         self.ty(&arg.metadata.1, out);
+        if let Some(default) = &arg.default {
+            self.expr(default, out);
+        }
     }
 
     /// Collects the declarations a checked type refers to.
@@ -329,7 +331,7 @@ impl Builder {
                 }
             }
             Ty::Fn(fn_ty) => {
-                for arg in &fn_ty.args {
+                for arg in fn_ty.sig.args.iter().chain(fn_ty.sig.kwargs.values()) {
                     self.ty(arg, out);
                 }
                 self.ty(&fn_ty.ret, out);
@@ -756,6 +758,30 @@ cell uses_unrelated() { let r = rect(\"met1\", x0 = unrelated(), y0 = 0., x1 = 1
                 )
             ),
             ["uses_middle"]
+        );
+    }
+
+    #[test]
+    fn a_default_value_is_part_of_the_fingerprint() {
+        const SOURCE: &str = "\
+fn helper() -> Float { 1. }
+fn scaled(x: Float, scale: Float = helper()) -> Float { x * scale }
+cell uses_scaled() { let r = rect(\"met1\", x0 = scaled(1.), y0 = 0., x1 = 1., y1 = 1.); }
+";
+        assert_eq!(
+            changed(
+                SOURCE,
+                &SOURCE.replace("scale: Float = helper()", "scale: Float = 2. * helper()")
+            ),
+            ["scaled", "uses_scaled"]
+        );
+        // A declaration a default calls is a dependency of the declaring fn.
+        assert_eq!(
+            changed(
+                SOURCE,
+                &SOURCE.replace("fn helper() -> Float { 1. }", "fn helper() -> Float { 9. }")
+            ),
+            ["helper", "scaled", "uses_scaled"]
         );
     }
 

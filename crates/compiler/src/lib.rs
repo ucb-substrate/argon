@@ -212,6 +212,8 @@ mod tests {
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
     const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
     const ARGON_PATH: &str = concatcp!(EXAMPLES_DIR, "/path/lib.ar");
+    const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
+    const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -1621,6 +1623,89 @@ mod tests {
     }
 
     #[test]
+    fn argon_kwargs_fn() {
+        let o = parse_workspace_with_std(ARGON_KWARGS_FN);
+        assert!(o.static_errors().is_empty());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        // Every rect's `x1` is a call with omitted, explicit, or
+        // parameter-referencing defaults, keyed by its `y0`.
+        let mut widths: Vec<(f64, f64)> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .map(|rect| (rect.y0.0, rect.x1.0))
+            .collect();
+        widths.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let expected = [
+            (0., 30.),
+            (20., 40.),
+            (40., 20.),
+            (60., 10.),
+            (80., 10.),
+            (100., 50.),
+        ];
+        assert_eq!(widths.len(), expected.len());
+        for ((y0, x1), (expected_y0, expected_x1)) in widths.iter().zip(expected) {
+            assert_relative_eq!(*y0, expected_y0, epsilon = EPSILON);
+            assert_relative_eq!(*x1, expected_x1, epsilon = EPSILON);
+        }
+    }
+
+    #[test]
+    fn argon_kwargs_cell() {
+        let o = parse_workspace_with_std(ARGON_KWARGS_CELL);
+        assert!(o.static_errors().is_empty());
+        // The positional API supplies every parameter, keyword ones included.
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: vec![CellArg::Float(100.)],
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        let mut insts: Vec<_> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .collect();
+        insts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let [square, tall, same, met2] = insts.as_slice() else {
+            panic!("expected four instances, got {}", insts.len());
+        };
+        assert_eq!(cells.cells.len(), 5);
+        let child_rect = |cell| {
+            cells.cells[&cell]
+                .objects
+                .values()
+                .find_map(|object| object.get_rect())
+                .cloned()
+                .expect("child emits a rect")
+        };
+        // `child(w)` and `child(w, h=w)` resolve to the same arguments.
+        for (inst, x1, y1, layer) in [
+            (square, 100., 100., "met1"),
+            (tall, 100., 200., "met1"),
+            (same, 100., 100., "met1"),
+            (met2, 50., 50., "met2"),
+        ] {
+            let rect = child_rect(inst.cell);
+            assert_relative_eq!(rect.x1.0, x1, epsilon = EPSILON);
+            assert_relative_eq!(rect.y1.0, y1, epsilon = EPSILON);
+            assert_eq!(rect.layer.as_deref(), Some(layer));
+        }
+    }
+
+    #[test]
     fn argon_library() {
         let o = parse_workspace_with_std(ARGON_LIBRARY);
         assert!(o.static_errors().is_empty());
@@ -2469,6 +2554,102 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         output.errors
+    }
+
+    /// Asserts that `source` reports an error accepted by `matches`.
+    #[track_caller]
+    fn assert_static_error(source: &str, matches: impl Fn(&StaticErrorKind) -> bool) {
+        let errors = static_errors(source);
+        assert!(
+            errors.iter().any(|error| matches(&error.kind)),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_parameters_type_check() {
+        let errors = static_errors(
+            r#"
+            fn scaled(x: Float, scale: Float = 2., offset: Float = x) -> Float {
+                x * scale + offset
+            }
+            cell child(w: Float, h: Float = w, layer: String = "met1") {
+                let body = rect(layer, x0=0., y0=0., x1=w, y1=h);
+            }
+            cell top(n: Int = 1) {
+                let a = scaled(1.);
+                let b = scaled(1., offset=0., scale=3.);
+                let c = inst(child(10.));
+                let d = inst(child(10., layer="met2", h=20.));
+            }
+            "#,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn keyword_parameter_declarations_are_checked() {
+        assert_static_error(
+            "fn f(a: Float, b: Float = 1., c: Float) -> Float { a }",
+            |kind| matches!(kind, StaticErrorKind::PositionalParamAfterDefault { name } if name == "c"),
+        );
+        assert_static_error("fn f(a: Float, a: Int) -> Float { a }", |kind| {
+            matches!(kind, StaticErrorKind::DuplicateNameDeclaration)
+        });
+        assert_static_error("cell c(w: Float, w: Float = 1.) {}", |kind| {
+            matches!(kind, StaticErrorKind::DuplicateNameDeclaration)
+        });
+        assert_static_error("fn f(b: Float = 1) -> Float { b }", |kind| {
+            matches!(
+                kind,
+                StaticErrorKind::IncorrectTy { expected, found } if expected == "Float" && found == "Int"
+            )
+        });
+        // A default sees only the parameters before it.
+        assert_static_error(
+            "fn f(a: Float = b, b: Float = 1.) -> Float { a }",
+            |kind| matches!(kind, StaticErrorKind::UndeclaredVar { name } if name == "b"),
+        );
+        assert_static_error(
+            "fn f(a: Float = a) -> Float { a }",
+            |kind| matches!(kind, StaticErrorKind::UndeclaredVar { name } if name == "a"),
+        );
+    }
+
+    #[test]
+    fn keyword_arguments_are_checked_at_calls() {
+        let call = |args: &str| {
+            format!(
+                "fn f(a: Float, b: Float = 1.) -> Float {{ a + b }}\ncell top() {{ let v = f({args}); }}"
+            )
+        };
+        // A keyword parameter cannot be passed positionally.
+        assert_static_error(&call("1., 2."), |kind| {
+            matches!(
+                kind,
+                StaticErrorKind::CallIncorrectPositionalArity {
+                    expected: 1,
+                    found: 2
+                }
+            )
+        });
+        // A positional parameter cannot be passed by keyword.
+        assert_static_error(&call("a=1."), |kind| {
+            matches!(kind, StaticErrorKind::InvalidKwArg)
+        });
+        assert_static_error(&call("1., zz=2."), |kind| {
+            matches!(kind, StaticErrorKind::InvalidKwArg)
+        });
+        assert_static_error(&call("1., b=2., b=3."), |kind| {
+            matches!(kind, StaticErrorKind::DuplicateKwArg)
+        });
+        assert_static_error(&call("1., b=true"), |kind| {
+            matches!(
+                kind,
+                StaticErrorKind::IncorrectTy { expected, found } if expected == "Float" && found == "Bool"
+            )
+        });
+        assert!(static_errors(&call("1., b=2.")).is_empty());
     }
 
     /// Cell typing is structural. `CellTy` carries the declaring cell's `VarId`

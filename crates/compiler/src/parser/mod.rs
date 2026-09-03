@@ -529,6 +529,34 @@ mod tests {
     }
 
     #[test]
+    fn default_values_parse() {
+        use crate::ast::{Decl, Expr};
+
+        let src = "fn f(a: Float, b: Float = 1., c: [Int] = []) {}\ncell c(n: Int = 2 * 3) {}";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let [Decl::Fn(f), Decl::Cell(c)] = ast.decls.as_slice() else {
+            panic!("expected a fn and a cell, got {:?}", ast.decls);
+        };
+        assert!(f.args[0].default.is_none());
+        let b = f.args[1].default.as_ref().expect("`b` has a default");
+        assert!(matches!(b, Expr::FloatLiteral(_)));
+        assert_eq!(&src[b.span().start()..b.span().end()], "1.");
+        assert!(matches!(f.args[2].default, Some(Expr::SeqNil(_))));
+        let n = c.args[0].default.as_ref().expect("`n` has a default");
+        assert_eq!(&src[n.span().start()..n.span().end()], "2 * 3");
+
+        for src in [
+            "fn f(a: Float = ) {}",
+            "cell c(n: Int = 1 {}",
+            "fn f(a = 1.) {}",
+        ] {
+            assert!(parse(src).is_err(), "should be rejected: `{src}`");
+        }
+    }
+
+    #[test]
     fn distinct_diagnostics_at_same_offset_are_kept() {
         // `foo(` then `}`: the `}` is simultaneously where an expression, a `)`,
         // and a `;` were expected — independent diagnostics at one byte offset.
