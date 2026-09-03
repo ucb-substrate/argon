@@ -331,10 +331,17 @@ impl NavIndex {
     /// Names visible at `offset`, with inner lexical bindings shadowing outer
     /// bindings and module items.
     pub fn completions_at(&self, file: &Path, offset: usize) -> Vec<CompletionCandidate> {
+        // Language-level names do not depend on a successful parse or type
+        // check. Start with them so completion remains useful while a new or
+        // half-written file has no entry in the typed index yet.
+        let static_candidates = Self::static_completions();
         let Some(module) = self.file_modules.get(file) else {
-            return Vec::new();
+            return static_candidates;
         };
-        let mut candidates: HashMap<String, CompletionCandidate> = HashMap::new();
+        let mut candidates: HashMap<String, CompletionCandidate> = static_candidates
+            .into_iter()
+            .map(|candidate| (candidate.label.clone(), candidate))
+            .collect();
         for candidate in self.module_completions(module, Some(offset)) {
             candidates.insert(candidate.label.clone(), candidate);
         }
@@ -368,39 +375,37 @@ impl NavIndex {
             }
         }
 
-        for name in BUILTINS {
-            let signature = builtin_signature(name).expect("every builtin has editor metadata");
-            candidates
-                .entry(name.to_owned())
-                .or_insert(CompletionCandidate {
-                    label: name.to_owned(),
-                    kind: CompletionKind::Function,
-                    detail: Some(signature.label),
-                    insert_text: None,
-                });
-        }
-        for name in PRIMITIVE_TYPES {
-            candidates
-                .entry(name.to_owned())
-                .or_insert(CompletionCandidate {
-                    label: name.to_owned(),
-                    kind: CompletionKind::Type,
-                    detail: Some(format!("builtin type {name}")),
-                    insert_text: None,
-                });
-        }
-        for keyword in KEYWORDS {
-            candidates
-                .entry(keyword.to_owned())
-                .or_insert(CompletionCandidate {
-                    label: keyword.to_owned(),
-                    kind: CompletionKind::Keyword,
-                    detail: None,
-                    insert_text: None,
-                });
-        }
-
         let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.label.cmp(&right.label));
+        candidates
+    }
+
+    /// Builtins, primitive types, and keywords that can be completed without
+    /// consulting a parsed or type-checked workspace.
+    pub fn static_completions() -> Vec<CompletionCandidate> {
+        let mut candidates =
+            Vec::with_capacity(BUILTINS.len() + PRIMITIVE_TYPES.len() + KEYWORDS.len());
+        candidates.extend(BUILTINS.into_iter().map(|name| {
+            let signature = builtin_signature(name).expect("every builtin has editor metadata");
+            CompletionCandidate {
+                label: name.to_owned(),
+                kind: CompletionKind::Function,
+                detail: Some(signature.label),
+                insert_text: None,
+            }
+        }));
+        candidates.extend(PRIMITIVE_TYPES.into_iter().map(|name| CompletionCandidate {
+            label: name.to_owned(),
+            kind: CompletionKind::Type,
+            detail: Some(format!("builtin type {name}")),
+            insert_text: None,
+        }));
+        candidates.extend(KEYWORDS.into_iter().map(|keyword| CompletionCandidate {
+            label: keyword.to_owned(),
+            kind: CompletionKind::Keyword,
+            detail: None,
+            insert_text: None,
+        }));
         candidates.sort_by(|left, right| left.label.cmp(&right.label));
         candidates
     }
@@ -2178,6 +2183,17 @@ cell top() {
             .into_iter()
             .map(|candidate| candidate.label)
             .collect()
+    }
+
+    #[test]
+    fn static_completion_does_not_require_an_indexed_file() {
+        let labels = labels(NavIndex::default().completions_at(Path::new("new.ar"), 0));
+        for expected in ["cell", "rect", "Float"] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "missing {expected}: {labels:?}"
+            );
+        }
     }
 
     #[test]

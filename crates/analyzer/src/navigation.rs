@@ -567,6 +567,16 @@ fn completion_item(candidate: CompletionCandidate) -> CompletionItem {
     }
 }
 
+fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionResponse {
+    let mut unique = HashMap::new();
+    for candidate in candidates {
+        unique.insert(candidate.label.clone(), candidate);
+    }
+    let mut candidates = unique.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.label.cmp(&right.label));
+    CompletionResponse::Array(candidates.into_iter().map(completion_item).collect())
+}
+
 fn lsp_symbol_kind(kind: ArgonSymbolKind) -> SymbolKind {
     match kind {
         ArgonSymbolKind::Function => SymbolKind::FUNCTION,
@@ -683,12 +693,19 @@ impl State {
         uri: &Uri,
         position: Position,
     ) -> Option<CompletionResponse> {
-        let index = self.nav_index().await?;
-        let path = self.compiler_path(uri).await?;
+        let Some(index) = self.nav_index().await else {
+            return Some(completion_response(NavIndex::static_completions()));
+        };
+        let Some(path) = self.compiler_path(uri).await else {
+            return Some(completion_response(NavIndex::static_completions()));
+        };
         let mut views = FileViews::new(self, &index);
-        let view = views.get(&path).await?;
-        let buffer_offset = view.buffer.position_to_offset(position)?;
-        let indexed_offset = view.indexed_offset(position)?;
+        let Some(view) = views.get(&path).await else {
+            return Some(completion_response(NavIndex::static_completions()));
+        };
+        let Some(buffer_offset) = view.buffer.position_to_offset(position) else {
+            return Some(completion_response(NavIndex::static_completions()));
+        };
         let context = completion_context(view.buffer.contents(), buffer_offset);
         let candidates = match context {
             CompletionContext::Member { base_end } => view
@@ -700,6 +717,9 @@ impl State {
                 index.qualified_completions(&path, &segments)
             }
             CompletionContext::Plain => {
+                let Some(indexed_offset) = view.indexed_offset(position) else {
+                    return Some(completion_response(NavIndex::static_completions()));
+                };
                 let mut candidates = index.completions_at(&path, indexed_offset);
                 if let Some(context) = call_context(view.buffer.contents(), buffer_offset)
                     && let Some(signature) =
@@ -713,15 +733,7 @@ impl State {
                 candidates
             }
         };
-        let mut unique = HashMap::new();
-        for candidate in candidates {
-            unique.insert(candidate.label.clone(), candidate);
-        }
-        let mut candidates = unique.into_values().collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.label.cmp(&right.label));
-        Some(CompletionResponse::Array(
-            candidates.into_iter().map(completion_item).collect(),
-        ))
+        Some(completion_response(candidates))
     }
 
     pub(crate) async fn hover(&self, uri: &Uri, position: Position) -> Option<Hover> {

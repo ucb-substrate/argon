@@ -153,6 +153,7 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
   end
   assert(completion_labels.width, 'completion should contain the visible local width')
   assert(completion_labels.rect, 'completion should contain builtin functions')
+  assert(completion_labels.cell, 'completion should contain language keywords')
 
   local hover = client:request_sync('textDocument/hover', params, 10000, bufnr)
   assert(hover and not hover.err and hover.result, 'hover request failed')
