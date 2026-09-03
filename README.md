@@ -173,13 +173,23 @@ The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
 
 Errors are reported as you type; `:Argon diagnostics` opens them in a list.
-Code navigation works on variables, function and cell names, enums and their
-variants, module paths, and the fields of an instance:
+Neovim's native completion menu opens as you type and includes visible local
+bindings, functions, cells, modules, enum variants, builtin types/functions,
+keyword arguments, and type-aware fields. Set `vim.g.argon.autocomplete = false`
+before the plugin loads if another completion plugin owns the insert-mode UI;
+manual LSP completion with `<C-x><C-o>` remains available.
+
+Navigation and IntelliSense work on variables, function and cell names, enums
+and their variants, module paths, and the fields of an instance. References to
+the symbol under the cursor are highlighted after `CursorHold`:
 
 | Mapping | Action |
 |---|---|
 | `gd`, `<C-]>` | Go to definition |
 | `grr` | List references |
+| `K` | Show type or signature information |
+| `<C-s>` (insert mode) | Show signature help |
+| `gO` | List symbols in the current file |
 
 Navigation crosses files, follows path dependencies into other libraries, and
 jumps into the standard library, which is written to `~/.cache/argon` the

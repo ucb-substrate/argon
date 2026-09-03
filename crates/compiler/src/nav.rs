@@ -25,7 +25,7 @@ use crate::{
         ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, Ident, IdentPath, ModPath, Scope,
         Statement, TySpec, TySpecKind, UseDecl, WorkspaceAst,
     },
-    compile::{BUILTINS, EnumId, Ty, VarId, VarIdTyMetadata, module_prefix},
+    compile::{BUILTINS, EnumId, RESERVED_CELL_FIELDS, Ty, VarId, VarIdTyMetadata, module_prefix},
 };
 
 /// Identity of something that can be navigated to.
@@ -53,6 +53,61 @@ pub enum SymbolKind {
     Module,
 }
 
+/// Kind of an editor completion candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    Function,
+    Cell,
+    Variable,
+    Parameter,
+    Enum,
+    Variant,
+    Module,
+    Field,
+    Type,
+    Keyword,
+}
+
+/// Protocol-independent completion data produced by the typed index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionCandidate {
+    pub label: String,
+    pub kind: CompletionKind,
+    pub detail: Option<String>,
+    /// Text to insert when it differs from `label` (notably keyword args).
+    pub insert_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParameterInfo {
+    pub label: String,
+    pub keyword: bool,
+}
+
+/// A callable signature, shared by signature help and completion details.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    pub label: String,
+    pub parameters: Vec<ParameterInfo>,
+}
+
+/// Quick information for the token or expression under a cursor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoverInfo {
+    pub span: cfgrammar::Span,
+    pub contents: String,
+}
+
+/// One source symbol suitable for a document outline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineSymbol {
+    pub name: String,
+    pub detail: String,
+    pub kind: SymbolKind,
+    pub range: cfgrammar::Span,
+    pub selection_range: cfgrammar::Span,
+}
+
 /// Where a definition can be shown to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefLocation {
@@ -74,6 +129,32 @@ pub struct Definition {
     pub kind: SymbolKind,
     pub name: String,
     pub location: DefLocation,
+    detail: String,
+    ty: Option<Ty>,
+    signature: Option<SignatureInfo>,
+    full_span: Option<crate::ast::Span>,
+}
+
+#[derive(Debug, Clone)]
+struct ScopeBinding {
+    name: String,
+    key: DefKey,
+    scope: cfgrammar::Span,
+    available_after: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ModuleItem {
+    name: String,
+    key: DefKey,
+    available_after: usize,
+}
+
+struct DefinitionInfo {
+    detail: String,
+    ty: Option<Ty>,
+    signature: Option<SignatureInfo>,
+    full_span: Option<cfgrammar::Span>,
 }
 
 /// An identifier that resolves to something the compiler provides rather than
@@ -119,6 +200,11 @@ pub struct NavIndex {
     sources: HashMap<PathBuf, ArcStr>,
     defs: HashMap<DefKey, Definition>,
     usages: HashMap<DefKey, Vec<crate::ast::Span>>,
+    file_modules: HashMap<PathBuf, ModPath>,
+    module_items: HashMap<ModPath, Vec<ModuleItem>>,
+    scope_bindings: HashMap<PathBuf, Vec<ScopeBinding>>,
+    expression_types: HashMap<PathBuf, Vec<(cfgrammar::Span, Ty)>>,
+    hover_details: HashMap<PathBuf, Vec<(cfgrammar::Span, String)>>,
 }
 
 impl NavIndex {
@@ -217,6 +303,335 @@ impl NavIndex {
             _ => Vec::new(),
         }
     }
+
+    fn completion_for(&self, name: &str, key: &DefKey) -> Option<CompletionCandidate> {
+        let definition = self.defs.get(key)?;
+        Some(CompletionCandidate {
+            label: name.to_owned(),
+            kind: completion_kind(definition.kind),
+            detail: Some(definition.detail.clone()),
+            insert_text: None,
+        })
+    }
+
+    fn module_completions(
+        &self,
+        module: &ModPath,
+        offset: Option<usize>,
+    ) -> Vec<CompletionCandidate> {
+        self.module_items
+            .get(module)
+            .into_iter()
+            .flatten()
+            .filter(|item| offset.is_none_or(|offset| item.available_after <= offset))
+            .filter_map(|item| self.completion_for(&item.name, &item.key))
+            .collect()
+    }
+
+    /// Names visible at `offset`, with inner lexical bindings shadowing outer
+    /// bindings and module items.
+    pub fn completions_at(&self, file: &Path, offset: usize) -> Vec<CompletionCandidate> {
+        let Some(module) = self.file_modules.get(file) else {
+            return Vec::new();
+        };
+        let mut candidates: HashMap<String, CompletionCandidate> = HashMap::new();
+        for candidate in self.module_completions(module, Some(offset)) {
+            candidates.insert(candidate.label.clone(), candidate);
+        }
+        for (label, key) in [
+            ("lib", DefKey::Module(Vec::new())),
+            ("std", DefKey::Module(vec!["std".to_owned()])),
+        ] {
+            if let Some(candidate) = self.completion_for(label, &key) {
+                candidates.insert(label.to_owned(), candidate);
+            }
+        }
+
+        let mut active = self
+            .scope_bindings
+            .get(file)
+            .into_iter()
+            .flatten()
+            .filter(|binding| {
+                binding.scope.start() <= offset
+                    && offset <= binding.scope.end()
+                    && binding.available_after <= offset
+            })
+            .collect::<Vec<_>>();
+        // Outer scopes first so a same-named binding in the innermost scope
+        // wins when inserted into the map.
+        active
+            .sort_by_key(|binding| std::cmp::Reverse(binding.scope.end() - binding.scope.start()));
+        for binding in active {
+            if let Some(candidate) = self.completion_for(&binding.name, &binding.key) {
+                candidates.insert(candidate.label.clone(), candidate);
+            }
+        }
+
+        for name in BUILTINS {
+            let signature = builtin_signature(name).expect("every builtin has editor metadata");
+            candidates
+                .entry(name.to_owned())
+                .or_insert(CompletionCandidate {
+                    label: name.to_owned(),
+                    kind: CompletionKind::Function,
+                    detail: Some(signature.label),
+                    insert_text: None,
+                });
+        }
+        for name in PRIMITIVE_TYPES {
+            candidates
+                .entry(name.to_owned())
+                .or_insert(CompletionCandidate {
+                    label: name.to_owned(),
+                    kind: CompletionKind::Type,
+                    detail: Some(format!("builtin type {name}")),
+                    insert_text: None,
+                });
+        }
+        for keyword in KEYWORDS {
+            candidates
+                .entry(keyword.to_owned())
+                .or_insert(CompletionCandidate {
+                    label: keyword.to_owned(),
+                    kind: CompletionKind::Keyword,
+                    detail: None,
+                    insert_text: None,
+                });
+        }
+
+        let mut candidates = candidates.into_values().collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.label.cmp(&right.label));
+        candidates
+    }
+
+    /// Members following a `.` after the expression ending at `offset`.
+    pub fn member_completions_at(&self, file: &Path, offset: usize) -> Vec<CompletionCandidate> {
+        let from_definition = self
+            .target_at(file, offset)
+            .and_then(|(_, target)| match target {
+                Target::Def(key) => self.defs.get(key)?.ty.as_ref(),
+                _ => None,
+            });
+        let ty = from_definition.or_else(|| {
+            self.expression_types
+                .get(file)?
+                .iter()
+                .filter(|(span, _)| {
+                    span.end() == offset || (span.start() <= offset && offset <= span.end())
+                })
+                .min_by_key(|(span, _)| {
+                    (usize::from(span.end() != offset), span.end() - span.start())
+                })
+                .map(|(_, ty)| ty)
+        });
+        ty.map(field_completions).unwrap_or_default()
+    }
+
+    /// Items exported by a module, or variants of an enum, named by a path
+    /// immediately before `::`.
+    pub fn qualified_completions(
+        &self,
+        file: &Path,
+        qualifier: &[String],
+    ) -> Vec<CompletionCandidate> {
+        let Some(current) = self.file_modules.get(file) else {
+            return Vec::new();
+        };
+        let module = module_prefix(current, qualifier.iter().map(String::as_str), 0);
+        if self.module_items.contains_key(&module) {
+            let mut result = self.module_completions(&module, None);
+            result.sort_by(|left, right| left.label.cmp(&right.label));
+            return result;
+        }
+
+        let Some((enum_name, prefix)) = qualifier.split_last() else {
+            return Vec::new();
+        };
+        let module = if prefix.is_empty() {
+            current.clone()
+        } else {
+            module_prefix(current, prefix.iter().map(String::as_str), 0)
+        };
+        let Some(enum_key) = self
+            .module_items
+            .get(&module)
+            .into_iter()
+            .flatten()
+            .find(|item| item.name == *enum_name)
+            .map(|item| &item.key)
+        else {
+            return Vec::new();
+        };
+        let DefKey::Var(enum_id) = enum_key else {
+            return Vec::new();
+        };
+        let mut result = self
+            .defs
+            .iter()
+            .filter_map(|(key, definition)| match key {
+                DefKey::Variant(id, name) if id == enum_id => {
+                    self.completion_for(name, key).or_else(|| {
+                        Some(CompletionCandidate {
+                            label: name.clone(),
+                            kind: CompletionKind::Variant,
+                            detail: Some(definition.detail.clone()),
+                            insert_text: None,
+                        })
+                    })
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        result.sort_by(|left, right| left.label.cmp(&right.label));
+        result
+    }
+
+    pub fn hover_at(&self, file: &Path, offset: usize) -> Option<HoverInfo> {
+        if let Some((span, target)) = self.target_at(file, offset) {
+            let contents = match target {
+                Target::Def(key) => self
+                    .defs
+                    .get(key)
+                    .map(|definition| definition.detail.clone()),
+                Target::Builtin(Builtin::Function(name)) => {
+                    builtin_signature(name).map(|signature| signature.label)
+                }
+                Target::Builtin(Builtin::Type(name)) => Some(format!("builtin type {name}")),
+                Target::Builtin(Builtin::Field(_)) | Target::Builtin(Builtin::KwArg(_)) => self
+                    .hover_details
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .find(|(candidate, _)| *candidate == span)
+                    .map(|(_, detail)| detail.clone()),
+                Target::Unresolved => None,
+            };
+            if let Some(contents) = contents {
+                return Some(HoverInfo { span, contents });
+            }
+        }
+
+        self.expression_types
+            .get(file)?
+            .iter()
+            .filter(|(span, _)| span.start() <= offset && offset <= span.end())
+            .min_by_key(|(span, _)| span.end() - span.start())
+            .map(|(span, ty)| HoverInfo {
+                span: *span,
+                contents: format!("expression: {ty}"),
+            })
+    }
+
+    pub fn signature_at(&self, file: &Path, offset: usize) -> Option<SignatureInfo> {
+        match self.target_at(file, offset)?.1 {
+            Target::Def(key) => self.defs.get(key)?.signature.clone(),
+            Target::Builtin(Builtin::Function(name)) => builtin_signature(name),
+            _ => None,
+        }
+    }
+
+    /// Resolves a newly typed callee name when it is not present in the stale
+    /// typed source yet.
+    pub fn signature_named_at(
+        &self,
+        file: &Path,
+        offset: usize,
+        path: &[String],
+    ) -> Option<SignatureInfo> {
+        let (name, prefix) = path.split_last()?;
+        if prefix.is_empty()
+            && let Some(signature) = builtin_signature(name)
+        {
+            return Some(signature);
+        }
+        let module = if prefix.is_empty() {
+            self.file_modules.get(file)?.clone()
+        } else {
+            module_prefix(
+                self.file_modules.get(file)?,
+                path.iter().map(String::as_str),
+                1,
+            )
+        };
+        self.module_items
+            .get(&module)?
+            .iter()
+            .filter(|item| {
+                item.name == *name && (!prefix.is_empty() || item.available_after <= offset)
+            })
+            .find_map(|item| self.defs.get(&item.key)?.signature.clone())
+    }
+
+    pub fn keyword_completions_for_signature(
+        &self,
+        signature: &SignatureInfo,
+    ) -> Vec<CompletionCandidate> {
+        signature
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.keyword)
+            .map(|parameter| {
+                let name = parameter
+                    .label
+                    .split_once(':')
+                    .map_or(parameter.label.as_str(), |(name, _)| name)
+                    .to_owned();
+                CompletionCandidate {
+                    label: name.clone(),
+                    kind: CompletionKind::Parameter,
+                    detail: Some(parameter.label.clone()),
+                    insert_text: Some(format!("{name}=")),
+                }
+            })
+            .collect()
+    }
+
+    pub fn document_symbols(&self, file: &Path) -> Vec<OutlineSymbol> {
+        let mut symbols = self
+            .defs
+            .values()
+            .filter_map(|definition| {
+                let DefLocation::Source(selection) = &definition.location else {
+                    return None;
+                };
+                (selection.path == file).then(|| OutlineSymbol {
+                    name: definition.name.clone(),
+                    detail: definition.detail.clone(),
+                    kind: definition.kind,
+                    range: definition
+                        .full_span
+                        .as_ref()
+                        .filter(|span| span.path == file)
+                        .map_or(selection.span, |span| span.span),
+                    selection_range: selection.span,
+                })
+            })
+            .collect::<Vec<_>>();
+        symbols.sort_by_key(|symbol| (symbol.range.start(), symbol.selection_range.start()));
+        symbols
+    }
+}
+
+const PRIMITIVE_TYPES: [&str; 9] = [
+    "Any", "Bool", "Float", "Int", "Path", "Point", "Polygon", "Rect", "String",
+];
+
+const KEYWORDS: [&str; 14] = [
+    "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod", "true",
+    "use",
+];
+
+fn completion_kind(kind: SymbolKind) -> CompletionKind {
+    match kind {
+        SymbolKind::Function => CompletionKind::Function,
+        SymbolKind::Cell => CompletionKind::Cell,
+        SymbolKind::Local | SymbolKind::LoopVar => CompletionKind::Variable,
+        SymbolKind::Parameter => CompletionKind::Parameter,
+        SymbolKind::Enum => CompletionKind::Enum,
+        SymbolKind::Variant => CompletionKind::Variant,
+        SymbolKind::Module => CompletionKind::Module,
+    }
 }
 
 /// The primitive type `name` spells, read off the type checker's own table so
@@ -236,6 +651,220 @@ fn declaring_cell(ty: &Ty) -> Option<VarId> {
 
 fn builtin_function(name: &str) -> Option<&'static str> {
     BUILTINS.into_iter().find(|builtin| *builtin == name)
+}
+
+fn parameter(label: &str, keyword: bool) -> ParameterInfo {
+    ParameterInfo {
+        label: label.to_owned(),
+        keyword,
+    }
+}
+
+fn signature(label: &str, positional: &[&str], keywords: &[&str]) -> SignatureInfo {
+    SignatureInfo {
+        label: label.to_owned(),
+        parameters: positional
+            .iter()
+            .map(|label| parameter(label, false))
+            .chain(keywords.iter().map(|label| parameter(label, true)))
+            .collect(),
+    }
+}
+
+fn builtin_signature(name: &str) -> Option<SignatureInfo> {
+    let rect_keywords = [
+        "x0: Float",
+        "x1: Float",
+        "y0: Float",
+        "y1: Float",
+        "x0i: Float",
+        "x1i: Float",
+        "y0i: Float",
+        "y1i: Float",
+        "w: Float",
+        "h: Float",
+    ];
+    let result = match name {
+        "list" => signature("fn list(value: T, ...) -> [T]", &["value: T"], &[]),
+        "cons" => signature(
+            "fn cons(value: T, tail: [T]) -> [T]",
+            &["value: T", "tail: [T]"],
+            &[],
+        ),
+        "head" => signature("fn head(sequence: [T]) -> T", &["sequence: [T]"], &[]),
+        "tail" => signature("fn tail(sequence: [T]) -> [T]", &["sequence: [T]"], &[]),
+        "range_full" => signature(
+            "fn range_full(start: Int, stop: Int, step: Int) -> [Int]",
+            &["start: Int", "stop: Int", "step: Int"],
+            &[],
+        ),
+        "crect" => {
+            let mut keywords = rect_keywords.to_vec();
+            keywords.push("layer: String");
+            signature("fn crect(*, coordinates...) -> Rect", &[], &keywords)
+        }
+        "rect" => signature(
+            "fn rect(layer: String, *, coordinates...) -> Rect",
+            &["layer: String"],
+            &rect_keywords,
+        ),
+        "polygon" => signature(
+            "fn polygon(layer: String, points: Int, *, xN/yN: Float) -> Polygon",
+            &["layer: String", "points: Int"],
+            &[],
+        ),
+        "path" => signature(
+            "fn path(layer: String, points: Int, *, coordinates...) -> Path",
+            &["layer: String", "points: Int"],
+            &[
+                "width: Float",
+                "widthi: Float",
+                "begin_extension: Float",
+                "begin_extensioni: Float",
+                "end_extension: Float",
+                "end_extensioni: Float",
+            ],
+        ),
+        "text" => signature(
+            "fn text(text: String, layer: String, x: Float, y: Float)",
+            &["text: String", "layer: String", "x: Float", "y: Float"],
+            &[],
+        ),
+        "float" => signature("fn float() -> Float", &[], &[]),
+        "eq" => signature(
+            "fn eq(left: Float, right: Float)",
+            &["left: Float", "right: Float"],
+            &[],
+        ),
+        "dimension" => signature(
+            "fn dimension(x0: Float, y0: Float, x1: Float, y1: Float, offset: Float, label_offset: Float, flip: Bool)",
+            &[
+                "x0: Float",
+                "y0: Float",
+                "x1: Float",
+                "y1: Float",
+                "offset: Float",
+                "label_offset: Float",
+                "flip: Bool",
+            ],
+            &[],
+        ),
+        "inst" => signature(
+            "fn inst(cell: Cell, *, placement...) -> Inst",
+            &["cell: Cell"],
+            &[
+                "reflect: Bool",
+                "angle: Int",
+                "x: Float",
+                "y: Float",
+                "xi: Float",
+                "yi: Float",
+                "construction: Bool",
+            ],
+        ),
+        "bbox" => signature(
+            "fn bbox(value: Cell | Inst) -> Rect",
+            &["value: Cell | Inst"],
+            &[],
+        ),
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn field_candidate(name: impl Into<String>, ty: &Ty) -> CompletionCandidate {
+    let name = name.into();
+    CompletionCandidate {
+        label: name.clone(),
+        kind: CompletionKind::Field,
+        detail: Some(format!("field {name}: {ty}")),
+        insert_text: None,
+    }
+}
+
+fn field_completions(ty: &Ty) -> Vec<CompletionCandidate> {
+    let fields: Vec<(String, Ty)> = match ty {
+        Ty::Rect => [
+            ("x0", Ty::Float),
+            ("x1", Ty::Float),
+            ("y0", Ty::Float),
+            ("y1", Ty::Float),
+            ("w", Ty::Float),
+            ("h", Ty::Float),
+            ("layer", Ty::String),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_owned(), ty))
+        .collect(),
+        Ty::Polygon => [
+            ("points", Ty::Seq(Box::new(Ty::Point))),
+            ("layer", Ty::String),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_owned(), ty))
+        .collect(),
+        Ty::Path => [
+            ("points", Ty::Seq(Box::new(Ty::Point))),
+            ("layer", Ty::String),
+            ("width", Ty::Float),
+            ("begin_extension", Ty::Float),
+            ("end_extension", Ty::Float),
+        ]
+        .into_iter()
+        .map(|(name, ty)| (name.to_owned(), ty))
+        .collect(),
+        Ty::Point => [("x", Ty::Float), ("y", Ty::Float)]
+            .into_iter()
+            .map(|(name, ty)| (name.to_owned(), ty))
+            .collect(),
+        Ty::Inst(cell) => RESERVED_CELL_FIELDS
+            .into_iter()
+            .map(|name| (name.to_owned(), Ty::Float))
+            .chain(
+                cell.data
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), ty.clone())),
+            )
+            .collect(),
+        Ty::Tuple(items) => items
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, ty)| (index.to_string(), ty))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut fields = fields
+        .into_iter()
+        .map(|(name, ty)| field_candidate(name, &ty))
+        .collect::<Vec<_>>();
+    fields.sort_by(|left, right| left.label.cmp(&right.label));
+    fields.dedup_by(|left, right| left.label == right.label);
+    fields
+}
+
+fn declared_signature(
+    keyword: &str,
+    name: &str,
+    args: &[ArgDecl<arcstr::Substr, VarIdTyMetadata>],
+    return_ty: Option<&Ty>,
+) -> SignatureInfo {
+    let parameters = args
+        .iter()
+        .map(|arg| parameter(&format!("{}: {}", arg.name.name, arg.metadata.1), false))
+        .collect::<Vec<_>>();
+    let args = parameters
+        .iter()
+        .map(|parameter| parameter.label.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let return_ty = return_ty
+        .filter(|ty| **ty != Ty::Nil)
+        .map_or_else(String::new, |ty| format!(" -> {ty}"));
+    SignatureInfo {
+        label: format!("{keyword} {name}({args}){return_ty}"),
+        parameters,
+    }
 }
 
 struct Builder<'a> {
@@ -299,19 +928,50 @@ impl<'a> Builder<'a> {
             if !is_navigable(&ast.path) {
                 continue;
             }
+            if indexes_source(ast) {
+                self.index
+                    .file_modules
+                    .insert(ast.path.clone(), module.clone());
+            }
             self.index.defs.insert(
                 DefKey::Module(module.clone()),
                 Definition {
                     kind: SymbolKind::Module,
                     name: module.last().cloned().unwrap_or_default(),
                     location: DefLocation::File(ast.path.clone()),
+                    detail: module
+                        .last()
+                        .map_or_else(|| "workspace root".to_owned(), |name| format!("mod {name}")),
+                    ty: None,
+                    signature: None,
+                    full_span: None,
                 },
             );
+            if let Some((name, parent)) = module.split_last() {
+                self.index
+                    .module_items
+                    .entry(parent.to_vec())
+                    .or_default()
+                    .push(ModuleItem {
+                        name: name.clone(),
+                        key: DefKey::Module(module.clone()),
+                        available_after: 0,
+                    });
+            }
             for decl in &ast.ast.decls {
                 match decl {
                     Decl::Enum(decl) => {
                         if let Some((name_id, enum_id)) = decl.metadata {
                             self.enums.insert(enum_id, name_id);
+                            self.index
+                                .module_items
+                                .entry(module.clone())
+                                .or_default()
+                                .push(ModuleItem {
+                                    name: decl.name.name.to_string(),
+                                    key: DefKey::Var(name_id),
+                                    available_after: 0,
+                                });
                         }
                     }
                     Decl::Cell(decl) => {
@@ -327,6 +987,34 @@ impl<'a> Builder<'a> {
                             })
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
+                        self.index
+                            .module_items
+                            .entry(module.clone())
+                            .or_default()
+                            .push(ModuleItem {
+                                name: decl.name.name.to_string(),
+                                key: DefKey::Var(decl.metadata.1),
+                                // Cells enter the compiler's binding frame
+                                // only after their body is checked.
+                                available_after: if decl.span.end() <= ast.source_text.len() {
+                                    decl.span.end()
+                                } else {
+                                    // GDS declarations are generated before
+                                    // user source and are always in scope.
+                                    0
+                                },
+                            });
+                    }
+                    Decl::Fn(decl) => {
+                        self.index
+                            .module_items
+                            .entry(module.clone())
+                            .or_default()
+                            .push(ModuleItem {
+                                name: decl.name.name.to_string(),
+                                key: DefKey::Var(decl.metadata.1),
+                                available_after: 0,
+                            });
                     }
                     _ => {}
                 }
@@ -352,6 +1040,9 @@ impl<'a> Builder<'a> {
             }
         }
         for entries in self.index.refs.values_mut() {
+            entries.sort_by_key(|(span, _)| (span.start(), std::cmp::Reverse(span.end())));
+        }
+        for entries in self.index.expression_types.values_mut() {
             entries.sort_by_key(|(span, _)| (span.start(), std::cmp::Reverse(span.end())));
         }
         self.index
@@ -389,12 +1080,29 @@ impl<'a> Builder<'a> {
             .push((span, target));
     }
 
+    fn record_hover_detail(&mut self, span: cfgrammar::Span, detail: String) {
+        if self.visible(span) {
+            self.index
+                .hover_details
+                .entry(self.path.to_path_buf())
+                .or_default()
+                .push((span, detail));
+        }
+    }
+
     fn define(
         &mut self,
         key: DefKey,
         kind: SymbolKind,
         name: &Ident<arcstr::Substr, VarIdTyMetadata>,
+        info: DefinitionInfo,
     ) {
+        let DefinitionInfo {
+            detail,
+            ty,
+            signature,
+            full_span,
+        } = info;
         let location = if self.visible(name.span) {
             DefLocation::Source(self.span(name.span))
         } else {
@@ -406,6 +1114,12 @@ impl<'a> Builder<'a> {
                 kind,
                 name: name.name.to_string(),
                 location,
+                detail,
+                ty,
+                signature,
+                full_span: full_span
+                    .filter(|span| self.visible(*span))
+                    .map(|span| self.span(span)),
             },
         );
         // A declaration is also a reference to itself, so that a cursor on the
@@ -443,32 +1157,76 @@ impl<'a> Builder<'a> {
         let Some((name_id, _)) = decl.metadata else {
             return;
         };
-        self.define(DefKey::Var(name_id), SymbolKind::Enum, &decl.name);
+        let variants = decl
+            .variants
+            .iter()
+            .map(|variant| variant.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.define(
+            DefKey::Var(name_id),
+            SymbolKind::Enum,
+            &decl.name,
+            DefinitionInfo {
+                detail: format!("enum {} {{ {variants} }}", decl.name.name),
+                ty: None,
+                signature: None,
+                full_span: None,
+            },
+        );
         for variant in &decl.variants {
             self.define(
                 DefKey::Variant(name_id, variant.name.to_string()),
                 SymbolKind::Variant,
                 variant,
+                DefinitionInfo {
+                    detail: format!("{}::{}", decl.name.name, variant.name),
+                    ty: None,
+                    signature: None,
+                    full_span: None,
+                },
             );
         }
     }
 
     fn cell_decl(&mut self, decl: &'a CellDecl<arcstr::Substr, VarIdTyMetadata>) {
-        self.define(DefKey::Var(decl.metadata.1), SymbolKind::Cell, &decl.name);
+        let signature = declared_signature("cell", &decl.name.name, &decl.args, None);
+        self.define(
+            DefKey::Var(decl.metadata.1),
+            SymbolKind::Cell,
+            &decl.name,
+            DefinitionInfo {
+                detail: signature.label.clone(),
+                ty: None,
+                signature: Some(signature),
+                full_span: Some(decl.span),
+            },
+        );
         for arg in &decl.args {
-            self.arg_decl(arg);
+            self.arg_decl(arg, decl.scope.span);
         }
         self.scope(&decl.scope);
     }
 
     fn fn_decl(&mut self, decl: &'a FnDecl<arcstr::Substr, VarIdTyMetadata>) {
+        let return_ty = match &decl.metadata.2 {
+            Ty::Fn(fn_ty) => Some(&fn_ty.ret),
+            _ => None,
+        };
+        let signature = declared_signature("fn", &decl.name.name, &decl.args, return_ty);
         self.define(
             DefKey::Var(decl.metadata.1),
             SymbolKind::Function,
             &decl.name,
+            DefinitionInfo {
+                detail: signature.label.clone(),
+                ty: Some(decl.metadata.2.clone()),
+                signature: Some(signature),
+                full_span: Some(decl.span),
+            },
         );
         for arg in &decl.args {
-            self.arg_decl(arg);
+            self.arg_decl(arg, decl.scope.span);
         }
         if let Some(spec) = &decl.return_ty {
             // The declared return type, recovered from the function's own type.
@@ -501,7 +1259,18 @@ impl<'a> Builder<'a> {
         // An alias is another name for the same binding, not a new definition,
         // so navigating from it lands on the original declaration.
         if let Some(alias) = &decl.alias {
-            self.record(alias.span, target);
+            self.record(alias.span, target.clone());
+        }
+        if let Target::Def(key) = target {
+            self.index
+                .module_items
+                .entry(self.current.clone())
+                .or_default()
+                .push(ModuleItem {
+                    name: decl.alias.as_ref().unwrap_or(item).name.to_string(),
+                    key,
+                    available_after: 0,
+                });
         }
     }
 
@@ -542,13 +1311,34 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn arg_decl(&mut self, arg: &'a ArgDecl<arcstr::Substr, VarIdTyMetadata>) {
+    fn arg_decl(
+        &mut self,
+        arg: &'a ArgDecl<arcstr::Substr, VarIdTyMetadata>,
+        scope: cfgrammar::Span,
+    ) {
+        let key = DefKey::Var(arg.metadata.0);
+        let ty = arg.metadata.1.clone();
         self.define(
-            DefKey::Var(arg.metadata.0),
+            key.clone(),
             SymbolKind::Parameter,
             &arg.name,
+            DefinitionInfo {
+                detail: format!("parameter {}: {ty}", arg.name.name),
+                ty: Some(ty.clone()),
+                signature: None,
+                full_span: None,
+            },
         );
-        let ty = arg.metadata.1.clone();
+        self.index
+            .scope_bindings
+            .entry(self.path.to_path_buf())
+            .or_default()
+            .push(ScopeBinding {
+                name: arg.name.name.to_string(),
+                key,
+                scope,
+                available_after: scope.start(),
+            });
         self.ty_spec(&arg.ty, &ty);
     }
 
@@ -606,15 +1396,58 @@ impl<'a> Builder<'a> {
                 Statement::LetBinding(binding) => {
                     // The initializer is evaluated before the name is bound.
                     self.expr(&binding.value);
+                    let key = DefKey::Var(binding.metadata);
+                    let ty = binding.value.ty();
                     self.define(
-                        DefKey::Var(binding.metadata),
+                        key.clone(),
                         SymbolKind::Local,
                         &binding.name,
+                        DefinitionInfo {
+                            detail: format!("let {}: {ty}", binding.name.name),
+                            ty: Some(ty),
+                            signature: None,
+                            full_span: Some(binding.span),
+                        },
                     );
+                    self.index
+                        .scope_bindings
+                        .entry(self.path.to_path_buf())
+                        .or_default()
+                        .push(ScopeBinding {
+                            name: binding.name.name.to_string(),
+                            key,
+                            scope: scope.span,
+                            available_after: binding.span.end(),
+                        });
                 }
                 Statement::ForLoop(loop_) => {
                     self.expr(&loop_.seq);
-                    self.define(DefKey::Var(loop_.metadata), SymbolKind::LoopVar, &loop_.var);
+                    let key = DefKey::Var(loop_.metadata);
+                    let ty = match loop_.seq.ty() {
+                        Ty::Seq(element) => *element,
+                        _ => Ty::Unknown,
+                    };
+                    self.define(
+                        key.clone(),
+                        SymbolKind::LoopVar,
+                        &loop_.var,
+                        DefinitionInfo {
+                            detail: format!("loop variable {}: {ty}", loop_.var.name),
+                            ty: Some(ty),
+                            signature: None,
+                            full_span: Some(loop_.span),
+                        },
+                    );
+                    self.index
+                        .scope_bindings
+                        .entry(self.path.to_path_buf())
+                        .or_default()
+                        .push(ScopeBinding {
+                            name: loop_.var.name.to_string(),
+                            key,
+                            scope: loop_.body.span,
+                            available_after: loop_.body.span.start(),
+                        });
                     self.scope(&loop_.body);
                 }
             }
@@ -627,6 +1460,13 @@ impl<'a> Builder<'a> {
     // ---------------------------------------------------------- expressions
 
     fn expr(&mut self, expr: &'a Expr<arcstr::Substr, VarIdTyMetadata>) {
+        if self.visible(expr.span()) {
+            self.index
+                .expression_types
+                .entry(self.path.to_path_buf())
+                .or_default()
+                .push((expr.span(), expr.ty()));
+        }
         match expr {
             Expr::IdentPath(path) => self.ident_path(path),
             Expr::Call(call) => {
@@ -653,6 +1493,10 @@ impl<'a> Builder<'a> {
                         kwarg.name.span,
                         Target::Builtin(Builtin::KwArg(kwarg.name.name.to_string())),
                     );
+                    self.record_hover_detail(
+                        kwarg.name.span,
+                        format!("keyword argument {}: {}", kwarg.name.name, kwarg.metadata),
+                    );
                     self.expr(&kwarg.value);
                 }
             }
@@ -661,6 +1505,10 @@ impl<'a> Builder<'a> {
                 self.expr(&access.base);
                 let target = self.field_target(&base, &access.field.name);
                 self.record(access.field.span, target);
+                self.record_hover_detail(
+                    access.field.span,
+                    format!("field {}: {}", access.field.name, access.metadata),
+                );
             }
             Expr::Cast(cast) => {
                 self.expr(&cast.value);
@@ -1323,6 +2171,92 @@ cell top() {
             "dependency".to_owned(),
             directory.join("../dependency_library"),
         )])
+    }
+
+    fn labels(candidates: Vec<CompletionCandidate>) -> Vec<String> {
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect()
+    }
+
+    #[test]
+    fn completion_respects_lexical_scope_and_declaration_order() {
+        let source = r#"
+fn helper(value: Float) -> Float { value }
+cell earlier_cell() {}
+cell top(arg: Float) {
+    let earlier = rect("met1");
+    if true {
+        let nested = 1.;
+        eq($0earlier.x0, arg);
+    } else {};
+    let later = 2.;
+}
+"#;
+        let (_, index, offsets) = index(source);
+        let labels = labels(index.completions_at(Path::new(ROOT), offsets[0]));
+        for expected in ["arg", "earlier", "nested", "earlier_cell", "helper", "rect"] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "missing {expected}: {labels:?}"
+            );
+        }
+        for hidden in ["later", "top"] {
+            assert!(
+                !labels.iter().any(|label| label == hidden),
+                "unexpected {hidden}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_is_type_aware_for_members_and_enum_paths() {
+        let source = r#"
+enum Mode { Fast, Small }
+cell top() {
+    let shape = rect("met1");
+    eq(shape.x0, 0.);
+}
+"#;
+        let (source, index, _) = index(source);
+        let base_end = source.find("shape.x0").unwrap() + "shape".len();
+        let fields = labels(index.member_completions_at(Path::new(ROOT), base_end));
+        for expected in ["h", "layer", "w", "x0", "x1", "y0", "y1"] {
+            assert!(
+                fields.iter().any(|field| field == expected),
+                "missing {expected}: {fields:?}"
+            );
+        }
+        assert_eq!(
+            labels(index.qualified_completions(Path::new(ROOT), &["Mode".to_owned()])),
+            vec!["Fast", "Small"]
+        );
+        let rect = source.find("rect").unwrap();
+        let signature = index.signature_at(Path::new(ROOT), rect).unwrap();
+        let keyword_args = index.keyword_completions_for_signature(&signature);
+        assert!(keyword_args.iter().any(|candidate| {
+            candidate.label == "x0" && candidate.insert_text.as_deref() == Some("x0=")
+        }));
+    }
+
+    #[test]
+    fn hover_signatures_and_outline_use_typed_declarations() {
+        let source = "fn scale(value: Float) -> Float { value * 2. }\ncell top() { scale(1.); }\n";
+        let (source, index, _) = index(source);
+        let call = source.rfind("scale").unwrap();
+        assert_eq!(
+            index.signature_at(Path::new(ROOT), call).unwrap().label,
+            "fn scale(value: Float) -> Float"
+        );
+        assert_eq!(
+            index.hover_at(Path::new(ROOT), call).unwrap().contents,
+            "fn scale(value: Float) -> Float"
+        );
+        let symbols = index.document_symbols(Path::new(ROOT));
+        assert!(symbols.iter().any(|symbol| symbol.name == "scale"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "value"));
+        assert!(symbols.iter().any(|symbol| symbol.name == "top"));
     }
 
     /// Structural invariants that must hold for every example in the corpus.

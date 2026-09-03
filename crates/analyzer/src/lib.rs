@@ -56,6 +56,18 @@ use crate::document::{Document, DocumentChange, PositionEncoding};
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
 
+fn completion_trigger_characters() -> Vec<String> {
+    // Neovim's native LSP completion uses the server's trigger characters for
+    // automatic completion. Argon identifiers are ASCII, so advertising the
+    // identifier alphabet gives completion on each typed prefix as well as on
+    // member/path separators.
+    (b'a'..=b'z')
+        .chain(b'A'..=b'Z')
+        .chain(*b"_.:")
+        .map(|byte| char::from(byte).to_string())
+        .collect()
+}
+
 fn read_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| {
         // Configuration updates replace the whole value, so no partially
@@ -1102,6 +1114,19 @@ impl LanguageServer for Backend {
                 position_encoding: Some(encoding.kind()),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(completion_trigger_characters()),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_owned(), ",".to_owned(), "=".to_owned()]),
+                    retrigger_characters: Some(vec![",".to_owned()]),
+                    ..Default::default()
+                }),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
                 text_document_sync: Some(TextDocumentSyncCapability::Options(
                     TextDocumentSyncOptions {
                         open_close: Some(true),
@@ -1222,6 +1247,52 @@ impl LanguageServer for Backend {
                 position.position,
                 params.context.include_declaration,
             )
+            .await)
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let position = params.text_document_position;
+        Ok(self
+            .state
+            .completion(&position.text_document.uri, position.position)
+            .await)
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let position = params.text_document_position_params;
+        Ok(self
+            .state
+            .hover(&position.text_document.uri, position.position)
+            .await)
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let position = params.text_document_position_params;
+        Ok(self
+            .state
+            .signature_help(&position.text_document.uri, position.position)
+            .await)
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        Ok(self
+            .state
+            .document_symbols(&params.text_document.uri)
+            .await
+            .map(DocumentSymbolResponse::Nested))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let position = params.text_document_position_params;
+        Ok(self
+            .state
+            .document_highlights(&position.text_document.uri, position.position)
             .await)
     }
 
