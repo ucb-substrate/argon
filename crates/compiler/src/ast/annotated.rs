@@ -303,6 +303,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
         _ty: &super::TySpec<Self::OutputS, Self::OutputMetadata>,
+        _default: &Option<super::Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         input.metadata.clone()
     }

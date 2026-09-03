@@ -366,10 +366,12 @@ pub struct KwArgValue<S, T: AstMetadata> {
     pub metadata: T::KwArgValue,
 }
 
+/// A parameter of a cell or function; `default` makes it a keyword parameter.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct ArgDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub ty: TySpec<S, T>,
+    pub default: Option<Expr<S, T>>,
     pub metadata: T::ArgDecl,
 }
 
@@ -580,6 +582,7 @@ pub trait AstTransformer {
         input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
         ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+        default: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl;
     fn dispatch_scope(
         &mut self,
@@ -972,8 +975,19 @@ pub trait AstTransformer {
     ) -> ArgDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
         let ty = self.transform_ty_spec(&input.ty);
-        let metadata = self.dispatch_arg_decl(input, &name, &ty);
-        ArgDecl { name, ty, metadata }
+        // The default is visited before the parameter is dispatched, so it can
+        // see earlier parameters but not this one.
+        let default = input
+            .default
+            .as_ref()
+            .map(|default| self.transform_expr(default));
+        let metadata = self.dispatch_arg_decl(input, &name, &ty, &default);
+        ArgDecl {
+            name,
+            ty,
+            default,
+            metadata,
+        }
     }
 
     fn transform_scope(
