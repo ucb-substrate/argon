@@ -79,6 +79,15 @@ const MAX_SOLVE_ITERS: u64 = 1 << 24;
 /// [`crate::run_with_stack`] reserves.
 const MAX_EVAL_DEPTH: u32 = 4096;
 
+/// The most cell fields whose types may be waiting on one another at once.
+///
+/// A field's type is computed on demand, and a demand for a field of a cell
+/// that is not yet typed suspends the current statement until that field is.
+/// The suspended statements form an explicit stack rather than native
+/// recursion, so this only bounds pathological workspaces; a genuine cycle is
+/// reported as [`StaticErrorKind::CyclicCellField`] long before it is reached.
+const MAX_CELL_TYPING_DEPTH: usize = 4096;
+
 /// The longest text label a GDSII `STRING` record may carry, in bytes.
 ///
 /// The format itself only bounds a record at `u16::MAX`, but the GDSII
@@ -1100,28 +1109,123 @@ fn check_text(text: &Text<f64>, cell: CellId, errs: &mut Vec<ExecError>) {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub(crate) struct VarIdTyFrame {
     var_bindings: IndexMap<Substr, (VarId, Ty)>,
 }
 
+/// The fields of a fully typed cell, by name.
+type CellFields = IndexMap<String, Ty>;
+
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
     mod_bindings: &'a IndexMap<&'a ModPath, VarIdTyFrame>,
+    /// Fields of the cells of every module typed before this one.
+    cell_fields: &'a IndexMap<VarId, CellFields>,
     current_path: &'a ModPath,
     next_id: VarId,
     bindings: Vec<VarIdTyFrame>,
     errors: Vec<StaticError>,
+    /// Cells of this module that are still being typed, by their id.
+    cells: IndexMap<VarId, CellTyping<'a>>,
+    /// The cell declared at each index of `ast.ast.decls`.
+    decl_cells: IndexMap<usize, VarId>,
+    /// Fields of the cells of this module that are fully typed.
+    finished_cell_fields: IndexMap<VarId, CellFields>,
+    /// Statements suspended on the type of a field, innermost last.
+    goals: Vec<Goal>,
+    /// Fields whose type could not be determined, as `(cell, statement)`. A
+    /// read of one is `Unknown` and raises no further demand.
+    poisoned: IndexSet<(VarId, usize)>,
+    /// The unit of source being typed, while one is.
+    attempt: Option<Attempt>,
+}
+
+/// A cell of the current module while its body is typed.
+///
+/// A cell's type is bound before any body is walked, so a cell may refer to
+/// itself, or to a cell declared below it. Only the *types of its fields*,
+/// the top-level `let` bindings of its body, have to wait for the body: they
+/// are computed one statement at a time, in any order, as they are demanded.
+struct CellTyping<'a> {
+    decl: &'a CellDecl<Substr, ParseMetadata>,
+    /// Top-level `let` name to the indices of the statements declaring it,
+    /// ascending. A name declared more than once is re-bound in sequence: a
+    /// statement sees the nearest `let` above it, and the field an instance
+    /// answers is the last.
+    lets: IndexMap<Substr, Vec<usize>>,
+    /// The typed parameters and the frame binding them, once typed.
+    params: Option<(Vec<ArgDecl<Substr, VarIdTyMetadata>>, VarIdTyFrame)>,
+    /// One slot per top-level statement of the body, filled as each is typed.
+    stmts: Vec<Option<Statement<Substr, VarIdTyMetadata>>>,
+    /// The typed tail, once typed; the inner `None` is a body without a tail.
+    tail: Option<Option<Expr<Substr, VarIdTyMetadata>>>,
+}
+
+/// One independently typed piece of a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    /// The parameter list, including default values.
+    Params,
+    /// The top-level statement at this index of the body.
+    Stmt(usize),
+    /// The tail expression.
+    Tail,
+}
+
+/// Work on the cell typing stack: type one statement of `cell`, or all of it.
+#[derive(Debug, Clone, Copy)]
+struct Goal {
+    cell: VarId,
+    /// The statement wanted, or `None` to type the whole cell.
+    target: Option<usize>,
+    /// The unit whose attempt this goal is suspended in, once attempted. A
+    /// demand for that very unit closes a cycle.
+    attempting: Option<Unit>,
+}
+
+/// A field type that was read before it was computed.
+#[derive(Debug, Clone)]
+struct Demand {
+    cell: VarId,
+    /// Index of the `let` statement declaring the field.
+    stmt: usize,
+    /// Where it was read, for the diagnostic if the demand cannot be met.
+    span: cfgrammar::Span,
+}
+
+/// One attempt at typing a unit. If it raises demands, everything it did is
+/// rolled back and it is attempted again once they are met.
+struct Attempt {
+    /// The cell whose unit this is; `None` for a `fn` declaration.
+    cell: Option<VarId>,
+    /// Top-level `let`s of `cell` that are in scope for this unit but not yet
+    /// typed, to the statement declaring them. A read of one is a demand.
+    visible_untyped: IndexMap<Substr, usize>,
+    demands: Vec<Demand>,
+}
+
+/// State shared by every module of a workspace while it is typed.
+struct WorkspaceTyping<'a> {
+    mod_bindings: IndexMap<&'a ModPath, VarIdTyFrame>,
+    /// Fields of every fully typed cell, by the cell's id.
+    cell_fields: IndexMap<VarId, CellFields>,
+    ast: WorkspaceAst<VarIdTyMetadata>,
+    errors: Vec<StaticError>,
+    next_id: VarId,
 }
 
 pub(crate) fn execute_var_id_ty_pass<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
 ) -> (WorkspaceAst<VarIdTyMetadata>, Vec<StaticError>) {
-    let mut mod_bindings = IndexMap::new();
-    let mut workspace_ast = IndexMap::new();
-    let mut errors = Vec::new();
-    let mut next_id = 1;
+    let mut typing = WorkspaceTyping {
+        mod_bindings: IndexMap::new(),
+        cell_fields: IndexMap::new(),
+        ast: IndexMap::new(),
+        errors: Vec::new(),
+        next_id: 1,
+    };
     let std_mod_path = vec!["std".to_string()];
     let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
     if let Some((root, _)) = ast.get_key_value(&vec![]) {
@@ -1130,59 +1234,53 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
             .flatten()
             .chain(ast.keys())
         {
-            execute_var_id_ty_pass_inner(
-                ast,
-                dag,
-                path,
-                &mut mod_bindings,
-                &mut workspace_ast,
-                &mut errors,
-                &mut next_id,
-            );
+            execute_var_id_ty_pass_inner(ast, dag, path, &mut typing);
         }
     }
-    (workspace_ast, errors)
+    (typing.ast, typing.errors)
 }
-pub(crate) fn execute_var_id_ty_pass_inner<'a>(
+
+fn execute_var_id_ty_pass_inner<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
     current_path: &'a ModPath,
-    mod_bindings: &mut IndexMap<&'a ModPath, VarIdTyFrame>,
-    workspace_ast: &mut WorkspaceAst<VarIdTyMetadata>,
-    errors: &mut Vec<StaticError>,
-    next_id: &mut VarId,
+    typing: &mut WorkspaceTyping<'a>,
 ) {
     // TODO: fix hacky way to track visited modules.
-    if mod_bindings.contains_key(&current_path) {
+    if typing.mod_bindings.contains_key(&current_path) {
         return;
     }
-    mod_bindings.insert(current_path, VarIdTyFrame::default());
+    typing
+        .mod_bindings
+        .insert(current_path, VarIdTyFrame::default());
 
     for children in dag[&current_path].keys() {
-        execute_var_id_ty_pass_inner(
-            ast,
-            dag,
-            children,
-            mod_bindings,
-            workspace_ast,
-            errors,
-            next_id,
-        );
+        execute_var_id_ty_pass_inner(ast, dag, children, typing);
     }
 
     let mut pass = VarIdTyPass {
         ast: &ast[current_path],
-        mod_bindings,
+        mod_bindings: &typing.mod_bindings,
+        cell_fields: &typing.cell_fields,
         current_path,
-        next_id: *next_id,
+        next_id: typing.next_id,
         bindings: vec![VarIdTyFrame::default()],
         errors: vec![],
+        cells: IndexMap::new(),
+        decl_cells: IndexMap::new(),
+        finished_cell_fields: IndexMap::new(),
+        goals: Vec::new(),
+        poisoned: IndexSet::new(),
+        attempt: None,
     };
-    let ast = pass.execute();
-    workspace_ast.insert(current_path.clone(), ast);
-    errors.extend(pass.errors);
-    *next_id = pass.next_id;
-    mod_bindings.insert(current_path, pass.bindings.into_iter().next().unwrap());
+    let module_ast = pass.execute();
+    typing.ast.insert(current_path.clone(), module_ast);
+    typing.errors.extend(pass.errors);
+    typing.next_id = pass.next_id;
+    let module_frame = pass.bindings.into_iter().next().unwrap();
+    let cell_fields = pass.finished_cell_fields;
+    typing.cell_fields.extend(cell_fields);
+    typing.mod_bindings.insert(current_path, module_frame);
 }
 
 #[derive(Debug, Clone)]
@@ -1292,15 +1390,6 @@ impl std::fmt::Display for Ty {
             Ty::Struct(s) => write!(f, "struct {}", s.name),
         }
     }
-}
-
-/// Whether an instance of `cell` would answer `field`.
-///
-/// A cell's public fields are its top-level `let` bindings plus
-/// [`RESERVED_CELL_FIELDS`]; a GDS-backed cell publishes its geometry at
-/// execution time, so it answers anything.
-fn cell_has_field(cell: &CellTy, field: &str) -> bool {
-    cell.dynamic_fields || cell.data.contains_key(field) || RESERVED_CELL_FIELDS.contains(&field)
 }
 
 impl Ty {
@@ -1497,33 +1586,32 @@ pub struct FnTy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
     sig: Signature,
-    /// The structural type produced when this cell function is called, shared
-    /// with every caller and every `inst` of the result.
+    /// The type produced when this cell function is called, shared with every
+    /// caller and every `inst` of the result.
     pub(crate) cell: Arc<CellTy>,
 }
 
+/// The type of a cell, and of an instance of it.
+///
+/// Cell types are *nominal*: the type is the declaration, identified by
+/// `def`, and carries no field information of its own. The fields an
+/// instance answers are the cell's top-level `let` bindings, which the type
+/// pass looks up through the declaring cell as they are needed. That is what
+/// lets a cell's type exist before its body is typed, so that cells may refer
+/// to one another, and to themselves, in any order.
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct CellTy {
-    /// The name the cell was declared with, carried solely so that a
-    /// diagnostic can say `Inst(inverter)` instead of dumping the field map.
-    ///
-    /// Deliberately excluded from `PartialEq`: cell types are *structural*, so
-    /// two identically shaped cells are the same type regardless of what they
-    /// are called, and `is_eq_ty` falls through to `==`. Including the name
-    /// here would silently make that check nominal.
+    /// The name the cell was declared with, module-qualified, carried solely
+    /// so that a diagnostic can say `Inst(inverter)`.
     name: String,
-    pub(crate) data: IndexMap<String, Ty>,
     /// GDS-backed cells publish geometry fields at execution time. Their
     /// generated source declaration is intentionally only a signature, so
-    /// field names cannot be enumerated by the source type pass.
+    /// field names cannot be enumerated by the source type pass, and every
+    /// field reads as `Any`.
     dynamic_fields: bool,
-    /// The declaring cell's [`VarId`], for navigation from a field access back
-    /// to the `let` that declared the field.
-    ///
-    /// Identity, not structure: cell typing is structural, so two cells with
-    /// the same fields must stay interchangeable. [`PartialEq`] therefore
-    /// ignores this field, and it is `None` for the generated signature of a
-    /// GDS-backed cell.
+    /// The declaring cell's [`VarId`]: the type's identity, and how navigation
+    /// reaches the `let` declaring a field. `None` for the generated signature
+    /// of a GDS-backed cell.
     pub(crate) def: Option<VarId>,
 }
 
@@ -1531,20 +1619,18 @@ impl PartialEq for CellTy {
     fn eq(&self, other: &Self) -> bool {
         // Destructured rather than field-by-field so that a field added later
         // has to be named here, instead of being silently excluded from
-        // structural equality.
+        // equality.
         let Self {
             name: _,
-            data,
             dynamic_fields,
-            def: _,
+            def,
         } = self;
         let Self {
             name: _,
-            data: other_data,
             dynamic_fields: other_dynamic_fields,
-            def: _,
+            def: other_def,
         } = other;
-        data == other_data && dynamic_fields == other_dynamic_fields
+        def == other_def && dynamic_fields == other_dynamic_fields
     }
 }
 
@@ -1625,10 +1711,10 @@ impl<'a> VarIdTyPass<'a> {
 
     /// The name a diagnostic should use for a declaration in this module.
     ///
-    /// Cell and enum types are structural, so two same-named declarations in
-    /// different modules are different types that a bare name renders
-    /// identically: `expected type Inst(child), found Inst(child)`. Matches
-    /// the qualification `ExecPass` records for the GDS exporter.
+    /// Two same-named declarations in different modules are different types
+    /// that a bare name renders identically: `expected type Inst(child), found
+    /// Inst(child)`. Matches the qualification `ExecPass` records for the GDS
+    /// exporter.
     fn qualified_name(&self, name: &str) -> String {
         self.current_path
             .iter()
@@ -1644,28 +1730,6 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
         None
-    }
-
-    fn unresolved_local_name_error(
-        &self,
-        name: &str,
-        use_span: cfgrammar::Span,
-    ) -> StaticErrorKind {
-        let is_cell_declared_later = self.ast.ast.decls.iter().any(|decl| {
-            matches!(decl, Decl::Cell(cell)
-                if cell.name.name.as_str() == name
-                    && cell.name.span.start() > use_span.start())
-        });
-
-        if is_cell_declared_later {
-            StaticErrorKind::UseBeforeDeclaration {
-                name: name.to_owned(),
-            }
-        } else {
-            StaticErrorKind::UndeclaredVar {
-                name: name.to_owned(),
-            }
-        }
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -1700,7 +1764,10 @@ impl<'a> VarIdTyPass<'a> {
         // are declared, allowing imported enum and struct types in fields and
         // signatures, and imported functions in any declaration body,
         // regardless of source order. Structs come before functions so that a
-        // signature may name a struct declared further down.
+        // signature may name a struct declared further down. Cells come last:
+        // their types are nominal, so binding them here, before any body is
+        // walked, lets a body refer to any cell of the module, including the
+        // one being declared.
         for decl in &self.ast.ast.decls {
             if let Decl::Enum(e) = decl {
                 self.declare_enum_decl(e);
@@ -1717,14 +1784,26 @@ impl<'a> VarIdTyPass<'a> {
                 self.declare_fn_decl(f);
             }
         }
+        for (index, decl) in self.ast.ast.decls.iter().enumerate() {
+            if let Decl::Cell(c) = decl {
+                self.declare_cell_decl(index, c);
+            }
+        }
 
-        for decl in &self.ast.ast.decls {
+        for (index, decl) in self.ast.ast.decls.iter().enumerate() {
             match decl {
                 Decl::Fn(f) => {
-                    decls.push(Decl::Fn(self.transform_fn_decl(f)));
+                    decls.push(Decl::Fn(self.type_fn_decl(f)));
                 }
-                Decl::Cell(c) => {
-                    decls.push(Decl::Cell(self.transform_cell_decl(c)));
+                Decl::Cell(_) => {
+                    let cell = self.decl_cells[&index];
+                    self.goals.push(Goal {
+                        cell,
+                        target: None,
+                        attempting: None,
+                    });
+                    self.run_goals();
+                    decls.push(Decl::Cell(self.finish_cell(cell)));
                 }
                 Decl::Mod(m) => {
                     decls.push(Decl::Mod(self.transform_mod_decl(m)));
@@ -1766,6 +1845,440 @@ impl<'a> VarIdTyPass<'a> {
             use_decl.path.iter().map(|ident| ident.name.as_str()),
             1,
         )
+    }
+
+    /// Binds a cell's type before its body is typed, and sets up the lazy
+    /// typing of its fields.
+    ///
+    /// The type is built from the signature alone, like a function's: cell
+    /// types are nominal, so nothing about the body is needed to name the
+    /// type. `index` is the declaration's position in `ast.ast.decls`.
+    fn declare_cell_decl(&mut self, index: usize, input: &'a CellDecl<Substr, ParseMetadata>) {
+        if BUILTINS.contains(&input.name.name.as_str()) {
+            self.errors.push(StaticError {
+                span: self.span(input.name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+        }
+        self.check_params(&input.args);
+        let sig = input
+            .args
+            .iter()
+            .map(|arg| {
+                let ty_spec = self.transform_ty_spec(&arg.ty);
+                (arg, self.ty_from_spec(&ty_spec))
+            })
+            .collect();
+        // Generated declarations -- the signatures standing in for GDS-backed
+        // cells -- sit at the front of the list. They have no declared fields
+        // to trace back to, so field accesses on them fall through to the
+        // builtin geometry fields.
+        let dynamic_fields = index < self.ast.generated_declarations;
+        let cell_id = self.alloc_id();
+        let ty = Ty::CellFn(Box::new(CellFnTy {
+            sig,
+            cell: Arc::new(CellTy {
+                name: self.qualified_name(&input.name.name),
+                dynamic_fields,
+                def: (!dynamic_fields).then_some(cell_id),
+            }),
+        }));
+        self.bind(&input.name.name, cell_id, ty);
+
+        let mut lets: IndexMap<Substr, Vec<usize>> = IndexMap::new();
+        for (stmt, statement) in input.scope.stmts.iter().enumerate() {
+            let Statement::LetBinding(binding) = statement else {
+                continue;
+            };
+            let name = &binding.name;
+            if RESERVED_CELL_FIELDS.contains(&name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(name.span),
+                    kind: StaticErrorKind::ReservedCellField {
+                        name: name.name.to_string(),
+                    },
+                });
+            }
+            lets.entry(name.name.clone()).or_default().push(stmt);
+        }
+        self.cells.insert(
+            cell_id,
+            CellTyping {
+                decl: input,
+                lets,
+                params: None,
+                stmts: input.scope.stmts.iter().map(|_| None).collect(),
+                tail: None,
+            },
+        );
+        self.decl_cells.insert(index, cell_id);
+    }
+
+    /// Types a function declaration, retrying whenever its body reads a cell
+    /// field that has not been typed yet.
+    ///
+    /// Functions are never suspended on the stack: a call needs only the
+    /// signature, which is bound up front, so no field can depend on a
+    /// function body and every retry makes progress.
+    fn type_fn_decl(
+        &mut self,
+        input: &'a FnDecl<Substr, ParseMetadata>,
+    ) -> FnDecl<Substr, VarIdTyMetadata> {
+        loop {
+            match self.attempt(None, VarIdTyFrame::default(), IndexMap::new(), |pass| {
+                pass.transform_fn_decl(input)
+            }) {
+                Ok((decl, _)) => return decl,
+                Err(demands) => {
+                    self.schedule(demands);
+                    self.run_goals();
+                }
+            }
+        }
+    }
+
+    /// Types one unit of source with `view` as its innermost frame.
+    ///
+    /// Returns the result and the frame, or the demands the unit raised, in
+    /// which case everything the attempt did is undone: what it produced
+    /// depends on types it did not have, so its diagnostics are dropped and
+    /// the ids it allocated are released for the retry.
+    fn attempt<T>(
+        &mut self,
+        cell: Option<VarId>,
+        view: VarIdTyFrame,
+        visible_untyped: IndexMap<Substr, usize>,
+        unit: impl FnOnce(&mut Self) -> T,
+    ) -> Result<(T, VarIdTyFrame), Vec<Demand>> {
+        debug_assert!(self.attempt.is_none(), "attempts do not nest");
+        let errors = self.errors.len();
+        let next_id = self.next_id;
+        self.bindings.push(view);
+        self.attempt = Some(Attempt {
+            cell,
+            visible_untyped,
+            demands: Vec::new(),
+        });
+        let result = unit(self);
+        let attempt = self.attempt.take().expect("set above");
+        let view = self.bindings.pop().expect("pushed above");
+        if attempt.demands.is_empty() {
+            Ok((result, view))
+        } else {
+            self.errors.truncate(errors);
+            self.next_id = next_id;
+            Err(attempt.demands)
+        }
+    }
+
+    /// The frame a statement of `cell` is typed in: the parameters, then the
+    /// nearest top-level `let` of each name declared above `limit`, if it has
+    /// been typed. One that has not is reported separately, so that reading
+    /// it raises a demand instead of an undeclared-name error, and it hides
+    /// any parameter of the same name.
+    fn statement_view(&self, cell: VarId, limit: usize) -> (VarIdTyFrame, IndexMap<Substr, usize>) {
+        let typing = &self.cells[&cell];
+        let (_, params) = typing
+            .params
+            .as_ref()
+            .expect("parameters are typed before the body");
+        let mut view = params.clone();
+        let mut visible_untyped = IndexMap::new();
+        for (name, stmts) in &typing.lets {
+            let Some(&stmt) = stmts.iter().rev().find(|&&stmt| stmt < limit) else {
+                continue;
+            };
+            match &typing.stmts[stmt] {
+                Some(Statement::LetBinding(binding)) => {
+                    view.var_bindings
+                        .insert(name.clone(), (binding.metadata, binding.value.ty()));
+                }
+                Some(_) => unreachable!("`lets` indexes `let` statements"),
+                None => {
+                    view.var_bindings.swap_remove(name.as_str());
+                    visible_untyped.insert(name.clone(), stmt);
+                }
+            }
+        }
+        (view, visible_untyped)
+    }
+
+    /// Attempts one unit of `cell`, recording the result on success.
+    fn attempt_unit(&mut self, cell: VarId, unit: Unit) -> Result<(), Vec<Demand>> {
+        let decl = self.cells[&cell].decl;
+        match unit {
+            Unit::Params => {
+                let (args, frame) = self.attempt(
+                    Some(cell),
+                    VarIdTyFrame::default(),
+                    IndexMap::new(),
+                    |pass| {
+                        decl.args
+                            .iter()
+                            .map(|arg| pass.transform_arg_decl(arg))
+                            .collect::<Vec<_>>()
+                    },
+                )?;
+                self.cells[&cell].params = Some((args, frame));
+            }
+            Unit::Stmt(stmt) => {
+                let (view, visible_untyped) = self.statement_view(cell, stmt);
+                let statement = &decl.scope.stmts[stmt];
+                let (typed, _) = self.attempt(Some(cell), view, visible_untyped, |pass| {
+                    pass.transform_statement(statement)
+                })?;
+                self.cells[&cell].stmts[stmt] = Some(typed);
+            }
+            Unit::Tail => {
+                let (view, visible_untyped) = self.statement_view(cell, decl.scope.stmts.len());
+                let (typed, _) = self.attempt(Some(cell), view, visible_untyped, |pass| {
+                    decl.scope
+                        .tail
+                        .as_ref()
+                        .map(|tail| pass.transform_expr(tail))
+                })?;
+                self.cells[&cell].tail = Some(typed);
+            }
+        }
+        Ok(())
+    }
+
+    /// The next unit `goal` needs, or `None` once it is met.
+    fn next_unit(&self, goal: Goal) -> Option<Unit> {
+        let typing = &self.cells[&goal.cell];
+        if typing.params.is_none() {
+            return Some(Unit::Params);
+        }
+        match goal.target {
+            Some(stmt) => typing.stmts[stmt].is_none().then_some(Unit::Stmt(stmt)),
+            None => typing
+                .stmts
+                .iter()
+                .position(Option::is_none)
+                .map(Unit::Stmt)
+                .or_else(|| typing.tail.is_none().then_some(Unit::Tail)),
+        }
+    }
+
+    /// Works the goal stack until it is empty.
+    ///
+    /// The top goal is always the one worked on; a goal below it is suspended
+    /// on a demand that some goal above it will meet. An attempt that raises
+    /// demands pushes a goal for each and is retried when it is on top again.
+    fn run_goals(&mut self) {
+        while let Some(goal) = self.goals.last().copied() {
+            let Some(unit) = self.next_unit(goal) else {
+                self.goals.pop();
+                continue;
+            };
+            self.goals.last_mut().expect("just peeked").attempting = Some(unit);
+            if let Err(demands) = self.attempt_unit(goal.cell, unit) {
+                self.schedule(demands);
+            }
+        }
+    }
+
+    /// Pushes a goal for every demand that can be met, and poisons those that
+    /// cannot so that the retry does not raise them again.
+    fn schedule(&mut self, demands: Vec<Demand>) {
+        for demand in demands {
+            let typing = &self.cells[&demand.cell];
+            if typing.stmts[demand.stmt].is_some()
+                || self.poisoned.contains(&(demand.cell, demand.stmt))
+            {
+                continue;
+            }
+            // The field's statement is suspended somewhere below, so its type
+            // depends on the statement that just read it. A cell suspended in
+            // its parameter list cannot type any statement either.
+            let cyclic = self.goals.iter().any(|goal| {
+                goal.cell == demand.cell
+                    && (goal.attempting == Some(Unit::Params)
+                        || goal.attempting == Some(Unit::Stmt(demand.stmt)))
+            });
+            if cyclic {
+                let Statement::LetBinding(binding) = &typing.decl.scope.stmts[demand.stmt] else {
+                    unreachable!("demands name `let` statements")
+                };
+                self.errors.push(StaticError {
+                    span: self.span(demand.span),
+                    kind: StaticErrorKind::CyclicCellField {
+                        cell: typing.decl.name.name.to_string(),
+                        field: binding.name.name.to_string(),
+                    },
+                });
+                self.poisoned.insert((demand.cell, demand.stmt));
+                continue;
+            }
+            if self.goals.len() >= MAX_CELL_TYPING_DEPTH {
+                self.errors.push(StaticError {
+                    span: self.span(demand.span),
+                    kind: StaticErrorKind::CellTypingLimitExceeded {
+                        limit: MAX_CELL_TYPING_DEPTH,
+                    },
+                });
+                self.poisoned.insert((demand.cell, demand.stmt));
+                continue;
+            }
+            // Already wanted by a goal that is not attempting it yet.
+            if self
+                .goals
+                .iter()
+                .any(|goal| goal.cell == demand.cell && goal.target == Some(demand.stmt))
+            {
+                continue;
+            }
+            self.goals.push(Goal {
+                cell: demand.cell,
+                target: Some(demand.stmt),
+                attempting: None,
+            });
+        }
+    }
+
+    /// Assembles a cell whose every unit has been typed, and publishes its
+    /// fields for the cells typed after it.
+    fn finish_cell(&mut self, cell: VarId) -> CellDecl<Substr, VarIdTyMetadata> {
+        let mut typing = self.cells.swap_remove(&cell).expect("declared");
+        let decl = typing.decl;
+        let (args, _) = typing.params.take().expect("typed by the goal stack");
+        let stmts = typing
+            .stmts
+            .into_iter()
+            .map(|stmt| stmt.expect("typed by the goal stack"))
+            .collect::<Vec<_>>();
+        let tail = typing.tail.expect("typed by the goal stack");
+        let name = self.transform_ident(&decl.name);
+        if let Some(tail) = tail.as_ref() {
+            self.errors.push(StaticError {
+                span: self.span(tail.span()),
+                kind: StaticErrorKind::CellWithTailExpr,
+            });
+        }
+        let fields = stmts
+            .iter()
+            .filter_map(|stmt| match stmt {
+                Statement::LetBinding(binding) => {
+                    Some((binding.name.name.to_string(), binding.value.ty()))
+                }
+                _ => None,
+            })
+            .collect();
+        self.finished_cell_fields.insert(cell, fields);
+        let scope = Scope {
+            scope_order: decl.scope.scope_order,
+            span: decl.scope.span,
+            metadata: tail.as_ref().map_or(Ty::Nil, Expr::ty),
+            stmts,
+            tail,
+        };
+        CellDecl {
+            name,
+            args,
+            scope,
+            span: decl.span,
+            metadata: (self.ast.path.clone(), cell),
+        }
+    }
+
+    /// Records that the current attempt read the field declared by statement
+    /// `stmt` of `cell` before it was typed.
+    fn demand(&mut self, cell: VarId, stmt: usize, span: cfgrammar::Span) {
+        if self.poisoned.contains(&(cell, stmt)) {
+            return;
+        }
+        if let Some(attempt) = self.attempt.as_mut() {
+            attempt.demands.push(Demand { cell, stmt, span });
+        }
+    }
+
+    /// Whether an unresolved `name` is a top-level `let` of the cell being
+    /// typed that is in scope but not yet typed. If so, the read is a demand
+    /// and the caller types it `Unknown` without reporting anything.
+    fn demand_local(&mut self, name: &str, span: cfgrammar::Span) -> bool {
+        let Some(attempt) = self.attempt.as_ref() else {
+            return false;
+        };
+        let (Some(cell), Some(&stmt)) = (attempt.cell, attempt.visible_untyped.get(name)) else {
+            return false;
+        };
+        self.demand(cell, stmt, span);
+        true
+    }
+
+    /// Whether an instance of `cell` would answer `field`.
+    ///
+    /// A cell's public fields are its top-level `let` bindings plus
+    /// [`RESERVED_CELL_FIELDS`]; a GDS-backed cell publishes its geometry at
+    /// execution time, so it answers anything.
+    fn cell_declares_field(&self, cell: &CellTy, field: &str) -> bool {
+        if cell.dynamic_fields || RESERVED_CELL_FIELDS.contains(&field) {
+            return true;
+        }
+        let Some(def) = cell.def else {
+            return false;
+        };
+        if let Some(fields) = self.finished_cell_fields.get(&def) {
+            fields.contains_key(field)
+        } else if let Some(typing) = self.cells.get(&def) {
+            typing.lets.contains_key(field)
+        } else {
+            self.cell_fields
+                .get(&def)
+                .is_some_and(|fields| fields.contains_key(field))
+        }
+    }
+
+    /// The type of `field` read from an instance of `cell`, whose type is
+    /// `base_ty`.
+    ///
+    /// A field of a cell of this module whose statement has not been typed yet
+    /// is a demand: the read types `Unknown` for now and the statement making
+    /// it is retried once the field is typed.
+    fn inst_field_ty(
+        &mut self,
+        cell: &CellTy,
+        field: &Ident<Substr, VarIdTyMetadata>,
+        base_ty: &Ty,
+    ) -> Ty {
+        let name = field.name.as_str();
+        if RESERVED_CELL_FIELDS.contains(&name) {
+            return Ty::Float;
+        }
+        if cell.dynamic_fields {
+            return Ty::Any;
+        }
+        let Some(def) = cell.def else {
+            return Ty::Any;
+        };
+        if let Some(fields) = self.finished_cell_fields.get(&def) {
+            return match fields.get(name) {
+                Some(ty) => ty.clone(),
+                None => self.no_field_on_ty(field, base_ty.clone()),
+            };
+        }
+        if let Some(typing) = self.cells.get(&def) {
+            // The field is the last `let` of that name.
+            let Some(&stmt) = typing.lets.get(name).and_then(|stmts| stmts.last()) else {
+                return self.no_field_on_ty(field, base_ty.clone());
+            };
+            return match &typing.stmts[stmt] {
+                Some(Statement::LetBinding(binding)) => binding.value.ty(),
+                Some(_) => unreachable!("`lets` indexes `let` statements"),
+                None => {
+                    self.demand(def, stmt, field.span);
+                    Ty::Unknown
+                }
+            };
+        }
+        match self
+            .cell_fields
+            .get(&def)
+            .and_then(|fields| fields.get(name))
+        {
+            Some(ty) => ty.clone(),
+            None => self.no_field_on_ty(field, base_ty.clone()),
+        }
     }
 
     /// Reports every top-level declaration whose name an earlier declaration
@@ -2355,14 +2868,13 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }
         } else {
+            if is_local && self.demand_local(name, call_span) {
+                return (None, Ty::Unknown);
+            }
             self.errors.push(StaticError {
                 span: self.span(call_span),
-                kind: if is_local {
-                    self.unresolved_local_name_error(name, call_span)
-                } else {
-                    StaticErrorKind::UndeclaredVar {
-                        name: name.to_owned(),
-                    }
+                kind: StaticErrorKind::UndeclaredVar {
+                    name: name.to_owned(),
                 },
             });
             (None, Ty::Unknown)
@@ -2429,12 +2941,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         // Parser grammar ensures paths cannot be empty.
         assert!(!input.path.is_empty());
         if input.path.len() == 1 {
-            if let Some((varid, ty)) = self.lookup(&input.path[0].name) {
+            let name = &input.path[0].name;
+            if let Some((varid, ty)) = self.lookup(name) {
                 (Some(varid), ty)
+            } else if self.demand_local(name, input.span) {
+                (None, Ty::Unknown)
             } else {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
-                    kind: self.unresolved_local_name_error(&input.path[0].name, input.span),
+                    kind: StaticErrorKind::UndeclaredVar {
+                        name: name.to_string(),
+                    },
                 });
                 (None, Ty::Unknown)
             }
@@ -2598,12 +3115,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let Some((_, ty)) = lookup else {
             self.errors.push(StaticError {
                 span: self.span(path.span),
-                kind: if path.path.len() == 1 {
-                    self.unresolved_local_name_error(name, path.span)
-                } else {
-                    StaticErrorKind::UndeclaredVar {
-                        name: name.to_string(),
-                    }
+                kind: StaticErrorKind::UndeclaredVar {
+                    name: name.to_string(),
                 },
             });
             return Ty::Unknown;
@@ -2667,12 +3180,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     fn dispatch_cell_decl(
         &mut self,
         _input: &CellDecl<Substr, Self::InputMetadata>,
-        name: &Ident<Substr, Self::OutputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
         _args: &[ArgDecl<Substr, Self::OutputMetadata>],
         _scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CellDecl {
-        // TODO: Argument checks
-        (self.ast.path.clone(), self.lookup(&name.name).unwrap().0)
+        // Cells are typed one unit at a time by the goal stack and assembled
+        // by `finish_cell`, never by `transform_cell_decl`.
+        unreachable!()
     }
 
     fn dispatch_fn_decl(
@@ -2720,88 +3234,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             args,
             return_ty,
             scope,
-            span: input.span,
-            metadata,
-        }
-    }
-
-    fn transform_cell_decl(
-        &mut self,
-        input: &CellDecl<Substr, Self::InputMetadata>,
-    ) -> CellDecl<Substr, Self::OutputMetadata> {
-        if BUILTINS.contains(&input.name.name.as_str()) {
-            self.errors.push(StaticError {
-                span: self.span(input.name.span),
-                kind: StaticErrorKind::RedeclarationOfBuiltin,
-            });
-        }
-        self.check_params(&input.args);
-        self.enter_scope(&input.scope);
-        let args: Vec<_> = input
-            .args
-            .iter()
-            .map(|arg| self.transform_arg_decl(arg))
-            .collect();
-        let scope = self.transform_scope_contents(&input.scope);
-        self.exit_scope(&input.scope, &scope);
-        if let Some(tail) = scope.tail.as_ref() {
-            self.errors.push(StaticError {
-                span: self.span(tail.span()),
-                kind: StaticErrorKind::CellWithTailExpr,
-            });
-        }
-        let data = scope
-            .stmts
-            .iter()
-            .filter_map(|stmt| {
-                if let Statement::LetBinding(lt) = stmt {
-                    if RESERVED_CELL_FIELDS.contains(&lt.name.name.as_str()) {
-                        self.errors.push(StaticError {
-                            span: self.span(lt.name.span),
-                            kind: StaticErrorKind::ReservedCellField {
-                                name: lt.name.name.to_string(),
-                            },
-                        });
-                    }
-                    Some((lt.name.name.to_string(), lt.value.ty()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let dynamic_fields = self
-            .ast
-            .ast
-            .decls
-            .iter()
-            .take(self.ast.generated_declarations)
-            .any(|decl| {
-                matches!(decl, Decl::Cell(cell) if cell.span == input.span && cell.name.name == input.name.name)
-            });
-        // The cell's type embeds its own id so that a field access on an
-        // instance can be traced back to the declaring cell. A GDS-backed cell
-        // has no declared fields to trace back to, so it records none and
-        // field accesses on it fall through to the builtin geometry fields.
-        let cell_id = self.alloc_id();
-        let ty = Ty::CellFn(Box::new(CellFnTy {
-            sig: args
-                .iter()
-                .map(|arg| (arg, arg.metadata.1.clone()))
-                .collect(),
-            cell: Arc::new(CellTy {
-                name: self.qualified_name(&input.name.name),
-                data,
-                dynamic_fields,
-                def: (!dynamic_fields).then_some(cell_id),
-            }),
-        }));
-        self.bind(&input.name.name, cell_id, ty);
-        let name = self.transform_ident(&input.name);
-        let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
-        CellDecl {
-            name,
-            scope,
-            args,
             span: input.span,
             metadata,
         }
@@ -3037,16 +3469,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
-            Ty::Inst(ref c) => match field.name.as_str() {
-                name if RESERVED_CELL_FIELDS.contains(&name) => Ty::Float,
-                name => c.data.get(name).cloned().unwrap_or_else(|| {
-                    if c.dynamic_fields {
-                        Ty::Any
-                    } else {
-                        self.no_field_on_ty(field, base_ty.clone())
-                    }
-                }),
-            },
+            Ty::Inst(ref c) => self.inst_field_ty(c, field, &base_ty),
             // A cell's coordinates are only determined relative to a
             // placement, so reading its geometry before `inst(...)` is
             // meaningless -- and the evaluator already refuses it. Saying so
@@ -3056,7 +3479,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             // Only when the field exists, though: telling someone who
             // misspelled a field to place the cell first is advice that
             // cannot help, so an unknown name still gets the no-field error.
-            Ty::Cell(ref c) if cell_has_field(c, field.name.as_str()) => {
+            Ty::Cell(ref c) if self.cell_declares_field(c, field.name.as_str()) => {
                 self.errors.push(StaticError {
                     span: self.span(field.span),
                     kind: StaticErrorKind::CellFieldBeforePlacement {
@@ -3066,7 +3489,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
                 Ty::Unknown
             }
-            Ty::CellFn(ref c) if cell_has_field(&c.cell, &field.name) => {
+            Ty::CellFn(ref c) if self.cell_declares_field(&c.cell, &field.name) => {
                 self.errors.push(StaticError {
                     span: self.span(field.span),
                     kind: StaticErrorKind::CellFnFieldAccess {
@@ -4662,6 +5085,18 @@ impl<'a> ExecPass<'a> {
             .unwrap_or_else(|| self.alloc_id());
         if self.entry_cell_var == Some(cell) {
             self.entry_cell = Some(cell_id);
+        }
+        // A state for this id means the same cell, with the same arguments, is
+        // still executing further up the stack: a cell that instantiates
+        // itself with its own arguments. Waiting for the depth limit would
+        // only report it later, with a less specific message.
+        if self.cell_states.contains_key(&cell_id) {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::RecursiveInstantiation { cell: cell_name },
+            });
+            return Err(());
         }
         self.partial_cells.push_back(cell_id);
         assert!(

@@ -328,12 +328,8 @@ impl Builder {
                     out.insert(*var);
                 }
             }
-            // Stop at the declaring cell. `CellTy::data` is an `Arc`-shared DAG
-            // of every field's type, including instantiated sub-cells, so
-            // descending it is exponential in hierarchy depth -- the exact
-            // blow-up `CellFnTy::cell`'s sharing exists to prevent. The
-            // declaring cell is itself an item whose own fingerprint covers its
-            // fields.
+            // A cell type is nominal: it names the declaring cell, which is
+            // itself an item whose own fingerprint covers its fields.
             Ty::Cell(cell) | Ty::Inst(cell) => {
                 if let Some(def) = cell.def {
                     out.insert(def);

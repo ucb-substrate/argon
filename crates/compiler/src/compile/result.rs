@@ -156,11 +156,20 @@ pub enum StaticErrorKind {
     /// An identifier was used without being declared in the current scope.
     #[error("`{name}` is not declared in this scope")]
     UndeclaredVar { name: String },
-    /// A cell was referenced before its declaration was processed.
+    /// The type of a cell field depends on itself.
+    ///
+    /// Cells may refer to one another in any order, and a field's type is
+    /// computed on demand, so the only reference that cannot be resolved is
+    /// one that leads back to the field being typed: `a.f` reads `b.g`, which
+    /// reads `a.f`. Reported at the reference that closes the cycle.
     #[error(
-        "cannot use `{name}` before its declaration; move the `cell {name} ...` declaration above this use"
+        "the type of `{cell}.{field}` depends on itself, directly or through the fields of other cells"
     )]
-    UseBeforeDeclaration { name: String },
+    CyclicCellField { cell: String, field: String },
+    /// Typing a cell field required more nested field types than the compiler
+    /// allows.
+    #[error("cell field types depend on each other more than {limit} levels deep")]
+    CellTypingLimitExceeded { limit: usize },
     /// A value of the given type cannot be called.
     #[error("cannot call type {0}")]
     CannotCall(String),
@@ -310,6 +319,10 @@ pub enum ExecErrorKind {
     /// Function inlining or cell instantiation nested too deeply.
     #[error("recursion limit of {limit} exceeded")]
     RecursionLimitExceeded { limit: u32 },
+    /// A cell instantiated itself with the arguments it was itself called
+    /// with, which no depth limit would end.
+    #[error("cell `{cell}` instantiates itself with its own arguments")]
+    RecursiveInstantiation { cell: String },
     /// A shape, sequence, or iteration count exceeded a compiler limit.
     #[error("{what} exceeds the maximum of {limit}")]
     LimitExceeded { what: String, limit: usize },

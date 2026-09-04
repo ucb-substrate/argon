@@ -209,6 +209,10 @@ pub struct NavIndex {
     scope_bindings: HashMap<PathBuf, Vec<ScopeBinding>>,
     expression_types: HashMap<PathBuf, Vec<(cfgrammar::Span, Ty)>>,
     hover_details: HashMap<PathBuf, Vec<(cfgrammar::Span, String)>>,
+    /// Cell `VarId` to the name and type of each of its fields, in declaration
+    /// order. Cell types are nominal and carry no fields of their own, so an
+    /// instance's completions come from the declaring cell's `let` bindings.
+    cell_field_types: HashMap<VarId, Vec<(String, Ty)>>,
 }
 
 impl NavIndex {
@@ -434,7 +438,71 @@ impl NavIndex {
                 })
                 .map(|(_, ty)| ty)
         });
-        ty.map(field_completions).unwrap_or_default()
+        ty.map(|ty| self.field_completions(ty)).unwrap_or_default()
+    }
+
+    /// Completions for the fields of a value of type `ty`.
+    fn field_completions(&self, ty: &Ty) -> Vec<CompletionCandidate> {
+        let fields: Vec<(String, Ty)> = match ty {
+            Ty::Rect => [
+                ("x0", Ty::Float),
+                ("x1", Ty::Float),
+                ("y0", Ty::Float),
+                ("y1", Ty::Float),
+                ("w", Ty::Float),
+                ("h", Ty::Float),
+                ("layer", Ty::String),
+            ]
+            .into_iter()
+            .map(|(name, ty)| (name.to_owned(), ty))
+            .collect(),
+            Ty::Polygon => [
+                ("points", Ty::Seq(Box::new(Ty::Point))),
+                ("layer", Ty::String),
+            ]
+            .into_iter()
+            .map(|(name, ty)| (name.to_owned(), ty))
+            .collect(),
+            Ty::Path => [
+                ("points", Ty::Seq(Box::new(Ty::Point))),
+                ("layer", Ty::String),
+                ("width", Ty::Float),
+                ("begin_extension", Ty::Float),
+                ("end_extension", Ty::Float),
+            ]
+            .into_iter()
+            .map(|(name, ty)| (name.to_owned(), ty))
+            .collect(),
+            Ty::Point => [("x", Ty::Float), ("y", Ty::Float)]
+                .into_iter()
+                .map(|(name, ty)| (name.to_owned(), ty))
+                .collect(),
+            Ty::Inst(cell) => RESERVED_CELL_FIELDS
+                .into_iter()
+                .map(|name| (name.to_owned(), Ty::Float))
+                .chain(
+                    cell.def
+                        .and_then(|cell| self.cell_field_types.get(&cell))
+                        .into_iter()
+                        .flatten()
+                        .cloned(),
+                )
+                .collect(),
+            Ty::Tuple(items) => items
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, ty)| (index.to_string(), ty))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut fields = fields
+            .into_iter()
+            .map(|(name, ty)| field_candidate(name, &ty))
+            .collect::<Vec<_>>();
+        fields.sort_by(|left, right| left.label.cmp(&right.label));
+        fields.dedup_by(|left, right| left.label == right.label);
+        fields
     }
 
     /// Items exported by a module, or variants of an enum, named by a path
@@ -793,67 +861,6 @@ fn field_candidate(name: impl Into<String>, ty: &Ty) -> CompletionCandidate {
     }
 }
 
-fn field_completions(ty: &Ty) -> Vec<CompletionCandidate> {
-    let fields: Vec<(String, Ty)> = match ty {
-        Ty::Rect => [
-            ("x0", Ty::Float),
-            ("x1", Ty::Float),
-            ("y0", Ty::Float),
-            ("y1", Ty::Float),
-            ("w", Ty::Float),
-            ("h", Ty::Float),
-            ("layer", Ty::String),
-        ]
-        .into_iter()
-        .map(|(name, ty)| (name.to_owned(), ty))
-        .collect(),
-        Ty::Polygon => [
-            ("points", Ty::Seq(Box::new(Ty::Point))),
-            ("layer", Ty::String),
-        ]
-        .into_iter()
-        .map(|(name, ty)| (name.to_owned(), ty))
-        .collect(),
-        Ty::Path => [
-            ("points", Ty::Seq(Box::new(Ty::Point))),
-            ("layer", Ty::String),
-            ("width", Ty::Float),
-            ("begin_extension", Ty::Float),
-            ("end_extension", Ty::Float),
-        ]
-        .into_iter()
-        .map(|(name, ty)| (name.to_owned(), ty))
-        .collect(),
-        Ty::Point => [("x", Ty::Float), ("y", Ty::Float)]
-            .into_iter()
-            .map(|(name, ty)| (name.to_owned(), ty))
-            .collect(),
-        Ty::Inst(cell) => RESERVED_CELL_FIELDS
-            .into_iter()
-            .map(|name| (name.to_owned(), Ty::Float))
-            .chain(
-                cell.data
-                    .iter()
-                    .map(|(name, ty)| (name.clone(), ty.clone())),
-            )
-            .collect(),
-        Ty::Tuple(items) => items
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, ty)| (index.to_string(), ty))
-            .collect(),
-        _ => Vec::new(),
-    };
-    let mut fields = fields
-        .into_iter()
-        .map(|(name, ty)| field_candidate(name, &ty))
-        .collect::<Vec<_>>();
-    fields.sort_by(|left, right| left.label.cmp(&right.label));
-    fields.dedup_by(|left, right| left.label == right.label);
-    fields
-}
-
 fn declared_signature(
     keyword: &str,
     name: &str,
@@ -995,18 +1002,27 @@ impl<'a> Builder<'a> {
                         }
                     }
                     Decl::Cell(decl) => {
-                        let fields = decl
+                        let bindings = decl
                             .scope
                             .stmts
                             .iter()
                             .filter_map(|stmt| match stmt {
-                                Statement::LetBinding(binding) => {
-                                    Some((binding.name.name.to_string(), binding.metadata))
-                                }
+                                Statement::LetBinding(binding) => Some(binding),
                                 _ => None,
                             })
+                            .collect::<Vec<_>>();
+                        let fields = bindings
+                            .iter()
+                            .map(|binding| (binding.name.name.to_string(), binding.metadata))
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
+                        let field_types = bindings
+                            .iter()
+                            .map(|binding| (binding.name.name.to_string(), binding.value.ty()))
+                            .collect();
+                        self.index
+                            .cell_field_types
+                            .insert(decl.metadata.1, field_types);
                         self.params.insert(decl.metadata.1, params(&decl.args));
                         self.index
                             .module_items
@@ -1947,24 +1963,43 @@ cell top() {
         );
     }
 
-    /// Cells are not hoisted: `VarIdTyPass` binds a cell only after walking its
-    /// body, so using one before its declaration is a `UseBeforeDeclaration`
-    /// error (see `examples/cell_out_of_order`). Navigation reports what the
-    /// compiler resolved, so there is deliberately nothing to jump to.
+    /// Cell types are bound before any body is walked, so a cell used before
+    /// its declaration resolves like a function does (see
+    /// `examples/cell_out_of_order`), and so do the fields of its instances.
     #[test]
-    fn a_cell_used_before_its_declaration_is_unresolved() {
+    fn a_cell_used_before_its_declaration_resolves() {
         check(
             r#"
 cell top() {
     let c = lat$0er();
     let i = inst(c);
+    eq(i.r$0.x0, 0.);
 }
 
 cell later() {
     let r = rect("met1");
 }
 "#,
-            &["Unresolved"],
+            &["later#1", "r#3"],
+        );
+    }
+
+    /// A recursive cell reads the fields of an instance of itself; they
+    /// resolve to the `let`s of the enclosing declaration.
+    #[test]
+    fn a_recursive_cell_resolves_its_own_fields() {
+        check(
+            r#"
+cell tree(n: Int) {
+    let leaf = rect("met1", x0=0., y0=0., w=10., h=10.);
+    if n > 0 {
+        let child = inst(tr$0ee(n - 1));
+        eq(child.le$0af.x0, leaf.x1);
+    } else {
+    };
+}
+"#,
+            &["tree#0", "leaf#0"],
         );
     }
 
