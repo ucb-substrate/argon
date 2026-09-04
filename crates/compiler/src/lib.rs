@@ -1962,6 +1962,75 @@ mod tests {
     }
 
     #[test]
+    fn top_level_declarations_share_one_namespace() {
+        // `bind` overwrote without checking, so `struct Mode` after
+        // `enum Mode` quietly won, `struct F` and `fn F` resolved to whichever
+        // kind the declaration passes visit last, and two `struct S` kept only
+        // the second.
+        let duplicates = |source: &str| {
+            static_errors(source)
+                .into_iter()
+                .filter(|error| matches!(error.kind, StaticErrorKind::DuplicateNameDeclaration))
+                .collect::<Vec<_>>()
+        };
+        for source in [
+            "enum Mode { A, B }\nstruct Mode { a: Int, }\n",
+            "struct Mode { a: Int, }\nenum Mode { A, B }\n",
+            "struct F { a: Int, }\nfn F() -> Int { 1 }\n",
+            "fn F() -> Int { 1 }\nstruct F { a: Int, }\n",
+            "struct S { a: Int, }\nstruct S { b: Float, }\n",
+            "enum E { A }\nenum E { B }\n",
+            "fn f() -> Int { 1 }\nfn f() -> Float { 1. }\n",
+            "cell top() {}\ncell top() {}\n",
+            "fn top() -> Int { 1 }\ncell top() {}\n",
+            "cell top() {}\nenum top { A }\n",
+            // An import takes a name like any declaration does.
+            "use std::max;\nfn max(a: Float) -> Float { a }\n",
+            "use std::max;\nuse std::min as max;\n",
+        ] {
+            let errors = duplicates(source);
+            assert_eq!(errors.len(), 1, "{source:?}: {errors:?}");
+        }
+
+        // The later declaration is the one reported, at its name.
+        let source = "enum Mode { A, B }\nstruct Mode { a: Int, }\n";
+        let errors = duplicates(source);
+        let [error] = errors.as_slice() else {
+            unreachable!("checked above")
+        };
+        let name = source.rfind("Mode").unwrap();
+        assert_eq!(error.span.span.start(), name);
+        assert_eq!(error.span.span.end(), name + "Mode".len());
+
+        // Every repeat is reported, not just the first.
+        assert_eq!(
+            duplicates("cell a() {}\ncell a() {}\ncell a() {}\n").len(),
+            2
+        );
+
+        // Distinct names in any mix of kinds are fine, and a name may be
+        // reused across modules: `std` declares `max` too.
+        assert!(
+            duplicates(
+                "enum A { X }\nstruct B { a: A, }\nfn c(b: B) -> A { b.a }\ncell d() {}\n\
+                 fn max(a: Float) -> Float { a }\n"
+            )
+            .is_empty()
+        );
+
+        // Modules live in their own namespace, so `mod m;` and `fn m` coexist.
+        let root = parse_source_text(
+            "mod m;\nfn m() -> Int { m::h() }\n",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let m = parse_source_text("fn h() -> Int { 2 }\n", PathBuf::from("/virtual/m.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["m".to_owned()], m)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+    }
+
+    #[test]
     fn argon_library() {
         let o = parse_workspace_with_std(ARGON_LIBRARY);
         assert!(o.static_errors().is_empty());

@@ -16,7 +16,10 @@ pub struct StaticError {
 pub enum StaticErrorKind {
     /// Multiple declarations with the same name.
     ///
-    /// For example, two cells named `my_cell`.
+    /// For example, two cells named `my_cell`. Top-level cells, functions,
+    /// structs, enums, and imports share one namespace per module, so
+    /// `struct Mode` after `enum Mode` is reported too. Also covers repeated
+    /// parameter names, enum variants, and struct fields.
     #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
     /// Attempted to declare an object with the same name as a built-in object.
