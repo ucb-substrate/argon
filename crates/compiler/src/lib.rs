@@ -228,11 +228,8 @@ mod tests {
     const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
     const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
     const ARGON_STRUCTS: &str = concatcp!(EXAMPLES_DIR, "/structs/lib.ar");
-<<<<<<< HEAD
     const ARGON_RECURSIVE_CELL: &str = concatcp!(EXAMPLES_DIR, "/recursive_cell/lib.ar");
-=======
     const ARGON_SHAPE_CELL_ARGS: &str = concatcp!(EXAMPLES_DIR, "/shape_cell_args/lib.ar");
->>>>>>> 8fbeb74 (feat(lang): support rects/tuples/etc. as cell arguments (#256))
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -1344,24 +1341,6 @@ mod tests {
             digest(ARGON_HIERARCHY),
             "reordering declarations changed the layout"
         );
-    }
-
-    /// Compiles `cell` of a one-file workspace with the standard library.
-    fn compile_source(source: &str, cell: &str, args: Vec<CellArg>) -> CompileOutput {
-        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
-        compile(
-            &ast,
-            CompileInput {
-                cell: &[cell],
-                args,
-            },
-        )
     }
 
     /// The drawn rectangles across every compiled cell.
