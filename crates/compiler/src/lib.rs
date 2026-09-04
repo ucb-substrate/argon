@@ -166,6 +166,19 @@ mod tests {
             &WorkspaceConfig::default().with_tech(Some(PathBuf::from(SKY130_TECH))),
         )
     }
+
+    /// Compiles `cell` from a one-file workspace without the standard library.
+    fn compile_source(source: &str, cell: &str, args: Vec<CellArg>) -> CompileOutput {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        compile(
+            &ast,
+            CompileInput {
+                cell: &[cell],
+                args,
+            },
+        )
+    }
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
@@ -215,7 +228,11 @@ mod tests {
     const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
     const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
     const ARGON_STRUCTS: &str = concatcp!(EXAMPLES_DIR, "/structs/lib.ar");
+<<<<<<< HEAD
     const ARGON_RECURSIVE_CELL: &str = concatcp!(EXAMPLES_DIR, "/recursive_cell/lib.ar");
+=======
+    const ARGON_SHAPE_CELL_ARGS: &str = concatcp!(EXAMPLES_DIR, "/shape_cell_args/lib.ar");
+>>>>>>> 8fbeb74 (feat(lang): support rects/tuples/etc. as cell arguments (#256))
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -2080,6 +2097,434 @@ mod tests {
                 .any(|e| matches!(e.kind, ExecErrorKind::InvalidCellArgumentType { .. })),
             "{:?}",
             errors.errors
+        );
+    }
+
+    /// Shapes are passed to cells by value: the caller's solved coordinates
+    /// arrive as constants, and `!` draws the ones that were drawn in the
+    /// caller.
+    #[test]
+    fn argon_shape_cell_args() {
+        let o = parse_workspace_with_std(ARGON_SHAPE_CELL_ARGS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        assert_eq!(cells.cells.len(), 3);
+        let mut insts: Vec<_> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .collect();
+        insts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let [vias, outline] = insts.as_slice() else {
+            panic!("expected two instances, got {}", insts.len());
+        };
+
+        let via_array = &cells.cells[&vias.cell];
+        let rects = |cell: &crate::compile::CompiledCell| {
+            cell.objects
+                .values()
+                .filter_map(|object| object.get_rect())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // The 80 x 40 overlap arrives as construction geometry, untranslated.
+        let region = rects(via_array)
+            .into_iter()
+            .find(|rect| rect.construction && relative_eq!(rect.x0.0, 10.))
+            .expect("the region is construction geometry");
+        assert_eq!(region.layer, None);
+        assert_relative_eq!(region.y0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(region.x1.0, 90., epsilon = EPSILON);
+        assert_relative_eq!(region.y1.0, 45., epsilon = EPSILON);
+        // Four columns and two rows of vias, centered in the region.
+        let drawn: Vec<_> = rects(via_array)
+            .into_iter()
+            .filter(|rect| !rect.construction)
+            .collect();
+        assert_eq!(drawn.len(), 8);
+        assert!(
+            drawn
+                .iter()
+                .all(|rect| rect.layer.as_deref() == Some("via1"))
+        );
+        let x0 = drawn.iter().map(|r| r.x0.0).fold(f64::INFINITY, f64::min);
+        let x1 = drawn
+            .iter()
+            .map(|r| r.x1.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let y0 = drawn.iter().map(|r| r.y0.0).fold(f64::INFINITY, f64::min);
+        let y1 = drawn
+            .iter()
+            .map(|r| r.y1.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_relative_eq!(x0, 15., epsilon = EPSILON);
+        assert_relative_eq!(x1, 85., epsilon = EPSILON);
+        assert_relative_eq!(y0, 10., epsilon = EPSILON);
+        assert_relative_eq!(y1, 40., epsilon = EPSILON);
+
+        let outline = &cells.cells[&outline.cell];
+        // `shape!` draws the polygon on its layer.
+        let polygon = outline
+            .objects
+            .values()
+            .find_map(|object| object.get_polygon())
+            .expect("outline holds the polygon");
+        assert!(!polygon.construction);
+        assert_eq!(polygon.layer, "met1");
+        assert_eq!(polygon.points.len(), 3);
+        assert_relative_eq!(polygon.points[2].0.0, 20., epsilon = EPSILON);
+        assert_relative_eq!(polygon.points[2].1.0, 30., epsilon = EPSILON);
+        // `guide!` leaves the crect undrawn.
+        let rects = rects(outline);
+        let guide = rects
+            .iter()
+            .find(|rect| rect.construction)
+            .expect("the guide is construction geometry");
+        assert_eq!(guide.layer, None);
+        assert_relative_eq!(guide.x0.0, 10., epsilon = EPSILON);
+        // The marker sits on the point read out of the polygon.
+        let marker = rects
+            .iter()
+            .find(|rect| !rect.construction)
+            .expect("the marker is drawn");
+        assert_eq!(marker.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(marker.x0.0, 20., epsilon = EPSILON);
+        assert_relative_eq!(marker.y0.0, 30., epsilon = EPSILON);
+        assert_relative_eq!(marker.x1.0, 25., epsilon = EPSILON);
+        assert_relative_eq!(marker.y1.0, 35., epsilon = EPSILON);
+    }
+
+    /// Shapes nested in sequences and structs, and proxies read out of an
+    /// instance, all arrive as construction geometry; `!` redraws exactly the
+    /// ones that were drawn in the caller.
+    #[test]
+    fn nested_and_proxied_shape_cell_arguments() {
+        let source = r#"
+struct Pair {
+    a: Rect,
+    b: Point,
+}
+
+cell leaf() {
+    let m = rect("met1", x0=0., y0=0., w=10., h=10.);
+}
+
+cell child(rs: [Rect], p: Pair, proxied: Rect) {
+    let first = head(rs)!;
+    let second = head(tail(rs))!;
+    let redrawn = proxied!;
+    let m = rect("met2", x0=p.b.x, y0=p.b.y, w=p.a.w, h=p.a.h);
+}
+
+cell top() {
+    let r1 = rect("met1", x0=0., y0=0., w=10., h=10.);
+    let r2 = crect(layer="via1", x0=50., y0=50., w=5., h=5.);
+    let poly = polygon("met1", 3, x0=0., y0=0., x1=4., y1=0., x2=2., y2=3.);
+    let l = inst(leaf(), x=100., y=0.);
+    let c = inst(child(cons(r1, cons(r2, [])), Pair { a: r2, b: poly.points[2] }, l.m), x=0., y=0.);
+}
+"#;
+        let cells = compile_source(source, "top", Vec::new()).unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        let child = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .find(|inst| relative_eq!(inst.x, 0.))
+            .expect("child instance");
+        let child = &cells.cells[&child.cell];
+        let rects: Vec<_> = child
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .collect();
+        let at = |x0: f64, y0: f64| {
+            rects
+                .iter()
+                .filter(|rect| relative_eq!(rect.x0.0, x0) && relative_eq!(rect.y0.0, y0))
+                .collect::<Vec<_>>()
+        };
+        // `r1` was layout in `top`, so `first!` draws it here.
+        let [first] = at(0., 0.)[..] else {
+            panic!("expected one rect at the origin");
+        };
+        assert!(!first.construction);
+        assert_eq!(first.layer.as_deref(), Some("met1"));
+        // `r2` is a crect. It arrives twice, once in the sequence and once in
+        // the struct, and `second!` draws neither.
+        let second = at(50., 50.);
+        assert_eq!(second.len(), 2);
+        assert!(
+            second
+                .iter()
+                .all(|rect| rect.construction && rect.layer.as_deref() == Some("via1"))
+        );
+        // `l.m` is a proxy of drawn geometry, in `top`'s frame, so `!` redraws
+        // it where `top` sees it.
+        let [redrawn] = at(100., 0.)[..] else {
+            panic!("expected one rect at the proxy's position");
+        };
+        assert!(!redrawn.construction);
+        assert_eq!(redrawn.layer.as_deref(), Some("met1"));
+        assert_relative_eq!(redrawn.x1.0, 110., epsilon = EPSILON);
+        // The struct's point and rect were read as constants.
+        let [m] = at(2., 3.)[..] else {
+            panic!("expected one rect at the polygon's vertex");
+        };
+        assert_eq!(m.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(m.x1.0, 7., epsilon = EPSILON);
+        assert_relative_eq!(m.y1.0, 8., epsilon = EPSILON);
+    }
+
+    /// Shape values passed through the positional cell API are checked against
+    /// the declared parameter type, and name the cell like every other
+    /// argument.
+    #[test]
+    fn shape_cell_arguments_are_checked_and_name_the_cell() {
+        let ast = parse_workspace_with_std(ARGON_SHAPE_CELL_ARGS).ast();
+        let region = |x0: f64| CellArg::Rect {
+            layer: None,
+            drawable: false,
+            x0,
+            y0: 0.,
+            x1: x0 + 90.,
+            y1: 40.,
+        };
+        let via_array = |args: Vec<CellArg>| {
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["via_array"],
+                    args,
+                },
+            )
+        };
+        let cells =
+            via_array(vec![region(0.), CellArg::Float(10.), CellArg::Float(20.)]).unwrap_valid();
+        // Five columns and two rows fit a 90 x 40 region.
+        let drawn = cells.cells[&cells.top]
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .filter(|rect| !rect.construction)
+            .count();
+        assert_eq!(drawn, 10);
+        // The same shape names the same cell; a shape elsewhere is a different
+        // argument, so it is a different cell.
+        let same =
+            via_array(vec![region(0.), CellArg::Float(10.), CellArg::Float(20.)]).unwrap_valid();
+        assert_eq!(cells.top, same.top);
+        let moved =
+            via_array(vec![region(100.), CellArg::Float(10.), CellArg::Float(20.)]).unwrap_valid();
+        assert_ne!(cells.top, moved.top);
+
+        let mismatch = |args: Vec<CellArg>, index: usize, expected: &str, found: &str| {
+            let errors = via_array(args).unwrap_exec_errors().errors;
+            assert!(
+                errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ExecErrorKind::InvalidCellArgumentType { index: i, expected: e, found: f }
+                        if *i == index && e == expected && f == found
+                )),
+                "{errors:?}"
+            );
+        };
+        mismatch(
+            vec![CellArg::Float(1.), CellArg::Float(10.), CellArg::Float(20.)],
+            1,
+            "Rect",
+            "Float",
+        );
+        mismatch(
+            vec![region(0.), region(0.), CellArg::Float(20.)],
+            2,
+            "Float",
+            "Rect",
+        );
+    }
+
+    /// A shape built in a cell invocation, as `arc run --cell` and the GUI
+    /// open-cell command supply it. The invocation's own geometry is not part
+    /// of the output.
+    #[test]
+    fn argon_shape_cell_invocation() {
+        let mut ast = parse_workspace_with_std(ARGON_SHAPE_CELL_ARGS).ast();
+        let invocation = crate::parse::splice_cell_invocation(
+            &mut ast,
+            "via_array(crect(x0=0., y0=0., w=90., h=40.), 10., 20.)",
+        )
+        .expect("invocation should splice");
+        let (typed, errors) = static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let config = WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH)));
+        let cells =
+            crate::compile::execute_cell_invocation(&typed, &invocation, &config).unwrap_valid();
+        assert_eq!(cells.cells.len(), 1);
+        let top = &cells.cells[&cells.top];
+        assert!(top.name.ends_with("via_array"), "{}", top.name);
+        let region = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .find(|rect| rect.construction && rect.layer.is_none() && relative_eq!(rect.x1.0, 90.))
+            .expect("the region arrives as construction geometry");
+        assert_relative_eq!(region.y1.0, 40., epsilon = EPSILON);
+        let drawn = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .filter(|rect| !rect.construction)
+            .count();
+        assert_eq!(drawn, 10);
+    }
+
+    /// Tuples are cell arguments like sequences and structs: element by
+    /// element, shapes included, and checked against the declared arity and
+    /// element types.
+    #[test]
+    fn tuple_cell_arguments() {
+        let source = r#"
+struct Placed {
+    at: (Float, Float),
+    size: (Int, Rect),
+}
+
+cell child(span: (Float, Float), p: Placed) {
+    let w = span.1 - span.0;
+    let m = rect("met2", x0=p.at.0, y0=p.at.1, w=w, h=(p.size.0 as Float));
+    let drawn = p.size.1!;
+}
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., w=10., h=10.);
+    let c = inst(child((5., 25.,), Placed { at: (100., 200.,), size: (3, r,) }), x=0., y=0.);
+}
+"#;
+        let cells = compile_source(source, "top", Vec::new()).unwrap_valid();
+        assert_eq!(cells.cells.len(), 2);
+        let (_, child) = cells
+            .cells
+            .iter()
+            .find(|(id, _)| **id != cells.top)
+            .expect("child cell");
+        let rects: Vec<_> = child
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .collect();
+        assert_eq!(rects.len(), 2);
+        // Every element of the nested tuples was read as a constant.
+        let m = rects
+            .iter()
+            .find(|rect| rect.layer.as_deref() == Some("met2"))
+            .expect("the marker is drawn");
+        assert_relative_eq!(m.x0.0, 100., epsilon = EPSILON);
+        assert_relative_eq!(m.y0.0, 200., epsilon = EPSILON);
+        assert_relative_eq!(m.x1.0, 120., epsilon = EPSILON);
+        assert_relative_eq!(m.y1.0, 203., epsilon = EPSILON);
+        // The rect inside the tuple is drawable, so `!` draws it.
+        let drawn = rects
+            .iter()
+            .find(|rect| rect.layer.as_deref() == Some("met1"))
+            .expect("the tuple's rect is drawn");
+        assert!(!drawn.construction);
+        assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
+
+        // Through the positional API the tuple is checked element by element.
+        let pair = |a: f64, b: f64| CellArg::Tuple(vec![CellArg::Float(a), CellArg::Float(b)]);
+        let placed = |size: CellArg| CellArg::Struct {
+            name: "Placed".to_owned(),
+            fields: vec![
+                ("at".to_owned(), pair(100., 200.)),
+                ("size".to_owned(), size),
+            ],
+        };
+        let rect = CellArg::Rect {
+            layer: Some("met1".to_owned()),
+            drawable: true,
+            x0: 0.,
+            y0: 0.,
+            x1: 10.,
+            y1: 10.,
+        };
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let child = |args: Vec<CellArg>| {
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["child"],
+                    args,
+                },
+            )
+        };
+        let good = child(vec![
+            pair(5., 25.),
+            placed(CellArg::Tuple(vec![CellArg::Int(3), rect.clone()])),
+        ])
+        .unwrap_valid();
+        assert_eq!(good.cells.len(), 1);
+        for (args, found) in [
+            // Wrong arity.
+            (
+                vec![
+                    CellArg::Tuple(vec![CellArg::Float(5.)]),
+                    placed(CellArg::Tuple(vec![CellArg::Int(3), rect.clone()])),
+                ],
+                "tuple",
+            ),
+            // Wrong element type, nested in a struct field.
+            (
+                vec![
+                    pair(5., 25.),
+                    placed(CellArg::Tuple(vec![CellArg::Float(3.), rect.clone()])),
+                ],
+                "struct",
+            ),
+        ] {
+            let errors = child(args).unwrap_exec_errors().errors;
+            assert!(
+                errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ExecErrorKind::InvalidCellArgumentType { found: f, .. } if f == found
+                )),
+                "{errors:?}"
+            );
+        }
+    }
+
+    /// A shape whose coordinates the caller never pins down is passed once the
+    /// caller's solver has settled them, and the caller is the cell reported.
+    #[test]
+    fn an_unsolved_shape_argument_waits_for_the_caller() {
+        let source = r#"
+cell child(r: Rect) {
+    let v = rect("met1", x0=r.x0, y0=r.y0, w=10., h=10.);
+}
+
+cell top() {
+    let m = rect("met1", w=50., h=50.);
+    let c = inst(child(m), x=0., y=0.);
+}
+"#;
+        let output = compile_source(source, "top", Vec::new()).unwrap_exec_errors();
+        let cells = output.output.expect("the layout is still produced");
+        assert_eq!(cells.cells.len(), 2);
+        assert!(!output.errors.is_empty());
+        assert!(
+            output.errors.iter().all(|error| {
+                matches!(error.kind, ExecErrorKind::Underconstrained) && error.cell == cells.top
+            }),
+            "{:?}",
+            output.errors
         );
     }
 

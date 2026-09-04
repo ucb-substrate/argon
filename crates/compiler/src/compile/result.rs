@@ -234,7 +234,7 @@ pub enum ExecErrorKind {
         found: String,
     },
     /// A cell invocation supplied an argument whose value cannot be passed to a
-    /// cell, such as a rectangle or an instance.
+    /// cell, such as an instance or a cell.
     #[error("invalid cell argument: a {0} value cannot be passed to a cell")]
     UnsupportedCellArgument(String),
     /// An argument in a cell invocation does not reduce to a constant, so it

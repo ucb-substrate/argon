@@ -129,13 +129,14 @@ other structs, sequences, and tuples. A struct declared in another module is
 imported with `use`, and a literal may name its module, as in
 `geom::Size { w: 1., h: 2. }`. Inside an `if` condition, a `match` scrutinee, or
 a `for` sequence a literal must be parenthesized, since `name {` there begins
-the construct's body. Struct values are valid cell arguments, including on the
-command line:
+the construct's body. Struct and tuple values are valid cell arguments,
+including on the command line:
 
 ```bash
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
 ```
 
+<<<<<<< HEAD
 Top-level declarations may appear in any order: a cell, function, struct, or
 enum can be used above the line that declares it. Cells may also instantiate
 themselves or one another, which is how a recursive layout is written. The
@@ -159,6 +160,41 @@ and a function that accepts either takes `Any`. The type of an instance field
 is worked out when it is first read, so the one thing that cannot be resolved
 is a field whose type depends on itself through the fields of other cells,
 which is reported as an error at the read that closes the cycle.
+=======
+Shapes are valid cell arguments too. A `Rect`, `Polygon`, `Path`, or `Point`
+parameter receives the shape by value: the caller's solver resolves its
+coordinates first, and the cell sees them as constants in its own coordinate
+frame, exactly as a `Float` argument arrives as a number. Placing an instance
+elsewhere does not move them, and constraints inside the cell cannot move the
+caller's geometry; share live geometry with a `fn` instead. Inside the cell the
+shape is construction geometry: it is not drawn and does not count toward the
+cell's extent, but its edges can constrain what the cell draws. `!` draws it on
+its layer when it was drawn in the caller, so layout geometry and shapes read
+out of an instance qualify while a `crect` or a `bbox` does not. Shapes at
+different positions are different arguments, so they compile to different
+cells:
+
+```rust
+cell via_array(region: Rect, size: Float, pitch: Float) {
+    let via = crect(layer="via1", x0=0., y0=0., w=size, h=size);
+    let vias = std::max_array(via, region.w, region.h, pitch, pitch);
+    eq(vias.x0 - region.x0, region.x1 - vias.x1);
+    eq(vias.y0 - region.y0, region.y1 - vias.y1);
+}
+
+cell top() {
+    let met1 = rect("met1", x0=0., y0=0., w=100., h=50.);
+    let met2 = rect("met2", x0=10., y0=5., w=80., h=40.);
+    let vias = inst(via_array(std::intersection(met1, met2), 10., 20.));
+}
+```
+
+Shapes built on the command line work the same way:
+
+```bash
+arc run --cell 'via_array(crect(x0=0., y0=0., w=90., h=40.), 10., 20.)'
+```
+>>>>>>> 8fbeb74 (feat(lang): support rects/tuples/etc. as cell arguments (#256))
 
 GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
