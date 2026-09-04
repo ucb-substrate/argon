@@ -3,16 +3,13 @@
 //! Builds `Ast<&'a str, ParseMetadata>` directly from the token stream in a
 //! single pass — no intermediate concrete syntax tree. Identifier and string
 //! text is borrowed straight from the source (`&'a str`); every node records a
-//! byte-offset `cfgrammar::Span` that indexes the original (untrimmed) input,
-//! matching the spans the ANTLR integration produced.
+//! byte-offset `cfgrammar::Span` that indexes the original (untrimmed) input.
 //!
-//! Expression precedence/associativity mirrors the ANTLR `expr` rule exactly
-//! (validated against the generated `expr_rec`/`precpred`): prefix unary binds
-//! tightest for its operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`,
-//! `as`) binds tighter than the binary operators; `* / %` > `+ -` > comparisons;
-//! all binary operators are left-associative. Boolean operations are lower precedence
-//! than comparisons, as in Rust:
-//! comparisons > `&&` > `||`.
+//! Expression precedence/associativity: prefix unary binds tightest for its
+//! operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`, `as`) binds tighter
+//! than the binary operators; `* / %` > `+ -` > comparisons; all binary
+//! operators are left-associative. Boolean operations are lower precedence than
+//! comparisons, as in Rust: comparisons > `&&` > `||`.
 
 use std::str::FromStr;
 
@@ -236,7 +233,7 @@ impl<'a> Parser<'a> {
     /// or recovery path a rule may consume nothing after capturing `lo`, leaving
     /// `prev_end < lo`; clamp so the span is never inverted (`cfgrammar::Span::new`
     /// panics when `end < start`). For well-formed nodes `prev_end >= lo`, so this
-    /// is a no-op and spans match the byte ranges ANTLR produced.
+    /// is a no-op.
     #[inline]
     fn finish_span(&self, lo: u32) -> Span {
         Span::new(lo as usize, self.prev_end.max(lo) as usize)
@@ -290,7 +287,7 @@ impl<'a> Parser<'a> {
         // Distinct diagnostics at the same offset are kept: they describe
         // independent problems (e.g. a token that is simultaneously not an
         // expression and not the expected `)`), so collapsing them by position
-        // alone dropped diagnostics ANTLR reported.
+        // alone would lose real diagnostics.
         if let Some(last) = self.errors.last()
             && last.span.start() == span.start()
             && last.message == message
@@ -335,9 +332,9 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        // Like ANTLR's `ast : decl* EOF` context, the root span runs to the EOF
-        // token, i.e. the end of the (untrimmed) input — `src` is the trimmed
-        // buffer, so `src.len() + base` is the original length.
+        // The root span runs to the EOF token, i.e. the end of the (untrimmed)
+        // input — `src` is the trimmed buffer, so `src.len() + base` is the
+        // original length.
         let end = self.src.len() + self.base;
         Ast {
             decls,
@@ -345,13 +342,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `callExpr EOF` as a standalone entry (used by `parse_cell`). Returns
-    /// `None` (with an error recorded) unless the input is *exactly* one call
-    /// expression: the whole input must parse to an `Expr::Call` and reach EOF.
+    /// A single call expression followed by EOF, as a standalone entry (used by
+    /// `parse_cell`). Returns `None` (with an error recorded) unless the input is
+    /// *exactly* one call expression: the whole input must parse to an
+    /// `Expr::Call` and reach EOF.
     /// This rejects both trailing garbage (`f() junk`) and suffixed calls
     /// (`f()!`, `f().x`, `f()[0]`, which parse to an `Emit`/`FieldAccess`/`Index`
-    /// root rather than a `Call`), keeping the "parses exactly a callExpr"
-    /// contract the old ANTLR `callExpr()` entry had.
+    /// root rather than a `Call`).
     pub fn parse_cell_entry(&mut self) -> Option<CallExpr<&'a str, Md>> {
         let expr = self.parse_expr(0);
         let Expr::Call(call) = expr else {
@@ -705,9 +702,7 @@ impl<'a> Parser<'a> {
         // routes a trailing un-semicoloned expression into `tail` (the
         // `at(RBrace) || at(Eof)` arm), and only ever pushes a `semicolon: false`
         // statement when more tokens follow it — so a `semicolon: false`
-        // statement is never the last element here. (ANTLR's
-        // `build_unannotated_scope` built statements and the tail separately and
-        // did need the fixup; this single-pass loop does not.)
+        // statement is never the last element here.
 
         self.exit_depth();
         Scope {
@@ -849,7 +844,7 @@ impl<'a> Parser<'a> {
         // Lexical start of this expression (the first token). Composite-node
         // spans start here, not at `lhs.span().start()`: a parenthesized
         // operand is unwrapped to its inner node (whose span excludes the
-        // parens), but ANTLR spans the enclosing operator from the `(`.
+        // parens), while the enclosing operator's span must start at the `(`.
         let lhs_start = self.cur.start;
         let mut lhs = self.parse_prefix();
 
