@@ -234,6 +234,13 @@ fn hash_cell_arg_key(hasher: &mut fnv::FnvHasher, arg: &CellArgKey) {
             hasher.write_u64(*x);
             hasher.write_u64(*y);
         }
+        CellArgKey::Tuple(values) => {
+            hasher.write_u8(11);
+            hasher.write_usize(values.len());
+            for value in values {
+                hash_cell_arg_key(hasher, value);
+            }
+        }
     }
 }
 

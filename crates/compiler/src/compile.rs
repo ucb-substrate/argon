@@ -3588,6 +3588,8 @@ pub enum CellArg {
     },
     /// A point, like [`Value::Point`]: its solved `x` and `y`.
     Point(f64, f64),
+    /// A tuple, like [`Value::Tuple`]: its elements in order.
+    Tuple(Vec<CellArg>),
 }
 
 impl CellArg {
@@ -3607,6 +3609,13 @@ impl CellArg {
                 values.iter().all(|value| value.matches_ty(inner))
             }
             (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            (Self::Tuple(values), Ty::Tuple(tys)) => {
+                values.len() == tys.len()
+                    && values
+                        .iter()
+                        .zip(tys)
+                        .all(|(value, ty)| value.matches_ty(ty))
+            }
             (Self::Struct { name, fields }, Ty::Struct(ty)) => {
                 *name == ty.name
                     && fields.len() == ty.fields.len()
@@ -3632,6 +3641,7 @@ impl CellArg {
             Self::Polygon { .. } => "Polygon",
             Self::Path { .. } => "Path",
             Self::Point(..) => "Point",
+            Self::Tuple(_) => "tuple",
         }
     }
 }
@@ -3662,6 +3672,7 @@ pub(crate) enum CellArgKey {
     /// centerline points.
     Path(String, bool, [u64; 3], Vec<(u64, u64)>),
     Point(u64, u64),
+    Tuple(Vec<CellArgKey>),
 }
 
 /// The bits of each coordinate pair.
@@ -3738,6 +3749,7 @@ impl From<&CellArg> for CellArgKey {
                 point_bits(points),
             ),
             CellArg::Point(x, y) => Self::Point(x.to_bits(), y.to_bits()),
+            CellArg::Tuple(v) => Self::Tuple(v.iter().map(Self::from).collect()),
         }
     }
 }
@@ -6401,6 +6413,11 @@ impl<'a> ExecPass<'a> {
                 Value::Path(path)
             }
             CellArg::Point(x, y) => Value::Point(((*x).into(), (*y).into())),
+            CellArg::Tuple(v) => Value::Tuple(
+                v.iter()
+                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                    .collect(),
+            ),
         }
     }
 
@@ -6561,6 +6578,16 @@ impl<'a> ExecPass<'a> {
                     return Ok(None);
                 };
                 Some(CellArg::Point(coords[0], coords[1]))
+            }
+            Value::Tuple(items) => {
+                let mut args = Vec::with_capacity(items.len());
+                for v in items {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => args.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Tuple(args))
             }
             // Already reported when it was poisoned. The caller turns this
             // `Err` into poison of its own rather than a second diagnostic

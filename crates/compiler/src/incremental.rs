@@ -816,6 +816,10 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
                 x.to_bits().hash(hasher);
                 y.to_bits().hash(hasher);
             }
+            CellArg::Tuple(values) => {
+                11_u8.hash(hasher);
+                hash_cell_args(values, hasher);
+            }
         }
     }
 }

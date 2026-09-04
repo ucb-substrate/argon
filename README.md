@@ -129,8 +129,8 @@ other structs, sequences, and tuples. A struct declared in another module is
 imported with `use`, and a literal may name its module, as in
 `geom::Size { w: 1., h: 2. }`. Inside an `if` condition, a `match` scrutinee, or
 a `for` sequence a literal must be parenthesized, since `name {` there begins
-the construct's body. Struct values are valid cell arguments, including on the
-command line:
+the construct's body. Struct and tuple values are valid cell arguments,
+including on the command line:
 
 ```bash
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'

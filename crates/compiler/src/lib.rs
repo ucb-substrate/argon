@@ -2139,6 +2139,121 @@ cell top() {
         assert_eq!(drawn, 10);
     }
 
+    /// Tuples are cell arguments like sequences and structs: element by
+    /// element, shapes included, and checked against the declared arity and
+    /// element types.
+    #[test]
+    fn tuple_cell_arguments() {
+        let source = r#"
+struct Placed {
+    at: (Float, Float),
+    size: (Int, Rect),
+}
+
+cell child(span: (Float, Float), p: Placed) {
+    let w = span.1 - span.0;
+    let m = rect("met2", x0=p.at.0, y0=p.at.1, w=w, h=(p.size.0 as Float));
+    let drawn = p.size.1!;
+}
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., w=10., h=10.);
+    let c = inst(child((5., 25.,), Placed { at: (100., 200.,), size: (3, r,) }), x=0., y=0.);
+}
+"#;
+        let cells = compile_source(source, "top", Vec::new()).unwrap_valid();
+        assert_eq!(cells.cells.len(), 2);
+        let (_, child) = cells
+            .cells
+            .iter()
+            .find(|(id, _)| **id != cells.top)
+            .expect("child cell");
+        let rects: Vec<_> = child
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .collect();
+        assert_eq!(rects.len(), 2);
+        // Every element of the nested tuples was read as a constant.
+        let m = rects
+            .iter()
+            .find(|rect| rect.layer.as_deref() == Some("met2"))
+            .expect("the marker is drawn");
+        assert_relative_eq!(m.x0.0, 100., epsilon = EPSILON);
+        assert_relative_eq!(m.y0.0, 200., epsilon = EPSILON);
+        assert_relative_eq!(m.x1.0, 120., epsilon = EPSILON);
+        assert_relative_eq!(m.y1.0, 203., epsilon = EPSILON);
+        // The rect inside the tuple is drawable, so `!` draws it.
+        let drawn = rects
+            .iter()
+            .find(|rect| rect.layer.as_deref() == Some("met1"))
+            .expect("the tuple's rect is drawn");
+        assert!(!drawn.construction);
+        assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
+
+        // Through the positional API the tuple is checked element by element.
+        let pair = |a: f64, b: f64| CellArg::Tuple(vec![CellArg::Float(a), CellArg::Float(b)]);
+        let placed = |size: CellArg| CellArg::Struct {
+            name: "Placed".to_owned(),
+            fields: vec![
+                ("at".to_owned(), pair(100., 200.)),
+                ("size".to_owned(), size),
+            ],
+        };
+        let rect = CellArg::Rect {
+            layer: Some("met1".to_owned()),
+            drawable: true,
+            x0: 0.,
+            y0: 0.,
+            x1: 10.,
+            y1: 10.,
+        };
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let child = |args: Vec<CellArg>| {
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["child"],
+                    args,
+                },
+            )
+        };
+        let good = child(vec![
+            pair(5., 25.),
+            placed(CellArg::Tuple(vec![CellArg::Int(3), rect.clone()])),
+        ])
+        .unwrap_valid();
+        assert_eq!(good.cells.len(), 1);
+        for (args, found) in [
+            // Wrong arity.
+            (
+                vec![
+                    CellArg::Tuple(vec![CellArg::Float(5.)]),
+                    placed(CellArg::Tuple(vec![CellArg::Int(3), rect.clone()])),
+                ],
+                "tuple",
+            ),
+            // Wrong element type, nested in a struct field.
+            (
+                vec![
+                    pair(5., 25.),
+                    placed(CellArg::Tuple(vec![CellArg::Float(3.), rect.clone()])),
+                ],
+                "struct",
+            ),
+        ] {
+            let errors = child(args).unwrap_exec_errors().errors;
+            assert!(
+                errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ExecErrorKind::InvalidCellArgumentType { found: f, .. } if f == found
+                )),
+                "{errors:?}"
+            );
+        }
+    }
+
     /// A shape whose coordinates the caller never pins down is passed once the
     /// caller's solver has settled them, and the caller is the cell reported.
     #[test]
