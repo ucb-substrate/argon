@@ -1,0 +1,53 @@
+---
+title: Hierarchy built-ins
+description: Place cell instances and inspect cell or instance bounds.
+sidebar_label: Hierarchy
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# Hierarchy built-ins
+
+## `inst`
+
+<ApiItem id="inst" name="inst" signature={'inst(cell: Cell, reflect?, angle?, x?, y?, xi?, yi?, construction?) -> Inst'} summary={<>Places a cell in the current scope.</>}>
+
+<ParameterTable rows={[
+  {name: 'cell', type: 'Cell', typeHref: '/language/types/instance#cell-values', requirement: 'Required, positional', description: 'The cell value to place, such as inverter(1200., 2000., 4).'},
+  {name: 'reflect', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional; false', description: 'Mirror the cell before rotating and translating it.'},
+  {name: 'angle', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Optional; 0', description: 'Rotation in degrees: 0, 90, 180, or 270.'},
+  {name: 'x', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'x position.'},
+  {name: 'y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'y position.'},
+  {name: 'xi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial x position.'},
+  {name: 'yi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial y position.'},
+  {name: 'construction', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional; false', description: 'When true, leave the instance out of layout export and of the parent bounding box.'},
+]} />
+
+<Returns type="Inst" href="/language/types/instance#instance-values">The instance, with its position and the fields its cell exports.</Returns>
+
+```argon
+let placed = inst(inverter(1200., 2000., 4), x=100., y=50., angle=90);
+```
+
+</ApiItem>
+
+## `bbox`
+
+<ApiItem id="bbox" name="bbox" signature={'bbox(value: Cell | Inst) -> Rect'} summary={<>Returns the bounding box of a cell or a placed instance, as a construction rectangle.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'Cell | Inst', typeHref: '/language/types/instance', requirement: 'Required, positional', description: 'A cell value, measured in its own coordinates, or an instance, measured after placement.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">A construction rectangle around the layout geometry.</Returns>
+
+```argon
+let child = inverter(1200., 2000., 4);
+let local = bbox(child);
+let placed = inst(child, x=100., y=50.);
+let transformed = bbox(placed);
+```
+
+Construction-only geometry does not count toward the bounding box.
+
+</ApiItem>

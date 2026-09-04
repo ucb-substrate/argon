@@ -1,0 +1,32 @@
+---
+title: Polygon
+description: Fields and coordinate access for polygon geometry.
+---
+
+import {FieldTable} from '@site/src/components/ApiReference';
+
+# `Polygon`
+
+`Polygon` is a fixed number of vertices on a layer. Create one with [`polygon`](/language/builtins/geometry#polygon).
+
+## Fields
+
+<FieldTable rows={[
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', description: 'Layer name.'},
+  {name: 'points', type: '[Point]', typeHref: '/language/types/collections#sequences', description: 'Vertices, in order.'},
+  {name: 'xN', type: 'Float', typeHref: '/language/types/scalars#float', description: 'x coordinate of vertex N, such as x0 or x2.'},
+  {name: 'yN', type: 'Float', typeHref: '/language/types/scalars#float', description: 'y coordinate of vertex N.'},
+]} />
+
+`shape.x2` and `shape.points[2].x` refer to the same coordinate.
+
+```argon
+let triangle = polygon(
+    "met1", 3,
+    x0=0., y0=0.,
+    x1=100., y1=0.,
+    x2=50., y2=80.,
+);
+```
+
+The constructor's `xNi` and `yNi` arguments set initial coordinates.

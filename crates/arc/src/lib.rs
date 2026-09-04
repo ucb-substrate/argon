@@ -8,6 +8,7 @@ use indexmap::{IndexMap, IndexSet};
 use serde::Deserialize;
 
 pub mod cli;
+pub mod doc;
 
 const MANIFEST_FILE: &str = "Argon.toml";
 const SOURCE_FILE: &str = "lib.ar";

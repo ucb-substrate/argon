@@ -111,9 +111,9 @@ them. Two consequences run through the whole implementation:
 
 - `cfgrammar::Span::new(start, end)` **panics if `end < start`.** Any code that
   builds a span from two independently-derived offsets must guarantee
-  `start <= end` (see [`finish_span`](#56-spans-finish_span-and-slicing)).
+  `start <= end` (see [`finish_span`](#55-spans-finish_span-and-slicing)).
 - Token boundaries always land on UTF-8 char boundaries (the lexer guarantees
-  this — see [§4](#4-the-lexer)), so slicing a token's span out of the source is
+  this — see [§4](#4-the-lexer-lexerrs)), so slicing a token's span out of the source is
   always valid UTF-8.
 
 ---

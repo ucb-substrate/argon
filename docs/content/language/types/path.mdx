@@ -1,0 +1,24 @@
+---
+title: Path
+description: Fields and coordinate access for path geometry.
+---
+
+import {FieldTable} from '@site/src/components/ApiReference';
+
+# `Path`
+
+`Path` is a constant-width path along a centerline. Create one with [`path`](/language/builtins/geometry#path).
+
+## Fields
+
+<FieldTable rows={[
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', description: 'Layer name.'},
+  {name: 'points', type: '[Point]', typeHref: '/language/types/collections#sequences', description: 'Centerline points, in order.'},
+  {name: 'xN', type: 'Float', typeHref: '/language/types/scalars#float', description: 'x coordinate of point N.'},
+  {name: 'yN', type: 'Float', typeHref: '/language/types/scalars#float', description: 'y coordinate of point N.'},
+  {name: 'width', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Full path width.'},
+  {name: 'begin_extension', type: 'Float', typeHref: '/language/types/scalars#float', description: 'How far the path extends past its first point.'},
+  {name: 'end_extension', type: 'Float', typeHref: '/language/types/scalars#float', description: 'How far the path extends past its last point.'},
+]} />
+
+Every numeric constructor argument has an initial-value form ending in `i`: `widthi`, `begin_extensioni`, `x0i`, and so on.

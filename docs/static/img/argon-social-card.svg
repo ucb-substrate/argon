@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630">
+  <rect width="1200" height="630" fill="#1b1b1d"/>
+  <rect x="100" y="240" width="120" height="120" rx="28" fill="#211b2d"/>
+  <path d="M130 325 162 262l33 63h-18l-5.5-12h-20.5l-5.5 12h-15.5Zm27.8-25.8h8l-4-11.2-4 11.2Z" fill="#c4b5fd"/>
+  <path d="M122 339h76" stroke="#7c3aed" stroke-width="5" stroke-linecap="round"/>
+  <text x="260" y="318" fill="#f4f4f5" font-family="system-ui, sans-serif" font-size="84" font-weight="600">Argon</text>
+  <text x="260" y="372" fill="#a1a1aa" font-family="system-ui, sans-serif" font-size="34">Documentation</text>
+</svg>

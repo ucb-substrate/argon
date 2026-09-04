@@ -100,7 +100,13 @@ fn run_inner(
                 },
                 Menu {
                     name: "File".into(),
-                    items: vec![MenuItem::action("Save", Save)],
+                    items: vec![
+                        MenuItem::action("New Cell…", NewCellCommand),
+                        MenuItem::action("Open Cell…", OpenCellCommand),
+                        MenuItem::action("Rename Cell…", RenameCellCommand),
+                        MenuItem::separator(),
+                        MenuItem::action("Save", Save),
+                    ],
                 },
                 Menu {
                     name: "Edit".into(),
@@ -161,6 +167,8 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", DrawDim, Some(CANVAS_CONTEXT)),
         KeyBinding::new("i", InstantiateCommand, Some(CANVAS_CONTEXT)),
         KeyBinding::new("o", OpenCellCommand, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("cmd-n", NewCellCommand, None),
+        KeyBinding::new("cmd-shift-r", RenameCellCommand, None),
         KeyBinding::new("f", Fit, Some(CANVAS_CONTEXT)),
         KeyBinding::new("q", Edit, Some(CANVAS_CONTEXT)),
         KeyBinding::new("u", Undo, Some(CANVAS_CONTEXT)),
@@ -235,6 +243,8 @@ mod tests {
         command_bar_count: usize,
         instantiate_count: usize,
         open_cell_count: usize,
+        new_cell_count: usize,
+        rename_cell_count: usize,
         focus_invoker_count: usize,
         show_diagnostics_count: usize,
         show_messages_count: usize,
@@ -272,6 +282,10 @@ mod tests {
                     cx.listener(|view, _: &InstantiateCommand, _, _| view.instantiate_count += 1),
                 )
                 .on_action(cx.listener(|view, _: &OpenCellCommand, _, _| view.open_cell_count += 1))
+                .on_action(cx.listener(|view, _: &NewCellCommand, _, _| view.new_cell_count += 1))
+                .on_action(
+                    cx.listener(|view, _: &RenameCellCommand, _, _| view.rename_cell_count += 1),
+                )
                 .on_action(
                     cx.listener(|view, _: &FocusInvoker, _, _| view.focus_invoker_count += 1),
                 )
@@ -310,6 +324,8 @@ mod tests {
                     command_bar_count: 0,
                     instantiate_count: 0,
                     open_cell_count: 0,
+                    new_cell_count: 0,
+                    rename_cell_count: 0,
                     focus_invoker_count: 0,
                     show_diagnostics_count: 0,
                     show_messages_count: 0,
@@ -330,7 +346,7 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(
             *window,
-            "u r p i o 0 1 * left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+            "u r p i o 0 1 * left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s cmd-n cmd-shift-r",
         );
         window
             .update(cx, |view, _, _| {
@@ -340,6 +356,8 @@ mod tests {
                 assert_eq!(view.command_bar_count, 0);
                 assert_eq!(view.instantiate_count, 0);
                 assert_eq!(view.open_cell_count, 0);
+                assert_eq!(view.new_cell_count, 1);
+                assert_eq!(view.rename_cell_count, 1);
                 assert_eq!(view.zero_count, 0);
                 assert_eq!(view.one_count, 0);
                 assert_eq!(view.all_count, 0);
@@ -358,7 +376,7 @@ mod tests {
             .unwrap();
         cx.simulate_keystrokes(
             *window,
-            "u r p i o 0 1 * left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s",
+            "u r p i o 0 1 * left right up down cmd-= cmd-+ cmd-- ctrl-= ctrl-+ ctrl-- ctrl-shift-d ctrl-shift-m : ctrl-\\ cmd-s cmd-n cmd-shift-r",
         );
         window
             .update(cx, |view, _, _| {
@@ -368,6 +386,8 @@ mod tests {
                 assert_eq!(view.command_bar_count, 1);
                 assert_eq!(view.instantiate_count, 1);
                 assert_eq!(view.open_cell_count, 1);
+                assert_eq!(view.new_cell_count, 2);
+                assert_eq!(view.rename_cell_count, 2);
                 assert_eq!(view.zero_count, 1);
                 assert_eq!(view.one_count, 1);
                 assert_eq!(view.all_count, 1);

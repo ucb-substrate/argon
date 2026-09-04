@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 argonc = { version = "0.1.0", path = "../compiler" }
+arcstr = { workspace = true }
 clap = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true }

@@ -1,3 +1,4 @@
+mod cell_edit;
 mod compiler_worker;
 pub mod document;
 pub mod rpc;
@@ -1103,6 +1104,12 @@ struct InstantiateParams {
     cell: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CellNameParams {
+    name: String,
+    uri: Uri,
+}
+
 const PREVIEW_BINDING_PREFIX: &str = "__argon_preview_instance";
 
 fn preview_instance_cell(
@@ -1249,6 +1256,71 @@ impl Backend {
             .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
         self.select_and_open_cell(params.cell).await;
+        Ok(())
+    }
+
+    async fn new_cell(&self, params: CellNameParams) -> Result<()> {
+        let Some(source_path) = params.uri.to_file_path().map(|path| path.into_owned()) else {
+            self.state
+                .report_message(
+                    MessageType::ERROR,
+                    "The active buffer does not have a file path",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(ast) = self.state.current_editor_ast().await else {
+            self.state
+                .report_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return Ok(());
+        };
+        let edit = match cell_edit::new_cell_edit(&ast, &source_path, &params.name) {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.state.report_message(MessageType::ERROR, error).await;
+                return Ok(());
+            }
+        };
+        let invocation = format!("{}()", params.name);
+        let previous = {
+            let mut source = self.state.source_state.lock().await;
+            source.cell.replace(invocation)
+        };
+        if !self.state.apply_source_edit(params.uri, edit).await {
+            self.state.source_state.lock().await.cell = previous;
+        }
+        Ok(())
+    }
+
+    async fn rename_cell(&self, params: CellNameParams) -> Result<()> {
+        let Some(ast) = self.state.current_editor_ast().await else {
+            self.state
+                .report_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return Ok(());
+        };
+        let current_invocation = self.state.source_state.lock().await.cell.clone();
+        let Some(current_invocation) = current_invocation else {
+            self.state
+                .report_message(MessageType::ERROR, "Open a cell before renaming it")
+                .await;
+            return Ok(());
+        };
+        let rename = match cell_edit::rename_cell_edits(&ast, &current_invocation, &params.name) {
+            Ok(rename) => rename,
+            Err(error) => {
+                self.state.report_message(MessageType::ERROR, error).await;
+                return Ok(());
+            }
+        };
+        let previous = {
+            let mut source = self.state.source_state.lock().await;
+            source.cell.replace(rename.invocation)
+        };
+        if !self.state.apply_source_changes(rename.changes, None).await {
+            self.state.source_state.lock().await.cell = previous;
+        }
         Ok(())
     }
 
@@ -1668,6 +1740,8 @@ pub async fn main_with_io_on_listener<I, O>(
     })
     .custom_method("custom/startGui", Backend::start_gui)
     .custom_method("custom/openCell", Backend::open_cell)
+    .custom_method("custom/newCell", Backend::new_cell)
+    .custom_method("custom/renameCell", Backend::rename_cell)
     .custom_method("custom/inst", Backend::instantiate)
     .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/setConfig", Backend::set_config)
