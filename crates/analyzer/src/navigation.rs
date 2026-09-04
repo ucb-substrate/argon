@@ -23,7 +23,7 @@ use argonc::{
         CompletionCandidate, CompletionKind as ArgonCompletionKind, DefLocation, NavIndex,
         OutlineSymbol, SignatureInfo, SymbolKind as ArgonSymbolKind,
     },
-    parse::{STD_PATH, virtual_source},
+    parse::{CompletionSite, STD_PATH, completion_site, virtual_source},
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, DocumentHighlight,
@@ -292,26 +292,7 @@ impl<'a> FileViews<'a> {
     async fn build(&self, path: &Path) -> Option<FileView> {
         let indexed = self.index.source(path)?;
         let uri = self.state.client_uri(path).await?;
-        let open = {
-            let source = self.state.source_state.lock().await;
-            source
-                .editor_files
-                .get(&uri)
-                .or_else(|| {
-                    // A client's spelling of a URI is not the one
-                    // `Uri::from_file_path` produces for the same file — the
-                    // two percent-encode different characters — so fall back
-                    // to comparing the paths. Missing an open buffer here
-                    // would align the index against itself and answer from
-                    // the snapshot instead of from what the user is looking
-                    // at.
-                    let file = uri.to_file_path()?;
-                    source.editor_files.iter().find_map(|(open, document)| {
-                        (open.to_file_path()? == file).then_some(document)
-                    })
-                })
-                .cloned()
-        };
+        let open = self.state.open_document(&uri).await;
         let buffer = open.unwrap_or_else(|| self.state.document(indexed.clone()));
         let alignment = Alignment::new(indexed, buffer.contents());
         Some(FileView {
@@ -577,6 +558,62 @@ fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionRespon
     CompletionResponse::Array(candidates.into_iter().map(completion_item).collect())
 }
 
+fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> bool {
+    use ArgonCompletionKind as Kind;
+
+    match site {
+        CompletionSite::Unknown => true,
+        CompletionSite::TopLevel => {
+            candidate.kind == Kind::Keyword
+                && matches!(
+                    candidate.label.as_str(),
+                    "cell" | "enum" | "fn" | "mod" | "use"
+                )
+        }
+        CompletionSite::Statement => match candidate.kind {
+            Kind::Function
+            | Kind::Cell
+            | Kind::Variable
+            | Kind::Parameter
+            | Kind::Enum
+            | Kind::Variant
+            | Kind::Module => true,
+            Kind::Keyword => matches!(
+                candidate.label.as_str(),
+                "false" | "for" | "if" | "let" | "match" | "true"
+            ),
+            Kind::Field | Kind::Type => false,
+        },
+        CompletionSite::Expression => match candidate.kind {
+            Kind::Function
+            | Kind::Cell
+            | Kind::Variable
+            | Kind::Parameter
+            | Kind::Enum
+            | Kind::Variant
+            | Kind::Module => true,
+            Kind::Keyword => matches!(candidate.label.as_str(), "false" | "if" | "match" | "true"),
+            Kind::Field | Kind::Type => false,
+        },
+        CompletionSite::Type => matches!(candidate.kind, Kind::Cell | Kind::Enum | Kind::Type),
+        CompletionSite::ImportPath => candidate.kind == Kind::Module,
+        CompletionSite::Keyword(keyword) => {
+            candidate.kind == Kind::Keyword && candidate.label == keyword
+        }
+        CompletionSite::NewIdentifier | CompletionSite::Suppressed => false,
+    }
+}
+
+fn filter_completions(
+    candidates: Vec<CompletionCandidate>,
+    site: CompletionSite,
+) -> Vec<CompletionCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| completion_allowed(candidate, site))
+        .collect()
+}
+
 fn lsp_symbol_kind(kind: ArgonSymbolKind) -> SymbolKind {
     match kind {
         ArgonSymbolKind::Function => SymbolKind::FUNCTION,
@@ -633,6 +670,25 @@ impl State {
             return Some(PathBuf::from(STD_PATH));
         }
         Some(path)
+    }
+
+    /// The current editor text for `uri`, accepting equivalent URI spellings.
+    ///
+    /// `Uri::from_file_path` and an LSP client do not necessarily percent-
+    /// encode a path identically, so exact URI lookup has a path-based fallback.
+    async fn open_document(&self, uri: &Uri) -> Option<Document> {
+        let source = self.source_state.lock().await;
+        source
+            .editor_files
+            .get(uri)
+            .or_else(|| {
+                let file = uri.to_file_path()?;
+                source
+                    .editor_files
+                    .iter()
+                    .find_map(|(open, document)| (open.to_file_path()? == file).then_some(document))
+            })
+            .cloned()
     }
 
     /// The URI a compiler path should be shown under.
@@ -693,20 +749,46 @@ impl State {
         uri: &Uri,
         position: Position,
     ) -> Option<CompletionResponse> {
-        let Some(index) = self.nav_index().await else {
-            return Some(completion_response(NavIndex::static_completions()));
+        let path = self.compiler_path(uri).await?;
+        let index = self.nav_index().await;
+        let buffer = match self.open_document(uri).await {
+            Some(buffer) => buffer,
+            None => self.document(index.as_ref()?.source(&path)?.clone()),
         };
-        let Some(path) = self.compiler_path(uri).await else {
-            return Some(completion_response(NavIndex::static_completions()));
+        let buffer_offset = buffer.position_to_offset(position)?;
+        let site = completion_site(buffer.contents(), buffer_offset);
+        let context = completion_context(buffer.contents(), buffer_offset);
+        if site == CompletionSite::Suppressed {
+            return Some(completion_response(Vec::new()));
+        }
+        let Some(index) = index else {
+            let candidates = match context {
+                CompletionContext::Plain => {
+                    filter_completions(NavIndex::static_completions(), site)
+                }
+                CompletionContext::Member { .. } | CompletionContext::Qualified { .. } => {
+                    Vec::new()
+                }
+            };
+            return Some(completion_response(candidates));
         };
-        let mut views = FileViews::new(self, &index);
-        let Some(view) = views.get(&path).await else {
-            return Some(completion_response(NavIndex::static_completions()));
+        let Some(indexed) = index.source(&path) else {
+            let candidates = match context {
+                CompletionContext::Plain => {
+                    filter_completions(NavIndex::static_completions(), site)
+                }
+                CompletionContext::Member { .. } | CompletionContext::Qualified { .. } => {
+                    Vec::new()
+                }
+            };
+            return Some(completion_response(candidates));
         };
-        let Some(buffer_offset) = view.buffer.position_to_offset(position) else {
-            return Some(completion_response(NavIndex::static_completions()));
+        let alignment = Alignment::new(indexed, buffer.contents());
+        let view = FileView {
+            uri: uri.clone(),
+            buffer,
+            alignment,
         };
-        let context = completion_context(view.buffer.contents(), buffer_offset);
         let candidates = match context {
             CompletionContext::Member { base_end } => view
                 .alignment
@@ -714,23 +796,31 @@ impl State {
                 .map(|offset| index.member_completions_at(&path, offset))
                 .unwrap_or_default(),
             CompletionContext::Qualified { segments } => {
-                index.qualified_completions(&path, &segments)
+                let candidates = index.qualified_completions(&path, &segments);
+                if site == CompletionSite::ImportPath {
+                    candidates
+                } else {
+                    filter_completions(candidates, site)
+                }
             }
             CompletionContext::Plain => {
                 let Some(indexed_offset) = view.indexed_offset(position) else {
-                    return Some(completion_response(NavIndex::static_completions()));
+                    return Some(completion_response(filter_completions(
+                        NavIndex::static_completions(),
+                        site,
+                    )));
                 };
                 let mut candidates = index.completions_at(&path, indexed_offset);
                 if let Some(context) = call_context(view.buffer.contents(), buffer_offset)
                     && let Some(signature) =
-                        signature_for_context(&index, &path, view, &context, indexed_offset)
+                        signature_for_context(&index, &path, &view, &context, indexed_offset)
                 {
                     // Keyword arguments are more relevant here than a
                     // same-named local, so append them and let deduplication
                     // below keep the last candidate.
                     candidates.extend(index.keyword_completions_for_signature(&signature));
                 }
-                candidates
+                filter_completions(candidates, site)
             }
         };
         Some(completion_response(candidates))
@@ -1070,6 +1160,54 @@ mod tests {
             completion_context("let wid", "let wid".len()),
             CompletionContext::Plain
         );
+    }
+
+    fn candidate(label: &str, kind: ArgonCompletionKind) -> CompletionCandidate {
+        CompletionCandidate {
+            label: label.to_owned(),
+            kind,
+            detail: None,
+            insert_text: None,
+        }
+    }
+
+    #[test]
+    fn completion_candidates_are_filtered_by_syntax_role() {
+        use ArgonCompletionKind as Kind;
+
+        let candidates = vec![
+            candidate("cell", Kind::Keyword),
+            candidate("else", Kind::Keyword),
+            candidate("let", Kind::Keyword),
+            candidate("true", Kind::Keyword),
+            candidate("rect", Kind::Function),
+            candidate("Widget", Kind::Cell),
+            candidate("Mode", Kind::Enum),
+            candidate("lib", Kind::Module),
+            candidate("width", Kind::Variable),
+            candidate("Float", Kind::Type),
+        ];
+        let labels = |site| {
+            filter_completions(candidates.clone(), site)
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(labels(CompletionSite::TopLevel), ["cell"]);
+        assert!(labels(CompletionSite::NewIdentifier).is_empty());
+        assert_eq!(labels(CompletionSite::Type), ["Widget", "Mode", "Float"]);
+        assert_eq!(
+            labels(CompletionSite::Expression),
+            ["true", "rect", "Widget", "Mode", "lib", "width"]
+        );
+        assert_eq!(
+            labels(CompletionSite::Statement),
+            ["let", "true", "rect", "Widget", "Mode", "lib", "width"]
+        );
+        assert_eq!(labels(CompletionSite::ImportPath), ["lib"]);
+        assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);
+        assert!(labels(CompletionSite::Suppressed).is_empty());
     }
 
     #[test]

@@ -13,6 +13,34 @@ local function schedule_workspace_modified(client_id)
     end)
 end
 
+--- Configure Neovim's native completion menu without replacing user options.
+---
+--- `noselect` prevents opening the menu from immediately inserting its first
+--- item. That keeps the original leader and match set stable while <C-n>,
+--- <C-p>, or a user's Tab mapping moves through the menu. `menuone` keeps the
+--- same UI when a context legitimately has only one candidate.
+---@param bufnr number
+local function configure_native_completion_menu(bufnr)
+    local completeopt = vim.api.nvim_get_option_value('completeopt', {
+        buf = bufnr,
+        scope = 'local',
+    })
+    if completeopt == '' then
+        completeopt = vim.api.nvim_get_option_value('completeopt', { scope = 'global' })
+    end
+    local values = vim.split(completeopt, ',', { plain = true, trimempty = true })
+    local present = {}
+    for _, value in ipairs(values) do
+        present[value] = true
+    end
+    for _, required in ipairs({ 'menuone', 'noselect' }) do
+        if not present[required] then
+            table.insert(values, required)
+        end
+    end
+    vim.api.nvim_set_option_value('completeopt', table.concat(values, ','), { buf = bufnr })
+end
+
 local modified_clients_by_buffer = {}
 
 local function schedule_buffer_clients(bufnr)
@@ -351,6 +379,7 @@ M.start = function(bufnr)
             config.autocomplete
             and lsp_client:supports_method('textDocument/completion')
         then
+            configure_native_completion_menu(attached_bufnr)
             vim.lsp.completion.enable(true, lsp_client.id, attached_bufnr, {
                 autotrigger = true,
             })

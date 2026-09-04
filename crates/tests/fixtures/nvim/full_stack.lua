@@ -92,6 +92,16 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
     vim.fn.maparg('gd', 'n', false, true).buffer == 1,
     'the plugin should map gd in an attached buffer'
   )
+  local completeopt = vim.opt_local.completeopt:get()
+  assert(
+    vim.list_contains(completeopt, 'noselect'),
+    'native completion should not preselect and insert its first item'
+  )
+  assert(
+    vim.list_contains(completeopt, 'menuone'),
+    'native completion should keep the menu for a single item'
+  )
+  assert(vim.list_contains(completeopt, 'popup'), 'existing completeopt values should be preserved')
   for _, capability in ipairs({
     'completionProvider',
     'hoverProvider',
@@ -144,16 +154,35 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. tostring(lines[location.range.start.line + 1])
   )
 
-  local completion = client:request_sync('textDocument/completion', params, 10000, bufnr)
-  assert(completion and not completion.err, 'completion request failed')
-  local completion_items = completion.result.items or completion.result
-  local completion_labels = {}
-  for _, item in ipairs(completion_items) do
-    completion_labels[item.label] = true
+  local function completion_labels_at(position)
+    local completion = client:request_sync('textDocument/completion', {
+      textDocument = vim.lsp.util.make_text_document_params(bufnr),
+      position = position,
+    }, 10000, bufnr)
+    assert(completion and not completion.err, 'completion request failed')
+    local labels = {}
+    for _, item in ipairs(completion.result.items or completion.result) do
+      labels[item.label] = true
+    end
+    return labels
   end
+
+  local completion_labels = completion_labels_at(params.position)
   assert(completion_labels.width, 'completion should contain the visible local width')
   assert(completion_labels.rect, 'completion should contain builtin functions')
-  assert(completion_labels.cell, 'completion should contain language keywords')
+  assert(not completion_labels.cell, 'expressions should exclude declaration keywords')
+  assert(not completion_labels.Float, 'expressions should exclude type names')
+  assert(not completion_labels.let, 'nested expressions should exclude statement keywords')
+
+  local declaration_labels = completion_labels_at({ line = 0, character = #'cell t' })
+  assert(
+    vim.tbl_isempty(declaration_labels),
+    'a cell declaration name should not offer existing symbols: ' .. vim.inspect(declaration_labels)
+  )
+
+  local top_level_labels = completion_labels_at({ line = 0, character = #'ce' })
+  assert(top_level_labels.cell, 'top-level completion should contain the cell keyword')
+  assert(not top_level_labels.rect, 'top-level completion should exclude functions')
 
   local hover = client:request_sync('textDocument/hover', params, 10000, bufnr)
   assert(hover and not hover.err and hover.result, 'hover request failed')
