@@ -42,6 +42,38 @@ end
 --- Buffers this plugin installed its own `gd` mapping in.
 local gd_mapped_buffers = {}
 
+local highlight_group = vim.api.nvim_create_augroup('argon_document_highlights', { clear = true })
+local highlighted_buffers = {}
+
+local function enable_document_highlights(bufnr)
+  vim.api.nvim_clear_autocmds({ group = highlight_group, buffer = bufnr })
+  vim.api.nvim_create_autocmd({ 'CursorHold', 'CursorHoldI' }, {
+    group = highlight_group,
+    buffer = bufnr,
+    callback = vim.lsp.buf.document_highlight,
+  })
+  vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI', 'BufLeave' }, {
+    group = highlight_group,
+    buffer = bufnr,
+    callback = vim.lsp.buf.clear_references,
+  })
+  highlighted_buffers[bufnr] = true
+end
+
+local function release_document_highlights(bufnr)
+  if
+    not highlighted_buffers[bufnr]
+    or #vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) > 0
+  then
+    return
+  end
+  highlighted_buffers[bufnr] = nil
+  if vim.api.nvim_buf_is_valid(bufnr) then
+    vim.api.nvim_clear_autocmds({ group = highlight_group, buffer = bufnr })
+    vim.api.nvim_buf_call(bufnr, vim.lsp.buf.clear_references)
+  end
+end
+
 --- Drops the `gd` mapping this plugin installed, once no argon client is left
 --- attached.
 ---
@@ -97,6 +129,7 @@ vim.api.nvim_create_autocmd('LspDetach', {
         -- Scheduled: the detaching client is still attached at this point.
         vim.schedule(function()
             release_gd_mapping(args.buf)
+            release_document_highlights(args.buf)
         end)
     end,
 })
@@ -314,6 +347,9 @@ M.start = function(bufnr)
 
     local old_on_attach = lsp_start_config.on_attach
     lsp_start_config.on_attach = function(lsp_client, attached_bufnr, ...)
+        if lsp_client:supports_method('textDocument/documentHighlight') then
+            enable_document_highlights(attached_bufnr)
+        end
         -- Neovim maps `grr` to references and points `tagfunc` (so `<C-]>`)
         -- at go-to-definition on its own. `gd` is the mapping people reach
         -- for first, so provide it, leaving any existing one alone.

@@ -1,9 +1,9 @@
 //! Hand-written, zero-copy parser for the Argon language.
 //!
-//! Replaces the ANTLR-generated parser: a streaming byte lexer ([`lexer`]) feeds
-//! a single-pass recursive-descent + Pratt parser ([`grammar`]) that builds the
-//! AST directly, borrowing all identifier/string text from the source. The two
-//! public entry points match the contract the rest of the compiler expects.
+//! A streaming byte lexer ([`lexer`]) feeds a single-pass recursive-descent +
+//! Pratt parser ([`grammar`]) that builds the AST directly, borrowing all
+//! identifier/string text from the source. The two public entry points match
+//! the contract the rest of the compiler expects.
 
 mod grammar;
 mod lexer;
@@ -18,12 +18,132 @@ use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{CallExpr, Decl};
 use crate::parse::{AnnotatedParseAst, ParseMetadata};
 
+/// The syntactic role of the identifier, keyword, or expression being entered
+/// at an editor cursor.
+///
+/// Completion uses this independently of type checking, so it remains
+/// available while the source is incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionSite {
+    /// Recovery could not identify a narrower grammar position.
+    Unknown,
+    /// Between declarations in a source file.
+    TopLevel,
+    /// At the start of a statement or tail expression in a scope.
+    Statement,
+    /// Somewhere an expression is expected.
+    Expression,
+    /// Somewhere a type specification is expected.
+    Type,
+    /// A path in a `use` declaration.
+    ImportPath,
+    /// A name being introduced rather than referenced.
+    NewIdentifier,
+    /// One particular grammar keyword is required here.
+    Keyword(&'static str),
+    /// Inside a comment or string literal.
+    Suppressed,
+}
+
+impl CompletionSite {
+    pub(super) fn priority(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::TopLevel => 1,
+            // These intentionally tie: the parser records Statement before
+            // descending into a direct expression. First-wins preserves that
+            // distinction, while a nested expression recorded later is not
+            // overwritten when the scope closes at the same cursor.
+            Self::Statement | Self::Expression => 2,
+            Self::Type | Self::ImportPath | Self::Keyword(_) => 3,
+            Self::NewIdentifier => 4,
+            Self::Suppressed => 5,
+        }
+    }
+}
+
 /// A syntax error with the byte span (into the original input) it occurred at.
-/// Shape-compatible with the old `antlr::AntlrParseError`.
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub span: Span,
     pub message: String,
+}
+
+/// Classify the grammar position at `cursor` for editor completion.
+///
+/// The regular recovery parser does the classification, so half-written code
+/// follows the same grammar as a complete source file. Strings and comments
+/// are suppressed before parsing because the lexer deliberately skips
+/// comments and would otherwise classify the token following one.
+pub fn completion_site(input: &str, cursor: usize) -> CompletionSite {
+    let cursor = cursor.min(input.len());
+    if cursor_is_suppressed(input, cursor) {
+        return CompletionSite::Suppressed;
+    }
+    let normalized = input.trim_start_matches(char::is_whitespace);
+    let offset_base = input.len() - normalized.len();
+    let mut parser = grammar::Parser::for_completion(normalized, offset_base, cursor);
+    parser.parse_root();
+    parser.completion_site().unwrap_or(CompletionSite::Unknown)
+}
+
+/// Whether the cursor is after the opening delimiter of an unfinished string,
+/// line comment, or nested block comment. Scanning only to the cursor also
+/// handles a cursor in the middle of an otherwise complete token.
+fn cursor_is_suppressed(input: &str, cursor: usize) -> bool {
+    let bytes = &input.as_bytes()[..cursor];
+    let mut index = 0;
+    let mut block_depth = 0usize;
+    let mut string = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if line_comment {
+            if matches!(byte, b'\n' | b'\r') {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_depth += 1;
+                index += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && next == Some(b'/') {
+            line_comment = true;
+            index += 2;
+        } else if byte == b'/' && next == Some(b'*') {
+            block_depth = 1;
+            index += 2;
+        } else {
+            if byte == b'"' {
+                string = true;
+            }
+            index += 1;
+        }
+    }
+    line_comment || block_depth > 0 || string
 }
 
 /// Parse a whole source file into an [`AnnotatedParseAst`].
@@ -90,6 +210,40 @@ mod tests {
     /// Parse `cell __t__() { <body> }` and return whether it succeeded.
     fn snippet_ok(body: &str) -> bool {
         parse(&format!("cell __t__() {{ {body} }}")).is_ok()
+    }
+
+    fn site(marked: &str) -> super::CompletionSite {
+        let cursor = marked.find('|').expect("test source has a cursor marker");
+        let source = marked.replacen('|', "", 1);
+        super::completion_site(&source, cursor)
+    }
+
+    #[test]
+    fn completion_sites_follow_incomplete_grammar_positions() {
+        use super::CompletionSite::*;
+
+        for (source, expected) in [
+            ("ce|", TopLevel),
+            ("cell |", NewIdentifier),
+            ("cell top(ar|: Float) {}", NewIdentifier),
+            ("cell top(arg: Flo|) {}", Type),
+            ("fn helper() -> | {}", Type),
+            ("use |", ImportPath),
+            ("use lib::shape |;", Keyword("as")),
+            ("use lib::shape as |;", NewIdentifier),
+            ("cell top() { let | = 1.; }", NewIdentifier),
+            ("cell top() { for | in [] {} }", NewIdentifier),
+            ("cell top() { let value = re|; }", Expression),
+            ("cell top() { re|; }", Statement),
+            ("cell top() { rect(|); }", Expression),
+            ("cell top() { for item | [] {} }", Keyword("in")),
+            ("cell top() { if true {} | {} }", Keyword("else")),
+            ("// cell |", Suppressed),
+            ("cell top() { let value = \"ce|ll\"; }", Suppressed),
+            ("/* outer /* cell | */", Suppressed),
+        ] {
+            assert_eq!(site(source), expected, "{source}");
+        }
     }
 
     #[test]
@@ -342,7 +496,7 @@ mod tests {
     #[test]
     fn leading_comment_is_allowed() {
         // The lexer skips `//` comments as trivia everywhere, so a comment
-        // before the first declaration parses fine (ANTLR rejected this).
+        // before the first declaration parses fine.
         assert!(parse("// header\ncell c() {}\n").is_ok());
         assert!(parse("  \n// c1\n// c2\nfn f() -> Float { 1. }\n").is_ok());
     }

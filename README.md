@@ -273,13 +273,33 @@ The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
 
 Errors are reported as you type; `:Argon diagnostics` opens them in a list.
-Code navigation works on variables, function and cell names, enums and their
-variants, module paths, and the fields of an instance:
+The analyzer exposes LSP completion for visible local bindings, functions,
+cells, modules, enum variants, builtin types/functions, keyword arguments, and
+type-aware fields. Suggestions are filtered by syntax: declaration-name slots
+stay empty, type positions show types, and expressions do not offer declaration
+keywords. Argon does not enable or configure a completion UI; Neovim's
+`<C-x><C-o>` works without additional setup, and completion plugins can consume
+the same LSP results.
+
+To include LSP suggestions in Neovim 0.12's built-in automatic completion,
+configure the editor rather than Argon:
+
+```lua
+vim.opt.autocomplete = true
+vim.opt.complete:append('o')
+```
+
+Navigation and IntelliSense work on variables, function and cell names, enums
+and their variants, module paths, and the fields of an instance. References to
+the symbol under the cursor are highlighted after `CursorHold`:
 
 | Mapping | Action |
 |---|---|
 | `gd`, `<C-]>` | Go to definition |
 | `grr` | List references |
+| `K` | Show type or signature information |
+| `<C-s>` (insert mode) | Show signature help |
+| `gO` | List symbols in the current file |
 
 Navigation crosses files, follows path dependencies into other libraries, and
 jumps into the standard library, which is written to `~/.cache/argon` the

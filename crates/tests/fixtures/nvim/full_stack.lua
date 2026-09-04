@@ -12,6 +12,14 @@ local function wait_for(description, predicate)
 end
 
 local bufnr = vim.api.nvim_get_current_buf()
+local expected_completeopt
+if vim.env.ARGON_TEST_MODE == 'navigation' then
+  expected_completeopt = 'menu,preview'
+  vim.api.nvim_set_option_value('completeopt', expected_completeopt, {
+    buf = bufnr,
+    scope = 'local',
+  })
+end
 wait_for('Argon language server', function()
   return #vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) == 1
     and vim.fn.exists(':Argon') == 2
@@ -92,6 +100,22 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
     vim.fn.maparg('gd', 'n', false, true).buffer == 1,
     'the plugin should map gd in an attached buffer'
   )
+  assert(
+    vim.api.nvim_get_option_value('completeopt', {
+      buf = bufnr,
+      scope = 'local',
+    }) == expected_completeopt,
+    'attaching Argon should not change the user completion options'
+  )
+  for _, capability in ipairs({
+    'completionProvider',
+    'hoverProvider',
+    'signatureHelpProvider',
+    'documentSymbolProvider',
+    'documentHighlightProvider',
+  }) do
+    assert(client.server_capabilities[capability], 'missing LSP capability ' .. capability)
+  end
 
   -- `width` on the last line refers to the `let` on the second.
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
@@ -134,6 +158,72 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
     'definition should land on the let binding, got line '
       .. tostring(lines[location.range.start.line + 1])
   )
+
+  local function completion_labels_at(position)
+    local completion = client:request_sync('textDocument/completion', {
+      textDocument = vim.lsp.util.make_text_document_params(bufnr),
+      position = position,
+    }, 10000, bufnr)
+    assert(completion and not completion.err, 'completion request failed')
+    local labels = {}
+    for _, item in ipairs(completion.result.items or completion.result) do
+      labels[item.label] = true
+    end
+    return labels
+  end
+
+  local completion_labels = completion_labels_at(params.position)
+  assert(completion_labels.width, 'completion should contain the visible local width')
+  assert(completion_labels.rect, 'completion should contain builtin functions')
+  assert(not completion_labels.cell, 'expressions should exclude declaration keywords')
+  assert(not completion_labels.Float, 'expressions should exclude type names')
+  assert(not completion_labels.let, 'nested expressions should exclude statement keywords')
+
+  local declaration_labels = completion_labels_at({ line = 0, character = #'cell t' })
+  assert(
+    vim.tbl_isempty(declaration_labels),
+    'a cell declaration name should not offer existing symbols: ' .. vim.inspect(declaration_labels)
+  )
+
+  local top_level_labels = completion_labels_at({ line = 0, character = #'ce' })
+  assert(top_level_labels.cell, 'top-level completion should contain the cell keyword')
+  assert(not top_level_labels.rect, 'top-level completion should exclude functions')
+
+  local hover = client:request_sync('textDocument/hover', params, 10000, bufnr)
+  assert(hover and not hover.err and hover.result, 'hover request failed')
+  assert(
+    hover.result.contents.value:find('let width: Float', 1, true),
+    'hover should show the inferred local type: ' .. vim.inspect(hover.result)
+  )
+
+  local highlights = client:request_sync('textDocument/documentHighlight', params, 10000, bufnr)
+  assert(highlights and not highlights.err, 'document-highlight request failed')
+  assert(
+    #highlights.result == 3,
+    'expected the width declaration and two uses to be highlighted, got '
+      .. tostring(#highlights.result)
+  )
+
+  local rect_column = assert(lines[3]:find('rect(', 1, true)) - 1 + #'rect('
+  local signature = client:request_sync('textDocument/signatureHelp', {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+    position = { line = 2, character = rect_column },
+  }, 10000, bufnr)
+  assert(signature and not signature.err and signature.result, 'signature-help request failed')
+  assert(
+    signature.result.signatures[1].label:find('fn rect(', 1, true) == 1,
+    'signature help should describe rect: ' .. vim.inspect(signature.result)
+  )
+
+  local symbols = client:request_sync('textDocument/documentSymbol', {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+  }, 10000, bufnr)
+  assert(symbols and not symbols.err, 'document-symbol request failed')
+  local symbol_names = {}
+  for _, symbol in ipairs(symbols.result) do
+    symbol_names[symbol.name] = true
+  end
+  assert(symbol_names.top and symbol_names.width, 'document outline is incomplete')
 
   params.context = { includeDeclaration = true }
   local references = client:request_sync('textDocument/references', params, 10000, bufnr)
