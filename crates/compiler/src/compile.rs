@@ -1694,6 +1694,7 @@ impl<'a> VarIdTyPass<'a> {
 
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
+        self.check_duplicate_decls();
         // Enum types must exist before imports and function signatures are
         // resolved. Imports are then installed before structs and functions
         // are declared, allowing imported enum and struct types in fields and
@@ -1765,6 +1766,44 @@ impl<'a> VarIdTyPass<'a> {
             use_decl.path.iter().map(|ident| ident.name.as_str()),
             1,
         )
+    }
+
+    /// Reports every top-level declaration whose name an earlier declaration
+    /// of this module already took.
+    ///
+    /// Cells, functions, structs, enums, and imports all bind into the one
+    /// module frame, so `struct Mode` after `enum Mode` clashes as much as two
+    /// `cell top`s do. The declaration passes run by kind rather than in
+    /// source order, so without this check the survivor of a clash was
+    /// whichever kind is declared last -- a struct always beat an enum of the
+    /// same name, whatever the file said -- and [`Self::declare_struct_decls`]
+    /// keys structs by name, so a repeated `struct S` dropped the first
+    /// declaration without a trace. The later declaration is reported and
+    /// binding proceeds as before; the file is already invalid.
+    ///
+    /// Modules are exempt: `mod m;` is resolved through `mod_bindings`, never
+    /// through this frame, so `mod m;` and `fn m` do not collide.
+    fn check_duplicate_decls(&mut self) {
+        let mut seen = IndexSet::new();
+        for decl in &self.ast.ast.decls {
+            let name = match decl {
+                Decl::Enum(e) => &e.name,
+                Decl::Struct(s) => &s.name,
+                Decl::Fn(f) => &f.name,
+                Decl::Cell(c) => &c.name,
+                Decl::Use(u) => u
+                    .alias
+                    .as_ref()
+                    .unwrap_or_else(|| u.path.last().expect("use paths are non-empty")),
+                Decl::Mod(_) | Decl::Constant(_) => continue,
+            };
+            if !seen.insert(name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+        }
     }
 
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
