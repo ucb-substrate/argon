@@ -46,10 +46,6 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
         .decls
         .iter()
         .filter_map(|decl| match decl {
-            Decl::Struct(decl) => Some(ParseError {
-                span: decl.name.span,
-                message: "struct declarations are not implemented".to_string(),
-            }),
             Decl::Constant(decl) => Some(ParseError {
                 span: decl.name.span,
                 message: "constant declarations are not implemented".to_string(),
@@ -135,6 +131,31 @@ mod tests {
             "let x = a && b!;",
             "let x = a < b && c >= d || !e;",
             "if a && b {} else {}",
+            // Struct literals: named fields in any order, shorthand fields,
+            // and a `..base` that must come last after a comma.
+            "let p = Point { x: 1., y: 2. };",
+            "let p = Point { x: 1., y: 2., };",
+            "let p = geom::Point { x: 1., y: 2. };",
+            "let p = lib::geom::Point { x: 1., y: 2. };",
+            "let p = Point { x, y };",
+            "let p = Point { x, y: 2. };",
+            "let p = Point { ..base };",
+            "let p = Point { x: 1., ..base };",
+            "let p = Point { x, ..base };",
+            "let p = Unit {};",
+            "let x = Point { x: 1., y: 2. }.x;",
+            "let p = Outer { inner: Inner { a: 1 }, list: cons(Inner { a: 2 }, []) };",
+            "let p = Point { x: if c { 1. } else { 2. }, y: 2. };",
+            "foo(Point { x: 1., y: 2. }, p=Point { ..base });",
+            "let x = arr[Point { i: 0 }.i];",
+            // A literal in an `if`/`match`/`for` head needs parentheses, but
+            // is fine inside the construct's scopes and arms.
+            "if (p == Point { x: 1., y: 2. }) {} else {}",
+            "if c { Point { x: 1., y: 2. } } else { q }",
+            "match k { A => Point { x: 1., y: 2. }, }",
+            "for i in seq { let p = Point { x: i, y: i }; }",
+            // A `match` in an `if` head still allows literals in its arms.
+            "if match k { A => Point { x: 1. }, }.x == 1. {} else {}",
         ];
         for body in valid {
             assert!(snippet_ok(body), "should parse: `{body}`");
@@ -153,10 +174,62 @@ mod tests {
             "let x = 99999999999999999999;",   // out of range for Int
             "let x = 1 . 5;",                  // a float may not be split by trivia
             "let x = t.99999999999999999999;", // out of range tuple index
+            // `name {` in an `if`/`match`/`for` head is the construct's scope.
+            "if p == Point { x: 1. } {} else {}",
+            "match Point { x: 1. } { A => 1, }",
+            "for p in Point { xs: [] }.xs {}",
+            "let p = Point { x: };",         // missing value
+            "let p = Point { x: 1. ..b };",  // a comma is required before `..`
+            "let p = Point { ..b, };",       // no comma after the base
+            "let p = Point { ..b, x: 1. };", // the base must come last
+            "let p = Point { x.y };",        // a field is a bare identifier
+            "let p = Point { x: 1. y: 2. };",
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
         }
+    }
+
+    #[test]
+    fn struct_declarations_take_type_specs() {
+        assert!(parse("struct S { a: [Float], b: (Int, Int), c: Other, }").is_ok());
+        assert!(parse("struct Unit {}").is_ok());
+        assert!(parse("struct S { a }").is_err());
+        assert!(parse("struct S { a: }").is_err());
+        assert!(parse("struct S { a: Float b: Float }").is_err());
+    }
+
+    /// A shorthand field desugars to `name: name` with the value at the name's
+    /// own span, so later passes see an ordinary field.
+    #[test]
+    fn shorthand_struct_fields_desugar_to_a_path_at_the_name() {
+        use crate::ast::{Decl, Expr, Statement};
+
+        let ast = parse("cell __t__() { let p = Point { x, y: 1., ..q }; }").unwrap();
+        let Decl::Cell(cell) = &ast.ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        let Statement::LetBinding(binding) = &cell.scope.stmts[0] else {
+            panic!("expected a let binding");
+        };
+        let Expr::StructLit(lit) = &binding.value else {
+            panic!("expected a struct literal");
+        };
+        assert_eq!(lit.path.path.len(), 1);
+        assert_eq!(lit.fields.len(), 2);
+        assert!(lit.fields[0].shorthand);
+        assert_eq!(lit.fields[0].value.span(), lit.fields[0].name.span);
+        assert!(matches!(
+            &lit.fields[0].value,
+            Expr::IdentPath(path) if path.path.len() == 1 && path.path[0].name == "x"
+        ));
+        assert!(!lit.fields[1].shorthand);
+        assert!(matches!(lit.base, Some(Expr::IdentPath(_))));
+        // The literal spans from its path to the closing brace.
+        assert_eq!(
+            &ast.text[lit.span.start()..lit.span.end()],
+            "Point { x, y: 1., ..q }"
+        );
     }
 
     /// Renders an expression fully parenthesized.

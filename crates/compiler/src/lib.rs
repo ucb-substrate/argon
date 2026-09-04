@@ -214,6 +214,7 @@ mod tests {
     const ARGON_PATH: &str = concatcp!(EXAMPLES_DIR, "/path/lib.ar");
     const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
     const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
+    const ARGON_STRUCTS: &str = concatcp!(EXAMPLES_DIR, "/structs/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -1703,6 +1704,261 @@ mod tests {
             assert_relative_eq!(rect.y1.0, y1, epsilon = EPSILON);
             assert_eq!(rect.layer.as_deref(), Some(layer));
         }
+    }
+
+    #[test]
+    fn argon_structs() {
+        let o = parse_workspace_with_std(ARGON_STRUCTS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        // `via(params)` and `via(wide)` are two parameterizations of `via`.
+        assert_eq!(cells.cells.len(), 3);
+        let mut insts: Vec<_> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .collect();
+        insts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let [narrow, wide] = insts.as_slice() else {
+            panic!("expected two instances, got {}", insts.len());
+        };
+        let child_rect = |cell| {
+            cells.cells[&cell]
+                .objects
+                .values()
+                .find_map(|object| object.get_rect())
+                .cloned()
+                .expect("via emits a rect")
+        };
+        // `grow(square(100.), 10.)`: `..s` keeps `h` at 100 while `w` grows.
+        let rect = child_rect(narrow.cell);
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+        assert_relative_eq!(rect.x1.0, 110., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 100., epsilon = EPSILON);
+        // `Size { w: 300., ..size }` inside `ViaParams { .., ..params }`.
+        let rect = child_rect(wide.cell);
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+        assert_relative_eq!(rect.x1.0, 300., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 100., epsilon = EPSILON);
+        assert_relative_eq!(wide.x, 160., epsilon = EPSILON);
+        // The outline is sized from a sequence of structs.
+        let outline = top
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top emits the outline");
+        assert_eq!(outline.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(outline.x1.0, 460., epsilon = EPSILON);
+        assert_relative_eq!(outline.y1.0, 100., epsilon = EPSILON);
+    }
+
+    /// A struct literal in a cell invocation, as `arc run --cell` and the GUI
+    /// open-cell command supply it.
+    #[test]
+    fn argon_structs_cell_invocation() {
+        let mut ast = parse_workspace_with_std(ARGON_STRUCTS).ast();
+        let invocation = crate::parse::splice_cell_invocation(
+            &mut ast,
+            "via(ViaParams { layer: \"met2\", size: geom::Size { w: 40., h: 20. }, n: 1 })",
+        )
+        .expect("invocation should splice");
+        let (typed, errors) = static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let config = WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH)));
+        let cells =
+            crate::compile::execute_cell_invocation(&typed, &invocation, &config).unwrap_valid();
+        let rect = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("via emits a rect");
+        assert_eq!(rect.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(rect.x1.0, 40., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 20., epsilon = EPSILON);
+    }
+
+    /// Struct values passed through the positional cell API are checked
+    /// against the declared parameter type, like every other argument.
+    #[test]
+    fn struct_cell_arguments_are_checked_at_runtime() {
+        let ast = parse_workspace_with_std(ARGON_STRUCTS).ast();
+        let size = |w: f64, h: f64| CellArg::Struct {
+            name: "geom::Size".to_owned(),
+            fields: vec![
+                ("w".to_owned(), CellArg::Float(w)),
+                ("h".to_owned(), CellArg::Float(h)),
+            ],
+        };
+        let params = CellArg::Struct {
+            name: "ViaParams".to_owned(),
+            fields: vec![
+                ("layer".to_owned(), CellArg::String("met1".to_owned())),
+                ("size".to_owned(), size(30., 20.)),
+                ("n".to_owned(), CellArg::Int(1)),
+            ],
+        };
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["via"],
+                args: vec![params],
+            },
+        )
+        .unwrap_valid();
+        let rect = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("via emits a rect");
+        assert_relative_eq!(rect.x1.0, 30., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 20., epsilon = EPSILON);
+
+        let wrong = compile(
+            &ast,
+            CompileInput {
+                cell: &["via"],
+                args: vec![size(30., 20.)],
+            },
+        );
+        let errors = wrong.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCellArgumentType { .. })),
+            "{:?}",
+            errors.errors
+        );
+    }
+
+    /// Type-checks a one-file workspace and returns the kinds of its static
+    /// errors.
+    fn static_errors_of(source: &str) -> Vec<StaticErrorKind> {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        output.errors.into_iter().map(|error| error.kind).collect()
+    }
+
+    /// The static errors of `body` as the body of a function that sees a
+    /// `Size`, an identically shaped `Other`, and an `Int`.
+    fn struct_errors(body: &str) -> Vec<StaticErrorKind> {
+        static_errors_of(&format!(
+            "struct Size {{ w: Float, h: Float, }}\n\
+             struct Other {{ w: Float, h: Float, }}\n\
+             fn f(s: Size, o: Other, n: Int) -> Float {{ {body} }}\n"
+        ))
+    }
+
+    #[test]
+    fn struct_literals_are_checked_against_the_declaration() {
+        assert!(struct_errors("Size { w: 1., h: 2. }.w").is_empty());
+        // Fields may come in any order; `..base` supplies the ones not listed.
+        assert!(struct_errors("Size { h: 2., w: 1. }.w").is_empty());
+        assert!(struct_errors("Size { w: 1., ..s }.h").is_empty());
+        assert!(struct_errors("Size { ..s }.h").is_empty());
+        assert!(struct_errors("Size { w: s.w, ..s }.h").is_empty());
+
+        assert!(matches!(
+            struct_errors("Size { w: 1. }.w").as_slice(),
+            [StaticErrorKind::MissingStructFields { ty, fields }]
+                if ty == "struct Size" && fields == "`h`"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1., h: 2., d: 3. }.w").as_slice(),
+            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "struct Size"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1., w: 2., h: 3. }.w").as_slice(),
+            [StaticErrorKind::DuplicateStructField { field }] if field == "w"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1, h: 2. }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "Float" && found == "Int"
+        ));
+        // Structs are nominal: a same-shaped struct is not a valid base.
+        assert!(matches!(
+            struct_errors("Size { w: 1., ..o }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "struct Size" && found == "struct Other"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1., ..n }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { found, .. }] if found == "Int"
+        ));
+        assert!(matches!(
+            struct_errors("n { w: 1., h: 2. }.w").as_slice(),
+            [StaticErrorKind::NotAStruct]
+        ));
+        assert!(matches!(
+            struct_errors("Nope { w: 1., h: 2. }.w").as_slice(),
+            [StaticErrorKind::UndeclaredVar { name }] if name == "Nope"
+        ));
+        assert!(matches!(
+            struct_errors("s.d").as_slice(),
+            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "struct Size"
+        ));
+        // A shorthand field reads a local of the same name.
+        assert!(matches!(
+            struct_errors("Size { w, h: 1. }.w").as_slice(),
+            [StaticErrorKind::UndeclaredVar { name }] if name == "w"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: s.w, ..s }.w + Size { ..o }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+        // Structs cannot be compared.
+        let errors = struct_errors("if (s == Size { w: 1., h: 1. }) { 1. } else { 2. }");
+        assert!(!errors.is_empty());
+        assert!(
+            errors
+                .iter()
+                .all(|e| matches!(e, StaticErrorKind::ComparisonInvalidType)),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn struct_declarations_are_checked() {
+        assert!(matches!(
+            static_errors_of("struct Node { next: Node, }\n").as_slice(),
+            [StaticErrorKind::RecursiveStruct { name }] if name == "Node"
+        ));
+        let errors = static_errors_of("struct A { b: [B], }\nstruct B { a: (Int, A), }\n");
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::RecursiveStruct { .. }]),
+            "{errors:?}"
+        );
+        assert!(matches!(
+            static_errors_of("struct S { a: Nope, }\n").as_slice(),
+            [StaticErrorKind::UnknownType]
+        ));
+        assert!(matches!(
+            static_errors_of("struct S { a: Int, a: Float, }\n").as_slice(),
+            [StaticErrorKind::DuplicateNameDeclaration]
+        ));
+        assert!(matches!(
+            static_errors_of("struct rect { a: Int, }\n").as_slice(),
+            [StaticErrorKind::RedeclarationOfBuiltin]
+        ));
+        // Forward references that do not close a cycle are fine, in any order.
+        assert!(
+            static_errors_of(
+                "struct Outer { inner: Inner, list: [Inner], pair: (Inner, Int), }\n\
+                 struct Inner { x: Float, }\n\
+                 fn f(o: Outer) -> Float { o.inner.x + o.list[0].x + o.pair.0.x }\n"
+            )
+            .is_empty()
+        );
     }
 
     #[test]

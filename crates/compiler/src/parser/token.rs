@@ -43,6 +43,7 @@ pub enum TokenKind {
     Arrow,    // ->
     AmpAmp,   // &&
     PipePipe, // ||
+    DotDot,   // ..
 
     // Single-character operators / punctuation.
     Lt,      // <
@@ -106,6 +107,7 @@ impl TokenKind {
             Arrow => "'->'",
             AmpAmp => "'&&'",
             PipePipe => "'||'",
+            DotDot => "'..'",
             Lt => "'<'",
             Gt => "'>'",
             Eq => "'='",

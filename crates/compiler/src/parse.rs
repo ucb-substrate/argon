@@ -59,6 +59,7 @@ impl AstMetadata for ParseMetadata {
     type FnDecl = ();
     type CastExpr = ();
     type TupleExpr = ();
+    type StructLitExpr = ();
 }
 
 /// The two files a `mod <name>;` declaration can name.

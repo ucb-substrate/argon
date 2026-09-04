@@ -27,7 +27,8 @@ use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
-    Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
+    Span, StructDecl, StructField, StructLitExpr, StructLitField, TySpec, TySpecKind, UnaryOp,
+    UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
@@ -534,13 +535,30 @@ impl<'a> ImportPass<'a> {
                     self.record_dependency(self.use_module_path(u), u.span);
                 }
                 Decl::Enum(_) => {}
+                Decl::Struct(s) => {
+                    self.transform_struct_decl(s);
+                }
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
-                Decl::Struct(_) | Decl::Constant(_) => continue,
+                Decl::Constant(_) => continue,
             }
         }
 
         (self.deps, self.errors)
+    }
+
+    /// Records the module a qualified item path names: everything before the
+    /// final segment, resolved like a `use`. A call and a struct literal both
+    /// name an item this way.
+    fn record_item_path_dependency(&mut self, path: &IdentPath<Substr, ParseMetadata>) {
+        if path.path.len() > 1 && path.path[0].name != "std" {
+            let module = module_prefix(
+                self.current_path,
+                path.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
+            self.record_dependency(module, path.span);
+        }
     }
 }
 
@@ -595,6 +613,38 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        _input: &StructDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[StructField<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        _input: &StructField<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        _input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
+        path: &IdentPath<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[StructLitField<Self::OutputS, Self::OutputMetadata>],
+        _base: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        self.record_item_path_dependency(path);
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
     }
 
     fn dispatch_cell_decl(
@@ -719,28 +769,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if func.path.len() > 1 && func.path[0].name != "std" {
-            let path = if func.path[0].name == "lib" {
-                func.path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(1)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec()
-            } else {
-                self.current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        func.path
-                            .iter()
-                            .dropping_back(1)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec()
-            };
-            self.record_dependency(path, func.span);
-        }
+        self.record_item_path_dependency(func);
     }
 
     fn dispatch_emit_expr(
@@ -1189,6 +1218,9 @@ pub enum Ty {
     CellFn(Box<CellFnTy>),
     Seq(Box<Ty>),
     Tuple(Vec<Ty>),
+    /// A user-declared `struct`. Nominal: two declarations with identical
+    /// fields are distinct types.
+    Struct(Arc<StructTy>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1257,6 +1289,7 @@ impl std::fmt::Display for Ty {
             Ty::Enum(e) => write!(f, "enum {} {{{}}}", e.name, e.variants.iter().format(", ")),
             Ty::Seq(inner) => write!(f, "[{inner}]"),
             Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
+            Ty::Struct(s) => write!(f, "struct {}", s.name),
         }
     }
 }
@@ -1528,13 +1561,36 @@ pub struct EnumTy {
     pub(crate) variants: IndexSet<String>,
 }
 
+/// The type of a `struct` declaration.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct StructTy {
+    /// The [`VarId`] the struct's name is bound to, which doubles as the type's
+    /// identity. Struct types are *nominal*, so two same-shaped declarations
+    /// are different types, and `id` is the only field equality reads. Being
+    /// the name's own id, it also lets navigation and fingerprinting reach the
+    /// declaration without an `EnumId`-style side map.
+    pub(crate) id: VarId,
+    /// The declared name, module-qualified, for diagnostics.
+    pub(crate) name: String,
+    /// The fields and their types, in declaration order.
+    pub(crate) fields: IndexMap<String, Ty>,
+}
+
+impl PartialEq for StructTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type IdentPath = (Option<VarId>, Ty);
     /// `None` when the name was rejected before it could be bound.
     type EnumDecl = Option<(VarId, EnumId)>;
-    type StructDecl = ();
-    type StructField = ();
+    /// `None` when the name was rejected before it could be bound.
+    type StructDecl = Option<VarId>;
+    /// The field's resolved type.
+    type StructField = Ty;
     type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
@@ -1556,6 +1612,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Typ = ();
     type CastExpr = Ty;
     type TupleExpr = Ty;
+    type StructLitExpr = Ty;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -1638,9 +1695,11 @@ impl<'a> VarIdTyPass<'a> {
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
         // Enum types must exist before imports and function signatures are
-        // resolved. Imports are then installed before functions are declared,
-        // allowing imported enum types in signatures and imported functions in
-        // any declaration body regardless of source order.
+        // resolved. Imports are then installed before structs and functions
+        // are declared, allowing imported enum and struct types in fields and
+        // signatures, and imported functions in any declaration body,
+        // regardless of source order. Structs come before functions so that a
+        // signature may name a struct declared further down.
         for decl in &self.ast.ast.decls {
             if let Decl::Enum(e) = decl {
                 self.declare_enum_decl(e);
@@ -1651,6 +1710,7 @@ impl<'a> VarIdTyPass<'a> {
                 self.declare_use_decl(u);
             }
         }
+        self.declare_struct_decls();
         for decl in &self.ast.ast.decls {
             if let Decl::Fn(f) = decl {
                 self.declare_fn_decl(f);
@@ -1674,9 +1734,12 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
+                Decl::Struct(s) => {
+                    decls.push(Decl::Struct(self.transform_struct_decl(s)));
+                }
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
-                Decl::Struct(_) | Decl::Constant(_) => continue,
+                Decl::Constant(_) => continue,
             }
         }
 
@@ -1787,6 +1850,107 @@ impl<'a> VarIdTyPass<'a> {
             variants,
         });
         self.alloc(&input.name.name, ty);
+    }
+
+    /// Declares every struct in the module, each after the local structs its
+    /// fields name, so that a field may refer to a struct declared further
+    /// down the file.
+    ///
+    /// A struct whose fields lead back to itself has no finite value, since
+    /// there is no optional type to end the recursion. The field that closes
+    /// the cycle is reported and typed `Unknown`, so the declaration still
+    /// binds and its other uses are checked normally.
+    fn declare_struct_decls(&mut self) {
+        let structs: IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>> = self
+            .ast
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Struct(s) => Some((s.name.name.as_str(), s)),
+                _ => None,
+            })
+            .collect();
+        let mut visiting = IndexSet::new();
+        let mut declared = IndexSet::new();
+        for name in structs.keys().copied().collect::<Vec<_>>() {
+            self.declare_struct_after_deps(name, &structs, &mut visiting, &mut declared);
+        }
+    }
+
+    fn declare_struct_after_deps(
+        &mut self,
+        name: &'a str,
+        structs: &IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>>,
+        visiting: &mut IndexSet<&'a str>,
+        declared: &mut IndexSet<&'a str>,
+    ) {
+        if declared.contains(name) {
+            return;
+        }
+        let decl = structs[name];
+        visiting.insert(name);
+        let mut recursive = IndexSet::new();
+        for (index, field) in decl.fields.iter().enumerate() {
+            for dep in ty_spec_names(&field.ty) {
+                // Anything that is not a struct of this module -- a primitive,
+                // an enum, an import, a typo -- is resolved by `ty_from_spec`.
+                if !structs.contains_key(dep) {
+                    continue;
+                }
+                if visiting.contains(dep) {
+                    recursive.insert(index);
+                } else {
+                    self.declare_struct_after_deps(dep, structs, visiting, declared);
+                }
+            }
+        }
+        visiting.swap_remove(name);
+        self.declare_struct_decl(decl, &recursive);
+        declared.insert(name);
+    }
+
+    /// Declares one struct. `recursive` holds the indices of the fields that
+    /// would make the type contain itself.
+    fn declare_struct_decl(
+        &mut self,
+        input: &'a StructDecl<Substr, ParseMetadata>,
+        recursive: &IndexSet<usize>,
+    ) {
+        if BUILTINS.contains(&input.name.name.as_str()) {
+            self.errors.push(StaticError {
+                span: self.span(input.name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+            return;
+        }
+        let id = self.alloc_id();
+        let mut fields = IndexMap::with_capacity(input.fields.len());
+        for (index, field) in input.fields.iter().enumerate() {
+            let ty = if recursive.contains(&index) {
+                self.errors.push(StaticError {
+                    span: self.span(field.ty.span),
+                    kind: StaticErrorKind::RecursiveStruct {
+                        name: input.name.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            } else {
+                self.ty_from_spec(&field.ty)
+            };
+            if fields.insert(field.name.name.to_string(), ty).is_some() {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+        }
+        let ty = Ty::Struct(Arc::new(StructTy {
+            id,
+            name: self.qualified_name(&input.name.name),
+            fields,
+        }));
+        self.bind(&input.name.name, id, ty);
     }
 
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
@@ -2167,6 +2331,16 @@ impl<'a> VarIdTyPass<'a> {
     }
 }
 
+/// The identifiers a type annotation is built from: `[(A, B)]` names `A` and
+/// `B`.
+fn ty_spec_names<M: AstMetadata>(spec: &TySpec<Substr, M>) -> Vec<&str> {
+    match &spec.kind {
+        TySpecKind::Ident(ident) => vec![ident.name.as_str()],
+        TySpecKind::Seq(inner) => ty_spec_names(inner),
+        TySpecKind::Tuple(items) => items.iter().flat_map(ty_spec_names).collect(),
+    }
+}
+
 impl<S> Expr<S, VarIdTyMetadata> {
     pub(crate) fn ty(&self) -> Ty {
         match self {
@@ -2191,6 +2365,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
             Expr::Tuple(t) => t.metadata.clone(),
+            Expr::StructLit(lit) => lit.metadata.clone(),
         }
     }
 }
@@ -2284,6 +2459,170 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Some((var_id, Ty::Enum(enum_ty))) => Some((var_id, enum_ty.id)),
             _ => None,
         }
+    }
+
+    fn transform_struct_decl(
+        &mut self,
+        input: &StructDecl<Substr, Self::InputMetadata>,
+    ) -> StructDecl<Substr, Self::OutputMetadata> {
+        // `declare_struct_decls` already resolved every field type; the
+        // annotated fields carry those types rather than resolving the specs a
+        // second time, which would report each error twice.
+        let struct_ty = match self.lookup(&input.name.name) {
+            Some((_, Ty::Struct(struct_ty))) => Some(struct_ty),
+            _ => None,
+        };
+        let name = self.transform_ident(&input.name);
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| {
+                let ty = struct_ty
+                    .as_ref()
+                    .and_then(|struct_ty| struct_ty.fields.get(field.name.name.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                StructField {
+                    name: self.transform_ident(&field.name),
+                    ty: self.transform_ty_spec(&field.ty),
+                    span: field.span,
+                    metadata: ty,
+                }
+            })
+            .collect_vec();
+        let metadata = self.dispatch_struct_decl(input, &name, &fields);
+        StructDecl {
+            name,
+            fields,
+            span: input.span,
+            metadata,
+        }
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        _input: &StructDecl<Substr, Self::InputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
+        _fields: &[StructField<Substr, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+        // Like `dispatch_enum_decl`: a name that collided with a builtin was
+        // never bound, and there is no id to report.
+        match self.lookup(&name.name) {
+            Some((var_id, Ty::Struct(_))) => Some(var_id),
+            _ => None,
+        }
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        _input: &StructField<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &TySpec<Substr, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
+        // `transform_struct_decl` builds the fields itself.
+        unreachable!()
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        _input: &IdentPath<Substr, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
+        // Resolved by `dispatch_struct_lit_expr`, whose metadata carries the
+        // struct type; like a call's `func` path, this one stays unresolved.
+        (None, Ty::Unknown)
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        input: &StructLitExpr<Substr, Self::InputMetadata>,
+        path: &IdentPath<Substr, Self::OutputMetadata>,
+        fields: &[StructLitField<Substr, Self::OutputMetadata>],
+        base: &Option<Expr<Substr, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        let name = &path.path.last().expect("paths are non-empty").name;
+        let lookup = if path.path.len() == 1 {
+            self.lookup(name)
+        } else {
+            let module = module_prefix(
+                self.current_path,
+                path.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
+            if &module == self.current_path {
+                self.lookup(name)
+            } else {
+                self.mod_bindings
+                    .get(&module)
+                    .and_then(|frame| frame.var_bindings.get(name.as_str()).cloned())
+            }
+        };
+        let Some((_, ty)) = lookup else {
+            self.errors.push(StaticError {
+                span: self.span(path.span),
+                kind: if path.path.len() == 1 {
+                    self.unresolved_local_name_error(name, path.span)
+                } else {
+                    StaticErrorKind::UndeclaredVar {
+                        name: name.to_string(),
+                    }
+                },
+            });
+            return Ty::Unknown;
+        };
+        let Ty::Struct(struct_ty) = ty else {
+            // An `Unknown` binding was already diagnosed where it was bound.
+            if !matches!(ty, Ty::Unknown) {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::NotAStruct,
+                });
+            }
+            return Ty::Unknown;
+        };
+        let ty = Ty::Struct(struct_ty.clone());
+
+        let mut seen = IndexSet::new();
+        for field in fields {
+            let field_name = field.name.name.as_str();
+            let Some(expected) = struct_ty.fields.get(field_name) else {
+                self.no_field_on_ty(&field.name, ty.clone());
+                continue;
+            };
+            if !seen.insert(field_name) {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateStructField {
+                        field: field_name.to_string(),
+                    },
+                });
+                continue;
+            }
+            self.assert_eq_ty(field.value.span(), &field.value.ty(), expected);
+        }
+
+        match base {
+            // Every field not listed comes from the base, which therefore has
+            // to be this very struct.
+            Some(base) => self.assert_eq_ty(base.span(), &base.ty(), &ty),
+            None => {
+                let missing = struct_ty
+                    .fields
+                    .keys()
+                    .filter(|name| !seen.contains(name.as_str()))
+                    .map(|name| format!("`{name}`"))
+                    .collect_vec();
+                if !missing.is_empty() {
+                    self.errors.push(StaticError {
+                        span: self.span(input.span),
+                        kind: StaticErrorKind::MissingStructFields {
+                            ty: ty.to_string(),
+                            fields: missing.join(", "),
+                        },
+                    });
+                }
+            }
+        }
+        ty
     }
 
     fn dispatch_cell_decl(
@@ -2698,6 +3037,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
                 Ty::Unknown
             }
+            Ty::Struct(ref s) => match s.fields.get(field.name.as_str()) {
+                Some(ty) => ty.clone(),
+                None => self.no_field_on_ty(field, base_ty.clone()),
+            },
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
@@ -3155,6 +3498,12 @@ pub enum CellArg {
     /// An enum variant, identified by name like [`Value::EnumValue`].
     Enum(String),
     Seq(Vec<CellArg>),
+    /// A struct value: the qualified name of its type and its fields in
+    /// declaration order, like [`Value::Struct`].
+    Struct {
+        name: String,
+        fields: Vec<(String, CellArg)>,
+    },
 }
 
 impl CellArg {
@@ -3170,6 +3519,14 @@ impl CellArg {
                 values.iter().all(|value| value.matches_ty(inner))
             }
             (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            (Self::Struct { name, fields }, Ty::Struct(ty)) => {
+                *name == ty.name
+                    && fields.len() == ty.fields.len()
+                    && fields
+                        .iter()
+                        .zip(&ty.fields)
+                        .all(|((name, value), (field, ty))| name == field && value.matches_ty(ty))
+            }
             _ => false,
         }
     }
@@ -3182,6 +3539,7 @@ impl CellArg {
             Self::String(_) => "String",
             Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
+            Self::Struct { .. } => "struct",
         }
     }
 }
@@ -3201,6 +3559,7 @@ pub(crate) enum CellArgKey {
     String(String),
     Enum(String),
     Seq(Vec<CellArgKey>),
+    Struct(String, Vec<(String, CellArgKey)>),
 }
 
 impl From<&CellArg> for CellArgKey {
@@ -3212,6 +3571,13 @@ impl From<&CellArg> for CellArgKey {
             CellArg::String(s) => Self::String(s.clone()),
             CellArg::Enum(v) => Self::Enum(v.clone()),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
+            CellArg::Struct { name, fields } => Self::Struct(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from(value)))
+                    .collect(),
+            ),
         }
     }
 }
@@ -5741,6 +6107,28 @@ impl<'a> ExecPass<'a> {
                         .collect(),
                 })
             }),
+            Expr::StructLit(lit) => {
+                // A static error aborts compilation before anything is
+                // executed, so the literal is known to name a struct.
+                let Ty::Struct(ty) = &lit.metadata else {
+                    unreachable!("struct literal was not resolved to a struct type")
+                };
+                let ty = ty.clone();
+                self.new_deferred_value(loc, |this| {
+                    let fields = lit
+                        .fields
+                        .iter()
+                        .map(|field| this.visit_expr(loc, &field.value))
+                        .collect();
+                    let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
+                    PartialEvalState::StructLit(Box::new(PartialStructLit {
+                        expr: (**lit).clone(),
+                        ty,
+                        fields,
+                        base,
+                    }))
+                })
+            }
         }
     }
 
@@ -5794,6 +6182,19 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 Some(CellArg::Seq(args))
+            }
+            Value::Struct(value) => {
+                let mut fields = Vec::with_capacity(value.fields.len());
+                for (name, v) in value.fields.iter() {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => fields.push((name.clone(), arg)),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Struct {
+                    name: value.name.clone(),
+                    fields,
+                })
             }
             // Already reported when it was poisoned. The caller turns this
             // `Err` into poison of its own rather than a second diagnostic
@@ -7580,6 +7981,18 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
                         }
+                        ValueRef::Struct(value) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            // The base may have arrived as `Any`, so the field
+                            // was never checked against the struct.
+                            let Some(val) = value.fields.get(field).cloned() else {
+                                let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
                         ValueRef::Inst(inst) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
                                 "x" => Some(Value::Linear(inst.x.clone())),
@@ -7982,6 +8395,71 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::StructLit(lit) => {
+                let pending = lit
+                    .fields
+                    .iter()
+                    .copied()
+                    .chain(lit.base)
+                    .find(|input| !self.values[input].is_ready());
+                if let Some(pending) = pending {
+                    self.add_value_dependent(pending, vid);
+                    false
+                } else {
+                    // The fields not listed come from the base, which the
+                    // static check proved to be this struct unless it was
+                    // typed `Any`.
+                    let base = match lit.base {
+                        None => None,
+                        Some(base) => match self.values[&base].get_ready() {
+                            Some(Value::Struct(value)) if value.name == lit.ty.name => {
+                                Some(value.fields.clone())
+                            }
+                            _ => {
+                                let base = lit.expr.base.as_ref().expect("base was evaluated");
+                                let span = self.span(&vref.loc, base.span());
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            }
+                        },
+                    };
+                    // Declaration order, whatever order the literal used:
+                    // `CellArg::Struct` fields are matched pairwise against
+                    // the type's.
+                    let fields = lit
+                        .ty
+                        .fields
+                        .keys()
+                        .map(|name| {
+                            let explicit = lit
+                                .expr
+                                .fields
+                                .iter()
+                                .zip(&lit.fields)
+                                .find(|(field, _)| field.name.name == *name)
+                                .map(|(_, value)| self.values[value].get_ready().cloned());
+                            let value = match explicit {
+                                Some(value) => value,
+                                None => base.as_ref().and_then(|base| base.get(name).cloned()),
+                            };
+                            value.map(|value| (name.clone(), value))
+                        })
+                        .collect::<Option<IndexMap<_, _>>>();
+                    let Some(fields) = fields else {
+                        let span = self.span(&vref.loc, lit.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(cell_id, vid);
+                    };
+                    self.values.insert(
+                        vid,
+                        DeferValue::Ready(Value::Struct(Box::new(StructValue {
+                            name: lit.ty.name.clone(),
+                            fields,
+                        }))),
+                    );
+                    true
+                }
+            }
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
@@ -8141,6 +8619,10 @@ pub enum Value {
     Inst(Instance),
     Seq(Seq),
     Tuple(Vec<Value>),
+    /// A struct value. Boxed like [`Value::Fn`]: a struct is rarely stored
+    /// per sequence element, and its field map is large relative to the
+    /// scalar variants.
+    Struct(Box<StructValue>),
     SeqNil,
     Nil,
     /// A value whose diagnostic has already been reported.
@@ -8172,6 +8654,13 @@ impl Value {
             CellArg::String(s) => Value::String(s.clone()),
             CellArg::Enum(v) => Value::EnumValue(v.clone()),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
+            CellArg::Struct { name, fields } => Value::Struct(Box::new(StructValue {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from_arg(value)))
+                    .collect(),
+            })),
         }
     }
 
@@ -8193,6 +8682,7 @@ impl Value {
             Self::Inst(_) => "instance",
             Self::Seq(_) | Self::SeqNil => "sequence",
             Self::Tuple(_) => "tuple",
+            Self::Struct(_) => "struct",
             Self::Nil => "nil",
             // Matches `Ty::Unknown`'s rendering. Reaching a diagnostic that
             // names a poisoned value means one was not suppressed upstream;
@@ -8220,6 +8710,17 @@ impl Value {
             Arrayed::Array(s) => Self::Seq(s.into_iter().map(Value::from_array).collect()),
         }
     }
+}
+
+/// A struct value. See [`Value::Struct`].
+#[derive(Debug, Clone)]
+pub struct StructValue {
+    /// The module-qualified name of the declaring struct, matching
+    /// `StructTy::name`, so that `..base` and cell arguments can check that a
+    /// value which arrived as `Any` is the struct they expect.
+    pub name: String,
+    /// The fields in declaration order.
+    pub fields: IndexMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8729,6 +9230,7 @@ enum PartialEvalState<T: AstMetadata> {
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
+    StructLit(Box<PartialStructLit<T>>),
     ForLoop(Box<PartialForLoop<T>>),
 }
 
@@ -8766,6 +9268,7 @@ impl<T: AstMetadata> PartialEvalState<T> {
             Self::Constraint(c) => vec![c.lhs, c.rhs],
             Self::Cast(e) => vec![e.state.value],
             Self::Tuple(e) => e.items.clone(),
+            Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
             Self::ForLoop(f) => vec![f.seq],
         }
     }
@@ -8892,6 +9395,17 @@ struct PartialCastExpr<T: AstMetadata> {
 #[derive(Debug, Clone)]
 struct PartialTupleExpr {
     items: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone)]
+struct PartialStructLit<T: AstMetadata> {
+    expr: StructLitExpr<Substr, T>,
+    /// The struct being built, from the literal's checked type; its field
+    /// order is the order the value's fields take.
+    ty: Arc<StructTy>,
+    /// One value per entry of `expr.fields`.
+    fields: Vec<ValueId>,
+    base: Option<ValueId>,
 }
 
 #[derive(Debug, Clone)]

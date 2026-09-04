@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn unsupported_source_is_a_diagnostic_not_a_panic() {
-        let source = temp_source("unsupported", "struct Point {}\n");
+        let source = temp_source("unsupported", "const X: Int = 1;\n");
         let diagnostic = render_failed(failed(check_args(source)));
         assert!(
             diagnostic.contains("error: error during parsing"),

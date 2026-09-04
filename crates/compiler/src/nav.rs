@@ -23,7 +23,7 @@ use arcstr::ArcStr;
 use crate::{
     ast::{
         ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, Ident, IdentPath, ModPath, Scope,
-        Statement, TySpec, TySpecKind, UseDecl, WorkspaceAst,
+        Statement, StructDecl, TySpec, TySpecKind, UseDecl, WorkspaceAst,
     },
     compile::{BUILTINS, EnumId, Ty, VarId, VarIdTyMetadata, module_prefix},
 };
@@ -31,13 +31,15 @@ use crate::{
 /// Identity of something that can be navigated to.
 ///
 /// A [`VarId`] already distinguishes every `fn`, `cell`, `let`, parameter,
-/// loop variable, and enum *name*, so it does most of the work. Enum variants
-/// and modules are the two things it does not cover.
+/// loop variable, enum *name*, and struct *name*, so it does most of the work.
+/// Enum variants, struct fields, and modules are the things it does not cover.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum DefKey {
     Var(VarId),
     /// A variant, keyed by the `VarId` of its enum's name and its own name.
     Variant(VarId, String),
+    /// A field, keyed by the `VarId` of its struct's name and its own name.
+    Field(VarId, String),
     Module(ModPath),
 }
 
@@ -50,6 +52,8 @@ pub enum SymbolKind {
     LoopVar,
     Enum,
     Variant,
+    Struct,
+    Field,
     Module,
 }
 
@@ -457,8 +461,25 @@ impl<'a> Builder<'a> {
                 self.record(decl.ident.span, target);
             }
             Decl::Use(decl) => self.use_decl(decl),
+            Decl::Struct(decl) => self.struct_decl(decl),
             // Rejected by `parse_ast` before this pass ever runs.
-            Decl::Struct(_) | Decl::Constant(_) => {}
+            Decl::Constant(_) => {}
+        }
+    }
+
+    fn struct_decl(&mut self, decl: &'a StructDecl<arcstr::Substr, VarIdTyMetadata>) {
+        // As for an enum, a name the type pass rejected has no id.
+        let Some(name_id) = decl.metadata else {
+            return;
+        };
+        self.define(DefKey::Var(name_id), SymbolKind::Struct, &decl.name);
+        for field in &decl.fields {
+            self.define(
+                DefKey::Field(name_id, field.name.name.to_string()),
+                SymbolKind::Field,
+                &field.name,
+            );
+            self.ty_spec(&field.ty, &field.metadata);
         }
     }
 
@@ -550,6 +571,7 @@ impl<'a> Builder<'a> {
             Decl::Fn(decl) if decl.name.name == name => Some(decl.metadata.1),
             Decl::Cell(decl) if decl.name.name == name => Some(decl.metadata.1),
             Decl::Enum(decl) if decl.name.name == name => decl.metadata.map(|(id, _)| id),
+            Decl::Struct(decl) if decl.name.name == name => decl.metadata,
             _ => None,
         });
         if declared.is_some() || depth == MAX_REEXPORT_DEPTH {
@@ -597,6 +619,9 @@ impl<'a> Builder<'a> {
                     .get(&enum_ty.id)
                     .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id)));
                 self.record(name.span, target);
+            }
+            (TySpecKind::Ident(name), Ty::Struct(struct_ty)) => {
+                self.record(name.span, Target::Def(DefKey::Var(struct_ty.id)));
             }
             (TySpecKind::Ident(name), ty) => {
                 // `ty_from_spec` resolves a name that is not a primitive by
@@ -724,6 +749,37 @@ impl<'a> Builder<'a> {
                     self.expr(item);
                 }
             }
+            Expr::StructLit(lit) => {
+                let Some((name, prefix)) = lit.path.path.split_last() else {
+                    return;
+                };
+                self.module_path(prefix);
+                // The struct reaches us through the literal's checked type;
+                // like a call's callee, the path itself carries no `VarId`.
+                let struct_id = match &lit.metadata {
+                    Ty::Struct(struct_ty) => Some(struct_ty.id),
+                    _ => None,
+                };
+                let target =
+                    struct_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id)));
+                self.record(name.span, target);
+                for field in &lit.fields {
+                    // A shorthand field is one token naming both the field and
+                    // a local. `target_at` keeps one target per span, and the
+                    // local -- recorded when the value is walked -- is the more
+                    // useful place to jump.
+                    if !field.shorthand {
+                        let target = struct_id.map_or(Target::Unresolved, |id| {
+                            Target::Def(DefKey::Field(id, field.name.name.to_string()))
+                        });
+                        self.record(field.name.span, target);
+                    }
+                    self.expr(&field.value);
+                }
+                if let Some(base) = &lit.base {
+                    self.expr(base);
+                }
+            }
             Expr::Nil(_)
             | Expr::SeqNil(_)
             | Expr::FloatLiteral(_)
@@ -811,6 +867,7 @@ impl<'a> Builder<'a> {
             Ty::Inst(_) | Ty::Rect | Ty::Polygon | Ty::Path | Ty::Point => {
                 Target::Builtin(Builtin::Field(name.to_string()))
             }
+            Ty::Struct(struct_ty) => Target::Def(DefKey::Field(struct_ty.id, name.to_string())),
             _ => Target::Unresolved,
         }
     }
@@ -921,6 +978,45 @@ cell top(wid$0th: Float) {
 }
 "#,
             &["width#0", "base#0", "width#0", "step#0", "scaled#0"],
+        );
+    }
+
+    #[test]
+    fn struct_names_fields_and_literals() {
+        check(
+            r#"
+struct Size {
+    wd: Float,
+    ht: Float,
+}
+
+fn expand(sz: Si$0ze, by: Float) -> Size {
+    Si$0ze { wd$0: sz.wd$0 + by, ..sz$0 }
+}
+
+fn same(wd: Float) -> Size {
+    let ht = wd;
+    Size { wd$0, ht$0: ht }
+}
+"#,
+            // A shorthand field navigates to the local it reads, not the field.
+            &["Size#0", "Size#0", "wd#0", "wd#0", "sz#0", "wd#3", "ht#0"],
+        );
+    }
+
+    #[test]
+    fn struct_typed_cell_parameters() {
+        check(
+            r#"
+struct Params {
+    layer: String,
+}
+
+cell via(p: Par$0ams) {
+    let r = rect(p.lay$0er, x0=0., y0=0., x1=1., y1=1.);
+}
+"#,
+            &["Params#0", "layer#0"],
         );
     }
 

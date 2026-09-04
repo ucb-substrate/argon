@@ -45,14 +45,15 @@ pub type Fingerprint = u64;
 ///
 /// `mod` and `use` are absent because neither can be called or named as a type,
 /// and a reference through an alias resolves to the original declaration's own
-/// `VarId`. `struct` and `const` are absent because `parser::check_unsupported`
-/// rejects both; the matches over [`Decl`] below are exhaustive so that
-/// supporting either becomes a compile error here.
+/// `VarId`. `const` is absent because `parse_ast` rejects it; the matches over
+/// [`Decl`] below are exhaustive so that supporting it becomes a compile error
+/// here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ItemKind {
     Cell,
     Fn,
     Enum,
+    Struct,
 }
 
 impl ItemKind {
@@ -61,6 +62,7 @@ impl ItemKind {
             Self::Cell => 0,
             Self::Fn => 1,
             Self::Enum => 2,
+            Self::Struct => 3,
         }
     }
 }
@@ -198,7 +200,18 @@ impl Builder {
                             span_range(decl.name.span),
                         )
                     }
-                    Decl::Struct(_) | Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => {
+                    Decl::Struct(decl) => {
+                        let Some(var) = decl.metadata else {
+                            continue;
+                        };
+                        (
+                            var,
+                            ItemKind::Struct,
+                            decl.name.name.as_str(),
+                            span_range(decl.span),
+                        )
+                    }
+                    Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => {
                         continue;
                     }
                 };
@@ -215,10 +228,10 @@ impl Builder {
                 write_module(&mut hasher, module);
                 write_str(&mut hasher, name);
                 match decl {
-                    // A cell's or function's declaration span runs from its
-                    // keyword to its closing brace with no surrounding trivia,
-                    // so this is exactly the declaration's text.
-                    Decl::Cell(_) | Decl::Fn(_) => {
+                    // A cell's, function's, or struct's declaration span runs
+                    // from its keyword to its closing brace with no surrounding
+                    // trivia, so this is exactly the declaration's text.
+                    Decl::Cell(_) | Decl::Fn(_) | Decl::Struct(_) => {
                         write_str(&mut hasher, &annotated.text[span.clone()]);
                     }
                     // An `enum` has no span to slice, and its structure is its
@@ -229,7 +242,7 @@ impl Builder {
                             write_str(&mut hasher, &variant.name);
                         }
                     }
-                    Decl::Struct(_) | Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => {
+                    Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => {
                         unreachable!("filtered above")
                     }
                 }
@@ -275,12 +288,19 @@ impl Builder {
                         self.scope(&decl.scope, &mut deps);
                         (decl.metadata.1, deps)
                     }
+                    // A struct means what its fields' types mean.
+                    Decl::Struct(decl) => {
+                        let Some(var) = decl.metadata else {
+                            continue;
+                        };
+                        let mut deps = IndexSet::new();
+                        for field in &decl.fields {
+                            self.ty(&field.metadata, &mut deps);
+                        }
+                        (var, deps)
+                    }
                     // An enum's meaning is entirely its own variant list.
-                    Decl::Enum(_)
-                    | Decl::Struct(_)
-                    | Decl::Constant(_)
-                    | Decl::Mod(_)
-                    | Decl::Use(_) => continue,
+                    Decl::Enum(_) | Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => continue,
                 };
                 deps.shift_remove(&var);
                 deps.retain(|dep| self.items.contains_key(dep));
@@ -323,6 +343,11 @@ impl Builder {
                 if let Some(def) = cell_fn.cell.def {
                     out.insert(def);
                 }
+            }
+            // Stop at the declaring struct for the same reason as a cell: the
+            // struct is itself an item whose own fingerprint covers its fields.
+            Ty::Struct(struct_ty) => {
+                out.insert(struct_ty.id);
             }
             Ty::Seq(inner) => self.ty(inner, out),
             Ty::Tuple(items) => {
@@ -447,6 +472,17 @@ impl Builder {
                 self.ty(&e.metadata, out);
                 for item in &e.items {
                     self.expr(item, out);
+                }
+            }
+            // The struct being built reaches us through the literal's checked
+            // type; its path carries no `VarId`.
+            Expr::StructLit(e) => {
+                self.ty(&e.metadata, out);
+                for field in &e.fields {
+                    self.expr(&field.value, out);
+                }
+                if let Some(base) = &e.base {
+                    self.expr(base, out);
                 }
             }
             Expr::Nil(_)
@@ -700,6 +736,10 @@ mod tests {
                         Some((var, _)) => (var, decl.name.name.to_string()),
                         None => continue,
                     },
+                    Decl::Struct(decl) => match decl.metadata {
+                        Some(var) => (var, decl.name.name.to_string()),
+                        None => continue,
+                    },
                     _ => continue,
                 };
                 named.insert(name, index.fingerprint(var).expect("every item is indexed"));
@@ -846,6 +886,29 @@ fn pick(m: Mode) -> Float { match m { Mode::Fast => 1., Mode::Slow => 2., Mode::
 fn untouched() -> Float { 5. }
 ";
         assert_eq!(changed(base, after), ["Mode", "pick"]);
+    }
+
+    /// Reordering a struct's fields changes its text but keeps every user
+    /// valid, so exactly the declarations that name the struct -- as a
+    /// parameter type, a return type, or a literal -- must change with it.
+    #[test]
+    fn a_struct_change_reaches_everything_that_names_it() {
+        let base = "\
+struct Size { w: Float, h: Float, }
+struct Outer { size: Size, }
+fn area(s: Size) -> Float { s.w * s.h }
+fn unit() -> Size { Size { w: 1., h: 1. } }
+fn width() -> Float { Size { w: 1., h: 2. }.w }
+fn untouched() -> Float { 5. }
+";
+        let after = base.replace(
+            "struct Size { w: Float, h: Float, }",
+            "struct Size { h: Float, w: Float, }",
+        );
+        assert_eq!(
+            changed(base, &after),
+            ["Outer", "Size", "area", "unit", "width"]
+        );
     }
 
     /// An enum used only as a parameter type, never matched on. The reference
