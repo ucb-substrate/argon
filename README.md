@@ -173,15 +173,21 @@ The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
 
 Errors are reported as you type; `:Argon diagnostics` opens them in a list.
-Neovim's native completion menu opens as you type and includes visible local
-bindings, functions, cells, modules, enum variants, builtin types/functions,
-keyword arguments, and type-aware fields. Suggestions are filtered by syntax:
-declaration-name slots stay empty, type positions show types, and expressions do
-not offer declaration keywords. Set `vim.g.argon.autocomplete = false`
-before the plugin loads if another completion plugin owns the insert-mode UI;
-manual LSP completion with `<C-x><C-o>` remains available. Native completion
-adds `menuone` and `noselect` to the buffer's `completeopt`, so `<C-n>`, `<C-p>`,
-or equivalent Tab mappings can browse candidates without accepting the first.
+The analyzer exposes LSP completion for visible local bindings, functions,
+cells, modules, enum variants, builtin types/functions, keyword arguments, and
+type-aware fields. Suggestions are filtered by syntax: declaration-name slots
+stay empty, type positions show types, and expressions do not offer declaration
+keywords. Argon does not enable or configure a completion UI; Neovim's
+`<C-x><C-o>` works without additional setup, and completion plugins can consume
+the same LSP results.
+
+To include LSP suggestions in Neovim 0.12's built-in automatic completion,
+configure the editor rather than Argon:
+
+```lua
+vim.opt.autocomplete = true
+vim.opt.complete:append('o')
+```
 
 Navigation and IntelliSense work on variables, function and cell names, enums
 and their variants, module paths, and the fields of an instance. References to

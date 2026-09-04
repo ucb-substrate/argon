@@ -12,6 +12,14 @@ local function wait_for(description, predicate)
 end
 
 local bufnr = vim.api.nvim_get_current_buf()
+local expected_completeopt
+if vim.env.ARGON_TEST_MODE == 'navigation' then
+  expected_completeopt = 'menu,preview'
+  vim.api.nvim_set_option_value('completeopt', expected_completeopt, {
+    buf = bufnr,
+    scope = 'local',
+  })
+end
 wait_for('Argon language server', function()
   return #vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) == 1
     and vim.fn.exists(':Argon') == 2
@@ -92,16 +100,13 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
     vim.fn.maparg('gd', 'n', false, true).buffer == 1,
     'the plugin should map gd in an attached buffer'
   )
-  local completeopt = vim.opt_local.completeopt:get()
   assert(
-    vim.list_contains(completeopt, 'noselect'),
-    'native completion should not preselect and insert its first item'
+    vim.api.nvim_get_option_value('completeopt', {
+      buf = bufnr,
+      scope = 'local',
+    }) == expected_completeopt,
+    'attaching Argon should not change the user completion options'
   )
-  assert(
-    vim.list_contains(completeopt, 'menuone'),
-    'native completion should keep the menu for a single item'
-  )
-  assert(vim.list_contains(completeopt, 'popup'), 'existing completeopt values should be preserved')
   for _, capability in ipairs({
     'completionProvider',
     'hoverProvider',

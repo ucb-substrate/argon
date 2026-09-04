@@ -20,8 +20,6 @@
 ---@field analyzer? string
 ---Override the complete LSP transport. See |vim.lsp.ClientConfig.cmd|.
 ---@field cmd? string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
----Enable Neovim's native, automatically triggered LSP completion UI.
----@field autocomplete? boolean
 
 local config = {}
 
@@ -49,10 +47,6 @@ local Config = {
     --- analyzer transport, for example with |vim.lsp.rpc.connect()|.
     ---@type nil | string[] | fun(dispatchers: vim.lsp.rpc.Dispatchers, config: vim.lsp.ClientConfig): vim.lsp.rpc.PublicClient
     cmd = nil,
-    --- Set false when another completion plugin owns the insert-mode UI.
-    --- Manual LSP completion through <C-x><C-o> remains available.
-    ---@type boolean
-    autocomplete = true,
 }
 
 ---@type argon.config.Config
