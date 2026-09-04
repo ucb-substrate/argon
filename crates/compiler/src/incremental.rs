@@ -770,7 +770,61 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
                     hash_cell_args(std::slice::from_ref(value), hasher);
                 }
             }
+            CellArg::Rect {
+                layer,
+                drawable,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => {
+                7_u8.hash(hasher);
+                layer.hash(hasher);
+                drawable.hash(hasher);
+                for value in [x0, y0, x1, y1] {
+                    value.to_bits().hash(hasher);
+                }
+            }
+            CellArg::Polygon {
+                layer,
+                drawable,
+                points,
+            } => {
+                8_u8.hash(hasher);
+                layer.hash(hasher);
+                drawable.hash(hasher);
+                hash_points(points, hasher);
+            }
+            CellArg::Path {
+                layer,
+                drawable,
+                width,
+                points,
+                begin_extension,
+                end_extension,
+            } => {
+                9_u8.hash(hasher);
+                layer.hash(hasher);
+                drawable.hash(hasher);
+                for value in [width, begin_extension, end_extension] {
+                    value.to_bits().hash(hasher);
+                }
+                hash_points(points, hasher);
+            }
+            CellArg::Point(x, y) => {
+                10_u8.hash(hasher);
+                x.to_bits().hash(hasher);
+                y.to_bits().hash(hasher);
+            }
         }
+    }
+}
+
+fn hash_points(points: &[(f64, f64)], hasher: &mut impl Hasher) {
+    points.len().hash(hasher);
+    for (x, y) in points {
+        x.to_bits().hash(hasher);
+        y.to_bits().hash(hasher);
     }
 }
 
