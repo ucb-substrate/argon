@@ -11,6 +11,8 @@ use crate::{
     workspace::WorkspaceConfig,
 };
 
+pub use crate::parser::{CompletionSite, completion_site};
+
 pub struct ParseMetadata;
 pub type AnnotatedParseAst = AnnotatedAst<ParseMetadata>;
 pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;

@@ -19,10 +19,18 @@ use std::{
 };
 
 use argonc::{
-    nav::{DefLocation, NavIndex},
-    parse::{STD_PATH, virtual_source},
+    nav::{
+        CompletionCandidate, CompletionKind as ArgonCompletionKind, DefLocation, NavIndex,
+        OutlineSymbol, SignatureInfo, SymbolKind as ArgonSymbolKind,
+    },
+    parse::{CompletionSite, STD_PATH, completion_site, virtual_source},
 };
-use tower_lsp_server::ls_types::{Location, Position, Range, Uri};
+use tower_lsp_server::ls_types::{
+    CompletionItem, CompletionItemKind, CompletionResponse, DocumentHighlight,
+    DocumentHighlightKind, DocumentSymbol, Hover, HoverContents, Location, MarkupContent,
+    MarkupKind, ParameterInformation, ParameterLabel, Position, Range, SignatureHelp,
+    SignatureInformation, SymbolKind, Uri,
+};
 
 use crate::{State, argon_cache_dir, document::Document};
 
@@ -194,6 +202,16 @@ impl Alignment {
         )
         .map(|range| range.start)
     }
+
+    fn to_indexed_range(self, range: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+        Self::translate(
+            range,
+            self.prefix,
+            self.suffix,
+            self.buffer_len,
+            self.indexed_len,
+        )
+    }
 }
 
 /// One file as the navigation index and the client each see it.
@@ -206,6 +224,11 @@ struct FileView {
 }
 
 impl FileView {
+    fn indexed_offset(&self, position: Position) -> Option<usize> {
+        self.alignment
+            .to_indexed(self.buffer.position_to_offset(position)?)
+    }
+
     /// Byte offset in the indexed text of a position the client sent, if the
     /// identifier the index has there is one the edits left intact.
     ///
@@ -269,26 +292,7 @@ impl<'a> FileViews<'a> {
     async fn build(&self, path: &Path) -> Option<FileView> {
         let indexed = self.index.source(path)?;
         let uri = self.state.client_uri(path).await?;
-        let open = {
-            let source = self.state.source_state.lock().await;
-            source
-                .editor_files
-                .get(&uri)
-                .or_else(|| {
-                    // A client's spelling of a URI is not the one
-                    // `Uri::from_file_path` produces for the same file — the
-                    // two percent-encode different characters — so fall back
-                    // to comparing the paths. Missing an open buffer here
-                    // would align the index against itself and answer from
-                    // the snapshot instead of from what the user is looking
-                    // at.
-                    let file = uri.to_file_path()?;
-                    source.editor_files.iter().find_map(|(open, document)| {
-                        (open.to_file_path()? == file).then_some(document)
-                    })
-                })
-                .cloned()
-        };
+        let open = self.state.open_document(&uri).await;
         let buffer = open.unwrap_or_else(|| self.state.document(indexed.clone()));
         let alignment = Alignment::new(indexed, buffer.contents());
         Some(FileView {
@@ -296,6 +300,337 @@ impl<'a> FileViews<'a> {
             buffer,
             alignment,
         })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionContext {
+    Plain,
+    Member { base_end: usize },
+    Qualified { segments: Vec<String> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CallContext {
+    callee: std::ops::Range<usize>,
+    path: Vec<String>,
+    active_positional: usize,
+    active_keyword: Option<String>,
+}
+
+fn is_ident_continue(byte: u8) -> bool {
+    byte == b'_' || byte.is_ascii_alphanumeric()
+}
+
+fn completion_context(source: &str, cursor: usize) -> CompletionContext {
+    let bytes = source.as_bytes();
+    let cursor = cursor.min(bytes.len());
+    let mut prefix_start = cursor;
+    while prefix_start > 0 && is_ident_continue(bytes[prefix_start - 1]) {
+        prefix_start -= 1;
+    }
+    if prefix_start > 0 && bytes[prefix_start - 1] == b'.' {
+        return CompletionContext::Member {
+            base_end: prefix_start - 1,
+        };
+    }
+    if prefix_start < 2 || &bytes[prefix_start - 2..prefix_start] != b"::" {
+        return CompletionContext::Plain;
+    }
+
+    let mut qualifier_start = prefix_start - 2;
+    while qualifier_start > 0
+        && (is_ident_continue(bytes[qualifier_start - 1]) || bytes[qualifier_start - 1] == b':')
+    {
+        qualifier_start -= 1;
+    }
+    let qualifier = &source[qualifier_start..prefix_start - 2];
+    let segments = qualifier
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        CompletionContext::Plain
+    } else {
+        CompletionContext::Qualified { segments }
+    }
+}
+
+/// Masks strings and comments without changing byte offsets.
+fn code_mask(source: &str, cursor: usize) -> Vec<u8> {
+    let source = source.as_bytes();
+    let end = cursor.min(source.len());
+    let mut mask = source[..end].to_vec();
+    let mut index = 0;
+    let mut block_depth = 0usize;
+    let mut string = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    while index < end {
+        let byte = source[index];
+        let next = source.get(index + 1).copied();
+        if line_comment {
+            if matches!(byte, b'\n' | b'\r') {
+                line_comment = false;
+            } else {
+                mask[index] = b' ';
+            }
+            index += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            mask[index] = b' ';
+            if byte == b'/' && next == Some(b'*') {
+                mask[index + 1] = b' ';
+                block_depth += 1;
+                index += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                mask[index + 1] = b' ';
+                block_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if string {
+            mask[index] = b' ';
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && next == Some(b'/') {
+            mask[index] = b' ';
+            mask[index + 1] = b' ';
+            line_comment = true;
+            index += 2;
+        } else if byte == b'/' && next == Some(b'*') {
+            mask[index] = b' ';
+            mask[index + 1] = b' ';
+            block_depth = 1;
+            index += 2;
+        } else if byte == b'"' {
+            mask[index] = b' ';
+            string = true;
+            index += 1;
+        } else {
+            index += 1;
+        }
+    }
+    mask
+}
+
+fn callee_before(
+    source: &str,
+    mask: &[u8],
+    open: usize,
+) -> Option<(std::ops::Range<usize>, Vec<String>)> {
+    let mut end = open;
+    while end > 0 && mask[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 || !is_ident_continue(mask[end - 1]) {
+        return None;
+    }
+    let mut start = end;
+    while start > 0 && (is_ident_continue(mask[start - 1]) || mask[start - 1] == b':') {
+        start -= 1;
+    }
+    let text = &source[start..end];
+    let path = text.split("::").map(str::to_owned).collect::<Vec<_>>();
+    if path.iter().any(String::is_empty) {
+        return None;
+    }
+    let final_start = text
+        .rfind("::")
+        .map_or(start, |separator| start + separator + 2);
+    Some((final_start..end, path))
+}
+
+fn call_context(source: &str, cursor: usize) -> Option<CallContext> {
+    let cursor = cursor.min(source.len());
+    let mask = code_mask(source, cursor);
+    let mut stack = Vec::new();
+    for (offset, byte) in mask.iter().copied().enumerate() {
+        match byte {
+            b'(' | b'[' | b'{' => stack.push((byte, offset)),
+            b')' | b']' | b'}' => {
+                let opening = match byte {
+                    b')' => b'(',
+                    b']' => b'[',
+                    b'}' => b'{',
+                    _ => unreachable!(),
+                };
+                if stack.last().is_some_and(|(byte, _)| *byte == opening) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let open = stack
+        .iter()
+        .rev()
+        .find(|(byte, _)| *byte == b'(')
+        .map(|(_, offset)| *offset)?;
+    let (callee, path) = callee_before(source, &mask, open)?;
+
+    let mut depth = 0usize;
+    let mut active_positional = 0usize;
+    let mut segment_start = open + 1;
+    for (offset, byte) in mask[open + 1..].iter().copied().enumerate() {
+        let offset = open + 1 + offset;
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                active_positional += 1;
+                segment_start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    let segment = &mask[segment_start..cursor];
+    let active_keyword = segment
+        .iter()
+        .position(|byte| *byte == b'=')
+        .and_then(|equals| {
+            let name = std::str::from_utf8(&segment[..equals]).ok()?.trim();
+            (!name.is_empty() && name.bytes().all(is_ident_continue)).then(|| name.to_owned())
+        });
+    Some(CallContext {
+        callee,
+        path,
+        active_positional,
+        active_keyword,
+    })
+}
+
+fn signature_for_context(
+    index: &NavIndex,
+    path: &Path,
+    view: &FileView,
+    context: &CallContext,
+    indexed_cursor: usize,
+) -> Option<SignatureInfo> {
+    let indexed_callee = view.alignment.to_indexed_range(context.callee.clone());
+    indexed_callee
+        .and_then(|range| index.signature_at(path, range.end))
+        .or_else(|| index.signature_named_at(path, indexed_cursor, &context.path))
+}
+
+fn completion_item(candidate: CompletionCandidate) -> CompletionItem {
+    let kind = match candidate.kind {
+        ArgonCompletionKind::Function => CompletionItemKind::FUNCTION,
+        ArgonCompletionKind::Cell => CompletionItemKind::CONSTRUCTOR,
+        ArgonCompletionKind::Variable => CompletionItemKind::VARIABLE,
+        ArgonCompletionKind::Parameter => CompletionItemKind::VARIABLE,
+        ArgonCompletionKind::Enum => CompletionItemKind::ENUM,
+        ArgonCompletionKind::Variant => CompletionItemKind::ENUM_MEMBER,
+        ArgonCompletionKind::Struct => CompletionItemKind::STRUCT,
+        ArgonCompletionKind::Module => CompletionItemKind::MODULE,
+        ArgonCompletionKind::Field => CompletionItemKind::FIELD,
+        ArgonCompletionKind::Type => CompletionItemKind::CLASS,
+        ArgonCompletionKind::Keyword => CompletionItemKind::KEYWORD,
+    };
+    CompletionItem {
+        label: candidate.label,
+        kind: Some(kind),
+        detail: candidate.detail,
+        insert_text: candidate.insert_text,
+        ..Default::default()
+    }
+}
+
+fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionResponse {
+    let mut unique = HashMap::new();
+    for candidate in candidates {
+        unique.insert(candidate.label.clone(), candidate);
+    }
+    let mut candidates = unique.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.label.cmp(&right.label));
+    CompletionResponse::Array(candidates.into_iter().map(completion_item).collect())
+}
+
+fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> bool {
+    use ArgonCompletionKind as Kind;
+
+    match site {
+        CompletionSite::Unknown => true,
+        CompletionSite::TopLevel => {
+            candidate.kind == Kind::Keyword
+                && matches!(
+                    candidate.label.as_str(),
+                    "cell" | "enum" | "fn" | "mod" | "struct" | "use"
+                )
+        }
+        CompletionSite::Statement => match candidate.kind {
+            Kind::Function
+            | Kind::Cell
+            | Kind::Variable
+            | Kind::Parameter
+            | Kind::Enum
+            | Kind::Variant
+            | Kind::Struct
+            | Kind::Module => true,
+            Kind::Keyword => matches!(
+                candidate.label.as_str(),
+                "false" | "for" | "if" | "let" | "match" | "true"
+            ),
+            Kind::Field | Kind::Type => false,
+        },
+        CompletionSite::Expression => match candidate.kind {
+            Kind::Function
+            | Kind::Cell
+            | Kind::Variable
+            | Kind::Parameter
+            | Kind::Enum
+            | Kind::Variant
+            | Kind::Struct
+            | Kind::Module => true,
+            Kind::Keyword => matches!(candidate.label.as_str(), "false" | "if" | "match" | "true"),
+            Kind::Field | Kind::Type => false,
+        },
+        CompletionSite::Type => matches!(
+            candidate.kind,
+            Kind::Cell | Kind::Enum | Kind::Struct | Kind::Type
+        ),
+        CompletionSite::ImportPath => candidate.kind == Kind::Module,
+        CompletionSite::Keyword(keyword) => {
+            candidate.kind == Kind::Keyword && candidate.label == keyword
+        }
+        CompletionSite::NewIdentifier | CompletionSite::Suppressed => false,
+    }
+}
+
+fn filter_completions(
+    candidates: Vec<CompletionCandidate>,
+    site: CompletionSite,
+) -> Vec<CompletionCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| completion_allowed(candidate, site))
+        .collect()
+}
+
+fn lsp_symbol_kind(kind: ArgonSymbolKind) -> SymbolKind {
+    match kind {
+        ArgonSymbolKind::Function => SymbolKind::FUNCTION,
+        ArgonSymbolKind::Cell => SymbolKind::CONSTRUCTOR,
+        ArgonSymbolKind::Local | ArgonSymbolKind::LoopVar => SymbolKind::VARIABLE,
+        ArgonSymbolKind::Parameter => SymbolKind::VARIABLE,
+        ArgonSymbolKind::Enum => SymbolKind::ENUM,
+        ArgonSymbolKind::Variant => SymbolKind::ENUM_MEMBER,
+        ArgonSymbolKind::Struct => SymbolKind::STRUCT,
+        ArgonSymbolKind::Field => SymbolKind::FIELD,
+        ArgonSymbolKind::Module => SymbolKind::MODULE,
     }
 }
 
@@ -343,6 +678,25 @@ impl State {
             return Some(PathBuf::from(STD_PATH));
         }
         Some(path)
+    }
+
+    /// The current editor text for `uri`, accepting equivalent URI spellings.
+    ///
+    /// `Uri::from_file_path` and an LSP client do not necessarily percent-
+    /// encode a path identically, so exact URI lookup has a path-based fallback.
+    async fn open_document(&self, uri: &Uri) -> Option<Document> {
+        let source = self.source_state.lock().await;
+        source
+            .editor_files
+            .get(uri)
+            .or_else(|| {
+                let file = uri.to_file_path()?;
+                source
+                    .editor_files
+                    .iter()
+                    .find_map(|(open, document)| (open.to_file_path()? == file).then_some(document))
+            })
+            .cloned()
     }
 
     /// The URI a compiler path should be shown under.
@@ -396,6 +750,213 @@ impl State {
             }
         }
         Some(locations)
+    }
+
+    pub(crate) async fn completion(
+        &self,
+        uri: &Uri,
+        position: Position,
+    ) -> Option<CompletionResponse> {
+        let path = self.compiler_path(uri).await?;
+        let index = self.nav_index().await;
+        let buffer = match self.open_document(uri).await {
+            Some(buffer) => buffer,
+            None => self.document(index.as_ref()?.source(&path)?.clone()),
+        };
+        let buffer_offset = buffer.position_to_offset(position)?;
+        let site = completion_site(buffer.contents(), buffer_offset);
+        let context = completion_context(buffer.contents(), buffer_offset);
+        if site == CompletionSite::Suppressed {
+            return Some(completion_response(Vec::new()));
+        }
+        let Some(index) = index else {
+            let candidates = match context {
+                CompletionContext::Plain => {
+                    filter_completions(NavIndex::static_completions(), site)
+                }
+                CompletionContext::Member { .. } | CompletionContext::Qualified { .. } => {
+                    Vec::new()
+                }
+            };
+            return Some(completion_response(candidates));
+        };
+        let Some(indexed) = index.source(&path) else {
+            let candidates = match context {
+                CompletionContext::Plain => {
+                    filter_completions(NavIndex::static_completions(), site)
+                }
+                CompletionContext::Member { .. } | CompletionContext::Qualified { .. } => {
+                    Vec::new()
+                }
+            };
+            return Some(completion_response(candidates));
+        };
+        let alignment = Alignment::new(indexed, buffer.contents());
+        let view = FileView {
+            uri: uri.clone(),
+            buffer,
+            alignment,
+        };
+        let candidates = match context {
+            CompletionContext::Member { base_end } => view
+                .alignment
+                .to_indexed(base_end)
+                .map(|offset| index.member_completions_at(&path, offset))
+                .unwrap_or_default(),
+            CompletionContext::Qualified { segments } => {
+                let candidates = index.qualified_completions(&path, &segments);
+                if site == CompletionSite::ImportPath {
+                    candidates
+                } else {
+                    filter_completions(candidates, site)
+                }
+            }
+            CompletionContext::Plain => {
+                let Some(indexed_offset) = view.indexed_offset(position) else {
+                    return Some(completion_response(filter_completions(
+                        NavIndex::static_completions(),
+                        site,
+                    )));
+                };
+                let mut candidates = index.completions_at(&path, indexed_offset);
+                if let Some(context) = call_context(view.buffer.contents(), buffer_offset)
+                    && let Some(signature) =
+                        signature_for_context(&index, &path, &view, &context, indexed_offset)
+                {
+                    // Keyword arguments are more relevant here than a
+                    // same-named local, so append them and let deduplication
+                    // below keep the last candidate.
+                    candidates.extend(index.keyword_completions_for_signature(&signature));
+                }
+                filter_completions(candidates, site)
+            }
+        };
+        Some(completion_response(candidates))
+    }
+
+    pub(crate) async fn hover(&self, uri: &Uri, position: Position) -> Option<Hover> {
+        let index = self.nav_index().await?;
+        let path = self.compiler_path(uri).await?;
+        let mut views = FileViews::new(self, &index);
+        let view = views.get(&path).await?;
+        let offset = view.indexed_offset(position)?;
+        let info = index.hover_at(&path, offset)?;
+        let range = view.location(info.span)?.range;
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: format!("```argon\n{}\n```", info.contents),
+            }),
+            range: Some(range),
+        })
+    }
+
+    pub(crate) async fn signature_help(
+        &self,
+        uri: &Uri,
+        position: Position,
+    ) -> Option<SignatureHelp> {
+        let index = self.nav_index().await?;
+        let path = self.compiler_path(uri).await?;
+        let mut views = FileViews::new(self, &index);
+        let view = views.get(&path).await?;
+        let buffer_offset = view.buffer.position_to_offset(position)?;
+        let indexed_offset = view.indexed_offset(position)?;
+        let context = call_context(view.buffer.contents(), buffer_offset)?;
+        let signature = signature_for_context(&index, &path, view, &context, indexed_offset)?;
+        let active_parameter = context
+            .active_keyword
+            .as_ref()
+            .and_then(|name| {
+                signature.parameters.iter().position(|parameter| {
+                    parameter
+                        .label
+                        .split_once(':')
+                        .is_some_and(|(parameter_name, _)| parameter_name == name)
+                })
+            })
+            .unwrap_or(context.active_positional)
+            .min(signature.parameters.len().saturating_sub(1))
+            as u32;
+        let parameters = signature
+            .parameters
+            .iter()
+            .map(|parameter| ParameterInformation {
+                label: ParameterLabel::Simple(parameter.label.clone()),
+                documentation: None,
+            })
+            .collect();
+        Some(SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label: signature.label,
+                documentation: None,
+                parameters: Some(parameters),
+                active_parameter: Some(active_parameter),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(active_parameter),
+        })
+    }
+
+    pub(crate) async fn document_symbols(&self, uri: &Uri) -> Option<Vec<DocumentSymbol>> {
+        let index = self.nav_index().await?;
+        let path = self.compiler_path(uri).await?;
+        let mut views = FileViews::new(self, &index);
+        let view = views.get(&path).await?;
+        Some(
+            index
+                .document_symbols(&path)
+                .into_iter()
+                .filter_map(
+                    |OutlineSymbol {
+                         name,
+                         detail,
+                         kind,
+                         range,
+                         selection_range,
+                     }| {
+                        Some(DocumentSymbol {
+                            name,
+                            detail: Some(detail),
+                            kind: lsp_symbol_kind(kind),
+                            tags: None,
+                            #[expect(
+                                deprecated,
+                                reason = "LSP keeps this compatibility field in DocumentSymbol"
+                            )]
+                            deprecated: None,
+                            range: view.location(range)?.range,
+                            selection_range: view.location(selection_range)?.range,
+                            children: None,
+                        })
+                    },
+                )
+                .collect(),
+        )
+    }
+
+    pub(crate) async fn document_highlights(
+        &self,
+        uri: &Uri,
+        position: Position,
+    ) -> Option<Vec<DocumentHighlight>> {
+        let index = self.nav_index().await?;
+        let path = self.compiler_path(uri).await?;
+        let mut views = FileViews::new(self, &index);
+        let view = views.get(&path).await?;
+        let offset = view.cursor(&index, &path, position)?;
+        let highlights = index
+            .references_at(&path, offset, true)
+            .into_iter()
+            .filter(|span| span.path == path)
+            .filter_map(|span| {
+                Some(DocumentHighlight {
+                    range: view.location(span.span)?.range,
+                    kind: Some(DocumentHighlightKind::READ),
+                })
+            })
+            .collect();
+        Some(highlights)
     }
 }
 
@@ -587,5 +1148,94 @@ mod tests {
             alignment.to_buffer(equals..equals + 1),
             Some(moved..moved + 1)
         );
+    }
+
+    #[test]
+    fn completion_context_distinguishes_members_paths_and_plain_names() {
+        assert_eq!(
+            completion_context("shape.wi", "shape.wi".len()),
+            CompletionContext::Member {
+                base_end: "shape".len()
+            }
+        );
+        assert_eq!(
+            completion_context("lib::geometry::re", "lib::geometry::re".len()),
+            CompletionContext::Qualified {
+                segments: vec!["lib".to_owned(), "geometry".to_owned()]
+            }
+        );
+        assert_eq!(
+            completion_context("let wid", "let wid".len()),
+            CompletionContext::Plain
+        );
+    }
+
+    fn candidate(label: &str, kind: ArgonCompletionKind) -> CompletionCandidate {
+        CompletionCandidate {
+            label: label.to_owned(),
+            kind,
+            detail: None,
+            insert_text: None,
+        }
+    }
+
+    #[test]
+    fn completion_candidates_are_filtered_by_syntax_role() {
+        use ArgonCompletionKind as Kind;
+
+        let candidates = vec![
+            candidate("cell", Kind::Keyword),
+            candidate("struct", Kind::Keyword),
+            candidate("else", Kind::Keyword),
+            candidate("let", Kind::Keyword),
+            candidate("true", Kind::Keyword),
+            candidate("rect", Kind::Function),
+            candidate("Widget", Kind::Cell),
+            candidate("Mode", Kind::Enum),
+            candidate("Size", Kind::Struct),
+            candidate("lib", Kind::Module),
+            candidate("width", Kind::Variable),
+            candidate("Float", Kind::Type),
+        ];
+        let labels = |site| {
+            filter_completions(candidates.clone(), site)
+                .into_iter()
+                .map(|candidate| candidate.label)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(labels(CompletionSite::TopLevel), ["cell", "struct"]);
+        assert!(labels(CompletionSite::NewIdentifier).is_empty());
+        assert_eq!(
+            labels(CompletionSite::Type),
+            ["Widget", "Mode", "Size", "Float"]
+        );
+        assert_eq!(
+            labels(CompletionSite::Expression),
+            ["true", "rect", "Widget", "Mode", "Size", "lib", "width"]
+        );
+        assert_eq!(
+            labels(CompletionSite::Statement),
+            [
+                "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width"
+            ]
+        );
+        assert_eq!(labels(CompletionSite::ImportPath), ["lib"]);
+        assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);
+        assert!(labels(CompletionSite::Suppressed).is_empty());
+    }
+
+    #[test]
+    fn call_context_tracks_nested_arguments_and_keywords() {
+        let source = "dimension(1., helper(2., 3.), flip=true";
+        let context = call_context(source, source.len()).unwrap();
+        assert_eq!(context.path, vec!["dimension"]);
+        assert_eq!(context.active_positional, 2);
+        assert_eq!(context.active_keyword.as_deref(), Some("flip"));
+
+        let source = "text(\"comma, paren)\", layer // ignored (,\n, 1.";
+        let context = call_context(source, source.len()).unwrap();
+        assert_eq!(context.path, vec!["text"]);
+        assert_eq!(context.active_positional, 2);
     }
 }
