@@ -70,6 +70,72 @@ arc run --cell 'top(pitch * 4., -width / 2.)'
 arc run --cell 'array(cons(250., cons(350., [])), Mode::Fast)'
 ```
 
+Parameters declared with a default value are keyword parameters. They are
+passed by name, may be omitted, and must follow the positional parameters. A
+default is an ordinary expression evaluated at each call; it may refer to the
+parameters declared before it and to module-level items, and its type must match
+the declared type exactly:
+
+```rust
+cell via(layer: String, w: Float, h: Float = w, n: Int = 1) {
+    // ...
+}
+
+cell top() {
+    let square = inst(via("met1", 100.));
+    let stack = inst(via("met1", 100., h=300., n=3));
+}
+```
+
+Positional parameters cannot be passed by name, and keyword parameters cannot be
+passed positionally. Keyword arguments also work in cell invocations:
+`arc run --cell 'via("met1", 100., n=3)'`.
+
+Structs group related values under named fields. Declare them at module level,
+construct them with braces, and read fields with `.`. Every field must be given
+exactly once unless `..base` supplies the ones not listed, and a bare `name` is
+shorthand for `name: name`:
+
+```rust
+struct Size {
+    w: Float,
+    h: Float,
+}
+
+struct ViaParams {
+    layer: String,
+    size: Size,
+    n: Int,
+}
+
+fn grow(s: Size, by: Float) -> Size {
+    Size { w: s.w + by, ..s }
+}
+
+cell via(p: ViaParams) {
+    let r = rect(p.layer, x0=0., y0=0., w=p.size.w, h=p.size.h);
+}
+
+cell top() {
+    let size = grow(Size { w: 100., h: 50. }, 10.);
+    let n = 2;
+    let v = inst(via(ViaParams { layer: "met1", size, n }));
+}
+```
+
+Struct types are nominal: two structs with the same fields are different types,
+and a struct may not contain itself. Fields may have any type, including enums,
+other structs, sequences, and tuples. A struct declared in another module is
+imported with `use`, and a literal may name its module, as in
+`geom::Size { w: 1., h: 2. }`. Inside an `if` condition, a `match` scrutinee, or
+a `for` sequence a literal must be parenthesized, since `name {` there begins
+the construct's body. Struct values are valid cell arguments, including on the
+command line:
+
+```bash
+arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
+```
+
 GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
 `use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,

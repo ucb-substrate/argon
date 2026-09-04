@@ -119,7 +119,7 @@ pub struct StructDecl<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct StructField<S, T: AstMetadata> {
     pub name: Ident<S, T>,
-    pub ty: Ident<S, T>,
+    pub ty: TySpec<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::StructField,
 }
@@ -263,6 +263,7 @@ pub enum Expr<S, T: AstMetadata> {
     Scope(Box<Scope<S, T>>),
     Cast(Box<CastExpr<S, T>>),
     Tuple(TupleExpr<S, T>),
+    StructLit(Box<StructLitExpr<S, T>>),
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -366,10 +367,12 @@ pub struct KwArgValue<S, T: AstMetadata> {
     pub metadata: T::KwArgValue,
 }
 
+/// A parameter of a cell or function; `default` makes it a keyword parameter.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct ArgDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
     pub ty: TySpec<S, T>,
+    pub default: Option<Expr<S, T>>,
     pub metadata: T::ArgDecl,
 }
 
@@ -386,6 +389,31 @@ pub struct TupleExpr<S, T: AstMetadata> {
     pub items: Vec<Expr<S, T>>,
     pub span: cfgrammar::Span,
     pub metadata: T::TupleExpr,
+}
+
+/// A struct literal, `Name { field: value, .. }`.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct StructLitExpr<S, T: AstMetadata> {
+    /// The struct being constructed, optionally module-qualified.
+    pub path: IdentPath<S, T>,
+    pub fields: Vec<StructLitField<S, T>>,
+    /// The `..base` expression, from which every field not listed is taken.
+    pub base: Option<Expr<S, T>>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::StructLitExpr,
+}
+
+/// One `field: value` entry of a [`StructLitExpr`].
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct StructLitField<S, T: AstMetadata> {
+    pub name: Ident<S, T>,
+    /// For the shorthand `field` (no value), an [`Expr::IdentPath`] naming
+    /// `field` at the same span as `name`.
+    pub value: Expr<S, T>,
+    /// Whether the field was written as the shorthand `field` rather than
+    /// `field: value`.
+    pub shorthand: bool,
+    pub span: cfgrammar::Span,
 }
 
 impl<S, T: AstMetadata> Expr<S, T> {
@@ -410,6 +438,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::Scope(x) => x.span,
             Self::Cast(x) => x.span,
             Self::Tuple(x) => x.span,
+            Self::StructLit(x) => x.span,
         }
     }
 }
@@ -441,6 +470,7 @@ pub trait AstMetadata {
     type Typ: Debug + Clone + Serialize + DeserializeOwned;
     type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
     type TupleExpr: Debug + Clone + Serialize + DeserializeOwned;
+    type StructLitExpr: Debug + Clone + Serialize + DeserializeOwned;
 }
 
 pub trait AstTransformer {
@@ -463,6 +493,18 @@ pub trait AstTransformer {
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
         variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl;
+    fn dispatch_struct_decl(
+        &mut self,
+        input: &StructDecl<Self::InputS, Self::InputMetadata>,
+        name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        fields: &[StructField<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl;
+    fn dispatch_struct_field(
+        &mut self,
+        input: &StructField<Self::InputS, Self::InputMetadata>,
+        name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField;
     fn dispatch_cell_decl(
         &mut self,
         input: &CellDecl<Self::InputS, Self::InputMetadata>,
@@ -534,6 +576,23 @@ pub trait AstTransformer {
         input: &TupleExpr<Self::InputS, Self::InputMetadata>,
         items: &[Expr<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr;
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
+        path: &IdentPath<Self::OutputS, Self::OutputMetadata>,
+        fields: &[StructLitField<Self::OutputS, Self::OutputMetadata>],
+        base: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr;
+    /// Metadata for the path of a struct literal.
+    ///
+    /// The path names a declaration, not a variable or an enum variant, so it
+    /// is resolved by [`Self::dispatch_struct_lit_expr`] and deliberately
+    /// bypasses [`Self::dispatch_ident_path`], which would read a qualified
+    /// path's last two segments as `Enum::Variant`.
+    fn dispatch_struct_lit_path(
+        &mut self,
+        input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath;
     fn dispatch_field_access_expr(
         &mut self,
         input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -580,6 +639,7 @@ pub trait AstTransformer {
         input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
         ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+        default: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl;
     fn dispatch_scope(
         &mut self,
@@ -657,6 +717,38 @@ pub trait AstTransformer {
         EnumDecl {
             name,
             variants,
+            metadata,
+        }
+    }
+    fn transform_struct_decl(
+        &mut self,
+        input: &StructDecl<Self::InputS, Self::InputMetadata>,
+    ) -> StructDecl<Self::OutputS, Self::OutputMetadata> {
+        let name = self.transform_ident(&input.name);
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| self.transform_struct_field(field))
+            .collect_vec();
+        let metadata = self.dispatch_struct_decl(input, &name, &fields);
+        StructDecl {
+            name,
+            fields,
+            span: input.span,
+            metadata,
+        }
+    }
+    fn transform_struct_field(
+        &mut self,
+        input: &StructField<Self::InputS, Self::InputMetadata>,
+    ) -> StructField<Self::OutputS, Self::OutputMetadata> {
+        let name = self.transform_ident(&input.name);
+        let ty = self.transform_ty_spec(&input.ty);
+        let metadata = self.dispatch_struct_field(input, &name, &ty);
+        StructField {
+            name,
+            ty,
+            span: input.span,
             metadata,
         }
     }
@@ -972,8 +1064,19 @@ pub trait AstTransformer {
     ) -> ArgDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
         let ty = self.transform_ty_spec(&input.ty);
-        let metadata = self.dispatch_arg_decl(input, &name, &ty);
-        ArgDecl { name, ty, metadata }
+        // The default is visited before the parameter is dispatched, so it can
+        // see earlier parameters but not this one.
+        let default = input
+            .default
+            .as_ref()
+            .map(|default| self.transform_expr(default));
+        let metadata = self.dispatch_arg_decl(input, &name, &ty, &default);
+        ArgDecl {
+            name,
+            ty,
+            default,
+            metadata,
+        }
     }
 
     fn transform_scope(
@@ -1044,6 +1147,41 @@ pub trait AstTransformer {
         }
     }
 
+    fn transform_struct_lit_expr(
+        &mut self,
+        input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
+    ) -> StructLitExpr<Self::OutputS, Self::OutputMetadata> {
+        let path = IdentPath {
+            path: input
+                .path
+                .path
+                .iter()
+                .map(|ident| self.transform_ident(ident))
+                .collect(),
+            metadata: self.dispatch_struct_lit_path(&input.path),
+            span: input.path.span,
+        };
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| StructLitField {
+                name: self.transform_ident(&field.name),
+                value: self.transform_expr(&field.value),
+                shorthand: field.shorthand,
+                span: field.span,
+            })
+            .collect_vec();
+        let base = input.base.as_ref().map(|base| self.transform_expr(base));
+        let metadata = self.dispatch_struct_lit_expr(input, &path, &fields, &base);
+        StructLitExpr {
+            path,
+            fields,
+            base,
+            span: input.span,
+            metadata,
+        }
+    }
+
     fn transform_string_literal(
         &mut self,
         input: &StringLiteral<Self::InputS>,
@@ -1089,6 +1227,7 @@ pub trait AstTransformer {
             Expr::Scope(scope) => Expr::Scope(Box::new(self.transform_scope(scope))),
             Expr::Cast(cast) => Expr::Cast(Box::new(self.transform_cast(cast))),
             Expr::Tuple(tuple) => Expr::Tuple(self.transform_tuple_expr(tuple)),
+            Expr::StructLit(lit) => Expr::StructLit(Box::new(self.transform_struct_lit_expr(lit))),
         }
     }
 }

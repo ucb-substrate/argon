@@ -138,6 +138,11 @@ impl<'a> Lexer<'a> {
             b'-' if peek2(1) == b'>' => (TokenKind::Arrow, 2),
             b'&' if peek2(1) == b'&' => (TokenKind::AmpAmp, 2),
             b'|' if peek2(1) == b'|' => (TokenKind::PipePipe, 2),
+            // `..` (struct update syntax) wins over `.`, so `1..` is `1` `..`
+            // rather than the float `1.` followed by `.`; the only construct
+            // that changes is a tuple index on a float literal, which never
+            // type-checked.
+            b'.' if peek2(1) == b'.' => (TokenKind::DotDot, 2),
             b':' => (TokenKind::Colon, 1),
             b'=' => (TokenKind::Eq, 1),
             b'!' => (TokenKind::Bang, 1),

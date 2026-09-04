@@ -3,16 +3,13 @@
 //! Builds `Ast<&'a str, ParseMetadata>` directly from the token stream in a
 //! single pass — no intermediate concrete syntax tree. Identifier and string
 //! text is borrowed straight from the source (`&'a str`); every node records a
-//! byte-offset `cfgrammar::Span` that indexes the original (untrimmed) input,
-//! matching the spans the ANTLR integration produced.
+//! byte-offset `cfgrammar::Span` that indexes the original (untrimmed) input.
 //!
-//! Expression precedence/associativity mirrors the ANTLR `expr` rule exactly
-//! (validated against the generated `expr_rec`/`precpred`): prefix unary binds
-//! tightest for its operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`,
-//! `as`) binds tighter than the binary operators; `* / %` > `+ -` > comparisons;
-//! all binary operators are left-associative. Boolean operations are lower precedence
-//! than comparisons, as in Rust:
-//! comparisons > `&&` > `||`.
+//! Expression precedence/associativity: prefix unary binds tightest for its
+//! operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`, `as`) binds tighter
+//! than the binary operators; `* / %` > `+ -` > comparisons; all binary
+//! operators are left-associative. Boolean operations are lower precedence than
+//! comparisons, as in Rust: comparisons > `&&` > `||`.
 
 use std::str::FromStr;
 
@@ -23,8 +20,8 @@ use crate::ast::{
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr, FieldAccessExpr,
     FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
     IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
-    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
-    TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, StructLitExpr,
+    StructLitField, TupleExpr, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -111,6 +108,9 @@ pub struct Parser<'a> {
     /// Next semantic scope ordinal in each enclosing lexical scope.
     scope_orders: Vec<u64>,
     depth: u32,
+    /// Whether `name {` must be read as an identifier followed by a scope
+    /// rather than as a struct literal. See [`Parser::with_struct_literals`].
+    no_struct_literal: bool,
     pub errors: Vec<ParseError>,
     completion: Option<CompletionProbe>,
 }
@@ -138,6 +138,7 @@ impl<'a> Parser<'a> {
             ntok: 0,
             scope_orders: vec![0],
             depth: 0,
+            no_struct_literal: false,
             errors: Vec::new(),
             completion: None,
         }
@@ -169,6 +170,22 @@ impl<'a> Parser<'a> {
         {
             completion.site = Some(site);
         }
+    }
+
+    /// Runs `f` with struct literals allowed or forbidden, restoring the
+    /// previous setting afterwards.
+    ///
+    /// A struct literal is forbidden at the top level of an `if` condition, a
+    /// `match` scrutinee, and a `for` sequence, where `name {` already opens
+    /// the construct's own scope; Rust has the same rule, and the same escape
+    /// hatch of wrapping the literal in parentheses. Parentheses, brackets,
+    /// call arguments, struct literal bodies, match arm bodies, and brace
+    /// scopes lift the restriction again.
+    fn with_struct_literals<T>(&mut self, allowed: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(&mut self.no_struct_literal, !allowed);
+        let result = f(self);
+        self.no_struct_literal = saved;
+        result
     }
 
     // ------------------------------------------------------------------
@@ -268,7 +285,7 @@ impl<'a> Parser<'a> {
     /// or recovery path a rule may consume nothing after capturing `lo`, leaving
     /// `prev_end < lo`; clamp so the span is never inverted (`cfgrammar::Span::new`
     /// panics when `end < start`). For well-formed nodes `prev_end >= lo`, so this
-    /// is a no-op and spans match the byte ranges ANTLR produced.
+    /// is a no-op.
     #[inline]
     fn finish_span(&self, lo: u32) -> Span {
         Span::new(lo as usize, self.prev_end.max(lo) as usize)
@@ -322,7 +339,7 @@ impl<'a> Parser<'a> {
         // Distinct diagnostics at the same offset are kept: they describe
         // independent problems (e.g. a token that is simultaneously not an
         // expression and not the expected `)`), so collapsing them by position
-        // alone dropped diagnostics ANTLR reported.
+        // alone would lose real diagnostics.
         if let Some(last) = self.errors.last()
             && last.span.start() == span.start()
             && last.message == message
@@ -380,13 +397,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `callExpr EOF` as a standalone entry (used by `parse_cell`). Returns
-    /// `None` (with an error recorded) unless the input is *exactly* one call
-    /// expression: the whole input must parse to an `Expr::Call` and reach EOF.
+    /// A single call expression followed by EOF, as a standalone entry (used by
+    /// `parse_cell`). Returns `None` (with an error recorded) unless the input is
+    /// *exactly* one call expression: the whole input must parse to an
+    /// `Expr::Call` and reach EOF.
     /// This rejects both trailing garbage (`f() junk`) and suffixed calls
     /// (`f()!`, `f().x`, `f()[0]`, which parse to an `Emit`/`FieldAccess`/`Index`
-    /// root rather than a `Call`), keeping the "parses exactly a callExpr"
-    /// contract the old ANTLR `callExpr()` entry had.
+    /// root rather than a `Call`).
     pub fn parse_cell_entry(&mut self) -> Option<CallExpr<&'a str, Md>> {
         let expr = self.parse_expr(0);
         let Expr::Call(call) = expr else {
@@ -471,12 +488,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `structField : ident COLON ident`
+    /// `structField : ident COLON tySpec`
     fn parse_struct_field(&mut self) -> StructField<&'a str, Md> {
         let lo = self.cur.start;
         let name = self.ident(CompletionSite::NewIdentifier);
         self.expect(TokenKind::Colon);
-        let ty = self.ident(CompletionSite::Type);
+        let ty = self.parse_ty_spec();
         StructField {
             name,
             ty,
@@ -583,20 +600,27 @@ impl<'a> Parser<'a> {
     }
 
     /// `argDecls : (argDecl (COMMA argDecl)* COMMA?)?`
+    ///
+    /// Default values number their scopes from zero, like a brace scope.
     fn parse_arg_decls(&mut self) -> Vec<ArgDecl<&'a str, Md>> {
-        self.separated_list(TokenKind::RParen, CompletionSite::NewIdentifier, |p| {
+        self.scope_orders.push(0);
+        let args = self.separated_list(TokenKind::RParen, CompletionSite::NewIdentifier, |p| {
             p.parse_arg_decl()
-        })
+        });
+        self.scope_orders.pop();
+        args
     }
 
-    /// `argDecl : ident COLON tySpec`
+    /// `argDecl : ident COLON tySpec (EQ expr)?`
     fn parse_arg_decl(&mut self) -> ArgDecl<&'a str, Md> {
         let name = self.ident(CompletionSite::NewIdentifier);
         self.expect(TokenKind::Colon);
         let ty = self.parse_ty_spec();
+        let default = self.eat(TokenKind::Eq).then(|| self.parse_expr(0));
         ArgDecl {
             name,
             ty,
+            default,
             metadata: (),
         }
     }
@@ -666,6 +690,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unannotated_scope(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
+        self.with_struct_literals(true, |p| p.parse_unannotated_scope_inner(scope_order))
+    }
+
+    fn parse_unannotated_scope_inner(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
         if !self.enter_depth() {
             self.error_at(self.span(self.cur), "nesting too deep".to_string());
             let lo = self.cur.start;
@@ -742,9 +770,7 @@ impl<'a> Parser<'a> {
         // routes a trailing un-semicoloned expression into `tail` (the
         // `at(RBrace) || at(Eof)` arm), and only ever pushes a `semicolon: false`
         // statement when more tokens follow it — so a `semicolon: false`
-        // statement is never the last element here. (ANTLR's
-        // `build_unannotated_scope` built statements and the tail separately and
-        // did need the fixup; this single-pass loop does not.)
+        // statement is never the last element here.
 
         self.exit_depth();
         Scope {
@@ -779,7 +805,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::KwFor);
         let var = self.ident(CompletionSite::NewIdentifier);
         self.expect(TokenKind::KwIn);
-        let seq = self.parse_expr(0);
+        let seq = self.with_struct_literals(false, |p| p.parse_expr(0));
         let body = self.parse_scope();
         ForLoop {
             var,
@@ -793,7 +819,7 @@ impl<'a> Parser<'a> {
 
     fn parse_if(&mut self, scope_order: u64, lo: u32) -> IfExpr<&'a str, Md> {
         self.expect(TokenKind::KwIf);
-        let cond = self.parse_expr(0);
+        let cond = self.with_struct_literals(false, |p| p.parse_expr(0));
         let then = self.parse_scope();
         self.expect(TokenKind::KwElse);
         let else_ = self.parse_scope();
@@ -811,7 +837,7 @@ impl<'a> Parser<'a> {
     fn parse_match(&mut self) -> MatchExpr<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwMatch);
-        let scrutinee = self.parse_expr(0);
+        let scrutinee = self.with_struct_literals(false, |p| p.parse_expr(0));
         let lbrace = self.expect(TokenKind::LBrace);
         let mut arms = Vec::new();
         self.record_completion_site(CompletionSite::Expression);
@@ -846,7 +872,10 @@ impl<'a> Parser<'a> {
         let lo = self.cur.start;
         let pattern = self.parse_ident_path(CompletionSite::Expression);
         self.expect(TokenKind::FatArrow);
-        let expr = self.parse_expr(0);
+        // An arm body is bounded by its comma, not by `{`, so a struct
+        // literal is unambiguous here even when the whole `match` sits in
+        // an `if`/`match`/`for` head.
+        let expr = self.with_struct_literals(true, |p| p.parse_expr(0));
         self.expect(TokenKind::Comma);
         MatchArm {
             pattern,
@@ -886,7 +915,7 @@ impl<'a> Parser<'a> {
         // Lexical start of this expression (the first token). Composite-node
         // spans start here, not at `lhs.span().start()`: a parenthesized
         // operand is unwrapped to its inner node (whose span excludes the
-        // parens), but ANTLR spans the enclosing operator from the `(`.
+        // parens), while the enclosing operator's span must start at the `(`.
         let lhs_start = self.cur.start;
         let mut lhs = self.parse_prefix();
 
@@ -1013,7 +1042,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LBrack => {
                 self.bump();
-                let index = self.parse_expr(0);
+                let index = self.with_struct_literals(true, |p| p.parse_expr(0));
                 self.expect(TokenKind::RBrack);
                 Expr::Index(Box::new(IndexExpr {
                     base: lhs,
@@ -1075,6 +1104,8 @@ impl<'a> Parser<'a> {
                         self.next_scope_order()
                     };
                     Expr::Call(self.finish_call(scope_order, lo, path))
+                } else if self.at(TokenKind::LBrace) && !self.no_struct_literal {
+                    Expr::StructLit(Box::new(self.parse_struct_lit(path)))
                 } else {
                     Expr::IdentPath(path)
                 }
@@ -1101,9 +1132,74 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `structLit : identPath LBRACE structLitBody RBRACE`, where
+    /// `structLitBody : (structLitField (COMMA structLitField)* (COMMA structBase | COMMA)?)? | structBase`
+    /// and `structBase : DOTDOT expr`.
+    ///
+    /// The `..base` comes last, after a comma, and may not be followed by one,
+    /// which is the shape Rust accepts. Because the body has two terminators
+    /// (`}` and `..`) it does not go through `separated_list`; termination
+    /// holds for the same reason, since every iteration that does not `break`
+    /// consumes the separator.
+    fn parse_struct_lit(&mut self, path: IdentPath<&'a str, Md>) -> StructLitExpr<&'a str, Md> {
+        let lo = path.span.start() as u32;
+        self.expect(TokenKind::LBrace);
+        let mut fields = Vec::new();
+        let mut base = None;
+        self.with_struct_literals(true, |p| {
+            while !p.at(TokenKind::RBrace) && !p.at(TokenKind::Eof) {
+                if p.eat(TokenKind::DotDot) {
+                    base = Some(p.parse_expr(0));
+                    break;
+                }
+                fields.push(p.parse_struct_lit_field());
+                if !p.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+        });
+        self.expect(TokenKind::RBrace);
+        StructLitExpr {
+            path,
+            fields,
+            base,
+            span: self.finish_span(lo),
+            metadata: (),
+        }
+    }
+
+    /// `structLitField : ident (COLON expr)?`
+    fn parse_struct_lit_field(&mut self) -> StructLitField<&'a str, Md> {
+        let lo = self.cur.start;
+        let name = self.ident(CompletionSite::NewIdentifier);
+        let (value, shorthand) = if self.eat(TokenKind::Colon) {
+            (self.parse_expr(0), false)
+        } else {
+            // Shorthand: `x` stands for `x: x`. The value is a path at the
+            // name's own span, so diagnostics and navigation on it point at the
+            // one token the user wrote.
+            let value = Expr::IdentPath(IdentPath {
+                path: vec![name.clone()],
+                metadata: (),
+                span: name.span,
+            });
+            (value, true)
+        };
+        StructLitField {
+            name,
+            value,
+            shorthand,
+            span: self.finish_span(lo),
+        }
+    }
+
     /// `( )` nil, `( expr )` parenthesized group (unwrapped), or
     /// `( expr , (expr ,)* )` tuple (a comma after every element is required).
     fn parse_paren(&mut self) -> Expr<&'a str, Md> {
+        self.with_struct_literals(true, |p| p.parse_paren_inner())
+    }
+
+    fn parse_paren_inner(&mut self) -> Expr<&'a str, Md> {
         let lp = self.bump();
         if self.at(TokenKind::RParen) {
             let rp = self.bump();
@@ -1181,6 +1277,10 @@ impl<'a> Parser<'a> {
 
     /// `args : posArgList (COMMA kwArgList)? COMMA? | kwArgList COMMA? | ε`
     fn parse_args(&mut self) -> Args<&'a str, Md> {
+        self.with_struct_literals(true, |p| p.parse_args_inner())
+    }
+
+    fn parse_args_inner(&mut self) -> Args<&'a str, Md> {
         let lparen_end = self.prev_end;
         let lo = self.cur.start;
         let mut posargs = Vec::new();

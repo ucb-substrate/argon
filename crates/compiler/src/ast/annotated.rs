@@ -60,9 +60,12 @@ impl<T: AstMetadata> AnnotatedAst<T> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(pass.transform_enum_decl(e)));
                 }
-                // Unsupported declaration kinds are rejected by the parser
-                // before the annotation pass is entered.
-                Decl::Struct(_) | Decl::Constant(_) => {}
+                Decl::Struct(s) => {
+                    decls.push(Decl::Struct(pass.transform_struct_decl(s)));
+                }
+                // Constant declarations are rejected by the parser before the
+                // annotation pass is entered.
+                Decl::Constant(_) => {}
             }
         }
 
@@ -130,6 +133,24 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
         _variants: &[super::Ident<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+        input.metadata.clone()
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        input: &super::StructDecl<Self::InputS, Self::InputMetadata>,
+        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[super::StructField<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+        input.metadata.clone()
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        input: &super::StructField<Self::InputS, Self::InputMetadata>,
+        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &super::TySpec<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
         input.metadata.clone()
     }
 
@@ -236,6 +257,23 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        input: &super::StructLitExpr<Self::InputS, Self::InputMetadata>,
+        _path: &super::IdentPath<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[super::StructLitField<Self::OutputS, Self::OutputMetadata>],
+        _base: &Option<super::Expr<Self::OutputS, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        input.metadata.clone()
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        input: &super::IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
+        input.metadata.clone()
+    }
+
     fn dispatch_field_access_expr(
         &mut self,
         input: &super::FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -303,6 +341,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
         _ty: &super::TySpec<Self::OutputS, Self::OutputMetadata>,
+        _default: &Option<super::Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         input.metadata.clone()
     }

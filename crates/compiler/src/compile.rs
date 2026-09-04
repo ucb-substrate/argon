@@ -27,7 +27,8 @@ use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
-    Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
+    Span, StructDecl, StructField, StructLitExpr, StructLitField, TySpec, TySpecKind, UnaryOp,
+    UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
@@ -534,13 +535,30 @@ impl<'a> ImportPass<'a> {
                     self.record_dependency(self.use_module_path(u), u.span);
                 }
                 Decl::Enum(_) => {}
+                Decl::Struct(s) => {
+                    self.transform_struct_decl(s);
+                }
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
-                Decl::Struct(_) | Decl::Constant(_) => continue,
+                Decl::Constant(_) => continue,
             }
         }
 
         (self.deps, self.errors)
+    }
+
+    /// Records the module a qualified item path names: everything before the
+    /// final segment, resolved like a `use`. A call and a struct literal both
+    /// name an item this way.
+    fn record_item_path_dependency(&mut self, path: &IdentPath<Substr, ParseMetadata>) {
+        if path.path.len() > 1 && path.path[0].name != "std" {
+            let module = module_prefix(
+                self.current_path,
+                path.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
+            self.record_dependency(module, path.span);
+        }
     }
 }
 
@@ -595,6 +613,38 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        _input: &StructDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[StructField<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        _input: &StructField<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        _input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
+        path: &IdentPath<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[StructLitField<Self::OutputS, Self::OutputMetadata>],
+        _base: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        self.record_item_path_dependency(path);
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
     }
 
     fn dispatch_cell_decl(
@@ -719,28 +769,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if func.path.len() > 1 && func.path[0].name != "std" {
-            let path = if func.path[0].name == "lib" {
-                func.path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(1)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec()
-            } else {
-                self.current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        func.path
-                            .iter()
-                            .dropping_back(1)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec()
-            };
-            self.record_dependency(path, func.span);
-        }
+        self.record_item_path_dependency(func);
     }
 
     fn dispatch_emit_expr(
@@ -771,6 +800,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+        _default: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
@@ -1188,6 +1218,9 @@ pub enum Ty {
     CellFn(Box<CellFnTy>),
     Seq(Box<Ty>),
     Tuple(Vec<Ty>),
+    /// A user-declared `struct`. Nominal: two declarations with identical
+    /// fields are distinct types.
+    Struct(Arc<StructTy>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1248,19 +1281,15 @@ impl std::fmt::Display for Ty {
             Ty::SeqNil => write!(f, "[]"),
             Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
-            Ty::CellFn(cell_fn) => write!(
-                f,
-                "cell {}({})",
-                cell_fn.cell.name,
-                cell_fn.args.iter().format(", ")
-            ),
-            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.args.iter().format(", "), func.ret),
+            Ty::CellFn(cell_fn) => write!(f, "cell {}({})", cell_fn.cell.name, cell_fn.sig),
+            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.sig, func.ret),
             // The name is what distinguishes two same-shaped enums: `EnumTy`
             // equality keys on `id`, so without it a mismatch renders as
             // `expected enum {A, B}, found enum {A, B}`.
             Ty::Enum(e) => write!(f, "enum {} {{{}}}", e.name, e.variants.iter().format(", ")),
             Ty::Seq(inner) => write!(f, "[{inner}]"),
             Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
+            Ty::Struct(s) => write!(f, "struct {}", s.name),
         }
     }
 }
@@ -1354,22 +1383,122 @@ impl Ty {
     }
 }
 
+/// The parameters a call must supply: positional types in order, then keyword
+/// parameters by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    pub(crate) args: Vec<Ty>,
+    pub(crate) kwargs: IndexMap<String, Ty>,
+}
+
+impl Signature {
+    /// A signature with only positional parameters.
+    fn positional(args: impl IntoIterator<Item = Ty>) -> Self {
+        Self {
+            args: args.into_iter().collect(),
+            kwargs: IndexMap::new(),
+        }
+    }
+
+    /// Adds keyword parameters.
+    fn keywords<'s>(mut self, kwargs: impl IntoIterator<Item = (&'s str, Ty)>) -> Self {
+        self.kwargs
+            .extend(kwargs.into_iter().map(|(name, ty)| (name.to_owned(), ty)));
+        self
+    }
+}
+
+/// Builds a signature from typed parameter declarations: parameters without a
+/// default are positional, the rest are keyword parameters.
+impl<'a, M: AstMetadata> FromIterator<(&'a ArgDecl<Substr, M>, Ty)> for Signature {
+    fn from_iter<I: IntoIterator<Item = (&'a ArgDecl<Substr, M>, Ty)>>(params: I) -> Self {
+        let mut sig = Self::default();
+        for (arg, ty) in params {
+            match arg.default {
+                Some(_) => {
+                    sig.kwargs.insert(arg.name.name.to_string(), ty);
+                }
+                None => sig.args.push(ty),
+            }
+        }
+        sig
+    }
+}
+
+impl std::fmt::Display for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let args = self.args.iter().map(ToString::to_string);
+        let kwargs = self.kwargs.iter().map(|(name, ty)| format!("{name}: {ty}"));
+        write!(f, "{}", args.chain(kwargs).format(", "))
+    }
+}
+
+/// Signatures of the builtins whose parameters do not depend on the call.
+/// Built once rather than per call site, since every keyword name is owned.
+mod builtin_sig {
+    use std::sync::LazyLock;
+
+    use super::{Signature, Ty};
+
+    /// The coordinate keywords every rectangle constructor accepts.
+    fn coordinates() -> impl Iterator<Item = (&'static str, Ty)> {
+        ["x0", "x1", "y0", "y1", "x0i", "x1i", "y0i", "y1i", "w", "h"]
+            .into_iter()
+            .map(|name| (name, Ty::Float))
+    }
+
+    pub(super) static CRECT: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::default().keywords(coordinates().chain([("layer", Ty::String)]))
+    });
+    pub(super) static RECT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String]).keywords(coordinates()));
+    pub(super) static TEXT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String, Ty::String, Ty::Float, Ty::Float]));
+    pub(super) static RANGE_FULL: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Int, Ty::Int, Ty::Int]));
+    pub(super) static EQ: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
+    pub(super) static DIMENSION: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Bool,
+        ])
+    });
+    /// The single positional parameter is a cell, which has no nameable type;
+    /// `Ty::Any` checks the arity and leaves the category to
+    /// `assert_ty_is_cell`.
+    pub(super) static INST: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::Any]).keywords([
+            ("reflect", Ty::Bool),
+            ("angle", Ty::Int),
+            ("x", Ty::Float),
+            ("y", Ty::Float),
+            ("xi", Ty::Float),
+            ("yi", Ty::Float),
+            ("construction", Ty::Bool),
+        ])
+    });
+    /// A builtin that takes no arguments, and the empty keyword set that
+    /// builtins with variadic positional arguments check against.
+    pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
-    pub(crate) args: Vec<Ty>,
+    pub(crate) sig: Signature,
     pub(crate) ret: Ty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
-    args: Vec<Ty>,
-    /// The structural type produced when this cell function is called.
-    ///
-    /// Stored behind an `Arc` so that every caller (and every `inst` of the
-    /// resulting cell) shares one allocation instead of deep-copying it. This
-    /// keeps the type representation a DAG rather than a tree: a cell that
-    /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
-    /// type size stays linear in hierarchy depth instead of doubling per level.
+    sig: Signature,
+    /// The structural type produced when this cell function is called, shared
+    /// with every caller and every `inst` of the result.
     pub(crate) cell: Arc<CellTy>,
 }
 
@@ -1432,13 +1561,36 @@ pub struct EnumTy {
     pub(crate) variants: IndexSet<String>,
 }
 
+/// The type of a `struct` declaration.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct StructTy {
+    /// The [`VarId`] the struct's name is bound to, which doubles as the type's
+    /// identity. Struct types are *nominal*, so two same-shaped declarations
+    /// are different types, and `id` is the only field equality reads. Being
+    /// the name's own id, it also lets navigation and fingerprinting reach the
+    /// declaration without an `EnumId`-style side map.
+    pub(crate) id: VarId,
+    /// The declared name, module-qualified, for diagnostics.
+    pub(crate) name: String,
+    /// The fields and their types, in declaration order.
+    pub(crate) fields: IndexMap<String, Ty>,
+}
+
+impl PartialEq for StructTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type IdentPath = (Option<VarId>, Ty);
     /// `None` when the name was rejected before it could be bound.
     type EnumDecl = Option<(VarId, EnumId)>;
-    type StructDecl = ();
-    type StructField = ();
+    /// `None` when the name was rejected before it could be bound.
+    type StructDecl = Option<VarId>;
+    /// The field's resolved type.
+    type StructField = Ty;
     type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
@@ -1460,6 +1612,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Typ = ();
     type CastExpr = Ty;
     type TupleExpr = Ty;
+    type StructLitExpr = Ty;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -1541,10 +1694,13 @@ impl<'a> VarIdTyPass<'a> {
 
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
+        self.check_duplicate_decls();
         // Enum types must exist before imports and function signatures are
-        // resolved. Imports are then installed before functions are declared,
-        // allowing imported enum types in signatures and imported functions in
-        // any declaration body regardless of source order.
+        // resolved. Imports are then installed before structs and functions
+        // are declared, allowing imported enum and struct types in fields and
+        // signatures, and imported functions in any declaration body,
+        // regardless of source order. Structs come before functions so that a
+        // signature may name a struct declared further down.
         for decl in &self.ast.ast.decls {
             if let Decl::Enum(e) = decl {
                 self.declare_enum_decl(e);
@@ -1555,6 +1711,7 @@ impl<'a> VarIdTyPass<'a> {
                 self.declare_use_decl(u);
             }
         }
+        self.declare_struct_decls();
         for decl in &self.ast.ast.decls {
             if let Decl::Fn(f) = decl {
                 self.declare_fn_decl(f);
@@ -1578,9 +1735,12 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
+                Decl::Struct(s) => {
+                    decls.push(Decl::Struct(self.transform_struct_decl(s)));
+                }
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
-                Decl::Struct(_) | Decl::Constant(_) => continue,
+                Decl::Constant(_) => continue,
             }
         }
 
@@ -1606,6 +1766,44 @@ impl<'a> VarIdTyPass<'a> {
             use_decl.path.iter().map(|ident| ident.name.as_str()),
             1,
         )
+    }
+
+    /// Reports every top-level declaration whose name an earlier declaration
+    /// of this module already took.
+    ///
+    /// Cells, functions, structs, enums, and imports all bind into the one
+    /// module frame, so `struct Mode` after `enum Mode` clashes as much as two
+    /// `cell top`s do. The declaration passes run by kind rather than in
+    /// source order, so without this check the survivor of a clash was
+    /// whichever kind is declared last -- a struct always beat an enum of the
+    /// same name, whatever the file said -- and [`Self::declare_struct_decls`]
+    /// keys structs by name, so a repeated `struct S` dropped the first
+    /// declaration without a trace. The later declaration is reported and
+    /// binding proceeds as before; the file is already invalid.
+    ///
+    /// Modules are exempt: `mod m;` is resolved through `mod_bindings`, never
+    /// through this frame, so `mod m;` and `fn m` do not collide.
+    fn check_duplicate_decls(&mut self) {
+        let mut seen = IndexSet::new();
+        for decl in &self.ast.ast.decls {
+            let name = match decl {
+                Decl::Enum(e) => &e.name,
+                Decl::Struct(s) => &s.name,
+                Decl::Fn(f) => &f.name,
+                Decl::Cell(c) => &c.name,
+                Decl::Use(u) => u
+                    .alias
+                    .as_ref()
+                    .unwrap_or_else(|| u.path.last().expect("use paths are non-empty")),
+                Decl::Mod(_) | Decl::Constant(_) => continue,
+            };
+            if !seen.insert(name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+        }
     }
 
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
@@ -1647,16 +1845,17 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
-        let args: Vec<_> = input
+        self.check_params(&input.args);
+        let sig = input
             .args
             .iter()
             .map(|arg| {
                 let ty_spec = self.transform_ty_spec(&arg.ty);
-                self.ty_from_spec(&ty_spec)
+                (arg, self.ty_from_spec(&ty_spec))
             })
             .collect();
         let ty = Ty::Fn(Box::new(FnTy {
-            args,
+            sig,
             ret: if let Some(return_ty) = &input.return_ty {
                 self.ty_from_spec(return_ty)
             } else {
@@ -1690,6 +1889,107 @@ impl<'a> VarIdTyPass<'a> {
             variants,
         });
         self.alloc(&input.name.name, ty);
+    }
+
+    /// Declares every struct in the module, each after the local structs its
+    /// fields name, so that a field may refer to a struct declared further
+    /// down the file.
+    ///
+    /// A struct whose fields lead back to itself has no finite value, since
+    /// there is no optional type to end the recursion. The field that closes
+    /// the cycle is reported and typed `Unknown`, so the declaration still
+    /// binds and its other uses are checked normally.
+    fn declare_struct_decls(&mut self) {
+        let structs: IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>> = self
+            .ast
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Struct(s) => Some((s.name.name.as_str(), s)),
+                _ => None,
+            })
+            .collect();
+        let mut visiting = IndexSet::new();
+        let mut declared = IndexSet::new();
+        for name in structs.keys().copied().collect::<Vec<_>>() {
+            self.declare_struct_after_deps(name, &structs, &mut visiting, &mut declared);
+        }
+    }
+
+    fn declare_struct_after_deps(
+        &mut self,
+        name: &'a str,
+        structs: &IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>>,
+        visiting: &mut IndexSet<&'a str>,
+        declared: &mut IndexSet<&'a str>,
+    ) {
+        if declared.contains(name) {
+            return;
+        }
+        let decl = structs[name];
+        visiting.insert(name);
+        let mut recursive = IndexSet::new();
+        for (index, field) in decl.fields.iter().enumerate() {
+            for dep in ty_spec_names(&field.ty) {
+                // Anything that is not a struct of this module -- a primitive,
+                // an enum, an import, a typo -- is resolved by `ty_from_spec`.
+                if !structs.contains_key(dep) {
+                    continue;
+                }
+                if visiting.contains(dep) {
+                    recursive.insert(index);
+                } else {
+                    self.declare_struct_after_deps(dep, structs, visiting, declared);
+                }
+            }
+        }
+        visiting.swap_remove(name);
+        self.declare_struct_decl(decl, &recursive);
+        declared.insert(name);
+    }
+
+    /// Declares one struct. `recursive` holds the indices of the fields that
+    /// would make the type contain itself.
+    fn declare_struct_decl(
+        &mut self,
+        input: &'a StructDecl<Substr, ParseMetadata>,
+        recursive: &IndexSet<usize>,
+    ) {
+        if BUILTINS.contains(&input.name.name.as_str()) {
+            self.errors.push(StaticError {
+                span: self.span(input.name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+            return;
+        }
+        let id = self.alloc_id();
+        let mut fields = IndexMap::with_capacity(input.fields.len());
+        for (index, field) in input.fields.iter().enumerate() {
+            let ty = if recursive.contains(&index) {
+                self.errors.push(StaticError {
+                    span: self.span(field.ty.span),
+                    kind: StaticErrorKind::RecursiveStruct {
+                        name: input.name.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            } else {
+                self.ty_from_spec(&field.ty)
+            };
+            if fields.insert(field.name.name.to_string(), ty).is_some() {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+        }
+        let ty = Ty::Struct(Arc::new(StructTy {
+            id,
+            name: self.qualified_name(&input.name.name),
+            fields,
+        }));
+        self.bind(&input.name.name, id, ty);
     }
 
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
@@ -1957,33 +2257,26 @@ impl<'a> VarIdTyPass<'a> {
     fn typecheck_kwargs(
         &mut self,
         kwargs: &[KwArgValue<Substr, VarIdTyMetadata>],
-        kwarg_defs: IndexMap<&str, Ty>,
+        defs: &IndexMap<String, Ty>,
     ) {
-        let mut defined = IndexSet::new();
+        let mut seen = IndexSet::new();
         for kwarg in kwargs {
-            let mut cont = false;
-            if !kwarg_defs.contains_key(&kwarg.name.name.as_str()) {
+            let name = kwarg.name.name.as_str();
+            let Some(expected) = defs.get(name) else {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::InvalidKwArg,
                 });
-                cont = true;
-            }
-            if defined.contains(&&kwarg.name.name) {
+                continue;
+            };
+            if !seen.insert(name) {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::DuplicateKwArg,
                 });
-                cont = true;
+                continue;
             }
-            defined.insert(&kwarg.name.name);
-            if !cont {
-                self.assert_eq_ty(
-                    kwarg.value.span(),
-                    &kwarg.value.ty(),
-                    kwarg_defs.get(&kwarg.name.name.as_str()).unwrap(),
-                );
-            }
+            self.assert_eq_ty(kwarg.value.span(), &kwarg.value.ty(), expected);
         }
     }
 
@@ -1999,15 +2292,40 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Checks a call's arguments against the callee's signature.
     fn typecheck_args(
         &mut self,
         call_span: cfgrammar::Span,
         args: &crate::ast::Args<Substr, VarIdTyMetadata>,
-        arg_defs: &[Ty],
-        kwarg_defs: IndexMap<&str, Ty>,
+        sig: &Signature,
     ) {
-        self.typecheck_posargs(call_span, &args.posargs, arg_defs);
-        self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+        self.typecheck_posargs(call_span, &args.posargs, &sig.args);
+        self.typecheck_kwargs(&args.kwargs, &sig.kwargs);
+    }
+
+    /// Rejects repeated parameter names and positional parameters declared
+    /// after keyword parameters.
+    fn check_params<M: AstMetadata>(&mut self, args: &[ArgDecl<Substr, M>]) {
+        let mut seen = IndexSet::new();
+        let mut keyword_seen = false;
+        for arg in args {
+            if !seen.insert(arg.name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(arg.name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            match arg.default {
+                Some(_) => keyword_seen = true,
+                None if keyword_seen => self.errors.push(StaticError {
+                    span: self.span(arg.name.span),
+                    kind: StaticErrorKind::PositionalParamAfterDefault {
+                        name: arg.name.name.to_string(),
+                    },
+                }),
+                None => {}
+            }
+        }
     }
 
     fn typecheck_call(
@@ -2021,11 +2339,11 @@ impl<'a> VarIdTyPass<'a> {
         if let Some((varid, ty)) = lookup {
             match ty {
                 Ty::Fn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    self.typecheck_args(call_span, args, &ty.sig);
                     (Some(varid), ty.ret.clone())
                 }
                 Ty::CellFn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    self.typecheck_args(call_span, args, &ty.sig);
                     (Some(varid), Ty::Cell(ty.cell.clone()))
                 }
                 ty => {
@@ -2049,6 +2367,16 @@ impl<'a> VarIdTyPass<'a> {
             });
             (None, Ty::Unknown)
         }
+    }
+}
+
+/// The identifiers a type annotation is built from: `[(A, B)]` names `A` and
+/// `B`.
+fn ty_spec_names<M: AstMetadata>(spec: &TySpec<Substr, M>) -> Vec<&str> {
+    match &spec.kind {
+        TySpecKind::Ident(ident) => vec![ident.name.as_str()],
+        TySpecKind::Seq(inner) => ty_spec_names(inner),
+        TySpecKind::Tuple(items) => items.iter().flat_map(ty_spec_names).collect(),
     }
 }
 
@@ -2076,6 +2404,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
             Expr::Tuple(t) => t.metadata.clone(),
+            Expr::StructLit(lit) => lit.metadata.clone(),
         }
     }
 }
@@ -2171,6 +2500,170 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         }
     }
 
+    fn transform_struct_decl(
+        &mut self,
+        input: &StructDecl<Substr, Self::InputMetadata>,
+    ) -> StructDecl<Substr, Self::OutputMetadata> {
+        // `declare_struct_decls` already resolved every field type; the
+        // annotated fields carry those types rather than resolving the specs a
+        // second time, which would report each error twice.
+        let struct_ty = match self.lookup(&input.name.name) {
+            Some((_, Ty::Struct(struct_ty))) => Some(struct_ty),
+            _ => None,
+        };
+        let name = self.transform_ident(&input.name);
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| {
+                let ty = struct_ty
+                    .as_ref()
+                    .and_then(|struct_ty| struct_ty.fields.get(field.name.name.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                StructField {
+                    name: self.transform_ident(&field.name),
+                    ty: self.transform_ty_spec(&field.ty),
+                    span: field.span,
+                    metadata: ty,
+                }
+            })
+            .collect_vec();
+        let metadata = self.dispatch_struct_decl(input, &name, &fields);
+        StructDecl {
+            name,
+            fields,
+            span: input.span,
+            metadata,
+        }
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        _input: &StructDecl<Substr, Self::InputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
+        _fields: &[StructField<Substr, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+        // Like `dispatch_enum_decl`: a name that collided with a builtin was
+        // never bound, and there is no id to report.
+        match self.lookup(&name.name) {
+            Some((var_id, Ty::Struct(_))) => Some(var_id),
+            _ => None,
+        }
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        _input: &StructField<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &TySpec<Substr, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
+        // `transform_struct_decl` builds the fields itself.
+        unreachable!()
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        _input: &IdentPath<Substr, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
+        // Resolved by `dispatch_struct_lit_expr`, whose metadata carries the
+        // struct type; like a call's `func` path, this one stays unresolved.
+        (None, Ty::Unknown)
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        input: &StructLitExpr<Substr, Self::InputMetadata>,
+        path: &IdentPath<Substr, Self::OutputMetadata>,
+        fields: &[StructLitField<Substr, Self::OutputMetadata>],
+        base: &Option<Expr<Substr, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        let name = &path.path.last().expect("paths are non-empty").name;
+        let lookup = if path.path.len() == 1 {
+            self.lookup(name)
+        } else {
+            let module = module_prefix(
+                self.current_path,
+                path.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
+            if &module == self.current_path {
+                self.lookup(name)
+            } else {
+                self.mod_bindings
+                    .get(&module)
+                    .and_then(|frame| frame.var_bindings.get(name.as_str()).cloned())
+            }
+        };
+        let Some((_, ty)) = lookup else {
+            self.errors.push(StaticError {
+                span: self.span(path.span),
+                kind: if path.path.len() == 1 {
+                    self.unresolved_local_name_error(name, path.span)
+                } else {
+                    StaticErrorKind::UndeclaredVar {
+                        name: name.to_string(),
+                    }
+                },
+            });
+            return Ty::Unknown;
+        };
+        let Ty::Struct(struct_ty) = ty else {
+            // An `Unknown` binding was already diagnosed where it was bound.
+            if !matches!(ty, Ty::Unknown) {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::NotAStruct,
+                });
+            }
+            return Ty::Unknown;
+        };
+        let ty = Ty::Struct(struct_ty.clone());
+
+        let mut seen = IndexSet::new();
+        for field in fields {
+            let field_name = field.name.name.as_str();
+            let Some(expected) = struct_ty.fields.get(field_name) else {
+                self.no_field_on_ty(&field.name, ty.clone());
+                continue;
+            };
+            if !seen.insert(field_name) {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateStructField {
+                        field: field_name.to_string(),
+                    },
+                });
+                continue;
+            }
+            self.assert_eq_ty(field.value.span(), &field.value.ty(), expected);
+        }
+
+        match base {
+            // Every field not listed comes from the base, which therefore has
+            // to be this very struct.
+            Some(base) => self.assert_eq_ty(base.span(), &base.ty(), &ty),
+            None => {
+                let missing = struct_ty
+                    .fields
+                    .keys()
+                    .filter(|name| !seen.contains(name.as_str()))
+                    .map(|name| format!("`{name}`"))
+                    .collect_vec();
+                if !missing.is_empty() {
+                    self.errors.push(StaticError {
+                        span: self.span(input.span),
+                        kind: StaticErrorKind::MissingStructFields {
+                            ty: ty.to_string(),
+                            fields: missing.join(", "),
+                        },
+                    });
+                }
+            }
+        }
+        ty
+    }
+
     fn dispatch_cell_decl(
         &mut self,
         _input: &CellDecl<Substr, Self::InputMetadata>,
@@ -2242,6 +2735,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
+        self.check_params(&input.args);
         self.enter_scope(&input.scope);
         let args: Vec<_> = input
             .args
@@ -2290,7 +2784,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         // field accesses on it fall through to the builtin geometry fields.
         let cell_id = self.alloc_id();
         let ty = Ty::CellFn(Box::new(CellFnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            sig: args
+                .iter()
+                .map(|arg| (arg, arg.metadata.1.clone()))
+                .collect(),
             cell: Arc::new(CellTy {
                 name: self.qualified_name(&input.name.name),
                 data,
@@ -2579,6 +3076,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
                 Ty::Unknown
             }
+            Ty::Struct(ref s) => match s.fields.get(field.name.as_str()) {
+                Some(ty) => ty.clone(),
+                None => self.no_field_on_ty(field, base_ty.clone()),
+            },
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
@@ -2652,94 +3153,44 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
-                    let kwarg_defs = if name == "crect" {
-                        self.typecheck_posargs(input.span, &args.posargs, &[]);
-                        IndexMap::from_iter([
-                            ("x0", Ty::Float),
-                            ("x1", Ty::Float),
-                            ("y0", Ty::Float),
-                            ("y1", Ty::Float),
-                            ("x0i", Ty::Float),
-                            ("x1i", Ty::Float),
-                            ("y0i", Ty::Float),
-                            ("y1i", Ty::Float),
-                            ("w", Ty::Float),
-                            ("h", Ty::Float),
-                            ("layer", Ty::String),
-                        ])
+                    let sig = if name == "crect" {
+                        &builtin_sig::CRECT
                     } else {
-                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
-                        IndexMap::from_iter([
-                            ("x0", Ty::Float),
-                            ("x1", Ty::Float),
-                            ("y0", Ty::Float),
-                            ("y1", Ty::Float),
-                            ("x0i", Ty::Float),
-                            ("x1i", Ty::Float),
-                            ("y0i", Ty::Float),
-                            ("y1i", Ty::Float),
-                            ("w", Ty::Float),
-                            ("h", Ty::Float),
-                        ])
+                        &builtin_sig::RECT
                     };
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    self.typecheck_args(input.span, args, sig);
                     (None, Ty::Rect)
                 }
                 "polygon" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if let Some(layer) = args.posargs.first() {
-                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
-                    }
-                    if let Some(points) = args.posargs.get(1) {
-                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
-                    }
-                    let kwarg_defs = args
-                        .kwargs
-                        .iter()
-                        .filter_map(|kwarg| {
-                            polygon_coordinate(kwarg.name.name.as_str())
-                                .map(|_| (kwarg.name.name.as_str(), Ty::Float))
-                        })
-                        .collect();
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    let coordinates = args.kwargs.iter().filter_map(|kwarg| {
+                        let name = kwarg.name.name.as_str();
+                        polygon_coordinate(name).map(|_| (name, Ty::Float))
+                    });
+                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
+                    self.typecheck_args(input.span, args, &sig);
                     (None, Ty::Polygon)
                 }
                 "path" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if let Some(layer) = args.posargs.first() {
-                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
-                    }
-                    if let Some(points) = args.posargs.get(1) {
-                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
-                    }
-                    let kwarg_defs = args
-                        .kwargs
-                        .iter()
-                        .filter_map(|kwarg| {
-                            let name = kwarg.name.name.as_str();
-                            (matches!(
-                                name,
-                                "width"
-                                    | "widthi"
-                                    | "begin_extension"
-                                    | "begin_extensioni"
-                                    | "end_extension"
-                                    | "end_extensioni"
-                            ) || polygon_coordinate(name).is_some())
-                            .then_some((name, Ty::Float))
-                        })
-                        .collect();
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    let keywords = args.kwargs.iter().filter_map(|kwarg| {
+                        let name = kwarg.name.name.as_str();
+                        (matches!(
+                            name,
+                            "width"
+                                | "widthi"
+                                | "begin_extension"
+                                | "begin_extensioni"
+                                | "end_extension"
+                                | "end_extensioni"
+                        ) || polygon_coordinate(name).is_some())
+                        .then_some((name, Ty::Float))
+                    });
+                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
+                    self.typecheck_args(input.span, args, &sig);
                     (None, Ty::Path)
                 }
                 "text" => {
                     // text, layer, x, y
-                    self.typecheck_posargs(
-                        input.span,
-                        &args.posargs,
-                        &[Ty::String, Ty::String, Ty::Float, Ty::Float],
-                    );
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_args(input.span, args, &builtin_sig::TEXT);
                     (None, Ty::Nil)
                 }
                 "cons" => {
@@ -2762,7 +3213,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     }
                 }
                 "list" => {
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::NONE.kwargs);
                     if args.posargs.is_empty() {
                         self.errors.push(StaticError {
                             span: self.span(input.span),
@@ -2796,8 +3247,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "range_full" => {
                     // Native builtin backing `std::range`/`std::range_full`: builds the
                     // whole `[Int]` in one pass instead of recursive `cons`.
-                    self.typecheck_posargs(input.span, &args.posargs, &[Ty::Int, Ty::Int, Ty::Int]);
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_args(input.span, args, &builtin_sig::RANGE_FULL);
                     (None, Ty::Seq(Box::new(Ty::Int)))
                 }
                 "head" => {
@@ -2867,44 +3317,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     (None, Ty::Rect)
                 }
                 "float" => {
-                    self.typecheck_args(input.span, args, &[], IndexMap::new());
+                    self.typecheck_args(input.span, args, &builtin_sig::NONE);
                     (None, Ty::Float)
                 }
                 "eq" => {
-                    self.typecheck_args(input.span, args, &[Ty::Float, Ty::Float], IndexMap::new());
+                    self.typecheck_args(input.span, args, &builtin_sig::EQ);
                     (None, Ty::Nil)
                 }
                 "dimension" => {
-                    self.typecheck_args(
-                        input.span,
-                        args,
-                        &[
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Bool,
-                        ],
-                        IndexMap::new(),
-                    );
+                    self.typecheck_args(input.span, args, &builtin_sig::DIMENSION);
                     (None, Ty::Nil)
                 }
                 "inst" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    self.typecheck_kwargs(
-                        &args.kwargs,
-                        IndexMap::from_iter([
-                            ("reflect", Ty::Bool),
-                            ("angle", Ty::Int),
-                            ("x", Ty::Float),
-                            ("y", Ty::Float),
-                            ("xi", Ty::Float),
-                            ("yi", Ty::Float),
-                            ("construction", Ty::Bool),
-                        ]),
-                    );
+                    self.typecheck_args(input.span, args, &builtin_sig::INST);
                     if let Some(ty) = args.posargs.first() {
                         self.assert_ty_is_cell(ty.span(), &ty.ty());
                         match ty.ty() {
@@ -3013,8 +3438,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         input: &ArgDecl<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
         _ty: &TySpec<Substr, Self::OutputMetadata>,
+        default: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         let ty = self.ty_from_spec(&input.ty);
+        if let Some(default) = default {
+            self.assert_eq_ty(default.span(), &default.ty(), &ty);
+        }
         (self.alloc(&input.name.name, ty.clone()), ty)
     }
 
@@ -3108,6 +3537,12 @@ pub enum CellArg {
     /// An enum variant, identified by name like [`Value::EnumValue`].
     Enum(String),
     Seq(Vec<CellArg>),
+    /// A struct value: the qualified name of its type and its fields in
+    /// declaration order, like [`Value::Struct`].
+    Struct {
+        name: String,
+        fields: Vec<(String, CellArg)>,
+    },
 }
 
 impl CellArg {
@@ -3123,6 +3558,14 @@ impl CellArg {
                 values.iter().all(|value| value.matches_ty(inner))
             }
             (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            (Self::Struct { name, fields }, Ty::Struct(ty)) => {
+                *name == ty.name
+                    && fields.len() == ty.fields.len()
+                    && fields
+                        .iter()
+                        .zip(&ty.fields)
+                        .all(|((name, value), (field, ty))| name == field && value.matches_ty(ty))
+            }
             _ => false,
         }
     }
@@ -3135,6 +3578,7 @@ impl CellArg {
             Self::String(_) => "String",
             Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
+            Self::Struct { .. } => "struct",
         }
     }
 }
@@ -3154,6 +3598,7 @@ pub(crate) enum CellArgKey {
     String(String),
     Enum(String),
     Seq(Vec<CellArgKey>),
+    Struct(String, Vec<(String, CellArgKey)>),
 }
 
 impl From<&CellArg> for CellArgKey {
@@ -3165,6 +3610,13 @@ impl From<&CellArg> for CellArgKey {
             CellArg::String(s) => Self::String(s.clone()),
             CellArg::Enum(v) => Self::Enum(v.clone()),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
+            CellArg::Struct { name, fields } => Self::Struct(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from(value)))
+                    .collect(),
+            ),
         }
     }
 }
@@ -5347,6 +5799,88 @@ impl<'a> ExecPass<'a> {
             .unwrap_or(self.nil_value)
     }
 
+    /// Creates an empty frame whose parent is the global frame.
+    fn new_call_frame(&mut self) -> FrameId {
+        let fid = self.frame_id();
+        self.frames.insert(
+            fid,
+            Frame {
+                bindings: Default::default(),
+                parent: Some(self.global_frame),
+            },
+        );
+        fid
+    }
+
+    /// Evaluates a call's explicit arguments in the caller's context: one slot
+    /// per parameter in declaration order, `None` where the default applies.
+    fn explicit_args(
+        &mut self,
+        loc: DynLoc,
+        call: &CallExpr<Substr, VarIdTyMetadata>,
+        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+    ) -> Vec<Option<ValueId>> {
+        params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                let arg = match call.args.posargs.get(index) {
+                    Some(arg) => arg,
+                    None => {
+                        let kwarg = call
+                            .args
+                            .kwargs
+                            .iter()
+                            .find(|kwarg| kwarg.name.name == param.name.name)?;
+                        &kwarg.value
+                    }
+                };
+                Some(self.visit_expr(loc, arg))
+            })
+            .collect()
+    }
+
+    /// Binds every parameter in `loc.frame` and returns the bound values in
+    /// declaration order. A parameter without an explicit argument gets its
+    /// default, evaluated in a scope of its own under `loc.scope` once the
+    /// parameters before it are bound.
+    fn bind_args(
+        &mut self,
+        loc: DynLoc,
+        call_order: u64,
+        path: &FsPath,
+        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+        explicit: Vec<Option<ValueId>>,
+    ) -> Vec<ValueId> {
+        params
+            .iter()
+            .zip(explicit)
+            .map(|(param, explicit)| {
+                let value = match (explicit, &param.default) {
+                    (Some(value), _) => value,
+                    (None, Some(default)) => {
+                        let scope = self.create_exec_scope_at_loc(
+                            loc,
+                            format!("{call_order} default {}", param.name.name),
+                            Span {
+                                path: path.to_path_buf(),
+                                span: default.span(),
+                            },
+                        );
+                        self.visit_expr(DynLoc { scope, ..loc }, default)
+                    }
+                    (None, None) => unreachable!("a parameter without an argument has a default"),
+                };
+                self.frames
+                    .get_mut(&loc.frame)
+                    .unwrap()
+                    .bindings
+                    .insert(param.metadata.0, value);
+                value
+            })
+            .collect()
+    }
+
     fn new_ready_value(&mut self, val: Value) -> ValueId {
         let vid = self.value_id();
         self.values.insert(vid, Defer::Ready(val));
@@ -5424,33 +5958,19 @@ impl<'a> ExecPass<'a> {
                         }))
                     })
                 } else {
-                    let arg_vals = c
-                        .args
-                        .posargs
-                        .iter()
-                        .map(|arg| self.visit_expr(loc, arg))
-                        .collect_vec();
-                    let val = &self.values[&self
+                    let callee = self
                         .lookup(
                             loc.frame,
                             c.metadata
                                 .0
                                 .expect("no var ID assigned to function being called"),
                         )
-                        .unwrap()]
-                        .as_ref()
-                        .unwrap_ready()
-                        .as_ref();
-                    match val {
+                        .unwrap();
+                    match self.values[&callee].as_ref().unwrap_ready().as_ref() {
                         ValueRef::Fn(val) => {
-                            let mut call_frame = Frame {
-                                bindings: Default::default(),
-                                parent: Some(self.global_frame),
-                            };
-                            for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
-                                call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
-                            }
-                            let new_scope = val.scope.clone();
+                            let (params, body, path) =
+                                (val.args.clone(), val.scope.clone(), val.metadata.0.clone());
+                            let explicit = self.explicit_args(loc, c, &params);
                             let scope = self.create_exec_scope(
                                 loc.cell,
                                 loc.scope,
@@ -5461,12 +5981,11 @@ impl<'a> ExecPass<'a> {
                                     c.func.path.iter().map(|ident| &ident.name).join("::")
                                 ),
                                 Span {
-                                    path: val.metadata.0.clone(),
-                                    span: val.scope.span,
+                                    path: path.clone(),
+                                    span: body.span,
                                 },
                             );
-                            let fid = self.frame_id();
-                            self.frames.insert(fid, call_frame);
+                            let fid = self.new_call_frame();
                             // A `fn` body is inlined here and now, unlike an
                             // `if`/`match` branch, so a recursive call that is
                             // not inside one descends natively with no
@@ -5483,25 +6002,34 @@ impl<'a> ExecPass<'a> {
                                 });
                                 return self.nil_value;
                             }
-                            let value =
-                                self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope);
+                            let callee_loc = DynLoc {
+                                cell: loc.cell,
+                                frame: fid,
+                                scope,
+                                seq_num: SeqNum::new(),
+                            };
+                            self.bind_args(callee_loc, c.scope_order, &path, &params, explicit);
+                            let value = self.visit_scope_expr_inner(loc.cell, fid, scope, &body);
                             self.eval_depth -= 1;
                             value
                         }
-                        ValueRef::CellFn(_) => self.new_deferred_value(loc, |this| {
-                            PartialEvalState::Call(Box::new(PartialCallExpr {
-                                expr: c.clone(),
-                                state: CallExprState {
-                                    posargs: arg_vals,
-                                    kwargs: c
-                                        .args
-                                        .kwargs
-                                        .iter()
-                                        .map(|arg| this.visit_expr(loc, &arg.value))
-                                        .collect(),
-                                },
-                            }))
-                        }),
+                        ValueRef::CellFn(val) => {
+                            let (params, path) = (val.args.clone(), val.metadata.0.clone());
+                            let explicit = self.explicit_args(loc, c, &params);
+                            let fid = self.new_call_frame();
+                            let callee_loc = DynLoc { frame: fid, ..loc };
+                            let posargs =
+                                self.bind_args(callee_loc, c.scope_order, &path, &params, explicit);
+                            self.new_deferred_value(loc, |_| {
+                                PartialEvalState::Call(Box::new(PartialCallExpr {
+                                    expr: c.clone(),
+                                    state: CallExprState {
+                                        posargs,
+                                        kwargs: Vec::new(),
+                                    },
+                                }))
+                            })
+                        }
                         _ => {
                             self.errors.push(ExecError {
                                 span: Some(self.span(&loc, c.span)),
@@ -5618,6 +6146,28 @@ impl<'a> ExecPass<'a> {
                         .collect(),
                 })
             }),
+            Expr::StructLit(lit) => {
+                // A static error aborts compilation before anything is
+                // executed, so the literal is known to name a struct.
+                let Ty::Struct(ty) = &lit.metadata else {
+                    unreachable!("struct literal was not resolved to a struct type")
+                };
+                let ty = ty.clone();
+                self.new_deferred_value(loc, |this| {
+                    let fields = lit
+                        .fields
+                        .iter()
+                        .map(|field| this.visit_expr(loc, &field.value))
+                        .collect();
+                    let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
+                    PartialEvalState::StructLit(Box::new(PartialStructLit {
+                        expr: (**lit).clone(),
+                        ty,
+                        fields,
+                        base,
+                    }))
+                })
+            }
         }
     }
 
@@ -5671,6 +6221,19 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 Some(CellArg::Seq(args))
+            }
+            Value::Struct(value) => {
+                let mut fields = Vec::with_capacity(value.fields.len());
+                for (name, v) in value.fields.iter() {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => fields.push((name.clone(), arg)),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Struct {
+                    name: value.name.clone(),
+                    fields,
+                })
             }
             // Already reported when it was poisoned. The caller turns this
             // `Err` into poison of its own rather than a second diagnostic
@@ -7457,6 +8020,18 @@ impl<'a> ExecPass<'a> {
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
                         }
+                        ValueRef::Struct(value) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            // The base may have arrived as `Any`, so the field
+                            // was never checked against the struct.
+                            let Some(val) = value.fields.get(field).cloned() else {
+                                let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
                         ValueRef::Inst(inst) => {
                             let val = match field_access_expr.expr.field.name.as_str() {
                                 "x" => Some(Value::Linear(inst.x.clone())),
@@ -7859,6 +8434,71 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::StructLit(lit) => {
+                let pending = lit
+                    .fields
+                    .iter()
+                    .copied()
+                    .chain(lit.base)
+                    .find(|input| !self.values[input].is_ready());
+                if let Some(pending) = pending {
+                    self.add_value_dependent(pending, vid);
+                    false
+                } else {
+                    // The fields not listed come from the base, which the
+                    // static check proved to be this struct unless it was
+                    // typed `Any`.
+                    let base = match lit.base {
+                        None => None,
+                        Some(base) => match self.values[&base].get_ready() {
+                            Some(Value::Struct(value)) if value.name == lit.ty.name => {
+                                Some(value.fields.clone())
+                            }
+                            _ => {
+                                let base = lit.expr.base.as_ref().expect("base was evaluated");
+                                let span = self.span(&vref.loc, base.span());
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            }
+                        },
+                    };
+                    // Declaration order, whatever order the literal used:
+                    // `CellArg::Struct` fields are matched pairwise against
+                    // the type's.
+                    let fields = lit
+                        .ty
+                        .fields
+                        .keys()
+                        .map(|name| {
+                            let explicit = lit
+                                .expr
+                                .fields
+                                .iter()
+                                .zip(&lit.fields)
+                                .find(|(field, _)| field.name.name == *name)
+                                .map(|(_, value)| self.values[value].get_ready().cloned());
+                            let value = match explicit {
+                                Some(value) => value,
+                                None => base.as_ref().and_then(|base| base.get(name).cloned()),
+                            };
+                            value.map(|value| (name.clone(), value))
+                        })
+                        .collect::<Option<IndexMap<_, _>>>();
+                    let Some(fields) = fields else {
+                        let span = self.span(&vref.loc, lit.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(cell_id, vid);
+                    };
+                    self.values.insert(
+                        vid,
+                        DeferValue::Ready(Value::Struct(Box::new(StructValue {
+                            name: lit.ty.name.clone(),
+                            fields,
+                        }))),
+                    );
+                    true
+                }
+            }
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
@@ -8018,6 +8658,10 @@ pub enum Value {
     Inst(Instance),
     Seq(Seq),
     Tuple(Vec<Value>),
+    /// A struct value. Boxed like [`Value::Fn`]: a struct is rarely stored
+    /// per sequence element, and its field map is large relative to the
+    /// scalar variants.
+    Struct(Box<StructValue>),
     SeqNil,
     Nil,
     /// A value whose diagnostic has already been reported.
@@ -8049,6 +8693,13 @@ impl Value {
             CellArg::String(s) => Value::String(s.clone()),
             CellArg::Enum(v) => Value::EnumValue(v.clone()),
             CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
+            CellArg::Struct { name, fields } => Value::Struct(Box::new(StructValue {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from_arg(value)))
+                    .collect(),
+            })),
         }
     }
 
@@ -8070,6 +8721,7 @@ impl Value {
             Self::Inst(_) => "instance",
             Self::Seq(_) | Self::SeqNil => "sequence",
             Self::Tuple(_) => "tuple",
+            Self::Struct(_) => "struct",
             Self::Nil => "nil",
             // Matches `Ty::Unknown`'s rendering. Reaching a diagnostic that
             // names a poisoned value means one was not suppressed upstream;
@@ -8097,6 +8749,17 @@ impl Value {
             Arrayed::Array(s) => Self::Seq(s.into_iter().map(Value::from_array).collect()),
         }
     }
+}
+
+/// A struct value. See [`Value::Struct`].
+#[derive(Debug, Clone)]
+pub struct StructValue {
+    /// The module-qualified name of the declaring struct, matching
+    /// `StructTy::name`, so that `..base` and cell arguments can check that a
+    /// value which arrived as `Any` is the struct they expect.
+    pub name: String,
+    /// The fields in declaration order.
+    pub fields: IndexMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8606,6 +9269,7 @@ enum PartialEvalState<T: AstMetadata> {
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
+    StructLit(Box<PartialStructLit<T>>),
     ForLoop(Box<PartialForLoop<T>>),
 }
 
@@ -8643,6 +9307,7 @@ impl<T: AstMetadata> PartialEvalState<T> {
             Self::Constraint(c) => vec![c.lhs, c.rhs],
             Self::Cast(e) => vec![e.state.value],
             Self::Tuple(e) => e.items.clone(),
+            Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
             Self::ForLoop(f) => vec![f.seq],
         }
     }
@@ -8769,6 +9434,17 @@ struct PartialCastExpr<T: AstMetadata> {
 #[derive(Debug, Clone)]
 struct PartialTupleExpr {
     items: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone)]
+struct PartialStructLit<T: AstMetadata> {
+    expr: StructLitExpr<Substr, T>,
+    /// The struct being built, from the literal's checked type; its field
+    /// order is the order the value's fields take.
+    ty: Arc<StructTy>,
+    /// One value per entry of `expr.fields`.
+    fields: Vec<ValueId>,
+    base: Option<ValueId>,
 }
 
 #[derive(Debug, Clone)]

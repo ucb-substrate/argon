@@ -16,7 +16,10 @@ pub struct StaticError {
 pub enum StaticErrorKind {
     /// Multiple declarations with the same name.
     ///
-    /// For example, two cells named `my_cell`.
+    /// For example, two cells named `my_cell`. Top-level cells, functions,
+    /// structs, enums, and imports share one namespace per module, so
+    /// `struct Mode` after `enum Mode` is reported too. Also covers repeated
+    /// parameter names, enum variants, and struct fields.
     #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
     /// Attempted to declare an object with the same name as a built-in object.
@@ -44,6 +47,18 @@ pub enum StaticErrorKind {
     /// Attempted to use an enum variant that is not declared by the enum.
     #[error("not a variant of the enum: {0}")]
     InvalidVariant(String),
+    /// A struct literal names something that is not a struct type.
+    #[error("expected a struct type")]
+    NotAStruct,
+    /// A struct literal gives the same field twice.
+    #[error("field `{field}` is specified more than once")]
+    DuplicateStructField { field: String },
+    /// A struct literal without `..base` omits declared fields.
+    #[error("missing fields {fields} in initializer of {ty}")]
+    MissingStructFields { ty: String, fields: String },
+    /// A struct contains itself, directly or through its fields' types.
+    #[error("struct `{name}` contains itself; recursive structs are not supported")]
+    RecursiveStruct { name: String },
     /// A cell had an expression in tail position, which is not permitted.
     #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
@@ -135,6 +150,9 @@ pub enum StaticErrorKind {
     /// A call supplies the same keyword argument more than once.
     #[error("duplicate keyword argument")]
     DuplicateKwArg,
+    /// A parameter without a default is declared after a parameter with one.
+    #[error("positional parameter `{name}` cannot follow a parameter with a default value")]
+    PositionalParamAfterDefault { name: String },
     /// An identifier was used without being declared in the current scope.
     #[error("`{name}` is not declared in this scope")]
     UndeclaredVar { name: String },

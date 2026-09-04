@@ -761,6 +761,15 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
                 5_u8.hash(hasher);
                 hash_cell_args(values, hasher);
             }
+            CellArg::Struct { name, fields } => {
+                6_u8.hash(hasher);
+                name.hash(hasher);
+                fields.len().hash(hasher);
+                for (field, value) in fields {
+                    field.hash(hasher);
+                    hash_cell_args(std::slice::from_ref(value), hasher);
+                }
+            }
         }
     }
 }
