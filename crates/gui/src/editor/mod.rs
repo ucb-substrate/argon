@@ -22,8 +22,8 @@ use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::{
-        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, OpenCellCommand, Redo, Save,
-        ShowDiagnostics, ShowMessages, Undo,
+        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, NewCellCommand, OpenCellCommand,
+        Redo, RenameCellCommand, Save, ShowDiagnostics, ShowMessages, Undo,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -917,6 +917,24 @@ impl Editor {
         self.open_invoking_command(Some("Argon openCell "), true, cx);
     }
 
+    fn new_cell_command(
+        &mut self,
+        _: &NewCellCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon newCell "), true, cx);
+    }
+
+    fn rename_cell_command(
+        &mut self,
+        _: &RenameCellCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_invoking_command(Some("Argon renameCell "), true, cx);
+    }
+
     fn open_invoking_command(
         &mut self,
         command: Option<&str>,
@@ -1103,6 +1121,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::show_messages))
             .on_action(cx.listener(Self::instantiate_command))
             .on_action(cx.listener(Self::open_cell_command))
+            .on_action(cx.listener(Self::new_cell_command))
+            .on_action(cx.listener(Self::rename_cell_command))
             .font_family("Zed Plex Sans")
             .size_full()
             .flex()

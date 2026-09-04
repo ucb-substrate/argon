@@ -1,0 +1,156 @@
+/* Global overrides on top of the Infima defaults. Kept deliberately small. */
+
+:root {
+  --ifm-color-primary: #5b21b6;
+  --ifm-color-primary-dark: #521ea4;
+  --ifm-color-primary-darker: #4d1c9b;
+  --ifm-color-primary-darkest: #3f1780;
+  --ifm-color-primary-light: #6424c8;
+  --ifm-color-primary-lighter: #6a26d1;
+  --ifm-color-primary-lightest: #7c3aed;
+  /* Body text in a humanist sans; headings, navigation, and buttons in a
+     geometric display sans; code in a monospace. */
+  --ifm-font-family-base: "Fira Sans", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --ifm-font-family-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --argon-font-display: "Space Grotesk", var(--ifm-font-family-base);
+  --ifm-heading-font-family: var(--argon-font-display);
+  --ifm-heading-font-weight: 700;
+  --ifm-h1-font-size: 2.1rem;
+  --ifm-h2-font-size: 1.5rem;
+  --ifm-h3-font-size: 1.15rem;
+  --ifm-code-font-size: 90%;
+  --ifm-navbar-shadow: none;
+  --doc-sidebar-width: 280px;
+  --argon-hero-top: #f4f1fb;
+}
+
+[data-theme='dark'] {
+  --ifm-color-primary: #b39cf5;
+  --ifm-color-primary-dark: #a183f2;
+  --ifm-color-primary-darker: #9877f1;
+  --ifm-color-primary-darkest: #7c51ec;
+  --ifm-color-primary-light: #c5b5f8;
+  --ifm-color-primary-lighter: #cec1f9;
+  --ifm-color-primary-lightest: #e9e2fc;
+  --argon-hero-top: #1c1826;
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -.02em;
+}
+
+/* Show code exactly as typed: no -> or :: ligatures. */
+code,
+kbd,
+.prism-code {
+  font-variant-ligatures: none;
+}
+
+.navbar {
+  border-bottom: 1px solid var(--ifm-color-emphasis-200);
+}
+
+.navbar__title,
+.navbar__link {
+  font-family: var(--argon-font-display);
+  letter-spacing: -.01em;
+}
+
+.navbar__title {
+  font-weight: 700;
+}
+
+.navbar__link {
+  font-size: .95rem;
+  font-weight: 500;
+}
+
+.navbar__search-input {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: .85rem;
+}
+
+/* On the front page the navbar takes the hero gradient's top color and loses
+   its border, so the two form one continuous band. */
+#__docusaurus:has(> .front-page) .navbar {
+  --ifm-navbar-background-color: var(--argon-hero-top);
+  border-bottom-color: transparent;
+}
+
+#__docusaurus:has(> .front-page) .navbar .navbar__search-input {
+  background-color: var(--ifm-background-surface-color);
+}
+
+.theme-doc-sidebar-container {
+  border-right-color: var(--ifm-color-emphasis-200) !important;
+}
+
+/* Sidebar links at regular weight; Infima defaults them to semibold. Only the
+   current page is emphasized. */
+.menu__link {
+  font-weight: 400;
+}
+
+.menu__link--active {
+  font-weight: 500;
+}
+
+.footer {
+  border-top: 1px solid var(--ifm-color-emphasis-200);
+  padding: 1.5rem 0;
+}
+
+.footer__links {
+  margin-bottom: .5rem;
+}
+
+.footer__copyright {
+  color: var(--ifm-color-emphasis-700);
+  font-size: .9rem;
+}
+
+/* Reference tables read better at full width. */
+.theme-doc-markdown table {
+  display: table;
+  width: 100%;
+}
+
+.theme-doc-markdown table th,
+.theme-doc-markdown table td {
+  vertical-align: top;
+}
+
+@media (max-width: 700px) {
+  .theme-doc-markdown table {
+    display: block;
+    width: auto;
+    overflow-x: auto;
+  }
+}
+
+/* API reference components (src/components/ApiReference.tsx). */
+.apiItem {
+  margin-bottom: 3rem;
+  scroll-margin-top: calc(var(--ifm-navbar-height) + 1rem);
+}
+
+.apiTableWrap {
+  overflow-x: auto;
+  margin: 1rem 0 1.25rem;
+}
+
+.apiTable {
+  margin: 0;
+  display: table;
+  width: 100%;
+}
+
+.apiTable td:first-child code {
+  font-weight: 600;
+}
+
+.apiReturns {
+  margin: 1rem 0;
+}

@@ -1,0 +1,23 @@
+---
+title: Point
+description: A solver-backed polygon or path coordinate pair.
+---
+
+import {FieldTable} from '@site/src/components/ApiReference';
+
+# `Point`
+
+`Point` is a vertex of a [`Polygon`](./polygon) or [`Path`](./path), taken from its `points` sequence.
+
+<FieldTable rows={[
+  {name: 'x', type: 'Float', typeHref: '/language/types/scalars#float', description: 'x coordinate.'},
+  {name: 'y', type: 'Float', typeHref: '/language/types/scalars#float', description: 'y coordinate.'},
+]} />
+
+```argon
+let route = path("met1", 2, x0=0., y0=0., x1=100., y1=40.);
+let endpoint = route.points[1];
+eq(endpoint.x, 100.);
+```
+
+You can't construct a point on its own; it always comes from a polygon or path.

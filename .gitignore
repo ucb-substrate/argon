@@ -91,6 +91,8 @@ tags
 
 out
 node_modules
+.docusaurus
+build
 *.tsbuildinfo
 
 Argon_ICCAD_2026.pdf

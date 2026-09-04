@@ -32,6 +32,24 @@ local argon_command_tbl = {
       gui.open_cell(table.concat(args, " "))
     end,
   },
+  newCell = {
+    impl = function(args)
+      if #args ~= 1 then
+        vim.notify('Argon newCell: expected one cell name', vim.log.levels.ERROR)
+        return
+      end
+      gui.new_cell(args[1])
+    end,
+  },
+  renameCell = {
+    impl = function(args)
+      if #args ~= 1 then
+        vim.notify('Argon renameCell: expected one cell name', vim.log.levels.ERROR)
+        return
+      end
+      gui.rename_cell(args[1])
+    end,
+  },
   inst = {
     impl = function(args, opts)
       gui.instantiate(table.concat(args, " "))

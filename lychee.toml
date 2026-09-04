@@ -16,4 +16,14 @@ include_fragments = "anchor-only"
 # Build output, and git internals, are not documentation. Links in Rust doc
 # comments are covered separately by rustdoc's own intra-doc link lints; see
 # `[workspace.lints.rustdoc]` in the root Cargo.toml.
-exclude_path = ["target", ".git"]
+exclude_path = [
+  "target",
+  ".git",
+  # The Docusaurus site under docs/ links with site-relative paths that only
+  # the site router resolves; `npm run build` in docs/ checks those links and
+  # fails on any broken one. Its dependencies and build output are not docs.
+  "docs/content",
+  "docs/node_modules",
+  "docs/build",
+  "docs/.docusaurus",
+]

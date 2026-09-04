@@ -10,8 +10,8 @@ use itertools::Itertools;
 
 use crate::{
     actions::{
-        DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, OpenCellCommand, Redo,
-        SelectMode, Undo,
+        DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, NewCellCommand,
+        OpenCellCommand, Redo, RenameCellCommand, SelectMode, Undo,
     },
     editor::{
         CompileOutputState, Layers, ScopeAddress, ScopePath,
@@ -622,6 +622,18 @@ impl Render for ToolBar {
                         }),
                     },
                     ToolbarItem::Button {
+                        id: "btn_new_cell",
+                        icon: "icons/file-circle-plus.svg",
+                        label: "New cell",
+                        action: Box::new(NewCellCommand),
+                        highlighted: Box::new(|_| false),
+                        on_click: Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&NewCellCommand);
+                            });
+                        }),
+                    },
+                    ToolbarItem::Button {
                         id: "btn_open_cell",
                         icon: "icons/folder-open.svg",
                         label: "Open cell",
@@ -630,6 +642,18 @@ impl Render for ToolBar {
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&OpenCellCommand);
+                            });
+                        }),
+                    },
+                    ToolbarItem::Button {
+                        id: "btn_rename_cell",
+                        icon: "icons/file-pen.svg",
+                        label: "Rename cell",
+                        action: Box::new(RenameCellCommand),
+                        highlighted: Box::new(|_| false),
+                        on_click: Arc::new(|_state, cx| {
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&RenameCellCommand);
                             });
                         }),
                     },
@@ -792,7 +816,10 @@ mod tool_bar_tests {
 
     use super::hotkey_text;
     use crate::{
-        actions::{DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, SelectMode, Undo},
+        actions::{
+            DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, NewCellCommand,
+            RenameCellCommand, SelectMode, Undo,
+        },
         key_bindings,
     };
 
@@ -821,6 +848,8 @@ mod tool_bar_tests {
                 assert_eq!(hotkey_text(&SelectMode, window), Some("S".into()));
                 assert_eq!(hotkey_text(&DrawDim, window), Some("D".into()));
                 assert_eq!(hotkey_text(&InstantiateCommand, window), Some("I".into()));
+                assert!(hotkey_text(&NewCellCommand, window).is_some());
+                assert!(hotkey_text(&RenameCellCommand, window).is_some());
                 assert_eq!(hotkey_text(&Undo, window), Some("U".into()));
                 // The path tool has no binding, so its tooltip shows the label alone.
                 assert_eq!(hotkey_text(&DrawPath, window), None);
