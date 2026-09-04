@@ -23,8 +23,8 @@ use crate::ast::{
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr, FieldAccessExpr,
     FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
     IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
-    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, TupleExpr, TySpec,
-    TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, StructLitExpr,
+    StructLitField, TupleExpr, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -111,6 +111,9 @@ pub struct Parser<'a> {
     /// Next semantic scope ordinal in each enclosing lexical scope.
     scope_orders: Vec<u64>,
     depth: u32,
+    /// Whether `name {` must be read as an identifier followed by a scope
+    /// rather than as a struct literal. See [`Parser::with_struct_literals`].
+    no_struct_literal: bool,
     pub errors: Vec<ParseError>,
 }
 
@@ -129,8 +132,25 @@ impl<'a> Parser<'a> {
             ntok: 0,
             scope_orders: vec![0],
             depth: 0,
+            no_struct_literal: false,
             errors: Vec::new(),
         }
+    }
+
+    /// Runs `f` with struct literals allowed or forbidden, restoring the
+    /// previous setting afterwards.
+    ///
+    /// A struct literal is forbidden at the top level of an `if` condition, a
+    /// `match` scrutinee, and a `for` sequence, where `name {` already opens
+    /// the construct's own scope; Rust has the same rule, and the same escape
+    /// hatch of wrapping the literal in parentheses. Parentheses, brackets,
+    /// call arguments, struct literal bodies, match arm bodies, and brace
+    /// scopes lift the restriction again.
+    fn with_struct_literals<T>(&mut self, allowed: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = std::mem::replace(&mut self.no_struct_literal, !allowed);
+        let result = f(self);
+        self.no_struct_literal = saved;
+        result
     }
 
     // ------------------------------------------------------------------
@@ -414,12 +434,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `structField : ident COLON ident`
+    /// `structField : ident COLON tySpec`
     fn parse_struct_field(&mut self) -> StructField<&'a str, Md> {
         let lo = self.cur.start;
         let name = self.ident();
         self.expect(TokenKind::Colon);
-        let ty = self.ident();
+        let ty = self.parse_ty_spec();
         StructField {
             name,
             ty,
@@ -608,6 +628,10 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unannotated_scope(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
+        self.with_struct_literals(true, |p| p.parse_unannotated_scope_inner(scope_order))
+    }
+
+    fn parse_unannotated_scope_inner(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
         if !self.enter_depth() {
             self.error_at(self.span(self.cur), "nesting too deep".to_string());
             let lo = self.cur.start;
@@ -718,7 +742,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::KwFor);
         let var = self.ident();
         self.expect(TokenKind::KwIn);
-        let seq = self.parse_expr(0);
+        let seq = self.with_struct_literals(false, |p| p.parse_expr(0));
         let body = self.parse_scope();
         ForLoop {
             var,
@@ -732,7 +756,7 @@ impl<'a> Parser<'a> {
 
     fn parse_if(&mut self, scope_order: u64, lo: u32) -> IfExpr<&'a str, Md> {
         self.expect(TokenKind::KwIf);
-        let cond = self.parse_expr(0);
+        let cond = self.with_struct_literals(false, |p| p.parse_expr(0));
         let then = self.parse_scope();
         self.expect(TokenKind::KwElse);
         let else_ = self.parse_scope();
@@ -750,7 +774,7 @@ impl<'a> Parser<'a> {
     fn parse_match(&mut self) -> MatchExpr<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwMatch);
-        let scrutinee = self.parse_expr(0);
+        let scrutinee = self.with_struct_literals(false, |p| p.parse_expr(0));
         let lbrace = self.expect(TokenKind::LBrace);
         let mut arms = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
@@ -783,7 +807,10 @@ impl<'a> Parser<'a> {
         let lo = self.cur.start;
         let pattern = self.parse_ident_path();
         self.expect(TokenKind::FatArrow);
-        let expr = self.parse_expr(0);
+        // An arm body is bounded by its comma, not by `{`, so a struct
+        // literal is unambiguous here even when the whole `match` sits in
+        // an `if`/`match`/`for` head.
+        let expr = self.with_struct_literals(true, |p| p.parse_expr(0));
         self.expect(TokenKind::Comma);
         MatchArm {
             pattern,
@@ -949,7 +976,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LBrack => {
                 self.bump();
-                let index = self.parse_expr(0);
+                let index = self.with_struct_literals(true, |p| p.parse_expr(0));
                 self.expect(TokenKind::RBrack);
                 Expr::Index(Box::new(IndexExpr {
                     base: lhs,
@@ -1011,6 +1038,8 @@ impl<'a> Parser<'a> {
                         self.next_scope_order()
                     };
                     Expr::Call(self.finish_call(scope_order, lo, path))
+                } else if self.at(TokenKind::LBrace) && !self.no_struct_literal {
+                    Expr::StructLit(Box::new(self.parse_struct_lit(path)))
                 } else {
                     Expr::IdentPath(path)
                 }
@@ -1037,9 +1066,74 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `structLit : identPath LBRACE structLitBody RBRACE`, where
+    /// `structLitBody : (structLitField (COMMA structLitField)* (COMMA structBase | COMMA)?)? | structBase`
+    /// and `structBase : DOTDOT expr`.
+    ///
+    /// The `..base` comes last, after a comma, and may not be followed by one,
+    /// which is the shape Rust accepts. Because the body has two terminators
+    /// (`}` and `..`) it does not go through `separated_list`; termination
+    /// holds for the same reason, since every iteration that does not `break`
+    /// consumes the separator.
+    fn parse_struct_lit(&mut self, path: IdentPath<&'a str, Md>) -> StructLitExpr<&'a str, Md> {
+        let lo = path.span.start() as u32;
+        self.expect(TokenKind::LBrace);
+        let mut fields = Vec::new();
+        let mut base = None;
+        self.with_struct_literals(true, |p| {
+            while !p.at(TokenKind::RBrace) && !p.at(TokenKind::Eof) {
+                if p.eat(TokenKind::DotDot) {
+                    base = Some(p.parse_expr(0));
+                    break;
+                }
+                fields.push(p.parse_struct_lit_field());
+                if !p.eat(TokenKind::Comma) {
+                    break;
+                }
+            }
+        });
+        self.expect(TokenKind::RBrace);
+        StructLitExpr {
+            path,
+            fields,
+            base,
+            span: self.finish_span(lo),
+            metadata: (),
+        }
+    }
+
+    /// `structLitField : ident (COLON expr)?`
+    fn parse_struct_lit_field(&mut self) -> StructLitField<&'a str, Md> {
+        let lo = self.cur.start;
+        let name = self.ident();
+        let (value, shorthand) = if self.eat(TokenKind::Colon) {
+            (self.parse_expr(0), false)
+        } else {
+            // Shorthand: `x` stands for `x: x`. The value is a path at the
+            // name's own span, so diagnostics and navigation on it point at the
+            // one token the user wrote.
+            let value = Expr::IdentPath(IdentPath {
+                path: vec![name.clone()],
+                metadata: (),
+                span: name.span,
+            });
+            (value, true)
+        };
+        StructLitField {
+            name,
+            value,
+            shorthand,
+            span: self.finish_span(lo),
+        }
+    }
+
     /// `( )` nil, `( expr )` parenthesized group (unwrapped), or
     /// `( expr , (expr ,)* )` tuple (a comma after every element is required).
     fn parse_paren(&mut self) -> Expr<&'a str, Md> {
+        self.with_struct_literals(true, |p| p.parse_paren_inner())
+    }
+
+    fn parse_paren_inner(&mut self) -> Expr<&'a str, Md> {
         let lp = self.bump();
         if self.at(TokenKind::RParen) {
             let rp = self.bump();
@@ -1117,6 +1211,10 @@ impl<'a> Parser<'a> {
 
     /// `args : posArgList (COMMA kwArgList)? COMMA? | kwArgList COMMA? | ε`
     fn parse_args(&mut self) -> Args<&'a str, Md> {
+        self.with_struct_literals(true, |p| p.parse_args_inner())
+    }
+
+    fn parse_args_inner(&mut self) -> Args<&'a str, Md> {
         let lparen_end = self.prev_end;
         let lo = self.cur.start;
         let mut posargs = Vec::new();

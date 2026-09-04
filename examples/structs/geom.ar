@@ -1,0 +1,4 @@
+struct Size {
+    w: Float,
+    h: Float,
+}

@@ -139,7 +139,7 @@ is irrelevant for Argon.)
 - **Keywords** — `enum struct match const cell mod if fn else let for in as
   true false` (15 of them).
 - **Names & literals** — `Ident`, `IntLit`, `StrLit`.
-- **Multi-character operators** — `:: => == != >= <= -> && ||`.
+- **Multi-character operators** — `:: => == != >= <= -> && || ..`.
 - **Single-character operators / punctuation** — `< > = ! + - * / % ( ) { } [ ]
   . : ; ,`.
 - **`Eof`** — the empty range `[len, len)`.
@@ -211,9 +211,9 @@ Notes on individual rules:
   closing quote produces an `Error` token spanning what was consumed.
 - **`lex_operator`** uses **maximal munch**: two-character operators are matched
   before their one-character prefixes (`::` before `:`, `==`/`=>` before `=`,
-  `->` before `-`, etc.). `&&` and `||` are the exception with no one-character
-  form: Argon has no bitwise operators, so a lone `&` or `|` is an `Error`
-  token like any other unrecognized byte.
+  `->` before `-`, `..` before `.`, etc.). `&&` and `||` are the exception with
+  no one-character form: Argon has no bitwise operators, so a lone `&` or `|`
+  is an `Error` token like any other unrecognized byte.
 
 ### Error tokens and UTF-8
 
@@ -344,7 +344,7 @@ while !self.at(Eof) {
 | Keyword  | Rule                | AST node      | Shape |
 |----------|---------------------|---------------|-------|
 | `enum`   | `parse_enum_decl`   | `EnumDecl`    | `enum Name { ident, … }` |
-| `struct` | `parse_struct_decl` | `StructDecl`  | `struct Name { field: Ty, … }` |
+| `struct` | `parse_struct_decl` | `StructDecl`  | `struct Name { field: tySpec, … }` |
 | `cell`   | `parse_cell_decl`   | `CellDecl`    | `cell Name(argDecls) scope` |
 | `fn`     | `parse_fn_decl`     | `FnDecl`      | `fn Name(argDecls) (-> Ty)? scope` |
 | `const`  | `parse_const_decl`  | `ConstantDecl`| `const Name: Ty = expr;` |
@@ -419,6 +419,9 @@ non-consuming `parse_item` cannot spin.
 > - **Match arms** (`matchArm : identPath FAT_ARROW expr COMMA`). The comma is
 >   part of each arm, and `matchArms : matchArm+` requires at least one arm, so
 >   `match k {}` is a syntax error.
+> - **Struct literal bodies** ([§9.5](#95-struct-literals)) are comma-separated
+>   with an optional trailing comma, but have two terminators — `}` and the
+>   `..base` — so they keep their own loop as well.
 
 ---
 
@@ -503,7 +506,8 @@ level).
     `Scope`. These are full expressions, so the Pratt loop can still attach
     trailing operators to them.
   - identifier → an `identPath` (`a::b::c`); becomes a `Call` if followed by
-    `(`, otherwise an `IdentPath`.
+    `(`, a `StructLit` if followed by `{` where a struct literal is allowed
+    ([§9.5](#95-struct-literals)), otherwise an `IdentPath`.
   - integer / string / `true` / `false` → the corresponding literal.
 - **`parse_suffix`** applies one postfix operator to the accumulated `lhs`:
 
@@ -533,6 +537,10 @@ floats from `IntLit DOT IntLit?`:
   checking — but it parses uniformly, like every other primary's `.field`.)
 - `1.0.2` → `IndexFieldAccess(FloatLiteral(1.0), 2)`: the first `.0` completes
   the float, the second `.2` is a tuple-index suffix.
+- `1..` → `IntLit DotDot`: the lexer's maximal munch gives the struct-update
+  `..` priority over `.`, so a float with no fractional digits cannot be
+  followed directly by another `.`. Nothing meaningful is lost — `1..2` used to
+  parse as a tuple index on a float, which never type-checked.
 
 A literal's value is parsed from the raw source slice. A slice that does not
 parse — an integer outside `i64`, or a float split by trivia (`1 . 5`) — is a
@@ -553,6 +561,33 @@ operand is a bare primary — suffixes do **not** bind inside it. So `-a.b` pars
 as `(-a).b` (`FieldAccess(Neg(a), b)`), and `-a!` as `(-a)!`. The suffix cluster
 binds tighter than the binary operators, but a prefix operator grabs only its
 immediate primary and the suffix then applies to the whole unary expression.
+
+### 9.5 Struct literals
+
+`Name { field: expr, other, ..base }` parses to a `StructLitExpr` holding the
+path, the explicit fields, and the optional base:
+
+- A field written without a value is **shorthand** for `field: field`. The
+  parser desugars it to an `IdentPath` at the name's own span and sets
+  `shorthand`, so the type checker and evaluator see an ordinary field while
+  navigation can still tell the two spellings apart.
+- The **`..base`** must come last, after a comma, and takes no comma after it —
+  Rust's rule. `Point { x: 1. ..b }`, `Point { ..b, }`, and `Point { ..b, x: 1. }`
+  are all syntax errors.
+- The body has two terminators (`}` and `..`), so `parse_struct_lit` has its
+  own loop rather than going through `separated_list`; it terminates for the
+  same reason, since every iteration that does not `break` consumes the
+  separator comma.
+
+**The head restriction.** `if c {`, `match k {`, and `for v in seq {` already
+read `name {` as an identifier followed by the construct's own scope, so a
+struct literal is not allowed at the top level of those three expressions:
+write `if (p == Point { x: 1. }) {`. This is Rust's rule as well. The
+`no_struct_literal` flag on `Parser` implements it: `with_struct_literals` sets
+the flag around the head expression and clears it again inside parentheses,
+brackets, call arguments, struct literal bodies, match arm bodies, and brace
+scopes, so the literal is fine in an `if` branch, a `match` arm, a `for`
+body, or a parenthesized condition.
 
 ---
 
