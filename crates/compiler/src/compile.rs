@@ -1160,6 +1160,52 @@ struct CellTyping<'a> {
     stmts: Vec<Option<Statement<Substr, VarIdTyMetadata>>>,
     /// The typed tail, once typed; the inner `None` is a body without a tail.
     tail: Option<Option<Expr<Substr, VarIdTyMetadata>>>,
+    /// The view `statement_view` last built, extended rather than rebuilt
+    /// when the next statement wanted is at or beyond its limit.
+    view: Option<StatementView>,
+}
+
+/// The frame a statement of a cell is typed in: the parameters, then the
+/// nearest top-level `let` of each name declared below `limit`, if it has
+/// been typed.
+///
+/// Kept between statements, so that typing a body in order extends it by one
+/// statement at a time instead of walking every `let` above each statement.
+#[derive(Default)]
+struct StatementView {
+    /// The statements below this index are reflected.
+    limit: usize,
+    frame: VarIdTyFrame,
+    /// Names whose nearest `let` below `limit` is not yet typed, to the
+    /// statement declaring it. They are absent from `frame`, so that reading
+    /// one raises a demand instead of resolving to a parameter or module
+    /// declaration of the same name.
+    untyped: IndexMap<Substr, usize>,
+}
+
+impl StatementView {
+    /// Reflects the statement at the limit and moves the limit past it.
+    fn extend(&mut self, typing: &CellTyping<'_>) {
+        let stmt = self.limit;
+        self.limit += 1;
+        let Statement::LetBinding(binding) = &typing.decl.scope.stmts[stmt] else {
+            return;
+        };
+        let name = &binding.name.name;
+        match &typing.stmts[stmt] {
+            Some(Statement::LetBinding(typed)) => {
+                self.frame
+                    .var_bindings
+                    .insert(name.clone(), (typed.metadata, typed.value.ty()));
+                self.untyped.swap_remove(name.as_str());
+            }
+            Some(_) => unreachable!("a `let` statement is typed as a `let`"),
+            None => {
+                self.frame.var_bindings.swap_remove(name.as_str());
+                self.untyped.insert(name.clone(), stmt);
+            }
+        }
+    }
 }
 
 /// One independently typed piece of a cell.
@@ -1724,7 +1770,17 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
-        for frame in self.bindings.iter().rev() {
+        // A top-level `let` of the cell being typed that is in scope but not
+        // yet typed hides the module's declarations, as a typed one in the
+        // view would. Reading it is a demand, so it must not resolve to them.
+        let hides_module = self
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.visible_untyped.contains_key(name));
+        for (index, frame) in self.bindings.iter().enumerate().rev() {
+            if index == 0 && hides_module {
+                break;
+            }
             if let Some(info) = frame.var_bindings.get(name) {
                 return Some(info.clone());
             }
@@ -1909,6 +1965,7 @@ impl<'a> VarIdTyPass<'a> {
                 params: None,
                 stmts: input.scope.stmts.iter().map(|_| None).collect(),
                 tail: None,
+                view: None,
             },
         );
         self.decl_cells.insert(index, cell_id);
@@ -1925,10 +1982,11 @@ impl<'a> VarIdTyPass<'a> {
         input: &'a FnDecl<Substr, ParseMetadata>,
     ) -> FnDecl<Substr, VarIdTyMetadata> {
         loop {
-            match self.attempt(None, VarIdTyFrame::default(), IndexMap::new(), |pass| {
+            let (result, _) = self.attempt(None, StatementView::default(), |pass| {
                 pass.transform_fn_decl(input)
-            }) {
-                Ok((decl, _)) => return decl,
+            });
+            match result {
+                Ok(decl) => return decl,
                 Err(demands) => {
                     self.schedule(demands);
                     self.run_goals();
@@ -1937,70 +1995,70 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
-    /// Types one unit of source with `view` as its innermost frame.
+    /// Types one unit of source with the frame of `view` as its innermost
+    /// frame.
     ///
-    /// Returns the result and the frame, or the demands the unit raised, in
-    /// which case everything the attempt did is undone: what it produced
-    /// depends on types it did not have, so its diagnostics are dropped and
-    /// the ids it allocated are released for the retry.
+    /// Returns the result, or the demands the unit raised, in which case
+    /// everything the attempt did is undone: what it produced depends on
+    /// types it did not have, so its diagnostics are dropped and the ids it
+    /// allocated are released for the retry. The view comes back either way,
+    /// holding whatever the unit bound in its frame.
     fn attempt<T>(
         &mut self,
         cell: Option<VarId>,
-        view: VarIdTyFrame,
-        visible_untyped: IndexMap<Substr, usize>,
+        view: StatementView,
         unit: impl FnOnce(&mut Self) -> T,
-    ) -> Result<(T, VarIdTyFrame), Vec<Demand>> {
+    ) -> (Result<T, Vec<Demand>>, StatementView) {
         debug_assert!(self.attempt.is_none(), "attempts do not nest");
         let errors = self.errors.len();
         let next_id = self.next_id;
-        self.bindings.push(view);
+        self.bindings.push(view.frame);
         self.attempt = Some(Attempt {
             cell,
-            visible_untyped,
+            visible_untyped: view.untyped,
             demands: Vec::new(),
         });
         let result = unit(self);
         let attempt = self.attempt.take().expect("set above");
-        let view = self.bindings.pop().expect("pushed above");
+        let view = StatementView {
+            limit: view.limit,
+            frame: self.bindings.pop().expect("pushed above"),
+            untyped: attempt.visible_untyped,
+        };
         if attempt.demands.is_empty() {
-            Ok((result, view))
+            (Ok(result), view)
         } else {
             self.errors.truncate(errors);
             self.next_id = next_id;
-            Err(attempt.demands)
+            (Err(attempt.demands), view)
         }
     }
 
-    /// The frame a statement of `cell` is typed in: the parameters, then the
-    /// nearest top-level `let` of each name declared above `limit`, if it has
-    /// been typed. One that has not is reported separately, so that reading
-    /// it raises a demand instead of an undeclared-name error, and it hides
-    /// any parameter of the same name.
-    fn statement_view(&self, cell: VarId, limit: usize) -> (VarIdTyFrame, IndexMap<Substr, usize>) {
-        let typing = &self.cells[&cell];
-        let (_, params) = typing
-            .params
-            .as_ref()
-            .expect("parameters are typed before the body");
-        let mut view = params.clone();
-        let mut visible_untyped = IndexMap::new();
-        for (name, stmts) in &typing.lets {
-            let Some(&stmt) = stmts.iter().rev().find(|&&stmt| stmt < limit) else {
-                continue;
-            };
-            match &typing.stmts[stmt] {
-                Some(Statement::LetBinding(binding)) => {
-                    view.var_bindings
-                        .insert(name.clone(), (binding.metadata, binding.value.ty()));
-                }
-                Some(_) => unreachable!("`lets` indexes `let` statements"),
-                None => {
-                    view.var_bindings.swap_remove(name.as_str());
-                    visible_untyped.insert(name.clone(), stmt);
+    /// The view for typing the statement at `limit` of `cell`, or its tail
+    /// when `limit` is the number of statements.
+    ///
+    /// The view last built is extended when the statements it reflects are a
+    /// prefix of those wanted; otherwise one is rebuilt from the parameters.
+    fn statement_view(&mut self, cell: VarId, limit: usize) -> StatementView {
+        let typing = &mut self.cells[&cell];
+        let mut view = match typing.view.take() {
+            Some(view) if view.limit <= limit => view,
+            _ => {
+                let (_, params) = typing
+                    .params
+                    .as_ref()
+                    .expect("parameters are typed before the body");
+                StatementView {
+                    limit: 0,
+                    frame: params.clone(),
+                    untyped: IndexMap::new(),
                 }
             }
+        };
+        while view.limit < limit {
+            view.extend(typing);
         }
-        (view, visible_untyped)
+        view
     }
 
     /// Attempts one unit of `cell`, recording the result on success.
@@ -2008,36 +2066,38 @@ impl<'a> VarIdTyPass<'a> {
         let decl = self.cells[&cell].decl;
         match unit {
             Unit::Params => {
-                let (args, frame) = self.attempt(
-                    Some(cell),
-                    VarIdTyFrame::default(),
-                    IndexMap::new(),
-                    |pass| {
-                        decl.args
-                            .iter()
-                            .map(|arg| pass.transform_arg_decl(arg))
-                            .collect::<Vec<_>>()
-                    },
-                )?;
-                self.cells[&cell].params = Some((args, frame));
+                let (args, view) = self.attempt(Some(cell), StatementView::default(), |pass| {
+                    decl.args
+                        .iter()
+                        .map(|arg| pass.transform_arg_decl(arg))
+                        .collect::<Vec<_>>()
+                });
+                self.cells[&cell].params = Some((args?, view.frame));
             }
             Unit::Stmt(stmt) => {
-                let (view, visible_untyped) = self.statement_view(cell, stmt);
+                let view = self.statement_view(cell, stmt);
                 let statement = &decl.scope.stmts[stmt];
-                let (typed, _) = self.attempt(Some(cell), view, visible_untyped, |pass| {
-                    pass.transform_statement(statement)
-                })?;
-                self.cells[&cell].stmts[stmt] = Some(typed);
+                let (typed, mut view) =
+                    self.attempt(Some(cell), view, |pass| pass.transform_statement(statement));
+                let typing = &mut self.cells[&cell];
+                let result = typed.map(|typed| typing.stmts[stmt] = Some(typed));
+                // The frame holds what the statement bound, typed or not;
+                // reflect the statement from its slot instead.
+                view.extend(typing);
+                typing.view = Some(view);
+                result?;
             }
             Unit::Tail => {
-                let (view, visible_untyped) = self.statement_view(cell, decl.scope.stmts.len());
-                let (typed, _) = self.attempt(Some(cell), view, visible_untyped, |pass| {
+                let view = self.statement_view(cell, decl.scope.stmts.len());
+                let (typed, view) = self.attempt(Some(cell), view, |pass| {
                     decl.scope
                         .tail
                         .as_ref()
                         .map(|tail| pass.transform_expr(tail))
-                })?;
-                self.cells[&cell].tail = Some(typed);
+                });
+                let typing = &mut self.cells[&cell];
+                typing.view = Some(view);
+                typing.tail = Some(typed?);
             }
         }
         Ok(())
@@ -2110,6 +2170,20 @@ impl<'a> VarIdTyPass<'a> {
                 self.poisoned.insert((demand.cell, demand.stmt));
                 continue;
             }
+            // Already wanted by a goal that has not been attempted yet, queued
+            // by an earlier demand. (One that had been attempted would be
+            // `attempting` this very statement: the cycle above.) The goal
+            // that raised this demand is retried as soon as it is on top
+            // again, so the wanted goal has to be worked first: move it up.
+            if let Some(index) = self
+                .goals
+                .iter()
+                .position(|goal| goal.cell == demand.cell && goal.target == Some(demand.stmt))
+            {
+                let goal = self.goals.remove(index);
+                self.goals.push(goal);
+                continue;
+            }
             if self.goals.len() >= MAX_CELL_TYPING_DEPTH {
                 self.errors.push(StaticError {
                     span: self.span(demand.span),
@@ -2118,14 +2192,6 @@ impl<'a> VarIdTyPass<'a> {
                     },
                 });
                 self.poisoned.insert((demand.cell, demand.stmt));
-                continue;
-            }
-            // Already wanted by a goal that is not attempting it yet.
-            if self
-                .goals
-                .iter()
-                .any(|goal| goal.cell == demand.cell && goal.target == Some(demand.stmt))
-            {
                 continue;
             }
             self.goals.push(Goal {

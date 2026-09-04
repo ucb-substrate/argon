@@ -1505,6 +1505,64 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
     }
 
+    /// A statement that reads two untyped fields queues a goal for each. When
+    /// the second field's statement reads the first, the first's queued goal
+    /// is worked before the second statement is retried.
+    #[test]
+    fn a_queued_field_read_again_is_typed_before_its_reader_is_retried() {
+        let errors = static_errors_of(
+            "cell x() {\n\
+                 eq(inst(a()).f.x0, inst(b()).g.x0);\n\
+             }\n\
+             cell a() {\n\
+                 let f = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n\
+             cell b() {\n\
+                 let g = inst(a()).f;\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A top-level `let` that is in scope but not yet typed hides a module
+    /// declaration of the same name, so a statement typed on demand reads the
+    /// local rather than the cell.
+    #[test]
+    fn an_untyped_local_hides_a_module_declaration_of_the_same_name() {
+        let errors = static_errors_of(
+            "cell user() {\n\
+                 let v = inst(top()).a;\n\
+             }\n\
+             cell top() {\n\
+                 let bot = 5.;\n\
+                 let a = bot + 1.;\n\
+             }\n\
+             cell bot() {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A statement typed on demand, ahead of the statements above it, sees the
+    /// same bindings it would when typed in order: the nearest `let` of each
+    /// name above it, typed as it is needed.
+    #[test]
+    fn a_statement_typed_out_of_order_sees_the_nearest_lets_above_it() {
+        let errors = static_errors_of(
+            "cell user() {\n\
+                 eq(inst(top()).c, 1.);\n\
+             }\n\
+             cell top() {\n\
+                 let r = 1.;\n\
+                 let s = r + 1.;\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 let c = r.w + s;\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
     /// A field whose type depends on itself is reported once, at the read that
     /// closes the cycle, and nothing else cascades from it.
     #[test]
