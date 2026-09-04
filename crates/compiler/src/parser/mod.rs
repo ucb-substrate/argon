@@ -1,9 +1,9 @@
 //! Hand-written, zero-copy parser for the Argon language.
 //!
-//! Replaces the ANTLR-generated parser: a streaming byte lexer ([`lexer`]) feeds
-//! a single-pass recursive-descent + Pratt parser ([`grammar`]) that builds the
-//! AST directly, borrowing all identifier/string text from the source. The two
-//! public entry points match the contract the rest of the compiler expects.
+//! A streaming byte lexer ([`lexer`]) feeds a single-pass recursive-descent +
+//! Pratt parser ([`grammar`]) that builds the AST directly, borrowing all
+//! identifier/string text from the source. The two public entry points match
+//! the contract the rest of the compiler expects.
 
 mod grammar;
 mod lexer;
@@ -18,12 +18,132 @@ use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{CallExpr, Decl};
 use crate::parse::{AnnotatedParseAst, ParseMetadata};
 
+/// The syntactic role of the identifier, keyword, or expression being entered
+/// at an editor cursor.
+///
+/// Completion uses this independently of type checking, so it remains
+/// available while the source is incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionSite {
+    /// Recovery could not identify a narrower grammar position.
+    Unknown,
+    /// Between declarations in a source file.
+    TopLevel,
+    /// At the start of a statement or tail expression in a scope.
+    Statement,
+    /// Somewhere an expression is expected.
+    Expression,
+    /// Somewhere a type specification is expected.
+    Type,
+    /// A path in a `use` declaration.
+    ImportPath,
+    /// A name being introduced rather than referenced.
+    NewIdentifier,
+    /// One particular grammar keyword is required here.
+    Keyword(&'static str),
+    /// Inside a comment or string literal.
+    Suppressed,
+}
+
+impl CompletionSite {
+    pub(super) fn priority(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::TopLevel => 1,
+            // These intentionally tie: the parser records Statement before
+            // descending into a direct expression. First-wins preserves that
+            // distinction, while a nested expression recorded later is not
+            // overwritten when the scope closes at the same cursor.
+            Self::Statement | Self::Expression => 2,
+            Self::Type | Self::ImportPath | Self::Keyword(_) => 3,
+            Self::NewIdentifier => 4,
+            Self::Suppressed => 5,
+        }
+    }
+}
+
 /// A syntax error with the byte span (into the original input) it occurred at.
-/// Shape-compatible with the old `antlr::AntlrParseError`.
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub span: Span,
     pub message: String,
+}
+
+/// Classify the grammar position at `cursor` for editor completion.
+///
+/// The regular recovery parser does the classification, so half-written code
+/// follows the same grammar as a complete source file. Strings and comments
+/// are suppressed before parsing because the lexer deliberately skips
+/// comments and would otherwise classify the token following one.
+pub fn completion_site(input: &str, cursor: usize) -> CompletionSite {
+    let cursor = cursor.min(input.len());
+    if cursor_is_suppressed(input, cursor) {
+        return CompletionSite::Suppressed;
+    }
+    let normalized = input.trim_start_matches(char::is_whitespace);
+    let offset_base = input.len() - normalized.len();
+    let mut parser = grammar::Parser::for_completion(normalized, offset_base, cursor);
+    parser.parse_root();
+    parser.completion_site().unwrap_or(CompletionSite::Unknown)
+}
+
+/// Whether the cursor is after the opening delimiter of an unfinished string,
+/// line comment, or nested block comment. Scanning only to the cursor also
+/// handles a cursor in the middle of an otherwise complete token.
+fn cursor_is_suppressed(input: &str, cursor: usize) -> bool {
+    let bytes = &input.as_bytes()[..cursor];
+    let mut index = 0;
+    let mut block_depth = 0usize;
+    let mut string = false;
+    let mut escaped = false;
+    let mut line_comment = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        if line_comment {
+            if matches!(byte, b'\n' | b'\r') {
+                line_comment = false;
+            }
+            index += 1;
+            continue;
+        }
+        if block_depth > 0 {
+            if byte == b'/' && next == Some(b'*') {
+                block_depth += 1;
+                index += 2;
+            } else if byte == b'*' && next == Some(b'/') {
+                block_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'/' && next == Some(b'/') {
+            line_comment = true;
+            index += 2;
+        } else if byte == b'/' && next == Some(b'*') {
+            block_depth = 1;
+            index += 2;
+        } else {
+            if byte == b'"' {
+                string = true;
+            }
+            index += 1;
+        }
+    }
+    line_comment || block_depth > 0 || string
 }
 
 /// Parse a whole source file into an [`AnnotatedParseAst`].
@@ -46,10 +166,6 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
         .decls
         .iter()
         .filter_map(|decl| match decl {
-            Decl::Struct(decl) => Some(ParseError {
-                span: decl.name.span,
-                message: "struct declarations are not implemented".to_string(),
-            }),
             Decl::Constant(decl) => Some(ParseError {
                 span: decl.name.span,
                 message: "constant declarations are not implemented".to_string(),
@@ -96,6 +212,40 @@ mod tests {
         parse(&format!("cell __t__() {{ {body} }}")).is_ok()
     }
 
+    fn site(marked: &str) -> super::CompletionSite {
+        let cursor = marked.find('|').expect("test source has a cursor marker");
+        let source = marked.replacen('|', "", 1);
+        super::completion_site(&source, cursor)
+    }
+
+    #[test]
+    fn completion_sites_follow_incomplete_grammar_positions() {
+        use super::CompletionSite::*;
+
+        for (source, expected) in [
+            ("ce|", TopLevel),
+            ("cell |", NewIdentifier),
+            ("cell top(ar|: Float) {}", NewIdentifier),
+            ("cell top(arg: Flo|) {}", Type),
+            ("fn helper() -> | {}", Type),
+            ("use |", ImportPath),
+            ("use lib::shape |;", Keyword("as")),
+            ("use lib::shape as |;", NewIdentifier),
+            ("cell top() { let | = 1.; }", NewIdentifier),
+            ("cell top() { for | in [] {} }", NewIdentifier),
+            ("cell top() { let value = re|; }", Expression),
+            ("cell top() { re|; }", Statement),
+            ("cell top() { rect(|); }", Expression),
+            ("cell top() { for item | [] {} }", Keyword("in")),
+            ("cell top() { if true {} | {} }", Keyword("else")),
+            ("// cell |", Suppressed),
+            ("cell top() { let value = \"ce|ll\"; }", Suppressed),
+            ("/* outer /* cell | */", Suppressed),
+        ] {
+            assert_eq!(site(source), expected, "{source}");
+        }
+    }
+
     #[test]
     fn accepts_valid_constructs() {
         let valid = [
@@ -129,6 +279,37 @@ mod tests {
             "let r = rect(\"met1\", x0=0., y0=0., x1=400.)!;",
             "for i in range(3) { eq(i, i); }",
             "match k { A => 1, B => 2, }",
+            "let x = a && b;",
+            "let x = a || b;",
+            "let x = !a && !b;",
+            "let x = a && b!;",
+            "let x = a < b && c >= d || !e;",
+            "if a && b {} else {}",
+            // Struct literals: named fields in any order, shorthand fields,
+            // and a `..base` that must come last after a comma.
+            "let p = Point { x: 1., y: 2. };",
+            "let p = Point { x: 1., y: 2., };",
+            "let p = geom::Point { x: 1., y: 2. };",
+            "let p = lib::geom::Point { x: 1., y: 2. };",
+            "let p = Point { x, y };",
+            "let p = Point { x, y: 2. };",
+            "let p = Point { ..base };",
+            "let p = Point { x: 1., ..base };",
+            "let p = Point { x, ..base };",
+            "let p = Unit {};",
+            "let x = Point { x: 1., y: 2. }.x;",
+            "let p = Outer { inner: Inner { a: 1 }, list: cons(Inner { a: 2 }, []) };",
+            "let p = Point { x: if c { 1. } else { 2. }, y: 2. };",
+            "foo(Point { x: 1., y: 2. }, p=Point { ..base });",
+            "let x = arr[Point { i: 0 }.i];",
+            // A literal in an `if`/`match`/`for` head needs parentheses, but
+            // is fine inside the construct's scopes and arms.
+            "if (p == Point { x: 1., y: 2. }) {} else {}",
+            "if c { Point { x: 1., y: 2. } } else { q }",
+            "match k { A => Point { x: 1., y: 2. }, }",
+            "for i in seq { let p = Point { x: i, y: i }; }",
+            // A `match` in an `if` head still allows literals in its arms.
+            "if match k { A => Point { x: 1. }, }.x == 1. {} else {}",
         ];
         for body in valid {
             assert!(snippet_ok(body), "should parse: `{body}`");
@@ -147,9 +328,149 @@ mod tests {
             "let x = 99999999999999999999;",   // out of range for Int
             "let x = 1 . 5;",                  // a float may not be split by trivia
             "let x = t.99999999999999999999;", // out of range tuple index
+            // `name {` in an `if`/`match`/`for` head is the construct's scope.
+            "if p == Point { x: 1. } {} else {}",
+            "match Point { x: 1. } { A => 1, }",
+            "for p in Point { xs: [] }.xs {}",
+            "let p = Point { x: };",         // missing value
+            "let p = Point { x: 1. ..b };",  // a comma is required before `..`
+            "let p = Point { ..b, };",       // no comma after the base
+            "let p = Point { ..b, x: 1. };", // the base must come last
+            "let p = Point { x.y };",        // a field is a bare identifier
+            "let p = Point { x: 1. y: 2. };",
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+    }
+
+    #[test]
+    fn struct_declarations_take_type_specs() {
+        assert!(parse("struct S { a: [Float], b: (Int, Int), c: Other, }").is_ok());
+        assert!(parse("struct Unit {}").is_ok());
+        assert!(parse("struct S { a }").is_err());
+        assert!(parse("struct S { a: }").is_err());
+        assert!(parse("struct S { a: Float b: Float }").is_err());
+    }
+
+    /// A shorthand field desugars to `name: name` with the value at the name's
+    /// own span, so later passes see an ordinary field.
+    #[test]
+    fn shorthand_struct_fields_desugar_to_a_path_at_the_name() {
+        use crate::ast::{Decl, Expr, Statement};
+
+        let ast = parse("cell __t__() { let p = Point { x, y: 1., ..q }; }").unwrap();
+        let Decl::Cell(cell) = &ast.ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        let Statement::LetBinding(binding) = &cell.scope.stmts[0] else {
+            panic!("expected a let binding");
+        };
+        let Expr::StructLit(lit) = &binding.value else {
+            panic!("expected a struct literal");
+        };
+        assert_eq!(lit.path.path.len(), 1);
+        assert_eq!(lit.fields.len(), 2);
+        assert!(lit.fields[0].shorthand);
+        assert_eq!(lit.fields[0].value.span(), lit.fields[0].name.span);
+        assert!(matches!(
+            &lit.fields[0].value,
+            Expr::IdentPath(path) if path.path.len() == 1 && path.path[0].name == "x"
+        ));
+        assert!(!lit.fields[1].shorthand);
+        assert!(matches!(lit.base, Some(Expr::IdentPath(_))));
+        // The literal spans from its path to the closing brace.
+        assert_eq!(
+            &ast.text[lit.span.start()..lit.span.end()],
+            "Point { x, y: 1., ..q }"
+        );
+    }
+
+    /// Renders an expression fully parenthesized.
+    fn shape<S: std::fmt::Display, T: crate::ast::AstMetadata>(
+        expr: &crate::ast::Expr<S, T>,
+    ) -> String {
+        use crate::ast::{ArithOp, BinOp, BoolOp, ComparisonOp, Expr, UnaryOp};
+        match expr {
+            Expr::BinOp(e) => {
+                let op = match e.op {
+                    BinOp::Bool(BoolOp::Or) => "||",
+                    BinOp::Bool(BoolOp::And) => "&&",
+                    BinOp::Cmp(ComparisonOp::Eq) => "==",
+                    BinOp::Cmp(ComparisonOp::Ne) => "!=",
+                    BinOp::Cmp(ComparisonOp::Geq) => ">=",
+                    BinOp::Cmp(ComparisonOp::Gt) => ">",
+                    BinOp::Cmp(ComparisonOp::Leq) => "<=",
+                    BinOp::Cmp(ComparisonOp::Lt) => "<",
+                    BinOp::Arith(ArithOp::Add) => "+",
+                    BinOp::Arith(ArithOp::Sub) => "-",
+                    BinOp::Arith(ArithOp::Mul) => "*",
+                    BinOp::Arith(ArithOp::Div) => "/",
+                    BinOp::Arith(ArithOp::Rem) => "%",
+                };
+                format!("({} {op} {})", shape(&e.left), shape(&e.right))
+            }
+            Expr::UnaryOp(e) => {
+                let op = match e.op {
+                    UnaryOp::Not => "!",
+                    UnaryOp::Neg => "-",
+                };
+                format!("({op}{})", shape(&e.operand))
+            }
+            Expr::Emit(e) => format!("({}!)", shape(&e.value)),
+            Expr::IdentPath(p) => p
+                .path
+                .iter()
+                .map(|ident| ident.name.to_string())
+                .collect::<Vec<_>>()
+                .join("::"),
+            Expr::BoolLiteral(b) => b.value.to_string(),
+            Expr::IntLiteral(i) => i.value.to_string(),
+            other => panic!(
+                "shape() does not render this expression kind (span {:?})",
+                other.span()
+            ),
+        }
+    }
+
+    /// Parses `let x = <expr>;` in a cell body and renders the expression.
+    fn expr_shape(expr: &str) -> String {
+        use crate::ast::{Decl, Statement};
+
+        let src = format!("cell __t__() {{ let x = {expr}; }}");
+        let mut parser = super::grammar::Parser::new(&src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "`{expr}`: {:?}", parser.errors);
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell decl");
+        };
+        let Statement::LetBinding(binding) = &cell.scope.stmts[0] else {
+            panic!("expected a let binding");
+        };
+        shape(&binding.value)
+    }
+
+    #[test]
+    fn boolean_operator_precedence_and_associativity() {
+        // `||` binds loosest, then `&&`, then the comparisons, then the
+        // arithmetic operators -- as in Rust. All are left-associative.
+        for (expr, expected) in [
+            ("a || b && c", "(a || (b && c))"),
+            ("a && b || c", "((a && b) || c)"),
+            ("a && b && c", "((a && b) && c)"),
+            ("a || b || c", "((a || b) || c)"),
+            ("a == b && c != d", "((a == b) && (c != d))"),
+            ("a < b || c >= d", "((a < b) || (c >= d))"),
+            ("a + b < c && d", "(((a + b) < c) && d)"),
+            // Prefix `!` takes only its operand, so it binds tighter than
+            // every infix operator but does not absorb a suffix.
+            ("!a && b", "((!a) && b)"),
+            ("!(a && b)", "(!(a && b))"),
+            ("!a || !b && !c", "((!a) || ((!b) && (!c)))"),
+            ("a && b!", "(a && (b!))"),
+            ("!a!", "((!a)!)"),
+        ] {
+            assert_eq!(expr_shape(expr), expected, "parsing `{expr}`");
         }
     }
 
@@ -175,7 +496,7 @@ mod tests {
     #[test]
     fn leading_comment_is_allowed() {
         // The lexer skips `//` comments as trivia everywhere, so a comment
-        // before the first declaration parses fine (ANTLR rejected this).
+        // before the first declaration parses fine.
         assert!(parse("// header\ncell c() {}\n").is_ok());
         assert!(parse("  \n// c1\n// c2\nfn f() -> Float { 1. }\n").is_ok());
     }
@@ -431,6 +752,34 @@ mod tests {
             "fn f(x: [(Float, Int)]) -> (Int,) {}",
         ] {
             assert!(parse(src).is_ok(), "should parse: `{src}`");
+        }
+    }
+
+    #[test]
+    fn default_values_parse() {
+        use crate::ast::{Decl, Expr};
+
+        let src = "fn f(a: Float, b: Float = 1., c: [Int] = []) {}\ncell c(n: Int = 2 * 3) {}";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let [Decl::Fn(f), Decl::Cell(c)] = ast.decls.as_slice() else {
+            panic!("expected a fn and a cell, got {:?}", ast.decls);
+        };
+        assert!(f.args[0].default.is_none());
+        let b = f.args[1].default.as_ref().expect("`b` has a default");
+        assert!(matches!(b, Expr::FloatLiteral(_)));
+        assert_eq!(&src[b.span().start()..b.span().end()], "1.");
+        assert!(matches!(f.args[2].default, Some(Expr::SeqNil(_))));
+        let n = c.args[0].default.as_ref().expect("`n` has a default");
+        assert_eq!(&src[n.span().start()..n.span().end()], "2 * 3");
+
+        for src in [
+            "fn f(a: Float = ) {}",
+            "cell c(n: Int = 1 {}",
+            "fn f(a = 1.) {}",
+        ] {
+            assert!(parse(src).is_err(), "should be rejected: `{src}`");
         }
     }
 

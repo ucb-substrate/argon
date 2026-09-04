@@ -12,6 +12,14 @@ local function wait_for(description, predicate)
 end
 
 local bufnr = vim.api.nvim_get_current_buf()
+local expected_completeopt
+if vim.env.ARGON_TEST_MODE == 'navigation' then
+  expected_completeopt = 'menu,preview'
+  vim.api.nvim_set_option_value('completeopt', expected_completeopt, {
+    buf = bufnr,
+    scope = 'local',
+  })
+end
 wait_for('Argon language server', function()
   return #vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) == 1
     and vim.fn.exists(':Argon') == 2
@@ -78,6 +86,185 @@ elseif vim.env.ARGON_TEST_MODE == 'diagnostics' then
   wait_for('diagnostics to clear', function()
     return #vim.diagnostic.get(bufnr) == 0
   end)
+elseif vim.env.ARGON_TEST_MODE == 'navigation' then
+  local client = vim.lsp.get_clients({ name = 'argon', bufnr = bufnr })[1]
+  assert(
+    client.offset_encoding == 'utf-8',
+    'expected the server to negotiate utf-8, got ' .. tostring(client.offset_encoding)
+  )
+  assert(
+    vim.bo[bufnr].tagfunc == 'v:lua.vim.lsp.tagfunc',
+    'advertising definitionProvider should make <C-]> work'
+  )
+  assert(
+    vim.fn.maparg('gd', 'n', false, true).buffer == 1,
+    'the plugin should map gd in an attached buffer'
+  )
+  assert(
+    vim.api.nvim_get_option_value('completeopt', {
+      buf = bufnr,
+      scope = 'local',
+    }) == expected_completeopt,
+    'attaching Argon should not change the user completion options'
+  )
+  for _, capability in ipairs({
+    'completionProvider',
+    'hoverProvider',
+    'signatureHelpProvider',
+    'documentSymbolProvider',
+    'documentHighlightProvider',
+  }) do
+    assert(client.server_capabilities[capability], 'missing LSP capability ' .. capability)
+  end
+
+  -- `width` on the last line refers to the `let` on the second.
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local use_line, use_column
+  for index = #lines, 1, -1 do
+    local column = lines[index]:find('width', 1, true)
+    if column and not lines[index]:find('let width', 1, true) then
+      use_line, use_column = index - 1, column - 1
+      break
+    end
+  end
+  assert(use_line, 'could not find a use of width')
+
+  local params = {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+    position = { line = use_line, character = use_column },
+  }
+  local function definition()
+    local response = client:request_sync('textDocument/definition', params, 10000, bufnr)
+    assert(response and not response.err, 'definition request failed: ' .. vim.inspect(response))
+    if response.result == nil or vim.tbl_isempty(response.result) then
+      return nil
+    end
+    return vim.islist(response.result) and response.result[1] or response.result
+  end
+
+  -- The index only exists once the debounced first compile has landed, and
+  -- nothing notifies the client when that happens.
+  local location
+  wait_for('the workspace to be indexed', function()
+    location = definition()
+    return location ~= nil
+  end)
+  assert(
+    vim.uri_to_fname(location.uri) == vim.fn.fnamemodify(vim.api.nvim_buf_get_name(bufnr), ':p'),
+    'definition should be in the same file, got ' .. tostring(location.uri)
+  )
+  assert(
+    lines[location.range.start.line + 1]:find('let width', 1, true),
+    'definition should land on the let binding, got line '
+      .. tostring(lines[location.range.start.line + 1])
+  )
+
+  local function completion_labels_at(position)
+    local completion = client:request_sync('textDocument/completion', {
+      textDocument = vim.lsp.util.make_text_document_params(bufnr),
+      position = position,
+    }, 10000, bufnr)
+    assert(completion and not completion.err, 'completion request failed')
+    local labels = {}
+    for _, item in ipairs(completion.result.items or completion.result) do
+      labels[item.label] = true
+    end
+    return labels
+  end
+
+  local completion_labels = completion_labels_at(params.position)
+  assert(completion_labels.width, 'completion should contain the visible local width')
+  assert(completion_labels.rect, 'completion should contain builtin functions')
+  assert(not completion_labels.cell, 'expressions should exclude declaration keywords')
+  assert(not completion_labels.Float, 'expressions should exclude type names')
+  assert(not completion_labels.let, 'nested expressions should exclude statement keywords')
+
+  local declaration_labels = completion_labels_at({ line = 0, character = #'cell t' })
+  assert(
+    vim.tbl_isempty(declaration_labels),
+    'a cell declaration name should not offer existing symbols: ' .. vim.inspect(declaration_labels)
+  )
+
+  local top_level_labels = completion_labels_at({ line = 0, character = #'ce' })
+  assert(top_level_labels.cell, 'top-level completion should contain the cell keyword')
+  assert(not top_level_labels.rect, 'top-level completion should exclude functions')
+
+  local hover = client:request_sync('textDocument/hover', params, 10000, bufnr)
+  assert(hover and not hover.err and hover.result, 'hover request failed')
+  assert(
+    hover.result.contents.value:find('let width: Float', 1, true),
+    'hover should show the inferred local type: ' .. vim.inspect(hover.result)
+  )
+
+  local highlights = client:request_sync('textDocument/documentHighlight', params, 10000, bufnr)
+  assert(highlights and not highlights.err, 'document-highlight request failed')
+  assert(
+    #highlights.result == 3,
+    'expected the width declaration and two uses to be highlighted, got '
+      .. tostring(#highlights.result)
+  )
+
+  local rect_column = assert(lines[3]:find('rect(', 1, true)) - 1 + #'rect('
+  local signature = client:request_sync('textDocument/signatureHelp', {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+    position = { line = 2, character = rect_column },
+  }, 10000, bufnr)
+  assert(signature and not signature.err and signature.result, 'signature-help request failed')
+  assert(
+    signature.result.signatures[1].label:find('fn rect(', 1, true) == 1,
+    'signature help should describe rect: ' .. vim.inspect(signature.result)
+  )
+
+  local symbols = client:request_sync('textDocument/documentSymbol', {
+    textDocument = vim.lsp.util.make_text_document_params(bufnr),
+  }, 10000, bufnr)
+  assert(symbols and not symbols.err, 'document-symbol request failed')
+  local symbol_names = {}
+  for _, symbol in ipairs(symbols.result) do
+    symbol_names[symbol.name] = true
+  end
+  assert(symbol_names.top and symbol_names.width, 'document outline is incomplete')
+
+  params.context = { includeDeclaration = true }
+  local references = client:request_sync('textDocument/references', params, 10000, bufnr)
+  assert(references and not references.err, 'references request failed')
+  assert(
+    #references.result == 3,
+    'expected the declaration and two uses, got ' .. tostring(#references.result)
+  )
+
+  -- Navigation must survive an edit that does not parse. Break the file after
+  -- the position under test, so the position itself is still meaningful.
+  vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { 'cell broken( {' })
+  wait_for('the broken edit to reach the analyzer', function()
+    return #vim.diagnostic.get(bufnr) > 0
+  end)
+  assert(
+    definition() ~= nil,
+    'navigation should keep answering from the last index that compiled'
+  )
+
+  -- A broken edit *before* the position under test shifts every offset after
+  -- it. The retained index still describes the file as it was, so the answer
+  -- has to be translated rather than read off the stale offsets directly.
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  wait_for('the restored file to compile', function()
+    return #vim.diagnostic.get(bufnr) == 0
+  end)
+  vim.api.nvim_buf_set_lines(bufnr, 0, 0, false, { 'cell broken( {' })
+  wait_for('the leading broken edit to reach the analyzer', function()
+    return #vim.diagnostic.get(bufnr) > 0
+  end)
+  params.position = { line = use_line + 1, character = use_column }
+  local shifted = definition()
+  assert(shifted, 'navigation should survive a broken edit above the cursor')
+  assert(
+    shifted.range.start.line == location.range.start.line + 1,
+    'the definition should follow the inserted line, expected '
+      .. tostring(location.range.start.line + 1)
+      .. ' got '
+      .. tostring(shifted.range.start.line)
+  )
 elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
   -- The Rust test drives the analyzer RPC directly and acknowledges the
   -- mirrored GUI error after observing it.

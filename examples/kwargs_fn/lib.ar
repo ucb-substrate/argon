@@ -1,0 +1,19 @@
+// Parameters with defaults are keyword parameters: they are passed by name and
+// may be omitted. A default may refer to the parameters declared before it.
+fn scaled(x: Float, scale: Float = 2., offset: Float = x) -> Float {
+    x * scale + offset
+}
+
+// A default may be any expression, including one that opens a scope.
+fn pick(flag: Bool, value: Float = if flag { 1. } else { 2. }) -> Float {
+    value
+}
+
+cell top() {
+    let a = rect("met1", x0=0., y0=0., x1=scaled(10.), y1=10.);
+    let b = rect("met1", x0=0., y0=20., x1=scaled(10., scale=3.), y1=30.);
+    let c = rect("met1", x0=0., y0=40., x1=scaled(10., offset=0.), y1=50.);
+    let d = rect("met1", x0=0., y0=60., x1=scaled(10., scale=0.5, offset=5.), y1=70.);
+    let e = rect("met1", x0=0., y0=80., x1=pick(true) * 10., y1=90.);
+    let f = rect("met1", x0=0., y0=100., x1=pick(false, value=5.) * 10., y1=110.);
+}

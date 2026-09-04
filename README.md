@@ -14,7 +14,8 @@ as caching and incremental compilation.
 
 ## Documentation
 
-The documentation site is built with Docusaurus and lives in [`docs/`](docs). Its pages are
+The documentation site is published at <https://ucb-substrate.github.io/argon/>.
+It is built with Docusaurus and lives in [`docs/`](docs). Its pages are
 under [`docs/content/`](docs/content), split into [guides](docs/content/guides/index.md), a
 [language reference](docs/content/language/overview.md), a
 [GUI manual](docs/content/gui/workspace.md), and a
@@ -85,6 +86,106 @@ library's scope, so they may call functions and build sequences:
 ```bash
 arc run --cell 'top(pitch * 4., -width / 2.)'
 arc run --cell 'array(cons(250., cons(350., [])), Mode::Fast)'
+```
+
+Parameters declared with a default value are keyword parameters. They are
+passed by name, may be omitted, and must follow the positional parameters. A
+default is an ordinary expression evaluated at each call; it may refer to the
+parameters declared before it and to module-level items, and its type must match
+the declared type exactly:
+
+```rust
+cell via(layer: String, w: Float, h: Float = w, n: Int = 1) {
+    // ...
+}
+
+cell top() {
+    let square = inst(via("met1", 100.));
+    let stack = inst(via("met1", 100., h=300., n=3));
+}
+```
+
+Positional parameters cannot be passed by name, and keyword parameters cannot be
+passed positionally. Keyword arguments also work in cell invocations:
+`arc run --cell 'via("met1", 100., n=3)'`.
+
+Structs group related values under named fields. Declare them at module level,
+construct them with braces, and read fields with `.`. Every field must be given
+exactly once unless `..base` supplies the ones not listed, and a bare `name` is
+shorthand for `name: name`:
+
+```rust
+struct Size {
+    w: Float,
+    h: Float,
+}
+
+struct ViaParams {
+    layer: String,
+    size: Size,
+    n: Int,
+}
+
+fn grow(s: Size, by: Float) -> Size {
+    Size { w: s.w + by, ..s }
+}
+
+cell via(p: ViaParams) {
+    let r = rect(p.layer, x0=0., y0=0., w=p.size.w, h=p.size.h);
+}
+
+cell top() {
+    let size = grow(Size { w: 100., h: 50. }, 10.);
+    let n = 2;
+    let v = inst(via(ViaParams { layer: "met1", size, n }));
+}
+```
+
+Struct types are nominal: two structs with the same fields are different types,
+and a struct may not contain itself. Fields may have any type, including enums,
+other structs, sequences, and tuples. A struct declared in another module is
+imported with `use`, and a literal may name its module, as in
+`geom::Size { w: 1., h: 2. }`. Inside an `if` condition, a `match` scrutinee, or
+a `for` sequence a literal must be parenthesized, since `name {` there begins
+the construct's body. Struct and tuple values are valid cell arguments,
+including on the command line:
+
+```bash
+arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
+```
+
+Shapes are valid cell arguments too. A `Rect`, `Polygon`, `Path`, or `Point`
+parameter receives the shape by value: the caller's solver resolves its
+coordinates first, and the cell sees them as constants in its own coordinate
+frame, exactly as a `Float` argument arrives as a number. Placing an instance
+elsewhere does not move them, and constraints inside the cell cannot move the
+caller's geometry; share live geometry with a `fn` instead. Inside the cell the
+shape is construction geometry: it is not drawn and does not count toward the
+cell's extent, but its edges can constrain what the cell draws. `!` draws it on
+its layer when it was drawn in the caller, so layout geometry and shapes read
+out of an instance qualify while a `crect` or a `bbox` does not. Shapes at
+different positions are different arguments, so they compile to different
+cells:
+
+```rust
+cell via_array(region: Rect, size: Float, pitch: Float) {
+    let via = crect(layer="via1", x0=0., y0=0., w=size, h=size);
+    let vias = std::max_array(via, region.w, region.h, pitch, pitch);
+    eq(vias.x0 - region.x0, region.x1 - vias.x1);
+    eq(vias.y0 - region.y0, region.y1 - vias.y1);
+}
+
+cell top() {
+    let met1 = rect("met1", x0=0., y0=0., w=100., h=50.);
+    let met2 = rect("met2", x0=10., y0=5., w=80., h=40.);
+    let vias = inst(via_array(std::intersection(met1, met2), 10., 20.));
+}
+```
+
+Shapes built on the command line work the same way:
+
+```bash
+arc run --cell 'via_array(crect(x0=0., y0=0., w=90., h=40.), 10., 20.)'
 ```
 
 GDS imports are zero-argument cells. A module-qualified entry such as
@@ -188,6 +289,40 @@ vim.pack.add({
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your
 `PATH`.
+
+Errors are reported as you type; `:Argon diagnostics` opens them in a list.
+The analyzer exposes LSP completion for visible local bindings, functions,
+cells, modules, enum variants, builtin types/functions, keyword arguments, and
+type-aware fields. Suggestions are filtered by syntax: declaration-name slots
+stay empty, type positions show types, and expressions do not offer declaration
+keywords. Argon does not enable or configure a completion UI; Neovim's
+`<C-x><C-o>` works without additional setup, and completion plugins can consume
+the same LSP results.
+
+To include LSP suggestions in Neovim 0.12's built-in automatic completion,
+configure the editor rather than Argon:
+
+```lua
+vim.opt.autocomplete = true
+vim.opt.complete:append('o')
+```
+
+Navigation and IntelliSense work on variables, function and cell names, enums
+and their variants, module paths, and the fields of an instance. References to
+the symbol under the cursor are highlighted after `CursorHold`:
+
+| Mapping | Action |
+|---|---|
+| `gd`, `<C-]>` | Go to definition |
+| `grr` | List references |
+| `K` | Show type or signature information |
+| `<C-s>` (insert mode) | Show signature help |
+| `gO` | List symbols in the current file |
+
+Navigation crosses files, follows path dependencies into other libraries, and
+jumps into the standard library, which is written to `~/.cache/argon` the
+first time you navigate into it. It keeps working while the workspace has
+errors, answering from the last version that type-checked.
 
 From an Argon project directory, start Neovim and the GUI together:
 

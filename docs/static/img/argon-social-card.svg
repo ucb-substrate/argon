@@ -1,8 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630">
   <rect width="1200" height="630" fill="#1b1b1d"/>
-  <rect x="100" y="240" width="120" height="120" rx="28" fill="#211b2d"/>
-  <path d="M130 325 162 262l33 63h-18l-5.5-12h-20.5l-5.5 12h-15.5Zm27.8-25.8h8l-4-11.2-4 11.2Z" fill="#c4b5fd"/>
-  <path d="M122 339h76" stroke="#7c3aed" stroke-width="5" stroke-linecap="round"/>
-  <text x="260" y="318" fill="#f4f4f5" font-family="system-ui, sans-serif" font-size="84" font-weight="600">Argon</text>
-  <text x="260" y="372" fill="#a1a1aa" font-family="system-ui, sans-serif" font-size="34">Documentation</text>
+  <g transform="translate(96 231) scale(3.5)">
+    <rect width="48" height="48" rx="11" fill="#211b2d"/>
+    <path d="M9.52 33.26L4.00 33.26L4.00 14.74L9.52 14.74L9.52 17.00L6.46 17.00L6.46 31.00L9.52 31.00L9.52 33.26Z M44 33.26L38.48 33.26L38.48 31.00L41.54 31.00L41.54 17.00L38.48 17.00L38.48 14.74L44 14.74L44 33.26Z" fill="#c4b5fd"/>
+    <path d="M15.39 31.09L12.87 31.09L16.49 16.71L19.67 16.71L23.31 31.09L20.79 31.09L20 27.61L16.18 27.61L15.39 31.09ZM17.50 21.71L16.63 25.60L19.55 25.60L18.68 21.73Q18.46 20.77 18.31 19.99Q18.15 19.21 18.09 18.86L18.09 18.86Q18.03 19.21 17.87 19.99Q17.71 20.77 17.50 21.71L17.50 21.71Z M28.37 31.09L25.91 31.09L25.91 20.26L28.32 20.26L28.32 22.36Q28.51 21.30 29.29 20.68Q30.07 20.06 31.31 20.06L31.31 20.06Q32.97 20.06 33.89 21.12Q34.82 22.19 34.82 24.10L34.82 24.10L34.82 25.12L32.35 25.12L32.35 24.22Q32.35 23.23 31.84 22.71Q31.33 22.19 30.38 22.19L30.38 22.19Q29.40 22.19 28.89 22.78Q28.37 23.37 28.37 24.45L28.37 24.45L28.37 31.09Z" fill="#f4f1fb"/>
+  </g>
+  <text x="310" y="318" fill="#f4f4f5" font-family="system-ui, sans-serif" font-size="88" font-weight="700">Argon</text>
+  <text x="312" y="376" fill="#a1a1aa" font-family="system-ui, sans-serif" font-size="34">Documentation</text>
 </svg>

@@ -256,6 +256,9 @@ fn compile_failed(
     if let Some(invocation) = invocation {
         diagnostics::remap_invocation(&mut diagnostics, invocation);
     }
+    // After remapping, so that diagnostics the invocation splice moves onto a
+    // common span are deduplicated too.
+    diagnostics::condense(&mut diagnostics);
     Failed(format, diagnostics)
 }
 
@@ -445,7 +448,7 @@ mod tests {
 
     #[test]
     fn unsupported_source_is_a_diagnostic_not_a_panic() {
-        let source = temp_source("unsupported", "struct Point {}\n");
+        let source = temp_source("unsupported", "const X: Int = 1;\n");
         let diagnostic = render_failed(failed(check_args(source)));
         assert!(
             diagnostic.contains("error: error during parsing"),
@@ -591,6 +594,20 @@ mod tests {
         );
         let rect = compiled_rect("enum", source, "top(Mode::Slow)");
         assert_eq!(rect.x1.0, 20.);
+    }
+
+    #[test]
+    fn execution_accepts_keyword_cell_arguments() {
+        let source = temp_source(
+            "kwargs",
+            "cell top(w: Float = 100., h: Float = w) {\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=h);\n\
+             }\n",
+        );
+        let rect = compiled_rect("kwargs-default", source.clone(), "top()");
+        assert_eq!((rect.x1.0, rect.y1.0), (100., 100.));
+        let rect = compiled_rect("kwargs-explicit", source, "top(w=300.)");
+        assert_eq!((rect.x1.0, rect.y1.0), (300., 300.));
     }
 
     #[test]

@@ -1,0 +1,28 @@
+fn emit_fallbacks(n: Int) {
+    // Emit `n` rectangles in the shape the GUI actually writes: every
+    // coordinate is an *initial condition* (`x0i`, `y0i`) rather than a hard
+    // constraint, because that is what `LangServer::draw_rect` emits so a
+    // later drag can rewrite the literal in place.
+    //
+    // The two `eq` constraints are what make this axis distinct from
+    // `stress_shapes`. A lone one-variable fallback is back-substituted by
+    // `constrain_eq0` the moment it is applied and never reaches `solve()`'s
+    // body, so a pile of *unconstrained* rectangles measures nothing. Coupling
+    // each rectangle's opposite edges leaves a two-variable constraint live
+    // until its fallback fires, which is the state a dimensioned layout is in.
+    if n <= 0 {
+    } else {
+        let r = rect("met1", x0i = 0., y0i = 0.);
+        eq(r.x1, r.x0 + 10.);
+        eq(r.y1, r.y0 + 8.);
+        emit_fallbacks(n - 1);
+    }
+}
+
+// Stress axis: number of pending *fallback* (initial-condition) constraints
+// coexisting with live multi-variable constraints -- the GUI-authored,
+// dimensioned layout. `fallbacks(n)` yields `2n` fallbacks and `2n` live
+// two-variable constraints over `4n` solver variables.
+cell fallbacks(n: Int) {
+    emit_fallbacks(n);
+}

@@ -1,0 +1,42 @@
+mod geom;
+
+use lib::geom::Size;
+
+struct ViaParams {
+    layer: String,
+    size: Size,
+    n: Int,
+}
+
+// `..s` copies every field that is not listed from `s`.
+fn grow(s: Size, by: Float) -> Size {
+    Size { w: s.w + by, ..s }
+}
+
+// Shorthand: `w` and `h` stand for `w: w` and `h: h`.
+fn square(w: Float) -> Size {
+    let h = w;
+    Size { w, h }
+}
+
+fn total_width(sizes: [Size], pitch: Float) -> Float {
+    if sizes == [] {
+        0.
+    } else {
+        head(sizes).w + pitch + total_width(tail(sizes), pitch)
+    }
+}
+
+cell via(p: ViaParams) {
+    let r = rect(p.layer, x0=0., y0=0., w=p.size.w, h=p.size.h);
+}
+
+cell top() {
+    let size = grow(square(100.), 10.);
+    let params = ViaParams { layer: "met1", size, n: 2 };
+    let wide = ViaParams { size: geom::Size { w: 300., ..size }, ..params };
+    let v1 = inst(via(params), x=0., y=0.);
+    let v2 = inst(via(wide), x=size.w + 50., y=0.);
+    let sizes = cons(params.size, cons(wide.size, []));
+    let outline = rect("met2", x0=0., y0=0., w=total_width(sizes, 50.) - 50., h=size.h);
+}

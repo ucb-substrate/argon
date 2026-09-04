@@ -25,3 +25,25 @@ base-directory environment variables.
 
 For example, you may add an `tracing::info!("debug");` statement to a line in the GUI 
 and check the GUI log to determine whether the subsequent code is reached.
+
+## Documentation checks
+
+CI enforces that documentation links resolve, in two jobs that mirror the two
+places documentation lives. Both are worth running locally before pushing a
+change that touches docs or doc comments.
+
+Rust doc comments are checked by rustdoc itself. The denied lints -- broken
+intra-doc links among them -- are declared in `[workspace.lints.rustdoc]` in the
+root `Cargo.toml`, so they apply to any `cargo doc` invocation:
+
+Markdown files are checked by [lychee](https://lychee.cli.rs), which validates
+relative file and image paths and in-page `#heading` anchors:
+
+```bash
+brew install lychee   # or: cargo install lychee --locked
+lychee --config lychee.toml '**/*.md'
+```
+
+`lychee.toml` runs the checker offline, so external http(s) links are
+deliberately left unchecked and the results never depend on a third-party site
+being reachable.

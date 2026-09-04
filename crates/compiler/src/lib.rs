@@ -1,9 +1,13 @@
 pub mod artifact;
 pub mod ast;
+pub mod cellcache;
 pub mod compile;
 pub mod diagnostics;
+pub mod fingerprint;
 pub mod gds;
+pub mod gdscache;
 pub mod incremental;
+pub mod nav;
 pub mod parse;
 mod parser;
 pub mod solver;
@@ -14,11 +18,9 @@ pub use workspace::WorkspaceConfig;
 
 /// Native stack reserved for compilation.
 ///
-/// The evaluator recurses natively for inlined `fn` calls and for nested cell
-/// instantiation, and both overflow the default stack well before
-/// `compile::MAX_EVAL_DEPTH`. A stack overflow aborts the process rather than
-/// unwinding, so no `catch_unwind` can turn it into a diagnostic: the stack
-/// has to be large enough that the depth limit is what stops the descent.
+/// A stack overflow aborts the process rather than unwinding, so no
+/// `catch_unwind` can turn it into a diagnostic: the stack has to be large
+/// enough that the depth limit is what stops the descent.
 pub const COMPILE_STACK_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Runs `f` on a thread with [`COMPILE_STACK_SIZE`] of stack, propagating a
@@ -121,8 +123,8 @@ mod tests {
 
     use crate::{
         compile::{
-            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RectInitialCondition, SolvedValue,
-            StaticErrorKind, static_compile,
+            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RESERVED_CELL_FIELDS,
+            RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -162,6 +164,19 @@ mod tests {
             ast,
             input,
             &WorkspaceConfig::default().with_tech(Some(PathBuf::from(SKY130_TECH))),
+        )
+    }
+
+    /// Compiles `cell` from a one-file workspace without the standard library.
+    fn compile_source(source: &str, cell: &str, args: Vec<CellArg>) -> CompileOutput {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        compile(
+            &ast,
+            CompileInput {
+                cell: &[cell],
+                args,
+            },
         )
     }
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
@@ -210,6 +225,10 @@ mod tests {
     const ARGON_PRECEDENCE: &str = concatcp!(EXAMPLES_DIR, "/precedence/lib.ar");
     const ARGON_POLYGON: &str = concatcp!(EXAMPLES_DIR, "/polygon/lib.ar");
     const ARGON_PATH: &str = concatcp!(EXAMPLES_DIR, "/path/lib.ar");
+    const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
+    const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
+    const ARGON_STRUCTS: &str = concatcp!(EXAMPLES_DIR, "/structs/lib.ar");
+    const ARGON_SHAPE_CELL_ARGS: &str = concatcp!(EXAMPLES_DIR, "/shape_cell_args/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -234,6 +253,8 @@ mod tests {
     const ARGON_STRESS_CONSTRAINTS: &str = concatcp!(EXAMPLES_DIR, "/stress_constraints/lib.ar");
     const ARGON_STRESS_INSTANCES: &str = concatcp!(EXAMPLES_DIR, "/stress_instances/lib.ar");
     const ARGON_STRESS_HIERARCHY: &str = concatcp!(EXAMPLES_DIR, "/stress_hierarchy/lib.ar");
+    const ARGON_STRESS_FALLBACKS: &str = concatcp!(EXAMPLES_DIR, "/stress_fallbacks/lib.ar");
+    const ARGON_STRESS_FREE: &str = concatcp!(EXAMPLES_DIR, "/stress_free/lib.ar");
 
     use crate::compile::CompileOutput;
 
@@ -609,6 +630,89 @@ mod tests {
         write_bench_csv("constraints", &rows);
     }
 
+    /// Axis 2b: number of pending *fallback* (initial-condition) constraints.
+    ///
+    /// This is the shape the GUI writes: `LangServer::draw_rect` emits every
+    /// coordinate as `x0i`/`y0i`/`x1i`/`y1i` so a later drag can rewrite the
+    /// literal in place, making a GUI-authored cell almost entirely fallbacks.
+    /// No other axis here covers that, since the other `stress_*` examples use
+    /// kwargs that `constrain_eq0` back-substitutes at insertion.
+    ///
+    /// The cell is *underconstrained* by construction, because
+    /// `report_underconstrained` runs its trial solve with compiler defaults
+    /// but without author fallbacks, so this axis asserts that output was
+    /// produced rather than that the compile was `Valid`.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_fallbacks() {
+        let _g = bench_guard();
+        let o = parse_workspace_with_std(ARGON_STRESS_FALLBACKS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes("ARGON_BENCH_FALLBACKS", &[125, 250, 500, 1000, 2000]) {
+            let (dt, mem, out) = measure(1, || {
+                compile(
+                    &ast,
+                    CompileInput {
+                        cell: &["fallbacks"],
+                        args: vec![CellArg::Int(n)],
+                    },
+                )
+            });
+            let nobj = count_objects(&out);
+            assert_eq!(nobj, n as usize, "fallbacks(n={n}) lost geometry");
+            eprintln!(
+                "fallbacks     n={n:>6} objects={nobj:>6} time={dt:>11.3?} peak={:>8.2} MiB",
+                mem as f64 / (1usize << 20) as f64
+            );
+            rows.push((n as f64, dt.as_secs_f64(), mem, nobj));
+        }
+        write_bench_csv("fallbacks", &rows);
+    }
+
+    /// Axis 2c: degrees of freedom the source leaves for the solver to pin.
+    ///
+    /// `crect` with relative dimensions and no absolute anchor leaves one
+    /// degree of freedom per axis per shape, and nothing in the source or in
+    /// the compiler defaults says where any of them goes, so the fixpoint loop
+    /// falls through to `Solver::force_solution`.
+    ///
+    /// Reports the solver's share of the compile directly, since this is the
+    /// one regime where the solve dominates evaluation rather than the other
+    /// way round.
+    #[test]
+    #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
+    fn bench_free() {
+        let _g = bench_guard();
+        let o = parse_workspace_with_std(ARGON_STRESS_FREE);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let mut rows = Vec::new();
+        for &n in &bench_sizes("ARGON_BENCH_FREE", &[250, 500, 1000, 2000, 4000]) {
+            crate::solver::solve_stats::reset();
+            let (dt, mem, out) = measure(1, || {
+                compile(
+                    &ast,
+                    CompileInput {
+                        cell: &["free_shapes"],
+                        args: vec![CellArg::Int(n)],
+                    },
+                )
+            });
+            let nobj = count_objects(&out);
+            assert_eq!(nobj, n as usize, "free_shapes(n={n}) lost geometry");
+            let (calls, body, nanos) = crate::solver::solve_stats::read();
+            eprintln!(
+                "free          n={n:>6} objects={nobj:>6} time={dt:>11.3?} peak={:>8.2} MiB solve_calls={calls} solve_body={body} solve={:>8.3?}",
+                mem as f64 / (1usize << 20) as f64,
+                std::time::Duration::from_nanos(nanos as u64),
+            );
+            rows.push((n as f64, dt.as_secs_f64(), mem, nobj));
+        }
+        write_bench_csv("free", &rows);
+    }
+
     /// Axis 3: number of instances of a single (cached) leaf cell.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
@@ -784,6 +888,207 @@ mod tests {
             out.is_valid(),
             "constraints ring should be fully determined: {out:?}"
         );
+    }
+
+    /// Fallbacks that share a connected component must still be applied one
+    /// per round, in priority order, with a solve between them.
+    ///
+    /// `x0i` and `x1i` are coupled by the `eq`, so applying both in one round
+    /// would assert `x1 = 50` on top of an `x1` that `x0i` has already
+    /// determined to be `15`, and report a satisfiable cell as inconsistent.
+    /// Applying them in order instead makes `x1i` moot.
+    #[test]
+    fn coupled_fallbacks_are_not_batched() {
+        let root = parse_source_text(
+            "cell top() {\n\
+             let a = rect(\"met1\", x0i = 5., x1i = 50., y0i = 0., y1i = 8.);\n\
+             eq(a.x1, a.x0 + 10.);\n\
+             }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let out = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        // Determined only by initial conditions, so it reports as
+        // underconstrained while still producing geometry -- see
+        // `stress_fallbacks_smoke`.
+        let errors = out.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+            "expected only underconstrained diagnostics: {:?}",
+            errors.errors
+        );
+        let d = errors
+            .output
+            .as_ref()
+            .expect("geometry despite diagnostics");
+        let cell = &d.cells[&d.top];
+        let rect = cell
+            .objects
+            .values()
+            .find_map(|o| match o {
+                SolvedValue::Rect(r) => Some(r),
+                _ => None,
+            })
+            .expect("the cell emits one rectangle");
+        assert_relative_eq!(rect.x0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(
+            rect.x1.0,
+            15.,
+            epsilon = EPSILON,
+            // 50. would mean `x1i` was applied alongside `x0i` rather than
+            // being made moot by it.
+        );
+        assert!(
+            cell.inconsistent_constraints.is_empty(),
+            "coupled initial conditions must not over-constrain the cell"
+        );
+        // Only the three that actually determined something were recorded;
+        // `x1i` was dropped as moot, and the GUI reads this list to decide
+        // which literals a drag may rewrite.
+        assert_eq!(cell.fallback_constraints_used.len(), 3);
+    }
+
+    /// `geometry_digest` must actually discriminate, or the shadow-execution
+    /// check (`ARGON_VERIFY_CELL_CACHE`) would pass vacuously.
+    #[test]
+    fn geometry_digest_distinguishes_what_a_user_can_see() {
+        let compile_source = |source: &str| {
+            let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+            let std = parse_source_text(
+                crate::parse::STD_SOURCE,
+                PathBuf::from(crate::parse::STD_PATH),
+            )
+            .unwrap();
+            let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["top"],
+                    args: Vec::new(),
+                },
+            )
+            .unwrap_valid()
+            .geometry_digest()
+        };
+
+        let base = "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
+        assert_eq!(compile_source(base), compile_source(base), "stable");
+        assert_ne!(
+            compile_source(base),
+            compile_source("cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=11., y1=10.); }"),
+            "a moved edge must change the digest"
+        );
+        assert_ne!(
+            compile_source(base),
+            compile_source("cell top() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); }"),
+            "a different layer must change the digest"
+        );
+        assert_ne!(
+            compile_source(base),
+            compile_source(
+                "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 let s = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.); }"
+            ),
+            "an extra shape must change the digest"
+        );
+    }
+
+    #[test]
+    fn stress_free_smoke() {
+        let o = parse_workspace_with_std(ARGON_STRESS_FREE);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let out = compile(
+            &ast,
+            CompileInput {
+                cell: &["free_shapes"],
+                args: vec![CellArg::Int(32)],
+            },
+        );
+        // Nothing anchors the geometry, so the cell reports as underconstrained
+        // and `force_solution` supplies the rest.
+        let errors = out.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+            "expected only underconstrained diagnostics: {:?}",
+            errors.errors
+        );
+        let d = errors
+            .output
+            .as_ref()
+            .expect("geometry despite diagnostics");
+        let rects = d
+            .cells
+            .values()
+            .flat_map(|c| c.objects.values())
+            .filter(|o| matches!(o, SolvedValue::Rect(_)))
+            .count();
+        assert_eq!(rects, 32);
+        // Every shape keeps the width and height the source did constrain,
+        // wherever `force_solution` decided to put it.
+        for object in d.cells.values().flat_map(|c| c.objects.values()) {
+            let SolvedValue::Rect(r) = object else {
+                continue;
+            };
+            assert_relative_eq!(r.x1.0 - r.x0.0, 10., epsilon = EPSILON);
+            assert_relative_eq!(r.y1.0 - r.y0.0, 8., epsilon = EPSILON);
+        }
+    }
+
+    #[test]
+    fn stress_fallbacks_smoke() {
+        let o = parse_workspace_with_std(ARGON_STRESS_FALLBACKS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let out = compile(
+            &ast,
+            CompileInput {
+                cell: &["fallbacks"],
+                args: vec![CellArg::Int(32)],
+            },
+        );
+        // Determined only by author fallbacks, so it reports as
+        // underconstrained while still producing every rectangle. Both halves
+        // matter: the diagnostic is what makes this a distinct axis from
+        // `stress_shapes`, and the geometry is what the benchmark measures.
+        let errors = out.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+            "expected only underconstrained diagnostics: {:?}",
+            errors.errors
+        );
+        let d = errors
+            .output
+            .as_ref()
+            .expect("geometry despite diagnostics");
+        let nrects = d
+            .cells
+            .values()
+            .flat_map(|c| c.objects.values())
+            .filter(|o| matches!(o, SolvedValue::Rect(r) if !r.construction))
+            .count();
+        assert_eq!(nrects, 32, "fallbacks should emit 32 rectangles");
     }
 
     #[test]
@@ -1330,6 +1635,841 @@ mod tests {
         );
         println!("{cells:#?}");
         cells.unwrap_valid();
+    }
+
+    #[test]
+    fn argon_kwargs_fn() {
+        let o = parse_workspace_with_std(ARGON_KWARGS_FN);
+        assert!(o.static_errors().is_empty());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        // Every rect's `x1` is a call with omitted, explicit, or
+        // parameter-referencing defaults, keyed by its `y0`.
+        let mut widths: Vec<(f64, f64)> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .map(|rect| (rect.y0.0, rect.x1.0))
+            .collect();
+        widths.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let expected = [
+            (0., 30.),
+            (20., 40.),
+            (40., 20.),
+            (60., 10.),
+            (80., 10.),
+            (100., 50.),
+        ];
+        assert_eq!(widths.len(), expected.len());
+        for ((y0, x1), (expected_y0, expected_x1)) in widths.iter().zip(expected) {
+            assert_relative_eq!(*y0, expected_y0, epsilon = EPSILON);
+            assert_relative_eq!(*x1, expected_x1, epsilon = EPSILON);
+        }
+    }
+
+    #[test]
+    fn argon_kwargs_cell() {
+        let o = parse_workspace_with_std(ARGON_KWARGS_CELL);
+        assert!(o.static_errors().is_empty());
+        // The positional API supplies every parameter, keyword ones included.
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: vec![CellArg::Float(100.)],
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        let mut insts: Vec<_> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .collect();
+        insts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let [square, tall, same, met2] = insts.as_slice() else {
+            panic!("expected four instances, got {}", insts.len());
+        };
+        assert_eq!(cells.cells.len(), 5);
+        let child_rect = |cell| {
+            cells.cells[&cell]
+                .objects
+                .values()
+                .find_map(|object| object.get_rect())
+                .cloned()
+                .expect("child emits a rect")
+        };
+        // `child(w)` and `child(w, h=w)` resolve to the same arguments.
+        for (inst, x1, y1, layer) in [
+            (square, 100., 100., "met1"),
+            (tall, 100., 200., "met1"),
+            (same, 100., 100., "met1"),
+            (met2, 50., 50., "met2"),
+        ] {
+            let rect = child_rect(inst.cell);
+            assert_relative_eq!(rect.x1.0, x1, epsilon = EPSILON);
+            assert_relative_eq!(rect.y1.0, y1, epsilon = EPSILON);
+            assert_eq!(rect.layer.as_deref(), Some(layer));
+        }
+    }
+
+    #[test]
+    fn argon_structs() {
+        let o = parse_workspace_with_std(ARGON_STRUCTS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        // `via(params)` and `via(wide)` are two parameterizations of `via`.
+        assert_eq!(cells.cells.len(), 3);
+        let mut insts: Vec<_> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .collect();
+        insts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let [narrow, wide] = insts.as_slice() else {
+            panic!("expected two instances, got {}", insts.len());
+        };
+        let child_rect = |cell| {
+            cells.cells[&cell]
+                .objects
+                .values()
+                .find_map(|object| object.get_rect())
+                .cloned()
+                .expect("via emits a rect")
+        };
+        // `grow(square(100.), 10.)`: `..s` keeps `h` at 100 while `w` grows.
+        let rect = child_rect(narrow.cell);
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+        assert_relative_eq!(rect.x1.0, 110., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 100., epsilon = EPSILON);
+        // `Size { w: 300., ..size }` inside `ViaParams { .., ..params }`.
+        let rect = child_rect(wide.cell);
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+        assert_relative_eq!(rect.x1.0, 300., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 100., epsilon = EPSILON);
+        assert_relative_eq!(wide.x, 160., epsilon = EPSILON);
+        // The outline is sized from a sequence of structs.
+        let outline = top
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("top emits the outline");
+        assert_eq!(outline.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(outline.x1.0, 460., epsilon = EPSILON);
+        assert_relative_eq!(outline.y1.0, 100., epsilon = EPSILON);
+    }
+
+    /// A struct literal in a cell invocation, as `arc run --cell` and the GUI
+    /// open-cell command supply it.
+    #[test]
+    fn argon_structs_cell_invocation() {
+        let mut ast = parse_workspace_with_std(ARGON_STRUCTS).ast();
+        let invocation = crate::parse::splice_cell_invocation(
+            &mut ast,
+            "via(ViaParams { layer: \"met2\", size: geom::Size { w: 40., h: 20. }, n: 1 })",
+        )
+        .expect("invocation should splice");
+        let (typed, errors) = static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let config = WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH)));
+        let cells =
+            crate::compile::execute_cell_invocation(&typed, &invocation, &config).unwrap_valid();
+        let rect = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("via emits a rect");
+        assert_eq!(rect.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(rect.x1.0, 40., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 20., epsilon = EPSILON);
+    }
+
+    /// Struct values passed through the positional cell API are checked
+    /// against the declared parameter type, like every other argument.
+    #[test]
+    fn struct_cell_arguments_are_checked_at_runtime() {
+        let ast = parse_workspace_with_std(ARGON_STRUCTS).ast();
+        let size = |w: f64, h: f64| CellArg::Struct {
+            name: "geom::Size".to_owned(),
+            fields: vec![
+                ("w".to_owned(), CellArg::Float(w)),
+                ("h".to_owned(), CellArg::Float(h)),
+            ],
+        };
+        let params = CellArg::Struct {
+            name: "ViaParams".to_owned(),
+            fields: vec![
+                ("layer".to_owned(), CellArg::String("met1".to_owned())),
+                ("size".to_owned(), size(30., 20.)),
+                ("n".to_owned(), CellArg::Int(1)),
+            ],
+        };
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["via"],
+                args: vec![params],
+            },
+        )
+        .unwrap_valid();
+        let rect = cells.cells[&cells.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("via emits a rect");
+        assert_relative_eq!(rect.x1.0, 30., epsilon = EPSILON);
+        assert_relative_eq!(rect.y1.0, 20., epsilon = EPSILON);
+
+        let wrong = compile(
+            &ast,
+            CompileInput {
+                cell: &["via"],
+                args: vec![size(30., 20.)],
+            },
+        );
+        let errors = wrong.unwrap_exec_errors();
+        assert!(
+            errors
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ExecErrorKind::InvalidCellArgumentType { .. })),
+            "{:?}",
+            errors.errors
+        );
+    }
+
+    /// Shapes are passed to cells by value: the caller's solved coordinates
+    /// arrive as constants, and `!` draws the ones that were drawn in the
+    /// caller.
+    #[test]
+    fn argon_shape_cell_args() {
+        let o = parse_workspace_with_std(ARGON_SHAPE_CELL_ARGS);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        assert_eq!(cells.cells.len(), 3);
+        let mut insts: Vec<_> = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .collect();
+        insts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let [vias, outline] = insts.as_slice() else {
+            panic!("expected two instances, got {}", insts.len());
+        };
+
+        let via_array = &cells.cells[&vias.cell];
+        let rects = |cell: &crate::compile::CompiledCell| {
+            cell.objects
+                .values()
+                .filter_map(|object| object.get_rect())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // The 80 x 40 overlap arrives as construction geometry, untranslated.
+        let region = rects(via_array)
+            .into_iter()
+            .find(|rect| rect.construction && relative_eq!(rect.x0.0, 10.))
+            .expect("the region is construction geometry");
+        assert_eq!(region.layer, None);
+        assert_relative_eq!(region.y0.0, 5., epsilon = EPSILON);
+        assert_relative_eq!(region.x1.0, 90., epsilon = EPSILON);
+        assert_relative_eq!(region.y1.0, 45., epsilon = EPSILON);
+        // Four columns and two rows of vias, centered in the region.
+        let drawn: Vec<_> = rects(via_array)
+            .into_iter()
+            .filter(|rect| !rect.construction)
+            .collect();
+        assert_eq!(drawn.len(), 8);
+        assert!(
+            drawn
+                .iter()
+                .all(|rect| rect.layer.as_deref() == Some("via1"))
+        );
+        let x0 = drawn.iter().map(|r| r.x0.0).fold(f64::INFINITY, f64::min);
+        let x1 = drawn
+            .iter()
+            .map(|r| r.x1.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let y0 = drawn.iter().map(|r| r.y0.0).fold(f64::INFINITY, f64::min);
+        let y1 = drawn
+            .iter()
+            .map(|r| r.y1.0)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert_relative_eq!(x0, 15., epsilon = EPSILON);
+        assert_relative_eq!(x1, 85., epsilon = EPSILON);
+        assert_relative_eq!(y0, 10., epsilon = EPSILON);
+        assert_relative_eq!(y1, 40., epsilon = EPSILON);
+
+        let outline = &cells.cells[&outline.cell];
+        // `shape!` draws the polygon on its layer.
+        let polygon = outline
+            .objects
+            .values()
+            .find_map(|object| object.get_polygon())
+            .expect("outline holds the polygon");
+        assert!(!polygon.construction);
+        assert_eq!(polygon.layer, "met1");
+        assert_eq!(polygon.points.len(), 3);
+        assert_relative_eq!(polygon.points[2].0.0, 20., epsilon = EPSILON);
+        assert_relative_eq!(polygon.points[2].1.0, 30., epsilon = EPSILON);
+        // `guide!` leaves the crect undrawn.
+        let rects = rects(outline);
+        let guide = rects
+            .iter()
+            .find(|rect| rect.construction)
+            .expect("the guide is construction geometry");
+        assert_eq!(guide.layer, None);
+        assert_relative_eq!(guide.x0.0, 10., epsilon = EPSILON);
+        // The marker sits on the point read out of the polygon.
+        let marker = rects
+            .iter()
+            .find(|rect| !rect.construction)
+            .expect("the marker is drawn");
+        assert_eq!(marker.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(marker.x0.0, 20., epsilon = EPSILON);
+        assert_relative_eq!(marker.y0.0, 30., epsilon = EPSILON);
+        assert_relative_eq!(marker.x1.0, 25., epsilon = EPSILON);
+        assert_relative_eq!(marker.y1.0, 35., epsilon = EPSILON);
+    }
+
+    /// Shapes nested in sequences and structs, and proxies read out of an
+    /// instance, all arrive as construction geometry; `!` redraws exactly the
+    /// ones that were drawn in the caller.
+    #[test]
+    fn nested_and_proxied_shape_cell_arguments() {
+        let source = r#"
+struct Pair {
+    a: Rect,
+    b: Point,
+}
+
+cell leaf() {
+    let m = rect("met1", x0=0., y0=0., w=10., h=10.);
+}
+
+cell child(rs: [Rect], p: Pair, proxied: Rect) {
+    let first = head(rs)!;
+    let second = head(tail(rs))!;
+    let redrawn = proxied!;
+    let m = rect("met2", x0=p.b.x, y0=p.b.y, w=p.a.w, h=p.a.h);
+}
+
+cell top() {
+    let r1 = rect("met1", x0=0., y0=0., w=10., h=10.);
+    let r2 = crect(layer="via1", x0=50., y0=50., w=5., h=5.);
+    let poly = polygon("met1", 3, x0=0., y0=0., x1=4., y1=0., x2=2., y2=3.);
+    let l = inst(leaf(), x=100., y=0.);
+    let c = inst(child(cons(r1, cons(r2, [])), Pair { a: r2, b: poly.points[2] }, l.m), x=0., y=0.);
+}
+"#;
+        let cells = compile_source(source, "top", Vec::new()).unwrap_valid();
+        let top = &cells.cells[&cells.top];
+        let child = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_instance())
+            .find(|inst| relative_eq!(inst.x, 0.))
+            .expect("child instance");
+        let child = &cells.cells[&child.cell];
+        let rects: Vec<_> = child
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .collect();
+        let at = |x0: f64, y0: f64| {
+            rects
+                .iter()
+                .filter(|rect| relative_eq!(rect.x0.0, x0) && relative_eq!(rect.y0.0, y0))
+                .collect::<Vec<_>>()
+        };
+        // `r1` was layout in `top`, so `first!` draws it here.
+        let [first] = at(0., 0.)[..] else {
+            panic!("expected one rect at the origin");
+        };
+        assert!(!first.construction);
+        assert_eq!(first.layer.as_deref(), Some("met1"));
+        // `r2` is a crect. It arrives twice, once in the sequence and once in
+        // the struct, and `second!` draws neither.
+        let second = at(50., 50.);
+        assert_eq!(second.len(), 2);
+        assert!(
+            second
+                .iter()
+                .all(|rect| rect.construction && rect.layer.as_deref() == Some("via1"))
+        );
+        // `l.m` is a proxy of drawn geometry, in `top`'s frame, so `!` redraws
+        // it where `top` sees it.
+        let [redrawn] = at(100., 0.)[..] else {
+            panic!("expected one rect at the proxy's position");
+        };
+        assert!(!redrawn.construction);
+        assert_eq!(redrawn.layer.as_deref(), Some("met1"));
+        assert_relative_eq!(redrawn.x1.0, 110., epsilon = EPSILON);
+        // The struct's point and rect were read as constants.
+        let [m] = at(2., 3.)[..] else {
+            panic!("expected one rect at the polygon's vertex");
+        };
+        assert_eq!(m.layer.as_deref(), Some("met2"));
+        assert_relative_eq!(m.x1.0, 7., epsilon = EPSILON);
+        assert_relative_eq!(m.y1.0, 8., epsilon = EPSILON);
+    }
+
+    /// Shape values passed through the positional cell API are checked against
+    /// the declared parameter type, and name the cell like every other
+    /// argument.
+    #[test]
+    fn shape_cell_arguments_are_checked_and_name_the_cell() {
+        let ast = parse_workspace_with_std(ARGON_SHAPE_CELL_ARGS).ast();
+        let region = |x0: f64| CellArg::Rect {
+            layer: None,
+            drawable: false,
+            x0,
+            y0: 0.,
+            x1: x0 + 90.,
+            y1: 40.,
+        };
+        let via_array = |args: Vec<CellArg>| {
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["via_array"],
+                    args,
+                },
+            )
+        };
+        let cells =
+            via_array(vec![region(0.), CellArg::Float(10.), CellArg::Float(20.)]).unwrap_valid();
+        // Five columns and two rows fit a 90 x 40 region.
+        let drawn = cells.cells[&cells.top]
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .filter(|rect| !rect.construction)
+            .count();
+        assert_eq!(drawn, 10);
+        // The same shape names the same cell; a shape elsewhere is a different
+        // argument, so it is a different cell.
+        let same =
+            via_array(vec![region(0.), CellArg::Float(10.), CellArg::Float(20.)]).unwrap_valid();
+        assert_eq!(cells.top, same.top);
+        let moved =
+            via_array(vec![region(100.), CellArg::Float(10.), CellArg::Float(20.)]).unwrap_valid();
+        assert_ne!(cells.top, moved.top);
+
+        let mismatch = |args: Vec<CellArg>, index: usize, expected: &str, found: &str| {
+            let errors = via_array(args).unwrap_exec_errors().errors;
+            assert!(
+                errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ExecErrorKind::InvalidCellArgumentType { index: i, expected: e, found: f }
+                        if *i == index && e == expected && f == found
+                )),
+                "{errors:?}"
+            );
+        };
+        mismatch(
+            vec![CellArg::Float(1.), CellArg::Float(10.), CellArg::Float(20.)],
+            1,
+            "Rect",
+            "Float",
+        );
+        mismatch(
+            vec![region(0.), region(0.), CellArg::Float(20.)],
+            2,
+            "Float",
+            "Rect",
+        );
+    }
+
+    /// A shape built in a cell invocation, as `arc run --cell` and the GUI
+    /// open-cell command supply it. The invocation's own geometry is not part
+    /// of the output.
+    #[test]
+    fn argon_shape_cell_invocation() {
+        let mut ast = parse_workspace_with_std(ARGON_SHAPE_CELL_ARGS).ast();
+        let invocation = crate::parse::splice_cell_invocation(
+            &mut ast,
+            "via_array(crect(x0=0., y0=0., w=90., h=40.), 10., 20.)",
+        )
+        .expect("invocation should splice");
+        let (typed, errors) = static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let config = WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH)));
+        let cells =
+            crate::compile::execute_cell_invocation(&typed, &invocation, &config).unwrap_valid();
+        assert_eq!(cells.cells.len(), 1);
+        let top = &cells.cells[&cells.top];
+        assert!(top.name.ends_with("via_array"), "{}", top.name);
+        let region = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .find(|rect| rect.construction && rect.layer.is_none() && relative_eq!(rect.x1.0, 90.))
+            .expect("the region arrives as construction geometry");
+        assert_relative_eq!(region.y1.0, 40., epsilon = EPSILON);
+        let drawn = top
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .filter(|rect| !rect.construction)
+            .count();
+        assert_eq!(drawn, 10);
+    }
+
+    /// Tuples are cell arguments like sequences and structs: element by
+    /// element, shapes included, and checked against the declared arity and
+    /// element types.
+    #[test]
+    fn tuple_cell_arguments() {
+        let source = r#"
+struct Placed {
+    at: (Float, Float),
+    size: (Int, Rect),
+}
+
+cell child(span: (Float, Float), p: Placed) {
+    let w = span.1 - span.0;
+    let m = rect("met2", x0=p.at.0, y0=p.at.1, w=w, h=(p.size.0 as Float));
+    let drawn = p.size.1!;
+}
+
+cell top() {
+    let r = rect("met1", x0=0., y0=0., w=10., h=10.);
+    let c = inst(child((5., 25.,), Placed { at: (100., 200.,), size: (3, r,) }), x=0., y=0.);
+}
+"#;
+        let cells = compile_source(source, "top", Vec::new()).unwrap_valid();
+        assert_eq!(cells.cells.len(), 2);
+        let (_, child) = cells
+            .cells
+            .iter()
+            .find(|(id, _)| **id != cells.top)
+            .expect("child cell");
+        let rects: Vec<_> = child
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .collect();
+        assert_eq!(rects.len(), 2);
+        // Every element of the nested tuples was read as a constant.
+        let m = rects
+            .iter()
+            .find(|rect| rect.layer.as_deref() == Some("met2"))
+            .expect("the marker is drawn");
+        assert_relative_eq!(m.x0.0, 100., epsilon = EPSILON);
+        assert_relative_eq!(m.y0.0, 200., epsilon = EPSILON);
+        assert_relative_eq!(m.x1.0, 120., epsilon = EPSILON);
+        assert_relative_eq!(m.y1.0, 203., epsilon = EPSILON);
+        // The rect inside the tuple is drawable, so `!` draws it.
+        let drawn = rects
+            .iter()
+            .find(|rect| rect.layer.as_deref() == Some("met1"))
+            .expect("the tuple's rect is drawn");
+        assert!(!drawn.construction);
+        assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
+
+        // Through the positional API the tuple is checked element by element.
+        let pair = |a: f64, b: f64| CellArg::Tuple(vec![CellArg::Float(a), CellArg::Float(b)]);
+        let placed = |size: CellArg| CellArg::Struct {
+            name: "Placed".to_owned(),
+            fields: vec![
+                ("at".to_owned(), pair(100., 200.)),
+                ("size".to_owned(), size),
+            ],
+        };
+        let rect = CellArg::Rect {
+            layer: Some("met1".to_owned()),
+            drawable: true,
+            x0: 0.,
+            y0: 0.,
+            x1: 10.,
+            y1: 10.,
+        };
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let child = |args: Vec<CellArg>| {
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["child"],
+                    args,
+                },
+            )
+        };
+        let good = child(vec![
+            pair(5., 25.),
+            placed(CellArg::Tuple(vec![CellArg::Int(3), rect.clone()])),
+        ])
+        .unwrap_valid();
+        assert_eq!(good.cells.len(), 1);
+        for (args, found) in [
+            // Wrong arity.
+            (
+                vec![
+                    CellArg::Tuple(vec![CellArg::Float(5.)]),
+                    placed(CellArg::Tuple(vec![CellArg::Int(3), rect.clone()])),
+                ],
+                "tuple",
+            ),
+            // Wrong element type, nested in a struct field.
+            (
+                vec![
+                    pair(5., 25.),
+                    placed(CellArg::Tuple(vec![CellArg::Float(3.), rect.clone()])),
+                ],
+                "struct",
+            ),
+        ] {
+            let errors = child(args).unwrap_exec_errors().errors;
+            assert!(
+                errors.iter().any(|error| matches!(
+                    &error.kind,
+                    ExecErrorKind::InvalidCellArgumentType { found: f, .. } if f == found
+                )),
+                "{errors:?}"
+            );
+        }
+    }
+
+    /// A shape whose coordinates the caller never pins down is passed once the
+    /// caller's solver has settled them, and the caller is the cell reported.
+    #[test]
+    fn an_unsolved_shape_argument_waits_for_the_caller() {
+        let source = r#"
+cell child(r: Rect) {
+    let v = rect("met1", x0=r.x0, y0=r.y0, w=10., h=10.);
+}
+
+cell top() {
+    let m = rect("met1", w=50., h=50.);
+    let c = inst(child(m), x=0., y=0.);
+}
+"#;
+        let output = compile_source(source, "top", Vec::new()).unwrap_exec_errors();
+        let cells = output.output.expect("the layout is still produced");
+        assert_eq!(cells.cells.len(), 2);
+        assert!(!output.errors.is_empty());
+        assert!(
+            output.errors.iter().all(|error| {
+                matches!(error.kind, ExecErrorKind::Underconstrained) && error.cell == cells.top
+            }),
+            "{:?}",
+            output.errors
+        );
+    }
+
+    /// Type-checks a one-file workspace and returns the kinds of its static
+    /// errors.
+    fn static_errors_of(source: &str) -> Vec<StaticErrorKind> {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        output.errors.into_iter().map(|error| error.kind).collect()
+    }
+
+    /// The static errors of `body` as the body of a function that sees a
+    /// `Size`, an identically shaped `Other`, and an `Int`.
+    fn struct_errors(body: &str) -> Vec<StaticErrorKind> {
+        static_errors_of(&format!(
+            "struct Size {{ w: Float, h: Float, }}\n\
+             struct Other {{ w: Float, h: Float, }}\n\
+             fn f(s: Size, o: Other, n: Int) -> Float {{ {body} }}\n"
+        ))
+    }
+
+    #[test]
+    fn struct_literals_are_checked_against_the_declaration() {
+        assert!(struct_errors("Size { w: 1., h: 2. }.w").is_empty());
+        // Fields may come in any order; `..base` supplies the ones not listed.
+        assert!(struct_errors("Size { h: 2., w: 1. }.w").is_empty());
+        assert!(struct_errors("Size { w: 1., ..s }.h").is_empty());
+        assert!(struct_errors("Size { ..s }.h").is_empty());
+        assert!(struct_errors("Size { w: s.w, ..s }.h").is_empty());
+
+        assert!(matches!(
+            struct_errors("Size { w: 1. }.w").as_slice(),
+            [StaticErrorKind::MissingStructFields { ty, fields }]
+                if ty == "struct Size" && fields == "`h`"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1., h: 2., d: 3. }.w").as_slice(),
+            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "struct Size"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1., w: 2., h: 3. }.w").as_slice(),
+            [StaticErrorKind::DuplicateStructField { field }] if field == "w"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1, h: 2. }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "Float" && found == "Int"
+        ));
+        // Structs are nominal: a same-shaped struct is not a valid base.
+        assert!(matches!(
+            struct_errors("Size { w: 1., ..o }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "struct Size" && found == "struct Other"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: 1., ..n }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { found, .. }] if found == "Int"
+        ));
+        assert!(matches!(
+            struct_errors("n { w: 1., h: 2. }.w").as_slice(),
+            [StaticErrorKind::NotAStruct]
+        ));
+        assert!(matches!(
+            struct_errors("Nope { w: 1., h: 2. }.w").as_slice(),
+            [StaticErrorKind::UndeclaredVar { name }] if name == "Nope"
+        ));
+        assert!(matches!(
+            struct_errors("s.d").as_slice(),
+            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "struct Size"
+        ));
+        // A shorthand field reads a local of the same name.
+        assert!(matches!(
+            struct_errors("Size { w, h: 1. }.w").as_slice(),
+            [StaticErrorKind::UndeclaredVar { name }] if name == "w"
+        ));
+        assert!(matches!(
+            struct_errors("Size { w: s.w, ..s }.w + Size { ..o }.w").as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+        // Structs cannot be compared.
+        let errors = struct_errors("if (s == Size { w: 1., h: 1. }) { 1. } else { 2. }");
+        assert!(!errors.is_empty());
+        assert!(
+            errors
+                .iter()
+                .all(|e| matches!(e, StaticErrorKind::ComparisonInvalidType)),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn struct_declarations_are_checked() {
+        assert!(matches!(
+            static_errors_of("struct Node { next: Node, }\n").as_slice(),
+            [StaticErrorKind::RecursiveStruct { name }] if name == "Node"
+        ));
+        let errors = static_errors_of("struct A { b: [B], }\nstruct B { a: (Int, A), }\n");
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::RecursiveStruct { .. }]),
+            "{errors:?}"
+        );
+        assert!(matches!(
+            static_errors_of("struct S { a: Nope, }\n").as_slice(),
+            [StaticErrorKind::UnknownType]
+        ));
+        assert!(matches!(
+            static_errors_of("struct S { a: Int, a: Float, }\n").as_slice(),
+            [StaticErrorKind::DuplicateNameDeclaration]
+        ));
+        assert!(matches!(
+            static_errors_of("struct rect { a: Int, }\n").as_slice(),
+            [StaticErrorKind::RedeclarationOfBuiltin]
+        ));
+        // Forward references that do not close a cycle are fine, in any order.
+        assert!(
+            static_errors_of(
+                "struct Outer { inner: Inner, list: [Inner], pair: (Inner, Int), }\n\
+                 struct Inner { x: Float, }\n\
+                 fn f(o: Outer) -> Float { o.inner.x + o.list[0].x + o.pair.0.x }\n"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn top_level_declarations_share_one_namespace() {
+        // `bind` overwrote without checking, so `struct Mode` after
+        // `enum Mode` quietly won, `struct F` and `fn F` resolved to whichever
+        // kind the declaration passes visit last, and two `struct S` kept only
+        // the second.
+        let duplicates = |source: &str| {
+            static_errors(source)
+                .into_iter()
+                .filter(|error| matches!(error.kind, StaticErrorKind::DuplicateNameDeclaration))
+                .collect::<Vec<_>>()
+        };
+        for source in [
+            "enum Mode { A, B }\nstruct Mode { a: Int, }\n",
+            "struct Mode { a: Int, }\nenum Mode { A, B }\n",
+            "struct F { a: Int, }\nfn F() -> Int { 1 }\n",
+            "fn F() -> Int { 1 }\nstruct F { a: Int, }\n",
+            "struct S { a: Int, }\nstruct S { b: Float, }\n",
+            "enum E { A }\nenum E { B }\n",
+            "fn f() -> Int { 1 }\nfn f() -> Float { 1. }\n",
+            "cell top() {}\ncell top() {}\n",
+            "fn top() -> Int { 1 }\ncell top() {}\n",
+            "cell top() {}\nenum top { A }\n",
+            // An import takes a name like any declaration does.
+            "use std::max;\nfn max(a: Float) -> Float { a }\n",
+            "use std::max;\nuse std::min as max;\n",
+        ] {
+            let errors = duplicates(source);
+            assert_eq!(errors.len(), 1, "{source:?}: {errors:?}");
+        }
+
+        // The later declaration is the one reported, at its name.
+        let source = "enum Mode { A, B }\nstruct Mode { a: Int, }\n";
+        let errors = duplicates(source);
+        let [error] = errors.as_slice() else {
+            unreachable!("checked above")
+        };
+        let name = source.rfind("Mode").unwrap();
+        assert_eq!(error.span.span.start(), name);
+        assert_eq!(error.span.span.end(), name + "Mode".len());
+
+        // Every repeat is reported, not just the first.
+        assert_eq!(
+            duplicates("cell a() {}\ncell a() {}\ncell a() {}\n").len(),
+            2
+        );
+
+        // Distinct names in any mix of kinds are fine, and a name may be
+        // reused across modules: `std` declares `max` too.
+        assert!(
+            duplicates(
+                "enum A { X }\nstruct B { a: A, }\nfn c(b: B) -> A { b.a }\ncell d() {}\n\
+                 fn max(a: Float) -> Float { a }\n"
+            )
+            .is_empty()
+        );
+
+        // Modules live in their own namespace, so `mod m;` and `fn m` coexist.
+        let root = parse_source_text(
+            "mod m;\nfn m() -> Int { m::h() }\n",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let m = parse_source_text("fn h() -> Int { 2 }\n", PathBuf::from("/virtual/m.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["m".to_owned()], m)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
     }
 
     #[test]
@@ -2138,10 +3278,8 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(output.errors.iter().any(|error| matches!(
-            error.kind,
-            StaticErrorKind::CannotIndexFieldAccess {
-                ty: crate::compile::Ty::Point
-            }
+            &error.kind,
+            StaticErrorKind::CannotIndexFieldAccess { ty } if ty == "Point"
         )));
     }
 
@@ -2168,11 +3306,8 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(output.errors.iter().any(|error| matches!(
-            error.kind,
-            StaticErrorKind::IncorrectTy {
-                expected: crate::compile::Ty::Int,
-                ..
-            }
+            &error.kind,
+            StaticErrorKind::IncorrectTy { expected, .. } if expected == "Int"
         )));
     }
 
@@ -2186,6 +3321,146 @@ mod tests {
         let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
         let (_, output) = static_compile(&ast).unwrap();
         output.errors
+    }
+
+    /// Asserts that `source` reports an error accepted by `matches`.
+    #[track_caller]
+    fn assert_static_error(source: &str, matches: impl Fn(&StaticErrorKind) -> bool) {
+        let errors = static_errors(source);
+        assert!(
+            errors.iter().any(|error| matches(&error.kind)),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_parameters_type_check() {
+        let errors = static_errors(
+            r#"
+            fn scaled(x: Float, scale: Float = 2., offset: Float = x) -> Float {
+                x * scale + offset
+            }
+            cell child(w: Float, h: Float = w, layer: String = "met1") {
+                let body = rect(layer, x0=0., y0=0., x1=w, y1=h);
+            }
+            cell top(n: Int = 1) {
+                let a = scaled(1.);
+                let b = scaled(1., offset=0., scale=3.);
+                let c = inst(child(10.));
+                let d = inst(child(10., layer="met2", h=20.));
+            }
+            "#,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn keyword_parameter_declarations_are_checked() {
+        assert_static_error(
+            "fn f(a: Float, b: Float = 1., c: Float) -> Float { a }",
+            |kind| matches!(kind, StaticErrorKind::PositionalParamAfterDefault { name } if name == "c"),
+        );
+        assert_static_error("fn f(a: Float, a: Int) -> Float { a }", |kind| {
+            matches!(kind, StaticErrorKind::DuplicateNameDeclaration)
+        });
+        assert_static_error("cell c(w: Float, w: Float = 1.) {}", |kind| {
+            matches!(kind, StaticErrorKind::DuplicateNameDeclaration)
+        });
+        assert_static_error("fn f(b: Float = 1) -> Float { b }", |kind| {
+            matches!(
+                kind,
+                StaticErrorKind::IncorrectTy { expected, found } if expected == "Float" && found == "Int"
+            )
+        });
+        // A default sees only the parameters before it.
+        assert_static_error(
+            "fn f(a: Float = b, b: Float = 1.) -> Float { a }",
+            |kind| matches!(kind, StaticErrorKind::UndeclaredVar { name } if name == "b"),
+        );
+        assert_static_error(
+            "fn f(a: Float = a) -> Float { a }",
+            |kind| matches!(kind, StaticErrorKind::UndeclaredVar { name } if name == "a"),
+        );
+    }
+
+    #[test]
+    fn keyword_arguments_are_checked_at_calls() {
+        let call = |args: &str| {
+            format!(
+                "fn f(a: Float, b: Float = 1.) -> Float {{ a + b }}\ncell top() {{ let v = f({args}); }}"
+            )
+        };
+        // A keyword parameter cannot be passed positionally.
+        assert_static_error(&call("1., 2."), |kind| {
+            matches!(
+                kind,
+                StaticErrorKind::CallIncorrectPositionalArity {
+                    expected: 1,
+                    found: 2
+                }
+            )
+        });
+        // A positional parameter cannot be passed by keyword.
+        assert_static_error(&call("a=1."), |kind| {
+            matches!(kind, StaticErrorKind::InvalidKwArg)
+        });
+        assert_static_error(&call("1., zz=2."), |kind| {
+            matches!(kind, StaticErrorKind::InvalidKwArg)
+        });
+        assert_static_error(&call("1., b=2., b=3."), |kind| {
+            matches!(kind, StaticErrorKind::DuplicateKwArg)
+        });
+        assert_static_error(&call("1., b=true"), |kind| {
+            matches!(
+                kind,
+                StaticErrorKind::IncorrectTy { expected, found } if expected == "Float" && found == "Bool"
+            )
+        });
+        assert!(static_errors(&call("1., b=2.")).is_empty());
+    }
+
+    /// Cell typing is structural. `CellTy` carries the declaring cell's `VarId`
+    /// so that a field access can be navigated back to its `let`, and that id
+    /// is deliberately excluded from `PartialEq`: if it were not, two cells
+    /// with identical fields would stop being interchangeable and a branch
+    /// over them would silently widen to `Ty::Any`.
+    #[test]
+    fn structurally_identical_cells_remain_interchangeable() {
+        let source = |field: &str| {
+            format!(
+                r#"
+                cell left() {{
+                    let met = rect("met1", x0=0., y0=0., x1=10., y1=10.);
+                }}
+
+                cell right() {{
+                    let met = rect("met1", x0=0., y0=0., x1=20., y1=20.);
+                }}
+
+                cell top(pick: Bool) {{
+                    let chosen = if pick {{ left() }} else {{ right() }};
+                    let placed = inst(chosen);
+                    eq(placed.{field}.x0, 0.);
+                }}
+                "#
+            )
+        };
+
+        // The branches share a cell type, so the common field type-checks.
+        let errors = static_errors(&source("met"));
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        // And the type is still a cell rather than `Ty::Any`: an unknown field
+        // is caught. Were the declaring cell's id part of `CellTy` equality,
+        // the two branches would no longer unify, `Ty::lub` would widen the
+        // branch to `Ty::Any`, and this error would silently disappear.
+        let errors = static_errors(&source("missing"));
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, StaticErrorKind::NoFieldOnTy { .. })),
+            "{errors:#?}"
+        );
     }
 
     fn comparison_source(comparison: &str) -> String {
@@ -2914,6 +4189,351 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Diagnostics-quality regressions. Each case produced a message that was
+    // unusable rather than merely imperfect: unbounded in size, naming the
+    // wrong thing, or contradicting itself.
+
+    #[test]
+    fn hierarchical_type_errors_stay_readable() {
+        // `Ty` had no `Display`, so nine `#[error]` strings formatted it with
+        // `{:?}` -- and `Debug` re-expands the `Arc`-shared `CellTy` DAG into a
+        // tree, making one message exponential in hierarchy depth. A depth-8
+        // binary hierarchy produced 30 KB, depth 20 produced 122 MB, and the
+        // analyzer pushed the whole string into an LSP diagnostic on every
+        // keystroke.
+        let depth = 16;
+        let mut source =
+            String::from("cell h0() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }\n");
+        for k in 1..=depth {
+            source.push_str(&format!(
+                "cell h{k}() {{ let p = inst(h{}()); let q = inst(h{}()); }}\n",
+                k - 1,
+                k - 1
+            ));
+        }
+        source.push_str(&format!(
+            "fn takes_float(v: Float) -> Float {{ v }}
+             cell top() {{ let a = inst(h{depth}()); let b = takes_float(a); }}"
+        ));
+
+        let errors = check_source(&source);
+        let message = errors
+            .iter()
+            .find_map(|error| match error {
+                StaticErrorKind::IncorrectTy { found, .. } => Some(found.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{errors:#?}"));
+        assert_eq!(message, format!("Inst(h{depth})"));
+    }
+
+    #[test]
+    fn an_undeclared_name_reports_one_error() {
+        // `Ty::Unknown` documents that it "suppresses type checking of
+        // dependent properties", but `is_eq_ty` special-cased only `Ty::Any`
+        // and fell through to `==` for `Unknown`, so every already-diagnosed
+        // expression produced a second `expected .., found Unknown`.
+        //
+        // Six predicates encode "this type satisfies every check". Teaching
+        // only `is_eq_ty`, `assert_ty_is_cell` and `assert_ty_is_enum` about
+        // `Unknown` left the other three still reporting a second error, so
+        // they all go through `Ty::is_wildcard` now and all are covered here.
+        for source in [
+            "cell top() {
+                 let a = float();
+                 eq(a, undeclared_thing);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=a)!;
+             }",
+            "cell top() { let c = missing_cell(); let i = inst(c); }",
+            "cell top() { let a = undeclared_thing + 1.; }",
+            "cell top() { let a = 1. + undeclared_thing; }",
+            "cell top() { let a = -undeclared_thing; }",
+            "cell top() { let a = undeclared_thing < 1.; }",
+            "cell top() { let a = if undeclared_thing { 1. } else { 2. }; }",
+            "cell top() { let a = undeclared_thing as Int; }",
+        ] {
+            let errors = check_source(source);
+            assert_eq!(
+                errors.len(),
+                1,
+                "an already-diagnosed name must not cascade\n{source}\n{errors:#?}"
+            );
+            assert!(
+                matches!(errors[0], StaticErrorKind::UndeclaredVar { .. }),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_match_that_names_no_enum_is_reported() {
+        // `dispatch_match_expr` returned `lub_ty.unwrap_or_default()` --
+        // `Ty::Unknown` -- with no diagnostic when neither the scrutinee nor
+        // any arm pattern resolved to an enum. That was survivable only while
+        // `is_eq_ty` compared `Unknown` structurally; once `Unknown` satisfies
+        // every check it silently suppressed the caller's checks too, and
+        // `--check` accepted a program the evaluator refuses.
+        let errors = check_source(
+            "enum E { A, B }
+             fn pick(v: Any, k: Float) -> Float { match v { k => 1., } }
+             cell top() {
+                 let n = pick(E::A, 2.);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=n, y1=1.)!;
+             }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::NotAnEnum)),
+            "{errors:#?}"
+        );
+
+        // A match that does name an enum still type checks.
+        assert!(
+            check_source(
+                "enum E { A, B }
+                 cell top() {
+                     let e = E::A;
+                     let w = match e { E::A => 1., E::B => 2., };
+                     let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=1.)!;
+                 }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn same_named_declarations_render_distinctly() {
+        // `Display for Ty` printed a cell's bare declared name and an enum's
+        // variants alone, but `CellTy` equality excludes the name and `EnumTy`
+        // equality keys on `id` -- so a mismatch between two distinct types
+        // rendered as `expected type Inst(child), found Inst(child)`, a
+        // message that refutes itself.
+        let errors = check_source(
+            "enum Dir { N, S }
+             enum Side { N, S }
+             fn takes_side(s: Side) -> Side { s }
+             cell top() { let d = takes_side(Dir::N); }",
+        );
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::IncorrectTy { expected, found } if expected != found
+            )),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_field_on_a_cell_is_not_a_placement_problem() {
+        // The `Ty::Cell`/`Ty::CellFn` arms fired without consulting the field
+        // map, so a typo was reported as "place it with `inst(...)` first" --
+        // advice that cannot help, because placing the cell reports the typo.
+        let errors = check_source(
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+             cell top() {
+                 let c = child();
+                 text(\"t\", \"text.label\", c.nonexistent.x0, 0.);
+             }",
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::NoFieldOnTy { field, .. } if field == "nonexistent")),
+            "{errors:#?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::CellFieldBeforePlacement { .. })),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn reading_a_field_of_an_unplaced_cell_says_so() {
+        // `dispatch_field_access_expr` had no `Ty::Cell` arm, so this fell
+        // through to the generic no-field error -- which, because `Ty` printed
+        // with `{:?}`, asserted that `r` was missing while printing the field
+        // map `{"r": Rect}` that contained it. The evaluator refuses the same
+        // read, so the type checker now agrees with it.
+        let errors = check_source(
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+             cell top() {
+                 let c = child();
+                 text(\"t\", \"text.label\", c.r.x0, 0.);
+             }",
+        );
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::CellFieldBeforePlacement { cell, field }
+                    if cell == "child" && field == "r"
+            )),
+            "{errors:#?}"
+        );
+
+        // The same read on an uncalled cell function names the call it needs.
+        let errors = check_source(
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+             cell top() { text(\"t\", \"text.label\", child.r.x0, 0.); }",
+        );
+        assert!(
+            errors.iter().any(|error| matches!(
+                error,
+                StaticErrorKind::CellFnFieldAccess { cell, .. } if cell == "child"
+            )),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn a_cell_field_named_x_reports_the_real_reason() {
+        // The check hardcoded `["x", "y"]` a second time and reported
+        // `RedeclarationOfBuiltin` -- but neither name is in `BUILTINS`, so
+        // the message pointed at a builtin that does not exist. `x` and `y`
+        // are among the most natural names in a layout language.
+        for name in RESERVED_CELL_FIELDS {
+            let errors = check_source(&format!("cell top() {{ let {name} = 1.; }}"));
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    StaticErrorKind::ReservedCellField { name: n } if n == name
+                )),
+                "{errors:#?}"
+            );
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::RedeclarationOfBuiltin)),
+                "{errors:#?}"
+            );
+        }
+
+        // A nested `let` never becomes a cell field, so it stays legal, as do
+        // the other binding forms -- `x` is only reserved where it would
+        // publish a field.
+        for source in [
+            "cell top() { let w = if true { let x = 1.; x } else { 2. }; }",
+            "fn f(x: Float) -> Float { x + 1. }",
+            "cell top(x: Float) { let r = rect(\"met1\", x0=x, y0=0., x1=1., y1=1.)!; }",
+            "cell top() { for x in std::range(3) { float(); } }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::ReservedCellField { .. })),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_misspelled_instance_field_names_the_field() {
+        // Reported `empty bbox`, carrying the repo's own
+        // `// TODO: More descriptive error`. Instances are normally passed as
+        // `Any` (cell types cannot be named), so this is where an ordinary
+        // misspelling lands.
+        assert_reports(
+            &run_source(
+                "fn left_edge(i: Any) -> Any { i.wdie.x0 }
+                 cell child() { let wide = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }
+                 cell top() {
+                     let i = inst(child());
+                     eq(i.x, 0.); eq(i.y, 0.);
+                     let r = rect(\"met1\", x0=left_edge(i), y0=0., x1=10., y1=10.);
+                 }",
+            ),
+            |error| {
+                matches!(error, ExecErrorKind::NoFieldOnInstance { field, cell }
+                if field == "wdie" && cell == "child")
+            },
+        );
+    }
+
+    #[test]
+    fn reading_the_layer_of_a_construction_rect_reports_one_error() {
+        // Used `InvalidRotation` -- a copy-paste, reported as "non-Manhattan
+        // rotation" -- and then continued with a fabricated `Value::String("")`
+        // that produced a second, unrelated error about the empty-string layer
+        // being absent from the technology file.
+        let errors = run_source(
+            "cell top() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let r = rect(c.layer, x0=0., y0=0., x1=10., y1=10.)!;
+             }",
+        );
+        assert_reports(
+            &errors,
+            |error| matches!(error, ExecErrorKind::EmptyField { field } if field == "layer"),
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error, ExecErrorKind::IllegalLayer { .. })),
+            "the fabricated empty layer must not cascade: {errors:#?}"
+        );
+        assert!(
+            !errors
+                .iter()
+                .any(|error| matches!(error, ExecErrorKind::InvalidRotation)),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn path_extensions_are_constrainable() {
+        // Extensions became solver variables only when a kwarg named them,
+        // unlike `width`, which always does. `eq(p.begin_extension, 5.)`
+        // therefore degenerated to `0 - 5 = 0` and reported a bare
+        // "inconsistent constraint" with nothing to say the extension had
+        // never become a variable.
+        let data = compile_top(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 eq(p.begin_extension, 5.);
+             }",
+        );
+        let path = layout_objects(&data, data.top)
+            .into_iter()
+            .find_map(SolvedValue::get_path)
+            .expect("top should contain a path");
+        assert_eq!(path.begin_extension.0, 5.);
+        // The unnamed extension still defaults to zero, and because that
+        // default is the compiler's rather than the author's it must not make
+        // the cell underconstrained.
+        assert_eq!(path.end_extension.0, 0.);
+        assert!(
+            data.cells[&data.top].unsolved_vars.is_empty(),
+            "{:#?}",
+            data.cells[&data.top].unsolved_vars
+        );
+    }
+
+    #[test]
+    fn a_value_waiting_on_a_defaulted_extension_is_still_evaluated() {
+        // Applying the compiler defaults and `continue`ing skipped
+        // `update_var_dependents`, so a value blocked on an extension the
+        // default had just solved was never re-queued. The solver was then
+        // fully solved with `deferred` empty, the loop exited, and `emit`
+        // panicked on the still-deferred value -- an internal compiler error
+        // on a program that compiled before extensions became variables.
+        let data = compile_top(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 let z = 1. / (p.begin_extension + 1.);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=z, y1=1.)!;
+             }",
+        );
+        let rect = layout_objects(&data, data.top)
+            .into_iter()
+            .find_map(SolvedValue::get_rect)
+            .expect("top should contain a rect");
+        assert_eq!(rect.x1.0, 1.);
+    }
+
     #[test]
     fn any_typed_arguments_report_a_type_error_rather_than_panicking() {
         // `Ty::Any` satisfies every static check, so each builtin has to test
@@ -3266,6 +4886,287 @@ mod tests {
             &run_source("cell top() { for i in range_full(0, 3, 0) { float(); } }"),
             |error| matches!(error, ExecErrorKind::ZeroRangeStep),
         );
+    }
+
+    /// Compiles `source`, keeping the layout even when the cell is
+    /// underconstrained -- which an `x0i=` initial condition makes it by
+    /// design.
+    fn compile_top_underconstrained(source: &str) -> CompiledData {
+        let (_dir, output) = scratch_workspace("layout", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:#?}",
+            output.static_errors()
+        );
+        match compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        ) {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(output) => {
+                assert!(
+                    output
+                        .errors
+                        .iter()
+                        .all(|error| matches!(error.kind, ExecErrorKind::Underconstrained)),
+                    "{:#?}",
+                    output.errors
+                );
+                output.output.expect("underconstrained cells still emit")
+            }
+            output => panic!("should compile: {output:?}"),
+        }
+    }
+
+    #[test]
+    fn extension_defaults_do_not_over_constrain_a_satisfiable_system() {
+        // Every applicable default was applied in one batch, each tested
+        // against solver state that had not yet seen the others. These two
+        // paths have four extension variables, rank-2 author constraints and
+        // so two degrees of freedom; applying all four zeroes contradicted
+        // `... = 40.` and reported `inconsistent constraint` on a system that
+        // is satisfiable at 20 per path.
+        let data = compile_top(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 let q = path(\"met1\", 2, width=1., x0=0., y0=5., x1=10., y1=5.);
+                 eq(p.begin_extension + p.end_extension
+                    + q.begin_extension + q.end_extension, 40.);
+                 eq(p.begin_extension + p.end_extension,
+                    q.begin_extension + q.end_extension);
+             }",
+        );
+        let sums = layout_objects(&data, data.top)
+            .iter()
+            .filter_map(|object| match object {
+                SolvedValue::Path(path) => Some(path.begin_extension.0 + path.end_extension.0),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sums, vec![20., 20.]);
+    }
+
+    #[test]
+    fn an_initial_condition_outranks_a_compiler_default() {
+        // Defaults drained at the first stall, before the fallback heap was
+        // popped, so the compiler's zero for `p.begin_extension` propagated
+        // through `eq` and determined `r.x0`. The author's `x0i=5.` was then
+        // skipped as moot: the rect emitted at 0, and because the fallback
+        // never fired it never reached `fallback_constraints_used`, which is
+        // what the GUI writes a drag back to source through.
+        let data = compile_top_underconstrained(
+            "cell top() {
+                 let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
+                 let r = rect(\"met1\", x0i=5., y0=0., x1=10., y1=10.);
+                 eq(p.begin_extension, r.x0);
+             }",
+        );
+        let x0 = layout_objects(&data, data.top)
+            .iter()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x0.0),
+                _ => None,
+            })
+            .expect("compiled rect");
+        assert_eq!(x0, 5.);
+        assert!(
+            !data.cells[&data.top].fallback_constraints_used.is_empty(),
+            "the initial condition must be recorded for the GUI write-back"
+        );
+    }
+    #[test]
+    fn an_execution_error_does_not_suppress_the_rest_of_the_cell() {
+        // Reporting and returning `Err(())` unwound out of `execute_cell`, so
+        // one bad field read hid every other diagnostic in the cell and left
+        // `output` as `None` -- which the analyzer reads as "the cell would
+        // not open", blanking the GUI canvas over a single typo.
+        let (_dir, output) = scratch_workspace(
+            "run",
+            "cell top() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let r = rect(c.layer, x0=0., y0=0., x1=10., y1=10.)!;
+                 let bad = rect(\"no_such_layer\", x0=0., y0=0., x1=1., y1=1.)!;
+                 let free = rect(\"met1\", x0=0., y0=0., y1=1.)!;
+             }",
+        );
+        let CompileOutput::ExecErrors(output) = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        ) else {
+            panic!("the cell has errors to report");
+        };
+        assert!(
+            output.output.is_some(),
+            "the layout must survive so the GUI still draws it"
+        );
+        let kinds = output
+            .errors
+            .iter()
+            .map(|error| error.kind.clone())
+            .collect::<Vec<_>>();
+        assert_reports(
+            &kinds,
+            |kind| matches!(kind, ExecErrorKind::EmptyField { field } if field == "layer"),
+        );
+        assert_reports(&kinds, |kind| {
+            matches!(kind, ExecErrorKind::Underconstrained)
+        });
+        assert_reports(
+            &kinds,
+            |kind| matches!(kind, ExecErrorKind::IllegalLayer { layer, .. } if layer == "no_such_layer"),
+        );
+    }
+
+    #[test]
+    fn a_poisoned_value_reports_once_however_often_it_is_read() {
+        // Poison propagates silently: the three rects below each read a value
+        // whose diagnostic was already recorded, and a second error from any
+        // of them would be noise about a mistake the author has already been
+        // told about.
+        let errors = run_source(
+            "cell top() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let l = c.layer;
+                 let r1 = rect(l, x0=0., y0=0., x1=1., y1=1.)!;
+                 let r2 = rect(l, x0=2., y0=0., x1=3., y1=1.)!;
+                 let r3 = rect(l, x0=4., y0=0., x1=5., y1=1.)!;
+             }",
+        );
+        assert_eq!(errors.len(), 1, "one mistake, one diagnostic: {errors:#?}");
+        assert!(
+            matches!(&errors[0], ExecErrorKind::EmptyField { field } if field == "layer"),
+            "{errors:#?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Boolean operators: `&&`, `||`, and `!`.
+
+    #[test]
+    fn boolean_operators_check_and_evaluate() {
+        assert!(check_source("cell top() { let a = !true && (false || true); }").is_empty());
+
+        // Every condition below must hold. If one does not, the `else` branch
+        // adds a second constraint on `x` that contradicts the first, and the
+        // solve fails -- so a wrong truth value cannot pass silently.
+        for cond in [
+            "true && true",
+            "!(true && false)",
+            "!(false && true)",
+            "!(false && false)",
+            "true || true",
+            "true || false",
+            "false || true",
+            "!(false || false)",
+            "!false",
+            "!!true",
+            "true == true",
+            "true != false",
+            "!(true == false)",
+            "p > 2. && p < 4.",
+            "p < 2. || p > 2.5",
+        ] {
+            let source = format!(
+                "cell top() {{
+                     let p = float();
+                     eq(p, 3.);
+                     let q = float();
+                     eq(q, 1.);
+                     if {cond} {{ }} else {{ eq(q, 2.); }};
+                 }}"
+            );
+            assert!(
+                run_source(&source).is_empty(),
+                "`{cond}` should evaluate to true"
+            );
+            // The negation must fail, or the check above proves nothing.
+            let negated = source.replace(&format!("if {cond}"), &format!("if !({cond})"));
+            assert!(
+                !run_source(&negated).is_empty(),
+                "`!({cond})` should evaluate to false"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_short_circuit() {
+        // The right operand is an arbitrary expression that may divide by zero,
+        // create constraints, or emit geometry, so it must not be evaluated
+        // when the left operand already decides the result -- the same reason
+        // `if` defers its branches.
+        assert!(run_source("cell top() { let a = false && (1 / 0 == 1); }").is_empty());
+        assert!(run_source("cell top() { let a = true || (1 / 0 == 1); }").is_empty());
+        assert_reports(
+            &run_source("cell top() { let a = true && (1 / 0 == 1); }"),
+            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
+        );
+        assert_reports(
+            &run_source("cell top() { let a = false || (1 / 0 == 1); }"),
+            |error| matches!(error, ExecErrorKind::DivideByZero(_)),
+        );
+
+        // A short-circuited operand emits no geometry either.
+        let emits = "(rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!.x1 > 0.)";
+        for (cond, drawn) in [
+            (format!("false && {emits}"), 0),
+            (format!("true && {emits}"), 1),
+            (format!("true || {emits}"), 0),
+            (format!("false || {emits}"), 1),
+        ] {
+            let data = compile_top(&format!("cell top() {{ let a = {cond}; }}"));
+            assert_eq!(
+                layout_objects(&data, data.top).len(),
+                drawn,
+                "`{cond}` should emit {drawn} shape(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_operators_reject_non_bool_operands() {
+        // `!` used to parse and then report `unimplemented`; `&&` and `||` did
+        // not lex at all.
+        for source in [
+            "cell top() { let a = 1 && true; }",
+            "cell top() { let a = true && 1; }",
+            "cell top() { let a = true || 2.; }",
+            "cell top() { let a = !1; }",
+            "cell top() { let a = !\"s\"; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BoolOpInvalidType)),
+                "{source}: {errors:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn booleans_compare_for_equality_only() {
+        // `Ty::Bool` was missing from the comparison whitelist, so even
+        // `true == false` was rejected.
+        assert!(check_source("cell top() { let a = true == false; }").is_empty());
+        assert!(check_source("cell top() { let a = true != false; }").is_empty());
+        for source in [
+            "cell top() { let a = true < false; }",
+            "cell top() { let a = true >= false; }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::BoolNotOrd)),
+                "{source}: {errors:#?}"
+            );
+        }
     }
 }
 pub mod cli;

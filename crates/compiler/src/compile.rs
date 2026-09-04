@@ -5,6 +5,7 @@
 //! Pass 3: solving
 use std::cell::RefCell;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::hash::Hasher;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
@@ -24,9 +25,10 @@ pub use result::{
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    BinOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
+    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
     IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
-    Span, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
+    Span, StructDecl, StructField, StructLitExpr, StructLitField, TySpec, TySpecKind, UnaryOp,
+    UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
@@ -35,9 +37,12 @@ use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
-        ArgDecl, Ast, AstMetadata, AstTransformer, BinOpExpr, CallExpr, CellDecl, ComparisonExpr,
+        ArgDecl, Ast, AstMetadata, AstTransformer, BinOp, BinOpExpr, BoolOp, CallExpr, CellDecl,
         Decl, Expr, Ident, IfExpr, LetBinding, Statement,
     },
+    cellcache::{CachedCell, CellCache},
+    fingerprint::{ItemIndex, RebaseError, SpanRebase},
+    gdscache::{self, GdsCache, GdsImportEntry, GdsImportKey, gds_cell_id, is_content_id},
     parse::ParseMetadata,
     solver::{LinearExpr, Solver},
 };
@@ -82,6 +87,18 @@ const MAX_EVAL_DEPTH: u32 = 4096;
 /// the writer can never fail partway through a file.
 pub(crate) const MAX_TEXT_LEN: usize = 512;
 
+/// Field names an instance already answers, so a cell's top-level `let` may
+/// not shadow one.
+///
+/// A cell's public fields are exactly its top-level `let` bindings, and
+/// `inst.x` / `inst.y` are the instance's position. The reserved-name check
+/// and the `Ty::Inst` field-access arm both read this list.
+///
+/// The evaluator's `ValueRef::Inst` field dispatch is the third site and
+/// cannot: each name maps to a different field of the instance, so it matches
+/// the literals directly and must be updated alongside this constant.
+pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
+
 pub const BUILTINS: [&str; 15] = [
     "list",
     "cons",
@@ -99,6 +116,34 @@ pub const BUILTINS: [&str; 15] = [
     "inst",
     "bbox",
 ];
+
+/// The module that the leading segments of a qualified `path` name.
+///
+/// `std::…` is absolute into the standard library, `lib::…` is absolute from
+/// the workspace root, and anything else is relative to `current`. `items` is
+/// how many trailing segments name the thing being resolved rather than its
+/// module: one for a `use` or a call, two for an `Enum::Variant`.
+///
+/// Which of the three forms a path takes is decided by its *first* segment, so
+/// the trailing item segments are dropped only after that: `use lib;` names the
+/// workspace root, not a child of the current module.
+pub(crate) fn module_prefix<'a>(
+    current: &ModPath,
+    path: impl IntoIterator<Item = &'a str>,
+    items: usize,
+) -> ModPath {
+    let path: Vec<&str> = path.into_iter().collect();
+    let prefix = &path[..path.len().saturating_sub(items)];
+    match path.first().copied() {
+        Some("std") => vec!["std".to_string()],
+        Some("lib") => prefix.iter().skip(1).map(|name| name.to_string()).collect(),
+        _ => current
+            .iter()
+            .cloned()
+            .chain(prefix.iter().map(|name| name.to_string()))
+            .collect(),
+    }
+}
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
@@ -147,23 +192,75 @@ pub struct StaticAnalysis {
     pub errors: Vec<StaticError>,
 }
 
+/// State a compilation session carries between compiles.
+pub struct SessionCaches<'a> {
+    /// Fingerprints naming the declarations in the tree being executed.
+    pub items: &'a Arc<ItemIndex>,
+    pub gds: &'a mut GdsCache,
+    pub cells: &'a mut CellCache,
+    /// Per-cell layer and geometry verdicts.
+    pub checks: &'a mut CheckCache,
+    /// The parsed technology, when the session already has it, so that the
+    /// technology file is not re-read and re-parsed on every execution.
+    pub tech: Option<&'a Technology>,
+}
+
 /// Executes a cell using workspace-wide external inputs from `config`.
 pub fn execute_cell(
     ast: &WorkspaceAst<VarIdTyMetadata>,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
+    // Caches that die with the call, and an index built rather than skipped.
+    // They exist so that a one-shot compile names its cells exactly as a
+    // session does: mixing the two schemes would mean the same source produced
+    // different ids depending on which tool compiled it, and GDS-imported
+    // cells are content-addressed on both paths regardless.
+    let mut gds = GdsCache::new();
+    let mut cells = CellCache::new();
+    let mut checks = CheckCache::new();
+    let items = Arc::new(ItemIndex::build(ast));
+    execute_cell_cached(
+        ast,
+        input,
+        config,
+        Some(SessionCaches {
+            items: &items,
+            gds: &mut gds,
+            cells: &mut cells,
+            checks: &mut checks,
+            tech: None,
+        }),
+    )
+}
+
+/// [`execute_cell`], reusing the caches in `session`.
+pub fn execute_cell_cached(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    input: CompileInput<'_>,
+    config: &WorkspaceConfig,
+    session: Option<SessionCaches<'_>>,
+) -> CompileOutput {
     let Some(tech_file) = config.tech.as_deref() else {
         return missing_tech_output();
     };
-    let tech = match read_tech(tech_file) {
-        Ok(tech) => tech,
-        Err(error) => return invalid_tech_output(ast, error.to_string()),
+    let tech = match session.as_ref().and_then(|session| session.tech) {
+        Some(tech) => tech.clone(),
+        None => match read_tech(tech_file) {
+            Ok(tech) => tech,
+            Err(error) => return invalid_tech_output(ast, error.to_string()),
+        },
     };
-    check_output(
-        ExecPass::new(ast, tech, &config.gds_imports).execute(input),
-        tech_file,
-    )
+    let mut pass = ExecPass::new(ast, tech, &config.gds_imports);
+    let mut checks = None;
+    if let Some(session) = session {
+        pass = pass
+            .with_gds_cache(session.gds)
+            .with_items(session.items)
+            .with_cell_cache(session.cells, session.items.clone());
+        checks = Some(session.checks);
+    }
+    check_output(pass.execute(input), tech_file, checks)
 }
 
 /// Executes a cell invocation spliced into `ast` by
@@ -174,17 +271,51 @@ pub fn execute_cell_invocation(
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
+    let mut gds = GdsCache::new();
+    let mut cells = CellCache::new();
+    let mut checks = CheckCache::new();
+    let items = Arc::new(ItemIndex::build(ast));
+    execute_cell_invocation_cached(
+        ast,
+        invocation,
+        config,
+        Some(SessionCaches {
+            items: &items,
+            gds: &mut gds,
+            cells: &mut cells,
+            checks: &mut checks,
+            tech: None,
+        }),
+    )
+}
+
+/// [`execute_cell_invocation`], reusing the caches in `session`.
+pub fn execute_cell_invocation_cached(
+    ast: &WorkspaceAst<VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+    session: Option<SessionCaches<'_>>,
+) -> CompileOutput {
     let Some(tech_file) = config.tech.as_deref() else {
         return missing_tech_output();
     };
-    let tech = match read_tech(tech_file) {
-        Ok(tech) => tech,
-        Err(error) => return invalid_tech_output(ast, error.to_string()),
+    let tech = match session.as_ref().and_then(|session| session.tech) {
+        Some(tech) => tech.clone(),
+        None => match read_tech(tech_file) {
+            Ok(tech) => tech,
+            Err(error) => return invalid_tech_output(ast, error.to_string()),
+        },
     };
-    check_output(
-        ExecPass::new(ast, tech, &config.gds_imports).execute_invocation(invocation),
-        tech_file,
-    )
+    let mut pass = ExecPass::new(ast, tech, &config.gds_imports);
+    let mut checks = None;
+    if let Some(session) = session {
+        pass = pass
+            .with_gds_cache(session.gds)
+            .with_items(session.items)
+            .with_cell_cache(session.cells, session.items.clone());
+        checks = Some(session.checks);
+    }
+    check_output(pass.execute_invocation(invocation), tech_file, checks)
 }
 
 fn missing_tech_output() -> CompileOutput {
@@ -210,7 +341,11 @@ fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> Co
     })
 }
 
-fn check_output(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
+fn check_output(
+    res: CompileOutput,
+    tech_file: &FsPath,
+    checks: Option<&mut CheckCache>,
+) -> CompileOutput {
     let (data, mut errors) = match res {
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, output }) => {
             if let Some(output) = output {
@@ -222,8 +357,7 @@ fn check_output(res: CompileOutput, tech_file: &FsPath) -> CompileOutput {
         CompileOutput::Valid(v) => (v, Vec::new()),
         o => return o,
     };
-    check_layers(&data, tech_file, &mut errors);
-    check_geometry(&data, &mut errors);
+    run_output_checks(&data, tech_file, checks, &mut errors);
     if errors.is_empty() {
         CompileOutput::Valid(data)
     } else {
@@ -380,28 +514,11 @@ impl<'a> ImportPass<'a> {
     }
 
     fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        match use_decl.path[0].name.as_str() {
-            "std" => vec!["std".to_string()],
-            "lib" => use_decl
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(1)
-                .map(|ident| ident.name.to_string())
-                .collect(),
-            _ => self
-                .current_path
-                .iter()
-                .cloned()
-                .chain(
-                    use_decl
-                        .path
-                        .iter()
-                        .dropping_back(1)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect(),
-        }
+        module_prefix(
+            self.current_path,
+            use_decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        )
     }
 
     pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
@@ -418,13 +535,30 @@ impl<'a> ImportPass<'a> {
                     self.record_dependency(self.use_module_path(u), u.span);
                 }
                 Decl::Enum(_) => {}
+                Decl::Struct(s) => {
+                    self.transform_struct_decl(s);
+                }
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
-                Decl::Struct(_) | Decl::Constant(_) => continue,
+                Decl::Constant(_) => continue,
             }
         }
 
         (self.deps, self.errors)
+    }
+
+    /// Records the module a qualified item path names: everything before the
+    /// final segment, resolved like a `use`. A call and a struct literal both
+    /// name an item this way.
+    fn record_item_path_dependency(&mut self, path: &IdentPath<Substr, ParseMetadata>) {
+        if path.path.len() > 1 && path.path[0].name != "std" {
+            let module = module_prefix(
+                self.current_path,
+                path.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
+            self.record_dependency(module, path.span);
+        }
     }
 }
 
@@ -479,6 +613,38 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        _input: &StructDecl<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[StructField<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        _input: &StructField<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        _input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
+        path: &IdentPath<Self::OutputS, Self::OutputMetadata>,
+        _fields: &[StructLitField<Self::OutputS, Self::OutputMetadata>],
+        _base: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        self.record_item_path_dependency(path);
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        _input: &IdentPath<Self::InputS, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
     }
 
     fn dispatch_cell_decl(
@@ -558,14 +724,6 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
     }
 
-    fn dispatch_comparison_expr(
-        &mut self,
-        _input: &ComparisonExpr<Self::InputS, Self::InputMetadata>,
-        _left: &Expr<Self::OutputS, Self::OutputMetadata>,
-        _right: &Expr<Self::OutputS, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
-    }
-
     fn dispatch_cast(
         &mut self,
         _input: &crate::ast::CastExpr<Self::InputS, Self::InputMetadata>,
@@ -611,28 +769,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        if func.path.len() > 1 && func.path[0].name != "std" {
-            let path = if func.path[0].name == "lib" {
-                func.path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(1)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec()
-            } else {
-                self.current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        func.path
-                            .iter()
-                            .dropping_back(1)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec()
-            };
-            self.record_dependency(path, func.span);
-        }
+        self.record_item_path_dependency(func);
     }
 
     fn dispatch_emit_expr(
@@ -663,6 +800,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &ArgDecl<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
         _ty: &TySpec<Self::OutputS, Self::OutputMetadata>,
+        _default: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
     }
 
@@ -679,60 +817,134 @@ impl<'a> AstTransformer for ImportPass<'a> {
     }
 }
 
-fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecError>) {
+/// Per-cell layer and geometry diagnostics, retained across compiles.
+///
+/// Both checks walk every object of every cell, and both are pure functions of
+/// a cell's objects and the technology, so a cell that is reused keeps its
+/// verdicts.
+#[derive(Debug, Default, Clone)]
+pub struct CheckCache {
+    entries: HashMap<CellId, CellChecks>,
+}
+
+#[derive(Debug, Clone)]
+struct CellChecks {
+    layers: Vec<ExecError>,
+    geometry: Vec<ExecError>,
+}
+
+impl CheckCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// Runs both output checks, reusing per-cell verdicts where they are known.
+fn run_output_checks(
+    data: &CompiledData,
+    tech_file: &FsPath,
+    checks: Option<&mut CheckCache>,
+    errs: &mut Vec<ExecError>,
+) {
     let mut layers = IndexSet::new();
     for layer in &data.tech.layers {
         layers.insert(layer.name.clone());
     }
+    let Some(checks) = checks else {
+        for (cell_id, cell) in data.cells.iter() {
+            check_cell_layers(*cell_id, cell, &layers, tech_file, errs);
+        }
+        for (cell_id, cell) in data.cells.iter() {
+            check_cell_geometry(*cell_id, cell, &data.tech, errs);
+        }
+        return;
+    };
+
     for (cell_id, cell) in data.cells.iter() {
-        for (_, obj) in cell.objects.iter() {
-            match obj {
-                SolvedValue::Rect(r) => {
-                    if let Some(layer) = &r.layer
-                        && !layers.contains(layer)
-                    {
-                        errs.push(ExecError {
-                            span: r.span.clone(),
-                            cell: *cell_id,
-                            kind: ExecErrorKind::IllegalLayer {
-                                layer: layer.clone(),
-                                tech: tech_file.display().to_string(),
-                            },
-                        });
-                    }
-                }
-                SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+        if checks.entries.contains_key(cell_id) {
+            continue;
+        }
+        let mut cell_layers = Vec::new();
+        let mut cell_geometry = Vec::new();
+        check_cell_layers(*cell_id, cell, &layers, tech_file, &mut cell_layers);
+        check_cell_geometry(*cell_id, cell, &data.tech, &mut cell_geometry);
+        checks.entries.insert(
+            *cell_id,
+            CellChecks {
+                layers: cell_layers,
+                geometry: cell_geometry,
+            },
+        );
+    }
+    // Appended as two passes over the cells, matching the order the uncached
+    // path produces: all layer diagnostics, then all geometry ones. Fusing
+    // them per cell would reorder diagnostics that reach the compiled output.
+    for cell_id in data.cells.keys() {
+        errs.extend(checks.entries[cell_id].layers.iter().cloned());
+    }
+    for cell_id in data.cells.keys() {
+        errs.extend(checks.entries[cell_id].geometry.iter().cloned());
+    }
+}
+
+fn check_cell_layers(
+    cell_id: CellId,
+    cell: &CompiledCell,
+    layers: &IndexSet<String>,
+    tech_file: &FsPath,
+    errs: &mut Vec<ExecError>,
+) {
+    for (_, obj) in cell.objects.iter() {
+        match obj {
+            SolvedValue::Rect(r) => {
+                if let Some(layer) = &r.layer
+                    && !layers.contains(layer)
+                {
                     errs.push(ExecError {
-                        span: polygon.span.clone(),
-                        cell: *cell_id,
+                        span: r.span.clone(),
+                        cell: cell_id,
                         kind: ExecErrorKind::IllegalLayer {
-                            layer: polygon.layer.clone(),
+                            layer: layer.clone(),
                             tech: tech_file.display().to_string(),
                         },
                     });
                 }
-                SolvedValue::Path(path) if !layers.contains(&path.layer) => {
-                    errs.push(ExecError {
-                        span: path.span.clone(),
-                        cell: *cell_id,
-                        kind: ExecErrorKind::IllegalLayer {
-                            layer: path.layer.clone(),
-                            tech: tech_file.display().to_string(),
-                        },
-                    });
-                }
-                SolvedValue::Text(text) if !layers.contains(&text.layer) => {
-                    errs.push(ExecError {
-                        span: text.span.clone(),
-                        cell: *cell_id,
-                        kind: ExecErrorKind::IllegalTextLayer {
-                            layer: text.layer.clone(),
-                            tech: tech_file.display().to_string(),
-                        },
-                    });
-                }
-                _ => {}
             }
+            SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
+                errs.push(ExecError {
+                    span: polygon.span.clone(),
+                    cell: cell_id,
+                    kind: ExecErrorKind::IllegalLayer {
+                        layer: polygon.layer.clone(),
+                        tech: tech_file.display().to_string(),
+                    },
+                });
+            }
+            SolvedValue::Path(path) if !layers.contains(&path.layer) => {
+                errs.push(ExecError {
+                    span: path.span.clone(),
+                    cell: cell_id,
+                    kind: ExecErrorKind::IllegalLayer {
+                        layer: path.layer.clone(),
+                        tech: tech_file.display().to_string(),
+                    },
+                });
+            }
+            SolvedValue::Text(text) if !layers.contains(&text.layer) => {
+                errs.push(ExecError {
+                    span: text.span.clone(),
+                    cell: cell_id,
+                    kind: ExecErrorKind::IllegalTextLayer {
+                        layer: text.layer.clone(),
+                        tech: tech_file.display().to_string(),
+                    },
+                });
+            }
+            _ => {}
         }
     }
 }
@@ -744,39 +956,40 @@ fn check_layers(data: &CompiledData, tech_file: &FsPath, errs: &mut Vec<ExecErro
 ///
 /// This runs before any output is written, so a rejected design produces a
 /// diagnostic with a span instead of a `.gds` full of `i32::MAX`.
-fn check_geometry(data: &CompiledData, errs: &mut Vec<ExecError>) {
-    let tech = &data.tech;
-    for (cell_id, cell) in data.cells.iter() {
-        let cell_id = *cell_id;
-        for (_, obj) in cell.objects.iter() {
-            match obj {
-                SolvedValue::Rect(r) => {
-                    let coords = [r.x0.0, r.y0.0, r.x1.0, r.y1.0];
-                    check_coordinates(coords, tech, cell_id, &r.span, errs);
-                }
-                SolvedValue::Polygon(p) => {
-                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]);
-                    check_coordinates(coords, tech, cell_id, &p.span, errs);
-                }
-                SolvedValue::Path(p) => {
-                    let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]).chain([
-                        p.width.0,
-                        p.begin_extension.0,
-                        p.end_extension.0,
-                    ]);
-                    check_coordinates(coords, tech, cell_id, &p.span, errs);
-                    check_path_dimensions(p, cell_id, errs);
-                }
-                SolvedValue::Instance(i) => {
-                    let span = Some(i.span.clone());
-                    check_coordinates([i.x, i.y], tech, cell_id, &span, errs);
-                }
-                SolvedValue::Text(t) => {
-                    check_coordinates([t.x, t.y], tech, cell_id, &t.span, errs);
-                    check_text(t, cell_id, errs);
-                }
-                SolvedValue::Dimension(_) => {}
+fn check_cell_geometry(
+    cell_id: CellId,
+    cell: &CompiledCell,
+    tech: &crate::tech::Technology,
+    errs: &mut Vec<ExecError>,
+) {
+    for (_, obj) in cell.objects.iter() {
+        match obj {
+            SolvedValue::Rect(r) => {
+                let coords = [r.x0.0, r.y0.0, r.x1.0, r.y1.0];
+                check_coordinates(coords, tech, cell_id, &r.span, errs);
             }
+            SolvedValue::Polygon(p) => {
+                let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]);
+                check_coordinates(coords, tech, cell_id, &p.span, errs);
+            }
+            SolvedValue::Path(p) => {
+                let coords = p.points.iter().flat_map(|(x, y)| [x.0, y.0]).chain([
+                    p.width.0,
+                    p.begin_extension.0,
+                    p.end_extension.0,
+                ]);
+                check_coordinates(coords, tech, cell_id, &p.span, errs);
+                check_path_dimensions(p, cell_id, errs);
+            }
+            SolvedValue::Instance(i) => {
+                let span = Some(i.span.clone());
+                check_coordinates([i.x, i.y], tech, cell_id, &span, errs);
+            }
+            SolvedValue::Text(t) => {
+                check_coordinates([t.x, t.y], tech, cell_id, &t.span, errs);
+                check_text(t, cell_id, errs);
+            }
+            SolvedValue::Dimension(_) => {}
         }
     }
 }
@@ -1005,6 +1218,9 @@ pub enum Ty {
     CellFn(Box<CellFnTy>),
     Seq(Box<Ty>),
     Tuple(Vec<Ty>),
+    /// A user-declared `struct`. Nominal: two declarations with identical
+    /// fields are distinct types.
+    Struct(Arc<StructTy>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1041,6 +1257,52 @@ fn polygon_coordinate(name: &str) -> Option<PolygonCoordinate> {
     })
 }
 
+/// Renders a type the way a user writes it.
+///
+/// Cell and instance types print as the *name* of the cell they came from.
+/// `Debug` cannot: it expands the `Arc`-shared `CellTy` DAG back into a tree,
+/// so a `{:?}` type in a diagnostic is exponential in hierarchy depth -- the
+/// very explosion the `Arc` on `CellFnTy::cell` exists to prevent. A depth-8
+/// binary hierarchy produced a 30 KB single-line error, a depth-20 one 122 MB.
+impl std::fmt::Display for Ty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ty::Unknown => write!(f, "?"),
+            Ty::Any => write!(f, "Any"),
+            Ty::Bool => write!(f, "Bool"),
+            Ty::Float => write!(f, "Float"),
+            Ty::Int => write!(f, "Int"),
+            Ty::Rect => write!(f, "Rect"),
+            Ty::Polygon => write!(f, "Polygon"),
+            Ty::Path => write!(f, "Path"),
+            Ty::Point => write!(f, "Point"),
+            Ty::String => write!(f, "String"),
+            Ty::Nil => write!(f, "()"),
+            Ty::SeqNil => write!(f, "[]"),
+            Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
+            Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
+            Ty::CellFn(cell_fn) => write!(f, "cell {}({})", cell_fn.cell.name, cell_fn.sig),
+            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.sig, func.ret),
+            // The name is what distinguishes two same-shaped enums: `EnumTy`
+            // equality keys on `id`, so without it a mismatch renders as
+            // `expected enum {A, B}, found enum {A, B}`.
+            Ty::Enum(e) => write!(f, "enum {} {{{}}}", e.name, e.variants.iter().format(", ")),
+            Ty::Seq(inner) => write!(f, "[{inner}]"),
+            Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
+            Ty::Struct(s) => write!(f, "struct {}", s.name),
+        }
+    }
+}
+
+/// Whether an instance of `cell` would answer `field`.
+///
+/// A cell's public fields are its top-level `let` bindings plus
+/// [`RESERVED_CELL_FIELDS`]; a GDS-backed cell publishes its geometry at
+/// execution time, so it answers anything.
+fn cell_has_field(cell: &CellTy, field: &str) -> bool {
+    cell.dynamic_fields || cell.data.contains_key(field) || RESERVED_CELL_FIELDS.contains(&field)
+}
+
 impl Ty {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
@@ -1059,15 +1321,37 @@ impl Ty {
         }
     }
 
+    /// The source spelling of a primitive type, for the names that can appear
+    /// as an identifier.
+    ///
+    /// The inverse of [`Self::from_name`], so that anything reporting what a
+    /// type annotation resolved to reads the same table the annotation was
+    /// resolved against. `()` and `[]` are spellings the grammar produces
+    /// rather than identifiers, so they have no name here.
+    pub fn primitive_name(&self) -> Option<&'static str> {
+        Some(match self {
+            Ty::Bool => "Bool",
+            Ty::Int => "Int",
+            Ty::Float => "Float",
+            Ty::Rect => "Rect",
+            Ty::Polygon => "Polygon",
+            Ty::Path => "Path",
+            Ty::Point => "Point",
+            Ty::Any => "Any",
+            Ty::String => "String",
+            _ => return None,
+        })
+    }
+
     /// Computes the least upper bound (LUB) of self and other.
     /// For use in type promotion.
     ///
     /// Returns `None` when the two types have no common supertype. Callers must
     /// report that as an error rather than widening: `Ty::Any` satisfies every
-    /// downstream check (`is_eq_ty` short-circuits on it), so promoting a
-    /// genuine mismatch to `Any` suppresses all further checking and defers the
-    /// failure to an evaluator `unwrap`. `Ty::Any` must only ever come from an
-    /// explicit `Any` annotation, never from inference giving up.
+    /// downstream check, so promoting a genuine mismatch to `Any` suppresses
+    /// all further checking and defers the failure to an evaluator `unwrap`.
+    /// `Ty::Any` must only ever come from an explicit `Any` annotation, never
+    /// from inference giving up.
     pub fn lub(&self, other: &Self) -> Option<Self> {
         match (self, other) {
             // Unknown promotes to any type. It already marks an earlier error,
@@ -1083,58 +1367,239 @@ impl Ty {
             (a, b) => (a == b).then(|| a.clone()),
         }
     }
+
+    /// Whether this type satisfies every static check.
+    ///
+    /// `Any` does so by definition. `Unknown` does so for the opposite reason:
+    /// it marks an expression that was *already* diagnosed, and its whole
+    /// purpose is to suppress checking of dependent properties, so comparing
+    /// it structurally turns one error into two. `Ty::lub` has always treated
+    /// it this way.
+    ///
+    /// Every predicate that admits `Any` must go through this, or the
+    /// already-diagnosed expression grows a second, spurious `.. found ?`.
+    pub(crate) fn is_wildcard(&self) -> bool {
+        matches!(self, Ty::Any | Ty::Unknown)
+    }
+}
+
+/// The parameters a call must supply: positional types in order, then keyword
+/// parameters by name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    pub(crate) args: Vec<Ty>,
+    pub(crate) kwargs: IndexMap<String, Ty>,
+}
+
+impl Signature {
+    /// A signature with only positional parameters.
+    fn positional(args: impl IntoIterator<Item = Ty>) -> Self {
+        Self {
+            args: args.into_iter().collect(),
+            kwargs: IndexMap::new(),
+        }
+    }
+
+    /// Adds keyword parameters.
+    fn keywords<'s>(mut self, kwargs: impl IntoIterator<Item = (&'s str, Ty)>) -> Self {
+        self.kwargs
+            .extend(kwargs.into_iter().map(|(name, ty)| (name.to_owned(), ty)));
+        self
+    }
+}
+
+/// Builds a signature from typed parameter declarations: parameters without a
+/// default are positional, the rest are keyword parameters.
+impl<'a, M: AstMetadata> FromIterator<(&'a ArgDecl<Substr, M>, Ty)> for Signature {
+    fn from_iter<I: IntoIterator<Item = (&'a ArgDecl<Substr, M>, Ty)>>(params: I) -> Self {
+        let mut sig = Self::default();
+        for (arg, ty) in params {
+            match arg.default {
+                Some(_) => {
+                    sig.kwargs.insert(arg.name.name.to_string(), ty);
+                }
+                None => sig.args.push(ty),
+            }
+        }
+        sig
+    }
+}
+
+impl std::fmt::Display for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let args = self.args.iter().map(ToString::to_string);
+        let kwargs = self.kwargs.iter().map(|(name, ty)| format!("{name}: {ty}"));
+        write!(f, "{}", args.chain(kwargs).format(", "))
+    }
+}
+
+/// Signatures of the builtins whose parameters do not depend on the call.
+/// Built once rather than per call site, since every keyword name is owned.
+mod builtin_sig {
+    use std::sync::LazyLock;
+
+    use super::{Signature, Ty};
+
+    /// The coordinate keywords every rectangle constructor accepts.
+    fn coordinates() -> impl Iterator<Item = (&'static str, Ty)> {
+        ["x0", "x1", "y0", "y1", "x0i", "x1i", "y0i", "y1i", "w", "h"]
+            .into_iter()
+            .map(|name| (name, Ty::Float))
+    }
+
+    pub(super) static CRECT: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::default().keywords(coordinates().chain([("layer", Ty::String)]))
+    });
+    pub(super) static RECT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String]).keywords(coordinates()));
+    pub(super) static TEXT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String, Ty::String, Ty::Float, Ty::Float]));
+    pub(super) static RANGE_FULL: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Int, Ty::Int, Ty::Int]));
+    pub(super) static EQ: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
+    pub(super) static DIMENSION: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Bool,
+        ])
+    });
+    /// The single positional parameter is a cell, which has no nameable type;
+    /// `Ty::Any` checks the arity and leaves the category to
+    /// `assert_ty_is_cell`.
+    pub(super) static INST: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::Any]).keywords([
+            ("reflect", Ty::Bool),
+            ("angle", Ty::Int),
+            ("x", Ty::Float),
+            ("y", Ty::Float),
+            ("xi", Ty::Float),
+            ("yi", Ty::Float),
+            ("construction", Ty::Bool),
+        ])
+    });
+    /// A builtin that takes no arguments, and the empty keyword set that
+    /// builtins with variadic positional arguments check against.
+    pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
-    args: Vec<Ty>,
-    ret: Ty,
+    pub(crate) sig: Signature,
+    pub(crate) ret: Ty,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
-    args: Vec<Ty>,
-    /// The structural type produced when this cell function is called.
-    ///
-    /// Stored behind an `Arc` so that every caller (and every `inst` of the
-    /// resulting cell) shares one allocation instead of deep-copying it. This
-    /// keeps the type representation a DAG rather than a tree: a cell that
-    /// references a child twice embeds two `Arc`s to the *same* `CellTy`, so
-    /// type size stays linear in hierarchy depth instead of doubling per level.
-    cell: Arc<CellTy>,
+    sig: Signature,
+    /// The structural type produced when this cell function is called, shared
+    /// with every caller and every `inst` of the result.
+    pub(crate) cell: Arc<CellTy>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct CellTy {
-    data: IndexMap<String, Ty>,
+    /// The name the cell was declared with, carried solely so that a
+    /// diagnostic can say `Inst(inverter)` instead of dumping the field map.
+    ///
+    /// Deliberately excluded from `PartialEq`: cell types are *structural*, so
+    /// two identically shaped cells are the same type regardless of what they
+    /// are called, and `is_eq_ty` falls through to `==`. Including the name
+    /// here would silently make that check nominal.
+    name: String,
+    pub(crate) data: IndexMap<String, Ty>,
     /// GDS-backed cells publish geometry fields at execution time. Their
     /// generated source declaration is intentionally only a signature, so
     /// field names cannot be enumerated by the source type pass.
     dynamic_fields: bool,
+    /// The declaring cell's [`VarId`], for navigation from a field access back
+    /// to the `let` that declared the field.
+    ///
+    /// Identity, not structure: cell typing is structural, so two cells with
+    /// the same fields must stay interchangeable. [`PartialEq`] therefore
+    /// ignores this field, and it is `None` for the generated signature of a
+    /// GDS-backed cell.
+    pub(crate) def: Option<VarId>,
+}
+
+impl PartialEq for CellTy {
+    fn eq(&self, other: &Self) -> bool {
+        // Destructured rather than field-by-field so that a field added later
+        // has to be named here, instead of being silently excluded from
+        // structural equality.
+        let Self {
+            name: _,
+            data,
+            dynamic_fields,
+            def: _,
+        } = self;
+        let Self {
+            name: _,
+            data: other_data,
+            dynamic_fields: other_dynamic_fields,
+            def: _,
+        } = other;
+        data == other_data && dynamic_fields == other_dynamic_fields
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnumTy {
-    id: EnumId,
-    variants: IndexSet<String>,
+    pub(crate) id: EnumId,
+    /// The name the enum was declared with, module-qualified, carried solely
+    /// so a diagnostic can distinguish two same-shaped enums.
+    ///
+    /// Redundant for equality -- `id` is already unique per declaration -- but
+    /// without it `Display` renders both sides of a mismatch as
+    /// `enum {N, S}`, which is the defect `Display` exists to remove.
+    name: String,
+    pub(crate) variants: IndexSet<String>,
+}
+
+/// The type of a `struct` declaration.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct StructTy {
+    /// The [`VarId`] the struct's name is bound to, which doubles as the type's
+    /// identity. Struct types are *nominal*, so two same-shaped declarations
+    /// are different types, and `id` is the only field equality reads. Being
+    /// the name's own id, it also lets navigation and fingerprinting reach the
+    /// declaration without an `EnumId`-style side map.
+    pub(crate) id: VarId,
+    /// The declared name, module-qualified, for diagnostics.
+    pub(crate) name: String,
+    /// The fields and their types, in declaration order.
+    pub(crate) fields: IndexMap<String, Ty>,
+}
+
+impl PartialEq for StructTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
 }
 
 impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type IdentPath = (Option<VarId>, Ty);
-    type EnumDecl = ();
-    type StructDecl = ();
-    type StructField = ();
+    /// `None` when the name was rejected before it could be bound.
+    type EnumDecl = Option<(VarId, EnumId)>;
+    /// `None` when the name was rejected before it could be bound.
+    type StructDecl = Option<VarId>;
+    /// The field's resolved type.
+    type StructField = Ty;
     type CellDecl = (PathBuf, VarId);
     type ConstantDecl = ();
     type LetBinding = VarId;
     type ForLoop = VarId; // the var ID of the var Ident
-    type FnDecl = (PathBuf, VarId);
+    type FnDecl = (PathBuf, VarId, Ty);
     type IfExpr = Ty;
     type MatchExpr = Ty;
     type BinOpExpr = Ty;
     type UnaryOpExpr = Ty;
-    type ComparisonExpr = Ty;
     type FieldAccessExpr = Ty;
     type IndexFieldAccessExpr = Ty;
     type IndexExpr = Ty;
@@ -1147,6 +1612,7 @@ impl AstMetadata for VarIdTyMetadata {
     type Typ = ();
     type CastExpr = Ty;
     type TupleExpr = Ty;
+    type StructLitExpr = Ty;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -1155,6 +1621,20 @@ impl<'a> VarIdTyPass<'a> {
             path: self.ast.path.clone(),
             span,
         }
+    }
+
+    /// The name a diagnostic should use for a declaration in this module.
+    ///
+    /// Cell and enum types are structural, so two same-named declarations in
+    /// different modules are different types that a bare name renders
+    /// identically: `expected type Inst(child), found Inst(child)`. Matches
+    /// the qualification `ExecPass` records for the GDS exporter.
+    fn qualified_name(&self, name: &str) -> String {
+        self.current_path
+            .iter()
+            .map(String::as_str)
+            .chain([name])
+            .join("::")
     }
 
     fn lookup(&self, name: &str) -> Option<(VarId, Ty)> {
@@ -1194,22 +1674,33 @@ impl<'a> VarIdTyPass<'a> {
         id
     }
 
-    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
-        let id = self.alloc_id();
+    /// Binds `name` to an id allocated earlier by [`Self::alloc_id`].
+    ///
+    /// Split out of [`Self::alloc`] for declarations whose type embeds their
+    /// own id, which have to know it before the type can be built.
+    fn bind(&mut self, name: &Substr, id: VarId, ty: Ty) {
         self.bindings
             .last_mut()
             .unwrap()
             .var_bindings
             .insert(name.clone(), (id, ty));
+    }
+
+    fn alloc(&mut self, name: &Substr, ty: Ty) -> VarId {
+        let id = self.alloc_id();
+        self.bind(name, id, ty);
         id
     }
 
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
+        self.check_duplicate_decls();
         // Enum types must exist before imports and function signatures are
-        // resolved. Imports are then installed before functions are declared,
-        // allowing imported enum types in signatures and imported functions in
-        // any declaration body regardless of source order.
+        // resolved. Imports are then installed before structs and functions
+        // are declared, allowing imported enum and struct types in fields and
+        // signatures, and imported functions in any declaration body,
+        // regardless of source order. Structs come before functions so that a
+        // signature may name a struct declared further down.
         for decl in &self.ast.ast.decls {
             if let Decl::Enum(e) = decl {
                 self.declare_enum_decl(e);
@@ -1220,6 +1711,7 @@ impl<'a> VarIdTyPass<'a> {
                 self.declare_use_decl(u);
             }
         }
+        self.declare_struct_decls();
         for decl in &self.ast.ast.decls {
             if let Decl::Fn(f) = decl {
                 self.declare_fn_decl(f);
@@ -1243,44 +1735,74 @@ impl<'a> VarIdTyPass<'a> {
                 Decl::Enum(e) => {
                     decls.push(Decl::Enum(self.transform_enum_decl(e)));
                 }
+                Decl::Struct(s) => {
+                    decls.push(Decl::Struct(self.transform_struct_decl(s)));
+                }
                 // `parse_ast` rejects these before this pass. Keep direct
                 // library callers non-panicking if they construct an AST.
-                Decl::Struct(_) | Decl::Constant(_) => continue,
+                Decl::Constant(_) => continue,
             }
         }
 
-        AnnotatedAst::new(
+        let mut annotated = AnnotatedAst::new(
             self.ast.text.clone(),
             &Ast {
                 decls,
                 span: self.ast.ast.span,
             },
             self.ast.path.clone(),
-        )
+        );
+        // Re-annotating starts from a clean slate; carry over what describes
+        // the file rather than the declarations that were just transformed.
+        annotated.source_text = self.ast.source_text.clone();
+        annotated.generated_declarations = self.ast.generated_declarations;
+        annotated.parsed = self.ast.parsed;
+        annotated
     }
 
     fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        match use_decl.path[0].name.as_str() {
-            "std" => vec!["std".to_string()],
-            "lib" => use_decl
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(1)
-                .map(|ident| ident.name.to_string())
-                .collect(),
-            _ => self
-                .current_path
-                .iter()
-                .cloned()
-                .chain(
-                    use_decl
-                        .path
-                        .iter()
-                        .dropping_back(1)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect(),
+        module_prefix(
+            self.current_path,
+            use_decl.path.iter().map(|ident| ident.name.as_str()),
+            1,
+        )
+    }
+
+    /// Reports every top-level declaration whose name an earlier declaration
+    /// of this module already took.
+    ///
+    /// Cells, functions, structs, enums, and imports all bind into the one
+    /// module frame, so `struct Mode` after `enum Mode` clashes as much as two
+    /// `cell top`s do. The declaration passes run by kind rather than in
+    /// source order, so without this check the survivor of a clash was
+    /// whichever kind is declared last -- a struct always beat an enum of the
+    /// same name, whatever the file said -- and [`Self::declare_struct_decls`]
+    /// keys structs by name, so a repeated `struct S` dropped the first
+    /// declaration without a trace. The later declaration is reported and
+    /// binding proceeds as before; the file is already invalid.
+    ///
+    /// Modules are exempt: `mod m;` is resolved through `mod_bindings`, never
+    /// through this frame, so `mod m;` and `fn m` do not collide.
+    fn check_duplicate_decls(&mut self) {
+        let mut seen = IndexSet::new();
+        for decl in &self.ast.ast.decls {
+            let name = match decl {
+                Decl::Enum(e) => &e.name,
+                Decl::Struct(s) => &s.name,
+                Decl::Fn(f) => &f.name,
+                Decl::Cell(c) => &c.name,
+                Decl::Use(u) => u
+                    .alias
+                    .as_ref()
+                    .unwrap_or_else(|| u.path.last().expect("use paths are non-empty")),
+                Decl::Mod(_) | Decl::Constant(_) => continue,
+            };
+            if !seen.insert(name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
         }
     }
 
@@ -1323,16 +1845,17 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
-        let args: Vec<_> = input
+        self.check_params(&input.args);
+        let sig = input
             .args
             .iter()
             .map(|arg| {
                 let ty_spec = self.transform_ty_spec(&arg.ty);
-                self.ty_from_spec(&ty_spec)
+                (arg, self.ty_from_spec(&ty_spec))
             })
             .collect();
         let ty = Ty::Fn(Box::new(FnTy {
-            args,
+            sig,
             ret: if let Some(return_ty) = &input.return_ty {
                 self.ty_from_spec(return_ty)
             } else {
@@ -1362,9 +1885,111 @@ impl<'a> VarIdTyPass<'a> {
         }
         let ty = Ty::Enum(EnumTy {
             id: self.alloc_id(),
+            name: self.qualified_name(&input.name.name),
             variants,
         });
         self.alloc(&input.name.name, ty);
+    }
+
+    /// Declares every struct in the module, each after the local structs its
+    /// fields name, so that a field may refer to a struct declared further
+    /// down the file.
+    ///
+    /// A struct whose fields lead back to itself has no finite value, since
+    /// there is no optional type to end the recursion. The field that closes
+    /// the cycle is reported and typed `Unknown`, so the declaration still
+    /// binds and its other uses are checked normally.
+    fn declare_struct_decls(&mut self) {
+        let structs: IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>> = self
+            .ast
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Struct(s) => Some((s.name.name.as_str(), s)),
+                _ => None,
+            })
+            .collect();
+        let mut visiting = IndexSet::new();
+        let mut declared = IndexSet::new();
+        for name in structs.keys().copied().collect::<Vec<_>>() {
+            self.declare_struct_after_deps(name, &structs, &mut visiting, &mut declared);
+        }
+    }
+
+    fn declare_struct_after_deps(
+        &mut self,
+        name: &'a str,
+        structs: &IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>>,
+        visiting: &mut IndexSet<&'a str>,
+        declared: &mut IndexSet<&'a str>,
+    ) {
+        if declared.contains(name) {
+            return;
+        }
+        let decl = structs[name];
+        visiting.insert(name);
+        let mut recursive = IndexSet::new();
+        for (index, field) in decl.fields.iter().enumerate() {
+            for dep in ty_spec_names(&field.ty) {
+                // Anything that is not a struct of this module -- a primitive,
+                // an enum, an import, a typo -- is resolved by `ty_from_spec`.
+                if !structs.contains_key(dep) {
+                    continue;
+                }
+                if visiting.contains(dep) {
+                    recursive.insert(index);
+                } else {
+                    self.declare_struct_after_deps(dep, structs, visiting, declared);
+                }
+            }
+        }
+        visiting.swap_remove(name);
+        self.declare_struct_decl(decl, &recursive);
+        declared.insert(name);
+    }
+
+    /// Declares one struct. `recursive` holds the indices of the fields that
+    /// would make the type contain itself.
+    fn declare_struct_decl(
+        &mut self,
+        input: &'a StructDecl<Substr, ParseMetadata>,
+        recursive: &IndexSet<usize>,
+    ) {
+        if BUILTINS.contains(&input.name.name.as_str()) {
+            self.errors.push(StaticError {
+                span: self.span(input.name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
+            });
+            return;
+        }
+        let id = self.alloc_id();
+        let mut fields = IndexMap::with_capacity(input.fields.len());
+        for (index, field) in input.fields.iter().enumerate() {
+            let ty = if recursive.contains(&index) {
+                self.errors.push(StaticError {
+                    span: self.span(field.ty.span),
+                    kind: StaticErrorKind::RecursiveStruct {
+                        name: input.name.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            } else {
+                self.ty_from_spec(&field.ty)
+            };
+            if fields.insert(field.name.name.to_string(), ty).is_some() {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+        }
+        let ty = Ty::Struct(Arc::new(StructTy {
+            id,
+            name: self.qualified_name(&input.name.name),
+            fields,
+        }));
+        self.bind(&input.name.name, id, ty);
     }
 
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
@@ -1395,7 +2020,7 @@ impl<'a> VarIdTyPass<'a> {
             span: self.span(field.span),
             kind: StaticErrorKind::NoFieldOnTy {
                 field: field.name.to_string(),
-                ty,
+                ty: ty.to_string(),
             },
         });
         Ty::Unknown
@@ -1404,13 +2029,155 @@ impl<'a> VarIdTyPass<'a> {
     fn cannot_index<M: AstMetadata>(&mut self, base: &Expr<Substr, M>, ty: Ty) -> Ty {
         self.errors.push(StaticError {
             span: self.span(base.span()),
-            kind: StaticErrorKind::CannotIndex { ty },
+            kind: StaticErrorKind::CannotIndex { ty: ty.to_string() },
         });
         Ty::Unknown
     }
 
+    fn check_arith(
+        &mut self,
+        span: cfgrammar::Span,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        let left_ty = left.ty();
+        let right_ty = right.ty();
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::ArithMismatchedTypes,
+            });
+        }
+        if !(matches!(left_ty, Ty::Float | Ty::Int) || left_ty.is_wildcard()) {
+            self.errors.push(StaticError {
+                span: self.span(left.span()),
+                kind: StaticErrorKind::ArithInvalidType(left_ty.to_string()),
+            });
+        }
+        if !(matches!(right_ty, Ty::Float | Ty::Int) || right_ty.is_wildcard()) {
+            self.errors.push(StaticError {
+                span: self.span(right.span()),
+                kind: StaticErrorKind::ArithInvalidType(right_ty.to_string()),
+            });
+        }
+        left_ty
+    }
+
+    fn check_bool_expr(
+        &mut self,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        for operand in [left, right] {
+            if !VarIdTyPass::is_bool_operand(&operand.ty()) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::BoolOpInvalidType,
+                });
+            }
+        }
+        Ty::Bool
+    }
+
+    fn check_comparison(
+        &mut self,
+        op: ComparisonOp,
+        span: cfgrammar::Span,
+        left: &Expr<Substr, VarIdTyMetadata>,
+        right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        let left_ty = left.ty();
+        let right_ty = right.ty();
+        // A mismatch here is already reported as `ComparisonMismatchedTypes`
+        // below, so an absent LUB only needs to not be `Ty::Seq`.
+        let lub_ty = left_ty.lub(&right_ty).unwrap_or(Ty::Unknown);
+        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::ComparisonMismatchedTypes,
+            });
+        }
+        if left_ty == Ty::Float && (op == ComparisonOp::Eq || op == ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::FloatEquality,
+            });
+        }
+        if matches!(left_ty, Ty::Enum(_)) && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::EnumsNotOrd,
+            });
+        }
+        if left_ty == Ty::Bool && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::BoolNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::Nil)
+            && matches!(right_ty, Ty::Nil)
+            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::NilNotOrd,
+            });
+        }
+        if matches!(left_ty, Ty::SeqNil)
+            && matches!(right_ty, Ty::SeqNil)
+            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::SeqNilNotOrd,
+            });
+        }
+        // A sequence may only be compared for equality/inequality against `[]`:
+        // the evaluator has no arm for two populated sequences, and none for
+        // ordering a sequence at all.
+        if matches!(lub_ty, Ty::Seq(_))
+            && !((op == ComparisonOp::Eq || op == ComparisonOp::Ne)
+                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
+        {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+            });
+        }
+        // `Ty::Any` is deliberately *not* admitted here: the evaluator has no
+        // comparison arm for a string, so `1. < any` has to be rejected
+        // statically. `Ty::Unknown` is admitted, because the expression that
+        // produced it was already diagnosed.
+        for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
+            if !matches!(
+                ty,
+                Ty::Float
+                    | Ty::Int
+                    | Ty::Bool
+                    | Ty::Enum(_)
+                    | Ty::Seq(_)
+                    | Ty::Nil
+                    | Ty::SeqNil
+                    | Ty::Unknown
+            ) {
+                self.errors.push(StaticError {
+                    span: self.span(operand.span()),
+                    kind: StaticErrorKind::ComparisonInvalidType,
+                });
+            }
+        }
+
+        Ty::Bool
+    }
+
+    /// Whether `ty` may be an operand of `&&`, `||`, or `!`.
+    fn is_bool_operand(ty: &Ty) -> bool {
+        matches!(ty, Ty::Bool | Ty::Any | Ty::Unknown)
+    }
+
     fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
-        if *a == Ty::Any || *b == Ty::Any {
+        if a.is_wildcard() || b.is_wildcard() {
             return true;
         }
 
@@ -1447,19 +2214,19 @@ impl<'a> VarIdTyPass<'a> {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
-                    found: found.clone(),
-                    expected: expected.clone(),
+                    found: found.to_string(),
+                    expected: expected.to_string(),
                 },
             });
         }
     }
 
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+        if !(matches!(ty, Ty::Cell(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.clone(),
+                    found: ty.to_string(),
                     expected: "Cell".into(),
                 },
             });
@@ -1467,11 +2234,11 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !matches!(ty, Ty::Enum(_) | Ty::Any) {
+        if !(matches!(ty, Ty::Enum(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.clone(),
+                    found: ty.to_string(),
                     expected: "Enum".into(),
                 },
             });
@@ -1490,33 +2257,26 @@ impl<'a> VarIdTyPass<'a> {
     fn typecheck_kwargs(
         &mut self,
         kwargs: &[KwArgValue<Substr, VarIdTyMetadata>],
-        kwarg_defs: IndexMap<&str, Ty>,
+        defs: &IndexMap<String, Ty>,
     ) {
-        let mut defined = IndexSet::new();
+        let mut seen = IndexSet::new();
         for kwarg in kwargs {
-            let mut cont = false;
-            if !kwarg_defs.contains_key(&kwarg.name.name.as_str()) {
+            let name = kwarg.name.name.as_str();
+            let Some(expected) = defs.get(name) else {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::InvalidKwArg,
                 });
-                cont = true;
-            }
-            if defined.contains(&&kwarg.name.name) {
+                continue;
+            };
+            if !seen.insert(name) {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::DuplicateKwArg,
                 });
-                cont = true;
+                continue;
             }
-            defined.insert(&kwarg.name.name);
-            if !cont {
-                self.assert_eq_ty(
-                    kwarg.value.span(),
-                    &kwarg.value.ty(),
-                    kwarg_defs.get(&kwarg.name.name.as_str()).unwrap(),
-                );
-            }
+            self.assert_eq_ty(kwarg.value.span(), &kwarg.value.ty(), expected);
         }
     }
 
@@ -1532,15 +2292,40 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Checks a call's arguments against the callee's signature.
     fn typecheck_args(
         &mut self,
         call_span: cfgrammar::Span,
         args: &crate::ast::Args<Substr, VarIdTyMetadata>,
-        arg_defs: &[Ty],
-        kwarg_defs: IndexMap<&str, Ty>,
+        sig: &Signature,
     ) {
-        self.typecheck_posargs(call_span, &args.posargs, arg_defs);
-        self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+        self.typecheck_posargs(call_span, &args.posargs, &sig.args);
+        self.typecheck_kwargs(&args.kwargs, &sig.kwargs);
+    }
+
+    /// Rejects repeated parameter names and positional parameters declared
+    /// after keyword parameters.
+    fn check_params<M: AstMetadata>(&mut self, args: &[ArgDecl<Substr, M>]) {
+        let mut seen = IndexSet::new();
+        let mut keyword_seen = false;
+        for arg in args {
+            if !seen.insert(arg.name.name.as_str()) {
+                self.errors.push(StaticError {
+                    span: self.span(arg.name.span),
+                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                });
+            }
+            match arg.default {
+                Some(_) => keyword_seen = true,
+                None if keyword_seen => self.errors.push(StaticError {
+                    span: self.span(arg.name.span),
+                    kind: StaticErrorKind::PositionalParamAfterDefault {
+                        name: arg.name.name.to_string(),
+                    },
+                }),
+                None => {}
+            }
+        }
     }
 
     fn typecheck_call(
@@ -1554,17 +2339,17 @@ impl<'a> VarIdTyPass<'a> {
         if let Some((varid, ty)) = lookup {
             match ty {
                 Ty::Fn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    self.typecheck_args(call_span, args, &ty.sig);
                     (Some(varid), ty.ret.clone())
                 }
                 Ty::CellFn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.args, IndexMap::new());
+                    self.typecheck_args(call_span, args, &ty.sig);
                     (Some(varid), Ty::Cell(ty.cell.clone()))
                 }
                 ty => {
                     self.errors.push(StaticError {
                         span: self.span(call_span),
-                        kind: StaticErrorKind::CannotCall(ty),
+                        kind: StaticErrorKind::CannotCall(ty.to_string()),
                     });
                     (None, Ty::Unknown)
                 }
@@ -1585,12 +2370,21 @@ impl<'a> VarIdTyPass<'a> {
     }
 }
 
+/// The identifiers a type annotation is built from: `[(A, B)]` names `A` and
+/// `B`.
+fn ty_spec_names<M: AstMetadata>(spec: &TySpec<Substr, M>) -> Vec<&str> {
+    match &spec.kind {
+        TySpecKind::Ident(ident) => vec![ident.name.as_str()],
+        TySpecKind::Seq(inner) => ty_spec_names(inner),
+        TySpecKind::Tuple(items) => items.iter().flat_map(ty_spec_names).collect(),
+    }
+}
+
 impl<S> Expr<S, VarIdTyMetadata> {
-    fn ty(&self) -> Ty {
+    pub(crate) fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
-            Expr::Comparison(comparison_expr) => comparison_expr.metadata.clone(),
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
             Expr::Emit(emit_expr) => emit_expr.metadata.clone(),
@@ -1610,6 +2404,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
             Expr::Tuple(t) => t.metadata.clone(),
+            Expr::StructLit(lit) => lit.metadata.clone(),
         }
     }
 }
@@ -1645,30 +2440,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
         } else {
             // look up enum
-            let path = match input.path[0].name.as_str() {
-                "std" => {
-                    vec!["std".to_string()]
-                }
-                "lib" => input
-                    .path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(2)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec(),
-                _ => self
-                    .current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        input
-                            .path
-                            .iter()
-                            .dropping_back(2)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec(),
-            };
+            let path = module_prefix(
+                self.current_path,
+                input.path.iter().map(|ident| ident.name.as_str()),
+                2,
+            );
             let enum_ = &input.path[input.path.len() - 2];
             let lookup = if path.is_empty() || &path == self.current_path {
                 self.lookup(&enum_.name)
@@ -1710,9 +2486,182 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     fn dispatch_enum_decl(
         &mut self,
         _input: &crate::ast::EnumDecl<Substr, Self::InputMetadata>,
-        _name: &Ident<Substr, Self::OutputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
         _variants: &[Ident<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+        // `declare_enum_decl` hoisted this binding before any body was walked,
+        // so it normally resolves. A name that collided with a builtin was
+        // rejected there and never bound, and there is no id to report: a
+        // shared placeholder would make every such enum in the workspace look
+        // like the same declaration.
+        match self.lookup(&name.name) {
+            Some((var_id, Ty::Enum(enum_ty))) => Some((var_id, enum_ty.id)),
+            _ => None,
+        }
+    }
+
+    fn transform_struct_decl(
+        &mut self,
+        input: &StructDecl<Substr, Self::InputMetadata>,
+    ) -> StructDecl<Substr, Self::OutputMetadata> {
+        // `declare_struct_decls` already resolved every field type; the
+        // annotated fields carry those types rather than resolving the specs a
+        // second time, which would report each error twice.
+        let struct_ty = match self.lookup(&input.name.name) {
+            Some((_, Ty::Struct(struct_ty))) => Some(struct_ty),
+            _ => None,
+        };
+        let name = self.transform_ident(&input.name);
+        let fields = input
+            .fields
+            .iter()
+            .map(|field| {
+                let ty = struct_ty
+                    .as_ref()
+                    .and_then(|struct_ty| struct_ty.fields.get(field.name.name.as_str()))
+                    .cloned()
+                    .unwrap_or_default();
+                StructField {
+                    name: self.transform_ident(&field.name),
+                    ty: self.transform_ty_spec(&field.ty),
+                    span: field.span,
+                    metadata: ty,
+                }
+            })
+            .collect_vec();
+        let metadata = self.dispatch_struct_decl(input, &name, &fields);
+        StructDecl {
+            name,
+            fields,
+            span: input.span,
+            metadata,
+        }
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        _input: &StructDecl<Substr, Self::InputMetadata>,
+        name: &Ident<Substr, Self::OutputMetadata>,
+        _fields: &[StructField<Substr, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::StructDecl {
+        // Like `dispatch_enum_decl`: a name that collided with a builtin was
+        // never bound, and there is no id to report.
+        match self.lookup(&name.name) {
+            Some((var_id, Ty::Struct(_))) => Some(var_id),
+            _ => None,
+        }
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        _input: &StructField<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _ty: &TySpec<Substr, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructField {
+        // `transform_struct_decl` builds the fields itself.
+        unreachable!()
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        _input: &IdentPath<Substr, Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
+        // Resolved by `dispatch_struct_lit_expr`, whose metadata carries the
+        // struct type; like a call's `func` path, this one stays unresolved.
+        (None, Ty::Unknown)
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        input: &StructLitExpr<Substr, Self::InputMetadata>,
+        path: &IdentPath<Substr, Self::OutputMetadata>,
+        fields: &[StructLitField<Substr, Self::OutputMetadata>],
+        base: &Option<Expr<Substr, Self::OutputMetadata>>,
+    ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
+        let name = &path.path.last().expect("paths are non-empty").name;
+        let lookup = if path.path.len() == 1 {
+            self.lookup(name)
+        } else {
+            let module = module_prefix(
+                self.current_path,
+                path.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
+            if &module == self.current_path {
+                self.lookup(name)
+            } else {
+                self.mod_bindings
+                    .get(&module)
+                    .and_then(|frame| frame.var_bindings.get(name.as_str()).cloned())
+            }
+        };
+        let Some((_, ty)) = lookup else {
+            self.errors.push(StaticError {
+                span: self.span(path.span),
+                kind: if path.path.len() == 1 {
+                    self.unresolved_local_name_error(name, path.span)
+                } else {
+                    StaticErrorKind::UndeclaredVar {
+                        name: name.to_string(),
+                    }
+                },
+            });
+            return Ty::Unknown;
+        };
+        let Ty::Struct(struct_ty) = ty else {
+            // An `Unknown` binding was already diagnosed where it was bound.
+            if !matches!(ty, Ty::Unknown) {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::NotAStruct,
+                });
+            }
+            return Ty::Unknown;
+        };
+        let ty = Ty::Struct(struct_ty.clone());
+
+        let mut seen = IndexSet::new();
+        for field in fields {
+            let field_name = field.name.name.as_str();
+            let Some(expected) = struct_ty.fields.get(field_name) else {
+                self.no_field_on_ty(&field.name, ty.clone());
+                continue;
+            };
+            if !seen.insert(field_name) {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateStructField {
+                        field: field_name.to_string(),
+                    },
+                });
+                continue;
+            }
+            self.assert_eq_ty(field.value.span(), &field.value.ty(), expected);
+        }
+
+        match base {
+            // Every field not listed comes from the base, which therefore has
+            // to be this very struct.
+            Some(base) => self.assert_eq_ty(base.span(), &base.ty(), &ty),
+            None => {
+                let missing = struct_ty
+                    .fields
+                    .keys()
+                    .filter(|name| !seen.contains(name.as_str()))
+                    .map(|name| format!("`{name}`"))
+                    .collect_vec();
+                if !missing.is_empty() {
+                    self.errors.push(StaticError {
+                        span: self.span(input.span),
+                        kind: StaticErrorKind::MissingStructFields {
+                            ty: ty.to_string(),
+                            fields: missing.join(", "),
+                        },
+                    });
+                }
+            }
+        }
+        ty
     }
 
     fn dispatch_cell_decl(
@@ -1745,7 +2694,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             };
             self.assert_eq_ty(span, &scope.metadata, &fn_ty.ret);
         }
-        (self.ast.path.clone(), var_id)
+        (self.ast.path.clone(), var_id, ty)
     }
 
     fn transform_fn_decl(
@@ -1786,6 +2735,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
         }
+        self.check_params(&input.args);
         self.enter_scope(&input.scope);
         let args: Vec<_> = input
             .args
@@ -1805,10 +2755,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .iter()
             .filter_map(|stmt| {
                 if let Statement::LetBinding(lt) = stmt {
-                    if ["x", "y"].contains(&lt.name.name.as_str()) {
+                    if RESERVED_CELL_FIELDS.contains(&lt.name.name.as_str()) {
                         self.errors.push(StaticError {
                             span: self.span(lt.name.span),
-                            kind: StaticErrorKind::RedeclarationOfBuiltin,
+                            kind: StaticErrorKind::ReservedCellField {
+                                name: lt.name.name.to_string(),
+                            },
                         });
                     }
                     Some((lt.name.name.to_string(), lt.value.ty()))
@@ -1826,14 +2778,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .any(|decl| {
                 matches!(decl, Decl::Cell(cell) if cell.span == input.span && cell.name.name == input.name.name)
             });
+        // The cell's type embeds its own id so that a field access on an
+        // instance can be traced back to the declaring cell. A GDS-backed cell
+        // has no declared fields to trace back to, so it records none and
+        // field accesses on it fall through to the builtin geometry fields.
+        let cell_id = self.alloc_id();
         let ty = Ty::CellFn(Box::new(CellFnTy {
-            args: args.iter().map(|arg| arg.metadata.1.clone()).collect(),
+            sig: args
+                .iter()
+                .map(|arg| (arg, arg.metadata.1.clone()))
+                .collect(),
             cell: Arc::new(CellTy {
+                name: self.qualified_name(&input.name.name),
                 data,
                 dynamic_fields,
+                def: (!dynamic_fields).then_some(cell_id),
             }),
         }));
-        self.alloc(&input.name.name, ty);
+        self.bind(&input.name.name, cell_id, ty);
         let name = self.transform_ident(&input.name);
         let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
@@ -1889,7 +2851,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let cond_ty = cond.ty();
         let then_ty = then.metadata.clone();
         let else_ty = else_.metadata.clone();
-        if cond_ty != Ty::Bool {
+        // `Unknown` marks an expression that was already diagnosed, so it must
+        // not produce a second `if conditions must have type bool`. `Any` is
+        // still rejected: the evaluator has no fallback for a non-bool
+        // condition.
+        if cond_ty != Ty::Bool && !matches!(cond_ty, Ty::Unknown) {
             self.errors.push(StaticError {
                 span: self.span(cond.span()),
                 kind: StaticErrorKind::IfCondNotBool,
@@ -1930,6 +2896,26 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Enum(_) => Some(scrutinee_ty.clone()),
             _ => pattern_ty,
         };
+
+        // Neither the scrutinee nor any arm pattern names an enum, so there is
+        // nothing to check the arms against. Falling through to
+        // `Ty::Unknown` silently was harmless only while `is_eq_ty` compared
+        // `Unknown` structurally; it now satisfies every downstream check, so
+        // an unsayable match type has to be reported here or `--check`
+        // accepts a program the evaluator refuses.
+        if expected_ty.is_none() {
+            let already_diagnosed = matches!(scrutinee_ty, Ty::Unknown)
+                || arms
+                    .iter()
+                    .any(|arm| matches!(arm.pattern.metadata.1, Ty::Unknown));
+            if !already_diagnosed {
+                self.errors.push(StaticError {
+                    span: self.span(scrutinee.span()),
+                    kind: StaticErrorKind::NotAnEnum,
+                });
+            }
+            return Ty::Unknown;
+        }
 
         if let Some(Ty::Enum(ref e)) = expected_ty {
             let mut covered = IndexSet::new();
@@ -1981,27 +2967,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         left: &Expr<Substr, Self::OutputMetadata>,
         right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::BinOpMismatchedTypes,
-            });
+        match input.op {
+            BinOp::Arith(_) => self.check_arith(input.span, left, right),
+            BinOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
+            BinOp::Bool(_) => self.check_bool_expr(left, right),
         }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&left_ty) {
-            self.errors.push(StaticError {
-                span: self.span(left.span()),
-                kind: StaticErrorKind::BinOpInvalidType(left_ty.clone()),
-            });
-        }
-        if ![Ty::Float, Ty::Int, Ty::Any].contains(&right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(right.span()),
-                kind: StaticErrorKind::BinOpInvalidType(right_ty),
-            });
-        }
-        left_ty
     }
 
     fn dispatch_unary_op_expr(
@@ -2011,15 +2981,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
-                self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::Unimplemented,
-                });
+                let operand_ty = operand.ty();
+                if !VarIdTyPass::is_bool_operand(&operand_ty) {
+                    self.errors.push(StaticError {
+                        span: self.span(operand.span()),
+                        kind: StaticErrorKind::BoolOpInvalidType,
+                    });
+                }
                 Ty::Bool
             }
             UnaryOp::Neg => {
                 let operand_ty = operand.ty();
-                if ![Ty::Float, Ty::Int, Ty::Any].contains(&operand_ty) {
+                if !(matches!(operand_ty, Ty::Float | Ty::Int) || operand_ty.is_wildcard()) {
                     self.errors.push(StaticError {
                         span: self.span(operand.span()),
                         kind: StaticErrorKind::UnaryOpInvalidType,
@@ -2028,82 +3001,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 operand_ty
             }
         }
-    }
-
-    fn dispatch_comparison_expr(
-        &mut self,
-        input: &ComparisonExpr<Substr, Self::InputMetadata>,
-        left: &Expr<Substr, Self::OutputMetadata>,
-        right: &Expr<Substr, Self::OutputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::ComparisonExpr {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        // A mismatch here is already reported as `ComparisonMismatchedTypes`
-        // below, so an absent LUB only needs to not be `Ty::Seq`.
-        let lub_ty = left_ty.lub(&right_ty).unwrap_or(Ty::Unknown);
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::ComparisonMismatchedTypes,
-            });
-        }
-        if left_ty == Ty::Float && (input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne) {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::FloatEquality,
-            });
-        }
-        if matches!(left_ty, Ty::Enum(_))
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::EnumsNotOrd,
-            });
-        }
-        if matches!(left_ty, Ty::Nil)
-            && matches!(right_ty, Ty::Nil)
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::NilNotOrd,
-            });
-        }
-        if matches!(left_ty, Ty::SeqNil)
-            && matches!(right_ty, Ty::SeqNil)
-            && (input.op != ComparisonOp::Eq && input.op != ComparisonOp::Ne)
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::SeqNilNotOrd,
-            });
-        }
-        // A sequence may only be compared for equality/inequality against `[]`:
-        // the evaluator has no arm for two populated sequences, and none for
-        // ordering a sequence at all.
-        if matches!(lub_ty, Ty::Seq(_))
-            && !((input.op == ComparisonOp::Eq || input.op == ComparisonOp::Ne)
-                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
-        {
-            self.errors.push(StaticError {
-                span: self.span(input.span),
-                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
-            });
-        }
-        for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
-            if !matches!(
-                ty,
-                Ty::Float | Ty::Int | Ty::Enum(_) | Ty::Seq(_) | Ty::Nil | Ty::SeqNil
-            ) {
-                self.errors.push(StaticError {
-                    span: self.span(operand.span()),
-                    kind: StaticErrorKind::ComparisonInvalidType,
-                });
-            }
-        }
-
-        Ty::Bool
     }
 
     fn dispatch_field_access_expr(
@@ -2141,7 +3038,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
             Ty::Inst(ref c) => match field.name.as_str() {
-                "x" | "y" => Ty::Float,
+                name if RESERVED_CELL_FIELDS.contains(&name) => Ty::Float,
                 name => c.data.get(name).cloned().unwrap_or_else(|| {
                     if c.dynamic_fields {
                         Ty::Any
@@ -2149,6 +3046,39 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         self.no_field_on_ty(field, base_ty.clone())
                     }
                 }),
+            },
+            // A cell's coordinates are only determined relative to a
+            // placement, so reading its geometry before `inst(...)` is
+            // meaningless -- and the evaluator already refuses it. Saying so
+            // beats the generic no-field error, which used to assert that a
+            // field was missing while printing the map that contained it.
+            //
+            // Only when the field exists, though: telling someone who
+            // misspelled a field to place the cell first is advice that
+            // cannot help, so an unknown name still gets the no-field error.
+            Ty::Cell(ref c) if cell_has_field(c, field.name.as_str()) => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CellFieldBeforePlacement {
+                        cell: c.name.clone(),
+                        field: field.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            }
+            Ty::CellFn(ref c) if cell_has_field(&c.cell, &field.name) => {
+                self.errors.push(StaticError {
+                    span: self.span(field.span),
+                    kind: StaticErrorKind::CellFnFieldAccess {
+                        cell: c.cell.name.clone(),
+                        field: field.name.to_string(),
+                    },
+                });
+                Ty::Unknown
+            }
+            Ty::Struct(ref s) => match s.fields.get(field.name.as_str()) {
+                Some(ty) => ty.clone(),
+                None => self.no_field_on_ty(field, base_ty.clone()),
             },
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
@@ -2188,7 +3118,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(field.span),
-                    kind: StaticErrorKind::CannotIndexFieldAccess { ty: base_ty },
+                    kind: StaticErrorKind::CannotIndexFieldAccess {
+                        ty: base_ty.to_string(),
+                    },
                 });
                 Ty::Unknown
             }
@@ -2221,94 +3153,44 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
                 name @ "crect" | name @ "rect" => {
-                    let kwarg_defs = if name == "crect" {
-                        self.typecheck_posargs(input.span, &args.posargs, &[]);
-                        IndexMap::from_iter([
-                            ("x0", Ty::Float),
-                            ("x1", Ty::Float),
-                            ("y0", Ty::Float),
-                            ("y1", Ty::Float),
-                            ("x0i", Ty::Float),
-                            ("x1i", Ty::Float),
-                            ("y0i", Ty::Float),
-                            ("y1i", Ty::Float),
-                            ("w", Ty::Float),
-                            ("h", Ty::Float),
-                            ("layer", Ty::String),
-                        ])
+                    let sig = if name == "crect" {
+                        &builtin_sig::CRECT
                     } else {
-                        self.typecheck_posargs(input.span, &args.posargs, &[Ty::String]);
-                        IndexMap::from_iter([
-                            ("x0", Ty::Float),
-                            ("x1", Ty::Float),
-                            ("y0", Ty::Float),
-                            ("y1", Ty::Float),
-                            ("x0i", Ty::Float),
-                            ("x1i", Ty::Float),
-                            ("y0i", Ty::Float),
-                            ("y1i", Ty::Float),
-                            ("w", Ty::Float),
-                            ("h", Ty::Float),
-                        ])
+                        &builtin_sig::RECT
                     };
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    self.typecheck_args(input.span, args, sig);
                     (None, Ty::Rect)
                 }
                 "polygon" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if let Some(layer) = args.posargs.first() {
-                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
-                    }
-                    if let Some(points) = args.posargs.get(1) {
-                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
-                    }
-                    let kwarg_defs = args
-                        .kwargs
-                        .iter()
-                        .filter_map(|kwarg| {
-                            polygon_coordinate(kwarg.name.name.as_str())
-                                .map(|_| (kwarg.name.name.as_str(), Ty::Float))
-                        })
-                        .collect();
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    let coordinates = args.kwargs.iter().filter_map(|kwarg| {
+                        let name = kwarg.name.name.as_str();
+                        polygon_coordinate(name).map(|_| (name, Ty::Float))
+                    });
+                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
+                    self.typecheck_args(input.span, args, &sig);
                     (None, Ty::Polygon)
                 }
                 "path" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if let Some(layer) = args.posargs.first() {
-                        self.assert_eq_ty(layer.span(), &layer.ty(), &Ty::String);
-                    }
-                    if let Some(points) = args.posargs.get(1) {
-                        self.assert_eq_ty(points.span(), &points.ty(), &Ty::Int);
-                    }
-                    let kwarg_defs = args
-                        .kwargs
-                        .iter()
-                        .filter_map(|kwarg| {
-                            let name = kwarg.name.name.as_str();
-                            (matches!(
-                                name,
-                                "width"
-                                    | "widthi"
-                                    | "begin_extension"
-                                    | "begin_extensioni"
-                                    | "end_extension"
-                                    | "end_extensioni"
-                            ) || polygon_coordinate(name).is_some())
-                            .then_some((name, Ty::Float))
-                        })
-                        .collect();
-                    self.typecheck_kwargs(&args.kwargs, kwarg_defs);
+                    let keywords = args.kwargs.iter().filter_map(|kwarg| {
+                        let name = kwarg.name.name.as_str();
+                        (matches!(
+                            name,
+                            "width"
+                                | "widthi"
+                                | "begin_extension"
+                                | "begin_extensioni"
+                                | "end_extension"
+                                | "end_extensioni"
+                        ) || polygon_coordinate(name).is_some())
+                        .then_some((name, Ty::Float))
+                    });
+                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
+                    self.typecheck_args(input.span, args, &sig);
                     (None, Ty::Path)
                 }
                 "text" => {
                     // text, layer, x, y
-                    self.typecheck_posargs(
-                        input.span,
-                        &args.posargs,
-                        &[Ty::String, Ty::String, Ty::Float, Ty::Float],
-                    );
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_args(input.span, args, &builtin_sig::TEXT);
                     (None, Ty::Nil)
                 }
                 "cons" => {
@@ -2320,8 +3202,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             self.errors.push(StaticError {
                                 span: self.span(args.posargs[1].span()),
                                 kind: StaticErrorKind::IncorrectTy {
-                                    found: tailty,
-                                    expected: seqty.clone(),
+                                    found: tailty.to_string(),
+                                    expected: seqty.to_string(),
                                 },
                             });
                         }
@@ -2331,7 +3213,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     }
                 }
                 "list" => {
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::NONE.kwargs);
                     if args.posargs.is_empty() {
                         self.errors.push(StaticError {
                             span: self.span(input.span),
@@ -2351,8 +3233,8 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                     self.errors.push(StaticError {
                                         span: self.span(arg.span()),
                                         kind: StaticErrorKind::IncorrectTy {
-                                            expected: elem_ty.clone(),
-                                            found: arg_ty,
+                                            expected: elem_ty.to_string(),
+                                            found: arg_ty.to_string(),
                                         },
                                     });
                                     elem_ty = Ty::Unknown;
@@ -2365,8 +3247,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "range_full" => {
                     // Native builtin backing `std::range`/`std::range_full`: builds the
                     // whole `[Int]` in one pass instead of recursive `cons`.
-                    self.typecheck_posargs(input.span, &args.posargs, &[Ty::Int, Ty::Int, Ty::Int]);
-                    self.typecheck_kwargs(&args.kwargs, IndexMap::default());
+                    self.typecheck_args(input.span, args, &builtin_sig::RANGE_FULL);
                     (None, Ty::Seq(Box::new(Ty::Int)))
                 }
                 "head" => {
@@ -2381,7 +3262,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                 self.errors.push(StaticError {
                                     span: self.span(input.span),
                                     kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty,
+                                        found: argty.to_string(),
                                         expected: "Seq".to_string(),
                                     },
                                 });
@@ -2405,7 +3286,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                                 self.errors.push(StaticError {
                                     span: self.span(input.span),
                                     kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty,
+                                        found: argty.to_string(),
                                         expected: "Seq".to_string(),
                                     },
                                 });
@@ -2427,7 +3308,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                             self.errors.push(StaticError {
                                 span: self.span(input.span),
                                 kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: argty,
+                                    found: argty.to_string(),
                                     expected: "Cell/Inst".to_string(),
                                 },
                             });
@@ -2436,44 +3317,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     (None, Ty::Rect)
                 }
                 "float" => {
-                    self.typecheck_args(input.span, args, &[], IndexMap::new());
+                    self.typecheck_args(input.span, args, &builtin_sig::NONE);
                     (None, Ty::Float)
                 }
                 "eq" => {
-                    self.typecheck_args(input.span, args, &[Ty::Float, Ty::Float], IndexMap::new());
+                    self.typecheck_args(input.span, args, &builtin_sig::EQ);
                     (None, Ty::Nil)
                 }
                 "dimension" => {
-                    self.typecheck_args(
-                        input.span,
-                        args,
-                        &[
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Float,
-                            Ty::Bool,
-                        ],
-                        IndexMap::new(),
-                    );
+                    self.typecheck_args(input.span, args, &builtin_sig::DIMENSION);
                     (None, Ty::Nil)
                 }
                 "inst" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    self.typecheck_kwargs(
-                        &args.kwargs,
-                        IndexMap::from_iter([
-                            ("reflect", Ty::Bool),
-                            ("angle", Ty::Int),
-                            ("x", Ty::Float),
-                            ("y", Ty::Float),
-                            ("xi", Ty::Float),
-                            ("yi", Ty::Float),
-                            ("construction", Ty::Bool),
-                        ]),
-                    );
+                    self.typecheck_args(input.span, args, &builtin_sig::INST);
                     if let Some(ty) = args.posargs.first() {
                         self.assert_ty_is_cell(ty.span(), &ty.ty());
                         match ty.ty() {
@@ -2488,29 +3344,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 name => self.typecheck_call(name, self.lookup(name), input.span, args, true),
             }
         } else {
-            let path = match func.path[0].name.as_str() {
-                "std" => {
-                    vec!["std".to_string()]
-                }
-                "lib" => func
-                    .path
-                    .iter()
-                    .skip(1)
-                    .dropping_back(1)
-                    .map(|ident| ident.name.to_string())
-                    .collect_vec(),
-                _ => self
-                    .current_path
-                    .iter()
-                    .cloned()
-                    .chain(
-                        func.path
-                            .iter()
-                            .dropping_back(1)
-                            .map(|ident| ident.name.to_string()),
-                    )
-                    .collect_vec(),
-            };
+            let path = module_prefix(
+                self.current_path,
+                func.path.iter().map(|ident| ident.name.as_str()),
+                1,
+            );
             let name = &func.path.last().unwrap().name;
             let lookup = self
                 .mod_bindings
@@ -2536,7 +3374,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         ) {
             self.errors.push(StaticError {
                 span: self.span(value.span()),
-                kind: StaticErrorKind::CannotEmit(ty.clone()),
+                kind: StaticErrorKind::CannotEmit(ty.to_string()),
             });
         }
         ty
@@ -2562,8 +3400,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             | (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Int)
             | (Ty::Float, Ty::Float) => (),
-            (_, Ty::Unknown) => (),
-            (Ty::Any, _) | (_, Ty::Any) => (),
+            // Either side being a wildcard suppresses the check: `Any` by
+            // definition, `Unknown` because the expression that produced it
+            // was already diagnosed. The source side used to admit only
+            // `Any`, so an undeclared name reported a second `invalid type
+            // cast`.
+            (source, target) if source.is_wildcard() || target.is_wildcard() => (),
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
@@ -2596,8 +3438,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         input: &ArgDecl<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
         _ty: &TySpec<Substr, Self::OutputMetadata>,
+        default: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::ArgDecl {
         let ty = self.ty_from_spec(&input.ty);
+        if let Some(default) = default {
+            self.assert_eq_ty(default.span(), &default.ty(), &ty);
+        }
         (self.alloc(&input.name.name, ty.clone()), ty)
     }
 
@@ -2646,7 +3492,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.seq.span()),
-                    kind: StaticErrorKind::CannotIterate { ty: seq_ty },
+                    kind: StaticErrorKind::CannotIterate {
+                        ty: seq_ty.to_string(),
+                    },
                 });
                 Ty::Unknown
             }
@@ -2680,6 +3528,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     }
 }
 
+/// A value passed to a cell.
+///
+/// A cell is compiled on its own and named by its arguments, so an argument
+/// has to be plain data: whatever the caller wrote, resolved to constants
+/// before the cell runs.
+///
+/// Shapes are passed *by value*. The caller's solver resolves their
+/// coordinates, and the cell receives those numbers unchanged, in its own
+/// coordinate frame: a cell can be instantiated anywhere, and any number of
+/// times, so nothing about a placement can reach them. Constraints the cell
+/// writes against a shape argument cannot move the caller's geometry either.
+/// Sharing live solver variables across a call is what `fn` is for.
+///
+/// Inside the cell a shape argument is construction geometry, so it draws
+/// nothing on its own. `!` draws it on its layer when it is *drawable*: when
+/// it stood for geometry drawn in the caller's layout, meaning it has a layer
+/// and is either layout geometry or a proxy of an instance's geometry. A
+/// `crect` or a `bbox` is not drawable, so `!` leaves it alone.
 #[derive(Debug, Clone)]
 pub enum CellArg {
     Float(f64),
@@ -2689,6 +3555,41 @@ pub enum CellArg {
     /// An enum variant, identified by name like [`Value::EnumValue`].
     Enum(String),
     Seq(Vec<CellArg>),
+    /// A struct value: the qualified name of its type and its fields in
+    /// declaration order, like [`Value::Struct`].
+    Struct {
+        name: String,
+        fields: Vec<(String, CellArg)>,
+    },
+    /// A rectangle, like [`Value::Rect`]: its layer and its solved corners.
+    Rect {
+        layer: Option<String>,
+        drawable: bool,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    /// A polygon, like [`Value::Polygon`]: its layer and its solved vertices.
+    Polygon {
+        layer: String,
+        drawable: bool,
+        points: Vec<(f64, f64)>,
+    },
+    /// A path, like [`Value::Path`]: its layer and its solved width,
+    /// centerline, and end extensions.
+    Path {
+        layer: String,
+        drawable: bool,
+        width: f64,
+        points: Vec<(f64, f64)>,
+        begin_extension: f64,
+        end_extension: f64,
+    },
+    /// A point, like [`Value::Point`]: its solved `x` and `y`.
+    Point(f64, f64),
+    /// A tuple, like [`Value::Tuple`]: its elements in order.
+    Tuple(Vec<CellArg>),
 }
 
 impl CellArg {
@@ -2698,12 +3599,31 @@ impl CellArg {
             (Self::Float(_), Ty::Float)
             | (Self::Int(_), Ty::Int)
             | (Self::Bool(_), Ty::Bool)
-            | (Self::String(_), Ty::String) => true,
+            | (Self::String(_), Ty::String)
+            | (Self::Rect { .. }, Ty::Rect)
+            | (Self::Polygon { .. }, Ty::Polygon)
+            | (Self::Path { .. }, Ty::Path)
+            | (Self::Point(..), Ty::Point) => true,
             (Self::Enum(variant), Ty::Enum(ty)) => ty.variants.contains(variant),
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner))
             }
             (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            (Self::Tuple(values), Ty::Tuple(tys)) => {
+                values.len() == tys.len()
+                    && values
+                        .iter()
+                        .zip(tys)
+                        .all(|(value, ty)| value.matches_ty(ty))
+            }
+            (Self::Struct { name, fields }, Ty::Struct(ty)) => {
+                *name == ty.name
+                    && fields.len() == ty.fields.len()
+                    && fields
+                        .iter()
+                        .zip(&ty.fields)
+                        .all(|((name, value), (field, ty))| name == field && value.matches_ty(ty))
+            }
             _ => false,
         }
     }
@@ -2716,6 +3636,12 @@ impl CellArg {
             Self::String(_) => "String",
             Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
+            Self::Struct { .. } => "struct",
+            Self::Rect { .. } => "Rect",
+            Self::Polygon { .. } => "Polygon",
+            Self::Path { .. } => "Path",
+            Self::Point(..) => "Point",
+            Self::Tuple(_) => "tuple",
         }
     }
 }
@@ -2727,14 +3653,49 @@ struct CellExecKey {
     scope_name: Option<String>,
 }
 
+/// A [`CellArg`] as something that can be hashed and compared: floats become
+/// their bits.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum CellArgKey {
+pub(crate) enum CellArgKey {
     Float(u64),
     Int(i64),
     Bool(bool),
     String(String),
     Enum(String),
     Seq(Vec<CellArgKey>),
+    Struct(String, Vec<(String, CellArgKey)>),
+    /// Layer, drawability, and `x0, y0, x1, y1`.
+    Rect(Option<String>, bool, [u64; 4]),
+    /// Layer, drawability, and the vertices.
+    Polygon(String, bool, Vec<(u64, u64)>),
+    /// Layer, drawability, the width and the begin and end extensions, and the
+    /// centerline points.
+    Path(String, bool, [u64; 3], Vec<(u64, u64)>),
+    Point(u64, u64),
+    Tuple(Vec<CellArgKey>),
+}
+
+/// The bits of each coordinate pair.
+fn point_bits(points: &[(f64, f64)]) -> Vec<(u64, u64)> {
+    points
+        .iter()
+        .map(|(x, y)| (x.to_bits(), y.to_bits()))
+        .collect()
+}
+
+/// Consecutive coordinates paired back up into points.
+fn pair_up(coords: &[f64]) -> Vec<(f64, f64)> {
+    coords
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[x, y]| (x, y))
+        .collect()
+}
+
+/// Constant coordinate pairs as solver expressions.
+fn constant_points(points: &[(f64, f64)]) -> Vec<(LinearExpr, LinearExpr)> {
+    points.iter().map(|&(x, y)| (x.into(), y.into())).collect()
 }
 
 impl From<&CellArg> for CellArgKey {
@@ -2746,6 +3707,49 @@ impl From<&CellArg> for CellArgKey {
             CellArg::String(s) => Self::String(s.clone()),
             CellArg::Enum(v) => Self::Enum(v.clone()),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
+            CellArg::Struct { name, fields } => Self::Struct(
+                name.clone(),
+                fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from(value)))
+                    .collect(),
+            ),
+            CellArg::Rect {
+                layer,
+                drawable,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => Self::Rect(
+                layer.clone(),
+                *drawable,
+                [x0.to_bits(), y0.to_bits(), x1.to_bits(), y1.to_bits()],
+            ),
+            CellArg::Polygon {
+                layer,
+                drawable,
+                points,
+            } => Self::Polygon(layer.clone(), *drawable, point_bits(points)),
+            CellArg::Path {
+                layer,
+                drawable,
+                width,
+                points,
+                begin_extension,
+                end_extension,
+            } => Self::Path(
+                layer.clone(),
+                *drawable,
+                [
+                    width.to_bits(),
+                    begin_extension.to_bits(),
+                    end_extension.to_bits(),
+                ],
+                point_bits(points),
+            ),
+            CellArg::Point(x, y) => Self::Point(x.to_bits(), y.to_bits()),
+            CellArg::Tuple(v) => Self::Tuple(v.iter().map(Self::from).collect()),
         }
     }
 }
@@ -2784,6 +3788,57 @@ pub fn format_initial_condition(value: f64, grid: f64) -> String {
         value
     } else {
         format!("{value}.")
+    }
+}
+
+#[cfg(test)]
+mod module_prefix_tests {
+    use super::module_prefix;
+
+    fn current() -> Vec<String> {
+        vec!["nested".to_owned()]
+    }
+
+    #[test]
+    fn a_relative_path_hangs_off_the_current_module() {
+        assert_eq!(
+            module_prefix(&current(), ["inner", "item"], 1),
+            ["nested", "inner"]
+        );
+        assert_eq!(module_prefix(&current(), ["item"], 1), ["nested"]);
+    }
+
+    #[test]
+    fn lib_and_std_are_absolute() {
+        assert_eq!(
+            module_prefix(&current(), ["lib", "utils", "item"], 1),
+            ["utils"]
+        );
+        assert_eq!(
+            module_prefix(&current(), ["std", "shapes", "item"], 1),
+            ["std"]
+        );
+    }
+
+    /// The leading segment decides which of the three forms a path takes, so
+    /// it has to be read before the item segments are dropped: `use lib;`
+    /// names the workspace root, not a `lib` child of the current module.
+    #[test]
+    fn a_single_segment_absolute_path_is_still_absolute() {
+        assert_eq!(module_prefix(&current(), ["lib"], 1), [] as [String; 0]);
+        assert_eq!(module_prefix(&current(), ["std"], 1), ["std"]);
+    }
+
+    #[test]
+    fn an_enum_variant_drops_both_its_item_segments() {
+        assert_eq!(
+            module_prefix(&current(), ["lib", "kinds", "Kind", "Variant"], 2),
+            ["kinds"]
+        );
+        assert_eq!(
+            module_prefix(&current(), ["Kind", "Variant"], 2),
+            ["nested"]
+        );
     }
 }
 
@@ -2993,6 +4048,19 @@ struct CellState {
     scopes: IndexMap<ScopeId, ExecScope>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
+    /// Values the *compiler* defaults when nothing else determines them, as
+    /// `(expr = 0, span)`, in source order.
+    ///
+    /// Distinct from `fallback_constraints`, which hold author-written initial
+    /// conditions (`x0i=`): those deliberately leave the cell underconstrained
+    /// and say so, and they rank *above* everything here. A default is the
+    /// last thing tried, so it can only ever pin a value nothing in the source
+    /// reached.
+    ///
+    /// The underconstrained check does not see that order: it is measured on a
+    /// trial solve with these applied, so a path extension nobody constrained
+    /// is not counted as a degree of freedom the author introduced.
+    compiler_defaults: VecDeque<(LinearExpr, Span)>,
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: IndexMap<ConstraintId, Span>,
@@ -3003,7 +4071,7 @@ struct CellState {
     /// A proxy is a view of geometry the instance's `SREF` already draws, so
     /// it is construction geometry by default. `!` on such a value is an
     /// explicit request to flatten that one shape into the parent as well;
-    /// [`ExecPass::mark_emitted_proxies_as_layout`] uses this set to tell the
+    /// [`mark_emitted_proxies_as_layout`] uses this set to tell the
     /// two apart once the emission list has been resolved to object IDs.
     proxy_objects: IndexSet<ObjectId>,
 }
@@ -3035,7 +4103,23 @@ struct ExecPass<'a> {
     // The first element of this stack is the root cell.
     // the last element of this stack is the current cell.
     partial_cells: VecDeque<CellId>,
-    compiled_cells: IndexMap<CellId, CompiledCell>,
+    compiled_cells: IndexMap<CellId, Arc<CompiledCell>>,
+    /// The ready `Value::Cell` naming each compiled cell, which is what a
+    /// proxy of a child instance's geometry points its `Instance::cell` at.
+    cell_values: HashMap<CellId, ValueId>,
+    /// Imported GDS hierarchies retained across source edits. `None` for a
+    /// one-shot compile, which has nothing to reuse across.
+    gds_cache: Option<&'a mut GdsCache>,
+    /// Content fingerprints for the workspace's declarations, which name cells
+    /// by content rather than by allocation order. Supplied by every public
+    /// entry point, so that the same source names its cells identically
+    /// however it was compiled.
+    items: Option<&'a ItemIndex>,
+    /// The same index behind an `Arc`, so a cache entry can record which
+    /// revision its spans were written against without cloning it.
+    items_arc: Option<Arc<ItemIndex>>,
+    /// Compiled cells retained across source edits.
+    cell_cache: Option<&'a mut CellCache>,
     compiled_cell_cache: HashMap<CellExecKey, CellId>,
     /// Cell declaration generated for a compiler entry point's invocation, and
     /// the cell it executed as. A call made directly by that cell is the
@@ -3169,6 +4253,11 @@ impl<'a> ExecPass<'a> {
             next_id: 6,
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
+            cell_values: HashMap::new(),
+            gds_cache: None,
+            items: None,
+            items_arc: None,
+            cell_cache: None,
             compiled_cell_cache: HashMap::new(),
             entry_cell_var: None,
             entry_cell: None,
@@ -3377,7 +4466,7 @@ impl<'a> ExecPass<'a> {
         // Reject a non-cell invocation statically, so the error lands on what
         // the caller wrote rather than surfacing from the executor.
         let ty = value.ty();
-        if !matches!(ty, Ty::Cell(_) | Ty::Any) {
+        if !(matches!(ty, Ty::Cell(_)) || ty.is_wildcard()) {
             return CompileOutput::StaticErrors(StaticErrorCompileOutput {
                 errors: vec![StaticError {
                     span: Span {
@@ -3385,7 +4474,7 @@ impl<'a> ExecPass<'a> {
                         span: value.span(),
                     },
                     kind: StaticErrorKind::IncorrectTyCategory {
-                        found: ty,
+                        found: ty.to_string(),
                         expected: "Cell".into(),
                     },
                 }],
@@ -3447,6 +4536,140 @@ impl<'a> ExecPass<'a> {
         }
     }
 
+    /// Applies every pending author fallback that is independent of the ones
+    /// already applied this round, in strict priority order.
+    ///
+    /// Fallbacks whose variables lie in disjoint components of the live
+    /// constraint graph cannot affect each other's `has_unsolved_var` test or
+    /// each other's back-substitution, so applying them in one round is
+    /// indistinguishable from applying them one at a time with a `solve()`
+    /// between each.
+    ///
+    /// Candidates are inspected with `peek` and popped only when they are
+    /// applied, so nothing is ever pushed back onto the heap -- which matters
+    /// because `FallbackConstraint`'s ordering compares only `priority`,
+    /// leaving ties to `BinaryHeap` internals. The first candidate that
+    /// collides with a claimed component ends the round rather than being
+    /// skipped over, which is what keeps `fallback_constraints_used` in
+    /// priority order.
+    fn apply_independent_fallbacks(state: &mut CellState) {
+        let labels = state.solver.unsolved_var_components();
+        let mut claimed = IndexSet::new();
+        while let Some(fallback) = state.fallback_constraints.peek() {
+            if !state.solver.has_unsolved_var(&fallback.constraint) {
+                state.fallback_constraints.pop();
+                continue;
+            }
+            let components = state
+                .solver
+                .unsolved_component_labels(&fallback.constraint, &labels);
+            if components.iter().any(|label| claimed.contains(label)) {
+                break;
+            }
+            claimed.extend(components);
+            let FallbackConstraint {
+                constraint,
+                span,
+                initial_condition,
+                ..
+            } = state
+                .fallback_constraints
+                .pop()
+                .expect("peeked a fallback just above");
+            state.fallback_constraints_used.push(UsedFallback {
+                constraint: constraint.clone(),
+                span: span.clone(),
+                initial_condition,
+            });
+            let id = state.solver.constrain_eq0(constraint);
+            state.constraint_span_map.insert(id, span);
+        }
+    }
+
+    /// The compiler-default counterpart of
+    /// [`Self::apply_independent_fallbacks`], with the same
+    /// component-disjointness rule and the same order guarantee. Returns
+    /// whether anything was applied.
+    fn apply_independent_defaults(state: &mut CellState) -> bool {
+        let labels = state.solver.unsolved_var_components();
+        let mut claimed = IndexSet::new();
+        let mut applied = false;
+        while let Some((constraint, _)) = state.compiler_defaults.front() {
+            if !state.solver.has_unsolved_var(constraint) {
+                state.compiler_defaults.pop_front();
+                continue;
+            }
+            let components = state.solver.unsolved_component_labels(constraint, &labels);
+            if components.iter().any(|label| claimed.contains(label)) {
+                break;
+            }
+            claimed.extend(components);
+            let (constraint, span) = state
+                .compiler_defaults
+                .pop_front()
+                .expect("peeked a default just above");
+            let id = state.solver.constrain_eq0(constraint);
+            state.constraint_span_map.insert(id, span);
+            applied = true;
+        }
+        applied
+    }
+
+    /// Records the cell's degrees of freedom and reports them, once.
+    ///
+    /// Measured on a trial solve with every pending compiler default applied:
+    /// a path extension nobody constrained is not a degree of freedom the
+    /// author introduced, and counting it would report every path without an
+    /// extension kwarg as underconstrained. The trial is rolled back rather
+    /// than kept, because those defaults rank below the author's fallbacks and
+    /// none of those have been applied yet.
+    ///
+    /// A trial that solves everything means the only freedom was the
+    /// compiler's own, which is not something to report.
+    fn report_underconstrained(&mut self, cell_id: CellId) {
+        let state = self.cell_state_mut(cell_id);
+        if state.unsolved_vars.is_some() {
+            return;
+        }
+        let snapshot = state.solver.clone();
+        let mut index = 0;
+        while index < state.compiler_defaults.len() {
+            let constraint = state.compiler_defaults[index].0.clone();
+            if state.solver.has_unsolved_var(&constraint) {
+                state.solver.constrain_eq0(constraint);
+                state.solver.solve();
+            }
+            index += 1;
+        }
+        let unsolved_vars = state.solver.unsolved_vars().clone();
+        let spans = unsolved_vars
+            .iter()
+            .filter_map(|var| state.var_span_map.get(var).cloned())
+            .collect::<IndexSet<_>>();
+        state.sse_basis = match state.solver.sparse_nullspace_vecs() {
+            Some(vectors) => SseBasis::Nullspace(vectors),
+            None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
+        };
+        // The trial's constraint ids roll back with it, so nothing above
+        // recorded a span for one.
+        state.solver = snapshot;
+        let underconstrained = !unsolved_vars.is_empty();
+        state.unsolved_vars = Some(unsolved_vars);
+        if !underconstrained {
+            return;
+        }
+        let spans = if spans.is_empty() {
+            vec![None]
+        } else {
+            spans.into_iter().map(Some).collect()
+        };
+        self.errors.extend(spans.into_iter().map(|span| ExecError {
+            span,
+            cell: cell_id,
+            kind: ExecErrorKind::Underconstrained,
+        }));
+    }
+
     pub(crate) fn execute_cell(
         &mut self,
         cell: VarId,
@@ -3460,6 +4683,9 @@ impl<'a> ExecPass<'a> {
         };
         if let Some(cell_id) = self.compiled_cell_cache.get(&cache_key) {
             return Ok(*cell_id);
+        }
+        if let Some(cell_id) = self.reinstate_cell(cell, &cache_key) {
+            return Ok(cell_id);
         }
         // Cell instantiation recurses natively between here and
         // `eval_partial`, so a hierarchy deeper than the stack allows aborts
@@ -3488,6 +4714,10 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        // Watermarks for what this cell costs: the diagnostics it reports and
+        // the ids it consumes, both of which a cache hit has to reproduce.
+        let cell_errors_start = self.errors.len();
+        let ids_start = self.next_id;
         if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
             if !args.is_empty() {
                 self.errors.push(ExecError {
@@ -3536,7 +4766,7 @@ impl<'a> ExecPass<'a> {
                 cell: 0,
                 kind: ExecErrorKind::InvalidCellArgumentType {
                     index: index + 1,
-                    expected: decl.metadata.1.clone(),
+                    expected: decl.metadata.1.to_string(),
                     found: arg.ty_name().to_string(),
                 },
             });
@@ -3560,7 +4790,9 @@ impl<'a> ExecPass<'a> {
             bindings: Default::default(),
         };
 
-        let cell_id = self.alloc_id();
+        let cell_id = self
+            .source_cell_id(cell, &cache_key)
+            .unwrap_or_else(|| self.alloc_id());
         if self.entry_cell_var == Some(cell) {
             self.entry_cell = Some(cell_id);
         }
@@ -3580,6 +4812,7 @@ impl<'a> ExecPass<'a> {
                         scopes: IndexMap::from_iter([(root_scope_id, root_scope)]),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
+                        compiler_defaults: VecDeque::new(),
                         sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
@@ -3592,9 +4825,15 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
-        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
+        for (arg, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
-            let val = Value::from_arg(&val);
+            // Built directly: `Self::span` resolves through a location, and
+            // the cell has no frame yet.
+            let span = Span {
+                path: cell_decl.metadata.0.clone(),
+                span: decl.name.span,
+            };
+            let val = self.bind_cell_arg(cell_id, &span, &arg);
             self.values.insert(vid, DeferValue::Ready(val));
             frame.bindings.insert(decl.metadata.0, vid);
         }
@@ -3681,65 +4920,51 @@ impl<'a> ExecPass<'a> {
             update_var_dependents(state);
 
             if !progress {
-                let underconstrained_spans = {
-                    let state = self.cell_state_mut(cell_id);
-                    if state.unsolved_vars.is_some() {
-                        None
-                    } else {
-                        let unsolved_vars = state.solver.unsolved_vars().clone();
-                        let spans = unsolved_vars
-                            .iter()
-                            .filter_map(|var| state.var_span_map.get(var).cloned())
-                            .collect::<IndexSet<_>>();
-                        state.unsolved_vars = Some(unsolved_vars);
-                        state.sse_basis = match state.solver.sparse_nullspace_vecs() {
-                            Some(vectors) => SseBasis::Nullspace(vectors),
-                            None => SseBasis::Rowspace(state.solver.rowspace_vecs()),
-                        };
-                        Some(spans)
-                    }
-                };
-                if let Some(spans) = underconstrained_spans {
-                    let spans = if spans.is_empty() {
-                        vec![None]
-                    } else {
-                        spans.into_iter().map(Some).collect()
-                    };
-                    self.errors.extend(spans.into_iter().map(|span| ExecError {
-                        span,
-                        cell: cell_id,
-                        kind: ExecErrorKind::Underconstrained,
-                    }));
-                }
-                let mut constraint_added = false;
                 let state = self.cell_state_mut(cell_id);
-                while let Some(FallbackConstraint {
-                    constraint,
-                    span,
-                    initial_condition,
-                    ..
-                }) = state.fallback_constraints.pop()
-                {
-                    if constraint
-                        .coeffs
-                        .iter()
-                        .any(|(c, v)| c.abs() > 1e-6 && !state.solver.is_solved(*v))
-                    {
-                        state.fallback_constraints_used.push(UsedFallback {
-                            constraint: constraint.clone(),
-                            span: span.clone(),
-                            initial_condition,
-                        });
-                        let constraint_id = state.solver.constrain_eq0(constraint);
-                        state.constraint_span_map.insert(constraint_id, span);
-                        constraint_added = true;
+                // Drop fallbacks another constraint has since made moot, so
+                // that what remains on top -- if anything -- is the
+                // highest-priority one that still determines something.
+                while let Some(fallback) = state.fallback_constraints.peek() {
+                    if state.solver.has_unsolved_var(&fallback.constraint) {
                         break;
                     }
+                    state.fallback_constraints.pop();
+                }
+                let has_fallback = !state.fallback_constraints.is_empty();
+                let mut constraint_added = false;
+                if !has_fallback {
+                    // Compiler defaults rank below every author-written
+                    // fallback: they say what a value is when *nothing* in the
+                    // source determines it. Applying one before the fallbacks
+                    // had their turn let a compiler zero propagate through the
+                    // author's own constraints and determine the variable an
+                    // `x0i=` was waiting for, which was then skipped as moot.
+                    //
+                    // Within one round they are applied as a batch, but only
+                    // across *independent* components -- see
+                    // `apply_independent_defaults`.
+                    constraint_added = Self::apply_independent_defaults(state);
                 }
                 if !constraint_added {
-                    state.solver.force_solution();
-                    update_var_dependents(state);
+                    // Either an author fallback is about to be applied or
+                    // nothing is left to apply at all. Both are the moment to
+                    // measure the cell's degrees of freedom: every compiler
+                    // default has had its turn, and no fallback -- which is an
+                    // author saying "leave this free" -- has been taken up yet.
+                    self.report_underconstrained(cell_id);
+                    let state = self.cell_state_mut(cell_id);
+                    if has_fallback {
+                        Self::apply_independent_fallbacks(state);
+                    } else {
+                        state.solver.force_solution();
+                    }
                 }
+                let state = self.cell_state_mut(cell_id);
+                // `constrain_eq0` and `force_solution` can solve variables
+                // outright. Values blocked on one are re-queued only here, so
+                // skipping this let the loop exit with a value still deferred
+                // and `emit` panic on it.
+                update_var_dependents(state);
             }
         }
 
@@ -3800,6 +5025,11 @@ impl<'a> ExecPass<'a> {
             self.cell_state(cell_id)
                 .emit
                 .iter()
+                // A poisoned value has no object to emit, but it already
+                // reported why. Adding `CannotEmit` on top would be the second
+                // error for one mistake, and the `Err` below would then throw
+                // away the layout the rest of the cell produced.
+                .filter(|emit| !self.is_poisoned(emit.value))
                 .filter(|emit| {
                     !self.values[&emit.value]
                         .get_ready()
@@ -3820,9 +5050,147 @@ impl<'a> ExecPass<'a> {
         }
 
         let cell = self.emit(cell_id);
-        assert!(self.compiled_cells.insert(cell_id, cell).is_none());
+        assert!(
+            self.compiled_cells
+                .insert(cell_id, Arc::new(cell))
+                .is_none()
+        );
+        // Every compiled cell has a ready `Value::Cell`, so a proxy built from
+        // one of its nested instances can name it without allocating a value
+        // from inside the borrow split in `eval_partial`.
+        self.cell_value(cell_id);
         self.compiled_cell_cache.insert(cache_key, cell_id);
+        self.retain_cell(cell_id, cell_errors_start, ids_start);
         Ok(cell_id)
+    }
+
+    /// Serves a cell from the session cache, if it is there and still valid.
+    fn reinstate_cell(&mut self, cell: VarId, key: &CellExecKey) -> Option<CellId> {
+        let id = self.source_cell_id(cell, key)?;
+        let items = self.items_arc.clone()?;
+        self.cell_cache.as_ref()?;
+        // Already materialized this run -- by an instantiation under a
+        // different key, or as part of another cell's closure. A fresh
+        // execution would have served this from `compiled_cell_cache` without
+        // re-reporting anything, so neither the diagnostics nor the id
+        // consumption may be replayed a second time.
+        if self.compiled_cells.contains_key(&id) {
+            self.compiled_cell_cache.insert(key.clone(), id);
+            return Some(id);
+        }
+        let ids_start = self.next_id;
+        let closure = self.cell_cache.as_deref_mut()?.reinstate(id, &items)?;
+        let mut consumed = 0;
+        for (cell_id, entry) in closure {
+            consumed = consumed.max(entry.ids_consumed);
+            self.compiled_cells.insert(cell_id, entry.cell);
+            self.cell_value(cell_id);
+            if cell_id == id {
+                // Only the cell that was asked for replays its diagnostics.
+                // Its children's were folded into it when it was compiled,
+                // exactly as the intra-run cache reports them once per
+                // distinct instantiation.
+                self.errors.extend(entry.errors);
+            }
+        }
+        self.next_id = ids_start + consumed;
+        // Record the intra-run mapping the fresh path records, so a second
+        // instantiation with the same key is a plain lookup rather than
+        // another closure walk that replays this cell's diagnostics.
+        self.compiled_cell_cache.insert(key.clone(), id);
+        Some(id)
+    }
+
+    /// Records a freshly compiled cell for reuse in a later revision.
+    fn retain_cell(&mut self, id: CellId, errors_start: usize, ids_start: u64) {
+        // A cell is named by content only when the session supplied
+        // fingerprints, and the generated entry cell is never named at all.
+        if self.items_arc.is_none() || !is_content_id(id) {
+            return;
+        }
+        // A depth failure is charged against the *ambient* evaluation depth,
+        // not against anything about this cell, so a cell that hit one is not
+        // a fact about the program: its geometry is truncated by wherever it
+        // happened to be instantiated from. Never retain one.
+        let errors = self.errors[errors_start..].to_vec();
+        if errors
+            .iter()
+            .any(|error| matches!(error.kind, ExecErrorKind::RecursionLimitExceeded { .. }))
+        {
+            return;
+        }
+        let Some(cell) = self.compiled_cells.get(&id).cloned() else {
+            return;
+        };
+        let children = cell
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                SolvedValue::Instance(inst) => Some(inst.cell),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Retaining a parent whose children are not retained would guarantee a
+        // miss on every future lookup, since `reinstate` requires the whole
+        // closure. GDS-imported children live in their own cache.
+        let items = self.items_arc.clone().expect("checked above");
+        if let Some(cache) = self.cell_cache.as_deref_mut() {
+            if children
+                .iter()
+                .any(|child| is_content_id(*child) && !cache.contains(*child))
+            {
+                return;
+            }
+            cache.insert(
+                id,
+                CachedCell {
+                    cell,
+                    children,
+                    errors,
+                    ids_consumed: self.next_id - ids_start,
+                    items,
+                },
+            );
+        }
+    }
+
+    /// Retains imported GDS hierarchies in `cache` instead of re-importing
+    /// them.
+    fn with_gds_cache(mut self, cache: &'a mut GdsCache) -> Self {
+        self.gds_cache = Some(cache);
+        self
+    }
+
+    /// Names cells by content instead of by allocation order, so that a cell
+    /// compiled in one revision can be recognised in the next.
+    fn with_items(mut self, items: &'a ItemIndex) -> Self {
+        self.items = Some(items);
+        self
+    }
+
+    /// Retains compiled cells in `cache` across source edits.
+    fn with_cell_cache(mut self, cache: &'a mut CellCache, items: Arc<ItemIndex>) -> Self {
+        self.cell_cache = Some(cache);
+        self.items_arc = Some(items);
+        self
+    }
+
+    /// The id for a cell about to be executed from source.
+    ///
+    /// `None` for the generated entry cell a compiler invocation splices in,
+    /// which is not part of the workspace and is never reused: its text
+    /// differs per invocation, and `execute_invocation` reads its `CellState`,
+    /// which a reinstated cell would not have.
+    fn source_cell_id(&self, cell: VarId, key: &CellExecKey) -> Option<CellId> {
+        if self.entry_cell_var == Some(cell) {
+            return None;
+        }
+        let fingerprint = self.items?.fingerprint(cell)?;
+        Some(gdscache::source_cell_id(
+            fingerprint,
+            &key.args,
+            key.scope_name.as_deref(),
+        ))
     }
 
     fn execute_gds_cell(
@@ -3831,31 +5199,56 @@ impl<'a> ExecPass<'a> {
         path: &FsPath,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        let ids_start = self.next_id;
+        let key = GdsImportKey {
+            declared_name: declared_name.to_owned(),
+            path: path.to_path_buf(),
+            scope_name: scope_name.clone(),
+        };
+        if let Some(cache) = self.gds_cache.as_deref_mut()
+            && let Some(entry) = cache.get(&key)
+        {
+            // Reinstated wholesale and in import order, so `compiled_cells`
+            // ends up exactly as a fresh import would leave it.
+            for (cell_id, cell) in entry.cells {
+                self.compiled_cells.insert(cell_id, cell);
+                self.cell_value(cell_id);
+            }
+            self.next_id = ids_start + entry.ids_consumed;
+            return Ok(entry.top);
+        }
         let imported = match import_gds(path, declared_name, &self.tech) {
             Ok(imported) => imported,
             Err(error) => {
                 self.errors.push(ExecError {
                     span: None,
                     cell: 0,
-                    kind: ExecErrorKind::InvalidGds(error.to_string()),
+                    // `{:#}` walks the whole `anyhow` chain. `to_string()`
+                    // renders only the outermost context, so a missing file, a
+                    // truncated one, and a malformed record all arrived as the
+                    // same "could not read imported GDS `..`" with the cause
+                    // discarded.
+                    kind: ExecErrorKind::InvalidGds(format!("{error:#}")),
                 });
                 return Err(());
             }
         };
+        // Only the import's top cell takes its scope name from the caller, so
+        // only its id depends on it; the structures beneath are shared between
+        // scope names rather than duplicated.
+        let top_scope_name = |index: usize| {
+            (index == imported.top)
+                .then_some(scope_name.as_deref())
+                .flatten()
+        };
         let cell_ids = (0..imported.structs.len())
-            .map(|_| self.alloc_id())
+            .map(|index| gds_cell_id(declared_name, path, index, top_scope_name(index)))
             .collect::<Vec<_>>();
         // Imported hierarchy has no source-level cell calls, but field access
         // through a child instance still needs a ready cell value.
-        let cell_vids = cell_ids
-            .iter()
-            .map(|cell_id| {
-                let vid = self.value_id();
-                self.values
-                    .insert(vid, DeferValue::Ready(Value::Cell(*cell_id)));
-                vid
-            })
-            .collect::<Vec<_>>();
+        for cell_id in &cell_ids {
+            self.cell_value(*cell_id);
+        }
         let top_id = cell_ids[imported.top];
         for (structure_index, structure) in imported.structs.into_iter().enumerate() {
             let cell_id = cell_ids[structure_index];
@@ -3967,7 +5360,6 @@ impl<'a> ExecPass<'a> {
                             construction: false,
                             cell: cell_ids[cell],
                             span: span.clone(),
-                            cell_vid: cell_vids[cell],
                         }),
                         Some(format!("gds_inst_{element_index}")),
                     ),
@@ -4007,7 +5399,7 @@ impl<'a> ExecPass<'a> {
             )]);
             self.compiled_cells.insert(
                 cell_id,
-                CompiledCell {
+                Arc::new(CompiledCell {
                     name: structure_name,
                     scopes,
                     root,
@@ -4017,6 +5409,20 @@ impl<'a> ExecPass<'a> {
                     fallback_constraints_used: Vec::new(),
                     unsolved_vars: IndexSet::new(),
                     inconsistent_constraints: IndexSet::new(),
+                }),
+            );
+        }
+        if let Some(cache) = self.gds_cache.as_deref_mut() {
+            let cells = cell_ids
+                .iter()
+                .map(|cell_id| (*cell_id, self.compiled_cells[cell_id].clone()))
+                .collect();
+            cache.insert(
+                key,
+                GdsImportEntry {
+                    top: top_id,
+                    cells,
+                    ids_consumed: self.next_id - ids_start,
                 },
             );
         }
@@ -4230,7 +5636,6 @@ impl<'a> ExecPass<'a> {
                         .into_cell()
                         .expect("inst parent not a cell"),
                     span: inst.span.clone(),
-                    cell_vid: inst.cell,
                 }),
             }
         };
@@ -4264,6 +5669,15 @@ impl<'a> ExecPass<'a> {
 
         let mut emitted = IndexSet::new();
         for emit in state.emit.iter() {
+            // A poisoned value reported its own diagnostic and never became an
+            // object. Skipping it is what lets the rest of the cell reach the
+            // GUI instead of the whole compile returning no layout at all.
+            if matches!(
+                self.values[&emit.value].as_ref().into_ready(),
+                Some(Value::Poison)
+            ) {
+                continue;
+            }
             let obj_id = emit_value(emit.value)
                 .expect("failed to emit")
                 .into_elem()
@@ -4320,6 +5734,18 @@ impl<'a> ExecPass<'a> {
         let id = self.next_id;
         self.next_id += 1;
         id
+    }
+
+    /// The ready `Value::Cell` for `cell`, created on first use.
+    fn cell_value(&mut self, cell: CellId) -> ValueId {
+        if let Some(vid) = self.cell_values.get(&cell) {
+            return *vid;
+        }
+        let vid = self.value_id();
+        self.values
+            .insert(vid, DeferValue::Ready(Value::Cell(cell)));
+        self.cell_values.insert(cell, vid);
+        vid
     }
 
     fn frame_id(&mut self) -> FrameId {
@@ -4512,6 +5938,88 @@ impl<'a> ExecPass<'a> {
             .unwrap_or(self.nil_value)
     }
 
+    /// Creates an empty frame whose parent is the global frame.
+    fn new_call_frame(&mut self) -> FrameId {
+        let fid = self.frame_id();
+        self.frames.insert(
+            fid,
+            Frame {
+                bindings: Default::default(),
+                parent: Some(self.global_frame),
+            },
+        );
+        fid
+    }
+
+    /// Evaluates a call's explicit arguments in the caller's context: one slot
+    /// per parameter in declaration order, `None` where the default applies.
+    fn explicit_args(
+        &mut self,
+        loc: DynLoc,
+        call: &CallExpr<Substr, VarIdTyMetadata>,
+        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+    ) -> Vec<Option<ValueId>> {
+        params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| {
+                let arg = match call.args.posargs.get(index) {
+                    Some(arg) => arg,
+                    None => {
+                        let kwarg = call
+                            .args
+                            .kwargs
+                            .iter()
+                            .find(|kwarg| kwarg.name.name == param.name.name)?;
+                        &kwarg.value
+                    }
+                };
+                Some(self.visit_expr(loc, arg))
+            })
+            .collect()
+    }
+
+    /// Binds every parameter in `loc.frame` and returns the bound values in
+    /// declaration order. A parameter without an explicit argument gets its
+    /// default, evaluated in a scope of its own under `loc.scope` once the
+    /// parameters before it are bound.
+    fn bind_args(
+        &mut self,
+        loc: DynLoc,
+        call_order: u64,
+        path: &FsPath,
+        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+        explicit: Vec<Option<ValueId>>,
+    ) -> Vec<ValueId> {
+        params
+            .iter()
+            .zip(explicit)
+            .map(|(param, explicit)| {
+                let value = match (explicit, &param.default) {
+                    (Some(value), _) => value,
+                    (None, Some(default)) => {
+                        let scope = self.create_exec_scope_at_loc(
+                            loc,
+                            format!("{call_order} default {}", param.name.name),
+                            Span {
+                                path: path.to_path_buf(),
+                                span: default.span(),
+                            },
+                        );
+                        self.visit_expr(DynLoc { scope, ..loc }, default)
+                    }
+                    (None, None) => unreachable!("a parameter without an argument has a default"),
+                };
+                self.frames
+                    .get_mut(&loc.frame)
+                    .unwrap()
+                    .bindings
+                    .insert(param.metadata.0, value);
+                value
+            })
+            .collect()
+    }
+
     fn new_ready_value(&mut self, val: Value) -> ValueId {
         let vid = self.value_id();
         self.values.insert(vid, Defer::Ready(val));
@@ -4589,33 +6097,19 @@ impl<'a> ExecPass<'a> {
                         }))
                     })
                 } else {
-                    let arg_vals = c
-                        .args
-                        .posargs
-                        .iter()
-                        .map(|arg| self.visit_expr(loc, arg))
-                        .collect_vec();
-                    let val = &self.values[&self
+                    let callee = self
                         .lookup(
                             loc.frame,
                             c.metadata
                                 .0
                                 .expect("no var ID assigned to function being called"),
                         )
-                        .unwrap()]
-                        .as_ref()
-                        .unwrap_ready()
-                        .as_ref();
-                    match val {
+                        .unwrap();
+                    match self.values[&callee].as_ref().unwrap_ready().as_ref() {
                         ValueRef::Fn(val) => {
-                            let mut call_frame = Frame {
-                                bindings: Default::default(),
-                                parent: Some(self.global_frame),
-                            };
-                            for (arg_val, arg_decl) in arg_vals.iter().zip(&val.args) {
-                                call_frame.bindings.insert(arg_decl.metadata.0, *arg_val);
-                            }
-                            let new_scope = val.scope.clone();
+                            let (params, body, path) =
+                                (val.args.clone(), val.scope.clone(), val.metadata.0.clone());
+                            let explicit = self.explicit_args(loc, c, &params);
                             let scope = self.create_exec_scope(
                                 loc.cell,
                                 loc.scope,
@@ -4626,12 +6120,11 @@ impl<'a> ExecPass<'a> {
                                     c.func.path.iter().map(|ident| &ident.name).join("::")
                                 ),
                                 Span {
-                                    path: val.metadata.0.clone(),
-                                    span: val.scope.span,
+                                    path: path.clone(),
+                                    span: body.span,
                                 },
                             );
-                            let fid = self.frame_id();
-                            self.frames.insert(fid, call_frame);
+                            let fid = self.new_call_frame();
                             // A `fn` body is inlined here and now, unlike an
                             // `if`/`match` branch, so a recursive call that is
                             // not inside one descends natively with no
@@ -4648,25 +6141,34 @@ impl<'a> ExecPass<'a> {
                                 });
                                 return self.nil_value;
                             }
-                            let value =
-                                self.visit_scope_expr_inner(loc.cell, fid, scope, &new_scope);
+                            let callee_loc = DynLoc {
+                                cell: loc.cell,
+                                frame: fid,
+                                scope,
+                                seq_num: SeqNum::new(),
+                            };
+                            self.bind_args(callee_loc, c.scope_order, &path, &params, explicit);
+                            let value = self.visit_scope_expr_inner(loc.cell, fid, scope, &body);
                             self.eval_depth -= 1;
                             value
                         }
-                        ValueRef::CellFn(_) => self.new_deferred_value(loc, |this| {
-                            PartialEvalState::Call(Box::new(PartialCallExpr {
-                                expr: c.clone(),
-                                state: CallExprState {
-                                    posargs: arg_vals,
-                                    kwargs: c
-                                        .args
-                                        .kwargs
-                                        .iter()
-                                        .map(|arg| this.visit_expr(loc, &arg.value))
-                                        .collect(),
-                                },
-                            }))
-                        }),
+                        ValueRef::CellFn(val) => {
+                            let (params, path) = (val.args.clone(), val.metadata.0.clone());
+                            let explicit = self.explicit_args(loc, c, &params);
+                            let fid = self.new_call_frame();
+                            let callee_loc = DynLoc { frame: fid, ..loc };
+                            let posargs =
+                                self.bind_args(callee_loc, c.scope_order, &path, &params, explicit);
+                            self.new_deferred_value(loc, |_| {
+                                PartialEvalState::Call(Box::new(PartialCallExpr {
+                                    expr: c.clone(),
+                                    state: CallExprState {
+                                        posargs,
+                                        kwargs: Vec::new(),
+                                    },
+                                }))
+                            })
+                        }
                         _ => {
                             self.errors.push(ExecError {
                                 span: Some(self.span(&loc, c.span)),
@@ -4692,14 +6194,6 @@ impl<'a> ExecPass<'a> {
                 PartialEvalState::Match(Box::new(PartialMatchExpr {
                     expr: (**match_expr).clone(),
                     state: MatchExprState::Scrutinee(scrutinee),
-                }))
-            }),
-            Expr::Comparison(comparison_expr) => self.new_deferred_value(loc, |this| {
-                let left = this.visit_expr(loc, &comparison_expr.left);
-                let right = this.visit_expr(loc, &comparison_expr.right);
-                PartialEvalState::Comparison(Box::new(PartialComparisonExpr {
-                    expr: (**comparison_expr).clone(),
-                    state: ComparisonExprState { left, right },
                 }))
             }),
             Expr::Scope(s) => {
@@ -4732,16 +6226,38 @@ impl<'a> ExecPass<'a> {
                     state: IndexExprState { base, index },
                 }))
             }),
-            Expr::BinOp(b) => self.new_deferred_value(loc, |this| {
-                let lhs = this.visit_expr(loc, &b.left);
-                let rhs = this.visit_expr(loc, &b.right);
-                PartialEvalState::BinOp(PartialBinOp {
-                    lhs,
-                    rhs,
-                    op: b.op,
-                    expr: b.clone(),
-                })
-            }),
+            Expr::BinOp(b) => match b.op {
+                BinOp::Arith(op) => self.new_deferred_value(loc, |this| {
+                    let left = this.visit_expr(loc, &b.left);
+                    let right = this.visit_expr(loc, &b.right);
+                    PartialEvalState::Arith(PartialArith {
+                        left,
+                        right,
+                        op,
+                        expr: b.clone(),
+                    })
+                }),
+                BinOp::Cmp(op) => self.new_deferred_value(loc, |this| {
+                    let left = this.visit_expr(loc, &b.left);
+                    let right = this.visit_expr(loc, &b.right);
+                    PartialEvalState::Comparison(Box::new(PartialComparison {
+                        op,
+                        expr: (**b).clone(),
+                        left,
+                        right,
+                    }))
+                }),
+                BinOp::Bool(op) => {
+                    let left = self.visit_expr(loc, &b.left);
+                    self.new_deferred_value(loc, |_| {
+                        PartialEvalState::BoolOp(Box::new(PartialBoolOp {
+                            op,
+                            expr: (**b).clone(),
+                            state: BoolOpState::Left(left),
+                        }))
+                    })
+                }
+            },
             Expr::UnaryOp(u) => self.new_deferred_value(loc, |this| {
                 let operand = this.visit_expr(loc, &u.operand);
                 PartialEvalState::UnaryOp(PartialUnaryOp {
@@ -4769,6 +6285,28 @@ impl<'a> ExecPass<'a> {
                         .collect(),
                 })
             }),
+            Expr::StructLit(lit) => {
+                // A static error aborts compilation before anything is
+                // executed, so the literal is known to name a struct.
+                let Ty::Struct(ty) = &lit.metadata else {
+                    unreachable!("struct literal was not resolved to a struct type")
+                };
+                let ty = ty.clone();
+                self.new_deferred_value(loc, |this| {
+                    let fields = lit
+                        .fields
+                        .iter()
+                        .map(|field| this.visit_expr(loc, &field.value))
+                        .collect();
+                    let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
+                    PartialEvalState::StructLit(Box::new(PartialStructLit {
+                        expr: (**lit).clone(),
+                        ty,
+                        fields,
+                        base,
+                    }))
+                })
+            }
         }
     }
 
@@ -4787,10 +6325,161 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
+    /// Binds an argument of the cell `cell_id` as a value in it.
+    ///
+    /// Scalars, sequences, and structs are copied. A shape becomes
+    /// construction geometry of the cell, rebuilt from the constants the
+    /// caller resolved. It is registered as an object, so that emitting it or
+    /// binding it to a field never leaves a dangling id, but not emitted
+    /// itself, so it draws nothing and adds nothing to the cell's extent. A
+    /// drawable shape is also recorded as a proxy, which is how `!` opts in
+    /// to drawing it here on its own layer -- see
+    /// [`mark_emitted_proxies_as_layout`]. `span` is the parameter's
+    /// declaration, which is where the shape is attributed.
+    fn bind_cell_arg(&mut self, cell_id: CellId, span: &Span, arg: &CellArg) -> Value {
+        match arg {
+            CellArg::Int(i) => Value::Int(*i),
+            CellArg::Bool(b) => Value::Bool(*b),
+            CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            CellArg::String(s) => Value::String(s.clone()),
+            CellArg::Enum(v) => Value::EnumValue(v.clone()),
+            CellArg::Seq(v) => Value::Seq(
+                v.iter()
+                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                    .collect(),
+            ),
+            CellArg::Struct { name, fields } => Value::Struct(Box::new(StructValue {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(field, arg)| (field.clone(), self.bind_cell_arg(cell_id, span, arg)))
+                    .collect(),
+            })),
+            CellArg::Rect {
+                layer,
+                drawable,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => {
+                let rect = Rect {
+                    id: self.object_id(),
+                    layer: layer.clone(),
+                    x0: (*x0).into(),
+                    y0: (*y0).into(),
+                    x1: (*x1).into(),
+                    y1: (*y1).into(),
+                    construction: true,
+                    span: Some(span.clone()),
+                };
+                self.register_shape_arg(cell_id, rect.id, rect.clone().into(), *drawable);
+                Value::Rect(rect)
+            }
+            CellArg::Polygon {
+                layer,
+                drawable,
+                points,
+            } => {
+                let polygon = Polygon {
+                    id: self.object_id(),
+                    layer: layer.clone(),
+                    points: constant_points(points),
+                    construction: true,
+                    span: Some(span.clone()),
+                };
+                self.register_shape_arg(cell_id, polygon.id, polygon.clone().into(), *drawable);
+                Value::Polygon(polygon)
+            }
+            CellArg::Path {
+                layer,
+                drawable,
+                width,
+                points,
+                begin_extension,
+                end_extension,
+            } => {
+                let path = Path {
+                    id: self.object_id(),
+                    layer: layer.clone(),
+                    width: (*width).into(),
+                    points: constant_points(points),
+                    begin_extension: (*begin_extension).into(),
+                    end_extension: (*end_extension).into(),
+                    construction: true,
+                    span: Some(span.clone()),
+                };
+                self.register_shape_arg(cell_id, path.id, path.clone().into(), *drawable);
+                Value::Path(path)
+            }
+            CellArg::Point(x, y) => Value::Point(((*x).into(), (*y).into())),
+            CellArg::Tuple(v) => Value::Tuple(
+                v.iter()
+                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Registers a shape argument as an object of `cell_id`. See
+    /// [`Self::bind_cell_arg`].
+    fn register_shape_arg(
+        &mut self,
+        cell_id: CellId,
+        id: ObjectId,
+        object: Object,
+        drawable: bool,
+    ) {
+        let state = self.cell_state_mut(cell_id);
+        state.objects.insert(id, object);
+        if drawable {
+            state.proxy_objects.insert(id);
+        }
+    }
+
+    /// Resolves `exprs` in the solver of `cell_id`, snapped to the grid like
+    /// every other coordinate. When any of them is still unsolved, records
+    /// `dependent_vid` as waiting on every variable they mention and returns
+    /// `None`, so that the conversion is retried once the solver progresses.
+    fn resolve_constants<'e>(
+        &mut self,
+        cell_id: CellId,
+        dependent_vid: ValueId,
+        exprs: impl IntoIterator<Item = &'e LinearExpr>,
+    ) -> Option<Vec<f64>> {
+        let exprs: Vec<&LinearExpr> = exprs.into_iter().collect();
+        let solver = &self.cell_state(cell_id).solver;
+        let values: Option<Vec<f64>> = exprs.iter().map(|expr| solver.eval_expr(expr)).collect();
+        if values.is_none() {
+            for expr in exprs {
+                for (_, var) in expr.coeffs.clone() {
+                    self.add_var_dependent(cell_id, var, dependent_vid);
+                }
+            }
+        }
+        values
+    }
+
+    /// Whether a shape of `cell_id` stands for geometry drawn in its layout:
+    /// it has a layer, and it is either layout geometry or a proxy of an
+    /// instance's geometry. See [`CellArg`].
+    fn shape_drawable(
+        &self,
+        cell_id: CellId,
+        id: ObjectId,
+        construction: bool,
+        has_layer: bool,
+    ) -> bool {
+        has_layer && (!construction || self.cell_state(cell_id).proxy_objects.contains(&id))
+    }
+
     /// Converts an evaluated value into a cell argument. `Ok(None)` means the
     /// value depends on solver variables that are not resolved yet, so the
     /// conversion should be retried; `Err` means the value can never be passed
     /// to a cell and an error has been recorded.
+    ///
+    /// A shape is passed by value: its coordinates are resolved in this cell's
+    /// solver, and the callee receives the constants. See [`CellArg`].
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
@@ -4823,6 +6512,87 @@ impl<'a> ExecPass<'a> {
                 }
                 Some(CellArg::Seq(args))
             }
+            Value::Struct(value) => {
+                let mut fields = Vec::with_capacity(value.fields.len());
+                for (name, v) in value.fields.iter() {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => fields.push((name.clone(), arg)),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Struct {
+                    name: value.name.clone(),
+                    fields,
+                })
+            }
+            Value::Rect(r) => {
+                let Some(coords) =
+                    self.resolve_constants(cell_id, dependent_vid, [&r.x0, &r.y0, &r.x1, &r.y1])
+                else {
+                    return Ok(None);
+                };
+                Some(CellArg::Rect {
+                    layer: r.layer.clone(),
+                    drawable: self.shape_drawable(cell_id, r.id, r.construction, r.layer.is_some()),
+                    x0: coords[0],
+                    y0: coords[1],
+                    x1: coords[2],
+                    y1: coords[3],
+                })
+            }
+            Value::Polygon(p) => {
+                let Some(coords) = self.resolve_constants(
+                    cell_id,
+                    dependent_vid,
+                    p.points.iter().flat_map(|(x, y)| [x, y]),
+                ) else {
+                    return Ok(None);
+                };
+                Some(CellArg::Polygon {
+                    layer: p.layer.clone(),
+                    drawable: self.shape_drawable(cell_id, p.id, p.construction, true),
+                    points: pair_up(&coords),
+                })
+            }
+            Value::Path(p) => {
+                let Some(coords) = self.resolve_constants(
+                    cell_id,
+                    dependent_vid,
+                    [&p.width, &p.begin_extension, &p.end_extension]
+                        .into_iter()
+                        .chain(p.points.iter().flat_map(|(x, y)| [x, y])),
+                ) else {
+                    return Ok(None);
+                };
+                Some(CellArg::Path {
+                    layer: p.layer.clone(),
+                    drawable: self.shape_drawable(cell_id, p.id, p.construction, true),
+                    width: coords[0],
+                    begin_extension: coords[1],
+                    end_extension: coords[2],
+                    points: pair_up(&coords[3..]),
+                })
+            }
+            Value::Point((x, y)) => {
+                let Some(coords) = self.resolve_constants(cell_id, dependent_vid, [x, y]) else {
+                    return Ok(None);
+                };
+                Some(CellArg::Point(coords[0], coords[1]))
+            }
+            Value::Tuple(items) => {
+                let mut args = Vec::with_capacity(items.len());
+                for v in items {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => args.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Tuple(args))
+            }
+            // Already reported when it was poisoned. The caller turns this
+            // `Err` into poison of its own rather than a second diagnostic
+            // naming a type the value never had.
+            Value::Poison => return Err(()),
             v => {
                 self.errors.push(ExecError {
                     span: None,
@@ -4832,6 +6602,32 @@ impl<'a> ExecPass<'a> {
                 return Err(());
             }
         })
+    }
+
+    /// Whether `vid` errored and said so. See [`Value::Poison`].
+    fn is_poisoned(&self, vid: ValueId) -> bool {
+        matches!(
+            self.values.get(&vid).and_then(Defer::get_ready),
+            Some(Value::Poison)
+        )
+    }
+
+    /// Marks `vid` as poisoned, having already reported the diagnostic for it,
+    /// and re-queues whatever was waiting on it.
+    ///
+    /// Returns `Ok(true)`: poisoning is progress. The alternative -- reporting
+    /// and returning `Err(())` -- unwinds out of `execute_cell` entirely, which
+    /// suppressed every other diagnostic in the cell and left
+    /// `ExecErrorCompileOutput::output` as `None`, so the GUI reported the cell
+    /// as failing to open over a single bad field read.
+    fn poison(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
+        self.values.insert(vid, Defer::Ready(Value::Poison));
+        if let Some(deps) = self.value_dependents.get(&vid) {
+            for dep_vid in deps.clone() {
+                self.cell_state_mut(cell_id).deferred.insert(dep_vid);
+            }
+        }
+        Ok(true)
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -4852,6 +6648,18 @@ impl<'a> ExecPass<'a> {
             Defer::Deferred(v) => v.clone(),
         };
         let cell_id = vref.loc.cell;
+        // Poison propagates here rather than at each read: a value built from
+        // one whose diagnostic was already reported would otherwise raise a
+        // second, derived error at every level of the expression tree it
+        // appears in.
+        if vref
+            .state
+            .inputs()
+            .iter()
+            .any(|input| matches!(self.values.get(input), Some(Defer::Ready(Value::Poison))))
+        {
+            return self.poison(cell_id, vid);
+        }
         let state = self.cell_states.get_mut(&cell_id).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
@@ -4878,7 +6686,7 @@ impl<'a> ExecPass<'a> {
                             match self.typed_string(arg_vid, vid, cell_id, &span) {
                                 Typed::Ready(layer) => Some(Some(layer)),
                                 Typed::Pending => None,
-                                Typed::Invalid => return Err(()),
+                                Typed::Invalid => return self.poison(cell_id, vid),
                             }
                         }
                     };
@@ -5002,7 +6810,7 @@ impl<'a> ExecPass<'a> {
                         {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => return Ok(false),
-                            Typed::Invalid => return Err(()),
+                            Typed::Invalid => return self.poison(cell_id, vid),
                         };
                         let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
                             Value::Int(count) => {
@@ -5012,7 +6820,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 };
                                 if count < 3 {
                                     self.errors.push(ExecError {
@@ -5020,7 +6828,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 if count > MAX_SHAPE_POINTS {
                                     self.errors.push(ExecError {
@@ -5031,7 +6839,7 @@ impl<'a> ExecPass<'a> {
                                             limit: MAX_SHAPE_POINTS,
                                         },
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 let state = self.cell_state_mut(cell_id);
                                 (0..count)
@@ -5049,7 +6857,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         if points.len() < 3 {
@@ -5058,7 +6866,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPolygon,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                         for kwarg in &c.expr.args.kwargs {
                             let coordinate = polygon_coordinate(kwarg.name.name.as_str())
@@ -5069,7 +6877,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         }
 
@@ -5149,7 +6957,7 @@ impl<'a> ExecPass<'a> {
                         ) {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => return Ok(false),
-                            Typed::Invalid => return Err(()),
+                            Typed::Invalid => return self.poison(cell_id, vid),
                         };
                         let point_spec = &self.values[&c.state.posargs[1]];
                         let count = match point_spec.as_ref().unwrap_ready().as_ref() {
@@ -5160,7 +6968,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         let Some(count) = count.filter(|count| *count >= 2) else {
@@ -5169,7 +6977,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPath,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         if count > MAX_SHAPE_POINTS {
                             self.errors.push(ExecError {
@@ -5180,7 +6988,7 @@ impl<'a> ExecPass<'a> {
                                     limit: MAX_SHAPE_POINTS,
                                 },
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                         for kwarg in &c.expr.args.kwargs {
                             let name = kwarg.name.name.as_str();
@@ -5192,7 +7000,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         }
 
@@ -5209,16 +7017,28 @@ impl<'a> ExecPass<'a> {
                         });
                         let state = self.cell_state_mut(cell_id);
                         let width = state.new_solver_var(&span).into();
-                        let begin_extension = if has_begin_extension {
-                            state.new_solver_var(&span).into()
-                        } else {
-                            LinearExpr::from(0.)
+                        // Extensions are free variables even when no kwarg
+                        // names them, exactly as `width` always is. Making
+                        // them conditional meant `eq(p.begin_extension, 5.)`
+                        // degenerated to `0 - 5 = 0` and reported a bare
+                        // "inconsistent constraint" with nothing to say the
+                        // extension had never become a variable.
+                        //
+                        // The default of zero is a *fallback*, so it applies
+                        // only if nothing else determines the extension: a
+                        // path that ignores extensions still solves to zero,
+                        // and one that constrains them now works.
+                        let extension = |state: &mut CellState, named: bool| {
+                            let var = state.new_solver_var(&span);
+                            if !named {
+                                state
+                                    .compiler_defaults
+                                    .push_back((var.into(), span.clone()));
+                            }
+                            LinearExpr::from(var)
                         };
-                        let end_extension = if has_end_extension {
-                            state.new_solver_var(&span).into()
-                        } else {
-                            LinearExpr::from(0.)
-                        };
+                        let begin_extension = extension(state, has_begin_extension);
+                        let end_extension = extension(state, has_end_extension);
                         let points = (0..count)
                             .map(|_| {
                                 (
@@ -5346,7 +7166,7 @@ impl<'a> ExecPass<'a> {
                             args[3].get_linear().cloned(),
                         ) else {
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -5415,7 +7235,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         if let Some(r) = r {
@@ -5491,7 +7311,7 @@ impl<'a> ExecPass<'a> {
                         let (Some(vl), Some(vr)) = (vl.get_linear(), vr.get_linear()) else {
                             let span = self.span(&vref.loc, c.expr.span);
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let expr = vl.clone() - vr.clone();
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -5537,7 +7357,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(Value::Seq(val)));
@@ -5593,7 +7413,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::ZeroRangeStep,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             let mut seq = Seq::new();
                             let mut i = *start;
@@ -5608,7 +7428,7 @@ impl<'a> ExecPass<'a> {
                                             limit: MAX_SEQ_LEN,
                                         },
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 seq.push_back(Value::Int(i));
                                 // A wrapping `i` would reverse the comparison
@@ -5628,7 +7448,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     } else {
                         self.add_value_dependent(c.state.posargs[0], vid);
@@ -5647,7 +7467,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::HeadEmptyList,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             Value::Seq(s) => {
                                 if let Some(s) = s.front() {
@@ -5659,7 +7479,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::HeadEmptyList,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             }
                             _ => {
@@ -5669,7 +7489,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(val));
@@ -5689,7 +7509,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::TailEmptyList,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             Value::Seq(s) => {
                                 if !s.is_empty() {
@@ -5706,7 +7526,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::TailEmptyList,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             }
                             _ => {
@@ -5716,7 +7536,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(val));
@@ -5747,7 +7567,7 @@ impl<'a> ExecPass<'a> {
                             .collect::<Option<Vec<_>>>();
                         let (Some(horiz), Some(linears)) = (horiz, linears) else {
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         // Positional order is (p, n, value, coord, pstop, nstop).
                         let [p, n, value, coord, pstop, nstop] =
@@ -5823,8 +7643,14 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                     };
-                    let refl = read_bool(self, reflect_arg)?;
-                    let construction = read_bool(self, construction_arg)?;
+                    let refl = match read_bool(self, reflect_arg) {
+                        Ok(value) => value,
+                        Err(()) => return self.poison(cell_id, vid),
+                    };
+                    let construction = match read_bool(self, construction_arg) {
+                        Ok(value) => value,
+                        Err(()) => return self.poison(cell_id, vid),
+                    };
                     let angle = match angle_arg {
                         None => None,
                         Some((kwarg, arg_vid)) => {
@@ -5850,7 +7676,7 @@ impl<'a> ExecPass<'a> {
                                     pending = true;
                                     None
                                 }
-                                Typed::Invalid => return Err(()),
+                                Typed::Invalid => return self.poison(cell_id, vid),
                             }
                         }
                     };
@@ -5929,9 +7755,12 @@ impl<'a> ExecPass<'a> {
                     for arg_vid in c.state.posargs.iter() {
                         match self.values[arg_vid].clone() {
                             Defer::Ready(v) => {
-                                match self.cell_arg_from_value(cell_id, *arg_vid, &v)? {
-                                    Some(arg) => arg_vals.push(arg),
-                                    None => unready.push(*arg_vid),
+                                match self.cell_arg_from_value(cell_id, *arg_vid, &v) {
+                                    Ok(Some(arg)) => arg_vals.push(arg),
+                                    Ok(None) => unready.push(*arg_vid),
+                                    // The diagnostic is already recorded, here
+                                    // or when the argument was poisoned.
+                                    Err(()) => return self.poison(cell_id, vid),
                                 }
                             }
                             _ => unready.push(*arg_vid),
@@ -5948,6 +7777,7 @@ impl<'a> ExecPass<'a> {
                         let cell =
                             self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
                         self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
+                        self.cell_values.insert(cell, vid);
                         true
                     } else {
                         for arg_vid in unready {
@@ -5957,16 +7787,16 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
-            PartialEvalState::BinOp(bin_op) => {
+            PartialEvalState::Arith(arith) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
-                    (&self.values[&bin_op.lhs], &self.values[&bin_op.rhs])
+                    (&self.values[&arith.left], &self.values[&arith.right])
                 {
                     match (vl, vr) {
                         (Value::Linear(vl), Value::Linear(vr)) => {
-                            let res = match bin_op.op {
-                                BinOp::Add => Some(vl.clone() + vr.clone()),
-                                BinOp::Sub => Some(vl.clone() - vr.clone()),
-                                BinOp::Mul => {
+                            let res = match arith.op {
+                                ArithOp::Add => Some(vl.clone() + vr.clone()),
+                                ArithOp::Sub => Some(vl.clone() - vr.clone()),
+                                ArithOp::Mul => {
                                     let res = match (
                                         state.solver.eval_expr_exact(vl),
                                         state.solver.eval_expr_exact(vr),
@@ -5985,7 +7815,7 @@ impl<'a> ExecPass<'a> {
                                     }
                                     res
                                 }
-                                BinOp::Div => {
+                                ArithOp::Div => {
                                     let res = state
                                         .solver
                                         .eval_expr_exact(vr)
@@ -5998,13 +7828,13 @@ impl<'a> ExecPass<'a> {
                                     res
                                 }
                                 _ => {
-                                    let span = self.span(&vref.loc, bin_op.expr.span);
+                                    let span = self.span(&vref.loc, arith.expr.span);
                                     self.errors.push(ExecError {
                                         span: Some(span.clone()),
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             if let Some(res) = res {
@@ -6015,13 +7845,13 @@ impl<'a> ExecPass<'a> {
                                 // to `i32::MAX` in GDS, and turns `as Int` into
                                 // `i64::MAX`.
                                 if !res.is_finite() {
-                                    let span = self.span(&vref.loc, bin_op.expr.span);
+                                    let span = self.span(&vref.loc, arith.expr.span);
                                     self.errors.push(ExecError {
                                         span: Some(span),
                                         cell: cell_id,
                                         kind: ExecErrorKind::NonFiniteValue,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                                 self.values
                                     .insert(vid, DeferValue::Ready(Value::Linear(res)));
@@ -6036,62 +7866,62 @@ impl<'a> ExecPass<'a> {
                             // but wrap silently in release -- so the same
                             // source would compute two different answers
                             // depending on how the compiler was built.
-                            if matches!(bin_op.op, BinOp::Div | BinOp::Rem) && *vr == 0 {
-                                let span = self.span(&vref.loc, bin_op.expr.span);
+                            if matches!(arith.op, ArithOp::Div | ArithOp::Rem) && *vr == 0 {
+                                let span = self.span(&vref.loc, arith.expr.span);
                                 self.errors.push(ExecError {
                                     span: Some(span),
                                     cell: cell_id,
                                     kind: ExecErrorKind::DivideByZero(
-                                        match bin_op.op {
-                                            BinOp::Div => "division",
+                                        match arith.op {
+                                            ArithOp::Div => "division",
                                             _ => "remainder",
                                         }
                                         .to_owned(),
                                     ),
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
-                            let res = match bin_op.op {
-                                BinOp::Add => vl.checked_add(*vr),
-                                BinOp::Sub => vl.checked_sub(*vr),
-                                BinOp::Mul => vl.checked_mul(*vr),
-                                BinOp::Div => vl.checked_div(*vr),
-                                BinOp::Rem => vl.checked_rem(*vr),
+                            let res = match arith.op {
+                                ArithOp::Add => vl.checked_add(*vr),
+                                ArithOp::Sub => vl.checked_sub(*vr),
+                                ArithOp::Mul => vl.checked_mul(*vr),
+                                ArithOp::Div => vl.checked_div(*vr),
+                                ArithOp::Rem => vl.checked_rem(*vr),
                             };
                             let Some(res) = res else {
-                                let span = self.span(&vref.loc, bin_op.expr.span);
+                                let span = self.span(&vref.loc, arith.expr.span);
                                 self.errors.push(ExecError {
                                     span: Some(span),
                                     cell: cell_id,
                                     kind: ExecErrorKind::IntegerOverflow(
-                                        match bin_op.op {
-                                            BinOp::Add => "+",
-                                            BinOp::Sub => "-",
-                                            BinOp::Mul => "*",
-                                            BinOp::Div => "/",
-                                            BinOp::Rem => "%",
+                                        match arith.op {
+                                            ArithOp::Add => "+",
+                                            ArithOp::Sub => "-",
+                                            ArithOp::Mul => "*",
+                                            ArithOp::Div => "/",
+                                            ArithOp::Rem => "%",
                                         }
                                         .to_owned(),
                                     ),
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
                         }
                         _ => {
-                            let span = self.span(&vref.loc, bin_op.expr.span);
+                            let span = self.span(&vref.loc, arith.expr.span);
                             self.errors.push(ExecError {
                                 span: Some(span.clone()),
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
-                    self.add_value_dependent(bin_op.lhs, vid);
-                    self.add_value_dependent(bin_op.rhs, vid);
+                    self.add_value_dependent(arith.left, vid);
+                    self.add_value_dependent(arith.right, vid);
                     false
                 }
             }
@@ -6115,11 +7945,23 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values
                                 .insert(vid, DeferValue::Ready(Value::Linear(res)));
+                            true
+                        }
+                        Value::Bool(v) => {
+                            let res = match unary_op.op {
+                                UnaryOp::Not => !*v,
+                                UnaryOp::Neg => {
+                                    let span = self.span(&vref.loc, unary_op.expr.span);
+                                    self.invalid_type(cell_id, &span);
+                                    return self.poison(cell_id, vid);
+                                }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                             true
                         }
                         Value::Int(v) => {
@@ -6133,7 +7975,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IntegerOverflow("-".to_owned()),
                                         });
-                                        return Err(());
+                                        return self.poison(cell_id, vid);
                                     };
                                     res
                                 }
@@ -6144,7 +7986,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
@@ -6157,7 +7999,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6231,7 +8073,7 @@ impl<'a> ExecPass<'a> {
                         let Some(variant) = val.get_enum_value() else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let arm = match_
                             .expr
@@ -6241,7 +8083,7 @@ impl<'a> ExecPass<'a> {
                         let Some(arm) = arm else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         };
                         let value = self.visit_expr(vref.loc, &arm.expr);
                         match_.state = MatchExprState::Value(value);
@@ -6263,28 +8105,73 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
-            PartialEvalState::Comparison(comparison_expr) => {
-                if let (Defer::Ready(vl), Defer::Ready(vr)) = (
-                    &self.values[&comparison_expr.state.left],
-                    &self.values[&comparison_expr.state.right],
-                ) {
+            PartialEvalState::BoolOp(bool_op) => match bool_op.state {
+                BoolOpState::Left(left) => {
+                    if let Defer::Ready(val) = &self.values[&left] {
+                        // An operand typed `Any` was never proven to be a bool.
+                        let Some(left_val) = val.get_bool().copied() else {
+                            let span = self.span(&vref.loc, bool_op.expr.left.span());
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(cell_id, vid);
+                        };
+                        // Whether or not this expression should short-circuit.
+                        let decided = match bool_op.op {
+                            BoolOp::And => !left_val,
+                            BoolOp::Or => left_val,
+                        };
+                        if decided {
+                            self.values
+                                .insert(vid, DeferValue::Ready(Value::Bool(left_val)));
+                        } else {
+                            let right = self.visit_expr(vref.loc, &bool_op.expr.right);
+                            bool_op.state = BoolOpState::Right(right);
+                            self.values.insert(vid, Defer::Deferred(vref));
+                            self.cell_state_mut(cell_id).deferred.insert(vid);
+                        }
+                        true
+                    } else {
+                        self.add_value_dependent(left, vid);
+                        false
+                    }
+                }
+                BoolOpState::Right(right) => {
+                    if let Defer::Ready(val) = &self.values[&right] {
+                        // The result is the right operand's value, so it has to
+                        // be a bool as well.
+                        let Some(res) = val.get_bool().copied() else {
+                            let span = self.span(&vref.loc, bool_op.expr.right.span());
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(cell_id, vid);
+                        };
+                        self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
+                        true
+                    } else {
+                        self.add_value_dependent(right, vid);
+                        false
+                    }
+                }
+            },
+            PartialEvalState::Comparison(cmp) => {
+                if let (Defer::Ready(vl), Defer::Ready(vr)) =
+                    (&self.values[&cmp.left], &self.values[&cmp.right])
+                {
                     // `Ty::Any` satisfies the static comparison checks, so an
                     // operand pair or an operator that those checks would have
                     // rejected can still arrive here. Every combination the
                     // evaluator has no answer for is an `InvalidType`
                     // diagnostic rather than an `unreachable!`.
-                    let op = comparison_expr.expr.op;
+                    let op = cmp.op;
                     let ordered = |ord: std::cmp::Ordering| match op {
-                        crate::ast::ComparisonOp::Eq => Some(ord.is_eq()),
-                        crate::ast::ComparisonOp::Ne => Some(ord.is_ne()),
-                        crate::ast::ComparisonOp::Geq => Some(ord.is_ge()),
-                        crate::ast::ComparisonOp::Gt => Some(ord.is_gt()),
-                        crate::ast::ComparisonOp::Leq => Some(ord.is_le()),
-                        crate::ast::ComparisonOp::Lt => Some(ord.is_lt()),
+                        ComparisonOp::Eq => Some(ord.is_eq()),
+                        ComparisonOp::Ne => Some(ord.is_ne()),
+                        ComparisonOp::Geq => Some(ord.is_ge()),
+                        ComparisonOp::Gt => Some(ord.is_gt()),
+                        ComparisonOp::Leq => Some(ord.is_le()),
+                        ComparisonOp::Lt => Some(ord.is_lt()),
                     };
                     let equality = |eq: bool| match op {
-                        crate::ast::ComparisonOp::Eq => Some(eq),
-                        crate::ast::ComparisonOp::Ne => Some(!eq),
+                        ComparisonOp::Eq => Some(eq),
+                        ComparisonOp::Ne => Some(!eq),
                         // Only equality is defined for these operand types.
                         _ => None,
                     };
@@ -6304,11 +8191,12 @@ impl<'a> ExecPass<'a> {
                                 // Float equality is meaningless against a
                                 // solved value, and is rejected statically
                                 // whenever the type is known.
-                                crate::ast::ComparisonOp::Eq | crate::ast::ComparisonOp::Ne => None,
+                                ComparisonOp::Eq | ComparisonOp::Ne => None,
                                 _ => el.partial_cmp(&er).and_then(ordered),
                             }
                         }
                         (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
+                        (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
                         (Value::EnumValue(vl), Value::EnumValue(vr)) => equality(vl == vr),
                         (Value::Nil, Value::Nil) => equality(true),
                         (Value::SeqNil, Value::SeqNil) => equality(true),
@@ -6318,15 +8206,15 @@ impl<'a> ExecPass<'a> {
                         _ => None,
                     };
                     let Some(res) = res else {
-                        let span = self.span(&vref.loc, comparison_expr.expr.span);
+                        let span = self.span(&vref.loc, cmp.expr.span);
                         self.invalid_type(cell_id, &span);
-                        return Err(());
+                        return self.poison(cell_id, vid);
                     };
                     self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                     true
                 } else {
-                    self.add_value_dependent(comparison_expr.state.left, vid);
-                    self.add_value_dependent(comparison_expr.state.right, vid);
+                    self.add_value_dependent(cmp.left, vid);
+                    self.add_value_dependent(cmp.right, vid);
                     false
                 }
             }
@@ -6342,18 +8230,26 @@ impl<'a> ExecPass<'a> {
                                 "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
                                 "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
                                 "layer" => {
-                                    if let Some(layer) = rect.layer.clone() {
-                                        Value::String(layer)
-                                    } else {
+                                    let Some(layer) = rect.layer.clone() else {
+                                        // A construction rect has no layer.
+                                        // Returning a fabricated `""` here
+                                        // used to add a second, unrelated
+                                        // error about the empty-string layer
+                                        // being absent from the technology
+                                        // file; failing the read reports the
+                                        // one thing that actually went wrong.
                                         let span =
                                             self.span(&vref.loc, field_access_expr.expr.span);
                                         self.errors.push(ExecError {
                                             span: Some(span),
                                             cell: cell_id,
-                                            kind: ExecErrorKind::InvalidRotation,
+                                            kind: ExecErrorKind::EmptyField {
+                                                field: "layer".to_string(),
+                                            },
                                         });
-                                        Value::String("".to_string())
-                                    }
+                                        return self.poison(cell_id, vid);
+                                    };
+                                    Value::String(layer)
                                 }
                                 _ => {
                                     let span = self.span(&vref.loc, field_access_expr.expr.span);
@@ -6362,7 +8258,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6392,7 +8288,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IndexOutOfBounds,
                                         });
-                                        return Err(());
+                                        return self.poison(cell_id, vid);
                                     };
                                     Value::Linear(match coordinate.axis {
                                         PolygonAxis::X => point.0.clone(),
@@ -6407,7 +8303,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6439,7 +8335,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IndexOutOfBounds,
                                         });
-                                        return Err(());
+                                        return self.poison(cell_id, vid);
                                     };
                                     Value::Linear(match coordinate.axis {
                                         PolygonAxis::X => point.0.clone(),
@@ -6454,7 +8350,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -6472,8 +8368,20 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return Err(());
+                                    return self.poison(cell_id, vid);
                                 }
+                            };
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
+                        ValueRef::Struct(value) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            // The base may have arrived as `Any`, so the field
+                            // was never checked against the struct.
+                            let Some(val) = value.fields.get(field).cloned() else {
+                                let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
@@ -6491,7 +8399,7 @@ impl<'a> ExecPass<'a> {
                                             let span =
                                                 self.span(&vref.loc, field_access_expr.expr.span);
                                             self.invalid_type(cell_id, &span);
-                                            return Err(());
+                                            return self.poison(cell_id, vid);
                                         };
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
@@ -6507,11 +8415,14 @@ impl<'a> ExecPass<'a> {
                                                         field_access_expr.expr.span,
                                                     )),
                                                     cell: cell_id,
-                                                    // TODO: More descriptive error
-                                                    kind: ExecErrorKind::EmptyBbox,
+                                                    kind: ExecErrorKind::NoFieldOnInstance {
+                                                        field: field.to_string(),
+                                                        cell: cell.name.clone(),
+                                                    },
                                                 });
-                                                return Err(());
+                                                return self.poison(cell_id, vid);
                                             };
+                                        let cell_values = &self.cell_values;
                                         let obj_id = &mut self.next_id;
                                         let cell_state =
                                             self.cell_states.get_mut(&cell_id).unwrap();
@@ -6644,7 +8555,7 @@ impl<'a> ExecPass<'a> {
                                                     let id = object_id(obj_id);
                                                     let oinst = Instance {
                                                         id,
-                                                        cell: cinst.cell_vid,
+                                                        cell: cell_values[&cinst.cell],
                                                         x: LinearExpr::add(inst.x.clone(), cx),
                                                         y: LinearExpr::add(inst.y.clone(), cy),
                                                         angle,
@@ -6684,7 +8595,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6709,7 +8620,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         }
                         _ => {
@@ -6719,7 +8630,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     }
                 } else {
@@ -6743,7 +8654,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                         } else {
                             let span = self.span(&vref.loc, index_expr.expr.index.span());
@@ -6752,7 +8663,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     } else {
                         let span = self.span(&vref.loc, index_expr.expr.base.span());
@@ -6761,7 +8672,7 @@ impl<'a> ExecPass<'a> {
                             cell: cell_id,
                             kind: ExecErrorKind::InvalidType,
                         });
-                        return Err(());
+                        return self.poison(cell_id, vid);
                     }
                 } else {
                     self.add_value_dependent(index_expr.state.base, vid);
@@ -6779,7 +8690,7 @@ impl<'a> ExecPass<'a> {
                     let (Some(lhs), Some(rhs)) = (vl.get_linear(), vr.get_linear()) else {
                         let span = c.span.clone();
                         self.invalid_type(cell_id, &span);
-                        return Err(());
+                        return self.poison(cell_id, vid);
                     };
                     let expr = lhs.clone() - rhs.clone();
                     let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -6822,7 +8733,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::NonFiniteValue,
                                 });
-                                return Err(());
+                                return self.poison(cell_id, vid);
                             }
                             let res = state
                                 .solver
@@ -6843,7 +8754,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidCast,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     };
                     if let Some(value) = value {
@@ -6877,6 +8788,71 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::StructLit(lit) => {
+                let pending = lit
+                    .fields
+                    .iter()
+                    .copied()
+                    .chain(lit.base)
+                    .find(|input| !self.values[input].is_ready());
+                if let Some(pending) = pending {
+                    self.add_value_dependent(pending, vid);
+                    false
+                } else {
+                    // The fields not listed come from the base, which the
+                    // static check proved to be this struct unless it was
+                    // typed `Any`.
+                    let base = match lit.base {
+                        None => None,
+                        Some(base) => match self.values[&base].get_ready() {
+                            Some(Value::Struct(value)) if value.name == lit.ty.name => {
+                                Some(value.fields.clone())
+                            }
+                            _ => {
+                                let base = lit.expr.base.as_ref().expect("base was evaluated");
+                                let span = self.span(&vref.loc, base.span());
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            }
+                        },
+                    };
+                    // Declaration order, whatever order the literal used:
+                    // `CellArg::Struct` fields are matched pairwise against
+                    // the type's.
+                    let fields = lit
+                        .ty
+                        .fields
+                        .keys()
+                        .map(|name| {
+                            let explicit = lit
+                                .expr
+                                .fields
+                                .iter()
+                                .zip(&lit.fields)
+                                .find(|(field, _)| field.name.name == *name)
+                                .map(|(_, value)| self.values[value].get_ready().cloned());
+                            let value = match explicit {
+                                Some(value) => value,
+                                None => base.as_ref().and_then(|base| base.get(name).cloned()),
+                            };
+                            value.map(|value| (name.clone(), value))
+                        })
+                        .collect::<Option<IndexMap<_, _>>>();
+                    let Some(fields) = fields else {
+                        let span = self.span(&vref.loc, lit.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(cell_id, vid);
+                    };
+                    self.values.insert(
+                        vid,
+                        DeferValue::Ready(Value::Struct(Box::new(StructValue {
+                            name: lit.ty.name.clone(),
+                            fields,
+                        }))),
+                    );
+                    true
+                }
+            }
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
@@ -6890,7 +8866,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return Err(());
+                            return self.poison(cell_id, vid);
                         }
                     };
                     for (i, elem) in seq.iter().enumerate() {
@@ -7036,8 +9012,20 @@ pub enum Value {
     Inst(Instance),
     Seq(Seq),
     Tuple(Vec<Value>),
+    /// A struct value. Boxed like [`Value::Fn`]: a struct is rarely stored
+    /// per sequence element, and its field map is large relative to the
+    /// scalar variants.
+    Struct(Box<StructValue>),
     SeqNil,
     Nil,
+    /// A value whose diagnostic has already been reported.
+    ///
+    /// Evaluation continues past the error instead of abandoning the cell, so
+    /// the rest of its diagnostics are still collected and the GUI still has a
+    /// layout to draw. Anything built from a poisoned value is poisoned in
+    /// turn, silently, so one mistake produces one error rather than one per
+    /// expression that reads it.
+    Poison,
 }
 
 impl Value {
@@ -7048,17 +9036,6 @@ impl Value {
             Self::Path(p) => Some(Object::Path(p.clone())),
             Self::Inst(i) => Some(Object::Inst(i.clone())),
             _ => None,
-        }
-    }
-
-    pub fn from_arg(arg: &CellArg) -> Self {
-        match arg {
-            CellArg::Int(i) => Value::Int(*i),
-            CellArg::Bool(b) => Value::Bool(*b),
-            CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
-            CellArg::String(s) => Value::String(s.clone()),
-            CellArg::Enum(v) => Value::EnumValue(v.clone()),
-            CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
         }
     }
 
@@ -7080,7 +9057,12 @@ impl Value {
             Self::Inst(_) => "instance",
             Self::Seq(_) | Self::SeqNil => "sequence",
             Self::Tuple(_) => "tuple",
+            Self::Struct(_) => "struct",
             Self::Nil => "nil",
+            // Matches `Ty::Unknown`'s rendering. Reaching a diagnostic that
+            // names a poisoned value means one was not suppressed upstream;
+            // `?` at least does not claim a type the value never had.
+            Self::Poison => "?",
         }
     }
 
@@ -7103,6 +9085,17 @@ impl Value {
             Arrayed::Array(s) => Self::Seq(s.into_iter().map(Value::from_array).collect()),
         }
     }
+}
+
+/// A struct value. See [`Value::Struct`].
+#[derive(Debug, Clone)]
+pub struct StructValue {
+    /// The module-qualified name of the declaring struct, matching
+    /// `StructTy::name`, so that `..base` and cell arguments can check that a
+    /// value which arrived as `Any` is the struct they expect.
+    pub name: String,
+    /// The fields in declaration order.
+    pub fields: IndexMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7130,10 +9123,6 @@ pub struct SolvedInstance {
     pub construction: bool,
     pub cell: CellId,
     pub span: Span,
-    /// The value ID of the cell being instantiated.
-    ///
-    /// For compiler internal use only.
-    cell_vid: ValueId,
 }
 
 #[enumify]
@@ -7298,7 +9287,166 @@ impl<T> Arrayed<T> {
     }
 }
 
+impl CompiledData {
+    /// A digest of everything a consumer can observe: the geometry, the layers
+    /// it lands on, and the shape of the instance graph.
+    ///
+    /// Excludes ids, which are internal handles whose values depend on
+    /// allocation order rather than on anything observable. Comparing digests
+    /// is what makes "the cache changed nothing" checkable; see
+    /// `ARGON_VERIFY_CELL_CACHE`.
+    pub fn geometry_digest(&self) -> u64 {
+        let mut cells = self
+            .cells
+            .values()
+            .map(|cell| {
+                let mut hasher = fnv::FnvHasher::default();
+                hash_str(&mut hasher, &cell.name);
+                for object in cell.objects.values() {
+                    hash_solved_value(&mut hasher, object, &self.cells);
+                }
+                for fallback in &cell.fallback_constraints_used {
+                    hash_str(&mut hasher, &fallback.span.path.to_string_lossy());
+                    hasher.write_u32(fallback.span.span.start() as u32);
+                    hasher.write_u32(fallback.span.span.end() as u32);
+                }
+                hasher.finish()
+            })
+            .collect::<Vec<_>>();
+        // Sorted because the map's order is an allocation detail.
+        cells.sort_unstable();
+        let mut hasher = fnv::FnvHasher::default();
+        for cell in cells {
+            hasher.write_u64(cell);
+        }
+        hash_str(&mut hasher, &self.cells[&self.top].name);
+        hasher.finish()
+    }
+}
+
+fn hash_str(hasher: &mut fnv::FnvHasher, value: &str) {
+    hasher.write_usize(value.len());
+    hasher.write(value.as_bytes());
+}
+
+fn hash_solved_value(
+    hasher: &mut fnv::FnvHasher,
+    value: &SolvedValue,
+    cells: &IndexMap<CellId, Arc<CompiledCell>>,
+) {
+    fn coord(hasher: &mut fnv::FnvHasher, v: f64) {
+        hasher.write_u64(v.to_bits());
+    }
+    match value {
+        SolvedValue::Rect(r) => {
+            hasher.write_u8(0);
+            for v in [r.x0.0, r.y0.0, r.x1.0, r.y1.0] {
+                coord(hasher, v);
+            }
+            hasher.write_u8(u8::from(r.construction));
+            hash_str(hasher, r.layer.as_deref().unwrap_or(""));
+        }
+        SolvedValue::Polygon(p) => {
+            hasher.write_u8(1);
+            for (x, y) in &p.points {
+                coord(hasher, x.0);
+                coord(hasher, y.0);
+            }
+            hash_str(hasher, &p.layer);
+        }
+        SolvedValue::Path(p) => {
+            hasher.write_u8(2);
+            coord(hasher, p.width.0);
+            for (x, y) in &p.points {
+                coord(hasher, x.0);
+                coord(hasher, y.0);
+            }
+            hash_str(hasher, &p.layer);
+        }
+        SolvedValue::Text(t) => {
+            hasher.write_u8(3);
+            coord(hasher, t.x);
+            coord(hasher, t.y);
+            hash_str(hasher, &t.text);
+            hash_str(hasher, &t.layer);
+        }
+        SolvedValue::Dimension(d) => {
+            hasher.write_u8(4);
+            coord(hasher, d.value.0);
+            coord(hasher, d.coord.0);
+        }
+        SolvedValue::Instance(i) => {
+            hasher.write_u8(5);
+            coord(hasher, i.x);
+            coord(hasher, i.y);
+            hasher.write_u8(i.angle as u8);
+            hasher.write_u8(u8::from(i.reflect));
+            // By name, because the referenced id is itself allocation-dependent.
+            hash_str(
+                hasher,
+                cells.get(&i.cell).map(|c| c.name.as_str()).unwrap_or(""),
+            );
+        }
+    }
+}
+
 impl CompiledCell {
+    /// Translates every source span in this cell onto another revision of the
+    /// workspace.
+    ///
+    /// Every field is named explicitly rather than matched with `..`, so that a
+    /// `Span` added to any of these types later fails to compile here instead
+    /// of being silently left stale.
+    pub fn rebase_spans(&mut self, rebase: &SpanRebase) -> Result<(), RebaseError> {
+        let Self {
+            name: _,
+            scopes,
+            root: _,
+            fields: _,
+            sse_basis: _,
+            objects,
+            fallback_constraints_used,
+            unsolved_vars: _,
+            inconsistent_constraints: _,
+        } = self;
+
+        for scope in scopes.values_mut() {
+            let CompiledScope {
+                static_parent: _,
+                bindings: _,
+                children: _,
+                name: _,
+                span,
+                emit,
+            } = scope;
+            rebase.rebase(span)?;
+            for (_, CompiledEmit { span }) in emit.iter_mut() {
+                rebase.rebase(span)?;
+            }
+        }
+
+        for object in objects.values_mut() {
+            match object {
+                SolvedValue::Rect(Rect { span, .. })
+                | SolvedValue::Polygon(Polygon { span, .. })
+                | SolvedValue::Path(Path { span, .. })
+                | SolvedValue::Text(Text { span, .. })
+                | SolvedValue::Dimension(Dimension { span, .. }) => rebase.rebase_opt(span)?,
+                SolvedValue::Instance(SolvedInstance { span, .. }) => rebase.rebase(span)?,
+            }
+        }
+
+        for fallback in fallback_constraints_used.iter_mut() {
+            let UsedFallback {
+                constraint: _,
+                span,
+                initial_condition: _,
+            } = fallback;
+            rebase.rebase(span)?;
+        }
+        Ok(())
+    }
+
     pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
         self.fields
             .get(name)
@@ -7406,7 +9554,11 @@ pub fn bbox_dim_union(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledData {
-    pub cells: IndexMap<CellId, CompiledCell>,
+    /// Compiled cells, shared rather than owned so that a session can hand the
+    /// same hierarchy out repeatedly without cloning it. A cell is immutable
+    /// once compiled, and a GDS import alone can contribute ten thousand cells
+    /// and hundreds of thousands of objects.
+    pub cells: IndexMap<CellId, Arc<CompiledCell>>,
     pub top: CellId,
     pub tech: crate::tech::Technology,
 }
@@ -7442,8 +9594,9 @@ struct PartialEval<T: AstMetadata> {
 enum PartialEvalState<T: AstMetadata> {
     If(Box<PartialIfExpr<T>>),
     Match(Box<PartialMatchExpr<T>>),
-    Comparison(Box<PartialComparisonExpr<T>>),
-    BinOp(PartialBinOp<T>),
+    Arith(PartialArith<T>),
+    Comparison(Box<PartialComparison<T>>),
+    BoolOp(Box<PartialBoolOp<T>>),
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
@@ -7452,7 +9605,48 @@ enum PartialEvalState<T: AstMetadata> {
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
+    StructLit(Box<PartialStructLit<T>>),
     ForLoop(Box<PartialForLoop<T>>),
+}
+
+impl<T: AstMetadata> PartialEvalState<T> {
+    /// The values this state reads to make its next step.
+    ///
+    /// `If` and `Match` hold only the branch evaluation has reached, so an
+    /// arm that was never taken is not an input and cannot poison the result.
+    fn inputs(&self) -> Vec<ValueId> {
+        match self {
+            Self::If(e) => match e.state {
+                IfExprState::Cond(v) | IfExprState::Then(v) | IfExprState::Else(v) => vec![v],
+            },
+            Self::Match(e) => match e.state {
+                MatchExprState::Scrutinee(v) | MatchExprState::Value(v) => vec![v],
+            },
+            Self::Arith(e) => vec![e.left, e.right],
+            Self::Comparison(e) => vec![e.left, e.right],
+            // One operand at a time, so a short-circuited `&&`/`||` never
+            // reads -- and so is never poisoned by -- the operand it skipped.
+            Self::BoolOp(e) => match e.state {
+                BoolOpState::Left(v) | BoolOpState::Right(v) => vec![v],
+            },
+            Self::UnaryOp(e) => vec![e.operand],
+            Self::Call(e) => e
+                .state
+                .posargs
+                .iter()
+                .chain(e.state.kwargs.iter())
+                .copied()
+                .collect(),
+            Self::FieldAccess(e) => vec![e.state.base],
+            Self::IndexFieldAccess(e) => vec![e.state.base],
+            Self::Index(e) => vec![e.state.base, e.state.index],
+            Self::Constraint(c) => vec![c.lhs, c.rhs],
+            Self::Cast(e) => vec![e.state.value],
+            Self::Tuple(e) => e.items.clone(),
+            Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
+            Self::ForLoop(f) => vec![f.seq],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7472,10 +9666,10 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBinOp<T: AstMetadata> {
-    lhs: ValueId,
-    rhs: ValueId,
-    op: BinOp,
+struct PartialArith<T: AstMetadata> {
+    left: ValueId,
+    right: ValueId,
+    op: ArithOp,
     expr: Box<BinOpExpr<Substr, T>>,
 }
 
@@ -7524,13 +9718,27 @@ pub struct CallExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialComparisonExpr<T: AstMetadata> {
-    expr: ComparisonExpr<Substr, T>,
-    state: ComparisonExprState,
+struct PartialBoolOp<T: AstMetadata> {
+    op: BoolOp,
+    expr: BinOpExpr<Substr, T>,
+    state: BoolOpState,
+}
+
+/// State of boolean operation.
+#[derive(Debug, Clone)]
+pub enum BoolOpState {
+    /// Evaluating the left operand.
+    Left(ValueId),
+    /// Evaluating the right operand.
+    ///
+    /// Indicates that the expression did not short-circuit.
+    Right(ValueId),
 }
 
 #[derive(Debug, Clone)]
-pub struct ComparisonExprState {
+struct PartialComparison<T: AstMetadata> {
+    op: ComparisonOp,
+    expr: BinOpExpr<Substr, T>,
     left: ValueId,
     right: ValueId,
 }
@@ -7562,6 +9770,17 @@ struct PartialCastExpr<T: AstMetadata> {
 #[derive(Debug, Clone)]
 struct PartialTupleExpr {
     items: Vec<ValueId>,
+}
+
+#[derive(Debug, Clone)]
+struct PartialStructLit<T: AstMetadata> {
+    expr: StructLitExpr<Substr, T>,
+    /// The struct being built, from the literal's checked type; its field
+    /// order is the order the value's fields take.
+    ty: Arc<StructTy>,
+    /// One value per entry of `expr.fields`.
+    fields: Vec<ValueId>,
+    base: Option<ValueId>,
 }
 
 #[derive(Debug, Clone)]

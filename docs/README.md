@@ -16,6 +16,17 @@ npm start
 `npm run build` writes a production build to `build/`. Internal links and
 anchors are checked as part of the build and a broken one fails it.
 
+## Deployment
+
+The site is published to GitHub Pages at <https://ucb-substrate.github.io/argon/>
+by `.github/workflows/docs.yml`. The workflow builds the site on every pull
+request that touches `docs/` and deploys on pushes to `main`. It needs the
+repository's Pages source set to "GitHub Actions" (Settings, Pages).
+
+The repository's Markdown link checker (lychee) skips `docs/content`, because
+the pages there link with site paths such as `/language/types/rect` that only
+the site's router resolves; the Docusaurus build checks them instead.
+
 | Path | Purpose |
 | --- | --- |
 | `content/` | The published pages, one directory per book (see below) |

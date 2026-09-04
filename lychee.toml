@@ -1,0 +1,29 @@
+# Configuration for lychee, the link checker run by the `markdown-links` CI job.
+# The settings live here rather than in the workflow so that a local
+# `lychee --config lychee.toml '**/*.md'` reproduces CI exactly.
+
+# Only check links that resolve without network access: relative file paths,
+# images, and in-page heading anchors. External http(s) links are deliberately
+# left unchecked so CI stays deterministic and never goes red because a
+# third-party site rate-limited or timed out on the runner.
+offline = true
+
+# Resolve `#section` fragments against the target document's headings. This is
+# what catches a cross-reference to a heading that was later renamed or
+# renumbered, which is the most common way these docs rot.
+include_fragments = "anchor-only"
+
+# Build output, and git internals, are not documentation. Links in Rust doc
+# comments are covered separately by rustdoc's own intra-doc link lints; see
+# `[workspace.lints.rustdoc]` in the root Cargo.toml.
+exclude_path = [
+  "target",
+  ".git",
+  # The Docusaurus site under docs/ links with site-relative paths that only
+  # the site router resolves; `npm run build` in docs/ checks those links and
+  # fails on any broken one. Its dependencies and build output are not docs.
+  "docs/content",
+  "docs/node_modules",
+  "docs/build",
+  "docs/.docusaurus",
+]

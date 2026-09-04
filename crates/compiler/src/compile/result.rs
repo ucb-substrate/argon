@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{ast::Span, solver::ConstraintId};
 
-use super::{CellId, CompiledData, Ty};
+use super::{CellId, CompiledData};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticError {
@@ -16,7 +16,10 @@ pub struct StaticError {
 pub enum StaticErrorKind {
     /// Multiple declarations with the same name.
     ///
-    /// For example, two cells named `my_cell`.
+    /// For example, two cells named `my_cell`. Top-level cells, functions,
+    /// structs, enums, and imports share one namespace per module, so
+    /// `struct Mode` after `enum Mode` is reported too. Also covers repeated
+    /// parameter names, enum variants, and struct fields.
     #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
     /// Attempted to declare an object with the same name as a built-in object.
@@ -24,12 +27,38 @@ pub enum StaticErrorKind {
     /// For example, users cannot declare cells or functions named `rect`.
     #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
+    /// A cell's top-level `let` shadows a field an instance already answers.
+    ///
+    /// Distinct from [`Self::RedeclarationOfBuiltin`]: neither `x` nor `y` is
+    /// in `BUILTINS`, and pointing at a builtin that does not exist is what
+    /// made this error confusing -- `x` and `y` are among the most natural
+    /// variable names in a layout language.
+    #[error("`{name}` is reserved for instance position; a cell field cannot be named `x` or `y`")]
+    ReservedCellField { name: String },
+    /// Geometry of a cell was read before the cell was placed.
+    #[error("`{cell}` is a cell; place it with `inst(...)` before reading field `{field}`")]
+    CellFieldBeforePlacement { cell: String, field: String },
+    /// A field was read from a cell function that was never called.
+    #[error("`{cell}` is a cell function; call it as `{cell}(...)` before reading field `{field}`")]
+    CellFnFieldAccess { cell: String, field: String },
     /// Attempted to treat a non-enum object like an enum using the `::` operator.
     #[error("expected an enum")]
     NotAnEnum,
     /// Attempted to use an enum variant that is not declared by the enum.
     #[error("not a variant of the enum: {0}")]
     InvalidVariant(String),
+    /// A struct literal names something that is not a struct type.
+    #[error("expected a struct type")]
+    NotAStruct,
+    /// A struct literal gives the same field twice.
+    #[error("field `{field}` is specified more than once")]
+    DuplicateStructField { field: String },
+    /// A struct literal without `..base` omits declared fields.
+    #[error("missing fields {fields} in initializer of {ty}")]
+    MissingStructFields { ty: String, fields: String },
+    /// A struct contains itself, directly or through its fields' types.
+    #[error("struct `{name}` contains itself; recursive structs are not supported")]
+    RecursiveStruct { name: String },
     /// A cell had an expression in tail position, which is not permitted.
     #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
@@ -45,9 +74,9 @@ pub enum StaticErrorKind {
     /// Match arms must be comprehensive.
     #[error("match arms must be comprehensive")]
     MatchArmsNotComprehensive,
-    /// The operands in a binary expression must have the same type.
-    #[error("operands of binary expression must have the same type")]
-    BinOpMismatchedTypes,
+    /// The operands in an arithmetic expression must have the same type.
+    #[error("operands of an arithmetic expression must have the same type")]
+    ArithMismatchedTypes,
     /// The operands in a comparison must have the same type.
     #[error("operands of a comparison must have the same type")]
     ComparisonMismatchedTypes,
@@ -57,6 +86,9 @@ pub enum StaticErrorKind {
     /// Enum values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on enum values")]
     EnumsNotOrd,
+    /// Boolean values cannot be ordered.
+    #[error("cannot perform greater/less than comparisons on booleans")]
+    BoolNotOrd,
     /// Nil values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
@@ -66,12 +98,19 @@ pub enum StaticErrorKind {
     /// Sequences may only be compared with an empty sequence for equality.
     #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
     SeqMustCompareEqSeqNil,
-    /// A type cannot be used in a binary expression.
-    #[error("type cannot be used in a binary expression: {0:?}")]
-    BinOpInvalidType(Ty),
+    /// A type cannot be used in an arithmetic expression.
+    ///
+    /// Carries the rendered type rather than the `Ty`: `{0:?}` printed the
+    /// whole structure, where `Display` names it the way the rest of the
+    /// diagnostics do.
+    #[error("type cannot be used in an arithmetic expression: {0}")]
+    ArithInvalidType(String),
     /// A type cannot be used in a unary operation.
     #[error("type cannot be used in a unary operation")]
     UnaryOpInvalidType,
+    /// A type cannot be used as an operand of `&&`, `||`, or `!`.
+    #[error("type cannot be used in a boolean expression; `&&`, `||`, and `!` require Bool")]
+    BoolOpInvalidType,
     /// A type cannot be used in a comparison expression.
     #[error("type cannot be used in comparison expression")]
     ComparisonInvalidType,
@@ -79,26 +118,26 @@ pub enum StaticErrorKind {
     #[error("unknown type")]
     UnknownType,
     /// The requested field does not exist on the given type.
-    #[error("no field {field} on type {ty:?}")]
-    NoFieldOnTy { field: String, ty: Ty },
+    #[error("no field {field} on type {ty}")]
+    NoFieldOnTy { field: String, ty: String },
     /// A tuple index is out of range.
     #[error("tuple index out of range")]
     TupleIndexOutOfRange,
     /// The given type does not support positional field access.
-    #[error("the fields of type {ty:?} cannot be accessed via index field access")]
-    CannotIndexFieldAccess { ty: Ty },
+    #[error("the fields of type {ty} cannot be accessed via index field access")]
+    CannotIndexFieldAccess { ty: String },
     /// The given type cannot be indexed.
-    #[error("type {ty:?} cannot be indexed")]
-    CannotIndex { ty: Ty },
+    #[error("type {ty} cannot be indexed")]
+    CannotIndex { ty: String },
     /// The given type cannot be iterated.
-    #[error("cannot iterate over type {ty:?}")]
-    CannotIterate { ty: Ty },
+    #[error("cannot iterate over type {ty}")]
+    CannotIterate { ty: String },
     /// A value has the wrong concrete type.
-    #[error("expected type {expected:?}, found {found:?}")]
-    IncorrectTy { expected: Ty, found: Ty },
+    #[error("expected type {expected}, found {found}")]
+    IncorrectTy { expected: String, found: String },
     /// A value does not belong to the expected type category.
-    #[error("expected type category {expected}, found {found:?}")]
-    IncorrectTyCategory { found: Ty, expected: String },
+    #[error("expected type category {expected}, found {found}")]
+    IncorrectTyCategory { found: String, expected: String },
     /// A list constructor was called without elements.
     #[error("list constructors cannot be empty (use `[]` for an empty list)")]
     EmptyListConstructor,
@@ -111,6 +150,9 @@ pub enum StaticErrorKind {
     /// A call supplies the same keyword argument more than once.
     #[error("duplicate keyword argument")]
     DuplicateKwArg,
+    /// A parameter without a default is declared after a parameter with one.
+    #[error("positional parameter `{name}` cannot follow a parameter with a default value")]
+    PositionalParamAfterDefault { name: String },
     /// An identifier was used without being declared in the current scope.
     #[error("`{name}` is not declared in this scope")]
     UndeclaredVar { name: String },
@@ -120,14 +162,14 @@ pub enum StaticErrorKind {
     )]
     UseBeforeDeclaration { name: String },
     /// A value of the given type cannot be called.
-    #[error("cannot call type {0:?}")]
-    CannotCall(Ty),
+    #[error("cannot call type {0}")]
+    CannotCall(String),
     /// The requested type cast is invalid.
     #[error("invalid type cast")]
     InvalidCast,
     /// A value that is not a layout element was emitted with `!`.
-    #[error("type {0:?} cannot be emitted; `!` requires a rect, polygon, path, or instance")]
-    CannotEmit(Ty),
+    #[error("type {0} cannot be emitted; `!` requires a rect, polygon, path, or instance")]
+    CannotEmit(String),
     /// A referenced module does not exist in the loaded workspace.
     #[error("module `{module}` does not exist or could not be loaded")]
     InvalidMod { module: String },
@@ -137,9 +179,6 @@ pub enum StaticErrorKind {
     /// Module references form a dependency cycle.
     #[error("cyclic module dependency: {cycle}")]
     CyclicModuleDependency { cycle: String },
-    /// Source text could not be lexed.
-    #[error("error during lexing: {0}")]
-    LexError(String),
     /// Source text could not be parsed.
     #[error("error during parsing: {0}")]
     ParseError(String),
@@ -179,14 +218,14 @@ pub enum ExecErrorKind {
     #[error("invalid cell arguments: expected {expected} arguments, found {found}")]
     InvalidCellArity { expected: usize, found: usize },
     /// A cell invocation supplied an argument of the wrong type.
-    #[error("invalid cell argument {index}: expected {expected:?}, found {found}")]
+    #[error("invalid cell argument {index}: expected {expected}, found {found}")]
     InvalidCellArgumentType {
         index: usize,
-        expected: Ty,
+        expected: String,
         found: String,
     },
     /// A cell invocation supplied an argument whose value cannot be passed to a
-    /// cell, such as a rectangle or an instance.
+    /// cell, such as an instance or a cell.
     #[error("invalid cell argument: a {0} value cannot be passed to a cell")]
     UnsupportedCellArgument(String),
     /// An argument in a cell invocation does not reduce to a constant, so it
@@ -243,9 +282,19 @@ pub enum ExecErrorKind {
     /// A cell or instance has no bounding box.
     #[error("empty bbox")]
     EmptyBbox,
-    /// An optional field was accessed without a value.
-    #[error("empty field (field was not assigned a value)")]
-    EmptyField,
+    /// A field was read from an instance whose cell does not declare it.
+    ///
+    /// Reaches the evaluator rather than the type checker whenever the
+    /// instance arrived as `Any`, which is the normal way to pass one, so a
+    /// plain misspelling lands here.
+    #[error("no field `{field}` on instance of cell `{cell}`")]
+    NoFieldOnInstance { field: String, cell: String },
+    /// An optional field was read on a value that never received one.
+    ///
+    /// Today this is only a `crect` created without a `layer=` argument, whose
+    /// `.layer` therefore has nothing to return.
+    #[error("field `{field}` was never assigned a value")]
+    EmptyField { field: String },
     /// Rectangle edges appear in the wrong order.
     #[error("rect edges are in the wrong order: {0}")]
     FlippedRect(String),

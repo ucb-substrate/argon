@@ -1042,12 +1042,21 @@ mod tests {
         ));
         let output = Command::new("/bin/sh")
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .env("SHELL", "/bin/sh")
+            // An interactive shell sources `$ENV`, so clear it to keep the
+            // host's startup files from deciding this test's outcome.
+            .env("ENV", "")
             .output()
             .unwrap();
 
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "interactive shell exited with {}\nstderr: {}\nstdout: {}\ncommand: {command}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
             format!(
