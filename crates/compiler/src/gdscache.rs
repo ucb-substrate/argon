@@ -195,6 +195,60 @@ fn hash_cell_arg_key(hasher: &mut fnv::FnvHasher, arg: &CellArgKey) {
                 hash_cell_arg_key(hasher, value);
             }
         }
+        CellArgKey::Rect(layer, drawable, corners) => {
+            hasher.write_u8(7);
+            // Tagged by presence, so that no layer and an empty layer name
+            // differ.
+            match layer {
+                Some(layer) => {
+                    hasher.write_u8(1);
+                    hasher.write_usize(layer.len());
+                    hasher.write(layer.as_bytes());
+                }
+                None => hasher.write_u8(0),
+            }
+            hasher.write_u8(u8::from(*drawable));
+            for bits in corners {
+                hasher.write_u64(*bits);
+            }
+        }
+        CellArgKey::Polygon(layer, drawable, points) => {
+            hasher.write_u8(8);
+            hasher.write_usize(layer.len());
+            hasher.write(layer.as_bytes());
+            hasher.write_u8(u8::from(*drawable));
+            hash_points(hasher, points);
+        }
+        CellArgKey::Path(layer, drawable, lengths, points) => {
+            hasher.write_u8(9);
+            hasher.write_usize(layer.len());
+            hasher.write(layer.as_bytes());
+            hasher.write_u8(u8::from(*drawable));
+            for bits in lengths {
+                hasher.write_u64(*bits);
+            }
+            hash_points(hasher, points);
+        }
+        CellArgKey::Point(x, y) => {
+            hasher.write_u8(10);
+            hasher.write_u64(*x);
+            hasher.write_u64(*y);
+        }
+        CellArgKey::Tuple(values) => {
+            hasher.write_u8(11);
+            hasher.write_usize(values.len());
+            for value in values {
+                hash_cell_arg_key(hasher, value);
+            }
+        }
+    }
+}
+
+fn hash_points(hasher: &mut fnv::FnvHasher, points: &[(u64, u64)]) {
+    hasher.write_usize(points.len());
+    for (x, y) in points {
+        hasher.write_u64(*x);
+        hasher.write_u64(*y);
     }
 }
 

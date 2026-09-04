@@ -3528,6 +3528,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     }
 }
 
+/// A value passed to a cell.
+///
+/// A cell is compiled on its own and named by its arguments, so an argument
+/// has to be plain data: whatever the caller wrote, resolved to constants
+/// before the cell runs.
+///
+/// Shapes are passed *by value*. The caller's solver resolves their
+/// coordinates, and the cell receives those numbers unchanged, in its own
+/// coordinate frame: a cell can be instantiated anywhere, and any number of
+/// times, so nothing about a placement can reach them. Constraints the cell
+/// writes against a shape argument cannot move the caller's geometry either.
+/// Sharing live solver variables across a call is what `fn` is for.
+///
+/// Inside the cell a shape argument is construction geometry, so it draws
+/// nothing on its own. `!` draws it on its layer when it is *drawable*: when
+/// it stood for geometry drawn in the caller's layout, meaning it has a layer
+/// and is either layout geometry or a proxy of an instance's geometry. A
+/// `crect` or a `bbox` is not drawable, so `!` leaves it alone.
 #[derive(Debug, Clone)]
 pub enum CellArg {
     Float(f64),
@@ -3543,6 +3561,35 @@ pub enum CellArg {
         name: String,
         fields: Vec<(String, CellArg)>,
     },
+    /// A rectangle, like [`Value::Rect`]: its layer and its solved corners.
+    Rect {
+        layer: Option<String>,
+        drawable: bool,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+    },
+    /// A polygon, like [`Value::Polygon`]: its layer and its solved vertices.
+    Polygon {
+        layer: String,
+        drawable: bool,
+        points: Vec<(f64, f64)>,
+    },
+    /// A path, like [`Value::Path`]: its layer and its solved width,
+    /// centerline, and end extensions.
+    Path {
+        layer: String,
+        drawable: bool,
+        width: f64,
+        points: Vec<(f64, f64)>,
+        begin_extension: f64,
+        end_extension: f64,
+    },
+    /// A point, like [`Value::Point`]: its solved `x` and `y`.
+    Point(f64, f64),
+    /// A tuple, like [`Value::Tuple`]: its elements in order.
+    Tuple(Vec<CellArg>),
 }
 
 impl CellArg {
@@ -3552,12 +3599,23 @@ impl CellArg {
             (Self::Float(_), Ty::Float)
             | (Self::Int(_), Ty::Int)
             | (Self::Bool(_), Ty::Bool)
-            | (Self::String(_), Ty::String) => true,
+            | (Self::String(_), Ty::String)
+            | (Self::Rect { .. }, Ty::Rect)
+            | (Self::Polygon { .. }, Ty::Polygon)
+            | (Self::Path { .. }, Ty::Path)
+            | (Self::Point(..), Ty::Point) => true,
             (Self::Enum(variant), Ty::Enum(ty)) => ty.variants.contains(variant),
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner))
             }
             (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
+            (Self::Tuple(values), Ty::Tuple(tys)) => {
+                values.len() == tys.len()
+                    && values
+                        .iter()
+                        .zip(tys)
+                        .all(|(value, ty)| value.matches_ty(ty))
+            }
             (Self::Struct { name, fields }, Ty::Struct(ty)) => {
                 *name == ty.name
                     && fields.len() == ty.fields.len()
@@ -3579,6 +3637,11 @@ impl CellArg {
             Self::Enum(_) => "enum variant",
             Self::Seq(_) => "sequence",
             Self::Struct { .. } => "struct",
+            Self::Rect { .. } => "Rect",
+            Self::Polygon { .. } => "Polygon",
+            Self::Path { .. } => "Path",
+            Self::Point(..) => "Point",
+            Self::Tuple(_) => "tuple",
         }
     }
 }
@@ -3590,6 +3653,8 @@ struct CellExecKey {
     scope_name: Option<String>,
 }
 
+/// A [`CellArg`] as something that can be hashed and compared: floats become
+/// their bits.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum CellArgKey {
     Float(u64),
@@ -3599,6 +3664,38 @@ pub(crate) enum CellArgKey {
     Enum(String),
     Seq(Vec<CellArgKey>),
     Struct(String, Vec<(String, CellArgKey)>),
+    /// Layer, drawability, and `x0, y0, x1, y1`.
+    Rect(Option<String>, bool, [u64; 4]),
+    /// Layer, drawability, and the vertices.
+    Polygon(String, bool, Vec<(u64, u64)>),
+    /// Layer, drawability, the width and the begin and end extensions, and the
+    /// centerline points.
+    Path(String, bool, [u64; 3], Vec<(u64, u64)>),
+    Point(u64, u64),
+    Tuple(Vec<CellArgKey>),
+}
+
+/// The bits of each coordinate pair.
+fn point_bits(points: &[(f64, f64)]) -> Vec<(u64, u64)> {
+    points
+        .iter()
+        .map(|(x, y)| (x.to_bits(), y.to_bits()))
+        .collect()
+}
+
+/// Consecutive coordinates paired back up into points.
+fn pair_up(coords: &[f64]) -> Vec<(f64, f64)> {
+    coords
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[x, y]| (x, y))
+        .collect()
+}
+
+/// Constant coordinate pairs as solver expressions.
+fn constant_points(points: &[(f64, f64)]) -> Vec<(LinearExpr, LinearExpr)> {
+    points.iter().map(|&(x, y)| (x.into(), y.into())).collect()
 }
 
 impl From<&CellArg> for CellArgKey {
@@ -3617,6 +3714,42 @@ impl From<&CellArg> for CellArgKey {
                     .map(|(field, value)| (field.clone(), Self::from(value)))
                     .collect(),
             ),
+            CellArg::Rect {
+                layer,
+                drawable,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => Self::Rect(
+                layer.clone(),
+                *drawable,
+                [x0.to_bits(), y0.to_bits(), x1.to_bits(), y1.to_bits()],
+            ),
+            CellArg::Polygon {
+                layer,
+                drawable,
+                points,
+            } => Self::Polygon(layer.clone(), *drawable, point_bits(points)),
+            CellArg::Path {
+                layer,
+                drawable,
+                width,
+                points,
+                begin_extension,
+                end_extension,
+            } => Self::Path(
+                layer.clone(),
+                *drawable,
+                [
+                    width.to_bits(),
+                    begin_extension.to_bits(),
+                    end_extension.to_bits(),
+                ],
+                point_bits(points),
+            ),
+            CellArg::Point(x, y) => Self::Point(x.to_bits(), y.to_bits()),
+            CellArg::Tuple(v) => Self::Tuple(v.iter().map(Self::from).collect()),
         }
     }
 }
@@ -4692,9 +4825,15 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
-        for (val, decl) in args.into_iter().zip(cell_decl.args.iter()) {
+        for (arg, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
-            let val = Value::from_arg(&val);
+            // Built directly: `Self::span` resolves through a location, and
+            // the cell has no frame yet.
+            let span = Span {
+                path: cell_decl.metadata.0.clone(),
+                span: decl.name.span,
+            };
+            let val = self.bind_cell_arg(cell_id, &span, &arg);
             self.values.insert(vid, DeferValue::Ready(val));
             frame.bindings.insert(decl.metadata.0, vid);
         }
@@ -6186,10 +6325,161 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
+    /// Binds an argument of the cell `cell_id` as a value in it.
+    ///
+    /// Scalars, sequences, and structs are copied. A shape becomes
+    /// construction geometry of the cell, rebuilt from the constants the
+    /// caller resolved. It is registered as an object, so that emitting it or
+    /// binding it to a field never leaves a dangling id, but not emitted
+    /// itself, so it draws nothing and adds nothing to the cell's extent. A
+    /// drawable shape is also recorded as a proxy, which is how `!` opts in
+    /// to drawing it here on its own layer -- see
+    /// [`mark_emitted_proxies_as_layout`]. `span` is the parameter's
+    /// declaration, which is where the shape is attributed.
+    fn bind_cell_arg(&mut self, cell_id: CellId, span: &Span, arg: &CellArg) -> Value {
+        match arg {
+            CellArg::Int(i) => Value::Int(*i),
+            CellArg::Bool(b) => Value::Bool(*b),
+            CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            CellArg::String(s) => Value::String(s.clone()),
+            CellArg::Enum(v) => Value::EnumValue(v.clone()),
+            CellArg::Seq(v) => Value::Seq(
+                v.iter()
+                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                    .collect(),
+            ),
+            CellArg::Struct { name, fields } => Value::Struct(Box::new(StructValue {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(field, arg)| (field.clone(), self.bind_cell_arg(cell_id, span, arg)))
+                    .collect(),
+            })),
+            CellArg::Rect {
+                layer,
+                drawable,
+                x0,
+                y0,
+                x1,
+                y1,
+            } => {
+                let rect = Rect {
+                    id: self.object_id(),
+                    layer: layer.clone(),
+                    x0: (*x0).into(),
+                    y0: (*y0).into(),
+                    x1: (*x1).into(),
+                    y1: (*y1).into(),
+                    construction: true,
+                    span: Some(span.clone()),
+                };
+                self.register_shape_arg(cell_id, rect.id, rect.clone().into(), *drawable);
+                Value::Rect(rect)
+            }
+            CellArg::Polygon {
+                layer,
+                drawable,
+                points,
+            } => {
+                let polygon = Polygon {
+                    id: self.object_id(),
+                    layer: layer.clone(),
+                    points: constant_points(points),
+                    construction: true,
+                    span: Some(span.clone()),
+                };
+                self.register_shape_arg(cell_id, polygon.id, polygon.clone().into(), *drawable);
+                Value::Polygon(polygon)
+            }
+            CellArg::Path {
+                layer,
+                drawable,
+                width,
+                points,
+                begin_extension,
+                end_extension,
+            } => {
+                let path = Path {
+                    id: self.object_id(),
+                    layer: layer.clone(),
+                    width: (*width).into(),
+                    points: constant_points(points),
+                    begin_extension: (*begin_extension).into(),
+                    end_extension: (*end_extension).into(),
+                    construction: true,
+                    span: Some(span.clone()),
+                };
+                self.register_shape_arg(cell_id, path.id, path.clone().into(), *drawable);
+                Value::Path(path)
+            }
+            CellArg::Point(x, y) => Value::Point(((*x).into(), (*y).into())),
+            CellArg::Tuple(v) => Value::Tuple(
+                v.iter()
+                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Registers a shape argument as an object of `cell_id`. See
+    /// [`Self::bind_cell_arg`].
+    fn register_shape_arg(
+        &mut self,
+        cell_id: CellId,
+        id: ObjectId,
+        object: Object,
+        drawable: bool,
+    ) {
+        let state = self.cell_state_mut(cell_id);
+        state.objects.insert(id, object);
+        if drawable {
+            state.proxy_objects.insert(id);
+        }
+    }
+
+    /// Resolves `exprs` in the solver of `cell_id`, snapped to the grid like
+    /// every other coordinate. When any of them is still unsolved, records
+    /// `dependent_vid` as waiting on every variable they mention and returns
+    /// `None`, so that the conversion is retried once the solver progresses.
+    fn resolve_constants<'e>(
+        &mut self,
+        cell_id: CellId,
+        dependent_vid: ValueId,
+        exprs: impl IntoIterator<Item = &'e LinearExpr>,
+    ) -> Option<Vec<f64>> {
+        let exprs: Vec<&LinearExpr> = exprs.into_iter().collect();
+        let solver = &self.cell_state(cell_id).solver;
+        let values: Option<Vec<f64>> = exprs.iter().map(|expr| solver.eval_expr(expr)).collect();
+        if values.is_none() {
+            for expr in exprs {
+                for (_, var) in expr.coeffs.clone() {
+                    self.add_var_dependent(cell_id, var, dependent_vid);
+                }
+            }
+        }
+        values
+    }
+
+    /// Whether a shape of `cell_id` stands for geometry drawn in its layout:
+    /// it has a layer, and it is either layout geometry or a proxy of an
+    /// instance's geometry. See [`CellArg`].
+    fn shape_drawable(
+        &self,
+        cell_id: CellId,
+        id: ObjectId,
+        construction: bool,
+        has_layer: bool,
+    ) -> bool {
+        has_layer && (!construction || self.cell_state(cell_id).proxy_objects.contains(&id))
+    }
+
     /// Converts an evaluated value into a cell argument. `Ok(None)` means the
     /// value depends on solver variables that are not resolved yet, so the
     /// conversion should be retried; `Err` means the value can never be passed
     /// to a cell and an error has been recorded.
+    ///
+    /// A shape is passed by value: its coordinates are resolved in this cell's
+    /// solver, and the callee receives the constants. See [`CellArg`].
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
@@ -6234,6 +6524,70 @@ impl<'a> ExecPass<'a> {
                     name: value.name.clone(),
                     fields,
                 })
+            }
+            Value::Rect(r) => {
+                let Some(coords) =
+                    self.resolve_constants(cell_id, dependent_vid, [&r.x0, &r.y0, &r.x1, &r.y1])
+                else {
+                    return Ok(None);
+                };
+                Some(CellArg::Rect {
+                    layer: r.layer.clone(),
+                    drawable: self.shape_drawable(cell_id, r.id, r.construction, r.layer.is_some()),
+                    x0: coords[0],
+                    y0: coords[1],
+                    x1: coords[2],
+                    y1: coords[3],
+                })
+            }
+            Value::Polygon(p) => {
+                let Some(coords) = self.resolve_constants(
+                    cell_id,
+                    dependent_vid,
+                    p.points.iter().flat_map(|(x, y)| [x, y]),
+                ) else {
+                    return Ok(None);
+                };
+                Some(CellArg::Polygon {
+                    layer: p.layer.clone(),
+                    drawable: self.shape_drawable(cell_id, p.id, p.construction, true),
+                    points: pair_up(&coords),
+                })
+            }
+            Value::Path(p) => {
+                let Some(coords) = self.resolve_constants(
+                    cell_id,
+                    dependent_vid,
+                    [&p.width, &p.begin_extension, &p.end_extension]
+                        .into_iter()
+                        .chain(p.points.iter().flat_map(|(x, y)| [x, y])),
+                ) else {
+                    return Ok(None);
+                };
+                Some(CellArg::Path {
+                    layer: p.layer.clone(),
+                    drawable: self.shape_drawable(cell_id, p.id, p.construction, true),
+                    width: coords[0],
+                    begin_extension: coords[1],
+                    end_extension: coords[2],
+                    points: pair_up(&coords[3..]),
+                })
+            }
+            Value::Point((x, y)) => {
+                let Some(coords) = self.resolve_constants(cell_id, dependent_vid, [x, y]) else {
+                    return Ok(None);
+                };
+                Some(CellArg::Point(coords[0], coords[1]))
+            }
+            Value::Tuple(items) => {
+                let mut args = Vec::with_capacity(items.len());
+                for v in items {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => args.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Tuple(args))
             }
             // Already reported when it was poisoned. The caller turns this
             // `Err` into poison of its own rather than a second diagnostic
@@ -8682,24 +9036,6 @@ impl Value {
             Self::Path(p) => Some(Object::Path(p.clone())),
             Self::Inst(i) => Some(Object::Inst(i.clone())),
             _ => None,
-        }
-    }
-
-    pub fn from_arg(arg: &CellArg) -> Self {
-        match arg {
-            CellArg::Int(i) => Value::Int(*i),
-            CellArg::Bool(b) => Value::Bool(*b),
-            CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
-            CellArg::String(s) => Value::String(s.clone()),
-            CellArg::Enum(v) => Value::EnumValue(v.clone()),
-            CellArg::Seq(v) => Value::Seq(v.iter().map(Self::from_arg).collect()),
-            CellArg::Struct { name, fields } => Value::Struct(Box::new(StructValue {
-                name: name.clone(),
-                fields: fields
-                    .iter()
-                    .map(|(field, value)| (field.clone(), Self::from_arg(value)))
-                    .collect(),
-            })),
         }
     }
 
