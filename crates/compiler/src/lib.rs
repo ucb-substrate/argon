@@ -228,6 +228,7 @@ mod tests {
     const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
     const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
     const ARGON_STRUCTS: &str = concatcp!(EXAMPLES_DIR, "/structs/lib.ar");
+    const ARGON_RECURSIVE_CELL: &str = concatcp!(EXAMPLES_DIR, "/recursive_cell/lib.ar");
     const ARGON_SHAPE_CELL_ARGS: &str = concatcp!(EXAMPLES_DIR, "/shape_cell_args/lib.ar");
 
     // ---------------------------------------------------------------------
@@ -748,9 +749,9 @@ mod tests {
 
     /// Axis 4: depth of cell hierarchy. Two series are produced: `single_ref`
     /// references each child once and `double_ref` references it twice. Both
-    /// are linear in depth because the structural cell type is shared across
-    /// references rather than copied (see `CellFnTy::cell`); `double_ref` is
-    /// kept as a regression guard against the old exponential expansion.
+    /// are linear in depth because a cell type is nominal and names its
+    /// declaration rather than carrying its fields; `double_ref` is kept as a
+    /// regression guard against the old exponential expansion.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_hierarchy() {
@@ -808,11 +809,11 @@ mod tests {
         }
         write_bench_csv("hierarchy_single_ref", &rows);
 
-        // `double_ref` binds the child cell twice. With the shared (`Arc`)
-        // structural cell type this scales the same as `single_ref`, so it is
-        // swept over the same depths. (Before that fix it expanded
-        // exponentially and had to be capped near depth 18.) Override
-        // `ARGON_BENCH_HIER_DOUBLE` to push deeper.
+        // `double_ref` binds the child cell twice. With nominal cell types
+        // this scales the same as `single_ref`, so it is swept over the same
+        // depths. (Before that fix it expanded exponentially and had to be
+        // capped near depth 18.) Override `ARGON_BENCH_HIER_DOUBLE` to push
+        // deeper.
         let mut rows = Vec::new();
         for depth in bench_sizes(
             "ARGON_BENCH_HIER_DOUBLE",
@@ -1316,32 +1317,315 @@ mod tests {
         assert!(scope_names.contains(&"2 else"));
     }
 
+    /// `examples/cell_out_of_order` is `examples/hierarchy` with `top` moved
+    /// above the `bot` it instantiates. Declaration order does not matter, so
+    /// the two produce the same layout.
     #[test]
-    fn argon_cell_out_of_order_reports_use_before_declaration() {
-        let o = parse_workspace_with_std(ARGON_CELL_OUT_OF_ORDER);
+    fn argon_cell_out_of_order() {
+        let digest = |path: &str| {
+            let o = parse_workspace_with_std(path);
+            assert!(o.static_errors().is_empty());
+            let ast = o.ast();
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["top"],
+                    args: Vec::new(),
+                },
+            )
+            .unwrap_valid()
+            .geometry_digest()
+        };
+        assert_eq!(
+            digest(ARGON_CELL_OUT_OF_ORDER),
+            digest(ARGON_HIERARCHY),
+            "reordering declarations changed the layout"
+        );
+    }
+
+    /// The drawn rectangles across every compiled cell.
+    fn rect_count(data: &CompiledData) -> usize {
+        data.cells
+            .values()
+            .flat_map(|cell| cell.objects.values())
+            .filter(|object| matches!(object, SolvedValue::Rect(rect) if !rect.construction))
+            .count()
+    }
+
+    #[test]
+    fn a_cell_may_read_fields_of_a_cell_declared_below_it() {
+        let errors = static_errors_of(
+            "cell top() {\n\
+                 let l = inst(bot());\n\
+                 eq(l.met1.x0, 0.);\n\
+                 let w = l.met1.w;\n\
+             }\n\
+             cell bot() {\n\
+                 let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        // A misspelled field of a later cell is still a plain field error.
+        assert!(matches!(
+            static_errors_of(
+                "cell top() {\n\
+                     let l = inst(bot());\n\
+                     eq(l.met2.x0, 0.);\n\
+                 }\n\
+                 cell bot() {\n\
+                     let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
+                 }\n"
+            )
+            .as_slice(),
+            [StaticErrorKind::NoFieldOnTy { .. }]
+        ));
+    }
+
+    /// `examples/recursive_cell`: `tree(n)` instantiates `tree(n - 1)`, so
+    /// `tree(3)` draws four squares across four compiled cells.
+    #[test]
+    fn a_cell_may_instantiate_itself() {
+        let o = parse_workspace_with_std(ARGON_RECURSIVE_CELL);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let data = compile(
             &ast,
             CompileInput {
-                cell: &["top"],
-                args: Vec::new(),
+                cell: &["tree"],
+                args: vec![CellArg::Int(3)],
             },
+        )
+        .unwrap_valid();
+        assert_eq!(data.cells.len(), 4);
+        assert_eq!(rect_count(&data), 4);
+    }
+
+    /// Recursion that never ends is a run-time error, not a hang.
+    #[test]
+    fn unbounded_cell_recursion_is_reported() {
+        // The same arguments name the same cell, so the cycle is caught as
+        // soon as it closes.
+        let errors = compile_source(
+            "cell forever() {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 let again = inst(forever());\n\
+             }\n",
+            "forever",
+            Vec::new(),
+        )
+        .unwrap_exec_errors()
+        .errors;
+        assert!(
+            errors.iter().any(|error| matches!(
+                &error.kind,
+                ExecErrorKind::RecursiveInstantiation { cell } if cell == "forever"
+            )),
+            "{errors:?}"
         );
-        let errors = cells.unwrap_static_errors();
-        let error = errors
+        // Ever-changing arguments run into the depth limit instead.
+        let errors = crate::run_with_stack("argon-compile", || {
+            compile_source(
+                "cell forever(n: Int) {\n\
+                     let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     let again = inst(forever(n + 1));\n\
+                 }\n",
+                "forever",
+                vec![CellArg::Int(0)],
+            )
+            .unwrap_exec_errors()
             .errors
-            .iter()
-            .find(|error| {
-                matches!(
-                    &error.kind,
-                    StaticErrorKind::UseBeforeDeclaration { name } if name == "bot"
-                )
-            })
-            .expect("expected an explicit use-before-declaration error for `bot`");
-        assert_eq!(
-            error.kind.to_string(),
-            "cannot use `bot` before its declaration; move the `cell bot ...` declaration above this use"
+        });
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, ExecErrorKind::RecursionLimitExceeded { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn cells_may_instantiate_each_other() {
+        let data = compile_source(
+            "cell a(n: Int) {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 if n > 0 {\n\
+                     let b = inst(b(n - 1));\n\
+                     eq(b.r.x0, r.x1);\n\
+                     eq(b.y, 0.);\n\
+                 } else {\n\
+                 };\n\
+             }\n\
+             cell b(n: Int) {\n\
+                 let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 if n > 0 {\n\
+                     let a = inst(a(n - 1));\n\
+                     eq(a.r.x0, r.x1);\n\
+                     eq(a.y, 0.);\n\
+                 } else {\n\
+                 };\n\
+             }\n",
+            "a",
+            vec![CellArg::Int(3)],
+        )
+        .unwrap_valid();
+        assert_eq!(rect_count(&data), 4);
+    }
+
+    /// A field is typed when it is first read, so a statement may read a
+    /// field declared below it through an instance of the enclosing cell.
+    #[test]
+    fn a_field_declared_later_in_the_same_cell_is_typed_on_demand() {
+        let errors = static_errors_of(
+            "cell a(n: Int) {\n\
+                 let k = if n > 0 { inst(a(n - 1)).z.w } else { 0. };\n\
+                 let z = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A statement that reads two untyped fields queues a goal for each. When
+    /// the second field's statement reads the first, the first's queued goal
+    /// is worked before the second statement is retried.
+    #[test]
+    fn a_queued_field_read_again_is_typed_before_its_reader_is_retried() {
+        let errors = static_errors_of(
+            "cell x() {\n\
+                 eq(inst(a()).f.x0, inst(b()).g.x0);\n\
+             }\n\
+             cell a() {\n\
+                 let f = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n\
+             cell b() {\n\
+                 let g = inst(a()).f;\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A top-level `let` that is in scope but not yet typed hides a module
+    /// declaration of the same name, so a statement typed on demand reads the
+    /// local rather than the cell.
+    #[test]
+    fn an_untyped_local_hides_a_module_declaration_of_the_same_name() {
+        let errors = static_errors_of(
+            "cell user() {\n\
+                 let v = inst(top()).a;\n\
+             }\n\
+             cell top() {\n\
+                 let bot = 5.;\n\
+                 let a = bot + 1.;\n\
+             }\n\
+             cell bot() {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A statement typed on demand, ahead of the statements above it, sees the
+    /// same bindings it would when typed in order: the nearest `let` of each
+    /// name above it, typed as it is needed.
+    #[test]
+    fn a_statement_typed_out_of_order_sees_the_nearest_lets_above_it() {
+        let errors = static_errors_of(
+            "cell user() {\n\
+                 eq(inst(top()).c, 1.);\n\
+             }\n\
+             cell top() {\n\
+                 let r = 1.;\n\
+                 let s = r + 1.;\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 let c = r.w + s;\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A field whose type depends on itself is reported once, at the read that
+    /// closes the cycle, and nothing else cascades from it.
+    #[test]
+    fn a_field_whose_type_depends_on_itself_is_an_error() {
+        let errors = static_errors_of("cell a(n: Int) {\n    let f = inst(a(n - 1)).f;\n}\n");
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::CyclicCellField { cell, field }] if cell == "a" && field == "f"
+            ),
+            "{errors:?}"
+        );
+
+        let source =
+            "cell a() {\n    let f = inst(b()).g;\n}\ncell b() {\n    let g = inst(a()).f;\n}\n";
+        let errors = static_errors(source);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [crate::compile::StaticError { kind: StaticErrorKind::CyclicCellField { cell, field }, span }]
+                    if cell == "a" && field == "f" && span.span.start() == source.rfind(".f").unwrap() + 1
+            ),
+            "{errors:?}"
+        );
+
+        // Through a local: `z` reads `k`, whose type needs `z`.
+        let errors = static_errors_of(
+            "cell a(n: Int) {\n    let k = inst(a(n - 1)).z;\n    let z = k;\n}\n",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::CyclicCellField { cell, field }] if cell == "a" && field == "k"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    /// Cell types are nominal: two cells with identical fields are different
+    /// types, and `Any` is how code accepts either.
+    #[test]
+    fn cell_types_are_nominal() {
+        let cells = "cell a() {\n\
+                         let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     }\n\
+                     cell b() {\n\
+                         let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     }\n";
+        let errors = static_errors_of(&format!(
+            "{cells}cell top(flag: Bool) {{\n    let c = if flag {{ a() }} else {{ b() }};\n}}\n"
+        ));
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::BranchesDifferentTypes]),
+            "{errors:?}"
+        );
+        let errors = static_errors_of(&format!(
+            "{cells}fn erase(c: Any) -> Any {{ c }}\n\
+             cell top(flag: Bool) {{\n    let c = inst(if flag {{ erase(a()) }} else {{ erase(b()) }});\n}}\n"
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A top-level `let` may re-bind a name: each statement sees the nearest
+    /// `let` above it, and the field an instance answers is the last one.
+    #[test]
+    fn a_repeated_top_level_let_rebinds_sequentially() {
+        let cells = "cell top() {\n\
+                         let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                         let s = r.w;\n\
+                         let r = 5.;\n\
+                         let t = r + 1.;\n\
+                     }\n";
+        let errors = static_errors_of(cells);
+        assert!(errors.is_empty(), "{errors:?}");
+        let errors = static_errors_of(&format!(
+            "{cells}cell user() {{\n    let i = inst(top());\n    let v = i.r + 1.;\n}}\n"
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+        let errors = static_errors_of(&format!(
+            "{cells}cell user() {{\n    let i = inst(top());\n    let v = i.r.w;\n}}\n"
+        ));
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::NoFieldOnTy { .. }]),
+            "{errors:?}"
         );
     }
 
@@ -3417,50 +3701,6 @@ cell top() {
             )
         });
         assert!(static_errors(&call("1., b=2.")).is_empty());
-    }
-
-    /// Cell typing is structural. `CellTy` carries the declaring cell's `VarId`
-    /// so that a field access can be navigated back to its `let`, and that id
-    /// is deliberately excluded from `PartialEq`: if it were not, two cells
-    /// with identical fields would stop being interchangeable and a branch
-    /// over them would silently widen to `Ty::Any`.
-    #[test]
-    fn structurally_identical_cells_remain_interchangeable() {
-        let source = |field: &str| {
-            format!(
-                r#"
-                cell left() {{
-                    let met = rect("met1", x0=0., y0=0., x1=10., y1=10.);
-                }}
-
-                cell right() {{
-                    let met = rect("met1", x0=0., y0=0., x1=20., y1=20.);
-                }}
-
-                cell top(pick: Bool) {{
-                    let chosen = if pick {{ left() }} else {{ right() }};
-                    let placed = inst(chosen);
-                    eq(placed.{field}.x0, 0.);
-                }}
-                "#
-            )
-        };
-
-        // The branches share a cell type, so the common field type-checks.
-        let errors = static_errors(&source("met"));
-        assert!(errors.is_empty(), "{errors:#?}");
-
-        // And the type is still a cell rather than `Ty::Any`: an unknown field
-        // is caught. Were the declaring cell's id part of `CellTy` equality,
-        // the two branches would no longer unify, `Ty::lub` would widen the
-        // branch to `Ty::Any`, and this error would silently disappear.
-        let errors = static_errors(&source("missing"));
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error.kind, StaticErrorKind::NoFieldOnTy { .. })),
-            "{errors:#?}"
-        );
     }
 
     fn comparison_source(comparison: &str) -> String {

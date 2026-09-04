@@ -170,6 +170,30 @@ Shapes built on the command line work the same way:
 arc run --cell 'via_array(crect(x0=0., y0=0., w=90., h=40.), 10., 20.)'
 ```
 
+Top-level declarations may appear in any order: a cell, function, struct, or
+enum can be used above the line that declares it. Cells may also instantiate
+themselves or one another, which is how a recursive layout is written. The
+recursion has to end on a parameter, since the compiler stops at a fixed
+nesting depth:
+
+```rust
+cell tree(n: Int) {
+    let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
+    if n > 0 {
+        let child = inst(tree(n - 1));
+        eq(child.leaf.x0, leaf.x1 + 50.);
+        eq(child.y, 0.);
+    } else {
+    };
+}
+```
+
+Cell types are nominal: two cells with the same fields are different types,
+and a function that accepts either takes `Any`. The type of an instance field
+is worked out when it is first read, so the one thing that cannot be resolved
+is a field whose type depends on itself through the fields of other cells,
+which is reported as an error at the read that closes the cycle.
+
 GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with
 `use lib::macros::sram;`. Paths in the manifest are relative to `Argon.toml`,
