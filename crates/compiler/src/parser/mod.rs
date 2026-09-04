@@ -1,9 +1,9 @@
 //! Hand-written, zero-copy parser for the Argon language.
 //!
-//! Replaces the ANTLR-generated parser: a streaming byte lexer ([`lexer`]) feeds
-//! a single-pass recursive-descent + Pratt parser ([`grammar`]) that builds the
-//! AST directly, borrowing all identifier/string text from the source. The two
-//! public entry points match the contract the rest of the compiler expects.
+//! A streaming byte lexer ([`lexer`]) feeds a single-pass recursive-descent +
+//! Pratt parser ([`grammar`]) that builds the AST directly, borrowing all
+//! identifier/string text from the source. The two public entry points match
+//! the contract the rest of the compiler expects.
 
 mod grammar;
 mod lexer;
@@ -19,7 +19,6 @@ use crate::ast::{CallExpr, Decl};
 use crate::parse::{AnnotatedParseAst, ParseMetadata};
 
 /// A syntax error with the byte span (into the original input) it occurred at.
-/// Shape-compatible with the old `antlr::AntlrParseError`.
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub span: Span,
@@ -342,7 +341,7 @@ mod tests {
     #[test]
     fn leading_comment_is_allowed() {
         // The lexer skips `//` comments as trivia everywhere, so a comment
-        // before the first declaration parses fine (ANTLR rejected this).
+        // before the first declaration parses fine.
         assert!(parse("// header\ncell c() {}\n").is_ok());
         assert!(parse("  \n// c1\n// c2\nfn f() -> Float { 1. }\n").is_ok());
     }

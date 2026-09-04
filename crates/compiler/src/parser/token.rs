@@ -4,8 +4,8 @@
 //! own any text. The parser slices identifier/string text directly from the
 //! input by span, so lexing and parsing are entirely copy-free.
 
-/// The lexical category of a token. Mirrors the lexer rules in
-/// `grammar/Argon.g4` (kept as the language reference).
+/// The lexical category of a token. The lexer in `lexer.rs` produces exactly
+/// these kinds; `describe` gives the human-readable name used in diagnostics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum TokenKind {
@@ -136,8 +136,7 @@ impl TokenKind {
 /// A lexed token: a kind plus the half-open byte range `[start, end)` it covers
 /// in the original source. Offsets already include the `offset_base` (the count
 /// of leading whitespace bytes trimmed before lexing), so they index the
-/// original (untrimmed) input — matching the spans the ANTLR integration
-/// produced.
+/// original (untrimmed) input.
 #[derive(Clone, Copy, Debug)]
 pub struct Token {
     pub kind: TokenKind,
