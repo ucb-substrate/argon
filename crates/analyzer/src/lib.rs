@@ -1513,7 +1513,12 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let edit = match cell_edit::new_cell_edit(&ast, &source_path, &params.name) {
+        let edit = match cell_edit::new_cell_edit(
+            &ast,
+            &source_path,
+            &params.name,
+            self.state.position_encoding(),
+        ) {
             Ok(edit) => edit,
             Err(error) => {
                 self.state.report_message(MessageType::ERROR, error).await;
@@ -1545,7 +1550,12 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let rename = match cell_edit::rename_cell_edits(&ast, &current_invocation, &params.name) {
+        let rename = match cell_edit::rename_cell_edits(
+            &ast,
+            &current_invocation,
+            &params.name,
+            self.state.position_encoding(),
+        ) {
             Ok(rename) => rename,
             Err(error) => {
                 self.state.report_message(MessageType::ERROR, error).await;
