@@ -1,6 +1,6 @@
 ---
 title: Standard library
-description: Rectangle, array, comparison, and sequence helpers in std.
+description: Rectangle, array, comparison, option, and sequence helpers in std.
 ---
 
 import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
@@ -148,15 +148,84 @@ If the rectangles don't overlap, the result is inverted rather than empty: this 
 
 </ApiItem>
 
-## `std::last` {#last}
+## `std::Option` {#option}
 
-<ApiItem id="last" name="std::last" signature={'std::last(lst: [Any]) -> Any'} summary={<>Returns the last element of a sequence.</>}>
+```argon
+enum Option<T> {
+    Some(T),
+    None,
+}
+```
+
+A value that may be absent. `Option`, `Some`, and `None` are in scope in every module without a `use`. A cell parameter typed `Option<Int>` with a `None` default is optional, and a struct field typed `Option<Node>` lets a struct contain itself. Take an `Option` apart with `match`:
+
+```argon
+fn count(n: Option<Int>) -> Int {
+    match n {
+        Some(value) => value,
+        None => 1,
+    }
+}
+```
+
+## `std::is_some` {#is-some}
+
+<ApiItem id="is-some" name="std::is_some" signature={'std::is_some<T>(o: Option<T>) -> Bool'} summary={<>Whether an option holds a value.</>}>
 
 <ParameterTable rows={[
-  {name: 'lst', type: '[Any]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'A non-empty sequence.'},
+  {name: 'o', type: 'Option<T>', typeHref: '/language/std#option', requirement: 'Required', description: 'The option to test.'},
 ]} />
 
-<Returns type="Any" href="/language/types/scalars#any">The last element, typed as Any.</Returns>
+<Returns type="Bool" href="/language/types/scalars#bool">`true` for `Some`, `false` for `None`.</Returns>
+
+</ApiItem>
+
+## `std::is_none` {#is-none}
+
+<ApiItem id="is-none" name="std::is_none" signature={'std::is_none<T>(o: Option<T>) -> Bool'} summary={<>Whether an option is empty.</>}>
+
+<ParameterTable rows={[
+  {name: 'o', type: 'Option<T>', typeHref: '/language/std#option', requirement: 'Required', description: 'The option to test.'},
+]} />
+
+<Returns type="Bool" href="/language/types/scalars#bool">`true` for `None`, `false` for `Some`.</Returns>
+
+</ApiItem>
+
+## `std::unwrap_or` {#unwrap-or}
+
+<ApiItem id="unwrap-or" name="std::unwrap_or" signature={'std::unwrap_or<T>(o: Option<T>, default: T) -> T'} summary={<>The value inside an option, or a default.</>}>
+
+<ParameterTable rows={[
+  {name: 'o', type: 'Option<T>', typeHref: '/language/std#option', requirement: 'Required', description: 'The option to unwrap.'},
+  {name: 'default', type: 'T', requirement: 'Required', description: 'The value returned for `None`.'},
+]} />
+
+<Returns type="T">The payload of `Some`, or `default`.</Returns>
+
+</ApiItem>
+
+## `std::first` {#first}
+
+<ApiItem id="first" name="std::first" signature={'std::first<T>(items: [T]) -> Option<T>'} summary={<>Returns the first element of a sequence, if it has one.</>}>
+
+<ParameterTable rows={[
+  {name: 'items', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'Any sequence.'},
+]} />
+
+<Returns type="Option<T>" href="/language/std#option">`Some` of the first element, or `None` for an empty sequence.</Returns>
+
+</ApiItem>
+
+## `std::last` {#last}
+
+<ApiItem id="last" name="std::last" signature={'std::last<T>(items: [T]) -> T'} summary={<>Returns the last element of a sequence.</>}>
+
+<ParameterTable rows={[
+  {name: 'items', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'A non-empty sequence.'},
+]} />
+
+<Returns type="T">The last element, with the sequence's element type.</Returns>
 
 </ApiItem>
 
