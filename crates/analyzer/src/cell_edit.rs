@@ -13,7 +13,7 @@ use argonc::{
 };
 use tower_lsp_server::ls_types::{Range, TextEdit, Uri};
 
-use crate::document::Document;
+use crate::document::{Document, PositionEncoding};
 
 const KEYWORDS: &[&str] = &[
     "as", "cell", "const", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
@@ -85,6 +85,7 @@ pub(crate) fn new_cell_edit(
     workspace: &WorkspaceParseAst,
     source_path: &Path,
     name: &str,
+    encoding: PositionEncoding,
 ) -> Result<TextEdit, String> {
     validate_cell_name(name)?;
     let (module_path, module) = workspace
@@ -101,7 +102,7 @@ pub(crate) fn new_cell_edit(
     } else {
         "\n\n"
     };
-    let document = Document::new(&module.source_text, 0);
+    let document = Document::new(&module.source_text, 0, encoding);
     let end = document.offset_to_pos(source.len());
     Ok(TextEdit {
         range: Range::new(end, end),
@@ -218,6 +219,7 @@ fn add_edit(
     path: &Path,
     span: cfgrammar::Span,
     new_name: &str,
+    encoding: PositionEncoding,
 ) -> Result<(), String> {
     if !seen.insert((path.to_owned(), span.start(), span.end())) {
         return Ok(());
@@ -231,7 +233,7 @@ fn add_edit(
     }
     let uri = Uri::from_file_path(path)
         .ok_or_else(|| format!("Could not convert `{}` to an editor URI", path.display()))?;
-    let document = Document::new(&module.source_text, 0);
+    let document = Document::new(&module.source_text, 0, encoding);
     changes.entry(uri).or_default().push(TextEdit {
         range: Range::new(
             document.offset_to_pos(span.start()),
@@ -246,6 +248,7 @@ pub(crate) fn rename_cell_edits(
     workspace: &WorkspaceParseAst,
     current_invocation: &str,
     new_name: &str,
+    encoding: PositionEncoding,
 ) -> Result<RenameCellEdit, String> {
     validate_cell_name(new_name)?;
 
@@ -300,6 +303,7 @@ pub(crate) fn rename_cell_edits(
         &target_source_path,
         declaration_span,
         new_name,
+        encoding,
     )?;
 
     // Calls carry the resolved declaration ID. Module name propagation tells
@@ -328,6 +332,7 @@ pub(crate) fn rename_cell_edits(
                     &source_module.path,
                     name.span,
                     renamed,
+                    encoding,
                 )?;
             }
         }
@@ -357,6 +362,7 @@ pub(crate) fn rename_cell_edits(
                     &module.path,
                     name.span,
                     renamed,
+                    encoding,
                 )?;
             }
         }
@@ -387,7 +393,7 @@ mod tests {
 
     use argonc::parse;
 
-    use super::{new_cell_edit, rename_cell_edits, validate_cell_name};
+    use super::{PositionEncoding, new_cell_edit, rename_cell_edits, validate_cell_name};
 
     #[test]
     fn cell_names_must_be_plain_non_reserved_identifiers() {
@@ -404,9 +410,10 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         fs::write(&source_path, "cell top() {}\n").unwrap();
         let workspace = parse::parse_workspace_with_std(&source_path).ast();
-        let edit = new_cell_edit(&workspace, &source_path, "child").unwrap();
+        let edit =
+            new_cell_edit(&workspace, &source_path, "child", PositionEncoding::Utf16).unwrap();
         assert_eq!(edit.new_text, "\ncell child() {\n}\n");
-        assert!(new_cell_edit(&workspace, &source_path, "top").is_err());
+        assert!(new_cell_edit(&workspace, &source_path, "top", PositionEncoding::Utf16).is_err());
     }
 
     #[test]
@@ -425,7 +432,13 @@ mod tests {
         )
         .unwrap();
         let workspace = parse::parse_workspace_with_std(&source_path).ast();
-        let rename = rename_cell_edits(&workspace, "lib::blocks::child()", "unit").unwrap();
+        let rename = rename_cell_edits(
+            &workspace,
+            "lib::blocks::child()",
+            "unit",
+            PositionEncoding::Utf16,
+        )
+        .unwrap();
 
         assert_eq!(rename.invocation, "lib::blocks::unit()");
         assert_eq!(rename.changes.values().map(Vec::len).sum::<usize>(), 3);
@@ -452,7 +465,8 @@ mod tests {
         .unwrap();
         fs::write(&module_path, "cell child() {}\n").unwrap();
         let workspace = parse::parse_workspace_with_std(&source_path).ast();
-        let rename = rename_cell_edits(&workspace, "placed()", "unit").unwrap();
+        let rename =
+            rename_cell_edits(&workspace, "placed()", "unit", PositionEncoding::Utf16).unwrap();
 
         assert_eq!(rename.invocation, "placed()");
         assert_eq!(rename.changes.values().map(Vec::len).sum::<usize>(), 2);
@@ -472,7 +486,13 @@ mod tests {
         fs::write(&public_path, "use lib::blocks::child;\n").unwrap();
         fs::write(&blocks_path, "cell child() {}\n").unwrap();
         let workspace = parse::parse_workspace_with_std(&source_path).ast();
-        let rename = rename_cell_edits(&workspace, "lib::blocks::child()", "unit").unwrap();
+        let rename = rename_cell_edits(
+            &workspace,
+            "lib::blocks::child()",
+            "unit",
+            PositionEncoding::Utf16,
+        )
+        .unwrap();
 
         assert_eq!(rename.changes.values().map(Vec::len).sum::<usize>(), 4);
     }
