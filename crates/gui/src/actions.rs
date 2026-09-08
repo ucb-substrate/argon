@@ -31,6 +31,8 @@ actions!(
         ShowMessages,
         InstantiateCommand,
         OpenCellCommand,
+        NewCellCommand,
+        RenameCellCommand,
         Cancel,
         Backspace,
         Delete,

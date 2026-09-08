@@ -1,0 +1,29 @@
+---
+title: Sequences and tuples
+description: Sequences of one type and fixed-size tuples of mixed types.
+---
+
+# Sequences and tuples
+
+## Sequences
+
+`[T]` is an ordered sequence whose elements all have type `T`.
+
+```argon
+let values: [Float] = list(10., 20., 30.);
+let first = values[0];
+```
+
+The empty literal `[]` works as an empty sequence of any element type. Build and take apart sequences with [`list`, `cons`, `head`, and `tail`](/language/builtins/collections).
+
+## Tuples
+
+`(A, B)` is a fixed-size tuple whose positions can have different types. Write a trailing comma to make the syntax unambiguous.
+
+```argon
+let placement = (100., 200., true,);
+let x = placement.0;
+let reflected = placement.2;
+```
+
+The empty tuple `()` is the [unit type](./scalars#unit).

@@ -342,7 +342,7 @@ impl State {
         }
     }
 
-    async fn apply_source_changes(
+    pub(crate) async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
         focus: Option<Uri>,
@@ -407,7 +407,7 @@ impl State {
         }
     }
 
-    async fn apply_source_edit(&self, uri: Uri, edit: TextEdit) -> bool {
+    pub(crate) async fn apply_source_edit(&self, uri: Uri, edit: TextEdit) -> bool {
         self.apply_source_changes(HashMap::from([(uri.clone(), vec![edit])]), Some(uri))
             .await
     }

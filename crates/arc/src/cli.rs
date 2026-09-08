@@ -5,7 +5,7 @@ use std::{
     process::{Command, ExitCode, Stdio},
 };
 
-use crate::{Library, create_workspace, find_manifest_path, format_workspace};
+use crate::{Library, create_workspace, doc, find_manifest_path, format_workspace};
 use anyhow::{Context, Result, anyhow, bail};
 use argonc::diagnostics::{self, Diagnostic};
 use clap::{Args, Parser, Subcommand};
@@ -27,6 +27,8 @@ enum CommandKind {
     Check(LibraryArgs),
     /// Execute an Argon cell and write the compiler output.
     Run(RunArgs),
+    /// Generate static HTML API documentation for an Argon library.
+    Doc(DocArgs),
 }
 
 #[derive(Debug, Args)]
@@ -73,12 +75,23 @@ struct RunArgs {
     gds: bool,
 }
 
+#[derive(Debug, Args)]
+struct DocArgs {
+    /// Path to Argon.toml. Defaults to the nearest manifest in this directory or a parent.
+    #[arg(long, value_name = "PATH")]
+    manifest_path: Option<PathBuf>,
+    /// Documentation output directory. Defaults to target/doc.
+    #[arg(short, long, value_name = "DIR")]
+    output: Option<PathBuf>,
+}
+
 pub fn run() -> ExitCode {
     let result = match Cli::parse().command {
         CommandKind::New(args) => new(args),
         CommandKind::Fmt(args) => fmt(args),
         CommandKind::Check(args) => check(args),
         CommandKind::Run(args) => run_cell(args),
+        CommandKind::Doc(args) => generate_docs(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -87,6 +100,27 @@ pub fn run() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn generate_docs(args: DocArgs) -> Result<()> {
+    let manifest_path = match args.manifest_path {
+        Some(path) => path,
+        None => find_manifest_path(".")?,
+    };
+    let library = Library::load(&manifest_path)?;
+    let output = args.output.unwrap_or_else(|| library.target_path("doc"));
+    status("Documenting", &library.name);
+    let report = doc::generate(&library, &output)?;
+    status(
+        "Generated",
+        &format!(
+            "{} module{} at {}",
+            report.modules,
+            if report.modules == 1 { "" } else { "s" },
+            report.output.join("index.html").display()
+        ),
+    );
+    Ok(())
 }
 
 fn fmt(args: FmtArgs) -> Result<()> {
@@ -241,5 +275,23 @@ fn print_error(message: &str) {
         eprintln!("\x1b[1;31merror\x1b[0m: {message}");
     } else {
         eprintln!("error: {message}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::{Cli, CommandKind};
+
+    #[test]
+    fn parses_documentation_output_directory() {
+        let cli = Cli::try_parse_from(["arc", "doc", "--output", "site"]).unwrap();
+        let CommandKind::Doc(args) = cli.command else {
+            panic!("doc subcommand should be selected");
+        };
+        assert_eq!(args.output, Some(PathBuf::from("site")));
     }
 }

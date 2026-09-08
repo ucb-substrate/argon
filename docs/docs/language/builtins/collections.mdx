@@ -1,0 +1,89 @@
+---
+title: Collection built-ins
+description: Construct and traverse homogeneous sequences.
+sidebar_label: Collections
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# Collection built-ins
+
+These functions build and take apart [`[T]`](/language/types/collections#sequences) sequences.
+
+## `list`
+
+<ApiItem id="list" name="list" signature={'list(first: T, rest: T...) -> [T]'} summary={<>Builds a sequence from one or more values of the same type.</>}>
+
+<ParameterTable rows={[
+  {name: 'first', type: 'T', requirement: 'Required, positional', description: 'First element. Its type becomes the element type.'},
+  {name: 'rest', type: 'T...', requirement: 'Zero or more positional', description: 'Further elements, all of the same type as the first.'},
+]} />
+
+<Returns type="[T]" href="/language/types/collections#sequences">The values, in order.</Returns>
+
+```argon
+let widths = list(80., 120., 160.);
+```
+
+</ApiItem>
+
+## `cons`
+
+<ApiItem id="cons" name="cons" signature={'cons(value: T, tail: [T]) -> [T]'} summary={<>Prepends one value to an existing sequence.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'T', requirement: 'Required, positional', description: 'New first element.'},
+  {name: 'tail', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required, positional', description: 'The rest of the sequence. The empty literal [] works for any element type.'},
+]} />
+
+<Returns type="[T]" href="/language/types/collections#sequences">A new sequence starting with value.</Returns>
+
+```argon
+let values = cons(10., cons(20., []));
+```
+
+</ApiItem>
+
+## `head`
+
+<ApiItem id="head" name="head" signature={'head(sequence: [T]) -> T'} summary={<>Returns the first element of a sequence.</>}>
+
+<ParameterTable rows={[
+  {name: 'sequence', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required, positional', description: 'A non-empty sequence.'},
+]} />
+
+<Returns type="T">The first element.</Returns>
+
+Fails at run time if the sequence is empty.
+
+</ApiItem>
+
+## `tail`
+
+<ApiItem id="tail" name="tail" signature={'tail(sequence: [T]) -> [T]'} summary={<>Returns every element after the first.</>}>
+
+<ParameterTable rows={[
+  {name: 'sequence', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required, positional', description: 'A non-empty sequence.'},
+]} />
+
+<Returns type="[T]" href="/language/types/collections#sequences">Everything after the first element.</Returns>
+
+Fails at run time if the sequence is empty.
+
+</ApiItem>
+
+## `range_full`
+
+<ApiItem id="range-full" name="range_full" signature={'range_full(start: Int, stop: Int, step: Int) -> [Int]'} summary={<>Builds an integer range from a start, stop, and step.</>}>
+
+<ParameterTable rows={[
+  {name: 'start', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'First value.'},
+  {name: 'stop', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Exclusive upper bound.'},
+  {name: 'step', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Step between values.'},
+]} />
+
+<Returns type="[Int]" href="/language/types/collections#sequences">The range as a sequence.</Returns>
+
+For the common case of counting from zero, use [`std::range(stop)`](/language/std#range).
+
+</ApiItem>
