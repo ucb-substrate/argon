@@ -16,10 +16,10 @@ as caching and incremental compilation.
 
 The documentation site is published at <https://ucb-substrate.github.io/argon/>.
 It is built with Docusaurus and lives in [`docs/`](docs). Its pages are
-under [`docs/content/`](docs/content), split into [guides](docs/content/guides/index.md), a
-[language reference](docs/content/language/overview.md), a
-[GUI manual](docs/content/gui/workspace.md), and a
-[tools reference](docs/content/tools/overview.md), each with its own sidebar.
+under [`docs/docs/`](docs/docs), split into [guides](docs/docs/guides/index.md), a
+[language reference](docs/docs/language/overview.md), a
+[GUI manual](docs/docs/gui/workspace.md), and a
+[tools reference](docs/docs/tools/overview.md), each with its own sidebar.
 
 ```bash
 cd docs

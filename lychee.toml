@@ -22,7 +22,7 @@ exclude_path = [
   # The Docusaurus site under docs/ links with site-relative paths that only
   # the site router resolves; `npm run build` in docs/ checks those links and
   # fails on any broken one. Its dependencies and build output are not docs.
-  "docs/content",
+  "docs/docs",
   "docs/node_modules",
   "docs/build",
   "docs/.docusaurus",

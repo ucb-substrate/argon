@@ -198,11 +198,19 @@
   letter-spacing: -.03em;
 }
 
-/* Comment-style prefix in the accent color. */
+/* Comment-style prefix in the accent color, set in the code font so the
+   slashes are upright and span the heading's cap height rather than
+   Space Grotesk's tall, low-slung slash. */
 .h2::before {
-  content: '// ';
+  content: '//';
+  display: inline-block;
+  margin-right: .45em;
   color: var(--ifm-color-primary);
-  font-weight: 500;
+  font-family: var(--ifm-font-family-monospace);
+  font-size: .78em;
+  font-weight: 700;
+  line-height: 1;
+  vertical-align: .06em;
 }
 
 .reasons {

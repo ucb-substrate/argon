@@ -3,10 +3,10 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 // Each top-level key is an independent sidebar. A page only ever shows the
 // sidebar it belongs to, so the guides, the language reference, the GUI manual,
 // and the tools reference read as separate books. Doc IDs are paths relative
-// to content/.
+// to docs/docs/.
 const sidebars: SidebarsConfig = {
   // One category per guide. Add new guides as further categories here and as
-  // rows in docs/guides/index.md.
+  // rows in docs/docs/guides/index.md.
   guides: [
     'guides/index',
     {

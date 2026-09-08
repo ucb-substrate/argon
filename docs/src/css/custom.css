@@ -52,6 +52,17 @@ kbd,
   border-bottom: 1px solid var(--ifm-color-emphasis-200);
 }
 
+/* The mark is the whole brand, so let it fill the bar. Docusaurus renders one
+   image per theme and hides the inactive one, so never set `display` on the
+   images. */
+.navbar__logo {
+  height: 2.5rem;
+}
+
+.navbar__brand {
+  margin-right: 1.5rem;
+}
+
 .navbar__title,
 .navbar__link {
   font-family: var(--argon-font-display);
@@ -70,6 +81,17 @@ kbd,
 .navbar__search-input {
   font-family: var(--ifm-font-family-monospace);
   font-size: .85rem;
+}
+
+/* The search box is the last right-hand navbar item. Docusaurus pads its
+   container by the item padding and the local-search plugin adds a 16px margin
+   inside, which stack into a 36px gap after the theme toggle. Collapse them. */
+.navbar__items--right > :last-child {
+  padding-left: 0;
+}
+
+.navbar__items--right > :last-child > div {
+  margin-left: .5rem;
 }
 
 /* On the front page the navbar takes the hero gradient's top color and loses

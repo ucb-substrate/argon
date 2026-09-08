@@ -40,9 +40,8 @@ const config: Config = {
       {
         docs: {
           // The site root is the repository's docs/ directory; the published
-          // books live in docs/content/. Contributor notes at the top level of
-          // docs/ are outside the content path and so are not published.
-          path: 'content',
+          // books live in docs/docs/ (the plugin default). Contributor notes at
+          // the top level of docs/ are outside that path and are not published.
           // Docs are served at the site root so each book gets a short prefix:
           // /guides, /language, /gui, /tools.
           routeBasePath: '/',
@@ -86,7 +85,7 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: 'Argon',
+      // The [Ar] mark alone; no title text beside it.
       logo: {
         alt: 'Argon',
         src: 'img/argon-mark.svg',

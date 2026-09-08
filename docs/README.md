@@ -23,13 +23,13 @@ by `.github/workflows/docs.yml`. The workflow builds the site on every pull
 request that touches `docs/` and deploys on pushes to `main`. It needs the
 repository's Pages source set to "GitHub Actions" (Settings, Pages).
 
-The repository's Markdown link checker (lychee) skips `docs/content`, because
+The repository's Markdown link checker (lychee) skips `docs/docs`, because
 the pages there link with site paths such as `/language/types/rect` that only
 the site's router resolves; the Docusaurus build checks them instead.
 
 | Path | Purpose |
 | --- | --- |
-| `content/` | The published pages, one directory per book (see below) |
+| `docs/` | The published pages, one directory per book (see below) |
 | `docusaurus.config.ts`, `sidebars.ts` | Site configuration and navigation |
 | `src/pages/index.tsx` | The front page |
 | `src/components/ApiReference.tsx` | Components used by the reference pages |
@@ -41,12 +41,12 @@ directory name is also the URL prefix.
 
 | Directory | Sidebar | Contents |
 | --- | --- | --- |
-| `content/guides/` | Guides | `index.md` lists the guides; each guide is a subdirectory, currently only `getting-started/` |
-| `content/language/` | Language | Language chapters, then `builtins/`, `std.mdx`, and `types/` for the reference |
-| `content/gui/` | GUI | The visual editor |
-| `content/tools/` | Tools | `arc`, `argone`, `argonc`, and the Neovim plugin |
+| `docs/guides/` | Guides | `index.md` lists the guides; each guide is a subdirectory, currently only `getting-started/` |
+| `docs/language/` | Language | Language chapters, then `builtins/`, `std.mdx`, and `types/` for the reference |
+| `docs/gui/` | GUI | The visual editor |
+| `docs/tools/` | Tools | `arc`, `argone`, `argonc`, and the Neovim plugin |
 
-Sidebar entries in `sidebars.ts` are paths relative to `content/`. Links within
+Sidebar entries in `sidebars.ts` are paths relative to `docs/docs/`. Links within
 pages use absolute URL paths such as `/language/types/rect`.
 
 `static/img/gui.png` is a screenshot of the GUI with `diff_vco_top()` from

@@ -53,4 +53,4 @@ The cell now takes two arguments, so `inset_rect()` no longer compiles. Press <k
 - Dragging a dashed edge updates its `*i` argument in the source.
 - An initial value never overrides a constraint.
 
-[Constraints and fallback values](/language/constraints) covers the model in more depth. Next: [Hierarchy and export](./hierarchy-export).
+[Constraints and fallback values](/language/constraints) covers the model in more depth.

@@ -47,7 +47,3 @@ vim.pack.add({
 ```
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your `PATH`.
-
-## Next
-
-[Your first cell](./first-cell) creates a library and opens it in the editor.
