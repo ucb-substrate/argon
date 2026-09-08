@@ -1,0 +1,408 @@
+use lib::params::PrechargeParams;
+
+fn precharge_xf(r: Rect) -> Rect {
+    lib::columns::util::cbox(940. - r.y1, 900. + r.x0, 940. - r.y0, 900. + r.x1)
+}
+
+fn pc_pull_width(p: PrechargeParams) -> Float {
+    p.pull_up_width as Float
+}
+
+fn pc_equalizer_width(p: PrechargeParams) -> Float {
+    p.equalizer_width as Float
+}
+
+fn pc_total_device_width(p: PrechargeParams) -> Float {
+    pc_equalizer_width(p) + 2. * pc_pull_width(p) + 540.
+}
+
+fn pc_gate_bot_span(p: PrechargeParams) -> (Float, Float) {
+    (360. - p.en_b_width as Float, 360.,)
+}
+
+fn pc_gate_top_span(p: PrechargeParams) -> (Float, Float) {
+    let start = pc_equalizer_width(p) + 2. * pc_pull_width(p) + 1980.;
+    (start, start + p.en_b_width as Float,)
+}
+
+fn pc_cut_bot(p: PrechargeParams) -> Float {
+    715. + pc_equalizer_width(p)
+}
+
+fn pc_cut_top(p: PrechargeParams) -> Float {
+    pc_equalizer_width(p) + 2. * pc_pull_width(p) + 1480.
+}
+
+fn pc_power_span(p: PrechargeParams) -> (Float, Float) {
+    let height = lib::columns::util::clamp(pc_pull_width(p), 800., 3600.);
+    let start = pc_equalizer_width(p) + pc_pull_width(p) + 1245. - height / 2.;
+    (start, start + height,)
+}
+
+fn pc_outline_top(p: PrechargeParams) -> Float {
+    pc_gate_top_span(p).1 + 400.
+}
+
+fn draw_precharge_xf(layer: Any, r: Rect) -> Rect {
+    lib::columns::util::draw_clip(layer, precharge_xf(r), 1200.)
+}
+
+fn precharge_sd_port_raw(x: Float, w: Float, row: Int) -> Rect {
+    let cy = row as Float * 430.;
+    let size = 170.;
+    let space = 170.;
+    let nx = lib::columns::util::contact_n_dir(w, w, w, 60., 80., size, space);
+    let aw = size * nx as Float + space * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
+    lib::columns::util::cbox(ax0 - 80., cy + 40., ax0 + aw + 80., cy + 210.)
+}
+
+fn draw_precharge_sd_contact(x: Float, w: Float, row: Int) -> Rect {
+    let cy = row as Float * 430.;
+    let size = 170.;
+    let space = 170.;
+    let nx = lib::columns::util::contact_n_dir(w, w, w, 60., 80., size, space);
+    let aw = size * nx as Float + space * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
+    for i in std::range(nx) {
+        draw_precharge_xf("licon1.drawing", lib::columns::util::cbox(ax0 + i as Float * (size + space), cy + 40., ax0 + i as Float * (size + space) + size, cy + 210.));
+    }
+    draw_precharge_xf("diff.drawing", lib::columns::util::cbox(ax0 - 60., cy, ax0 + aw + 60., cy + 250.));
+    let li = precharge_sd_port_raw(x, w, row);
+    draw_precharge_xf("li1.drawing", li);
+    precharge_xf(li)
+}
+
+fn draw_precharge_gate_contact(p: PrechargeParams, right: Bool) -> Rect {
+    let gate_right = pc_total_device_width(p) + 190.;
+    let li = if right {
+        lib::columns::util::cbox(gate_right, 255., gate_right + 330., 425.)
+    } else {
+        lib::columns::util::cbox(-520., 255., -190., 425.)
+    };
+    let poly = if right {
+        lib::columns::util::cbox(gate_right, 205., gate_right + 330., 475.)
+    } else {
+        lib::columns::util::cbox(-520., 205., -190., 475.)
+    };
+    let cut = if right {
+        lib::columns::util::cbox(gate_right + 80., 255., gate_right + 250., 425.)
+    } else {
+        lib::columns::util::cbox(-440., 255., -270., 425.)
+    };
+    draw_precharge_xf("poly.drawing", poly);
+    draw_precharge_xf("li1.drawing", li);
+    draw_precharge_xf("licon1.drawing", cut);
+    precharge_xf(li)
+}
+
+fn draw_precharge_mos(p: PrechargeParams) -> (Rect, Rect, Rect, Rect, Rect, Rect, Rect, Rect) {
+    let eq = pc_equalizer_width(p);
+    let pull = pc_pull_width(p);
+    let pull0 = eq + 270.;
+    let pull1 = eq + pull + 540.;
+    let total = pc_total_device_width(p);
+    let diff_perp = 530. + p.length as Float;
+    draw_precharge_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., eq + 125., diff_perp + 125.));
+    draw_precharge_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., pull0 + pull + 125., diff_perp + 125.));
+    draw_precharge_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., total + 125., diff_perp + 125.));
+    draw_precharge_xf("nwell.drawing", lib::columns::util::cbox(-180., -180., eq + 180., diff_perp + 180.));
+    draw_precharge_xf("nwell.drawing", lib::columns::util::cbox(pull0 - 180., -180., pull0 + pull + 180., diff_perp + 180.));
+    draw_precharge_xf("nwell.drawing", lib::columns::util::cbox(pull1 - 180., -180., pull1 + pull + 180., diff_perp + 180.));
+    draw_precharge_xf("diff.drawing", lib::columns::util::cbox(0., 0., eq, diff_perp));
+    draw_precharge_xf("diff.drawing", lib::columns::util::cbox(pull0, 0., pull0 + pull, diff_perp));
+    draw_precharge_xf("diff.drawing", lib::columns::util::cbox(pull1, 0., pull1 + pull, diff_perp));
+    draw_precharge_xf("poly.drawing", lib::columns::util::cbox(-190., 265., total + 190., 265. + p.length as Float));
+    let gate = draw_precharge_gate_contact(p, false);
+    let gate_x = draw_precharge_gate_contact(p, true);
+    draw_precharge_xf("npc.drawing", lib::columns::util::cbox(-540., 155., -170., 525.));
+    draw_precharge_xf("npc.drawing", lib::columns::util::cbox(total + 170., 155., total + 540., 525.));
+    let sd00 = draw_precharge_sd_contact(0., eq, 0);
+    let sd01 = draw_precharge_sd_contact(0., eq, 1);
+    let sd10 = draw_precharge_sd_contact(pull0, pull, 0);
+    let sd11 = draw_precharge_sd_contact(pull0, pull, 1);
+    let sd20 = draw_precharge_sd_contact(pull1, pull, 0);
+    let sd21 = draw_precharge_sd_contact(pull1, pull, 1);
+    lib::columns::util::draw_clip("psdm.drawing", lib::columns::util::cbox(0., 775., 1200., eq + 1025.), 1200.);
+    lib::columns::util::draw_clip("psdm.drawing", lib::columns::util::cbox(0., 775., 1200., eq + pull + 1295.), 1200.);
+    lib::columns::util::draw_clip("psdm.drawing", lib::columns::util::cbox(0., 775., 1200., eq + 2. * pull + 1565.), 1200.);
+    lib::columns::util::draw_clip("nwell.drawing", lib::columns::util::cbox(0., -90., 1200., pc_outline_top(p)), 1200.);
+    (gate, gate_x, sd10, sd21, sd20, sd11, sd00, sd01,)
+}
+
+
+cell precharge_exact(p: PrechargeParams) {
+    let width = 1200.;
+    let gate_bot = lib::columns::util::rect_from_spans((-width, 2. * width,), pc_gate_bot_span(p));
+    let gate_top = lib::columns::util::rect_from_spans((-width, 2. * width,), pc_gate_top_span(p));
+    let gate_bot_draw = lib::columns::util::draw_clip("met2.drawing", gate_bot, width);
+    let gate_top_draw = lib::columns::util::draw_clip("met2.drawing", gate_top, width);
+    lib::columns::util::draw_clip("met2.pin", gate_bot, width);
+    lib::columns::util::draw_clip("met2.pin", gate_top, width);
+    let mos = draw_precharge_mos(p);
+    let gate = mos.0;
+    let gate_x_port = mos.1;
+    let sd_1_0 = mos.2;
+    let sd_2_1 = mos.3;
+    let sd_2_0 = mos.4;
+    let sd_1_1 = mos.5;
+    let sd_0_0 = mos.6;
+    let sd_0_1 = mos.7;
+
+    let cut_bot = pc_cut_bot(p);
+    let cut_top = pc_cut_top(p);
+    let o0 = lib::columns::util::cbox(lib::columns::util::precharge_out_track(0).0, -90., lib::columns::util::precharge_out_track(0).1, cut_bot);
+    let o1 = lib::columns::util::cbox(lib::columns::util::precharge_out_track(1).0, -90., lib::columns::util::precharge_out_track(1).1, gate.y1);
+    let o2 = lib::columns::util::cbox(lib::columns::util::precharge_out_track(2).0, -90., lib::columns::util::precharge_out_track(2).1, cut_bot);
+    lib::columns::util::draw_clip("met1.drawing", o0, width);
+    lib::columns::util::draw_clip("met1.drawing", o2, width);
+
+    let gate_x = lib::columns::util::cbox(lib::columns::util::precharge_out_track(1).0, gate_x_port.y0, lib::columns::util::precharge_out_track(1).1, pc_gate_top_span(p).1);
+
+    let dst_pos = lib::columns::util::simple_jog_clip(
+        "met1.drawing",
+        cut_bot,
+        lib::columns::util::precharge_out_track(0),
+        lib::columns::util::precharge_out_track(2),
+        lib::columns::util::precharge_in_track(1),
+        lib::columns::util::precharge_in_track(2),
+        140.,
+        140.,
+        width,
+    );
+    let r0 = lib::columns::util::cbox(lib::columns::util::precharge_in_track(0).0, dst_pos, lib::columns::util::precharge_in_track(0).1, cut_top);
+    let r1 = lib::columns::util::cbox(lib::columns::util::precharge_in_track(1).0, dst_pos, lib::columns::util::precharge_in_track(1).1, cut_top);
+    let r2 = lib::columns::util::cbox(lib::columns::util::precharge_in_track(2).0, dst_pos, lib::columns::util::precharge_in_track(2).1, cut_top);
+    let r3 = lib::columns::util::cbox(lib::columns::util::precharge_in_track(3).0, dst_pos, lib::columns::util::precharge_in_track(3).1, cut_top);
+    lib::columns::util::draw_clip("met1.drawing", lib::columns::util::cbox(r0.x0 - 60., r0.y0, r0.x1 + 60., r0.y1), width);
+    lib::columns::util::draw_clip("met1.drawing", r1, width);
+    lib::columns::util::draw_clip("met1.drawing", r2, width);
+    lib::columns::util::draw_clip("met1.drawing", lib::columns::util::cbox(r3.x0 - 60., r3.y0, r3.x1 + 60., r3.y1), width);
+
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::rect_translate(lib::columns::util::rect_expand_vert(sd_1_0, -20.), 5., 0.), lib::columns::util::rect_translate(r2, 5., 0.), 0, 0, true, width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::rect_expand_vert(sd_2_1, -20.), r1, 0, 0, true, width);
+
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(width, sd_2_0.y0 + 20., width, sd_2_0.y1 - 20.), r3, 0, 0, true, width);
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(lib::columns::util::fmin(sd_2_0.x0, width), sd_2_0.y0, lib::columns::util::fmax(sd_2_0.x1, width), sd_2_0.y1), width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(0., sd_1_1.y0 + 20., 0., sd_1_1.y1 - 20.), r0, 0, 0, true, width);
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(lib::columns::util::fmin(sd_1_1.x0, 0.), sd_1_1.y0, lib::columns::util::fmax(sd_1_1.x1, 0.), sd_1_1.y1), width);
+
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(lib::columns::util::rect_cx(o0), sd_0_0.y0 + 20., lib::columns::util::rect_cx(o0), sd_0_0.y1 - 20.), lib::columns::util::rect_expand_vert(o0, -80.), 0, 0, true, width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(lib::columns::util::rect_cx(o2), sd_0_1.y0 + 20., lib::columns::util::rect_cx(o2), sd_0_1.y1 - 20.), lib::columns::util::rect_expand_vert(o2, -80.), 0, 0, true, width);
+
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", gate_bot, lib::columns::util::rect_expand_vert(o1, -80.), 0, 0, true, width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", gate_top, lib::columns::util::rect_expand_vert(gate_x, -80.), 0, 0, true, width);
+
+    let stripe = lib::columns::util::rect_from_spans((-width, 2. * width,), pc_power_span(p));
+    let vdd = lib::columns::util::draw_clip("met2.drawing", stripe, width);
+    lib::columns::util::draw_clip("met2.pin", stripe, width);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", lib::columns::util::double_left(r0), stripe, 0, 0, true, width);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", lib::columns::util::double_right(r3), stripe, 0, 0, true, width);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", o1, gate_bot, 0, 0, true, width);
+    let gate_ct = lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", gate_x, gate_top, 0, 0, true, width);
+    let gate_ct_top = gate_ct.1.y1;
+
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(gate.x0, o1.y0, gate.x1, o1.y1), width);
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(gate.x0, gate_x.y0, gate.x1, gate_x.y1), width);
+
+    let dst_pos2 = lib::columns::util::simple_jog_clip(
+        "met1.drawing",
+        cut_top,
+        lib::columns::util::precharge_in_track(1),
+        lib::columns::util::precharge_in_track(2),
+        lib::columns::util::precharge_out_track(0),
+        lib::columns::util::precharge_out_track(2),
+        140.,
+        140.,
+        width,
+    );
+    lib::columns::util::draw_clip("met1.drawing", lib::columns::util::cbox(lib::columns::util::precharge_out_track(0).0, dst_pos2, lib::columns::util::precharge_out_track(0).1, gate_ct_top), width);
+    lib::columns::util::draw_clip("met1.drawing", lib::columns::util::cbox(lib::columns::util::precharge_out_track(2).0, dst_pos2, lib::columns::util::precharge_out_track(2).1, gate_ct_top), width);
+
+    let dst_pos3 = lib::columns::util::simple_jog_clip(
+        "met1.drawing",
+        gate_ct_top,
+        lib::columns::util::precharge_out_track(0),
+        lib::columns::util::precharge_out_track(2),
+        lib::columns::util::precharge_in_track(1),
+        lib::columns::util::precharge_in_track(2),
+        140.,
+        140.,
+        width,
+    );
+    let br_in = lib::columns::util::draw_clip("met1.drawing", lib::columns::util::cbox(lib::columns::util::precharge_in_track(1).0, dst_pos3 - 140., lib::columns::util::precharge_in_track(1).1, dst_pos3), width);
+    let bl_in = lib::columns::util::draw_clip("met1.drawing", lib::columns::util::cbox(lib::columns::util::precharge_in_track(2).0, dst_pos3 - 140., lib::columns::util::precharge_in_track(2).1, dst_pos3), width);
+    let br_out = lib::columns::util::draw_clip("met1.drawing", o0, width);
+    let bl_out = lib::columns::util::draw_clip("met1.drawing", o2, width);
+    lib::columns::util::draw_clip("met1.pin", br_in, width);
+    lib::columns::util::draw_clip("met1.pin", bl_in, width);
+    lib::columns::util::draw_clip("met1.pin", br_out, width);
+    lib::columns::util::draw_clip("met1.pin", bl_out, width);
+
+    let en_b = list(gate_bot_draw, gate_top_draw);
+    let br = list(br_out, br_in);
+    let bl = list(bl_out, bl_in);
+    let outline = crect(x0=0., y0=-90., x1=width, y1=pc_outline_top(p));
+}
+
+fn draw_precharge_tap_contact(outline_top: Float) -> Rect {
+    let area = lib::columns::mux::rect_shrink_all(lib::columns::util::cbox(0., -90., 1300., outline_top), 300.);
+    let cut_bbox = lib::columns::mux::draw_centered_via_array("licon1.drawing", area, 170., 340., 0., 120.);
+    let tap_bbox = lib::columns::util::rect_expand_vert(cut_bbox, 120.);
+    let li_bbox = lib::columns::util::rect_expand_xy(cut_bbox, 80., 0.);
+    lib::columns::util::draw_box("tap.drawing", tap_bbox);
+    lib::columns::util::draw_box("li1.drawing", li_bbox);
+    li_bbox
+}
+
+fn draw_precharge_center_via(tap_li: Rect) -> Rect {
+    // ViaParams' default expansion is used here in SRAM22 (as opposed to the
+    // longer-direction rule used by the side vias).
+    let contact = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", tap_li, tap_li, 0, 1, false);
+    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(tap_li), lib::columns::util::rect_vspan(contact.0)));
+    contact.1
+}
+
+fn draw_precharge_shifted_contact(
+    via: Int,
+    bot_layer: Any,
+    top_layer: Any,
+    bot: Rect,
+    top: Rect,
+    bot_ext_dir: Int,
+    top_ext_dir: Int,
+    longer: Bool,
+    target_x: Float,
+    width: Float,
+) -> (Rect, Rect, Rect) {
+    let choice = lib::columns::util::contact_choice(via, bot, top, bot_ext_dir, top_ext_dir, longer);
+    let size = lib::columns::util::contact_size(via);
+    let space = lib::columns::util::contact_space(via);
+    let nx = choice.0;
+    let ny = choice.1;
+    let center = lib::columns::util::contact_center(bot, top);
+    let aw = size * nx as Float + space * (nx - 1) as Float;
+    let ah = size * ny as Float + space * (ny - 1) as Float;
+    let ax0 = lib::columns::util::snap5(lib::columns::util::rect_cx_i(center) - aw / 2.);
+    let ay0 = lib::columns::util::snap5(lib::columns::util::rect_cy_i(center) - ah / 2.);
+    let arr = lib::columns::util::cbox(ax0, ay0, ax0 + aw, ay0 + ah);
+    let bot_rect = lib::columns::util::rect_expand_xy(arr, choice.2, choice.3);
+    let top_rect = lib::columns::util::rect_expand_xy(arr, choice.4, choice.5);
+    let bbox = lib::columns::util::rect_union(bot_rect, top_rect);
+    let dx = target_x - lib::columns::util::rect_cx_i(bbox);
+    for ix in std::range(nx) {
+        for iy in std::range(ny) {
+            let cut = lib::columns::util::rect_translate(lib::columns::util::cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size), dx, 0.);
+            lib::columns::util::draw_clip(if via == 1 { "via.drawing" } else { "mcon.drawing" }, cut, width);
+        }
+    }
+    let moved_bot = lib::columns::util::rect_translate(bot_rect, dx, 0.);
+    let moved_top = lib::columns::util::rect_translate(top_rect, dx, 0.);
+    lib::columns::util::draw_clip(bot_layer, moved_bot, width);
+    lib::columns::util::draw_clip(top_layer, moved_top, width);
+    (moved_bot, moved_top, lib::columns::util::rect_union(moved_bot, moved_top),)
+}
+
+fn pc_out_rect(p: PrechargeParams, index: Int) -> Rect {
+    let top = if index == 1 { precharge_xf(lib::columns::util::cbox(-520., 255., -190., 425.)).y1 } else { pc_cut_bot(p) };
+    lib::columns::util::rect_from_spans(lib::columns::util::precharge_out_track(index), (-90., top,))
+}
+
+fn pc_in_rect(p: PrechargeParams, index: Int) -> Rect {
+    lib::columns::util::rect_from_spans(lib::columns::util::precharge_in_track(index), (pc_cut_bot(p) + 420., pc_cut_top(p),))
+}
+
+fn pc_sd_port(p: PrechargeParams, device: Int, row: Int) -> Rect {
+    let eq = pc_equalizer_width(p);
+    let pull = pc_pull_width(p);
+    let x = if device == 0 { 0. } else { if device == 1 { eq + 270. } else { eq + pull + 540. } };
+    let w = if device == 0 { eq } else { pull };
+    precharge_xf(precharge_sd_port_raw(x, w, row))
+}
+
+fn draw_precharge_side_via(p: PrechargeParams, right: Bool, top_side: Bool, tap_li: Rect) -> Rect {
+    let target_x = if right { 1300. } else { 0. };
+    let bot = if top_side {
+        let sd = pc_sd_port(p, 2, 0);
+        lib::columns::util::cbox(1200., sd.y0 + 20., 1200., sd.y1 - 20.)
+    } else {
+        let sd = pc_sd_port(p, 1, 1);
+        lib::columns::util::cbox(0., sd.y0 + 20., 0., sd.y1 - 20.)
+    };
+    let top = if top_side { pc_in_rect(p, 3) } else { pc_in_rect(p, 0) };
+    let via = draw_precharge_shifted_contact(0, "li1.drawing", "met1.drawing", bot, top, 0, 0, true, target_x, 1300.);
+    let connect_hspan = if right { (tap_li.x0, 1300.,) } else { (0., tap_li.x1,) };
+    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(connect_hspan, lib::columns::util::rect_vspan(via.2)));
+    via.2
+}
+
+fn draw_precharge_power_via(center_m1: Rect, power: Rect) -> Rect {
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", center_m1, power, 1, 1, false).2
+}
+
+fn draw_precharge_side_power_via(p: PrechargeParams, right: Bool, power: Rect) -> Rect {
+    let target_x = if right { 1300. } else { 0. };
+    let source = if right { lib::columns::util::double_right(pc_in_rect(p, 3)) } else { lib::columns::util::double_left(pc_in_rect(p, 0)) };
+    draw_precharge_shifted_contact(1, "met1.drawing", "met2.drawing", source, power, 0, 0, true, target_x, 1300.).2
+}
+
+cell precharge_tap(p: PrechargeParams, both_sides: Bool, via_top: Bool) {
+    let top = pc_outline_top(p);
+    let brect = lib::columns::util::cbox(0., -90., 1300., top);
+    lib::columns::util::draw_box("nwell.drawing", brect);
+    lib::columns::util::draw_box("nsdm.drawing", brect);
+    let tap_li = draw_precharge_tap_contact(top);
+    let center_m1 = draw_precharge_center_via(tap_li);
+    let route_span = (pc_cut_bot(p) + 420., pc_cut_top(p),);
+    if both_sides {
+        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., 130.,), route_span));
+        draw_precharge_side_via(p, false, true, tap_li);
+    } else {
+        crect(x0=0., y0=0., x1=0., y1=0.);
+    };
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((1170., 1300.,), route_span));
+    draw_precharge_side_via(p, true, lib::columns::util::bor(via_top, both_sides), tap_li);
+
+    let gate_bot = lib::columns::util::rect_from_spans((0., 1300.,), pc_gate_bot_span(p));
+    let gate_top = lib::columns::util::rect_from_spans((0., 1300.,), pc_gate_top_span(p));
+    let power = lib::columns::util::rect_from_spans((0., 1300.,), pc_power_span(p));
+    let en0 = lib::columns::util::draw_box("met2.drawing", gate_bot);
+    let en1 = lib::columns::util::draw_box("met2.drawing", gate_top);
+    let vdd = lib::columns::util::draw_box("met2.drawing", power);
+    lib::columns::util::draw_box("met2.pin", gate_bot);
+    lib::columns::util::draw_box("met2.pin", gate_top);
+    lib::columns::util::draw_box("met2.pin", power);
+    draw_precharge_power_via(center_m1, power);
+    if both_sides {
+        draw_precharge_side_power_via(p, false, power);
+    } else {
+        crect(x0=0., y0=0., x1=0., y1=0.);
+    };
+    draw_precharge_side_power_via(p, true, power);
+    let en_b = list(en0, en1);
+    let outline = crect(x0=0., y0=-90., x1=1300., y1=top);
+}
+
+
+cell precharge(p: PrechargeParams) {
+    let base = inst(precharge_exact(p), x=0., y=0.);
+    let vdd = base.vdd;
+    let bl = base.bl;
+    let br = base.br;
+    let en_b = base.en_b;
+    let outline = base.outline;
+}
+
+cell precharge_cent(p: PrechargeParams) {
+    let base = inst(precharge_tap(p, true, false), x=0., y=0.);
+    let vdd = base.vdd;
+    let en_b = base.en_b;
+    let outline = base.outline;
+}
+
+cell precharge_end(p: PrechargeParams) {
+    let base = inst(precharge_tap(p, false, false), x=0., y=0.);
+    let vdd = base.vdd;
+    let en_b = base.en_b;
+    let outline = base.outline;
+}

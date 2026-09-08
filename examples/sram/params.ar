@@ -1,0 +1,54 @@
+// Public parameter records shared by the native layout modules.
+
+struct PrimitiveGateParams {
+    nwidth: Int,
+    pwidth: Int,
+    length: Int,
+}
+
+struct DiffLatchParams {
+    inv_in: PrimitiveGateParams,
+    lch: Int,
+    inv_out: PrimitiveGateParams,
+    invq: PrimitiveGateParams,
+    nwidth: Int,
+}
+
+struct PrechargeParams {
+    length: Int,
+    pull_up_width: Int,
+    equalizer_width: Int,
+    en_b_width: Int,
+}
+
+struct TGateMuxParams {
+    length: Int,
+    pwidth: Int,
+    nwidth: Int,
+    mux_ratio: Int,
+    idx: Int,
+    sel_width: Int,
+}
+
+struct WriteDriverParams {
+    length: Int,
+    pwidth_driver: Int,
+    nwidth_driver: Int,
+}
+
+struct ColParams {
+    pc: PrechargeParams,
+    mux: TGateMuxParams,
+    wrdriver: WriteDriverParams,
+    latch: DiffLatchParams,
+    cols: Int,
+    include_wmask: Bool,
+    wmask_granularity: Int,
+}
+
+struct SramParams {
+    wmask_granularity: Int,
+    mux_ratio: Int,
+    num_words: Int,
+    data_width: Int,
+}

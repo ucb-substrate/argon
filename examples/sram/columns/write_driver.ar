@@ -1,0 +1,332 @@
+use lib::params::WriteDriverParams;
+
+fn wdrv_diff_perp(length: Float) -> Float {
+    530. + 2. * length + 280.
+}
+
+fn wdrv_gate_start(length: Float) -> Float {
+    lib::columns::util::snap5(length + 30.)
+}
+
+fn wdrv_gate_raw(idx: Int, length: Float) -> Rect {
+    let y = wdrv_gate_start(length) + idx as Float * 480.;
+    lib::columns::util::cbox(-520., y + 50., -190., y + 220.)
+}
+
+fn wdrv_gate_poly_raw(idx: Int, length: Float) -> Rect {
+    let y = wdrv_gate_start(length) + idx as Float * 480.;
+    lib::columns::util::cbox(-520., y, -190., y + 270.)
+}
+
+fn wdrv_gate_cut_raw(idx: Int, length: Float) -> Rect {
+    let y = wdrv_gate_start(length) + idx as Float * 480.;
+    lib::columns::util::cbox(-440., y + 50., -270., y + 220.)
+}
+
+fn wdrv_gate_npc_raw(idx: Int, length: Float) -> Rect {
+    let y = wdrv_gate_start(length) + idx as Float * 480.;
+    lib::columns::util::cbox(-540., y - 50., -170., y + 320.)
+}
+
+fn wdrv_sd_port_raw(w: Float, row: Int, length: Float) -> Rect {
+    let cy = row as Float * (length + 280.);
+    let nx = lib::columns::util::contact_n_dir(w, w, w, 60., 80., 170., 170.);
+    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(w / 2. - aw / 2.);
+    lib::columns::util::cbox(ax0 - 80., cy + 40., ax0 + aw + 80., cy + 210.)
+}
+
+fn xf_refl_h(r: Rect, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::cbox(dx - r.x1, dy + r.y0, dx - r.x0, dy + r.y1)
+}
+
+fn xf_flip_yx(r: Rect, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::cbox(dx + r.y0, dy + r.x0, dx + r.y1, dy + r.x1)
+}
+
+fn wdrv_base_pu_dx(p: WriteDriverParams) -> Float {
+    p.nwidth_driver as Float + p.pwidth_driver as Float + 520.
+}
+
+fn wdrv_width(p: WriteDriverParams, pmos: Bool) -> Float {
+    if pmos { p.pwidth_driver as Float } else { p.nwidth_driver as Float }
+}
+
+fn wdrv_xf_base(r: Rect, pmos: Bool, p: WriteDriverParams) -> Rect {
+    if pmos { xf_refl_h(r, wdrv_base_pu_dx(p), 0.) } else { r }
+}
+
+fn wdrv_base_gate(p: WriteDriverParams, pmos: Bool, idx: Int) -> Rect {
+    wdrv_xf_base(wdrv_gate_raw(idx, p.length as Float), pmos, p)
+}
+
+fn wdrv_base_sd(p: WriteDriverParams, pmos: Bool, row: Int) -> Rect {
+    wdrv_xf_base(wdrv_sd_port_raw(wdrv_width(p, pmos), row, p.length as Float), pmos, p)
+}
+
+fn wdrv_base_dout(p: WriteDriverParams) -> Rect {
+    lib::columns::util::rect_union(wdrv_base_sd(p, false, 2), wdrv_base_sd(p, true, 2))
+}
+
+fn wdrv_base_bbox(p: WriteDriverParams) -> Rect {
+    lib::columns::util::cbox(-540., -180., p.nwidth_driver as Float + p.pwidth_driver as Float + 1060., wdrv_diff_perp(p.length as Float) + 180.)
+}
+
+fn wdrv_bl_rect(r: Rect) -> Rect {
+    lib::columns::mux::xf_q1(r, 0., 0.)
+}
+
+fn wdrv_br_rect(r: Rect) -> Rect {
+    xf_flip_yx(r, 530., 0.)
+}
+
+fn wdrv_inst_port(p: WriteDriverParams, pmos: Bool, kind: Int, idx: Int, right: Bool) -> Rect {
+    let base = if kind == 0 { wdrv_base_gate(p, pmos, idx) } else { wdrv_base_sd(p, pmos, idx) };
+    if right { wdrv_br_rect(base) } else { wdrv_bl_rect(base) }
+}
+
+fn wdrv_inst_dout(p: WriteDriverParams, right: Bool) -> Rect {
+    let base = wdrv_base_dout(p);
+    if right { wdrv_br_rect(base) } else { wdrv_bl_rect(base) }
+}
+
+fn wdrv_inst_bbox(p: WriteDriverParams, right: Bool) -> Rect {
+    let base = wdrv_base_bbox(p);
+    if right { wdrv_br_rect(base) } else { wdrv_bl_rect(base) }
+}
+
+fn draw_wdrv_xf(layer: Any, r: Rect, pmos: Bool, p: WriteDriverParams) -> Rect {
+    lib::columns::util::draw_box(layer, wdrv_xf_base(r, pmos, p))
+}
+
+fn draw_wdrv_sd_contact(p: WriteDriverParams, pmos: Bool, row: Int) -> Rect {
+    let w = wdrv_width(p, pmos);
+    let length = p.length as Float;
+    let cy = row as Float * (length + 280.);
+    let nx = lib::columns::util::contact_n_dir(w, w, w, 60., 80., 170., 170.);
+    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(w / 2. - aw / 2.);
+    for i in std::range(nx) {
+        draw_wdrv_xf("licon1.drawing", lib::columns::util::cbox(ax0 + i as Float * 340., cy + 40., ax0 + i as Float * 340. + 170., cy + 210.), pmos, p);
+    }
+    draw_wdrv_xf("diff.drawing", lib::columns::util::cbox(ax0 - 60., cy, ax0 + aw + 60., cy + 250.), pmos, p);
+    let li = wdrv_sd_port_raw(w, row, length);
+    draw_wdrv_xf("li1.drawing", li, pmos, p);
+    wdrv_xf_base(li, pmos, p)
+}
+
+fn draw_wdrv_gate_contact(p: WriteDriverParams, pmos: Bool, idx: Int) -> Rect {
+    let length = p.length as Float;
+    draw_wdrv_xf("poly.drawing", wdrv_gate_poly_raw(idx, length), pmos, p);
+    draw_wdrv_xf("li1.drawing", wdrv_gate_raw(idx, length), pmos, p);
+    draw_wdrv_xf("licon1.drawing", wdrv_gate_cut_raw(idx, length), pmos, p);
+    draw_wdrv_xf("npc.drawing", wdrv_gate_npc_raw(idx, length), pmos, p);
+    wdrv_base_gate(p, pmos, idx)
+}
+
+fn draw_wdrv_mos(p: WriteDriverParams, pmos: Bool) -> (Rect, Rect, Rect, Rect) {
+    let w = wdrv_width(p, pmos);
+    let length = p.length as Float;
+    let diff_perp = wdrv_diff_perp(length);
+    if pmos {
+        draw_wdrv_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., w + 125., diff_perp + 125.), true, p);
+        draw_wdrv_xf("nwell.drawing", lib::columns::util::cbox(-180., -180., w + 180., diff_perp + 180.), true, p);
+    } else {
+        draw_wdrv_xf("nsdm.drawing", lib::columns::util::cbox(-125., -125., w + 125., diff_perp + 125.), false, p);
+    };
+    draw_wdrv_xf("diff.drawing", lib::columns::util::cbox(0., 0., w, diff_perp), pmos, p);
+    draw_wdrv_xf("poly.drawing", lib::columns::util::cbox(-190., 265., w + 130., 265. + length), pmos, p);
+    draw_wdrv_xf("poly.drawing", lib::columns::util::cbox(-190., 265. + length + 280., w + 130., 265. + 2. * length + 280.), pmos, p);
+    let g0 = draw_wdrv_gate_contact(p, pmos, 0);
+    let g1 = draw_wdrv_gate_contact(p, pmos, 1);
+    draw_wdrv_xf("npc.drawing", lib::columns::util::cbox(-540., wdrv_gate_start(length) - 50., -170., wdrv_gate_start(length) + 800.), pmos, p);
+    let sd0 = draw_wdrv_sd_contact(p, pmos, 0);
+    let sd2 = draw_wdrv_sd_contact(p, pmos, 2);
+    (g0, g1, sd0, sd2,)
+}
+
+cell tristate_inv_exact(p: WriteDriverParams) {
+    let length = p.length as Float;
+    let nmos = draw_wdrv_mos(p, false);
+    let pmos = draw_wdrv_mos(p, true);
+    lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-190., 265., p.nwidth_driver as Float + p.pwidth_driver as Float + 710., 265. + length));
+    let dout = lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_union(nmos.3, pmos.3));
+    let din_n = nmos.0;
+    let din_p = pmos.0;
+    let en = nmos.1;
+    let en_b = pmos.1;
+    let vss = nmos.2;
+    let vdd = pmos.2;
+    lib::columns::util::draw_box("li1.pin", din_n);
+    lib::columns::util::draw_box("li1.pin", din_p);
+    lib::columns::util::draw_box("li1.pin", en);
+    lib::columns::util::draw_box("li1.pin", en_b);
+    lib::columns::util::draw_box("li1.pin", vss);
+    lib::columns::util::draw_box("li1.pin", vdd);
+    lib::columns::util::draw_box("li1.pin", dout);
+}
+
+fn wdrv_center_span(center: Float, span: Float) -> (Float, Float) {
+    lib::columns::mux::centered_span_gridded(center, span, 5.)
+}
+
+fn wdrv_sa_hspan() -> (Float, Float) {
+    wdrv_center_span(265., 4800.)
+}
+
+fn wdrv_sa_span(x0: Float, x1: Float) -> (Float, Float) {
+    let sa = wdrv_sa_hspan();
+    (sa.0 + x0, sa.0 + x1,)
+}
+
+fn draw_wdrv_bitline(p: WriteDriverParams, right: Bool) -> Rect {
+    let inst_bbox = wdrv_inst_bbox(p, right);
+    let h = if right { wdrv_sa_span(4420., 4700.) } else { wdrv_sa_span(100., 380.) };
+    let m1_rect = lib::columns::util::rect_from_spans(h, (inst_bbox.y0 + 600., inst_bbox.y1,));
+    lib::columns::util::draw_box("met1.drawing", m1_rect);
+    lib::columns::util::draw_box("met1.pin", m1_rect);
+    let via = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", m1_rect, m1_rect, 2, 2, true);
+    let inv_out = wdrv_inst_dout(p, right);
+    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans((lib::columns::util::fmin(inv_out.x0, via.0.x0), lib::columns::util::fmax(inv_out.x1, via.0.x1),), (inv_out.y0, inv_out.y1,)));
+    m1_rect
+}
+
+fn draw_wdrv_en_route(p: WriteDriverParams, en_b: Bool) -> Rect {
+    let p0 = if en_b { wdrv_inst_port(p, true, 0, 1, false) } else { wdrv_inst_port(p, false, 0, 1, false) };
+    let p1 = if en_b { wdrv_inst_port(p, true, 0, 1, true) } else { wdrv_inst_port(p, false, 0, 1, true) };
+    lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p0, p0, 0, 0, true);
+    let via0 = lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", p0, p0, 0, 0, true);
+    lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p1, p1, 0, 0, true);
+    let via1 = lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", p1, p1, 0, 0, true);
+    let port_rect = lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_union(via0.1, via1.1));
+    if en_b {
+        let below_en = lib::columns::util::rect_cx_i(p0) - 460.;
+        let track = wdrv_center_span(lib::columns::util::rect_cx_i(port_rect), 240.);
+        let m1_rect = lib::columns::util::rect_from_spans(track, (lib::columns::util::fmin(port_rect.y0, below_en), lib::columns::util::fmax(port_rect.y1, below_en),));
+        lib::columns::util::draw_box("met1.drawing", m1_rect);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", m1_rect, port_rect, 0, 0, true);
+        let via_rect = lib::columns::util::rect_from_spans(track, wdrv_center_span(below_en, 320.));
+        let final_via = lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", via_rect, via_rect, 0, 0, true);
+        lib::columns::util::draw_box("met2.pin", final_via.1);
+        final_via.1
+    } else {
+        lib::columns::util::draw_box("met2.pin", port_rect);
+        port_rect
+    }
+}
+
+fn wdrv_power_span(p: WriteDriverParams, vdd_power: Bool) -> (Float, Float) {
+    let p0 = if vdd_power { wdrv_inst_port(p, true, 1, 0, false) } else { wdrv_inst_port(p, false, 1, 0, false) };
+    let h = lib::columns::util::rect_h(p0);
+    let stripe_h = lib::columns::util::fmin(lib::columns::util::fmax(h - 280., 800.), 3600.);
+    wdrv_center_span(lib::columns::util::rect_cy_i(p0), stripe_h)
+}
+
+fn draw_wdrv_power(p: WriteDriverParams, vdd_power: Bool) -> Rect {
+    let p0 = if vdd_power { wdrv_inst_port(p, true, 1, 0, false) } else { wdrv_inst_port(p, false, 1, 0, false) };
+    let p1 = if vdd_power { wdrv_inst_port(p, true, 1, 0, true) } else { wdrv_inst_port(p, false, 1, 0, true) };
+    let power_span = wdrv_power_span(p, vdd_power);
+    let stripe = lib::columns::util::rect_from_spans(wdrv_sa_hspan(), power_span);
+    let c0 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p0, p0, 0, 2, true);
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c0.1, stripe, 2, 0, true);
+    let c1 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p1, p1, 0, 2, true);
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c1.1, stripe, 2, 0, true);
+    lib::columns::util::draw_box("met2.drawing", stripe);
+    lib::columns::util::draw_box("met2.pin", stripe);
+    stripe
+}
+
+fn draw_wdrv_tap_li_contact(area: Rect) -> (Rect, Rect) {
+    let vertical_count = lib::columns::mux::via_array_count(lib::columns::util::rect_w(area), 170., 340., 0.) * lib::columns::mux::via_array_count(lib::columns::util::rect_h(area), 170., 340., 120.);
+    let horizontal_count = lib::columns::mux::via_array_count(lib::columns::util::rect_w(area), 170., 340., 120.) * lib::columns::mux::via_array_count(lib::columns::util::rect_h(area), 170., 340., 0.);
+    let vertical = vertical_count > horizontal_count;
+    let cut_bbox = lib::columns::mux::draw_centered_via_array("licon1.drawing", area, 170., 340., if vertical { 0. } else { 120. }, if vertical { 120. } else { 0. });
+    let tap_bbox = if vertical {
+        lib::columns::util::cbox(cut_bbox.x0, cut_bbox.y0 - 120., cut_bbox.x1, cut_bbox.y1 + 120.)
+    } else {
+        lib::columns::util::cbox(cut_bbox.x0 - 120., cut_bbox.y0, cut_bbox.x1 + 120., cut_bbox.y1)
+    };
+    let li_bbox = if vertical {
+        lib::columns::util::cbox(cut_bbox.x0, cut_bbox.y0 - 80., cut_bbox.x1, cut_bbox.y1 + 80.)
+    } else {
+        lib::columns::util::cbox(cut_bbox.x0 - 80., cut_bbox.y0, cut_bbox.x1 + 80., cut_bbox.y1)
+    };
+    lib::columns::util::draw_box("tap.drawing", tap_bbox);
+    lib::columns::util::draw_box("li1.drawing", li_bbox);
+    (tap_bbox, li_bbox,)
+}
+
+fn draw_wdrv_li_met1_contact(area: Rect) -> (Rect, Rect) {
+    let choice = lib::columns::util::contact_choice(0, area, area, 0, 0, true);
+    let nx = choice.0;
+    let ny = choice.1;
+    let size = 170.;
+    let space = 190.;
+    let center = lib::columns::util::contact_center(area, area);
+    let aw = size * nx as Float + space * (nx - 1) as Float;
+    let ah = size * ny as Float + space * (ny - 1) as Float;
+    let ax0 = lib::columns::util::snap5(lib::columns::util::rect_cx_i(center) - aw / 2.);
+    let ay0 = lib::columns::util::snap5(lib::columns::util::rect_cy_i(center) - ah / 2.);
+    for ix in std::range(nx) {
+        for iy in std::range(ny) {
+            lib::columns::util::draw_box("mcon.drawing", lib::columns::util::cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size));
+        }
+    }
+    let cut_bbox = lib::columns::util::cbox(ax0, ay0, ax0 + aw, ay0 + ah);
+    let li_rect = lib::columns::util::rect_expand_xy(cut_bbox, choice.2, choice.3);
+    let m1_rect = lib::columns::util::rect_expand_xy(cut_bbox, 60., 30.);
+    lib::columns::util::draw_box("li1.drawing", li_rect);
+    lib::columns::util::draw_box("met1.drawing", m1_rect);
+    (li_rect, m1_rect,)
+}
+
+cell write_driver(p: WriteDriverParams) {
+    let blinv = inst(tristate_inv_exact(p), x=0., y=0., angle=90);
+    let brinv = inst(tristate_inv_exact(p), x=530., y=0., reflect=true, angle=90);
+    let bl = draw_wdrv_bitline(p, false);
+    let br = draw_wdrv_bitline(p, true);
+    let en = draw_wdrv_en_route(p, false);
+    let en_b = draw_wdrv_en_route(p, true);
+    let vdd = draw_wdrv_power(p, true);
+    let vss = draw_wdrv_power(p, false);
+    let data_b = wdrv_inst_port(p, true, 0, 0, false);
+    let data = wdrv_inst_port(p, true, 0, 0, true);
+    lib::columns::util::draw_box("li1.pin", data_b);
+    lib::columns::util::draw_box("li1.pin", data);
+    let diff_perp = wdrv_diff_perp(p.length as Float);
+    let top = p.nwidth_driver as Float + p.pwidth_driver as Float + 1060.;
+    lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::cbox(0. - diff_perp - 125., -125., diff_perp + 655., p.nwidth_driver as Float + 125.));
+    lib::columns::util::draw_box("psdm.drawing", lib::columns::util::cbox(0. - diff_perp - 125., p.nwidth_driver as Float + 395., diff_perp + 655., p.nwidth_driver as Float + p.pwidth_driver as Float + 645.));
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans(wdrv_sa_hspan(), (p.nwidth_driver as Float + 340., top,)));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(wdrv_sa_span(520., 800.), (-1415., top,)));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(wdrv_sa_span(4000., 4280.), (-1415., top,)));
+}
+
+cell write_driver_cent(p: WriteDriverParams) {
+    let h0 = 0.;
+    let h1 = 1300.;
+    let top = p.nwidth_driver as Float + p.pwidth_driver as Float + 1060.;
+    let nwell_bottom = p.nwidth_driver as Float + 340.;
+    let pspan = (p.nwidth_driver as Float + 395., p.nwidth_driver as Float + p.pwidth_driver as Float + 645.,);
+    let nspan = (-125., p.nwidth_driver as Float + 125.,);
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(h0, nwell_bottom, h1, top));
+    let outline = rect("layout_boundary.boundary", x0=h0, y0=-1415., x1=h1, y1=top);
+
+    let vdd_tap = lib::columns::mux::rect_shrink_all(lib::columns::util::rect_from_spans((h0, h1,), pspan), 200.);
+    let vdd_li = draw_wdrv_tap_li_contact(vdd_tap);
+    lib::columns::util::draw_box("nsdm.drawing", lib::columns::mux::rect_expand_all(vdd_li.0, 130.));
+    let vdd_stripe = lib::columns::util::rect_from_spans((h0, h1,), wdrv_power_span(p, true));
+    let vdd_m1 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", vdd_tap, vdd_tap, 0, 1, false);
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", vdd_m1.1, vdd_stripe, 0, 0, true);
+    let vdd = lib::columns::util::draw_box("met2.drawing", vdd_stripe);
+    lib::columns::util::draw_box("met2.pin", vdd_stripe);
+
+    let vss_tap = lib::columns::mux::rect_shrink_all(lib::columns::util::rect_from_spans((h0, h1,), nspan), 200.);
+    let vss_li = draw_wdrv_tap_li_contact(vss_tap);
+    lib::columns::util::draw_box("psdm.drawing", lib::columns::mux::rect_expand_all(vss_li.0, 130.));
+    let vss_stripe = lib::columns::util::rect_from_spans((h0, h1,), wdrv_power_span(p, false));
+    let vss_m1 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", vss_tap, vss_tap, 0, 1, false);
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", vss_m1.1, vss_stripe, 0, 0, true);
+    let vss = lib::columns::util::draw_box("met2.drawing", vss_stripe);
+    lib::columns::util::draw_box("met2.pin", vss_stripe);
+}

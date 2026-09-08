@@ -545,6 +545,19 @@ mod tests {
     }
 
     #[test]
+    fn float_to_int_cast_does_not_snap_to_the_layout_grid() {
+        let source = temp_source(
+            "float-to-int-exact",
+            "cell top() {\n\
+             let n = 7.9 as Int;\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=n as Float, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("float-to-int-exact", source, "top()");
+        assert_eq!(rect.x1.0, 7.);
+    }
+
+    #[test]
     fn execution_evaluates_a_function_call_and_string_cell_argument() {
         let source = temp_source(
             "call-args",

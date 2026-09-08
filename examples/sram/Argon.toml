@@ -1,0 +1,2 @@
+name = "sram"
+tech = "../../pdks/sky130/sky130.tech.toml"

@@ -1,0 +1,161 @@
+// Native Argon port of SRAM22 column peripherals.
+// All layout dimensions are in Sky130 nanometers.
+
+mod params;
+
+use lib::params::PrimitiveGateParams;
+use lib::params::DiffLatchParams;
+use lib::params::PrechargeParams;
+use lib::params::TGateMuxParams;
+use lib::params::WriteDriverParams;
+use lib::params::ColParams;
+use lib::params::SramParams;
+
+fn default_precharge_params() -> PrechargeParams {
+    PrechargeParams {
+        length: 150,
+        pull_up_width: 2000,
+        equalizer_width: 1200,
+        en_b_width: 360,
+    }
+}
+
+fn default_mux_params(mux_ratio: Int) -> TGateMuxParams {
+    TGateMuxParams {
+        length: 150,
+        pwidth: 3600,
+        nwidth: 2400,
+        mux_ratio,
+        idx: mux_ratio / 2,
+        sel_width: 360,
+    }
+}
+
+fn default_write_driver_params() -> WriteDriverParams {
+    WriteDriverParams {
+        length: 150,
+        pwidth_driver: 3000,
+        nwidth_driver: 3000,
+    }
+}
+
+fn default_latch_params() -> DiffLatchParams {
+    let inv = PrimitiveGateParams { nwidth: 1200, pwidth: 2000, length: 150 };
+    DiffLatchParams {
+        inv_in: inv,
+        lch: 150,
+        inv_out: inv,
+        invq: inv,
+        nwidth: 2000,
+    }
+}
+
+fn default_col_params(cols: Int, mux_ratio: Int, include_wmask: Bool, wmask_granularity: Int) -> ColParams {
+    ColParams {
+        pc: default_precharge_params(),
+        mux: default_mux_params(mux_ratio),
+        wrdriver: default_write_driver_params(),
+        latch: default_latch_params(),
+        cols,
+        include_wmask,
+        wmask_granularity,
+    }
+}
+
+fn col_wmask_params() -> ColParams {
+    default_col_params(16, 4, true, 2)
+}
+
+fn col_params() -> ColParams {
+    default_col_params(128, 4, false, 8)
+}
+
+fn sram_params(wmask_granularity: Int, mux_ratio: Int, num_words: Int, data_width: Int) -> SramParams {
+    SramParams { wmask_granularity, mux_ratio, num_words, data_width }
+}
+
+fn round_positive(value: Float) -> Int {
+    (value + 0.5) as Int
+}
+
+// Matches geometry::snap_to_grid for the positive transistor dimensions used
+// by SRAM22. An exact half-grid remainder rounds toward the lower grid point.
+fn snap_width_50(value: Int) -> Int {
+    let remainder = value % 50;
+    if remainder <= 25 { value - remainder } else { value + 50 - remainder }
+}
+
+fn scale_width(width: Int, scale: Float, minimum: Int) -> Int {
+    let rounded = round_positive(width as Float * scale);
+    snap_width_50(if rounded < minimum { minimum } else { rounded })
+}
+
+// These are the characterized capacitances used by SramParams::col_params in
+// SRAM22. Keeping the derivation here makes arbitrary practical row counts use
+// the same load-based sizing policy rather than a table of known answers.
+fn practical_col_params(p: SramParams) -> ColParams {
+    let rows = p.num_words / p.mux_ratio;
+    let bitline_cap_per_cell = 0.00000000000008859364177937068 / 128.;
+    let pc_b_cap = 0.000000000000591432 / 130.;
+    let sel_cap = 0.000000000000186458 / 32.;
+    let we_cap = 0.000000000000036462 / 4.;
+    let bitline_cap = (rows + 4) as Float * bitline_cap_per_cell;
+    let pc_scale_raw = bitline_cap / pc_b_cap / 8.;
+    let mux_scale_raw = bitline_cap / sel_cap / 8.;
+    let wrdriver_scale_raw = bitline_cap / we_cap / 6.;
+    ColParams {
+        pc: PrechargeParams {
+            length: 150,
+            pull_up_width: scale_width(2000, pc_scale_raw, 800),
+            equalizer_width: scale_width(1200, pc_scale_raw, 500),
+            en_b_width: 360,
+        },
+        mux: TGateMuxParams {
+            length: 150,
+            pwidth: scale_width(3600, mux_scale_raw, 1800),
+            nwidth: scale_width(2400, mux_scale_raw, 1200),
+            mux_ratio: p.mux_ratio,
+            idx: p.mux_ratio / 2,
+            sel_width: 360,
+        },
+        wrdriver: WriteDriverParams {
+            length: 150,
+            pwidth_driver: scale_width(3000, wrdriver_scale_raw, 1200),
+            nwidth_driver: scale_width(3000, wrdriver_scale_raw, 1200),
+        },
+        latch: default_latch_params(),
+        cols: p.data_width * p.mux_ratio,
+        include_wmask: true,
+        wmask_granularity: p.wmask_granularity,
+    }
+}
+
+mod columns;
+
+cell col_peripherals(p: ColParams) {
+    let native = inst(columns::top::column_peripherals_exact(p), x=0., y=0.);
+    let din = native.din;
+    let dout = native.dout;
+    let wmask = native.wmask;
+    let vdd = native.vdd;
+    let vss = native.vss;
+    let pc_b = native.pc_b;
+    let precharge_en = native.precharge_en;
+    let sense_en = native.sense_en;
+    let clk = native.clk;
+    let rstb = native.rstb;
+    let we = native.we;
+    let write_en = native.write_en;
+    let sel = native.sel;
+    let sel_b = native.sel_b;
+    let bl = native.bl;
+    let br = native.br;
+}
+
+cell col_peripherals_for_sram(p: SramParams) {
+    let native = inst(col_peripherals(practical_col_params(p)), x=0., y=0.);
+}
+
+cell example_col_peripherals() {
+    let native = inst(col_peripherals_for_sram(sram_params(8, 4, 64, 24)), x=0., y=0.);
+}

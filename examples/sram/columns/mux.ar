@@ -1,0 +1,570 @@
+use lib::params::TGateMuxParams;
+
+fn centered_span_gridded(center: Float, span: Float, grid: Float) -> (Float, Float) {
+    let start = lib::columns::util::snap5(center - span / 2.);
+    (start, start + span,)
+}
+
+fn span_shrink_all(span: (Float, Float), amount: Float) -> (Float, Float) {
+    (span.0 + amount, span.1 - amount,)
+}
+
+fn span_centered_if_too_tall(span: (Float, Float), max_h: Float) -> (Float, Float) {
+    if span.1 - span.0 > max_h {
+        centered_span_gridded((span.0 + span.1) / 2., max_h, 5.)
+    } else {
+        span
+    }
+}
+
+fn rect_shrink_all(r: Rect, d: Float) -> Rect {
+    lib::columns::util::cbox(r.x0 + d, r.y0 + d, r.x1 - d, r.y1 - d)
+}
+
+fn rect_expand_all(r: Rect, d: Float) -> Rect {
+    lib::columns::util::cbox(r.x0 - d, r.y0 - d, r.x1 + d, r.y1 + d)
+}
+
+fn tgm_diff_perp(length: Float) -> Float {
+    530. + length
+}
+
+fn tgm_raw_right(pmos: Bool, w: Float) -> Float {
+    if pmos { 2. * w + 450. } else { 2. * w + 400. }
+}
+
+fn tgm_raw_bot(pmos: Bool) -> Float {
+    if pmos { -180. } else { -125. }
+}
+
+fn tgm_raw_top(pmos: Bool, length: Float) -> Float {
+    if pmos { tgm_diff_perp(length) + 180. } else { tgm_diff_perp(length) + 125. }
+}
+
+fn tgm_raw_bbox(pmos: Bool, w: Float, length: Float) -> Rect {
+    lib::columns::util::cbox(-540., tgm_raw_bot(pmos), tgm_raw_right(pmos, w), tgm_raw_top(pmos, length))
+}
+
+fn xf_q1(r: Rect, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::cbox(dx - r.y1, dy + r.x0, dx - r.y0, dy + r.x1)
+}
+
+fn xf_q3(r: Rect, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::cbox(dx + r.y0, dy - r.x1, dx + r.y1, dy - r.x0)
+}
+
+fn tgm_xf(r: Rect, q: Int, dx: Float, dy: Float) -> Rect {
+    if q == 1 { xf_q1(r, dx, dy) } else { xf_q3(r, dx, dy) }
+}
+
+fn draw_tgm_xf(layer: Any, r: Rect, q: Int, dx: Float, dy: Float, width: Float) -> Rect {
+    lib::columns::util::draw_clip(layer, tgm_xf(r, q, dx, dy), width)
+}
+
+fn tgm_pmos_dx(length: Float) -> Float {
+    600. + tgm_diff_perp(length) / 2.
+}
+
+fn tgm_pmos_dy() -> Float {
+    540.
+}
+
+fn tgm_pmos_bbox(length: Float, pwidth: Float) -> Rect {
+    tgm_xf(tgm_raw_bbox(true, pwidth, length), 1, tgm_pmos_dx(length), tgm_pmos_dy())
+}
+
+fn tgm_nmos_dx(length: Float) -> Float {
+    600. - tgm_diff_perp(length) / 2.
+}
+
+fn tgm_nmos_dy(length: Float, pwidth: Float, nwidth: Float) -> Float {
+    tgm_pmos_bbox(length, pwidth).y1 + 400. + tgm_raw_right(false, nwidth)
+}
+
+fn tgm_nmos_bbox(length: Float, pwidth: Float, nwidth: Float) -> Rect {
+    tgm_xf(tgm_raw_bbox(false, nwidth, length), 3, tgm_nmos_dx(length), tgm_nmos_dy(length, pwidth, nwidth))
+}
+
+fn tgm_sd_port_raw(x: Float, w: Float, row: Int, length: Float) -> Rect {
+    let cy = row as Float * (length + 280.);
+    let nx = lib::columns::util::contact_n_dir(w, w, w, 60., 80., 170., 170.);
+    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
+    lib::columns::util::cbox(ax0 - 80., cy + 40., ax0 + aw + 80., cy + 210.)
+}
+
+fn tgm_sd_port(dev: Int, row: Int, pmos: Bool, length: Float, w: Float, q: Int, dx: Float, dy: Float) -> Rect {
+    let x = if dev == 0 { 0. } else { w + 270. };
+    tgm_xf(tgm_sd_port_raw(x, w, row, length), q, dx, dy)
+}
+
+fn draw_tgm_sd_contact(x: Float, w: Float, row: Int, length: Float, q: Int, dx: Float, dy: Float, width: Float) -> Rect {
+    let cy = row as Float * (length + 280.);
+    let nx = lib::columns::util::contact_n_dir(w, w, w, 60., 80., 170., 170.);
+    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
+    for i in std::range(nx) {
+        draw_tgm_xf("licon1.drawing", lib::columns::util::cbox(ax0 + i as Float * 340., cy + 40., ax0 + i as Float * 340. + 170., cy + 210.), q, dx, dy, width);
+    }
+    draw_tgm_xf("diff.drawing", lib::columns::util::cbox(ax0 - 60., cy, ax0 + aw + 60., cy + 250.), q, dx, dy, width);
+    let li = tgm_sd_port_raw(x, w, row, length);
+    draw_tgm_xf("li1.drawing", li, q, dx, dy, width);
+    tgm_xf(li, q, dx, dy)
+}
+
+fn tgm_gate_port_raw(length: Float) -> Rect {
+    let contact_start = lib::columns::util::snap5(265. + length / 2. - 135.);
+    lib::columns::util::cbox(-520., contact_start + 50., -190., contact_start + 220.)
+}
+
+fn tgm_gate_port(length: Float, q: Int, dx: Float, dy: Float) -> Rect {
+    tgm_xf(tgm_gate_port_raw(length), q, dx, dy)
+}
+
+fn draw_tgm_gate_contact(length: Float, q: Int, dx: Float, dy: Float, width: Float) -> Rect {
+    let contact_start = lib::columns::util::snap5(265. + length / 2. - 135.);
+    draw_tgm_xf("poly.drawing", lib::columns::util::cbox(-520., contact_start, -190., contact_start + 270.), q, dx, dy, width);
+    draw_tgm_xf("li1.drawing", lib::columns::util::cbox(-520., contact_start + 50., -190., contact_start + 220.), q, dx, dy, width);
+    draw_tgm_xf("licon1.drawing", lib::columns::util::cbox(-440., contact_start + 50., -270., contact_start + 220.), q, dx, dy, width);
+    draw_tgm_xf("npc.drawing", lib::columns::util::cbox(-540., contact_start - 50., -170., contact_start + 320.), q, dx, dy, width);
+    tgm_gate_port(length, q, dx, dy)
+}
+
+fn draw_tgm_mos(pmos: Bool, length: Float, w: Float, q: Int, dx: Float, dy: Float, width: Float) -> (Rect, Rect, Rect, Rect, Rect, Rect) {
+    let diff_perp = tgm_diff_perp(length);
+    let x1 = w + 270.;
+    if pmos {
+        draw_tgm_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., w + 125., diff_perp + 125.), q, dx, dy, width);
+        draw_tgm_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., 2. * w + 395., diff_perp + 125.), q, dx, dy, width);
+        draw_tgm_xf("nwell.drawing", lib::columns::util::cbox(-180., -180., w + 180., diff_perp + 180.), q, dx, dy, width);
+        draw_tgm_xf("nwell.drawing", lib::columns::util::cbox(w + 90., -180., 2. * w + 450., diff_perp + 180.), q, dx, dy, width);
+    } else {
+        draw_tgm_xf("nsdm.drawing", lib::columns::util::cbox(-125., -125., w + 125., diff_perp + 125.), q, dx, dy, width);
+        draw_tgm_xf("nsdm.drawing", lib::columns::util::cbox(-125., -125., 2. * w + 395., diff_perp + 125.), q, dx, dy, width);
+    };
+    draw_tgm_xf("diff.drawing", lib::columns::util::cbox(0., 0., w, diff_perp), q, dx, dy, width);
+    draw_tgm_xf("diff.drawing", lib::columns::util::cbox(x1, 0., x1 + w, diff_perp), q, dx, dy, width);
+    draw_tgm_xf("poly.drawing", lib::columns::util::cbox(-190., 265., 2. * w + 400., 265. + length), q, dx, dy, width);
+    let gate = draw_tgm_gate_contact(length, q, dx, dy, width);
+    let sd00 = draw_tgm_sd_contact(0., w, 0, length, q, dx, dy, width);
+    let sd01 = draw_tgm_sd_contact(0., w, 1, length, q, dx, dy, width);
+    let sd10 = draw_tgm_sd_contact(x1, w, 0, length, q, dx, dy, width);
+    let sd11 = draw_tgm_sd_contact(x1, w, 1, length, q, dx, dy, width);
+    let bbox = tgm_xf(tgm_raw_bbox(pmos, w, length), q, dx, dy);
+    (bbox, gate, sd00, sd01, sd10, sd11,)
+}
+
+fn tgm_split_vspan(target: Rect, track: Rect, x: Float, right: Bool) -> (Float, Float) {
+    let via_top = lib::columns::util::rect_expand_vert(if right { lib::columns::util::double_right(track) } else { lib::columns::util::double_left(track) }, -80.);
+    let via_bot = lib::columns::util::cbox(x, target.y0, x, target.y1);
+    let via_bbox = lib::columns::util::contact_bbox(0, via_bot, via_top, 0, 2, true);
+    centered_span_gridded(lib::columns::util::rect_cy_i(via_bbox), 600., 5.)
+}
+
+fn draw_tgm_split(target: Rect, track: Rect, x: Float, right: Bool, width: Float) -> (Float, Float, Rect) {
+    let via_top = lib::columns::util::rect_expand_vert(if right { lib::columns::util::double_right(track) } else { lib::columns::util::double_left(track) }, -80.);
+    let via_bot = lib::columns::util::cbox(x, target.y0, x, target.y1);
+    let ct0 = lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", via_bot, via_top, 0, 2, true, width);
+    let via_bbox = ct0.2;
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(lib::columns::util::fmin(target.x0, via_bbox.x0), target.y0, lib::columns::util::fmax(target.x1, via_bbox.x1), target.y1), width);
+    let stripe_vspan = centered_span_gridded(lib::columns::util::rect_cy_i(via_bbox), 600., 5.);
+    let stripe = lib::columns::util::rect_from_spans((-1200., 2400.,), stripe_vspan);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", if right { lib::columns::util::double_right(track) } else { lib::columns::util::double_left(track) }, stripe, 0, 0, true, width);
+    lib::columns::util::draw_clip("met2.drawing", stripe, width);
+    (stripe_vspan.0, stripe_vspan.1, stripe,)
+}
+
+fn tgm_track(index: Int, abs_bot: Float, in_top: Float) -> Rect {
+    let it = lib::columns::util::precharge_in_track(index);
+    let bot = if lib::columns::util::bor(index == 0, index == 3) { abs_bot } else { 600. };
+    if index == 0 {
+        lib::columns::util::cbox(it.0, bot, it.1 + 70., in_top)
+    } else {
+        if index == 3 { lib::columns::util::cbox(it.0 - 70., bot, it.1, in_top) } else { lib::columns::util::cbox(it.0, bot, it.1, in_top) }
+    }
+}
+
+fn tgm_abs_bot(mux: Int, sel_width: Float) -> Float {
+    let space = lib::columns::util::fmax(sel_width / 4., 140.);
+    0. - (sel_width + space) * mux as Float
+}
+
+fn tgm_abs_top(mux: Int, sel_width: Float, nmos_top: Float) -> Float {
+    let space = lib::columns::util::fmax(sel_width / 4., 140.);
+    nmos_top + (sel_width + space) * mux as Float + lib::columns::util::fmax(170. - space, 0.)
+}
+
+fn tgm_outline_vspan(mux: Int, sel_width: Float, nmos_top: Float) -> (Float, Float) {
+    let space = lib::columns::util::fmax(sel_width / 4., 140.);
+    let ymin = 0. - (sel_width + space) * (mux - 1) as Float - sel_width;
+    let abs_top = tgm_abs_top(mux, sel_width, nmos_top);
+    (ymin - 2. * (320. + 180.), abs_top,)
+}
+
+fn tgm_y_offset(mux: Int, sel_width: Float, nmos_top: Float) -> Float {
+    0. - tgm_outline_vspan(mux, sel_width, nmos_top).0
+}
+
+fn tgm_group_y_offset(p: TGateMuxParams) -> Float {
+    tgm_y_offset(p.mux_ratio, p.sel_width as Float, tgm_params_nmos_bbox(p).y1)
+}
+
+fn tgm_group_height(p: TGateMuxParams) -> Float {
+    let outline = tgm_outline_vspan(p.mux_ratio, p.sel_width as Float, tgm_params_nmos_bbox(p).y1);
+    outline.1 - outline.0
+}
+
+fn tgm_params_pmos_bbox(p: TGateMuxParams) -> Rect {
+    tgm_pmos_bbox(p.length as Float, p.pwidth as Float)
+}
+
+fn tgm_params_nmos_bbox(p: TGateMuxParams) -> Rect {
+    tgm_nmos_bbox(p.length as Float, p.pwidth as Float, p.nwidth as Float)
+}
+
+fn tgm_params_track(index: Int, p: TGateMuxParams) -> Rect {
+    let nbox = tgm_params_nmos_bbox(p);
+    tgm_track(index, tgm_abs_bot(p.mux_ratio, p.sel_width as Float), nbox.y1 - 600.)
+}
+
+fn tgm_split_spans(p: TGateMuxParams) -> ((Float, Float), (Float, Float), (Float, Float), (Float, Float)) {
+    let length = p.length as Float;
+    let pwidth = p.pwidth as Float;
+    let nwidth = p.nwidth as Float;
+    let pbox = tgm_params_pmos_bbox(p);
+    let nbox = tgm_params_nmos_bbox(p);
+    let pdx = tgm_pmos_dx(length);
+    let pdy = tgm_pmos_dy();
+    let ndx = tgm_nmos_dx(length);
+    let ndy = tgm_nmos_dy(length, pwidth, nwidth);
+    let tr0 = tgm_params_track(0, p);
+    let tr3 = tgm_params_track(3, p);
+    let s0 = tgm_split_vspan(tgm_sd_port(1, 0, true, length, pwidth, 1, pdx, pdy), tr3, 1200., true);
+    let s1 = tgm_split_vspan(tgm_sd_port(0, 1, true, length, pwidth, 1, pdx, pdy), tr0, 0., false);
+    let s2 = tgm_split_vspan(tgm_sd_port(0, 1, false, length, nwidth, 3, ndx, ndy), tr3, 1200., true);
+    let s3 = tgm_split_vspan(tgm_sd_port(1, 0, false, length, nwidth, 3, ndx, ndy), tr0, 0., false);
+    (s0, s1, s2, s3,)
+}
+
+fn tgm_vdd_vss_spans(p: TGateMuxParams) -> ((Float, Float), (Float, Float)) {
+    let spans = tgm_split_spans(p);
+    let vdd = span_centered_if_too_tall(span_shrink_all((spans.1.1, spans.0.0,), 300.), 1800.);
+    let vss = span_centered_if_too_tall(span_shrink_all((spans.3.1, spans.2.0,), 300.), 1800.);
+    (vdd, vss,)
+}
+
+fn via_array_count(len: Float, cut: Float, pitch: Float, enc: Float) -> Int {
+    lib::columns::util::imax((((len + (pitch - cut) - 2. * enc) / pitch) + 0.000001) as Int, 1)
+}
+
+fn draw_via_array(layer: Any, x0: Float, y0: Float, nx: Int, ny: Int, cut: Float, pitch: Float) -> Rect {
+    for ix in std::range(nx) {
+        for iy in std::range(ny) {
+            lib::columns::util::draw_box(layer, lib::columns::util::cbox(x0 + ix as Float * pitch, y0 + iy as Float * pitch, x0 + ix as Float * pitch + cut, y0 + iy as Float * pitch + cut));
+        }
+    }
+    lib::columns::util::cbox(x0, y0, x0 + cut + pitch * (nx - 1) as Float, y0 + cut + pitch * (ny - 1) as Float)
+}
+
+fn draw_centered_via_array(layer: Any, area: Rect, cut: Float, pitch: Float, enc_x: Float, enc_y: Float) -> Rect {
+    let nx = via_array_count(lib::columns::util::rect_w(area), cut, pitch, enc_x);
+    let ny = via_array_count(lib::columns::util::rect_h(area), cut, pitch, enc_y);
+    let aw = cut + pitch * (nx - 1) as Float;
+    let ah = cut + pitch * (ny - 1) as Float;
+    let x0 = lib::columns::util::snap5(lib::columns::util::rect_cx_i(area) - aw / 2.);
+    let y0 = lib::columns::util::snap5(lib::columns::util::rect_cy_i(area) - ah / 2.);
+    draw_via_array(layer, x0, y0, nx, ny, cut, pitch)
+}
+
+fn draw_tgate_tap_li_contact(area: Rect) -> (Rect, Rect) {
+    let cut_bbox = draw_centered_via_array("licon1.drawing", area, 170., 340., 0., 120.);
+    let tap_bbox = lib::columns::util::cbox(cut_bbox.x0, cut_bbox.y0 - 120., cut_bbox.x1, cut_bbox.y1 + 120.);
+    let li_bbox = lib::columns::util::cbox(cut_bbox.x0 - 80., cut_bbox.y0, cut_bbox.x1 + 80., cut_bbox.y1);
+    lib::columns::util::draw_box("tap.drawing", tap_bbox);
+    lib::columns::util::draw_box("li1.drawing", li_bbox);
+    (tap_bbox, li_bbox,)
+}
+
+fn draw_tgate_center_tap_stack(tap_area: Rect, power_stripe: Rect, ptap: Bool) -> Rect {
+    let tap = draw_tgate_tap_li_contact(tap_area);
+    let tap_bbox = tap.0;
+    let li_bbox = tap.1;
+    if ptap {
+        lib::columns::util::draw_box("psdm.drawing", rect_expand_all(tap_bbox, 130.));
+    } else {
+        crect(x0=0., y0=0., x1=0., y1=0.);
+    };
+
+    let m0_m1 = lib::columns::util::draw_contact_full(
+        0,
+        "li1.drawing",
+        "met1.drawing",
+        li_bbox,
+        li_bbox,
+        0,
+        1,
+        false,
+    );
+    let m1_m2 = lib::columns::util::draw_contact_full(
+        1,
+        "met1.drawing",
+        "met2.drawing",
+        m0_m1.1,
+        power_stripe,
+        0,
+        0,
+        false,
+    );
+    m1_m2.1
+}
+
+fn draw_tgm_tap_split_li(target: Rect, track: Rect, center_x: Float, width: Float) -> Rect {
+    let via_top = lib::columns::util::rect_expand_vert(lib::columns::util::cbox(center_x - 140., track.y0, center_x + 140., track.y1), -80.);
+    let via_bot = lib::columns::util::cbox(center_x, target.y0, center_x, target.y1);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", via_bot, via_top, 0, 2, true, width).2
+}
+
+fn draw_tgm_tap_split_met(track: Rect, stripe: (Float, Float), center_x: Float, width: Float) -> Rect {
+    let via_bot = lib::columns::util::cbox(center_x - 140., track.y0, center_x + 140., track.y1);
+    let via_top = lib::columns::util::cbox(center_x - 1200., stripe.0, center_x + 2400., stripe.1);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", via_bot, via_top, 0, 0, true, width).2
+}
+
+fn draw_tgm_tap_split_pair(center_x: Float, p: TGateMuxParams, width: Float) -> Rect {
+    let length = p.length as Float;
+    let pwidth = p.pwidth as Float;
+    let nwidth = p.nwidth as Float;
+    let pdx = tgm_pmos_dx(length);
+    let pdy = tgm_pmos_dy();
+    let ndx = tgm_nmos_dx(length);
+    let ndy = tgm_nmos_dy(length, pwidth, nwidth);
+    let tr0 = tgm_params_track(0, p);
+    let spans = tgm_split_spans(p);
+    draw_tgm_tap_split_li(tgm_sd_port(0, 1, true, length, pwidth, 1, pdx, pdy), tr0, center_x, width);
+    draw_tgm_tap_split_met(tr0, spans.1, center_x, width);
+    draw_tgm_tap_split_li(tgm_sd_port(1, 0, false, length, nwidth, 3, ndx, ndy), tr0, center_x, width);
+    draw_tgm_tap_split_met(tr0, spans.3, center_x, width)
+}
+
+
+cell tgate_mux_unit(p: TGateMuxParams, idx: Int) {
+    let width = 1200.;
+    let length = p.length as Float;
+    let pwidth = p.pwidth as Float;
+    let nwidth = p.nwidth as Float;
+    let mux = p.mux_ratio;
+    let sel_width = p.sel_width as Float;
+    let sel_space = lib::columns::util::fmax(sel_width / 4., 140.);
+    let pdx = tgm_pmos_dx(length);
+    let pdy = tgm_pmos_dy();
+    let pmos = draw_tgm_mos(true, length, pwidth, 1, pdx, pdy, width);
+    let pbox = pmos.0;
+    let ndx = tgm_nmos_dx(length);
+    let ndy = tgm_nmos_dy(length, pwidth, nwidth);
+    let nmos = draw_tgm_mos(false, length, nwidth, 3, ndx, ndy, width);
+    let nbox = nmos.0;
+
+    let in_top = nbox.y1 - 600.;
+    let out_top = lib::columns::util::simple_jog_clip(
+        "met1.drawing",
+        in_top,
+        lib::columns::util::precharge_in_track(1),
+        lib::columns::util::precharge_in_track(2),
+        lib::columns::util::precharge_out_track(0),
+        lib::columns::util::precharge_out_track(2),
+        140.,
+        140.,
+        width,
+    );
+    let abs_bot = tgm_abs_bot(mux, sel_width);
+    let abs_top = tgm_abs_top(mux, sel_width, nbox.y1);
+    lib::columns::util::draw_clip("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::precharge_out_track(0), (out_top, abs_top,)), width);
+    lib::columns::util::draw_clip("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::precharge_out_track(2), (out_top, abs_top,)), width);
+
+    let tr0 = tgm_track(0, abs_bot, in_top);
+    let tr1 = tgm_track(1, abs_bot, in_top);
+    let tr2 = tgm_track(2, abs_bot, in_top);
+    let tr3 = tgm_track(3, abs_bot, in_top);
+    let bl = lib::columns::util::draw_clip("met1.drawing", tr1, width);
+    let br = lib::columns::util::draw_clip("met1.drawing", tr2, width);
+    lib::columns::util::draw_clip("met1.pin", tr1, width);
+    lib::columns::util::draw_clip("met1.pin", tr2, width);
+
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", tr2, nmos.5, 0, 2, true, width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", tr1, nmos.2, 0, 2, true, width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", tr1, pmos.5, 0, 2, true, width);
+    lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", tr2, pmos.2, 0, 2, true, width);
+
+    let s0 = draw_tgm_split(pmos.4, tr3, width, true, width);
+    let s1 = draw_tgm_split(pmos.3, tr0, 0., false, width);
+    let s2 = draw_tgm_split(nmos.3, tr3, width, true, width);
+    let s3 = draw_tgm_split(nmos.4, tr0, 0., false, width);
+    let bl_out = lib::columns::util::draw_clip("met2.drawing", s0.2, width);
+    let br_out = lib::columns::util::draw_clip("met2.drawing", s1.2, width);
+    lib::columns::util::draw_clip("met2.pin", s0.2, width);
+    lib::columns::util::draw_clip("met2.pin", s1.2, width);
+
+    for bit in std::range(mux) {
+        let y0 = 0. - (sel_width + sel_space) * bit as Float - sel_width;
+        let stripe = lib::columns::util::cbox(-width, y0, 2. * width, y0 + sel_width);
+        lib::columns::util::draw_clip("met2.drawing", stripe, width);
+        lib::columns::util::draw_clip("met2.pin", stripe, width);
+        if bit == idx {
+            let gate_conn = lib::columns::util::cbox(pmos.1.x0, lib::columns::util::fmin(pmos.1.y0, stripe.y0), pmos.1.x1, lib::columns::util::fmax(pmos.1.y1, stripe.y1));
+            let via_rect = lib::columns::util::rect_from_spans(lib::columns::util::precharge_out_track(1), (stripe.y0, stripe.y1,));
+            lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", via_rect, stripe, 0, 0, true, width);
+            lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", gate_conn, via_rect, 0, 0, true, width);
+            lib::columns::util::draw_clip("li1.drawing", gate_conn, width);
+        } else {
+            crect(x0=0., y0=0., x1=0., y1=0.);
+        };
+    }
+    for bit in std::range(mux) {
+        let y0 = nbox.y1 + (sel_width + sel_space) * bit as Float;
+        let stripe = lib::columns::util::cbox(-width, y0, 2. * width, y0 + sel_width);
+        lib::columns::util::draw_clip("met2.drawing", stripe, width);
+        lib::columns::util::draw_clip("met2.pin", stripe, width);
+        if bit == idx {
+            let gate_conn = lib::columns::util::cbox(nmos.1.x0, lib::columns::util::fmin(nmos.1.y0, stripe.y0), nmos.1.x1, lib::columns::util::fmax(nmos.1.y1, stripe.y1));
+            let via_rect = lib::columns::util::rect_from_spans(lib::columns::util::precharge_out_track(1), (stripe.y0, stripe.y1,));
+            lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", via_rect, stripe, 0, 0, true, width);
+            lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", gate_conn, via_rect, 0, 0, true, width);
+            lib::columns::util::draw_clip("li1.drawing", gate_conn, width);
+        } else {
+            crect(x0=0., y0=0., x1=0., y1=0.);
+        };
+    }
+
+    let vv = tgm_vdd_vss_spans(p);
+    lib::columns::util::draw_clip("met2.drawing", lib::columns::util::rect_from_spans((-width, 2. * width,), vv.0), width);
+    lib::columns::util::draw_clip("met2.drawing", lib::columns::util::rect_from_spans((-width, 2. * width,), vv.1), width);
+
+    lib::columns::util::draw_clip("nwell.drawing", lib::columns::util::cbox(0., pbox.y0, width, pbox.y1), width);
+    let pps0 = tgm_xf(lib::columns::util::cbox(-125., -125., pwidth + 125., tgm_diff_perp(length) + 125.), 1, pdx, pdy);
+    let pps1 = tgm_xf(lib::columns::util::cbox(-125., -125., 2. * pwidth + 395., tgm_diff_perp(length) + 125.), 1, pdx, pdy);
+    let nns0 = tgm_xf(lib::columns::util::cbox(-125., -125., nwidth + 125., tgm_diff_perp(length) + 125.), 3, ndx, ndy);
+    let nns1 = tgm_xf(lib::columns::util::cbox(-125., -125., 2. * nwidth + 395., tgm_diff_perp(length) + 125.), 3, ndx, ndy);
+    lib::columns::util::draw_clip("psdm.drawing", lib::columns::util::cbox(0., pps0.y0, width, pps0.y1), width);
+    lib::columns::util::draw_clip("psdm.drawing", lib::columns::util::cbox(0., pps1.y0, width, pps1.y1), width);
+    lib::columns::util::draw_clip("nsdm.drawing", lib::columns::util::cbox(0., nns0.y0, width, nns0.y1), width);
+    lib::columns::util::draw_clip("nsdm.drawing", lib::columns::util::cbox(0., nns1.y0, width, nns1.y1), width);
+
+    let ov = tgm_outline_vspan(mux, sel_width, nbox.y1);
+    let outline = rect("layout_boundary.boundary", x0=0., y0=ov.0, x1=width, y1=ov.1);
+}
+
+cell tgate_mux_tap(p: TGateMuxParams, end: Bool) {
+    let width = 1300.;
+    let mux = p.mux_ratio;
+    let sel_width = p.sel_width as Float;
+    let sel_space = lib::columns::util::fmax(sel_width / 4., 140.);
+    let pbox = tgm_params_pmos_bbox(p);
+    let nbox = tgm_params_nmos_bbox(p);
+    let ov = tgm_outline_vspan(mux, sel_width, nbox.y1);
+    let bounds = lib::columns::util::cbox(0., ov.0, width, ov.1);
+
+    draw_tgm_tap_split_pair(width, p, width);
+    if end {
+        crect(x0=0., y0=0., x1=0., y1=0.)
+    } else {
+        draw_tgm_tap_split_pair(0., p, width)
+    };
+
+    for bit in std::range(mux) {
+        let y0 = 0. - (sel_width + sel_space) * bit as Float - sel_width;
+        let stripe = lib::columns::util::cbox(-width, y0, 2. * width, y0 + sel_width);
+        lib::columns::util::draw_clip("met2.drawing", stripe, width);
+        lib::columns::util::draw_clip("met2.pin", stripe, width);
+    }
+    for bit in std::range(mux) {
+        let y0 = nbox.y1 + (sel_width + sel_space) * bit as Float;
+        let stripe = lib::columns::util::cbox(-width, y0, 2. * width, y0 + sel_width);
+        lib::columns::util::draw_clip("met2.drawing", stripe, width);
+        lib::columns::util::draw_clip("met2.pin", stripe, width);
+    }
+
+    let vv = tgm_vdd_vss_spans(p);
+    let vdd_stripe = lib::columns::util::rect_from_spans((-width, 2. * width,), vv.0);
+    let vss_stripe = lib::columns::util::rect_from_spans((-width, 2. * width,), vv.1);
+    let vdd = lib::columns::util::draw_clip("met2.drawing", vdd_stripe, width);
+    let vss = lib::columns::util::draw_clip("met2.drawing", vss_stripe, width);
+    lib::columns::util::draw_clip("met2.pin", vdd_stripe, width);
+    lib::columns::util::draw_clip("met2.pin", vss_stripe, width);
+
+    let ntap_bounds = lib::columns::util::cbox(0., pbox.y0, width, pbox.y1);
+    draw_tgate_center_tap_stack(rect_shrink_all(ntap_bounds, 300.), vdd_stripe, false);
+    let ptap_bounds = lib::columns::util::cbox(bounds.x0 + 300., pbox.y1 + 600., bounds.x1 - 300., bounds.y1 - 600.);
+    draw_tgate_center_tap_stack(ptap_bounds, vss_stripe, true);
+
+    let spans = tgm_split_spans(p);
+    if end {
+        crect(x0=0., y0=0., x1=0., y1=0.)
+    } else {
+        lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., spans.0.0, 200., spans.0.1));
+        lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., spans.1.0, 200., spans.1.1));
+        lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., spans.2.0, 200., spans.2.1));
+        lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., spans.3.0, 200., spans.3.1))
+    };
+    lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(width - 200., spans.0.0, width, spans.0.1));
+    lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(width - 200., spans.1.0, width, spans.1.1));
+    lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(width - 200., spans.2.0, width, spans.2.1));
+    lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(width - 200., spans.3.0, width, spans.3.1));
+
+    lib::columns::util::draw_box("nwell.drawing", ntap_bounds);
+    lib::columns::util::draw_box("nsdm.drawing", ntap_bounds);
+    let outline = rect("layout_boundary.boundary", x0=0., y0=ov.0, x1=width, y1=ov.1);
+}
+
+cell tgate_mux_group(p: TGateMuxParams) {
+    let mux = p.mux_ratio;
+    let width = lib::columns::util::column_w(mux);
+    let sel_width = p.sel_width as Float;
+    let sel_space = lib::columns::util::fmax(sel_width / 4., 140.);
+    let nbox = tgm_params_nmos_bbox(p);
+    let yoff = tgm_group_y_offset(p);
+    for bit in std::range(mux) {
+        let x = bit as Float * 1200.;
+        if bit % 2 == 0 {
+            let unit = inst(tgate_mux_unit(p, bit), x=x, y=yoff);
+        } else {
+            let unit = inst(tgate_mux_unit(p, bit), x=x + 1200., y=yoff, reflect=true, angle=180);
+        };
+    }
+
+    let blbr_top = nbox.y1 - 600. + yoff;
+    let x0 = (mux / 2) as Float * 1200.;
+    let brm1 = lib::columns::util::cbox(x0 - 140., 0., x0 + 140., blbr_top);
+    let brm2 = lib::columns::util::cbox(0., 500., width, 820.);
+    lib::columns::util::draw_box("met1.drawing", brm1);
+    let br_out = lib::columns::util::draw_box("met2.drawing", brm2);
+    lib::columns::util::draw_box("met2.pin", brm2);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", brm1, brm2, 0, 0, true, 1000000000.);
+
+    let x1 = (mux / 2 + 1) as Float * 1200.;
+    let blm1 = lib::columns::util::cbox(x1 - 140., 0., x1 + 140., blbr_top);
+    let blm2 = lib::columns::util::cbox(0., 0., width, 320.);
+    lib::columns::util::draw_box("met1.drawing", blm1);
+    let bl_out = lib::columns::util::draw_box("met2.drawing", blm2);
+    lib::columns::util::draw_box("met2.pin", blm2);
+    lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", blm1, blm2, 0, 0, true, 1000000000.);
+
+    for bit in std::range(mux) {
+        let y0 = yoff - bit as Float * (sel_width + sel_space) - sel_width;
+        lib::columns::util::draw_clip("met2.pin", lib::columns::util::cbox(0., y0, width, y0 + sel_width), width);
+        let y1 = nbox.y1 + yoff + bit as Float * (sel_width + sel_space);
+        lib::columns::util::draw_clip("met2.pin", lib::columns::util::cbox(0., y1, width, y1 + sel_width), width);
+    }
+
+    let ov = tgm_outline_vspan(mux, sel_width, nbox.y1);
+    let outline = rect("layout_boundary.boundary", x0=0., y0=ov.0 + yoff, x1=width, y1=ov.1 + yoff);
+}
+
+cell tgate_mux_cent(p: TGateMuxParams) {
+    let base = inst(tgate_mux_tap(p, false), x=0., y=0.);
+    let outline = base.outline;
+}
+
+cell tgate_mux_end(p: TGateMuxParams) {
+    let base = inst(tgate_mux_tap(p, true), x=0., y=0.);
+    let outline = base.outline;
+}

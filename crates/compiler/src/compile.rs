@@ -8737,7 +8737,7 @@ impl<'a> ExecPass<'a> {
                             }
                             let res = state
                                 .solver
-                                .eval_expr(expr)
+                                .eval_expr_exact(expr)
                                 .map(|val| Value::Int(val as i64));
                             if res.is_none() {
                                 for (_, var) in expr.coeffs.clone() {
