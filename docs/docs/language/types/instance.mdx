@@ -1,0 +1,35 @@
+---
+title: Cells and instances
+description: Cell values and placed instances.
+---
+
+import {FieldTable} from '@site/src/components/ApiReference';
+
+# Cells and instances
+
+## Cell values
+
+Calling a cell runs its body with the given arguments and produces a cell value:
+
+```argon
+let child = inverter(1200., 2000., 4);
+```
+
+A cell value isn't placed anywhere until you pass it to [`inst`](/language/builtins/hierarchy#inst). Pass it to [`bbox`](/language/builtins/hierarchy#bbox) to get its bounds.
+
+## Instance values
+
+`Inst` is a placed cell. Its type carries the fields the cell exports.
+
+<FieldTable rows={[
+  {name: 'x', type: 'Float', typeHref: '/language/types/scalars#float', description: 'x position.'},
+  {name: 'y', type: 'Float', typeHref: '/language/types/scalars#float', description: 'y position.'},
+  {name: '<cell field>', type: 'Declared type', description: 'A field exported by the cell, moved into the parent coordinate system where that applies.'},
+]} />
+
+```argon
+let placed = inst(inverter(1200., 2000., 4), x=100., y=50.);
+let bounds = bbox(placed);
+```
+
+Imported GDS cells expose fields found in the file, including pin names when pin layers are configured.

@@ -1,0 +1,179 @@
+---
+title: Standard library
+description: Rectangle, array, comparison, and sequence helpers in std.
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# Standard library
+
+The `std` module is written in Argon itself. Call its functions with the `std::` prefix.
+
+## `std::max` {#max}
+
+<ApiItem id="max" name="std::max" signature={'std::max(x0: Float, x1: Float) -> Float'} summary={<>Returns the greater of two floats.</>}>
+
+<ParameterTable rows={[
+  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'First value.'},
+  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Second value.'},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">`x1` when `x0 < x1`; otherwise `x0`.</Returns>
+
+</ApiItem>
+
+## `std::min` {#min}
+
+<ApiItem id="min" name="std::min" signature={'std::min(x0: Float, x1: Float) -> Float'} summary={<>Returns the lesser of two floats.</>}>
+
+<ParameterTable rows={[
+  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'First value.'},
+  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Second value.'},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">`x0` when `x0 < x1`; otherwise `x1`.</Returns>
+
+</ApiItem>
+
+## `std::intersection` {#intersection}
+
+<ApiItem id="intersection" name="std::intersection" signature={'std::intersection(rect1: Rect, rect2: Rect) -> Rect'} summary={<>The overlap of two rectangles, as a construction rectangle.</>}>
+
+<ParameterTable rows={[
+  {name: 'rect1', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'First rectangle.'},
+  {name: 'rect2', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Second rectangle.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">A construction rectangle whose lower edges are the larger of the two inputs' and whose upper edges are the smaller.</Returns>
+
+If the rectangles don't overlap, the result is inverted rather than empty: this computes edge expressions and doesn't test for overlap.
+
+</ApiItem>
+
+## `std::union` {#union}
+
+<ApiItem id="union" name="std::union" signature={'std::union(rect1: Rect, rect2: Rect) -> Rect'} summary={<>The smallest construction rectangle containing both inputs.</>}>
+
+<ParameterTable rows={[
+  {name: 'rect1', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'First rectangle.'},
+  {name: 'rect2', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Second rectangle.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">A construction rectangle from the smaller lower edges and the larger upper edges.</Returns>
+
+</ApiItem>
+
+## `std::array` {#array}
+
+<ApiItem id="array" name="std::array" signature={'std::array(r: Rect, n: Int, xpitch: Float, ypitch: Float) -> Rect'} summary={<>Draws a row of rectangles and returns its bounds.</>}>
+
+<ParameterTable rows={[
+  {name: 'r', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Template. Each copy has its layer, width, and height.'},
+  {name: 'n', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required', description: 'Number of copies. Below one, the result is a zero-size rectangle.'},
+  {name: 'xpitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'x pitch between copies.'},
+  {name: 'ypitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'y pitch between copies.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">A construction rectangle around the row.</Returns>
+
+</ApiItem>
+
+## `std::array2` {#array2}
+
+<ApiItem id="array2" name="std::array2" signature={'std::array2(r: Rect, nx: Int, ny: Int, xpitch: Float, ypitch: Float) -> Rect'} summary={<>Draws a grid of rectangles and returns its bounds.</>}>
+
+<ParameterTable rows={[
+  {name: 'r', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Template, copied at every position.'},
+  {name: 'nx', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required', description: 'Number of columns.'},
+  {name: 'ny', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required', description: 'Number of rows.'},
+  {name: 'xpitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'x pitch.'},
+  {name: 'ypitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'y pitch.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">A construction rectangle around the grid.</Returns>
+
+</ApiItem>
+
+## `std::max_array` {#max-array}
+
+<ApiItem id="max-array" name="std::max_array" signature={'std::max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect'} summary={<>Draws the largest grid of rectangles that fits in a given width and height.</>}>
+
+<ParameterTable rows={[
+  {name: 'r', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Template.'},
+  {name: 'w', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Available width.'},
+  {name: 'h', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Available height.'},
+  {name: 'xpitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'x pitch.'},
+  {name: 'ypitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'y pitch.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">The bounds from `std::array2`, or a zero-size rectangle if nothing fits.</Returns>
+
+</ApiItem>
+
+## `std::eq_rect` {#eq-rect}
+
+<ApiItem id="eq-rect" name="std::eq_rect" signature={'std::eq_rect(r1: Rect, r2: Rect) -> ()'} summary={<>Constrains two rectangles to coincide.</>}>
+
+<ParameterTable rows={[
+  {name: 'r1', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'First rectangle.'},
+  {name: 'r2', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Second rectangle.'},
+]} />
+
+<Returns type="()">Nothing; four edge constraints are added.</Returns>
+
+</ApiItem>
+
+## `std::center_rects` {#center-rects}
+
+<ApiItem id="center-rects" name="std::center_rects" signature={'std::center_rects(r1: Rect, r2: Rect) -> ()'} summary={<>Constrains two rectangles to share a center.</>}>
+
+<ParameterTable rows={[
+  {name: 'r1', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'First rectangle.'},
+  {name: 'r2', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'Second rectangle.'},
+]} />
+
+<Returns type="()">Nothing; two center constraints are added.</Returns>
+
+</ApiItem>
+
+## `std::crect2rect` {#crect2rect}
+
+<ApiItem id="crect2rect" name="std::crect2rect" signature={'std::crect2rect(r: Rect) -> Rect'} summary={<>Draws a rectangle with the same layer and edges as a construction rectangle.</>}>
+
+<ParameterTable rows={[
+  {name: 'r', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'The construction rectangle. It must have a layer.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">The drawn rectangle.</Returns>
+
+</ApiItem>
+
+## `std::last` {#last}
+
+<ApiItem id="last" name="std::last" signature={'std::last(lst: [Any]) -> Any'} summary={<>Returns the last element of a sequence.</>}>
+
+<ParameterTable rows={[
+  {name: 'lst', type: '[Any]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'A non-empty sequence.'},
+]} />
+
+<Returns type="Any" href="/language/types/scalars#any">The last element, typed as Any.</Returns>
+
+</ApiItem>
+
+## `std::range` {#range}
+
+<ApiItem id="range" name="std::range" signature={'std::range(stop: Int) -> [Int]'} summary={<>Returns the integers from 0 up to stop.</>}>
+
+<ParameterTable rows={[
+  {name: 'stop', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required', description: 'Exclusive upper bound.'},
+]} />
+
+<Returns type="[Int]" href="/language/types/collections#sequences">Integers from zero up to, but not including, stop.</Returns>
+
+```argon
+for index in std::range(4) {
+    // index is 0, 1, 2, then 3
+}
+```
+
+</ApiItem>

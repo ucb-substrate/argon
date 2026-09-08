@@ -12,6 +12,24 @@ general-purpose programming language. The main goal of Argon is to allow interop
 enable the creation of most practical parametric cells, and allow for performance optimizations such
 as caching and incremental compilation.
 
+## Documentation
+
+The documentation site is published at <https://ucb-substrate.github.io/argon/>.
+It is built with Docusaurus and lives in [`docs/`](docs). Its pages are
+under [`docs/docs/`](docs/docs), split into [guides](docs/docs/guides/index.md), a
+[language reference](docs/docs/language/overview.md), a
+[GUI manual](docs/docs/gui/workspace.md), and a
+[tools reference](docs/docs/tools/overview.md), each with its own sidebar.
+
+```bash
+cd docs
+npm install
+npm start
+```
+
+Run `npm run build` for a production build with strict internal-link and anchor checks.
+See [`docs/README.md`](docs/README.md) for the layout of the site.
+
 ## Installation
 
 To use Argon, you will need:

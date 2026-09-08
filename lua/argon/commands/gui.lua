@@ -15,6 +15,26 @@ function M.open_cell(cell)
     end
 end
 
+function M.new_cell(name)
+    local client_found = client.buf_request(0, "custom/newCell", {
+        name = name,
+        uri = vim.uri_from_bufnr(0),
+    }, client.print_error)
+    if not client_found then
+        vim.notify('No Argon language server is attached to this buffer', vim.log.levels.ERROR)
+    end
+end
+
+function M.rename_cell(name)
+    local client_found = client.buf_request(0, "custom/renameCell", {
+        name = name,
+        uri = vim.uri_from_bufnr(0),
+    }, client.print_error)
+    if not client_found then
+        vim.notify('No Argon language server is attached to this buffer', vim.log.levels.ERROR)
+    end
+end
+
 function M.instantiate(cell)
     local client_found = client.buf_request(0, "custom/inst", {
         cell = cell

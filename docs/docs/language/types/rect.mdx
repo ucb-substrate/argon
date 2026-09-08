@@ -1,0 +1,40 @@
+---
+title: Rect
+description: Fields and behavior of rectangular Argon geometry.
+---
+
+import {FieldTable} from '@site/src/components/ApiReference';
+
+# `Rect`
+
+`Rect` is an axis-aligned rectangle. Drawn rectangles from [`rect`](/language/builtins/geometry#rect) and construction rectangles from [`crect`](/language/builtins/geometry#crect) both have this type.
+
+## Fields
+
+<FieldTable rows={[
+  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Left edge.'},
+  {name: 'y0', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Bottom edge.'},
+  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Right edge.'},
+  {name: 'y1', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Top edge.'},
+  {name: 'w', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Width, x1 - x0.'},
+  {name: 'h', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Height, y1 - y0.'},
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', description: 'Layer name. A construction rectangle may have none.'},
+]} />
+
+## How the fields relate
+
+Give any combination of edges and sizes that pins the rectangle down, and the solver derives the rest:
+
+```argon
+let r = rect("met1", x0=10., y0=20., w=100., h=80.);
+eq(r.x1, 110.);
+eq(r.y1, 100.);
+```
+
+Arguments such as `x0` are constraints. Arguments such as `x0i` are initial values for whatever is left free.
+
+## Related
+
+- [`rect`](/language/builtins/geometry#rect) and [`crect`](/language/builtins/geometry#crect)
+- [`bbox`](/language/builtins/hierarchy#bbox)
+- [`std::intersection`](/language/std#intersection) and [`std::union`](/language/std#union)
