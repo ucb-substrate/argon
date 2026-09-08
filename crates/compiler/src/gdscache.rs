@@ -172,10 +172,14 @@ fn hash_cell_arg_key(hasher: &mut fnv::FnvHasher, arg: &CellArgKey) {
             hasher.write_usize(value.len());
             hasher.write(value.as_bytes());
         }
-        CellArgKey::Enum(value) => {
+        CellArgKey::Enum(variant, payload) => {
             hasher.write_u8(4);
-            hasher.write_usize(value.len());
-            hasher.write(value.as_bytes());
+            hasher.write_usize(variant.len());
+            hasher.write(variant.as_bytes());
+            hasher.write_usize(payload.len());
+            for value in payload {
+                hash_cell_arg_key(hasher, value);
+            }
         }
         CellArgKey::Seq(values) => {
             hasher.write_u8(5);

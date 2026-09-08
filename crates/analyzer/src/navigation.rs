@@ -602,6 +602,17 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             candidate.kind,
             Kind::Cell | Kind::Enum | Kind::Struct | Kind::Type
         ),
+        CompletionSite::Pattern => match candidate.kind {
+            Kind::Enum | Kind::Variant | Kind::Module => true,
+            Kind::Keyword => candidate.label == "_",
+            Kind::Function
+            | Kind::Cell
+            | Kind::Variable
+            | Kind::Parameter
+            | Kind::Struct
+            | Kind::Field
+            | Kind::Type => false,
+        },
         CompletionSite::ImportPath => candidate.kind == Kind::Module,
         CompletionSite::Keyword(keyword) => {
             candidate.kind == Kind::Keyword && candidate.label == keyword
@@ -631,6 +642,7 @@ fn lsp_symbol_kind(kind: ArgonSymbolKind) -> SymbolKind {
         ArgonSymbolKind::Struct => SymbolKind::STRUCT,
         ArgonSymbolKind::Field => SymbolKind::FIELD,
         ArgonSymbolKind::Module => SymbolKind::MODULE,
+        ArgonSymbolKind::TypeParam => SymbolKind::TYPE_PARAMETER,
     }
 }
 
@@ -1196,6 +1208,8 @@ mod tests {
             candidate("lib", Kind::Module),
             candidate("width", Kind::Variable),
             candidate("Float", Kind::Type),
+            candidate("_", Kind::Keyword),
+            candidate("Some", Kind::Variant),
         ];
         let labels = |site| {
             filter_completions(candidates.clone(), site)
@@ -1212,15 +1226,21 @@ mod tests {
         );
         assert_eq!(
             labels(CompletionSite::Expression),
-            ["true", "rect", "Widget", "Mode", "Size", "lib", "width"]
+            [
+                "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
         );
         assert_eq!(
             labels(CompletionSite::Statement),
             [
-                "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width"
+                "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
             ]
         );
         assert_eq!(labels(CompletionSite::ImportPath), ["lib"]);
+        assert_eq!(
+            labels(CompletionSite::Pattern),
+            ["Mode", "lib", "_", "Some"]
+        );
         assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);
         assert!(labels(CompletionSite::Suppressed).is_empty());
     }

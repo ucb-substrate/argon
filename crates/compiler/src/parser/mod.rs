@@ -35,6 +35,8 @@ pub enum CompletionSite {
     Expression,
     /// Somewhere a type specification is expected.
     Type,
+    /// The pattern of a `match` arm.
+    Pattern,
     /// A path in a `use` declaration.
     ImportPath,
     /// A name being introduced rather than referenced.
@@ -55,7 +57,7 @@ impl CompletionSite {
             // distinction, while a nested expression recorded later is not
             // overwritten when the scope closes at the same cursor.
             Self::Statement | Self::Expression => 2,
-            Self::Type | Self::ImportPath | Self::Keyword(_) => 3,
+            Self::Type | Self::Pattern | Self::ImportPath | Self::Keyword(_) => 3,
             Self::NewIdentifier => 4,
             Self::Suppressed => 5,
         }
@@ -238,6 +240,11 @@ mod tests {
             ("cell top() { rect(|); }", Expression),
             ("cell top() { for item | [] {} }", Keyword("in")),
             ("cell top() { if true {} | {} }", Keyword("else")),
+            ("cell top() { match m { | } }", Pattern),
+            ("cell top() { match m { Some(|) => 1, } }", Pattern),
+            ("fn f<|>() {}", NewIdentifier),
+            ("fn f(o: Option<|>) {}", Type),
+            ("cell top() { let n: | = 1; }", Type),
             ("// cell |", Suppressed),
             ("cell top() { let value = \"ce|ll\"; }", Suppressed),
             ("/* outer /* cell | */", Suppressed),
@@ -342,6 +349,131 @@ mod tests {
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
         }
+    }
+
+    #[test]
+    fn generic_declarations_parse() {
+        for src in [
+            "struct Pair<A, B> { first: A, second: B, }",
+            "struct Wrap<T,> { item: T, }",
+            "enum Option<T> { Some(T), None, }",
+            "enum Shape { Circle(Float), Box(Float, Float,), Empty, }",
+            "fn last<T>(items: [T]) -> T { head(items) }",
+            "fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> { p }",
+            "cell row<T>(items: [T], pitch: Float) {}",
+            // Nested arguments never produce a `>>` token.
+            "fn f(o: Option<Option<T>>) -> [Option<(Int, Option<Int>)>] { [] }",
+            // `>=` is split when it closes a type argument list.
+            "fn f(n: Option<Int>=None) -> Int { 1 }",
+            "cell c() { let n: Option<Int>=None; }",
+        ] {
+            assert!(
+                parse(src).is_ok(),
+                "should parse: `{src}`: {:?}",
+                parse(src).err()
+            );
+        }
+        for src in [
+            "struct S<> { a: Int, }",
+            "fn f<>() {}",
+            "fn f(o: Option<) {}",
+            "fn f(o: Option<Int) {}",
+            "enum E { A( }",
+            "use lib::Option::<Int>::None;",
+        ] {
+            assert!(parse(src).is_err(), "should be rejected: `{src}`");
+        }
+    }
+
+    #[test]
+    fn turbofish_let_annotations_and_patterns_parse() {
+        let valid = [
+            "let n = None::<Int>;",
+            "let m = Option::<Int>::None;",
+            "let xs = empty::<Float>();",
+            "let p = Pair::<Int, Float> { first: 1, second: 2. };",
+            "let s = std::Option::<Int>::Some(1);",
+            "let empty: Option<Rect> = None;",
+            "let n: Int = 1;",
+            "let t: (Int, [Float]) = (1, [],);",
+            "match o { Some(x) => x, None => 0, }",
+            "match s { Shape::Circle(_) => 1, Shape::Box(w, h) => 2, _ => 3, }",
+            "match s { lib::shapes::Shape::Box(w, _,) => w, other => 0., }",
+            "match s { Shape::Empty() => 1, _ => 2, }",
+            // `a as Float < b` stays a comparison: the target of `as` takes no
+            // type arguments.
+            "if a as Float < b {} else {}",
+        ];
+        for body in valid {
+            assert!(snippet_ok(body), "should parse: `{body}`");
+        }
+        let invalid = [
+            "let n = None::<>;",
+            "let n = a::<Int>::<Float>::b;",
+            "let x: = 1;",
+            "match o { Some(Some(x)) => x, _ => 0, }",
+            "match o { Some(x:) => x, }",
+        ];
+        for body in invalid {
+            assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+    }
+
+    #[test]
+    fn generic_nodes_span_their_source_text() {
+        use crate::ast::{Decl, Expr, Pattern, Statement, TySpecKind};
+
+        let src = "enum Option<T> { Some(T), None, }\n\
+                   cell c() {\n  let n: Option<Int> = None::<Int>;\n  let v = match n { Some(x) => x, _ => 0, };\n}\n";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let text = |span: cfgrammar::Span| &src[span.start()..span.end()];
+
+        let Decl::Enum(option) = &ast.decls[0] else {
+            panic!("expected an enum");
+        };
+        assert_eq!(text(option.span), "enum Option<T> { Some(T), None, }");
+        assert_eq!(text(option.params[0].span), "T");
+        assert_eq!(text(option.variants[0].span), "Some(T)");
+        assert_eq!(option.variants[0].payload.len(), 1);
+        assert_eq!(text(option.variants[1].span), "None");
+        assert!(option.variants[1].payload.is_empty());
+
+        let Decl::Cell(cell) = &ast.decls[1] else {
+            panic!("expected a cell");
+        };
+        let Statement::LetBinding(n) = &cell.scope.stmts[0] else {
+            panic!("expected a let");
+        };
+        let ty = n.ty.as_ref().expect("annotated");
+        assert_eq!(text(ty.span), "Option<Int>");
+        let TySpecKind::Path { name, args } = &ty.kind else {
+            panic!("expected a path type");
+        };
+        assert_eq!(name.name, "Option");
+        assert_eq!(text(args[0].span), "Int");
+        let Expr::IdentPath(none) = &n.value else {
+            panic!("expected a path");
+        };
+        assert_eq!(text(none.span), "None::<Int>");
+        let turbofish = none.generic_args.as_ref().expect("turbofish");
+        assert_eq!(turbofish.segment, 0);
+        assert_eq!(text(turbofish.span), "<Int>");
+
+        let Statement::LetBinding(v) = &cell.scope.stmts[1] else {
+            panic!("expected a let");
+        };
+        let Expr::Match(m) = &v.value else {
+            panic!("expected a match");
+        };
+        let Pattern::Variant { path, fields, span } = &m.arms[0].pattern else {
+            panic!("expected a variant pattern");
+        };
+        assert_eq!(text(*span), "Some(x)");
+        assert_eq!(path.path[0].name, "Some");
+        assert!(matches!(&fields[0], Pattern::Binding { name, .. } if name.name == "x"));
+        assert!(matches!(&m.arms[1].pattern, Pattern::Wildcard { span } if text(*span) == "_"));
     }
 
     #[test]

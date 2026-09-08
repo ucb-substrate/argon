@@ -53,10 +53,28 @@ pub enum Decl<S, T: AstMetadata> {
     Fn(FnDecl<S, T>),
 }
 
+/// A possibly qualified name, `a::b::c`, with optional turbofish arguments.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct IdentPath<S, T: AstMetadata> {
     pub path: Vec<Ident<S, T>>,
+    /// Explicit type arguments, `::<A, B>`, and the segment they follow.
+    pub generic_args: Option<GenericArgs<S, T>>,
     pub metadata: T::IdentPath,
+    pub span: cfgrammar::Span,
+}
+
+/// The `::<A, B>` of a path, attached to the segment at index `segment`.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct GenericArgs<S, T: AstMetadata> {
+    pub segment: usize,
+    pub args: Vec<TySpec<S, T>>,
+    pub span: cfgrammar::Span,
+}
+
+/// A declared type parameter, `T` in `fn f<T>(..)`.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct TyParam<S, T: AstMetadata> {
+    pub name: Ident<S, T>,
     pub span: cfgrammar::Span,
 }
 
@@ -104,13 +122,25 @@ pub struct BoolLiteral {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct EnumDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
-    pub variants: Vec<Ident<S, T>>,
+    pub params: Vec<TyParam<S, T>>,
+    pub variants: Vec<EnumVariant<S, T>>,
+    pub span: cfgrammar::Span,
     pub metadata: T::EnumDecl,
+}
+
+/// One variant of an enum, with the types of its payload: `Some(T)` or `None`.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct EnumVariant<S, T: AstMetadata> {
+    pub name: Ident<S, T>,
+    pub payload: Vec<TySpec<S, T>>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::EnumVariant,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct StructDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
+    pub params: Vec<TyParam<S, T>>,
     pub fields: Vec<StructField<S, T>>,
     pub span: cfgrammar::Span,
     pub metadata: T::StructDecl,
@@ -127,6 +157,7 @@ pub struct StructField<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct CellDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
+    pub params: Vec<TyParam<S, T>>,
     pub args: Vec<ArgDecl<S, T>>,
     pub scope: Scope<S, T>,
     pub span: cfgrammar::Span,
@@ -135,7 +166,11 @@ pub struct CellDecl<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub enum TySpecKind<S, T: AstMetadata> {
-    Ident(Ident<S, T>),
+    /// A named type with optional arguments: `Float`, `Option<Int>`, `T`.
+    Path {
+        name: Ident<S, T>,
+        args: Vec<TySpec<S, T>>,
+    },
     Seq(Box<TySpec<S, T>>),
     Tuple(Vec<TySpec<S, T>>),
 }
@@ -149,6 +184,7 @@ pub struct TySpec<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct FnDecl<S, T: AstMetadata> {
     pub name: Ident<S, T>,
+    pub params: Vec<TyParam<S, T>>,
     pub args: Vec<ArgDecl<S, T>>,
     pub return_ty: Option<TySpec<S, T>>,
     pub scope: Scope<S, T>,
@@ -184,6 +220,8 @@ pub enum Statement<S, T: AstMetadata> {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct LetBinding<S, T: AstMetadata> {
     pub name: Ident<S, T>,
+    /// The declared type, `let x: T = ..`.
+    pub ty: Option<TySpec<S, T>>,
     pub value: Expr<S, T>,
     pub metadata: T::LetBinding,
     pub span: cfgrammar::Span,
@@ -287,9 +325,37 @@ pub struct MatchExpr<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct MatchArm<S, T: AstMetadata> {
-    pub pattern: IdentPath<S, T>,
+    pub pattern: Pattern<S, T>,
     pub expr: Expr<S, T>,
     pub span: cfgrammar::Span,
+}
+
+/// The pattern of a `match` arm.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub enum Pattern<S, T: AstMetadata> {
+    /// `_`: matches anything and binds nothing.
+    Wildcard { span: cfgrammar::Span },
+    /// A bare name, bound to whatever it matches.
+    Binding {
+        name: Ident<S, T>,
+        metadata: T::PatternBinding,
+    },
+    /// An enum variant, with one sub-pattern per payload element.
+    Variant {
+        path: IdentPath<S, T>,
+        fields: Vec<Pattern<S, T>>,
+        span: cfgrammar::Span,
+    },
+}
+
+impl<S, T: AstMetadata> Pattern<S, T> {
+    pub fn span(&self) -> cfgrammar::Span {
+        match self {
+            Self::Wildcard { span } => *span,
+            Self::Binding { name, .. } => name.span,
+            Self::Variant { span, .. } => *span,
+        }
+    }
 }
 
 /// A binary operation expression.
@@ -447,6 +513,8 @@ pub trait AstMetadata {
     type Ident: Debug + Clone + Serialize + DeserializeOwned;
     type IdentPath: Debug + Clone + Serialize + DeserializeOwned;
     type EnumDecl: Debug + Clone + Serialize + DeserializeOwned;
+    type EnumVariant: Debug + Clone + Serialize + DeserializeOwned;
+    type PatternBinding: Debug + Clone + Serialize + DeserializeOwned;
     type StructDecl: Debug + Clone + Serialize + DeserializeOwned;
     type StructField: Debug + Clone + Serialize + DeserializeOwned;
     type CellDecl: Debug + Clone + Serialize + DeserializeOwned;
@@ -491,8 +559,19 @@ pub trait AstTransformer {
         &mut self,
         input: &EnumDecl<Self::InputS, Self::InputMetadata>,
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
+        variants: &[EnumVariant<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl;
+    fn dispatch_enum_variant(
+        &mut self,
+        input: &EnumVariant<Self::InputS, Self::InputMetadata>,
+        name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        payload: &[TySpec<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant;
+    fn dispatch_pattern_binding(
+        &mut self,
+        input: &Pattern<Self::InputS, Self::InputMetadata>,
+        name: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::PatternBinding;
     fn dispatch_struct_decl(
         &mut self,
         input: &StructDecl<Self::InputS, Self::InputMetadata>,
@@ -681,9 +760,48 @@ pub trait AstTransformer {
                 .iter()
                 .map(|ident| self.transform_ident(ident))
                 .collect(),
+            generic_args: input
+                .generic_args
+                .as_ref()
+                .map(|args| self.transform_generic_args(args)),
             metadata,
             span: input.span,
         }
+    }
+
+    fn transform_generic_args(
+        &mut self,
+        input: &GenericArgs<Self::InputS, Self::InputMetadata>,
+    ) -> GenericArgs<Self::OutputS, Self::OutputMetadata> {
+        GenericArgs {
+            segment: input.segment,
+            args: input
+                .args
+                .iter()
+                .map(|arg| self.transform_ty_spec(arg))
+                .collect(),
+            span: input.span,
+        }
+    }
+
+    fn transform_ty_param(
+        &mut self,
+        input: &TyParam<Self::InputS, Self::InputMetadata>,
+    ) -> TyParam<Self::OutputS, Self::OutputMetadata> {
+        TyParam {
+            name: self.transform_ident(&input.name),
+            span: input.span,
+        }
+    }
+
+    fn transform_ty_params(
+        &mut self,
+        input: &[TyParam<Self::InputS, Self::InputMetadata>],
+    ) -> Vec<TyParam<Self::OutputS, Self::OutputMetadata>> {
+        input
+            .iter()
+            .map(|param| self.transform_ty_param(param))
+            .collect()
     }
 
     fn transform_ty_spec(
@@ -691,7 +809,10 @@ pub trait AstTransformer {
         input: &TySpec<Self::InputS, Self::InputMetadata>,
     ) -> TySpec<Self::OutputS, Self::OutputMetadata> {
         let kind = match &input.kind {
-            TySpecKind::Ident(inner) => TySpecKind::Ident(self.transform_ident(inner)),
+            TySpecKind::Path { name, args } => TySpecKind::Path {
+                name: self.transform_ident(name),
+                args: args.iter().map(|arg| self.transform_ty_spec(arg)).collect(),
+            },
             TySpecKind::Seq(inner) => TySpecKind::Seq(Box::new(self.transform_ty_spec(inner))),
             TySpecKind::Tuple(t) => {
                 TySpecKind::Tuple(t.iter().map(|x| self.transform_ty_spec(x)).collect())
@@ -708,15 +829,36 @@ pub trait AstTransformer {
         input: &EnumDecl<Self::InputS, Self::InputMetadata>,
     ) -> EnumDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
         let variants = input
             .variants
             .iter()
-            .map(|variant| self.transform_ident(variant))
+            .map(|variant| self.transform_enum_variant(variant))
             .collect_vec();
         let metadata = self.dispatch_enum_decl(input, &name, &variants);
         EnumDecl {
             name,
+            params,
             variants,
+            span: input.span,
+            metadata,
+        }
+    }
+    fn transform_enum_variant(
+        &mut self,
+        input: &EnumVariant<Self::InputS, Self::InputMetadata>,
+    ) -> EnumVariant<Self::OutputS, Self::OutputMetadata> {
+        let name = self.transform_ident(&input.name);
+        let payload = input
+            .payload
+            .iter()
+            .map(|ty| self.transform_ty_spec(ty))
+            .collect_vec();
+        let metadata = self.dispatch_enum_variant(input, &name, &payload);
+        EnumVariant {
+            name,
+            payload,
+            span: input.span,
             metadata,
         }
     }
@@ -725,6 +867,7 @@ pub trait AstTransformer {
         input: &StructDecl<Self::InputS, Self::InputMetadata>,
     ) -> StructDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
         let fields = input
             .fields
             .iter()
@@ -733,6 +876,7 @@ pub trait AstTransformer {
         let metadata = self.dispatch_struct_decl(input, &name, &fields);
         StructDecl {
             name,
+            params,
             fields,
             span: input.span,
             metadata,
@@ -757,6 +901,7 @@ pub trait AstTransformer {
         input: &CellDecl<Self::InputS, Self::InputMetadata>,
     ) -> CellDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
         let args = input
             .args
             .iter()
@@ -766,6 +911,7 @@ pub trait AstTransformer {
         let metadata = self.dispatch_cell_decl(input, &name, &args, &scope);
         CellDecl {
             name,
+            params,
             args,
             scope,
             span: input.span,
@@ -777,6 +923,7 @@ pub trait AstTransformer {
         input: &FnDecl<Self::InputS, Self::InputMetadata>,
     ) -> FnDecl<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
         let args = input
             .args
             .iter()
@@ -790,6 +937,7 @@ pub trait AstTransformer {
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
         FnDecl {
             name,
+            params,
             args,
             return_ty,
             scope,
@@ -857,10 +1005,12 @@ pub trait AstTransformer {
         input: &LetBinding<Self::InputS, Self::InputMetadata>,
     ) -> LetBinding<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
+        let ty = input.ty.as_ref().map(|ty| self.transform_ty_spec(ty));
         let value = self.transform_expr(&input.value);
         let metadata = self.dispatch_let_binding(input, &name, &value);
         LetBinding {
             name,
+            ty,
             value,
             metadata,
             span: input.span,
@@ -908,10 +1058,13 @@ pub trait AstTransformer {
         let arms = input
             .arms
             .iter()
-            .map(|arm| MatchArm {
-                pattern: self.transform_ident_path(&arm.pattern),
-                expr: self.transform_expr(&arm.expr),
-                span: arm.span,
+            .map(|arm| {
+                let pattern = self.transform_pattern(&arm.pattern);
+                MatchArm {
+                    pattern,
+                    expr: self.transform_expr(&arm.expr),
+                    span: arm.span,
+                }
             })
             .collect::<Vec<_>>();
         let metadata = self.dispatch_match_expr(input, &scrutinee, &arms);
@@ -920,6 +1073,27 @@ pub trait AstTransformer {
             arms,
             span: input.span,
             metadata,
+        }
+    }
+    fn transform_pattern(
+        &mut self,
+        input: &Pattern<Self::InputS, Self::InputMetadata>,
+    ) -> Pattern<Self::OutputS, Self::OutputMetadata> {
+        match input {
+            Pattern::Wildcard { span } => Pattern::Wildcard { span: *span },
+            Pattern::Binding { name, .. } => {
+                let name = self.transform_ident(name);
+                let metadata = self.dispatch_pattern_binding(input, &name);
+                Pattern::Binding { name, metadata }
+            }
+            Pattern::Variant { path, fields, span } => Pattern::Variant {
+                path: self.transform_ident_path(path),
+                fields: fields
+                    .iter()
+                    .map(|field| self.transform_pattern(field))
+                    .collect(),
+                span: *span,
+            },
         }
     }
     fn transform_bin_op_expr(
@@ -1158,6 +1332,11 @@ pub trait AstTransformer {
                 .iter()
                 .map(|ident| self.transform_ident(ident))
                 .collect(),
+            generic_args: input
+                .path
+                .generic_args
+                .as_ref()
+                .map(|args| self.transform_generic_args(args)),
             metadata: self.dispatch_struct_lit_path(&input.path),
             span: input.path.span,
         };
