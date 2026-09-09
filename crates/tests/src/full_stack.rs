@@ -1,6 +1,6 @@
 //! Neovim, analyzer, and headless-GUI test scenarios.
 
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 
 use analyzer::{
     ArgonConfig,
@@ -46,6 +46,9 @@ pub enum GuiEvent {
 #[derive(Clone)]
 struct HeadlessGui {
     events: mpsc::UnboundedSender<GuiEvent>,
+    /// The scope of the last cell compiled, reported as the selection so
+    /// requests that depend on one have something to resolve against.
+    selected_scope: Arc<std::sync::Mutex<Option<Span>>>,
 }
 
 impl Gui for HeadlessGui {
@@ -63,6 +66,9 @@ impl Gui for HeadlessGui {
 
     async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
         let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
+        if let Some(scope) = scope.clone() {
+            *self.selected_scope.lock().expect("selected scope") = Some(scope);
+        }
         self.events
             .send(GuiEvent::UpdateCell {
                 revision: snapshot.revision,
@@ -103,7 +109,7 @@ impl Gui for HeadlessGui {
     }
 
     async fn selected_scope(self, _: context::Context) -> Option<Span> {
-        None
+        self.selected_scope.lock().expect("selected scope").clone()
     }
 
     async fn place_instance(self, _: context::Context, _: InstancePreview) {}
@@ -182,6 +188,7 @@ impl Session {
             .expect("read analyzer LSP address")
             .port();
         let (events_tx, events) = mpsc::unbounded_channel();
+        let selected_scope = Arc::new(std::sync::Mutex::new(None));
         let mut listener =
             tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Bincode::default)
                 .await
@@ -195,6 +202,7 @@ impl Session {
                 .map(move |channel| {
                     let server = HeadlessGui {
                         events: events_tx.clone(),
+                        selected_scope: selected_scope.clone(),
                     };
                     channel
                         .execute(server.serve())
@@ -469,7 +477,7 @@ mod tests {
         assert_completes("waiting for navigation requests", async {
             let _guard = FULL_STACK_LOCK.lock().await;
             let mut session = Session::new(
-                "cell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\n",
+                "cell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\ncell child(w: Float, h: Float = w, layer: String = \"met1\") {\n    let body = rect(layer, x0=0., y0=0., x1=w, y1=h);\n}\n",
             )
             .await;
             session.start_analyzer();
