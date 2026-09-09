@@ -571,8 +571,8 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
                     "cell" | "enum" | "fn" | "mod" | "struct" | "use"
                 )
         }
-        // `StatementOrElse` is a statement position that can additionally
-        // take an `else` continuing the `if` that just closed.
+        // `StatementOrElse` also accepts an `else` continuing the `if` just
+        // closed.
         CompletionSite::Statement | CompletionSite::StatementOrElse => match candidate.kind {
             Kind::Function
             | Kind::Cell
@@ -1245,8 +1245,7 @@ mod tests {
             labels(CompletionSite::Pattern),
             ["Mode", "lib", "_", "Some"]
         );
-        // After an `else`-less `if`'s then-scope both are possible, so the
-        // statement candidates are offered with `else` added to them.
+        // The statement candidates, plus `else`.
         assert_eq!(
             labels(CompletionSite::StatementOrElse),
             [

@@ -311,8 +311,7 @@ pub struct IfExpr<S, T: AstMetadata> {
     pub cond: Expr<S, T>,
     pub then: Scope<S, T>,
     /// The `else` body, absent for an `if` used as a statement. An `else if`
-    /// is desugared by the parser into a statement-less scope whose tail is
-    /// the nested `if`, so this is never anything but a scope.
+    /// appears as a statement-less scope whose tail is the nested `if`.
     pub else_: Option<Scope<S, T>>,
     pub span: cfgrammar::Span,
     pub metadata: T::IfExpr,

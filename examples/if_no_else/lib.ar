@@ -1,10 +1,8 @@
 // An `if` with no `else` is a statement: it produces no value, so it is only
-// allowed where a statement is expected. Before it existed, every conditional
-// written purely to emit geometry had to carry a dead `} else { };`.
+// allowed where a statement is expected.
 
-// One rect always, plus a marker only on the wide instances. The `if` is the
-// last thing in the cell body -- a tail expression would be rejected there,
-// which is why an `else`-less `if` is a statement and never a tail.
+// One rect always, plus a marker chosen by `wide`. The last `if` in the body
+// needs no `;`, being a statement rather than a tail expression.
 cell strap(w: Float, wide: Bool) {
     let met1 = rect("met1", x0=0., y0=0., x1=w, y1=100.)!;
 
@@ -18,9 +16,8 @@ cell strap(w: Float, wide: Bool) {
     }
 }
 
-// An `else if` chain may also end without an `else`, in which case the whole
-// chain is a statement. Here exactly one of the three bands is drawn, and
-// nothing at all when `n` is outside the range.
+// An `else if` chain may also end without an `else`, making the whole chain a
+// statement: one band is drawn, or none when `n` is out of range.
 cell band(n: Int) {
     if n == 0 {
         rect("met1", x0=0., y0=0., x1=100., y1=20.);

@@ -4543,9 +4543,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             });
         }
         let Some(else_) = else_ else {
-            // With no `else` the `if` yields nothing, so neither may the
-            // branch that runs. `Unknown` is again the already-diagnosed
-            // marker; an inference variable is solved to `()`.
+            // With no `else` the `if` yields nothing, so neither may its
+            // branch. `Unknown` is already diagnosed; an inference variable
+            // is solved to `()`.
             let then_ty = self.shallow(&then.metadata);
             let is_unit = match then_ty {
                 Ty::Infer(_) => self.unify(&then_ty, &Ty::Nil),
@@ -4561,8 +4561,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 span: self.span(span),
                 kind: StaticErrorKind::IfWithoutElseNotUnit,
             });
-            // `Unknown`, not `Nil`, so an enclosing `else if` does not go on
-            // to report `BranchesDifferentTypes` for the same mistake.
             return Ty::Unknown;
         };
         let Some(ty) = self.join(&then.metadata, &else_.metadata) else {
@@ -10388,8 +10386,7 @@ impl<'a> ExecPass<'a> {
                 IfExprState::Cond(cond) => {
                     if let Defer::Ready(val) = &self.values[&cond] {
                         // The branch that runs, or `None` when the condition
-                        // is false and there is no `else` -- then the `if` is
-                        // `()` and opens no scope at all.
+                        // is false and there is no `else`.
                         let taken = if *val.as_ref().unwrap_bool() {
                             let scope = self.create_exec_scope_at_loc(
                                 vref.loc,
@@ -10425,8 +10422,7 @@ impl<'a> ExecPass<'a> {
                                 self.values.insert(vid, Defer::Deferred(vref));
                                 self.cell_state_mut(cell_id).deferred.insert(vid);
                             }
-                            // Ready now, so the caller wakes this value's
-                            // dependents on the way out.
+                            // Ready immediately: no branch to wait on.
                             None => {
                                 self.values.insert(vid, Defer::Ready(Value::Nil));
                             }
