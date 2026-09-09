@@ -10669,6 +10669,52 @@ fn object_id(id: &mut u64) -> ObjectId {
 }
 
 impl CompiledData {
+    /// Resolve one object's source name without allocating names for every
+    /// reachable object. Later bindings and array entries win, as they do in
+    /// [`Self::reachable_objs`]. This keeps hover hit testing cheap in large
+    /// imported cells.
+    pub fn reachable_obj_name(
+        &self,
+        cell: CellId,
+        scope: ScopeId,
+        object: ObjectId,
+    ) -> Option<String> {
+        fn array_suffix(value: &Arrayed<ObjectId>, object: ObjectId) -> Option<String> {
+            match value {
+                Arrayed::Elem(id) => (*id == object).then(String::new),
+                Arrayed::Array(values) => values.iter().enumerate().rev().find_map(|(i, value)| {
+                    array_suffix(value, object).map(|suffix| format!("[{i}]{suffix}"))
+                }),
+            }
+        }
+
+        let cell = &self.cells[&cell];
+        if !matches!(
+            cell.objects.get(&object)?,
+            SolvedValue::Rect(_)
+                | SolvedValue::Polygon(_)
+                | SolvedValue::Path(_)
+                | SolvedValue::Instance(_)
+        ) {
+            return None;
+        }
+        let mut scope = scope;
+        let mut before = SeqNum::end();
+        loop {
+            let info = &cell.scopes[&scope];
+            for (seq, (name, value)) in info.bindings.iter().rev() {
+                if *seq < before
+                    && let Some(suffix) = array_suffix(value, object)
+                {
+                    return Some(format!("{name}{suffix}"));
+                }
+            }
+            let (parent, seq) = info.static_parent?;
+            scope = parent;
+            before = seq;
+        }
+    }
+
     pub fn reachable_objs(&self, cell: CellId, scope: ScopeId) -> IndexMap<ObjectId, String> {
         let mut set = Default::default();
         self.reachable_objs_inner(cell, scope, SeqNum::end(), "", &mut set);

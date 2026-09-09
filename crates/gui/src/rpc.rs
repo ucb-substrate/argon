@@ -90,6 +90,20 @@ fn connect_client(app: &AsyncApp, lang_server_addr: SocketAddr) -> Result<LangSe
 }
 
 impl SyncLangServerClient {
+    /// Disconnected client for rendering tests that never issue source edits.
+    #[cfg(test)]
+    pub(crate) fn for_render_test(app: AsyncApp) -> Self {
+        let (transport, _) = tarpc::transport::channel::unbounded();
+        let client = LangServerClient::new(tarpc::client::Config::default(), transport).client;
+        let (to_exec, _) = mpsc::unbounded();
+        Self {
+            app,
+            lang_server_addr: "127.0.0.1:1".parse().unwrap(),
+            client: Arc::new(Mutex::new(client)),
+            to_exec,
+        }
+    }
+
     pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, UnboundedReceiver<EditorFn>) {
         let client = connect_client(&app, lang_server_addr).unwrap();
         let (to_exec, rx) = mpsc::unbounded();

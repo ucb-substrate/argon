@@ -28,6 +28,80 @@ cannot be recursive or forward-referenced).
 
 ## Running
 
+### SRAM rendering regression
+
+The GUI has an opt-in benchmark for a local SRAM GDS (the layout is not stored
+in this repository):
+
+```bash
+ARGON_RENDER_GDS="$HOME/Downloads/sram22_512x32m4w8.gds" \
+  cargo test -p argone --lib --release local_sram_render_benchmark \
+  -- --ignored --nocapture
+```
+
+Add `ARGON_RENDER_OPEN_SRAM=1` to test opening the imported SRAM cell directly;
+the default displays a source cell containing one SRAM instance.
+
+This uses the production compiler, snapshot preparation, spatial index, raster
+builder, and GPUI canvas paint path at a 1200×800 logical-pixel viewport and
+eight zoom levels. It checks nonblank rasters, identical repeated frames,
+pixel-identical overlapping interiors after a 32-pixel pan, stable presentation
+when switching between select/rectangle/dimension tools, and a covered-camera
+handoff when replacement pan tiles arrive. It prints CPU raster and canvas-paint
+timings. GPUI's test platform does not measure GPU presentation or display refresh.
+
+That pixel benchmark supplies completed tiles and disables prefetch while timing
+paint. It does **not** exercise cold loading or the real background tile lifecycle.
+For those paths, compile a project with `arc run`, then run:
+
+```bash
+ARGON_RENDER_ARTIFACT="/path/to/project/target/argon.bin" \
+  ARGON_RENDER_EDITOR=1 \
+  cargo test -p argone --lib --release local_project_pan_lifecycle \
+  -- --ignored --nocapture
+```
+
+This starts with cold indexes and no tiles, runs the normal density decisions and
+background workers, and measures pan input plus paint during rapid keyboard-path
+and middle-mouse pans, reversals, and zooms. It checks complete retained coverage,
+camera catch-up, bounded UI geometry, and completion of the rendering indicator.
+It paints between individual background tasks, including after input stops.
+`ARGON_RENDER_EDITOR=1` includes the full editor in a 1200×800 window and asserts
+that activity changes never resize the canvas; omitting it benchmarks an isolated
+1200×800 canvas.
+It reports background field time separately from UI latency and full-view raster
+time. See [recorded results](rendering-results.md).
+
+The regular GUI suite also covers a full editor pan/zoom lifecycle with one
+camera handoff per stopped gesture, stable viewport size when the spinner
+appears/disappears, cold-pan deferral, retaining and painting displayed tiles
+while recentering, keeping the last direct frame through the first raster
+handoff, layer-aware and subpixel LOD, visible gaps, hidden descendants,
+hierarchy cutoffs, raster invalidation, fitting, and restarting density decisions
+after switching to direct geometry:
+
+```bash
+cargo test -p argonc --lib --release
+cargo test -p argone --lib --release
+```
+
+To measure a top-level rectangle edit in a generated 4×4 SRAM bank:
+
+```bash
+ARGON_RENDER_GDS="$HOME/Downloads/sram22_1024x32m8w8.gds" \
+  cargo test -p argone --lib --release local_sram_edit_pipeline \
+  -- --ignored --nocapture --test-threads=1
+```
+
+This separates incremental compilation, full-snapshot file encoding/decoding,
+and GUI hierarchy preparation, and checks that the edit reuses the GDS import.
+File timings include I/O and are not measurements of the live RPC connection.
+Add `ARGON_VERIFY_HIERARCHY=1` to compare every prepared scope, bound, path, and
+layer against the previous expanded traversal. That intentionally slow reference
+check is reported separately from preparation timing.
+
+### Compiler scaling
+
 The easiest way to run the benchmarks and regenerate every artifact is the
 wrapper script [`run_benchmarks.sh`](run_benchmarks.sh):
 

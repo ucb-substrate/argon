@@ -5,7 +5,6 @@ local config = require('argon.config').config
 local commands = require('argon.commands')
 local focus = require('argon.focus')
 local save = require('argon.save')
-local server_status = require('argon.server_status')
 
 local function schedule_workspace_modified(client_id)
     vim.schedule(function()
@@ -373,7 +372,6 @@ M.start = function(bufnr)
         -- on_exit runs in_fast_event
         vim.schedule(function()
           commands.delete_argon_command()
-          server_status.reset_client_state(client_id)
         end)
         if type(old_on_exit) == 'function' then
           old_on_exit(code, signal, client_id, ...)
@@ -394,15 +392,6 @@ M.stop = function(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local clients = client.get_active_argon_lsp_clients(bufnr, filter)
   vim.lsp.stop_client(clients)
-  if type(clients) == 'table' then
-    ---@cast clients vim.lsp.Client[]
-    for _, client in ipairs(clients) do
-      server_status.reset_client_state(client.id)
-    end
-  else
-    ---@cast clients vim.lsp.Client
-    server_status.reset_client_state(clients.id)
-  end
   return clients
 end
 
