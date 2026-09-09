@@ -308,7 +308,7 @@ pub(crate) fn rename_cell_edits(
 
     // Calls carry the resolved declaration ID. Module name propagation tells
     // us whether their final segment changes or is a stable explicit alias.
-    for (module_path, module) in &typed {
+    for (module_path, module) in typed.iter() {
         let Some(source_module) = workspace.get(module_path) else {
             continue;
         };

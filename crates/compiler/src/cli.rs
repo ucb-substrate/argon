@@ -597,6 +597,21 @@ mod tests {
     }
 
     #[test]
+    fn execution_evaluates_an_option_cell_argument() {
+        let source = temp_source(
+            "option-args",
+            "cell top(w: Float, n: Option<Int> = None) {\n\
+             let count = std::unwrap_or(n, 1);\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w * (count as Float), y1=w);\n\
+             }\n",
+        );
+        let rect = compiled_rect("option-some", source.clone(), "top(10., n=Some(3))");
+        assert_eq!(rect.x1.0, 30.);
+        let rect = compiled_rect("option-none", source, "top(10.)");
+        assert_eq!(rect.x1.0, 10.);
+    }
+
+    #[test]
     fn execution_accepts_keyword_cell_arguments() {
         let source = temp_source(
             "kwargs",

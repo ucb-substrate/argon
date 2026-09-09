@@ -339,31 +339,43 @@ while !self.at(Eof) {
 
 | Keyword  | Rule                | AST node      | Shape |
 |----------|---------------------|---------------|-------|
-| `enum`   | `parse_enum_decl`   | `EnumDecl`    | `enum Name { ident, … }` |
-| `struct` | `parse_struct_decl` | `StructDecl`  | `struct Name { field: tySpec, … }` |
-| `cell`   | `parse_cell_decl`   | `CellDecl`    | `cell Name(argDecls) scope` |
-| `fn`     | `parse_fn_decl`     | `FnDecl`      | `fn Name(argDecls) (-> Ty)? scope` |
+| `enum`   | `parse_enum_decl`   | `EnumDecl`    | `enum Name genericParams? { enumVariant, … }` |
+| `struct` | `parse_struct_decl` | `StructDecl`  | `struct Name genericParams? { field: tySpec, … }` |
+| `cell`   | `parse_cell_decl`   | `CellDecl`    | `cell Name genericParams? (argDecls) scope` |
+| `fn`     | `parse_fn_decl`     | `FnDecl`      | `fn Name genericParams? (argDecls) (-> Ty)? scope` |
 | `const`  | `parse_const_decl`  | `ConstantDecl`| `const Name: Ty = expr;` |
 | `mod`    | `parse_mod_decl`    | `ModDecl`     | `mod Name;` |
 
 Argument declarations (`argDecl : ident COLON tySpec (EQ expr)?`) and enum
 variants / struct fields are comma-separated lists parsed by the shared
-`separated_list` helper (§8). A parameter with a default value is a keyword
+`separated_list` helper (§8). An enum variant is
+`enumVariant : ident (LPAREN tySpecList RPAREN)?`, so `Some(T)` carries a
+payload and `None` does not. A parameter with a default value is a keyword
 parameter; `parse_arg_decls` gives the parameter list its own scope-ordinal
 counter (§10) so scopes opened inside default values are numbered from zero.
+
+`genericParams : LT ident (COMMA ident)* COMMA? GT` follows the name of a
+struct, enum, fn, or cell. It goes through `angle_list`, the angle-bracket
+sibling of `separated_list`: trailing commas are allowed and an empty `<>` is
+an error. The closing `>` is consumed by `expect_gt`, which also splits a
+`>=` token into `>` and a synthetic `=` at its second byte, so
+`fn f(n: Option<Int>=None)` reads the `=` of the default. The lexer never
+produces `>>`, so nested arguments such as `Option<Option<T>>` need no
+splitting.
 
 ---
 
 ## 7. Type specifications
 
-`parse_ty_spec` parses `tySpec : ident | LBRACK tySpec RBRACK | LPAREN tySpecList
-RPAREN` into a `TySpec { kind, span }` where:
+`parse_ty_spec` parses `tySpec : tyPath | LBRACK tySpec RBRACK | LPAREN
+tySpecList RPAREN`, where `tyPath : ident (LT tySpecList GT)?`, into a
+`TySpec { kind, span }` where:
 
 ```rust
-enum TySpecKind { Ident(Ident), Seq(Box<TySpec>), Tuple(Vec<TySpec>) }
+enum TySpecKind { Path { name: Ident, args: Vec<TySpec> }, Seq(Box<TySpec>), Tuple(Vec<TySpec>) }
 ```
 
-- `Float` → `Ident`
+- `Float` → `Path` with no arguments; `Option<Int>` → `Path` with one
 - `[T]` → `Seq` (a sequence/list type)
 - `(A, B)` → `Tuple`; `()` → empty `Tuple`; `(A,)` and `(A)` → 1-element `Tuple`
 
@@ -372,7 +384,12 @@ trailing comma both parse**. The empty tuple type is the **unit type**: the
 later TySpec→`Ty` lowering (`ty_from_spec` in `compile.rs`) maps an empty
 `Tuple` to `Ty::Nil` — the same type as the `()` *value* (`Expr::Nil`) — so `()`
 is a real, usable type rather than an unhandled edge case. `parse_ty_spec` is
-also guarded by `enter_depth`/`exit_depth` because `[`/`(` nest recursively.
+also guarded by `enter_depth`/`exit_depth` because `[`/`(`/`<` nest
+recursively.
+
+The one place a type takes no arguments is the target of `as`: `a as Float <
+b` is a comparison, so `parse_suffix` parses the cast target with
+`parse_ty_spec_inner(false)`.
 
 ---
 
@@ -412,9 +429,13 @@ non-consuming `parse_item` cannot spin.
 >   disambiguates a parenthesized group `(a)` (no node — the inner expression's
 >   own span is kept) from a one-tuple `(a,)`. `(a, b)` is therefore a **syntax
 >   error**; the tuple is `(a, b,)`.
-> - **Match arms** (`matchArm : identPath FAT_ARROW expr COMMA`). The comma is
+> - **Match arms** (`matchArm : pattern FAT_ARROW expr COMMA`). The comma is
 >   part of each arm, and `matchArms : matchArm+` requires at least one arm, so
->   `match k {}` is a syntax error.
+>   `match k {}` is a syntax error. A `pattern` is `_`, an `identPath`, or an
+>   `identPath` followed by a parenthesised list of sub-patterns, each a name
+>   or `_`; `parse_pattern` records `CompletionSite::Pattern`. A bare name
+>   parses as a `Pattern::Binding`, and the type checker decides whether it
+>   names a unit variant instead.
 > - **Struct literal bodies** ([§9.5](#95-struct-literals)) are comma-separated
 >   with an optional trailing comma, but have two terminators — `}` and the
 >   `..base` — so they keep their own loop as well.
@@ -503,7 +524,11 @@ level).
     trailing operators to them.
   - identifier → an `identPath` (`a::b::c`); becomes a `Call` if followed by
     `(`, a `StructLit` if followed by `{` where a struct literal is allowed
-    ([§9.5](#95-struct-literals)), otherwise an `IdentPath`.
+    ([§9.5](#95-struct-literals)), otherwise an `IdentPath`. A path is
+    `pathSeg (PATHSEP pathSeg)*` with `pathSeg : ident (PATHSEP LT tySpecList
+    GT)?`: the turbofish `None::<Int>` or `Option::<Int>::None` is recorded
+    in `IdentPath::generic_args` with the index of the segment it follows, and
+    a second turbofish on one path is an error.
   - integer / string / `true` / `false` → the corresponding literal.
 - **`parse_suffix`** applies one postfix operator to the accumulated `lhs`:
 
@@ -599,7 +624,7 @@ produce stable GUI hierarchy IDs without adding annotations to source text.
 
 The statement loop dispatches on `cur`:
 
-- `let name = expr ;` → `Statement::LetBinding`
+- `let name (: tySpec)? = expr ;` → `Statement::LetBinding`
 - `for v in expr scope` → `Statement::ForLoop`
 - anything else → an expression statement. The expression is parsed, then:
   - followed by `;` → `Statement::Expr { semicolon: true }`

@@ -25,10 +25,10 @@ pub use result::{
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, FieldAccessExpr, FnDecl, ForLoop,
-    IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchExpr, ModPath, Scope,
-    Span, StructDecl, StructField, StructLitExpr, StructLitField, TySpec, TySpecKind, UnaryOp,
-    UnaryOpExpr, UseDecl, WorkspaceAst,
+    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, EnumVariant, FieldAccessExpr, FnDecl,
+    ForLoop, IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchArm,
+    MatchExpr, ModPath, Pattern, Scope, Span, StructDecl, StructField, StructLitExpr,
+    StructLitField, TyParam, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
@@ -156,7 +156,7 @@ pub(crate) fn module_prefix<'a>(
 
 pub fn static_compile(
     ast: &WorkspaceParseAst,
-) -> Option<(WorkspaceAst<VarIdTyMetadata>, StaticErrorCompileOutput)> {
+) -> Option<(TypedWorkspace, StaticErrorCompileOutput)> {
     if !ast.contains_key(&vec![]) {
         return None;
     }
@@ -165,11 +165,30 @@ pub fn static_compile(
     // with a missing module or a dependency cycle only produces misleading
     // follow-on errors from half-populated module binding frames.
     if !errors.is_empty() {
-        return Some((IndexMap::new(), StaticErrorCompileOutput { errors }));
+        return Some((
+            TypedWorkspace::default(),
+            StaticErrorCompileOutput { errors },
+        ));
     }
     let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
     errors.extend(new_errors);
     Some((ast, StaticErrorCompileOutput { errors }))
+}
+
+/// A type-checked workspace: the annotated modules and the struct and enum
+/// definitions their types refer to.
+#[derive(Debug, Clone, Default)]
+pub struct TypedWorkspace {
+    pub ast: WorkspaceAst<VarIdTyMetadata>,
+    pub defs: Arc<TypeDefs>,
+}
+
+impl std::ops::Deref for TypedWorkspace {
+    type Target = WorkspaceAst<VarIdTyMetadata>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ast
+    }
 }
 
 /// Runs static analysis for a parsed workspace and folds parser diagnostics
@@ -196,7 +215,7 @@ pub struct StaticAnalysis {
     /// Parsed source AST used for source-aware tooling.
     pub ast: WorkspaceParseAst,
     /// Type-annotated AST, absent only when the workspace has no root module.
-    pub typed_ast: Option<WorkspaceAst<VarIdTyMetadata>>,
+    pub typed_ast: Option<TypedWorkspace>,
     /// Parser, import-resolution, and type-checking diagnostics.
     pub errors: Vec<StaticError>,
 }
@@ -216,7 +235,7 @@ pub struct SessionCaches<'a> {
 
 /// Executes a cell using workspace-wide external inputs from `config`.
 pub fn execute_cell(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
@@ -245,7 +264,7 @@ pub fn execute_cell(
 
 /// [`execute_cell`], reusing the caches in `session`.
 pub fn execute_cell_cached(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     input: CompileInput<'_>,
     config: &WorkspaceConfig,
     session: Option<SessionCaches<'_>>,
@@ -276,7 +295,7 @@ pub fn execute_cell_cached(
 /// [`crate::parse::add_cell_invocation`]. Its arguments are evaluated by the
 /// ordinary expression evaluator, so they may be any expression.
 pub fn execute_cell_invocation(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
@@ -300,7 +319,7 @@ pub fn execute_cell_invocation(
 
 /// [`execute_cell_invocation`], reusing the caches in `session`.
 pub fn execute_cell_invocation_cached(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
     session: Option<SessionCaches<'_>>,
@@ -338,7 +357,7 @@ fn missing_tech_output() -> CompileOutput {
     })
 }
 
-fn invalid_tech_output(ast: &WorkspaceAst<VarIdTyMetadata>, error: String) -> CompileOutput {
+fn invalid_tech_output(ast: &TypedWorkspace, error: String) -> CompileOutput {
     CompileOutput::StaticErrors(StaticErrorCompileOutput {
         errors: vec![StaticError {
             span: Span {
@@ -399,6 +418,10 @@ type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
 pub(crate) struct ImportPass<'a> {
     ast: &'a WorkspaceParseAst,
     current_path: &'a ModPath,
+    /// Names bound as items of this module without naming another module: its
+    /// declarations, its imports, and the prelude. `Name::Variant` on one of
+    /// them is an enum variant rather than a module item.
+    local_items: IndexSet<&'a str>,
     deps: IndexMap<&'a ModPath, cfgrammar::Span>,
     errors: Vec<StaticError>,
 }
@@ -489,9 +512,30 @@ fn dependency_cycle_errors(ast: &WorkspaceParseAst, dag: &ModDag<'_>) -> Vec<Sta
 
 impl<'a> ImportPass<'a> {
     fn new(ast: &'a WorkspaceParseAst, current_path: &'a ModPath) -> Self {
+        let local_items = ast[current_path]
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Enum(e) => Some(e.name.name.as_str()),
+                Decl::Struct(s) => Some(s.name.name.as_str()),
+                Decl::Fn(f) => Some(f.name.name.as_str()),
+                Decl::Cell(c) => Some(c.name.name.as_str()),
+                Decl::Use(u) => Some(
+                    u.alias
+                        .as_ref()
+                        .unwrap_or_else(|| u.path.last().expect("use paths are non-empty"))
+                        .name
+                        .as_str(),
+                ),
+                Decl::Mod(_) | Decl::Constant(_) => None,
+            })
+            .chain(["Option"])
+            .collect();
         Self {
             ast,
             current_path,
+            local_items,
             deps: Default::default(),
             errors: Default::default(),
         }
@@ -522,14 +566,6 @@ impl<'a> ImportPass<'a> {
         }
     }
 
-    fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        module_prefix(
-            self.current_path,
-            use_decl.path.iter().map(|ident| ident.name.as_str()),
-            1,
-        )
-    }
-
     pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
@@ -541,9 +577,11 @@ impl<'a> ImportPass<'a> {
                 }
                 Decl::Mod(_) => {}
                 Decl::Use(u) => {
-                    self.record_dependency(self.use_module_path(u), u.span);
+                    self.record_qualified_path(&u.path, u.span, false);
                 }
-                Decl::Enum(_) => {}
+                Decl::Enum(e) => {
+                    self.transform_enum_decl(e);
+                }
                 Decl::Struct(s) => {
                     self.transform_struct_decl(s);
                 }
@@ -556,17 +594,34 @@ impl<'a> ImportPass<'a> {
         (self.deps, self.errors)
     }
 
-    /// Records the module a qualified item path names: everything before the
-    /// final segment, resolved like a `use`. A call and a struct literal both
-    /// name an item this way.
-    fn record_item_path_dependency(&mut self, path: &IdentPath<Substr, ParseMetadata>) {
-        if path.path.len() > 1 && path.path[0].name != "std" {
-            let module = module_prefix(
-                self.current_path,
-                path.path.iter().map(|ident| ident.name.as_str()),
-                1,
-            );
-            self.record_dependency(module, path.span);
+    /// Records the module a qualified path names: the path less one segment
+    /// (`module::item`) or less two (`module::Enum::Variant`), whichever
+    /// exists. When neither does, the `module::item` reading is a missing
+    /// module unless the enum reading names an item of this module or
+    /// `lenient` leaves the diagnosis to the type checker.
+    fn record_qualified_path(
+        &mut self,
+        path: &[Ident<Substr, ParseMetadata>],
+        span: cfgrammar::Span,
+        lenient: bool,
+    ) {
+        if path.len() < 2 || path[0].name == "std" {
+            return;
+        }
+        let names = || path.iter().map(|ident| ident.name.as_str());
+        let item_module = module_prefix(self.current_path, names(), 1);
+        let enum_module = module_prefix(self.current_path, names(), 2);
+        let local_enum = enum_module == *self.current_path
+            && self
+                .local_items
+                .contains(path[path.len() - 2].name.as_str());
+        let existing = [item_module.clone(), enum_module]
+            .into_iter()
+            .find(|module| *module != *self.current_path && self.ast.contains_key(module));
+        match existing {
+            Some(module) => self.record_dependency(module, span),
+            None if !local_enum && !lenient => self.record_dependency(item_module, span),
+            None => {}
         }
     }
 }
@@ -587,41 +642,32 @@ impl<'a> AstTransformer for ImportPass<'a> {
         &mut self,
         input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
-        // Multi-component identifier paths are enum values. The final two
-        // components are the enum and variant, leaving the module path.
-        if input.path.len() <= 2 || input.path[0].name == "std" {
-            return;
-        }
-        let path = if input.path[0].name == "lib" {
-            input
-                .path
-                .iter()
-                .skip(1)
-                .dropping_back(2)
-                .map(|ident| ident.name.to_string())
-                .collect_vec()
-        } else {
-            self.current_path
-                .iter()
-                .cloned()
-                .chain(
-                    input
-                        .path
-                        .iter()
-                        .dropping_back(2)
-                        .map(|ident| ident.name.to_string()),
-                )
-                .collect_vec()
-        };
-        self.record_dependency(path, input.span);
+        // A two-segment value path is `Enum::Variant` of this module unless
+        // its first segment is a module, which the type checker decides.
+        self.record_qualified_path(&input.path, input.span, true);
     }
 
     fn dispatch_enum_decl(
         &mut self,
         _input: &crate::ast::EnumDecl<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        _variants: &[Ident<Self::OutputS, Self::OutputMetadata>],
+        _variants: &[EnumVariant<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
+    }
+
+    fn dispatch_enum_variant(
+        &mut self,
+        _input: &EnumVariant<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+        _payload: &[TySpec<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
+    }
+
+    fn dispatch_pattern_binding(
+        &mut self,
+        _input: &Pattern<Self::InputS, Self::InputMetadata>,
+        _name: &Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::PatternBinding {
     }
 
     fn dispatch_struct_decl(
@@ -647,7 +693,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _fields: &[StructLitField<Self::OutputS, Self::OutputMetadata>],
         _base: &Option<Expr<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::StructLitExpr {
-        self.record_item_path_dependency(path);
+        self.record_qualified_path(&path.path, path.span, false);
     }
 
     fn dispatch_struct_lit_path(
@@ -778,7 +824,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         func: &IdentPath<Self::OutputS, Self::OutputMetadata>,
         _args: &crate::ast::Args<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
-        self.record_item_path_dependency(func);
+        self.record_qualified_path(&func.path, func.span, false);
     }
 
     fn dispatch_emit_expr(
@@ -1122,6 +1168,14 @@ pub(crate) struct VarIdTyPass<'a> {
     mod_bindings: &'a IndexMap<&'a ModPath, VarIdTyFrame>,
     /// Fields of the cells of every module typed before this one.
     cell_fields: &'a IndexMap<VarId, CellFields>,
+    /// Struct and enum definitions of every module typed before this one.
+    type_defs: &'a TypeDefs,
+    /// Struct and enum definitions of this module.
+    local_defs: TypeDefs,
+    /// The struct declarations of this module, by the id of each struct's name.
+    struct_decls: IndexMap<VarId, &'a StructDecl<Substr, ParseMetadata>>,
+    /// Inference variables of the unit being typed.
+    infer: InferCtx,
     current_path: &'a ModPath,
     next_id: VarId,
     bindings: Vec<VarIdTyFrame>,
@@ -1130,6 +1184,8 @@ pub(crate) struct VarIdTyPass<'a> {
     cells: IndexMap<VarId, CellTyping<'a>>,
     /// The cell declared at each index of `ast.ast.decls`.
     decl_cells: IndexMap<usize, VarId>,
+    /// The struct or enum declared at each index of `ast.ast.decls`.
+    decl_adts: IndexMap<usize, VarId>,
     /// Fields of the cells of this module that are fully typed.
     finished_cell_fields: IndexMap<VarId, CellFields>,
     /// Statements suspended on the type of a field, innermost last.
@@ -1149,6 +1205,8 @@ pub(crate) struct VarIdTyPass<'a> {
 /// are computed one statement at a time, in any order, as they are demanded.
 struct CellTyping<'a> {
     decl: &'a CellDecl<Substr, ParseMetadata>,
+    /// The cell's type parameters, in scope for every unit of its body.
+    ty_params: Vec<Arc<TyParamTy>>,
     /// Top-level `let` name to the indices of the statements declaring it,
     /// ascending. A name declared more than once is re-bound in sequence: a
     /// statement sees the nearest `let` above it, and the field an instance
@@ -1256,6 +1314,8 @@ struct WorkspaceTyping<'a> {
     mod_bindings: IndexMap<&'a ModPath, VarIdTyFrame>,
     /// Fields of every fully typed cell, by the cell's id.
     cell_fields: IndexMap<VarId, CellFields>,
+    /// Struct and enum definitions of every typed module.
+    type_defs: TypeDefs,
     ast: WorkspaceAst<VarIdTyMetadata>,
     errors: Vec<StaticError>,
     next_id: VarId,
@@ -1264,10 +1324,11 @@ struct WorkspaceTyping<'a> {
 pub(crate) fn execute_var_id_ty_pass<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
-) -> (WorkspaceAst<VarIdTyMetadata>, Vec<StaticError>) {
+) -> (TypedWorkspace, Vec<StaticError>) {
     let mut typing = WorkspaceTyping {
         mod_bindings: IndexMap::new(),
         cell_fields: IndexMap::new(),
+        type_defs: TypeDefs::new(),
         ast: IndexMap::new(),
         errors: Vec::new(),
         next_id: 1,
@@ -1283,7 +1344,13 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
             execute_var_id_ty_pass_inner(ast, dag, path, &mut typing);
         }
     }
-    (typing.ast, typing.errors)
+    (
+        TypedWorkspace {
+            ast: typing.ast,
+            defs: Arc::new(typing.type_defs),
+        },
+        typing.errors,
+    )
 }
 
 fn execute_var_id_ty_pass_inner<'a>(
@@ -1308,12 +1375,17 @@ fn execute_var_id_ty_pass_inner<'a>(
         ast: &ast[current_path],
         mod_bindings: &typing.mod_bindings,
         cell_fields: &typing.cell_fields,
+        type_defs: &typing.type_defs,
+        local_defs: TypeDefs::new(),
+        struct_decls: IndexMap::new(),
+        infer: InferCtx::default(),
         current_path,
         next_id: typing.next_id,
         bindings: vec![VarIdTyFrame::default()],
         errors: vec![],
         cells: IndexMap::new(),
         decl_cells: IndexMap::new(),
+        decl_adts: IndexMap::new(),
         finished_cell_fields: IndexMap::new(),
         goals: Vec::new(),
         poisoned: IndexSet::new(),
@@ -1325,12 +1397,17 @@ fn execute_var_id_ty_pass_inner<'a>(
     typing.next_id = pass.next_id;
     let module_frame = pass.bindings.into_iter().next().unwrap();
     let cell_fields = pass.finished_cell_fields;
+    let local_defs = pass.local_defs;
     typing.cell_fields.extend(cell_fields);
+    typing.type_defs.extend(local_defs);
     typing.mod_bindings.insert(current_path, module_frame);
 }
 
 #[derive(Debug, Clone)]
 pub struct VarIdTyMetadata;
+
+/// The index of an inference variable within the unit being typed.
+pub type InferId = u32;
 
 #[enumify]
 #[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1340,9 +1417,7 @@ pub enum Ty {
     /// Suppresses type checking of dependent properties.
     #[default]
     Unknown,
-    /// Catch-all any type.
-    ///
-    /// Should eventually be removed.
+    /// Catch-all type for cells and instances, which cannot be named.
     Any,
     Bool,
     Float,
@@ -1357,14 +1432,363 @@ pub enum Ty {
     Nil,
     SeqNil,
     Fn(Box<FnTy>),
-    /// An enum variant type, e.g. the type of `MyEnum::MyVariant`.
-    Enum(EnumTy),
+    /// A user-declared `enum`: the declaring enum and its type arguments.
+    Enum(Arc<EnumTy>),
     CellFn(Box<CellFnTy>),
     Seq(Box<Ty>),
     Tuple(Vec<Ty>),
-    /// A user-declared `struct`. Nominal: two declarations with identical
-    /// fields are distinct types.
+    /// A user-declared `struct`: the declaring struct and its type arguments.
     Struct(Arc<StructTy>),
+    /// A variant constructor, the type of `Some` or `Option::None` as a name.
+    Ctor(Arc<CtorTy>),
+    /// A type parameter, rigid within its declaration.
+    Param(Arc<TyParamTy>),
+    /// An inference variable, solved and removed before its unit is finished.
+    Infer(InferId),
+}
+
+/// A type parameter of a generic declaration.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct TyParamTy {
+    /// The [`VarId`] the parameter's name is bound to, which is its identity.
+    pub(crate) id: VarId,
+    pub(crate) name: String,
+}
+
+impl PartialEq for TyParamTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+/// The type of a `struct`.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct StructTy {
+    /// The [`VarId`] the struct's name is bound to, which keys its
+    /// [`StructDef`] in [`TypeDefs`].
+    pub(crate) def: VarId,
+    /// The declared name, module-qualified, for diagnostics.
+    pub(crate) name: String,
+    /// One argument per parameter of the declaration.
+    pub(crate) args: Vec<Ty>,
+}
+
+impl PartialEq for StructTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.def == other.def && self.args == other.args
+    }
+}
+
+/// The type of an `enum`.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct EnumTy {
+    /// The [`VarId`] the enum's name is bound to, which keys its [`EnumDef`]
+    /// in [`TypeDefs`].
+    pub(crate) def: VarId,
+    /// The declared name, module-qualified, for diagnostics.
+    pub(crate) name: String,
+    /// One argument per parameter of the declaration.
+    pub(crate) args: Vec<Ty>,
+}
+
+impl PartialEq for EnumTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.def == other.def && self.args == other.args
+    }
+}
+
+/// The type of a variant used as a name rather than as a value.
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
+pub struct CtorTy {
+    /// The declaring enum's [`VarId`].
+    pub(crate) def: VarId,
+    /// The declaring enum's qualified name, for diagnostics.
+    pub(crate) enum_name: String,
+    pub(crate) variant: String,
+    /// The enum's arguments when fixed by a turbofish; empty otherwise.
+    pub(crate) args: Vec<Ty>,
+}
+
+impl PartialEq for CtorTy {
+    fn eq(&self, other: &Self) -> bool {
+        self.def == other.def && self.variant == other.variant && self.args == other.args
+    }
+}
+
+/// The definition of a `struct`: its parameters and its fields, whose types
+/// mention the parameters as [`Ty::Param`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructDef {
+    pub name: String,
+    pub params: Vec<Arc<TyParamTy>>,
+    pub fields: IndexMap<String, Ty>,
+}
+
+/// The definition of an `enum`: its parameters and its variants, whose payload
+/// types mention the parameters as [`Ty::Param`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumDef {
+    pub name: String,
+    pub params: Vec<Arc<TyParamTy>>,
+    pub variants: IndexMap<String, VariantDef>,
+}
+
+/// One variant of an [`EnumDef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariantDef {
+    /// The [`VarId`] the variant is bound to by `use`, the prelude, and the
+    /// evaluator's global frame.
+    pub id: VarId,
+    pub payload: Vec<Ty>,
+}
+
+/// A struct or enum definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdtDef {
+    Struct(StructDef),
+    Enum(EnumDef),
+}
+
+impl AdtDef {
+    pub fn params(&self) -> &[Arc<TyParamTy>] {
+        match self {
+            Self::Struct(def) => &def.params,
+            Self::Enum(def) => &def.params,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Struct(def) => &def.name,
+            Self::Enum(def) => &def.name,
+        }
+    }
+
+    pub fn as_struct(&self) -> Option<&StructDef> {
+        match self {
+            Self::Struct(def) => Some(def),
+            Self::Enum(_) => None,
+        }
+    }
+
+    pub fn as_enum(&self) -> Option<&EnumDef> {
+        match self {
+            Self::Enum(def) => Some(def),
+            Self::Struct(_) => None,
+        }
+    }
+}
+
+/// Every struct and enum definition of a workspace, by the [`VarId`] of the
+/// declaration's name.
+pub type TypeDefs = IndexMap<VarId, AdtDef>;
+
+/// Replaces each [`Ty::Param`] in `ty` by its entry in `map`.
+pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
+    if map.is_empty() {
+        return ty.clone();
+    }
+    match ty {
+        Ty::Param(param) => map.get(&param.id).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Seq(inner) => Ty::Seq(Box::new(subst(inner, map))),
+        Ty::Tuple(items) => Ty::Tuple(items.iter().map(|item| subst(item, map)).collect()),
+        Ty::Struct(s) => Ty::Struct(Arc::new(StructTy {
+            def: s.def,
+            name: s.name.clone(),
+            args: s.args.iter().map(|arg| subst(arg, map)).collect(),
+        })),
+        Ty::Enum(e) => Ty::Enum(Arc::new(EnumTy {
+            def: e.def,
+            name: e.name.clone(),
+            args: e.args.iter().map(|arg| subst(arg, map)).collect(),
+        })),
+        Ty::Ctor(c) => Ty::Ctor(Arc::new(CtorTy {
+            def: c.def,
+            enum_name: c.enum_name.clone(),
+            variant: c.variant.clone(),
+            args: c.args.iter().map(|arg| subst(arg, map)).collect(),
+        })),
+        Ty::Cell(cell) => Ty::Cell(Arc::new(cell.subst(map))),
+        Ty::Inst(cell) => Ty::Inst(Arc::new(cell.subst(map))),
+        Ty::Fn(f) => Ty::Fn(Box::new(FnTy {
+            params: f.params.clone(),
+            sig: f.sig.subst(map),
+            ret: subst(&f.ret, map),
+        })),
+        Ty::CellFn(f) => Ty::CellFn(Box::new(CellFnTy {
+            params: f.params.clone(),
+            sig: f.sig.subst(map),
+            cell: Arc::new(f.cell.subst(map)),
+        })),
+        Ty::Unknown
+        | Ty::Any
+        | Ty::Bool
+        | Ty::Float
+        | Ty::Int
+        | Ty::Rect
+        | Ty::Polygon
+        | Ty::Path
+        | Ty::Point
+        | Ty::String
+        | Ty::Nil
+        | Ty::SeqNil
+        | Ty::Infer(_) => ty.clone(),
+    }
+}
+
+/// The substitution from a definition's parameters to `args`, pairwise.
+pub(crate) fn param_map(params: &[Arc<TyParamTy>], args: &[Ty]) -> HashMap<VarId, Ty> {
+    params
+        .iter()
+        .zip(args)
+        .map(|(param, arg)| (param.id, arg.clone()))
+        .collect()
+}
+
+/// Renders a type argument list, or nothing for a non-generic type.
+fn fmt_args(f: &mut std::fmt::Formatter<'_>, args: &[Ty]) -> std::fmt::Result {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        write!(f, "<{}>", args.iter().format(", "))
+    }
+}
+
+/// Renders a type parameter list, or nothing for a non-generic declaration.
+fn fmt_params(f: &mut std::fmt::Formatter<'_>, params: &[Arc<TyParamTy>]) -> std::fmt::Result {
+    if params.is_empty() {
+        Ok(())
+    } else {
+        write!(
+            f,
+            "<{}>",
+            params.iter().map(|param| &param.name).format(", ")
+        )
+    }
+}
+
+/// The inference variables of one unit and what each has been solved to.
+#[derive(Debug, Clone, Default)]
+struct InferCtx {
+    solutions: Vec<Option<Ty>>,
+}
+
+impl InferCtx {
+    fn fresh(&mut self) -> Ty {
+        let id = InferId::try_from(self.solutions.len()).expect("inference variable count");
+        self.solutions.push(None);
+        Ty::Infer(id)
+    }
+
+    /// Follows solved variables at the top of `ty` until a non-variable or an
+    /// unsolved variable is reached.
+    fn shallow(&self, ty: &Ty) -> Ty {
+        let mut ty = ty.clone();
+        while let Ty::Infer(id) = ty {
+            match &self.solutions[id as usize] {
+                Some(solution) => ty = solution.clone(),
+                None => return Ty::Infer(id),
+            }
+        }
+        ty
+    }
+
+    /// Replaces every solved variable in `ty` by its solution, leaving
+    /// unsolved ones in place.
+    fn deep(&self, ty: &Ty) -> Ty {
+        let ty = self.shallow(ty);
+        match &ty {
+            Ty::Seq(inner) => Ty::Seq(Box::new(self.deep(inner))),
+            Ty::Tuple(items) => Ty::Tuple(items.iter().map(|item| self.deep(item)).collect()),
+            Ty::Struct(s) if !s.args.is_empty() => Ty::Struct(Arc::new(StructTy {
+                def: s.def,
+                name: s.name.clone(),
+                args: s.args.iter().map(|arg| self.deep(arg)).collect(),
+            })),
+            Ty::Enum(e) if !e.args.is_empty() => Ty::Enum(Arc::new(EnumTy {
+                def: e.def,
+                name: e.name.clone(),
+                args: e.args.iter().map(|arg| self.deep(arg)).collect(),
+            })),
+            Ty::Ctor(c) if !c.args.is_empty() => Ty::Ctor(Arc::new(CtorTy {
+                def: c.def,
+                enum_name: c.enum_name.clone(),
+                variant: c.variant.clone(),
+                args: c.args.iter().map(|arg| self.deep(arg)).collect(),
+            })),
+            Ty::Cell(cell) if !cell.args.is_empty() => Ty::Cell(Arc::new(CellTy {
+                args: cell.args.iter().map(|arg| self.deep(arg)).collect(),
+                ..(**cell).clone()
+            })),
+            Ty::Inst(cell) if !cell.args.is_empty() => Ty::Inst(Arc::new(CellTy {
+                args: cell.args.iter().map(|arg| self.deep(arg)).collect(),
+                ..(**cell).clone()
+            })),
+            _ => ty,
+        }
+    }
+
+    /// Whether `ty` contains an unsolved variable.
+    fn has_unsolved(&self, ty: &Ty) -> bool {
+        match self.shallow(ty) {
+            Ty::Infer(_) => true,
+            Ty::Seq(inner) => self.has_unsolved(&inner),
+            Ty::Tuple(items) => items.iter().any(|item| self.has_unsolved(item)),
+            Ty::Struct(s) => s.args.iter().any(|arg| self.has_unsolved(arg)),
+            Ty::Enum(e) => e.args.iter().any(|arg| self.has_unsolved(arg)),
+            Ty::Ctor(c) => c.args.iter().any(|arg| self.has_unsolved(arg)),
+            Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| self.has_unsolved(arg)),
+            _ => false,
+        }
+    }
+
+    /// Whether the unsolved variable `id` occurs in `ty`.
+    fn occurs(&self, id: InferId, ty: &Ty) -> bool {
+        match self.shallow(ty) {
+            Ty::Infer(other) => other == id,
+            Ty::Seq(inner) => self.occurs(id, &inner),
+            Ty::Tuple(items) => items.iter().any(|item| self.occurs(id, item)),
+            Ty::Struct(s) => s.args.iter().any(|arg| self.occurs(id, arg)),
+            Ty::Enum(e) => e.args.iter().any(|arg| self.occurs(id, arg)),
+            Ty::Ctor(c) => c.args.iter().any(|arg| self.occurs(id, arg)),
+            Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| self.occurs(id, arg)),
+            _ => false,
+        }
+    }
+
+    /// Solves every unsolved variable in `ty` to `solution`.
+    fn solve_unsolved(&mut self, ty: &Ty, solution: &Ty) {
+        match self.shallow(ty) {
+            Ty::Infer(id) => self.solutions[id as usize] = Some(solution.clone()),
+            Ty::Seq(inner) => self.solve_unsolved(&inner, solution),
+            Ty::Tuple(items) => {
+                for item in &items {
+                    self.solve_unsolved(item, solution);
+                }
+            }
+            Ty::Struct(s) => {
+                for arg in &s.args {
+                    self.solve_unsolved(arg, solution);
+                }
+            }
+            Ty::Enum(e) => {
+                for arg in &e.args {
+                    self.solve_unsolved(arg, solution);
+                }
+            }
+            Ty::Ctor(c) => {
+                for arg in &c.args {
+                    self.solve_unsolved(arg, solution);
+                }
+            }
+            Ty::Cell(cell) | Ty::Inst(cell) => {
+                for arg in &cell.args {
+                    self.solve_unsolved(arg, solution);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1425,15 +1849,29 @@ impl std::fmt::Display for Ty {
             Ty::SeqNil => write!(f, "[]"),
             Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
-            Ty::CellFn(cell_fn) => write!(f, "cell {}({})", cell_fn.cell.name, cell_fn.sig),
-            Ty::Fn(func) => write!(f, "fn({}) -> {}", func.sig, func.ret),
-            // The name is what distinguishes two same-shaped enums: `EnumTy`
-            // equality keys on `id`, so without it a mismatch renders as
-            // `expected enum {A, B}, found enum {A, B}`.
-            Ty::Enum(e) => write!(f, "enum {} {{{}}}", e.name, e.variants.iter().format(", ")),
+            Ty::CellFn(cell_fn) => {
+                write!(f, "cell {}", cell_fn.cell.name)?;
+                fmt_params(f, &cell_fn.params)?;
+                write!(f, "({})", cell_fn.sig)
+            }
+            Ty::Fn(func) => {
+                write!(f, "fn")?;
+                fmt_params(f, &func.params)?;
+                write!(f, "({}) -> {}", func.sig, func.ret)
+            }
+            Ty::Enum(e) => {
+                write!(f, "{}", e.name)?;
+                fmt_args(f, &e.args)
+            }
             Ty::Seq(inner) => write!(f, "[{inner}]"),
             Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
-            Ty::Struct(s) => write!(f, "struct {}", s.name),
+            Ty::Struct(s) => {
+                write!(f, "{}", s.name)?;
+                fmt_args(f, &s.args)
+            }
+            Ty::Ctor(c) => write!(f, "{}::{}", c.enum_name, c.variant),
+            Ty::Param(param) => write!(f, "{}", param.name),
+            Ty::Infer(_) => write!(f, "_"),
         }
     }
 }
@@ -1478,38 +1916,12 @@ impl Ty {
         })
     }
 
-    /// Computes the least upper bound (LUB) of self and other.
-    /// For use in type promotion.
-    ///
-    /// Returns `None` when the two types have no common supertype. Callers must
-    /// report that as an error rather than widening: `Ty::Any` satisfies every
-    /// downstream check, so promoting a genuine mismatch to `Any` suppresses
-    /// all further checking and defers the failure to an evaluator `unwrap`.
-    /// `Ty::Any` must only ever come from an explicit `Any` annotation, never
-    /// from inference giving up.
-    pub fn lub(&self, other: &Self) -> Option<Self> {
-        match (self, other) {
-            // Unknown promotes to any type. It already marks an earlier error,
-            // so it suppresses cascades instead of producing new ones.
-            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
-            // At least one Any results in Any.
-            (Ty::Any, _) | (_, Ty::Any) => Some(Ty::Any),
-            // SeqNil promotes to any sequence type.
-            (Ty::SeqNil, Ty::Seq(inner)) | (Ty::Seq(inner), Ty::SeqNil) => {
-                Some(Ty::Seq(inner.clone()))
-            }
-            // Mismatched types have no LUB.
-            (a, b) => (a == b).then(|| a.clone()),
-        }
-    }
-
     /// Whether this type satisfies every static check.
     ///
     /// `Any` does so by definition. `Unknown` does so for the opposite reason:
     /// it marks an expression that was *already* diagnosed, and its whole
     /// purpose is to suppress checking of dependent properties, so comparing
-    /// it structurally turns one error into two. `Ty::lub` has always treated
-    /// it this way.
+    /// it structurally turns one error into two.
     ///
     /// Every predicate that admits `Any` must go through this, or the
     /// already-diagnosed expression grows a second, spurious `.. found ?`.
@@ -1527,6 +1939,18 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// This signature with [`subst`] applied to every parameter type.
+    fn subst(&self, map: &HashMap<VarId, Ty>) -> Self {
+        Self {
+            args: self.args.iter().map(|ty| subst(ty, map)).collect(),
+            kwargs: self
+                .kwargs
+                .iter()
+                .map(|(name, ty)| (name.clone(), subst(ty, map)))
+                .collect(),
+        }
+    }
+
     /// A signature with only positional parameters.
     fn positional(args: impl IntoIterator<Item = Ty>) -> Self {
         Self {
@@ -1571,9 +1995,40 @@ impl std::fmt::Display for Signature {
 /// Signatures of the builtins whose parameters do not depend on the call.
 /// Built once rather than per call site, since every keyword name is owned.
 mod builtin_sig {
-    use std::sync::LazyLock;
+    use std::sync::{Arc, LazyLock};
 
-    use super::{Signature, Ty};
+    use super::{FnTy, Signature, Ty, TyParamTy};
+
+    /// The one type parameter of the polymorphic sequence builtins. `VarId` 0
+    /// is never allocated to a declaration, so it cannot collide.
+    pub(super) static T: LazyLock<Arc<TyParamTy>> = LazyLock::new(|| {
+        Arc::new(TyParamTy {
+            id: 0,
+            name: "T".to_owned(),
+        })
+    });
+
+    fn param() -> Ty {
+        Ty::Param(T.clone())
+    }
+
+    fn seq() -> Ty {
+        Ty::Seq(Box::new(param()))
+    }
+
+    fn scheme(args: impl IntoIterator<Item = Ty>, ret: Ty) -> FnTy {
+        FnTy {
+            params: vec![T.clone()],
+            sig: Signature::positional(args),
+            ret,
+        }
+    }
+
+    pub(super) static CONS: LazyLock<FnTy> = LazyLock::new(|| scheme([param(), seq()], seq()));
+    pub(super) static HEAD: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], param()));
+    pub(super) static TAIL: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], seq()));
+    /// `list` is variadic: every element is unified with `T`.
+    pub(super) static LIST: LazyLock<FnTy> = LazyLock::new(|| scheme([param()], seq()));
 
     /// The coordinate keywords every rectangle constructor accepts.
     fn coordinates() -> impl Iterator<Item = (&'static str, Ty)> {
@@ -1623,17 +2078,24 @@ mod builtin_sig {
     pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
 }
 
+/// The type of a function: its type parameters, its parameters, and what it
+/// returns. Parameter and return types mention the type parameters as
+/// [`Ty::Param`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FnTy {
+    pub(crate) params: Vec<Arc<TyParamTy>>,
     pub(crate) sig: Signature,
     pub(crate) ret: Ty,
 }
 
+/// The type of a cell function: its type parameters, its parameters, and the
+/// cell type a call produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellFnTy {
-    sig: Signature,
-    /// The type produced when this cell function is called, shared with every
-    /// caller and every `inst` of the result.
+    pub(crate) params: Vec<Arc<TyParamTy>>,
+    pub(crate) sig: Signature,
+    /// The type produced when this cell function is called, with the type
+    /// parameters as its arguments.
     pub(crate) cell: Arc<CellTy>,
 }
 
@@ -1659,6 +2121,26 @@ pub struct CellTy {
     /// reaches the `let` declaring a field. `None` for the generated signature
     /// of a GDS-backed cell.
     pub(crate) def: Option<VarId>,
+    /// The declaring cell's type parameters, which its field types mention.
+    pub(crate) params: Vec<Arc<TyParamTy>>,
+    /// One argument per parameter.
+    pub(crate) args: Vec<Ty>,
+}
+
+impl CellTy {
+    /// This type with [`subst`] applied to its arguments.
+    fn subst(&self, map: &HashMap<VarId, Ty>) -> Self {
+        Self {
+            args: self.args.iter().map(|arg| subst(arg, map)).collect(),
+            ..self.clone()
+        }
+    }
+
+    /// The substitution from the declaring cell's parameters to this type's
+    /// arguments.
+    pub(crate) fn param_map(&self) -> HashMap<VarId, Ty> {
+        param_map(&self.params, &self.args)
+    }
 }
 
 impl PartialEq for CellTy {
@@ -1670,47 +2152,17 @@ impl PartialEq for CellTy {
             name: _,
             dynamic_fields,
             def,
+            params: _,
+            args,
         } = self;
         let Self {
             name: _,
             dynamic_fields: other_dynamic_fields,
             def: other_def,
+            params: _,
+            args: other_args,
         } = other;
-        def == other_def && dynamic_fields == other_dynamic_fields
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnumTy {
-    pub(crate) id: EnumId,
-    /// The name the enum was declared with, module-qualified, carried solely
-    /// so a diagnostic can distinguish two same-shaped enums.
-    ///
-    /// Redundant for equality -- `id` is already unique per declaration -- but
-    /// without it `Display` renders both sides of a mismatch as
-    /// `enum {N, S}`, which is the defect `Display` exists to remove.
-    name: String,
-    pub(crate) variants: IndexSet<String>,
-}
-
-/// The type of a `struct` declaration.
-#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
-pub struct StructTy {
-    /// The [`VarId`] the struct's name is bound to, which doubles as the type's
-    /// identity. Struct types are *nominal*, so two same-shaped declarations
-    /// are different types, and `id` is the only field equality reads. Being
-    /// the name's own id, it also lets navigation and fingerprinting reach the
-    /// declaration without an `EnumId`-style side map.
-    pub(crate) id: VarId,
-    /// The declared name, module-qualified, for diagnostics.
-    pub(crate) name: String,
-    /// The fields and their types, in declaration order.
-    pub(crate) fields: IndexMap<String, Ty>,
-}
-
-impl PartialEq for StructTy {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        def == other_def && dynamic_fields == other_dynamic_fields && args == other_args
     }
 }
 
@@ -1718,7 +2170,11 @@ impl AstMetadata for VarIdTyMetadata {
     type Ident = ();
     type IdentPath = (Option<VarId>, Ty);
     /// `None` when the name was rejected before it could be bound.
-    type EnumDecl = Option<(VarId, EnumId)>;
+    type EnumDecl = Option<VarId>;
+    /// The variant's own id; `None` when its enum was rejected.
+    type EnumVariant = Option<VarId>;
+    /// The binding's id and the type it binds.
+    type PatternBinding = (VarId, Ty);
     /// `None` when the name was rejected before it could be bound.
     type StructDecl = Option<VarId>;
     /// The field's resolved type.
@@ -1815,26 +2271,35 @@ impl<'a> VarIdTyPass<'a> {
     fn execute(&mut self) -> AnnotatedAst<VarIdTyMetadata> {
         let mut decls = Vec::new();
         self.check_duplicate_decls();
-        // Enum types must exist before imports and function signatures are
-        // resolved. Imports are then installed before structs and functions
-        // are declared, allowing imported enum and struct types in fields and
-        // signatures, and imported functions in any declaration body,
-        // regardless of source order. Structs come before functions so that a
+        // Struct and enum names are bound first, so that a field, a payload, an
+        // import, or a signature may name any type of the module in any order.
+        // The prelude and imports are installed next, then the definitions are
+        // filled in. Structs and enums come before functions so that a
         // signature may name a struct declared further down. Cells come last:
         // their types are nominal, so binding them here, before any body is
         // walked, lets a body refer to any cell of the module, including the
         // one being declared.
-        for decl in &self.ast.ast.decls {
-            if let Decl::Enum(e) = decl {
-                self.declare_enum_decl(e);
+        for (index, decl) in self.ast.ast.decls.iter().enumerate() {
+            match decl {
+                Decl::Enum(e) => self.bind_enum_decl(index, e),
+                Decl::Struct(s) => self.bind_struct_decl(index, s),
+                _ => {}
             }
         }
+        self.bind_prelude();
         for decl in &self.ast.ast.decls {
             if let Decl::Use(u) = decl {
                 self.declare_use_decl(u);
             }
         }
-        self.declare_struct_decls();
+        for (index, decl) in self.ast.ast.decls.iter().enumerate() {
+            match decl {
+                Decl::Enum(e) => self.define_enum_decl(index, e),
+                Decl::Struct(s) => self.define_struct_decl(index, s),
+                _ => {}
+            }
+        }
+        self.check_recursive_structs();
         for decl in &self.ast.ast.decls {
             if let Decl::Fn(f) = decl {
                 self.declare_fn_decl(f);
@@ -1895,14 +2360,6 @@ impl<'a> VarIdTyPass<'a> {
         annotated
     }
 
-    fn use_module_path(&self, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-        module_prefix(
-            self.current_path,
-            use_decl.path.iter().map(|ident| ident.name.as_str()),
-            1,
-        )
-    }
-
     /// Binds a cell's type before its body is typed, and sets up the lazy
     /// typing of its fields.
     ///
@@ -1917,14 +2374,14 @@ impl<'a> VarIdTyPass<'a> {
             });
         }
         self.check_params(&input.args);
+        let params = self.declare_ty_params(&input.params);
+        self.push_ty_params(&params);
         let sig = input
             .args
             .iter()
-            .map(|arg| {
-                let ty_spec = self.transform_ty_spec(&arg.ty);
-                (arg, self.ty_from_spec(&ty_spec))
-            })
+            .map(|arg| (arg, self.ty_from_spec(&arg.ty)))
             .collect();
+        self.bindings.pop();
         // Generated declarations -- the signatures standing in for GDS-backed
         // cells -- sit at the front of the list. They have no declared fields
         // to trace back to, so field accesses on them fall through to the
@@ -1932,11 +2389,17 @@ impl<'a> VarIdTyPass<'a> {
         let dynamic_fields = index < self.ast.generated_declarations;
         let cell_id = self.alloc_id();
         let ty = Ty::CellFn(Box::new(CellFnTy {
+            params: params.clone(),
             sig,
             cell: Arc::new(CellTy {
                 name: self.qualified_name(&input.name.name),
                 dynamic_fields,
                 def: (!dynamic_fields).then_some(cell_id),
+                args: params
+                    .iter()
+                    .map(|param| Ty::Param(param.clone()))
+                    .collect(),
+                params: params.clone(),
             }),
         }));
         self.bind(&input.name.name, cell_id, ty);
@@ -1961,6 +2424,7 @@ impl<'a> VarIdTyPass<'a> {
             cell_id,
             CellTyping {
                 decl: input,
+                ty_params: params,
                 lets,
                 params: None,
                 stmts: input.scope.stmts.iter().map(|_| None).collect(),
@@ -2003,7 +2467,7 @@ impl<'a> VarIdTyPass<'a> {
     /// types it did not have, so its diagnostics are dropped and the ids it
     /// allocated are released for the retry. The view comes back either way,
     /// holding whatever the unit bound in its frame.
-    fn attempt<T>(
+    fn attempt<T: Zonk>(
         &mut self,
         cell: Option<VarId>,
         view: StatementView,
@@ -2012,6 +2476,7 @@ impl<'a> VarIdTyPass<'a> {
         debug_assert!(self.attempt.is_none(), "attempts do not nest");
         let errors = self.errors.len();
         let next_id = self.next_id;
+        self.infer = InferCtx::default();
         self.bindings.push(view.frame);
         self.attempt = Some(Attempt {
             cell,
@@ -2026,12 +2491,31 @@ impl<'a> VarIdTyPass<'a> {
             untyped: attempt.visible_untyped,
         };
         if attempt.demands.is_empty() {
-            (Ok(result), view)
+            (Ok(self.zonk(result)), view)
         } else {
             self.errors.truncate(errors);
             self.next_id = next_id;
             (Err(attempt.demands), view)
         }
+    }
+
+    /// Replaces every inference variable in `value` by its solution, reporting
+    /// the ones that have none.
+    fn zonk<T: Zonk>(&mut self, value: T) -> T {
+        let mut zonker = Zonker {
+            infer: &self.infer,
+            seen: IndexSet::new(),
+            unsolved: IndexSet::new(),
+        };
+        let value = value.zonk(&mut zonker);
+        let unsolved = zonker.unsolved;
+        for span in unsolved {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::TypeAnnotationsNeeded,
+            });
+        }
+        value
     }
 
     /// The view for typing the statement at `limit` of `cell`, or its tail
@@ -2063,6 +2547,14 @@ impl<'a> VarIdTyPass<'a> {
 
     /// Attempts one unit of `cell`, recording the result on success.
     fn attempt_unit(&mut self, cell: VarId, unit: Unit) -> Result<(), Vec<Demand>> {
+        let ty_params = self.cells[&cell].ty_params.clone();
+        self.push_ty_params(&ty_params);
+        let result = self.attempt_cell_unit(cell, unit);
+        self.bindings.pop();
+        result
+    }
+
+    fn attempt_cell_unit(&mut self, cell: VarId, unit: Unit) -> Result<(), Vec<Demand>> {
         let decl = self.cells[&cell].decl;
         match unit {
             Unit::Params => {
@@ -2215,6 +2707,7 @@ impl<'a> VarIdTyPass<'a> {
             .collect::<Vec<_>>();
         let tail = typing.tail.expect("typed by the goal stack");
         let name = self.transform_ident(&decl.name);
+        let params = self.transform_ty_params(&decl.params);
         if let Some(tail) = tail.as_ref() {
             self.errors.push(StaticError {
                 span: self.span(tail.span()),
@@ -2240,6 +2733,7 @@ impl<'a> VarIdTyPass<'a> {
         };
         CellDecl {
             name,
+            params,
             args,
             scope,
             span: decl.span,
@@ -2317,9 +2811,12 @@ impl<'a> VarIdTyPass<'a> {
         let Some(def) = cell.def else {
             return Ty::Any;
         };
+        // Field types mention the cell's own type parameters; an instance
+        // reads them with its arguments substituted.
+        let map = cell.param_map();
         if let Some(fields) = self.finished_cell_fields.get(&def) {
             return match fields.get(name) {
-                Some(ty) => ty.clone(),
+                Some(ty) => subst(ty, &map),
                 None => self.no_field_on_ty(field, base_ty.clone()),
             };
         }
@@ -2329,7 +2826,7 @@ impl<'a> VarIdTyPass<'a> {
                 return self.no_field_on_ty(field, base_ty.clone());
             };
             return match &typing.stmts[stmt] {
-                Some(Statement::LetBinding(binding)) => binding.value.ty(),
+                Some(Statement::LetBinding(binding)) => subst(&binding.value.ty(), &map),
                 Some(_) => unreachable!("`lets` indexes `let` statements"),
                 None => {
                     self.demand(def, stmt, field.span);
@@ -2342,7 +2839,7 @@ impl<'a> VarIdTyPass<'a> {
             .get(&def)
             .and_then(|fields| fields.get(name))
         {
-            Some(ty) => ty.clone(),
+            Some(ty) => subst(ty, &map),
             None => self.no_field_on_ty(field, base_ty.clone()),
         }
     }
@@ -2353,12 +2850,9 @@ impl<'a> VarIdTyPass<'a> {
     /// Cells, functions, structs, enums, and imports all bind into the one
     /// module frame, so `struct Mode` after `enum Mode` clashes as much as two
     /// `cell top`s do. The declaration passes run by kind rather than in
-    /// source order, so without this check the survivor of a clash was
-    /// whichever kind is declared last -- a struct always beat an enum of the
-    /// same name, whatever the file said -- and [`Self::declare_struct_decls`]
-    /// keys structs by name, so a repeated `struct S` dropped the first
-    /// declaration without a trace. The later declaration is reported and
-    /// binding proceeds as before; the file is already invalid.
+    /// source order, so the survivor of a clash is whichever kind is declared
+    /// last. The later declaration is reported and binding proceeds; the file
+    /// is already invalid.
     ///
     /// Modules are exempt: `mod m;` is resolved through `mod_bindings`, never
     /// through this frame, so `mod m;` and `fn m` do not collide.
@@ -2385,18 +2879,218 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
-    fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
-        let module = self.use_module_path(use_decl);
-        let item = use_decl.path.last().expect("use paths are non-empty");
-        let local_name = use_decl.alias.as_ref().unwrap_or(item);
-        let imported = if &module == self.current_path {
-            self.lookup(&item.name)
+    /// The binding `name` has in `module`.
+    fn module_item(&self, module: &ModPath, name: &str) -> Option<(VarId, Ty)> {
+        if module == self.current_path {
+            self.lookup(name)
         } else {
             self.mod_bindings
-                .get(&module)
-                .and_then(|frame| frame.var_bindings.get(item.name.as_str()).cloned())
-        };
+                .get(module)
+                .and_then(|frame| frame.var_bindings.get(name).cloned())
+        }
+    }
 
+    /// The definition of the struct or enum whose name is bound to `id`.
+    fn adt_def(&self, id: VarId) -> Option<&AdtDef> {
+        self.local_defs.get(&id).or_else(|| self.type_defs.get(&id))
+    }
+
+    /// The type of the variant `ctor` names when used as a name: a unit
+    /// variant is a value of its enum, a tuple variant is the constructor.
+    /// `explicit` are turbofish arguments for the enum.
+    fn ctor_value_ty(
+        &mut self,
+        ctor: &CtorTy,
+        explicit: Option<Vec<Ty>>,
+        span: cfgrammar::Span,
+    ) -> Ty {
+        let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+            return Ty::Unknown;
+        };
+        let explicit = explicit.or_else(|| (!ctor.args.is_empty()).then(|| ctor.args.clone()));
+        let is_unit = def
+            .variants
+            .get(&ctor.variant)
+            .is_some_and(|variant| variant.payload.is_empty());
+        if is_unit {
+            let map = self.instantiate(&def.params, explicit, span, &ctor.enum_name);
+            return Ty::Enum(Arc::new(EnumTy {
+                def: ctor.def,
+                name: ctor.enum_name.clone(),
+                args: def
+                    .params
+                    .iter()
+                    .map(|param| map[&param.id].clone())
+                    .collect(),
+            }));
+        }
+        let args = match explicit {
+            Some(args) if args.len() == def.params.len() => args,
+            Some(args) => {
+                self.errors.push(StaticError {
+                    span: self.span(span),
+                    kind: StaticErrorKind::TypeArgArity {
+                        ty: ctor.enum_name.clone(),
+                        expected: def.params.len(),
+                        found: args.len(),
+                    },
+                });
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        Ty::Ctor(Arc::new(CtorTy {
+            args,
+            ..ctor.clone()
+        }))
+    }
+
+    /// The type a name of type `ty` has as a value, applying turbofish
+    /// arguments where the name is a variant.
+    fn value_ty(&mut self, ty: Ty, explicit: Option<Vec<Ty>>, span: cfgrammar::Span) -> Ty {
+        match ty {
+            Ty::Ctor(ctor) => self.ctor_value_ty(&ctor, explicit, span),
+            ty => {
+                if let Some(explicit) = explicit {
+                    self.errors.push(StaticError {
+                        span: self.span(span),
+                        kind: StaticErrorKind::TypeArgArity {
+                            ty: self.display(&ty),
+                            expected: 0,
+                            found: explicit.len(),
+                        },
+                    });
+                }
+                ty
+            }
+        }
+    }
+
+    /// Resolves the turbofish of `path`, if it has one.
+    fn explicit_args<M: AstMetadata>(&mut self, path: &IdentPath<Substr, M>) -> Option<Vec<Ty>> {
+        path.generic_args
+            .as_ref()
+            .map(|args| args.args.iter().map(|arg| self.ty_from_spec(arg)).collect())
+    }
+
+    /// Resolves a path of two or more segments: `Enum::Variant`, possibly
+    /// module-qualified, or `module::item`.
+    fn resolve_qualified<M: AstMetadata>(
+        &mut self,
+        path: &[Ident<Substr, M>],
+    ) -> Result<(VarId, Ty), QualifiedError> {
+        let len = path.len();
+        debug_assert!(len >= 2, "a qualified path has at least two segments");
+        let names = || path.iter().map(|ident| ident.name.as_str());
+        let enum_module = module_prefix(self.current_path, names(), 2);
+        let enum_ident = &path[len - 2];
+        let item = &path[len - 1];
+        if let Some((_, Ty::Enum(enum_ty))) = self.module_item(&enum_module, &enum_ident.name) {
+            let variant = self
+                .adt_def(enum_ty.def)
+                .and_then(AdtDef::as_enum)
+                .and_then(|def| def.variants.get(item.name.as_str()));
+            return match variant {
+                Some(variant) => Ok((
+                    variant.id,
+                    Ty::Ctor(Arc::new(CtorTy {
+                        def: enum_ty.def,
+                        enum_name: enum_ty.name.clone(),
+                        variant: item.name.to_string(),
+                        args: Vec::new(),
+                    })),
+                )),
+                None => Err(QualifiedError::InvalidVariant {
+                    span: item.span,
+                    variant: item.name.to_string(),
+                }),
+            };
+        }
+        let module = module_prefix(self.current_path, names(), 1);
+        if let Some(binding) = self.module_item(&module, &item.name) {
+            return Ok(binding);
+        }
+        if module == *self.current_path || self.mod_bindings.contains_key(&module) {
+            return Err(QualifiedError::Undeclared {
+                name: item.name.to_string(),
+            });
+        }
+        Err(QualifiedError::NotAnEnum {
+            span: enum_ident.span,
+        })
+    }
+
+    fn report_qualified_error(&mut self, error: QualifiedError, span: cfgrammar::Span) {
+        let (span, kind) = match error {
+            QualifiedError::InvalidVariant { span, variant } => {
+                (span, StaticErrorKind::InvalidVariant(variant))
+            }
+            QualifiedError::Undeclared { name } => (span, StaticErrorKind::UndeclaredVar { name }),
+            QualifiedError::NotAnEnum { span } => (span, StaticErrorKind::NotAnEnum),
+        };
+        self.errors.push(StaticError {
+            span: self.span(span),
+            kind,
+        });
+    }
+
+    /// Binds `Option`, `Some`, and `None` from the standard library, except
+    /// where this module declares an item of that name.
+    fn bind_prelude(&mut self) {
+        let declared = self
+            .ast
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Enum(e) => Some(e.name.name.as_str()),
+                Decl::Struct(s) => Some(s.name.name.as_str()),
+                Decl::Fn(f) => Some(f.name.name.as_str()),
+                Decl::Cell(c) => Some(c.name.name.as_str()),
+                Decl::Use(u) => Some(
+                    u.alias
+                        .as_ref()
+                        .unwrap_or_else(|| u.path.last().expect("use paths are non-empty"))
+                        .name
+                        .as_str(),
+                ),
+                Decl::Mod(_) | Decl::Constant(_) => None,
+            })
+            .collect::<IndexSet<_>>();
+        let std_path = vec!["std".to_owned()];
+        let Some((option_id, Ty::Enum(enum_ty))) = self.module_item(&std_path, "Option") else {
+            return;
+        };
+        let Some(def) = self.adt_def(enum_ty.def).and_then(AdtDef::as_enum).cloned() else {
+            return;
+        };
+        if !declared.contains("Option") {
+            self.bind(
+                &Substr::from("Option"),
+                option_id,
+                Ty::Enum(enum_ty.clone()),
+            );
+        }
+        for variant in ["Some", "None"] {
+            if declared.contains(variant) {
+                continue;
+            }
+            if let Some(variant_def) = def.variants.get(variant) {
+                let ty = Ty::Ctor(Arc::new(CtorTy {
+                    def: enum_ty.def,
+                    enum_name: enum_ty.name.clone(),
+                    variant: variant.to_owned(),
+                    args: Vec::new(),
+                }));
+                self.bind(&Substr::from(variant), variant_def.id, ty);
+            }
+        }
+    }
+
+    fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
+        let item = use_decl.path.last().expect("use paths are non-empty");
+        let local_name = use_decl.alias.as_ref().unwrap_or(item);
+        let imported = self.resolve_qualified(&use_decl.path).ok();
         if let Some(binding) = imported {
             self.bindings
                 .last_mut()
@@ -2417,6 +3111,67 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Checks a declaration's type parameters and allocates each an id.
+    fn declare_ty_params(
+        &mut self,
+        params: &[TyParam<Substr, ParseMetadata>],
+    ) -> Vec<Arc<TyParamTy>> {
+        let mut seen = IndexSet::new();
+        params
+            .iter()
+            .map(|param| {
+                let name = param.name.name.as_str();
+                if Ty::from_name(name).is_some() {
+                    self.errors.push(StaticError {
+                        span: self.span(param.name.span),
+                        kind: StaticErrorKind::RedeclarationOfBuiltin,
+                    });
+                }
+                if !seen.insert(name) {
+                    self.errors.push(StaticError {
+                        span: self.span(param.name.span),
+                        kind: StaticErrorKind::DuplicateNameDeclaration,
+                    });
+                }
+                Arc::new(TyParamTy {
+                    id: self.alloc_id(),
+                    name: name.to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    /// Pushes a frame binding each of `params` as a rigid type.
+    fn push_ty_params(&mut self, params: &[Arc<TyParamTy>]) {
+        self.bindings.push(VarIdTyFrame::default());
+        for param in params {
+            self.bind(
+                &Substr::from(param.name.as_str()),
+                param.id,
+                Ty::Param(param.clone()),
+            );
+        }
+    }
+
+    /// Reports each parameter of a struct or enum that none of `tys` mentions.
+    fn check_unused_params(
+        &mut self,
+        decl_params: &[TyParam<Substr, ParseMetadata>],
+        params: &[Arc<TyParamTy>],
+        tys: &[Ty],
+    ) {
+        for (decl_param, param) in decl_params.iter().zip(params) {
+            if !tys.iter().any(|ty| mentions_param(ty, param.id)) {
+                self.errors.push(StaticError {
+                    span: self.span(decl_param.span),
+                    kind: StaticErrorKind::UnusedTypeParam {
+                        name: param.name.clone(),
+                    },
+                });
+            }
+        }
+    }
+
     fn declare_fn_decl(&mut self, input: &'a FnDecl<Substr, ParseMetadata>) {
         if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
@@ -2425,26 +3180,25 @@ impl<'a> VarIdTyPass<'a> {
             });
         }
         self.check_params(&input.args);
+        let params = self.declare_ty_params(&input.params);
+        self.push_ty_params(&params);
         let sig = input
             .args
             .iter()
-            .map(|arg| {
-                let ty_spec = self.transform_ty_spec(&arg.ty);
-                (arg, self.ty_from_spec(&ty_spec))
-            })
+            .map(|arg| (arg, self.ty_from_spec(&arg.ty)))
             .collect();
-        let ty = Ty::Fn(Box::new(FnTy {
-            sig,
-            ret: if let Some(return_ty) = &input.return_ty {
-                self.ty_from_spec(return_ty)
-            } else {
-                Ty::Nil
-            },
-        }));
+        let ret = match &input.return_ty {
+            Some(return_ty) => self.ty_from_spec(return_ty),
+            None => Ty::Nil,
+        };
+        self.bindings.pop();
+        let ty = Ty::Fn(Box::new(FnTy { params, sig, ret }));
         self.alloc(&input.name.name, ty);
     }
 
-    fn declare_enum_decl(&mut self, input: &'a EnumDecl<Substr, ParseMetadata>) {
+    /// Binds an enum's name and allocates its variants' ids; the payload
+    /// types are filled in by [`Self::define_enum_decl`].
+    fn bind_enum_decl(&mut self, index: usize, input: &'a EnumDecl<Substr, ParseMetadata>) {
         if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
@@ -2452,89 +3206,91 @@ impl<'a> VarIdTyPass<'a> {
             });
             return;
         }
-        let mut variants = IndexSet::with_capacity(input.variants.len());
-        for variant in input.variants.iter() {
-            if variants.contains(variant.name.as_str()) {
+        let params = self.declare_ty_params(&input.params);
+        let id = self.alloc_id();
+        let mut variants = IndexMap::with_capacity(input.variants.len());
+        for variant in &input.variants {
+            let name = variant.name.name.as_str();
+            if BUILTINS.contains(&name) {
                 self.errors.push(StaticError {
-                    span: self.span(variant.span),
+                    span: self.span(variant.name.span),
+                    kind: StaticErrorKind::RedeclarationOfBuiltin,
+                });
+            }
+            if variants.contains_key(name) {
+                self.errors.push(StaticError {
+                    span: self.span(variant.name.span),
                     kind: StaticErrorKind::DuplicateNameDeclaration,
                 });
+                continue;
             }
-            variants.insert(variant.name.to_string());
+            variants.insert(
+                name.to_owned(),
+                VariantDef {
+                    id: self.alloc_id(),
+                    payload: Vec::new(),
+                },
+            );
         }
-        let ty = Ty::Enum(EnumTy {
-            id: self.alloc_id(),
-            name: self.qualified_name(&input.name.name),
-            variants,
-        });
-        self.alloc(&input.name.name, ty);
+        let name = self.qualified_name(&input.name.name);
+        self.local_defs.insert(
+            id,
+            AdtDef::Enum(EnumDef {
+                name: name.clone(),
+                params: params.clone(),
+                variants,
+            }),
+        );
+        let ty = Ty::Enum(Arc::new(EnumTy {
+            def: id,
+            name,
+            args: params
+                .iter()
+                .map(|param| Ty::Param(param.clone()))
+                .collect(),
+        }));
+        self.bind(&input.name.name, id, ty);
+        self.decl_adts.insert(index, id);
     }
 
-    /// Declares every struct in the module, each after the local structs its
-    /// fields name, so that a field may refer to a struct declared further
-    /// down the file.
-    ///
-    /// A struct whose fields lead back to itself has no finite value, since
-    /// there is no optional type to end the recursion. The field that closes
-    /// the cycle is reported and typed `Unknown`, so the declaration still
-    /// binds and its other uses are checked normally.
-    fn declare_struct_decls(&mut self) {
-        let structs: IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>> = self
-            .ast
-            .ast
-            .decls
-            .iter()
-            .filter_map(|decl| match decl {
-                Decl::Struct(s) => Some((s.name.name.as_str(), s)),
-                _ => None,
-            })
-            .collect();
-        let mut visiting = IndexSet::new();
-        let mut declared = IndexSet::new();
-        for name in structs.keys().copied().collect::<Vec<_>>() {
-            self.declare_struct_after_deps(name, &structs, &mut visiting, &mut declared);
-        }
-    }
-
-    fn declare_struct_after_deps(
-        &mut self,
-        name: &'a str,
-        structs: &IndexMap<&'a str, &'a StructDecl<Substr, ParseMetadata>>,
-        visiting: &mut IndexSet<&'a str>,
-        declared: &mut IndexSet<&'a str>,
-    ) {
-        if declared.contains(name) {
+    /// Resolves the payload types of an enum bound by [`Self::bind_enum_decl`].
+    fn define_enum_decl(&mut self, index: usize, input: &'a EnumDecl<Substr, ParseMetadata>) {
+        let Some(&id) = self.decl_adts.get(&index) else {
             return;
-        }
-        let decl = structs[name];
-        visiting.insert(name);
-        let mut recursive = IndexSet::new();
-        for (index, field) in decl.fields.iter().enumerate() {
-            for dep in ty_spec_names(&field.ty) {
-                // Anything that is not a struct of this module -- a primitive,
-                // an enum, an import, a typo -- is resolved by `ty_from_spec`.
-                if !structs.contains_key(dep) {
-                    continue;
-                }
-                if visiting.contains(dep) {
-                    recursive.insert(index);
-                } else {
-                    self.declare_struct_after_deps(dep, structs, visiting, declared);
-                }
+        };
+        let params = self.local_defs[&id].params().to_vec();
+        self.push_ty_params(&params);
+        let payloads = input
+            .variants
+            .iter()
+            .map(|variant| {
+                let payload = variant
+                    .payload
+                    .iter()
+                    .map(|spec| self.ty_from_spec(spec))
+                    .collect_vec();
+                (variant.name.name.as_str(), payload)
+            })
+            .collect_vec();
+        self.bindings.pop();
+        let all = payloads
+            .iter()
+            .flat_map(|(_, payload)| payload.iter().cloned())
+            .collect_vec();
+        let Some(AdtDef::Enum(def)) = self.local_defs.get_mut(&id) else {
+            unreachable!("bound as an enum")
+        };
+        for (name, payload) in payloads {
+            if let Some(variant) = def.variants.get_mut(name) {
+                variant.payload = payload;
             }
         }
-        visiting.swap_remove(name);
-        self.declare_struct_decl(decl, &recursive);
-        declared.insert(name);
+        self.check_unused_params(&input.params, &params, &all);
     }
 
-    /// Declares one struct. `recursive` holds the indices of the fields that
-    /// would make the type contain itself.
-    fn declare_struct_decl(
-        &mut self,
-        input: &'a StructDecl<Substr, ParseMetadata>,
-        recursive: &IndexSet<usize>,
-    ) {
+    /// Binds a struct's name; the field types are filled in by
+    /// [`Self::define_struct_decl`].
+    fn bind_struct_decl(&mut self, index: usize, input: &'a StructDecl<Substr, ParseMetadata>) {
         if BUILTINS.contains(&input.name.name.as_str()) {
             self.errors.push(StaticError {
                 span: self.span(input.name.span),
@@ -2542,20 +3298,40 @@ impl<'a> VarIdTyPass<'a> {
             });
             return;
         }
+        let params = self.declare_ty_params(&input.params);
         let id = self.alloc_id();
+        let name = self.qualified_name(&input.name.name);
+        self.local_defs.insert(
+            id,
+            AdtDef::Struct(StructDef {
+                name: name.clone(),
+                params: params.clone(),
+                fields: IndexMap::new(),
+            }),
+        );
+        let ty = Ty::Struct(Arc::new(StructTy {
+            def: id,
+            name,
+            args: params
+                .iter()
+                .map(|param| Ty::Param(param.clone()))
+                .collect(),
+        }));
+        self.bind(&input.name.name, id, ty);
+        self.decl_adts.insert(index, id);
+        self.struct_decls.insert(id, input);
+    }
+
+    /// Resolves the field types of a struct bound by [`Self::bind_struct_decl`].
+    fn define_struct_decl(&mut self, index: usize, input: &'a StructDecl<Substr, ParseMetadata>) {
+        let Some(&id) = self.decl_adts.get(&index) else {
+            return;
+        };
+        let params = self.local_defs[&id].params().to_vec();
+        self.push_ty_params(&params);
         let mut fields = IndexMap::with_capacity(input.fields.len());
-        for (index, field) in input.fields.iter().enumerate() {
-            let ty = if recursive.contains(&index) {
-                self.errors.push(StaticError {
-                    span: self.span(field.ty.span),
-                    kind: StaticErrorKind::RecursiveStruct {
-                        name: input.name.name.to_string(),
-                    },
-                });
-                Ty::Unknown
-            } else {
-                self.ty_from_spec(&field.ty)
-            };
+        for field in &input.fields {
+            let ty = self.ty_from_spec(&field.ty);
             if fields.insert(field.name.name.to_string(), ty).is_some() {
                 self.errors.push(StaticError {
                     span: self.span(field.name.span),
@@ -2563,54 +3339,207 @@ impl<'a> VarIdTyPass<'a> {
                 });
             }
         }
-        let ty = Ty::Struct(Arc::new(StructTy {
-            id,
-            name: self.qualified_name(&input.name.name),
-            fields,
-        }));
-        self.bind(&input.name.name, id, ty);
+        self.bindings.pop();
+        let all = fields.values().cloned().collect_vec();
+        let Some(AdtDef::Struct(def)) = self.local_defs.get_mut(&id) else {
+            unreachable!("bound as a struct")
+        };
+        def.fields = fields;
+        self.check_unused_params(&input.params, &params, &all);
+    }
+
+    /// Reports each struct of this module that contains itself through struct
+    /// fields and tuple elements alone; a cycle through an enum payload or a
+    /// sequence is finite.
+    fn check_recursive_structs(&mut self) {
+        for (id, decl) in self.struct_decls.clone() {
+            let Some(def) = self.adt_def(id).and_then(AdtDef::as_struct) else {
+                continue;
+            };
+            let recursive = def
+                .fields
+                .iter()
+                .find(|(_, ty)| self.reaches_struct(ty, id, &mut IndexSet::new()))
+                .map(|(name, _)| name.clone());
+            let Some(field_name) = recursive else {
+                continue;
+            };
+            let span = decl
+                .fields
+                .iter()
+                .find(|field| *field.name.name == *field_name)
+                .map_or(decl.name.span, |field| field.ty.span);
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::RecursiveStruct {
+                    name: decl.name.name.to_string(),
+                },
+            });
+        }
+    }
+
+    /// Whether a value of type `ty` must contain a value of struct `target`.
+    fn reaches_struct(&self, ty: &Ty, target: VarId, visiting: &mut IndexSet<VarId>) -> bool {
+        match ty {
+            Ty::Struct(s) if s.def == target => true,
+            Ty::Struct(s) => {
+                if !visiting.insert(s.def) {
+                    return false;
+                }
+                let Some(def) = self.adt_def(s.def).and_then(AdtDef::as_struct) else {
+                    return false;
+                };
+                let map = param_map(&def.params, &s.args);
+                let reaches = def
+                    .fields
+                    .values()
+                    .any(|field| self.reaches_struct(&subst(field, &map), target, visiting));
+                visiting.swap_remove(&s.def);
+                reaches
+            }
+            Ty::Tuple(items) => items
+                .iter()
+                .any(|item| self.reaches_struct(item, target, visiting)),
+            _ => false,
+        }
     }
 
     fn ty_from_spec<M: AstMetadata>(&mut self, spec: &TySpec<Substr, M>) -> Ty {
         match &spec.kind {
-            TySpecKind::Ident(ident) => Ty::from_name(ident.name.as_str()).unwrap_or_else(|| {
-                if let Some((_, ty)) = self.lookup(ident.name.as_str()) {
-                    ty
-                } else {
+            TySpecKind::Path { name, args } => {
+                let args = args.iter().map(|arg| self.ty_from_spec(arg)).collect_vec();
+                if let Some(ty) = Ty::from_name(name.name.as_str()) {
+                    self.check_ty_arg_arity(name.span, &ty.to_string(), 0, args.len());
+                    return ty;
+                }
+                let Some((_, ty)) = self.lookup(name.name.as_str()) else {
                     self.errors.push(StaticError {
-                        span: self.span(ident.span),
+                        span: self.span(name.span),
                         kind: StaticErrorKind::UnknownType,
                     });
-                    Ty::Unknown
+                    return Ty::Unknown;
+                };
+                let (def, ty_name) = match &ty {
+                    Ty::Struct(s) => (s.def, s.name.clone()),
+                    Ty::Enum(e) => (e.def, e.name.clone()),
+                    _ => {
+                        self.check_ty_arg_arity(name.span, &self.display(&ty), 0, args.len());
+                        return ty;
+                    }
+                };
+                let expected = self.adt_def(def).map_or(0, |def| def.params().len());
+                if !self.check_ty_arg_arity(name.span, &ty_name, expected, args.len()) {
+                    return Ty::Unknown;
                 }
-            }),
+                match ty {
+                    Ty::Struct(_) => Ty::Struct(Arc::new(StructTy {
+                        def,
+                        name: ty_name,
+                        args,
+                    })),
+                    _ => Ty::Enum(Arc::new(EnumTy {
+                        def,
+                        name: ty_name,
+                        args,
+                    })),
+                }
+            }
             TySpecKind::Seq(inner) => Ty::Seq(Box::new(self.ty_from_spec(inner))),
             // The empty tuple type `()` is the unit type, i.e. the type of the
             // `()` value (`Expr::Nil` => `Ty::Nil`). Lower it to `Ty::Nil` so the
             // two agree — otherwise `Ty::Tuple([])` would be a distinct type no
-            // value could inhabit (`is_eq_ty` never equates it with `Ty::Nil`).
+            // value could inhabit (`unify` never equates it with `Ty::Nil`).
             TySpecKind::Tuple(t) if t.is_empty() => Ty::Nil,
             TySpecKind::Tuple(t) => Ty::Tuple(t.iter().map(|x| self.ty_from_spec(x)).collect()),
         }
     }
 
+    /// Reports a type applied to the wrong number of arguments. Returns whether
+    /// the count was right.
+    fn check_ty_arg_arity(
+        &mut self,
+        span: cfgrammar::Span,
+        ty: &str,
+        expected: usize,
+        found: usize,
+    ) -> bool {
+        if expected == found {
+            return true;
+        }
+        self.errors.push(StaticError {
+            span: self.span(span),
+            kind: StaticErrorKind::TypeArgArity {
+                ty: ty.to_owned(),
+                expected,
+                found,
+            },
+        });
+        false
+    }
+
+    /// A fresh inference variable.
+    fn fresh(&mut self) -> Ty {
+        self.infer.fresh()
+    }
+
+    /// `ty` with solved variables at its top replaced by their solutions.
+    fn shallow(&self, ty: &Ty) -> Ty {
+        self.infer.shallow(ty)
+    }
+
+    /// Renders `ty` for a diagnostic, with every solved variable replaced.
+    fn display(&self, ty: &Ty) -> String {
+        self.infer.deep(ty).to_string()
+    }
+
+    /// The substitution instantiating `params`: the turbofish arguments when
+    /// given, otherwise a fresh inference variable for each parameter.
+    fn instantiate(
+        &mut self,
+        params: &[Arc<TyParamTy>],
+        explicit: Option<Vec<Ty>>,
+        span: cfgrammar::Span,
+        name: &str,
+    ) -> HashMap<VarId, Ty> {
+        if let Some(explicit) = explicit {
+            if self.check_ty_arg_arity(span, name, params.len(), explicit.len()) {
+                return param_map(params, &explicit);
+            }
+            // The arity error is the whole story; unsolved variables would
+            // only add a second report.
+            return params.iter().map(|param| (param.id, Ty::Unknown)).collect();
+        }
+        params
+            .iter()
+            .map(|param| (param.id, self.fresh()))
+            .collect()
+    }
+
     fn no_field_on_ty<M: AstMetadata>(&mut self, field: &Ident<Substr, M>, ty: Ty) -> Ty {
+        let ty = self.display(&ty);
         self.errors.push(StaticError {
             span: self.span(field.span),
             kind: StaticErrorKind::NoFieldOnTy {
                 field: field.name.to_string(),
-                ty: ty.to_string(),
+                ty,
             },
         });
         Ty::Unknown
     }
 
     fn cannot_index<M: AstMetadata>(&mut self, base: &Expr<Substr, M>, ty: Ty) -> Ty {
+        let ty = self.display(&ty);
         self.errors.push(StaticError {
             span: self.span(base.span()),
-            kind: StaticErrorKind::CannotIndex { ty: ty.to_string() },
+            kind: StaticErrorKind::CannotIndex { ty },
         });
         Ty::Unknown
+    }
+
+    /// Whether `ty`, resolved, is a number, an inference variable that may
+    /// still become one, or a wildcard.
+    fn is_numeric(ty: &Ty) -> bool {
+        matches!(ty, Ty::Float | Ty::Int | Ty::Infer(_)) || ty.is_wildcard()
     }
 
     fn check_arith(
@@ -2619,27 +3548,37 @@ impl<'a> VarIdTyPass<'a> {
         left: &Expr<Substr, VarIdTyMetadata>,
         right: &Expr<Substr, VarIdTyMetadata>,
     ) -> Ty {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+        if !self.unify(&left.ty(), &right.ty()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::ArithMismatchedTypes,
             });
         }
-        if !(matches!(left_ty, Ty::Float | Ty::Int) || left_ty.is_wildcard()) {
+        let left_ty = self.shallow(&left.ty());
+        let right_ty = self.shallow(&right.ty());
+        if !Self::is_numeric(&left_ty) {
             self.errors.push(StaticError {
                 span: self.span(left.span()),
-                kind: StaticErrorKind::ArithInvalidType(left_ty.to_string()),
+                kind: StaticErrorKind::ArithInvalidType(self.display(&left_ty)),
             });
         }
-        if !(matches!(right_ty, Ty::Float | Ty::Int) || right_ty.is_wildcard()) {
+        if !Self::is_numeric(&right_ty) {
             self.errors.push(StaticError {
                 span: self.span(right.span()),
-                kind: StaticErrorKind::ArithInvalidType(right_ty.to_string()),
+                kind: StaticErrorKind::ArithInvalidType(self.display(&right_ty)),
             });
         }
         left_ty
+    }
+
+    /// Requires `operand` to be a `Bool`, solving an inference variable to it.
+    fn check_bool_operand(&mut self, operand: &Expr<Substr, VarIdTyMetadata>) {
+        if !self.unify(&operand.ty(), &Ty::Bool) {
+            self.errors.push(StaticError {
+                span: self.span(operand.span()),
+                kind: StaticErrorKind::BoolOpInvalidType,
+            });
+        }
     }
 
     fn check_bool_expr(
@@ -2647,15 +3586,36 @@ impl<'a> VarIdTyPass<'a> {
         left: &Expr<Substr, VarIdTyMetadata>,
         right: &Expr<Substr, VarIdTyMetadata>,
     ) -> Ty {
-        for operand in [left, right] {
-            if !VarIdTyPass::is_bool_operand(&operand.ty()) {
-                self.errors.push(StaticError {
-                    span: self.span(operand.span()),
-                    kind: StaticErrorKind::BoolOpInvalidType,
-                });
+        self.check_bool_operand(left);
+        self.check_bool_operand(right);
+        Ty::Bool
+    }
+
+    /// Whether every value of enum `enum_ty` can be compared for equality:
+    /// every payload type of every variant admits equality.
+    fn enum_equality(
+        &self,
+        enum_ty: &EnumTy,
+        visiting: &mut IndexSet<VarId>,
+    ) -> Result<(), EqualityFailure> {
+        if !visiting.insert(enum_ty.def) {
+            return Ok(());
+        }
+        let Some(def) = self.adt_def(enum_ty.def).and_then(AdtDef::as_enum) else {
+            return Ok(());
+        };
+        let map = param_map(&def.params, &enum_ty.args);
+        for variant in def.variants.values() {
+            for payload in &variant.payload {
+                match self.shallow(&subst(payload, &map)) {
+                    Ty::Int | Ty::Bool | Ty::Nil | Ty::Unknown | Ty::Any | Ty::Infer(_) => {}
+                    Ty::Float => return Err(EqualityFailure::Float),
+                    Ty::Enum(inner) => self.enum_equality(&inner, visiting)?,
+                    _ => return Err(EqualityFailure::Other),
+                }
             }
         }
-        Ty::Bool
+        Ok(())
     }
 
     fn check_comparison(
@@ -2665,48 +3625,53 @@ impl<'a> VarIdTyPass<'a> {
         left: &Expr<Substr, VarIdTyMetadata>,
         right: &Expr<Substr, VarIdTyMetadata>,
     ) -> Ty {
-        let left_ty = left.ty();
-        let right_ty = right.ty();
+        let is_equality = op == ComparisonOp::Eq || op == ComparisonOp::Ne;
         // A mismatch here is already reported as `ComparisonMismatchedTypes`
-        // below, so an absent LUB only needs to not be `Ty::Seq`.
-        let lub_ty = left_ty.lub(&right_ty).unwrap_or(Ty::Unknown);
-        if !VarIdTyPass::is_eq_ty(&left_ty, &right_ty) {
+        // below, so an absent join only needs to not be `Ty::Seq`.
+        let join_ty = self.join(&left.ty(), &right.ty()).unwrap_or(Ty::Unknown);
+        if !self.unify(&left.ty(), &right.ty()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::ComparisonMismatchedTypes,
             });
         }
-        if left_ty == Ty::Float && (op == ComparisonOp::Eq || op == ComparisonOp::Ne) {
+        let left_ty = self.shallow(&left.ty());
+        let right_ty = self.shallow(&right.ty());
+        if left_ty == Ty::Float && is_equality {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::FloatEquality,
             });
         }
-        if matches!(left_ty, Ty::Enum(_)) && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
-            self.errors.push(StaticError {
-                span: self.span(span),
-                kind: StaticErrorKind::EnumsNotOrd,
-            });
+        if let Ty::Enum(enum_ty) = &left_ty {
+            if !is_equality {
+                self.errors.push(StaticError {
+                    span: self.span(span),
+                    kind: StaticErrorKind::EnumsNotOrd,
+                });
+            } else if let Err(failure) = self.enum_equality(enum_ty, &mut IndexSet::new()) {
+                self.errors.push(StaticError {
+                    span: self.span(span),
+                    kind: match failure {
+                        EqualityFailure::Float => StaticErrorKind::FloatEquality,
+                        EqualityFailure::Other => StaticErrorKind::ComparisonInvalidType,
+                    },
+                });
+            }
         }
-        if left_ty == Ty::Bool && (op != ComparisonOp::Eq && op != ComparisonOp::Ne) {
+        if left_ty == Ty::Bool && !is_equality {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::BoolNotOrd,
             });
         }
-        if matches!(left_ty, Ty::Nil)
-            && matches!(right_ty, Ty::Nil)
-            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
-        {
+        if matches!(left_ty, Ty::Nil) && matches!(right_ty, Ty::Nil) && !is_equality {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::NilNotOrd,
             });
         }
-        if matches!(left_ty, Ty::SeqNil)
-            && matches!(right_ty, Ty::SeqNil)
-            && (op != ComparisonOp::Eq && op != ComparisonOp::Ne)
-        {
+        if matches!(left_ty, Ty::SeqNil) && matches!(right_ty, Ty::SeqNil) && !is_equality {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::SeqNilNotOrd,
@@ -2715,9 +3680,8 @@ impl<'a> VarIdTyPass<'a> {
         // A sequence may only be compared for equality/inequality against `[]`:
         // the evaluator has no arm for two populated sequences, and none for
         // ordering a sequence at all.
-        if matches!(lub_ty, Ty::Seq(_))
-            && !((op == ComparisonOp::Eq || op == ComparisonOp::Ne)
-                && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
+        if matches!(self.shallow(&join_ty), Ty::Seq(_))
+            && !(is_equality && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
         {
             self.errors.push(StaticError {
                 span: self.span(span),
@@ -2727,7 +3691,8 @@ impl<'a> VarIdTyPass<'a> {
         // `Ty::Any` is deliberately *not* admitted here: the evaluator has no
         // comparison arm for a string, so `1. < any` has to be rejected
         // statically. `Ty::Unknown` is admitted, because the expression that
-        // produced it was already diagnosed.
+        // produced it was already diagnosed, and so is an unsolved inference
+        // variable, which is reported if it stays unsolved.
         for (operand, ty) in [(left, &left_ty), (right, &right_ty)] {
             if !matches!(
                 ty,
@@ -2739,6 +3704,7 @@ impl<'a> VarIdTyPass<'a> {
                     | Ty::Nil
                     | Ty::SeqNil
                     | Ty::Unknown
+                    | Ty::Infer(_)
             ) {
                 self.errors.push(StaticError {
                     span: self.span(operand.span()),
@@ -2750,62 +3716,88 @@ impl<'a> VarIdTyPass<'a> {
         Ty::Bool
     }
 
-    /// Whether `ty` may be an operand of `&&`, `||`, or `!`.
-    fn is_bool_operand(ty: &Ty) -> bool {
-        matches!(ty, Ty::Bool | Ty::Any | Ty::Unknown)
+    /// Makes `a` and `b` the same type, solving inference variables as needed.
+    /// A wildcard (`Any` or `Unknown`) equals every type and solves the
+    /// variables on the other side to itself; `[]` belongs to every sequence
+    /// type.
+    fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
+        let a = self.shallow(a);
+        let b = self.shallow(b);
+        match (&a, &b) {
+            (Ty::Infer(x), Ty::Infer(y)) if x == y => true,
+            (Ty::Infer(var), other) | (other, Ty::Infer(var)) => {
+                if self.infer.occurs(*var, other) {
+                    return false;
+                }
+                self.infer.solutions[*var as usize] = Some(other.clone());
+                true
+            }
+            _ if a.is_wildcard() => {
+                self.infer.solve_unsolved(&b, &a);
+                true
+            }
+            _ if b.is_wildcard() => {
+                self.infer.solve_unsolved(&a, &b);
+                true
+            }
+            (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil) => true,
+            (Ty::Seq(a), Ty::Seq(b)) => self.unify(a, b),
+            (Ty::Tuple(a), Ty::Tuple(b)) => self.unify_all(a, b),
+            (Ty::Struct(a), Ty::Struct(b)) => a.def == b.def && self.unify_all(&a.args, &b.args),
+            (Ty::Enum(a), Ty::Enum(b)) => a.def == b.def && self.unify_all(&a.args, &b.args),
+            (Ty::Ctor(a), Ty::Ctor(b)) => {
+                a.def == b.def && a.variant == b.variant && self.unify_all(&a.args, &b.args)
+            }
+            (Ty::Param(a), Ty::Param(b)) => a.id == b.id,
+            (Ty::Cell(a), Ty::Cell(b)) | (Ty::Inst(a), Ty::Inst(b)) => {
+                a.def == b.def
+                    && a.dynamic_fields == b.dynamic_fields
+                    && self.unify_all(&a.args, &b.args)
+            }
+            _ => a == b,
+        }
     }
 
-    fn is_eq_ty(a: &Ty, b: &Ty) -> bool {
-        if a.is_wildcard() || b.is_wildcard() {
-            return true;
-        }
+    /// Unifies two lists pairwise; lists of different lengths never unify.
+    fn unify_all(&mut self, a: &[Ty], b: &[Ty]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| self.unify(a, b))
+    }
 
-        // An empty sequence belongs to every sequence type, as `Ty::lub` and the
-        // `cons` tail check already assume. The runtime check in
-        // `CellArg::matches_ty` still enforces emptiness where `[]` is declared.
-        if matches!((a, b), (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil)) {
-            return true;
+    /// The common type of two branches, or `None` when they have none.
+    ///
+    /// A wildcard absorbs the other branch, and `[]` widens to the other
+    /// branch's sequence type; otherwise the two are unified.
+    fn join(&mut self, a: &Ty, b: &Ty) -> Option<Ty> {
+        let a = self.shallow(a);
+        let b = self.shallow(b);
+        match (&a, &b) {
+            (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
+            (Ty::Any, _) | (_, Ty::Any) => Some(Ty::Any),
+            (Ty::SeqNil, Ty::Seq(_)) => Some(b),
+            (Ty::Seq(_), Ty::SeqNil) => Some(a),
+            _ => self.unify(&a, &b).then(|| self.shallow(&a)),
         }
-
-        if let Ty::Seq(a) = a
-            && let Ty::Seq(b) = b
-        {
-            return VarIdTyPass::is_eq_ty(a, b);
-        }
-
-        if let Ty::Tuple(a) = a
-            && let Ty::Tuple(b) = b
-        {
-            if a.len() != b.len() {
-                return false;
-            }
-            return a
-                .iter()
-                .zip(b.iter())
-                .all(|(a, b)| VarIdTyPass::is_eq_ty(a, b));
-        }
-
-        *a == *b
     }
 
     fn assert_eq_ty(&mut self, span: cfgrammar::Span, found: &Ty, expected: &Ty) {
-        if !VarIdTyPass::is_eq_ty(found, expected) {
+        if !self.unify(found, expected) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTy {
-                    found: found.to_string(),
-                    expected: expected.to_string(),
+                    found: self.display(found),
+                    expected: self.display(expected),
                 },
             });
         }
     }
 
     fn assert_ty_is_cell(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !(matches!(ty, Ty::Cell(_)) || ty.is_wildcard()) {
+        let ty = self.shallow(ty);
+        if !(matches!(ty, Ty::Cell(_) | Ty::Infer(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.to_string(),
+                    found: self.display(&ty),
                     expected: "Cell".into(),
                 },
             });
@@ -2813,11 +3805,12 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
-        if !(matches!(ty, Ty::Enum(_)) || ty.is_wildcard()) {
+        let ty = self.shallow(ty);
+        if !(matches!(ty, Ty::Enum(_) | Ty::Infer(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
-                    found: ty.to_string(),
+                    found: self.display(&ty),
                     expected: "Enum".into(),
                 },
             });
@@ -2882,6 +3875,19 @@ impl<'a> VarIdTyPass<'a> {
         self.typecheck_kwargs(&args.kwargs, &sig.kwargs);
     }
 
+    /// Checks a call of a builtin with a polymorphic signature.
+    fn call_scheme(
+        &mut self,
+        scheme: &FnTy,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> (Option<VarId>, Ty) {
+        let map = self.instantiate(&scheme.params, None, call_span, "");
+        let sig = scheme.sig.subst(&map);
+        self.typecheck_args(call_span, args, &sig);
+        (None, subst(&scheme.ret, &map))
+    }
+
     /// Rejects repeated parameter names and positional parameters declared
     /// after keyword parameters.
     fn check_params<M: AstMetadata>(&mut self, args: &[ArgDecl<Substr, M>]) {
@@ -2907,6 +3913,62 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Checks a call of the tuple variant `ctor`, which builds a value of its
+    /// enum.
+    fn typecheck_ctor_call(
+        &mut self,
+        varid: VarId,
+        ctor: &CtorTy,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+        explicit: Option<Vec<Ty>>,
+    ) -> (Option<VarId>, Ty) {
+        let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+            return (None, Ty::Unknown);
+        };
+        let Some(variant) = def.variants.get(&ctor.variant) else {
+            return (None, Ty::Unknown);
+        };
+        if variant.payload.is_empty() {
+            self.errors.push(StaticError {
+                span: self.span(call_span),
+                kind: StaticErrorKind::CannotCall(format!("{}::{}", ctor.enum_name, ctor.variant)),
+            });
+            return (None, Ty::Unknown);
+        }
+        let explicit = explicit.or_else(|| (!ctor.args.is_empty()).then(|| ctor.args.clone()));
+        let map = self.instantiate(&def.params, explicit, call_span, &ctor.enum_name);
+        for kwarg in &args.kwargs {
+            self.errors.push(StaticError {
+                span: self.span(kwarg.name.span),
+                kind: StaticErrorKind::InvalidKwArg,
+            });
+        }
+        if args.posargs.len() != variant.payload.len() {
+            self.errors.push(StaticError {
+                span: self.span(call_span),
+                kind: StaticErrorKind::VariantPayloadArity {
+                    variant: ctor.variant.clone(),
+                    expected: variant.payload.len(),
+                    found: args.posargs.len(),
+                },
+            });
+        }
+        for (arg, payload) in args.posargs.iter().zip(&variant.payload) {
+            self.assert_eq_ty(arg.span(), &arg.ty(), &subst(payload, &map));
+        }
+        let ty = Ty::Enum(Arc::new(EnumTy {
+            def: ctor.def,
+            name: ctor.enum_name.clone(),
+            args: def
+                .params
+                .iter()
+                .map(|param| map[&param.id].clone())
+                .collect(),
+        }));
+        (Some(varid), ty)
+    }
+
     fn typecheck_call(
         &mut self,
         name: &str,
@@ -2914,21 +3976,25 @@ impl<'a> VarIdTyPass<'a> {
         call_span: cfgrammar::Span,
         args: &crate::ast::Args<Substr, VarIdTyMetadata>,
         is_local: bool,
+        explicit: Option<Vec<Ty>>,
     ) -> (Option<VarId>, Ty) {
         if let Some((varid, ty)) = lookup {
             match ty {
                 Ty::Fn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.sig);
-                    (Some(varid), ty.ret.clone())
+                    let map = self.instantiate(&ty.params, explicit, call_span, name);
+                    self.typecheck_args(call_span, args, &ty.sig.subst(&map));
+                    (Some(varid), subst(&ty.ret, &map))
                 }
                 Ty::CellFn(ty) => {
-                    self.typecheck_args(call_span, args, &ty.sig);
-                    (Some(varid), Ty::Cell(ty.cell.clone()))
+                    let map = self.instantiate(&ty.params, explicit, call_span, name);
+                    self.typecheck_args(call_span, args, &ty.sig.subst(&map));
+                    (Some(varid), Ty::Cell(Arc::new(ty.cell.subst(&map))))
                 }
+                Ty::Ctor(ctor) => self.typecheck_ctor_call(varid, &ctor, call_span, args, explicit),
                 ty => {
                     self.errors.push(StaticError {
                         span: self.span(call_span),
-                        kind: StaticErrorKind::CannotCall(ty.to_string()),
+                        kind: StaticErrorKind::CannotCall(self.display(&ty)),
                     });
                     (None, Ty::Unknown)
                 }
@@ -2948,13 +4014,66 @@ impl<'a> VarIdTyPass<'a> {
     }
 }
 
-/// The identifiers a type annotation is built from: `[(A, B)]` names `A` and
-/// `B`.
-fn ty_spec_names<M: AstMetadata>(spec: &TySpec<Substr, M>) -> Vec<&str> {
-    match &spec.kind {
-        TySpecKind::Ident(ident) => vec![ident.name.as_str()],
-        TySpecKind::Seq(inner) => ty_spec_names(inner),
-        TySpecKind::Tuple(items) => items.iter().flat_map(ty_spec_names).collect(),
+/// Why a path of two or more segments did not resolve.
+enum QualifiedError {
+    /// The enum named by the second-to-last segment has no such variant.
+    InvalidVariant {
+        span: cfgrammar::Span,
+        variant: String,
+    },
+    /// The module exists but has no such item.
+    Undeclared { name: String },
+    /// The second-to-last segment names neither an enum nor a module.
+    NotAnEnum { span: cfgrammar::Span },
+}
+
+/// Why an enum type cannot be compared for equality.
+enum EqualityFailure {
+    /// A payload is a `Float`.
+    Float,
+    /// A payload is some other type without equality.
+    Other,
+}
+
+/// Whether `ty` mentions the type parameter `id`.
+fn mentions_param(ty: &Ty, id: VarId) -> bool {
+    match ty {
+        Ty::Param(param) => param.id == id,
+        Ty::Seq(inner) => mentions_param(inner, id),
+        Ty::Tuple(items) => items.iter().any(|item| mentions_param(item, id)),
+        Ty::Struct(s) => s.args.iter().any(|arg| mentions_param(arg, id)),
+        Ty::Enum(e) => e.args.iter().any(|arg| mentions_param(arg, id)),
+        Ty::Ctor(c) => c.args.iter().any(|arg| mentions_param(arg, id)),
+        Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| mentions_param(arg, id)),
+        Ty::Fn(f) => {
+            f.sig
+                .args
+                .iter()
+                .chain(f.sig.kwargs.values())
+                .any(|arg| mentions_param(arg, id))
+                || mentions_param(&f.ret, id)
+        }
+        Ty::CellFn(f) => {
+            f.sig
+                .args
+                .iter()
+                .chain(f.sig.kwargs.values())
+                .any(|arg| mentions_param(arg, id))
+                || f.cell.args.iter().any(|arg| mentions_param(arg, id))
+        }
+        Ty::Unknown
+        | Ty::Any
+        | Ty::Bool
+        | Ty::Float
+        | Ty::Int
+        | Ty::Rect
+        | Ty::Polygon
+        | Ty::Path
+        | Ty::Point
+        | Ty::String
+        | Ty::Nil
+        | Ty::SeqNil
+        | Ty::Infer(_) => false,
     }
 }
 
@@ -3003,13 +4122,13 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &IdentPath<Self::InputS, Self::InputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IdentPath {
-        // Currently, ident path exprs are either single variables or enum values.
         // Parser grammar ensures paths cannot be empty.
         assert!(!input.path.is_empty());
+        let explicit = self.explicit_args(input);
         if input.path.len() == 1 {
             let name = &input.path[0].name;
             if let Some((varid, ty)) = self.lookup(name) {
-                (Some(varid), ty)
+                (Some(varid), self.value_ty(ty, explicit, input.span))
             } else if self.demand_local(name, input.span) {
                 (None, Ty::Unknown)
             } else {
@@ -3022,47 +4141,54 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 (None, Ty::Unknown)
             }
         } else {
-            // look up enum
-            let path = module_prefix(
-                self.current_path,
-                input.path.iter().map(|ident| ident.name.as_str()),
-                2,
-            );
-            let enum_ = &input.path[input.path.len() - 2];
-            let lookup = if path.is_empty() || &path == self.current_path {
-                self.lookup(&enum_.name)
-            } else {
-                self.mod_bindings
-                    .get(&path)
-                    .as_ref()
-                    .and_then(|mod_binding| {
-                        mod_binding.var_bindings.get(enum_.name.as_str()).cloned()
-                    })
-            };
-            if let Some((_, ty)) = lookup {
-                if let Ty::Enum(ref e) = ty {
-                    let variant = &input.path.last().unwrap().name;
-                    if !e.variants.contains(variant.as_str()) {
-                        self.errors.push(StaticError {
-                            span: self.span(enum_.span),
-                            kind: StaticErrorKind::InvalidVariant(variant.to_string()),
-                        });
-                    }
-                    (None, ty)
-                } else {
-                    self.errors.push(StaticError {
-                        span: self.span(enum_.span),
-                        kind: StaticErrorKind::NotAnEnum,
-                    });
+            match self.resolve_qualified(&input.path) {
+                Ok((varid, ty)) => (Some(varid), self.value_ty(ty, explicit, input.span)),
+                Err(error) => {
+                    self.report_qualified_error(error, input.span);
                     (None, Ty::Unknown)
                 }
-            } else {
-                self.errors.push(StaticError {
-                    span: self.span(enum_.span),
-                    kind: StaticErrorKind::NotAnEnum,
-                });
-                (None, Ty::Unknown)
             }
+        }
+    }
+
+    fn transform_enum_decl(
+        &mut self,
+        input: &EnumDecl<Substr, Self::InputMetadata>,
+    ) -> EnumDecl<Substr, Self::OutputMetadata> {
+        // `bind_enum_decl` allocated every variant's id; the annotated
+        // variants carry those ids rather than resolving anything again.
+        let def = match self.lookup(&input.name.name) {
+            Some((_, Ty::Enum(enum_ty))) => {
+                self.adt_def(enum_ty.def).and_then(AdtDef::as_enum).cloned()
+            }
+            _ => None,
+        };
+        let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
+        let variants = input
+            .variants
+            .iter()
+            .map(|variant| EnumVariant {
+                name: self.transform_ident(&variant.name),
+                payload: variant
+                    .payload
+                    .iter()
+                    .map(|spec| self.transform_ty_spec(spec))
+                    .collect(),
+                span: variant.span,
+                metadata: def
+                    .as_ref()
+                    .and_then(|def| def.variants.get(variant.name.name.as_str()))
+                    .map(|variant| variant.id),
+            })
+            .collect_vec();
+        let metadata = self.dispatch_enum_decl(input, &name, &variants);
+        EnumDecl {
+            name,
+            params,
+            variants,
+            span: input.span,
+            metadata,
         }
     }
 
@@ -3070,38 +4196,61 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         _input: &crate::ast::EnumDecl<Substr, Self::InputMetadata>,
         name: &Ident<Substr, Self::OutputMetadata>,
-        _variants: &[Ident<Substr, Self::OutputMetadata>],
+        _variants: &[EnumVariant<Substr, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
-        // `declare_enum_decl` hoisted this binding before any body was walked,
+        // `bind_enum_decl` hoisted this binding before any body was walked,
         // so it normally resolves. A name that collided with a builtin was
         // rejected there and never bound, and there is no id to report: a
         // shared placeholder would make every such enum in the workspace look
         // like the same declaration.
         match self.lookup(&name.name) {
-            Some((var_id, Ty::Enum(enum_ty))) => Some((var_id, enum_ty.id)),
+            Some((var_id, Ty::Enum(_))) => Some(var_id),
             _ => None,
         }
+    }
+
+    fn dispatch_enum_variant(
+        &mut self,
+        _input: &EnumVariant<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+        _payload: &[TySpec<Substr, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
+        // `transform_enum_decl` builds the variants itself.
+        unreachable!()
+    }
+
+    fn dispatch_pattern_binding(
+        &mut self,
+        _input: &Pattern<Substr, Self::InputMetadata>,
+        _name: &Ident<Substr, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::PatternBinding {
+        // `transform_match_expr` types patterns itself.
+        unreachable!()
     }
 
     fn transform_struct_decl(
         &mut self,
         input: &StructDecl<Substr, Self::InputMetadata>,
     ) -> StructDecl<Substr, Self::OutputMetadata> {
-        // `declare_struct_decls` already resolved every field type; the
+        // `define_struct_decl` already resolved every field type; the
         // annotated fields carry those types rather than resolving the specs a
         // second time, which would report each error twice.
-        let struct_ty = match self.lookup(&input.name.name) {
-            Some((_, Ty::Struct(struct_ty))) => Some(struct_ty),
+        let def = match self.lookup(&input.name.name) {
+            Some((_, Ty::Struct(struct_ty))) => self
+                .adt_def(struct_ty.def)
+                .and_then(AdtDef::as_struct)
+                .cloned(),
             _ => None,
         };
         let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
         let fields = input
             .fields
             .iter()
             .map(|field| {
-                let ty = struct_ty
+                let ty = def
                     .as_ref()
-                    .and_then(|struct_ty| struct_ty.fields.get(field.name.name.as_str()))
+                    .and_then(|def| def.fields.get(field.name.name.as_str()))
                     .cloned()
                     .unwrap_or_default();
                 StructField {
@@ -3115,6 +4264,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let metadata = self.dispatch_struct_decl(input, &name, &fields);
         StructDecl {
             name,
+            params,
             fields,
             span: input.span,
             metadata,
@@ -3170,13 +4320,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 path.path.iter().map(|ident| ident.name.as_str()),
                 1,
             );
-            if &module == self.current_path {
-                self.lookup(name)
-            } else {
-                self.mod_bindings
-                    .get(&module)
-                    .and_then(|frame| frame.var_bindings.get(name.as_str()).cloned())
-            }
+            self.module_item(&module, name)
         };
         let Some((_, ty)) = lookup else {
             self.errors.push(StaticError {
@@ -3197,12 +4341,29 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
             return Ty::Unknown;
         };
-        let ty = Ty::Struct(struct_ty.clone());
+        let Some(def) = self
+            .adt_def(struct_ty.def)
+            .and_then(AdtDef::as_struct)
+            .cloned()
+        else {
+            return Ty::Unknown;
+        };
+        let explicit = self.explicit_args(path);
+        let map = self.instantiate(&def.params, explicit, path.span, &struct_ty.name);
+        let ty = Ty::Struct(Arc::new(StructTy {
+            def: struct_ty.def,
+            name: struct_ty.name.clone(),
+            args: def
+                .params
+                .iter()
+                .map(|param| map[&param.id].clone())
+                .collect(),
+        }));
 
         let mut seen = IndexSet::new();
         for field in fields {
             let field_name = field.name.name.as_str();
-            let Some(expected) = struct_ty.fields.get(field_name) else {
+            let Some(expected) = def.fields.get(field_name) else {
                 self.no_field_on_ty(&field.name, ty.clone());
                 continue;
             };
@@ -3215,7 +4376,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
                 continue;
             }
-            self.assert_eq_ty(field.value.span(), &field.value.ty(), expected);
+            self.assert_eq_ty(
+                field.value.span(),
+                &field.value.ty(),
+                &subst(expected, &map),
+            );
         }
 
         match base {
@@ -3223,7 +4388,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             // to be this very struct.
             Some(base) => self.assert_eq_ty(base.span(), &base.ty(), &ty),
             None => {
-                let missing = struct_ty
+                let missing = def
                     .fields
                     .keys()
                     .filter(|name| !seen.contains(name.as_str()))
@@ -3233,7 +4398,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.errors.push(StaticError {
                         span: self.span(input.span),
                         kind: StaticErrorKind::MissingStructFields {
-                            ty: ty.to_string(),
+                            ty: self.display(&ty),
                             fields: missing.join(", "),
                         },
                     });
@@ -3281,7 +4446,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &FnDecl<Substr, Self::InputMetadata>,
     ) -> FnDecl<Substr, Self::OutputMetadata> {
+        // The type parameters bound for the signature are bound again for the
+        // body, from the stored type so their ids are stable across retries.
+        let ty_params = match self.lookup(&input.name.name) {
+            Some((_, Ty::Fn(fn_ty))) => fn_ty.params.clone(),
+            _ => Vec::new(),
+        };
+        self.push_ty_params(&ty_params);
         let name = self.transform_ident(&input.name);
+        let params = self.transform_ty_params(&input.params);
         let return_ty = input
             .return_ty
             .as_ref()
@@ -3295,8 +4468,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let scope = self.transform_scope_contents(&input.scope);
         self.exit_scope(&input.scope, &scope);
         let metadata = self.dispatch_fn_decl(input, &name, &args, &return_ty, &scope);
+        self.bindings.pop();
         FnDecl {
             name,
+            params,
             args,
             return_ty,
             scope,
@@ -3316,6 +4491,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 .iter()
                 .map(|ident| self.transform_ident(ident))
                 .collect(),
+            generic_args: input
+                .func
+                .generic_args
+                .as_ref()
+                .map(|args| self.transform_generic_args(args)),
             metadata: (None, Ty::Unknown),
             span: input.func.span,
         };
@@ -3346,27 +4526,61 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         then: &Scope<Substr, Self::OutputMetadata>,
         else_: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
-        let cond_ty = cond.ty();
-        let then_ty = then.metadata.clone();
-        let else_ty = else_.metadata.clone();
+        let cond_ty = self.shallow(&cond.ty());
         // `Unknown` marks an expression that was already diagnosed, so it must
         // not produce a second `if conditions must have type bool`. `Any` is
         // still rejected: the evaluator has no fallback for a non-bool
-        // condition.
-        if cond_ty != Ty::Bool && !matches!(cond_ty, Ty::Unknown) {
+        // condition. An inference variable is solved to `Bool`.
+        let is_bool = match cond_ty {
+            Ty::Infer(_) => self.unify(&cond_ty, &Ty::Bool),
+            Ty::Unknown | Ty::Bool => true,
+            _ => false,
+        };
+        if !is_bool {
             self.errors.push(StaticError {
                 span: self.span(cond.span()),
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
-        let Some(lub_ty) = then_ty.lub(&else_ty) else {
+        let Some(ty) = self.join(&then.metadata, &else_.metadata) else {
             self.errors.push(StaticError {
                 span: self.span(input.span),
                 kind: StaticErrorKind::BranchesDifferentTypes,
             });
             return Ty::Unknown;
         };
-        lub_ty
+        ty
+    }
+
+    fn transform_match_expr(
+        &mut self,
+        input: &MatchExpr<Self::InputS, Self::InputMetadata>,
+    ) -> MatchExpr<Self::OutputS, Self::OutputMetadata> {
+        let scrutinee = self.transform_expr(&input.scrutinee);
+        let scrutinee_ty = self.shallow(&scrutinee.ty());
+        let arms = input
+            .arms
+            .iter()
+            .map(|arm| {
+                // A pattern's bindings are in scope for its arm alone.
+                self.bindings.push(VarIdTyFrame::default());
+                let pattern = self.type_pattern(&arm.pattern, &scrutinee_ty);
+                let expr = self.transform_expr(&arm.expr);
+                self.bindings.pop();
+                MatchArm {
+                    pattern,
+                    expr,
+                    span: arm.span,
+                }
+            })
+            .collect_vec();
+        let metadata = self.dispatch_match_expr(input, &scrutinee, &arms);
+        MatchExpr {
+            scrutinee,
+            arms,
+            span: input.span,
+            metadata,
+        }
     }
 
     fn dispatch_match_expr(
@@ -3375,19 +4589,24 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         scrutinee: &Expr<Self::OutputS, Self::OutputMetadata>,
         arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
-        let scrutinee_ty = scrutinee.ty();
+        let scrutinee_ty = self.shallow(&scrutinee.ty());
         self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
-        let mut lub_ty: Option<Ty> = None;
 
         // The scrutinee type is only known statically when it is a declared
-        // enum. `Any` is the common case in practice, because cell and instance
-        // types cannot be named, so arms must be checked against the enum the
+        // enum. `Any` is common in practice, because cell and instance types
+        // cannot be named, so arms are then checked against the enum the
         // *patterns* name instead. The evaluator has no fallback for an arm set
         // that does not cover the runtime variant, so the checks below are what
-        // keep it from reaching a `find(..).unwrap()`.
+        // keep it from reaching an unmatched value.
+        fn variant_ty(arm: &MatchArm<Substr, VarIdTyMetadata>) -> Option<&Ty> {
+            match &arm.pattern {
+                Pattern::Variant { path, .. } => Some(&path.metadata.1),
+                _ => None,
+            }
+        }
         let pattern_ty = arms
             .iter()
-            .map(|arm| &arm.pattern.metadata.1)
+            .filter_map(variant_ty)
             .find(|ty| matches!(ty, Ty::Enum(_)))
             .cloned();
         let expected_ty = match scrutinee_ty {
@@ -3396,16 +4615,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         };
 
         // Neither the scrutinee nor any arm pattern names an enum, so there is
-        // nothing to check the arms against. Falling through to
-        // `Ty::Unknown` silently was harmless only while `is_eq_ty` compared
-        // `Unknown` structurally; it now satisfies every downstream check, so
-        // an unsayable match type has to be reported here or `--check`
-        // accepts a program the evaluator refuses.
-        if expected_ty.is_none() {
+        // nothing to check the arms against: an unsayable match type has to be
+        // reported here or `--check` accepts a program the evaluator refuses.
+        let Some(expected_ty) = expected_ty else {
             let already_diagnosed = matches!(scrutinee_ty, Ty::Unknown)
                 || arms
                     .iter()
-                    .any(|arm| matches!(arm.pattern.metadata.1, Ty::Unknown));
+                    .filter_map(variant_ty)
+                    .any(|ty| matches!(ty, Ty::Unknown));
             if !already_diagnosed {
                 self.errors.push(StaticError {
                     span: self.span(scrutinee.span()),
@@ -3413,50 +4630,67 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
             }
             return Ty::Unknown;
-        }
-
-        if let Some(Ty::Enum(ref e)) = expected_ty {
-            let mut covered = IndexSet::new();
-            let mut remaining = e.variants.clone();
-            for arm in arms.iter() {
-                let arm_ty = &arm.pattern.metadata.1;
-                // All arms must belong to the same enum, whether or not the
-                // scrutinee's own type pinned that enum down.
-                self.assert_eq_ty(arm.pattern.span, arm_ty, expected_ty.as_ref().unwrap());
-
-                let variant = arm.pattern.path.last().unwrap().name.clone();
-                remaining.swap_remove(variant.as_str());
-                if !covered.insert(variant) {
-                    self.errors.push(StaticError {
-                        span: self.span(arm.pattern.span),
-                        kind: StaticErrorKind::DuplicateMatchArm,
-                    });
-                }
-
-                lub_ty = match lub_ty {
-                    Some(inner) => match inner.lub(&arm.expr.ty()) {
-                        Some(lub) => Some(lub),
-                        None => {
-                            self.errors.push(StaticError {
-                                span: self.span(arm.expr.span()),
-                                kind: StaticErrorKind::BranchesDifferentTypes,
-                            });
-                            return Ty::Unknown;
-                        }
-                    },
-                    None => Some(arm.expr.ty()),
-                };
-            }
-
-            if !remaining.is_empty() {
+        };
+        // An `Any` scrutinee leaves the patterns' type arguments unsolved; an
+        // inference variable scrutinee is solved to the patterns' enum.
+        self.unify(&scrutinee_ty, &expected_ty);
+        let Ty::Enum(enum_ty) = &expected_ty else {
+            unreachable!("expected type is an enum")
+        };
+        let mut remaining = self
+            .adt_def(enum_ty.def)
+            .and_then(AdtDef::as_enum)
+            .map(|def| def.variants.keys().cloned().collect::<IndexSet<_>>())
+            .unwrap_or_default();
+        let mut covered = IndexSet::new();
+        let mut result: Option<Ty> = None;
+        for arm in arms {
+            if remaining.is_empty() {
                 self.errors.push(StaticError {
-                    span: self.span(input.span),
-                    kind: StaticErrorKind::MatchArmsNotComprehensive,
+                    span: self.span(arm.pattern.span()),
+                    kind: StaticErrorKind::UnreachableMatchArm,
                 });
+            } else {
+                match &arm.pattern {
+                    Pattern::Variant { path, .. } => {
+                        // All arms must belong to the same enum, whether or not
+                        // the scrutinee's own type pinned that enum down.
+                        self.assert_eq_ty(arm.pattern.span(), &path.metadata.1, &expected_ty);
+                        let variant = path.path.last().expect("paths are non-empty").name.clone();
+                        remaining.swap_remove(variant.as_str());
+                        if !covered.insert(variant) {
+                            self.errors.push(StaticError {
+                                span: self.span(arm.pattern.span()),
+                                kind: StaticErrorKind::DuplicateMatchArm,
+                            });
+                        }
+                    }
+                    Pattern::Binding { .. } | Pattern::Wildcard { .. } => remaining.clear(),
+                }
             }
+
+            result = match result {
+                Some(inner) => match self.join(&inner, &arm.expr.ty()) {
+                    Some(joined) => Some(joined),
+                    None => {
+                        self.errors.push(StaticError {
+                            span: self.span(arm.expr.span()),
+                            kind: StaticErrorKind::BranchesDifferentTypes,
+                        });
+                        return Ty::Unknown;
+                    }
+                },
+                None => Some(arm.expr.ty()),
+            };
         }
 
-        lub_ty.unwrap_or_default()
+        if !remaining.is_empty() {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::MatchArmsNotComprehensive,
+            });
+        }
+        result.unwrap_or_default()
     }
 
     fn dispatch_bin_op_expr(
@@ -3479,18 +4713,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::UnaryOpExpr {
         match input.op {
             UnaryOp::Not => {
-                let operand_ty = operand.ty();
-                if !VarIdTyPass::is_bool_operand(&operand_ty) {
-                    self.errors.push(StaticError {
-                        span: self.span(operand.span()),
-                        kind: StaticErrorKind::BoolOpInvalidType,
-                    });
-                }
+                self.check_bool_operand(operand);
                 Ty::Bool
             }
             UnaryOp::Neg => {
-                let operand_ty = operand.ty();
-                if !(matches!(operand_ty, Ty::Float | Ty::Int) || operand_ty.is_wildcard()) {
+                let operand_ty = self.shallow(&operand.ty());
+                if !Self::is_numeric(&operand_ty) {
                     self.errors.push(StaticError {
                         span: self.span(operand.span()),
                         kind: StaticErrorKind::UnaryOpInvalidType,
@@ -3507,7 +4735,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         base: &Expr<Substr, Self::OutputMetadata>,
         field: &Ident<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FieldAccessExpr {
-        let base_ty = base.ty();
+        let base_ty = self.shallow(&base.ty());
         match base_ty {
             Ty::Rect => match field.name.as_str() {
                 "x0" | "x1" | "y0" | "y1" | "w" | "h" => Ty::Float,
@@ -3539,8 +4767,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             // A cell's coordinates are only determined relative to a
             // placement, so reading its geometry before `inst(...)` is
             // meaningless -- and the evaluator already refuses it. Saying so
-            // beats the generic no-field error, which used to assert that a
-            // field was missing while printing the map that contained it.
+            // beats the generic no-field error.
             //
             // Only when the field exists, though: telling someone who
             // misspelled a field to place the cell first is advice that
@@ -3565,13 +4792,21 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
                 Ty::Unknown
             }
-            Ty::Struct(ref s) => match s.fields.get(field.name.as_str()) {
-                Some(ty) => ty.clone(),
-                None => self.no_field_on_ty(field, base_ty.clone()),
-            },
-            // Propagate any and unknown types without throwing an error.
+            Ty::Struct(ref s) => {
+                let def = self.adt_def(s.def).and_then(AdtDef::as_struct);
+                match def.and_then(|def| {
+                    let ty = def.fields.get(field.name.as_str())?;
+                    Some(subst(ty, &param_map(&def.params, &s.args)))
+                }) {
+                    Some(ty) => ty,
+                    None => self.no_field_on_ty(field, base_ty.clone()),
+                }
+            }
+            // Propagate any and unknown types without throwing an error. An
+            // unsolved variable cannot be given a field type here; it is
+            // reported if it stays unsolved.
             Ty::Any => Ty::Any,
-            Ty::Unknown => Ty::Unknown,
+            Ty::Unknown | Ty::Infer(_) => Ty::Unknown,
             _ => self.no_field_on_ty(field, base_ty.clone()),
         }
     }
@@ -3582,7 +4817,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         base: &Expr<Substr, Self::OutputMetadata>,
         field: &IntLiteral,
     ) -> <Self::OutputMetadata as AstMetadata>::IndexFieldAccessExpr {
-        let base_ty = base.ty();
+        let base_ty = self.shallow(&base.ty());
         match base_ty {
             Ty::Tuple(t) => usize::try_from(field.value)
                 .map(|i| {
@@ -3603,12 +4838,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }),
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
-            Ty::Unknown => Ty::Unknown,
+            Ty::Unknown | Ty::Infer(_) => Ty::Unknown,
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(field.span),
                     kind: StaticErrorKind::CannotIndexFieldAccess {
-                        ty: base_ty.to_string(),
+                        ty: self.display(&base_ty),
                     },
                 });
                 Ty::Unknown
@@ -3622,10 +4857,16 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         base: &Expr<Self::OutputS, Self::OutputMetadata>,
         index: &Expr<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::IndexExpr {
-        let base_ty = base.ty();
+        let base_ty = self.shallow(&base.ty());
         self.assert_eq_ty(index.span(), &index.ty(), &Ty::Int);
         match base_ty {
             Ty::Seq(s) => (*s).clone(),
+            // Indexing makes the base a sequence of a still-unknown element.
+            Ty::Infer(_) => {
+                let element = self.fresh();
+                self.unify(&base_ty, &Ty::Seq(Box::new(element.clone())));
+                element
+            }
             // Propagate any and unknown types without throwing an error.
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
@@ -3682,27 +4923,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::TEXT);
                     (None, Ty::Nil)
                 }
-                "cons" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 2);
-                    if args.posargs.len() == 2 {
-                        let seqty = Ty::Seq(Box::new(args.posargs[0].ty()));
-                        let tailty = args.posargs[1].ty();
-                        if !(tailty == Ty::SeqNil || VarIdTyPass::is_eq_ty(&tailty, &seqty)) {
-                            self.errors.push(StaticError {
-                                span: self.span(args.posargs[1].span()),
-                                kind: StaticErrorKind::IncorrectTy {
-                                    found: tailty.to_string(),
-                                    expected: seqty.to_string(),
-                                },
-                            });
-                        }
-                        (None, seqty)
-                    } else {
-                        (None, Ty::SeqNil)
-                    }
-                }
+                "cons" => self.call_scheme(&builtin_sig::CONS, input.span, args),
+                "head" => self.call_scheme(&builtin_sig::HEAD, input.span, args),
+                "tail" => self.call_scheme(&builtin_sig::TAIL, input.span, args),
                 "list" => {
-                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::NONE.kwargs);
+                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::LIST.sig.kwargs);
                     if args.posargs.is_empty() {
                         self.errors.push(StaticError {
                             span: self.span(input.span),
@@ -3710,27 +4935,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         });
                         (None, Ty::Nil)
                     } else {
-                        // Fold pairwise rather than widening a mismatch to
-                        // `[Any]`, which would satisfy every downstream check
-                        // and defer the failure to an evaluator `unwrap`.
-                        let mut elem_ty = args.posargs[0].ty();
-                        for arg in &args.posargs[1..] {
-                            let arg_ty = arg.ty();
-                            match elem_ty.lub(&arg_ty) {
-                                Some(lub) => elem_ty = lub,
-                                None => {
-                                    self.errors.push(StaticError {
-                                        span: self.span(arg.span()),
-                                        kind: StaticErrorKind::IncorrectTy {
-                                            expected: elem_ty.to_string(),
-                                            found: arg_ty.to_string(),
-                                        },
-                                    });
-                                    elem_ty = Ty::Unknown;
-                                }
-                            }
+                        // Every element is unified with one element type, so a
+                        // mismatch is reported at the element rather than
+                        // widened away.
+                        let element = self.fresh();
+                        for arg in &args.posargs {
+                            self.assert_eq_ty(arg.span(), &arg.ty(), &element);
                         }
-                        (None, Ty::Seq(Box::new(elem_ty)))
+                        (None, Ty::Seq(Box::new(element)))
                     }
                 }
                 "range_full" => {
@@ -3739,65 +4951,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::RANGE_FULL);
                     (None, Ty::Seq(Box::new(Ty::Int)))
                 }
-                "head" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    if args.posargs.len() == 1 {
-                        let argty = args.posargs[0].ty();
-                        let vty = match argty {
-                            Ty::Seq(i) => *i,
-                            Ty::Any => Ty::Any,
-                            Ty::Unknown => Ty::Unknown,
-                            _ => {
-                                self.errors.push(StaticError {
-                                    span: self.span(input.span),
-                                    kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty.to_string(),
-                                        expected: "Seq".to_string(),
-                                    },
-                                });
-                                Ty::Unknown
-                            }
-                        };
-                        (None, vty)
-                    } else {
-                        (None, Ty::Unknown)
-                    }
-                }
-                "tail" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    if args.posargs.len() == 1 {
-                        let argty = args.posargs[0].ty();
-                        let vty = match argty {
-                            Ty::Seq(_) => argty,
-                            Ty::Any => Ty::Any,
-                            Ty::Unknown => Ty::Unknown,
-                            _ => {
-                                self.errors.push(StaticError {
-                                    span: self.span(input.span),
-                                    kind: StaticErrorKind::IncorrectTyCategory {
-                                        found: argty.to_string(),
-                                        expected: "Seq".to_string(),
-                                    },
-                                });
-                                Ty::Unknown
-                            }
-                        };
-                        (None, vty)
-                    } else {
-                        (None, Ty::Nil)
-                    }
-                }
                 "bbox" => {
                     self.assert_eq_arity(input.span, args.posargs.len(), 1);
                     // `assert_eq_arity` only records a diagnostic, so the argument
                     // must still be fetched fallibly, as the sibling builtins do.
                     if let Some(arg) = args.posargs.first() {
-                        let argty = arg.ty();
+                        let argty = self.shallow(&arg.ty());
                         if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
                             self.errors.push(StaticError {
                                 span: self.span(input.span),
                                 kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: argty.to_string(),
+                                    found: self.display(&argty),
                                     expected: "Cell/Inst".to_string(),
                                 },
                             });
@@ -3821,7 +4985,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::INST);
                     if let Some(ty) = args.posargs.first() {
                         self.assert_ty_is_cell(ty.span(), &ty.ty());
-                        match ty.ty() {
+                        match self.shallow(&ty.ty()) {
                             Ty::Cell(c) => (None, Ty::Inst(c.clone())),
                             Ty::Any => (None, Ty::Any),
                             _ => (None, Ty::Unknown),
@@ -3830,21 +4994,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                         (None, Ty::Unknown)
                     }
                 }
-                name => self.typecheck_call(name, self.lookup(name), input.span, args, true),
+                name => {
+                    let lookup = self.lookup(name);
+                    let explicit = self.explicit_args(func);
+                    self.typecheck_call(name, lookup, input.span, args, true, explicit)
+                }
             }
         } else {
-            let path = module_prefix(
-                self.current_path,
-                func.path.iter().map(|ident| ident.name.as_str()),
-                1,
-            );
             let name = &func.path.last().unwrap().name;
-            let lookup = self
-                .mod_bindings
-                .get(&path)
-                .as_ref()
-                .and_then(|mod_binding| mod_binding.var_bindings.get(name).cloned());
-            self.typecheck_call(name, lookup, input.span, args, false)
+            let explicit = self.explicit_args(func);
+            match self.resolve_qualified(&func.path) {
+                Ok(binding) => {
+                    self.typecheck_call(name, Some(binding), input.span, args, false, explicit)
+                }
+                Err(QualifiedError::Undeclared { .. }) => {
+                    self.typecheck_call(name, None, input.span, args, false, explicit)
+                }
+                Err(error) => {
+                    self.report_qualified_error(error, func.span);
+                    (None, Ty::Unknown)
+                }
+            }
         }
     }
 
@@ -3853,17 +5023,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _input: &crate::ast::EmitExpr<Substr, Self::InputMetadata>,
         value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EmitExpr {
-        let ty = value.ty();
+        let ty = self.shallow(&value.ty());
         // Emission collects a single layout element per `!`. `Any` and
         // `Unknown` are deferred to the runtime `CannotEmit` check, since the
         // static type says nothing about what the value will be.
         if !matches!(
             ty,
-            Ty::Rect | Ty::Polygon | Ty::Path | Ty::Inst(_) | Ty::Any | Ty::Unknown
+            Ty::Rect | Ty::Polygon | Ty::Path | Ty::Inst(_) | Ty::Any | Ty::Unknown | Ty::Infer(_)
         ) {
             self.errors.push(StaticError {
                 span: self.span(value.span()),
-                kind: StaticErrorKind::CannotEmit(ty.to_string()),
+                kind: StaticErrorKind::CannotEmit(self.display(&ty)),
             });
         }
         ty
@@ -3884,17 +5054,17 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         ty: &TySpec<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::CastExpr {
         let ty = self.ty_from_spec(ty);
-        match (value.ty(), &ty) {
+        match (self.shallow(&value.ty()), &ty) {
             (Ty::Int, Ty::Float)
             | (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Int)
             | (Ty::Float, Ty::Float) => (),
             // Either side being a wildcard suppresses the check: `Any` by
             // definition, `Unknown` because the expression that produced it
-            // was already diagnosed. The source side used to admit only
-            // `Any`, so an undeclared name reported a second `invalid type
-            // cast`.
+            // was already diagnosed. An unsolved variable is reported if it
+            // stays unsolved.
             (source, target) if source.is_wildcard() || target.is_wildcard() => (),
+            (Ty::Infer(_), _) => (),
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
@@ -3959,11 +5129,22 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_let_binding(
         &mut self,
-        _input: &LetBinding<Substr, Self::InputMetadata>,
+        input: &LetBinding<Substr, Self::InputMetadata>,
         name: &Ident<Substr, Self::OutputMetadata>,
         value: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::LetBinding {
-        self.alloc(&name.name, value.ty())
+        // A declared type is checked against the initializer and becomes the
+        // binding's type, which is how a value whose type cannot be inferred
+        // from its initializer alone is pinned.
+        let ty = match &input.ty {
+            Some(spec) => {
+                let declared = self.ty_from_spec(spec);
+                self.assert_eq_ty(value.span(), &value.ty(), &declared);
+                declared
+            }
+            None => value.ty(),
+        };
+        self.alloc(&name.name, ty)
     }
 
     fn transform_for_loop(
@@ -3972,17 +5153,23 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> crate::ast::ForLoop<Self::OutputS, Self::OutputMetadata> {
         let var = self.transform_ident(&input.var);
         let seq = self.transform_expr(&input.seq);
-        let seq_ty = seq.ty();
+        let seq_ty = self.shallow(&seq.ty());
         let elem_ty = match seq_ty {
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             Ty::Seq(t) => (*t).clone(),
             Ty::SeqNil => Ty::Any,
+            // Iterating makes the sequence one of a still-unknown element.
+            Ty::Infer(_) => {
+                let element = self.fresh();
+                self.unify(&seq_ty, &Ty::Seq(Box::new(element.clone())));
+                element
+            }
             _ => {
                 self.errors.push(StaticError {
                     span: self.span(input.seq.span()),
                     kind: StaticErrorKind::CannotIterate {
-                        ty: seq_ty.to_string(),
+                        ty: self.display(&seq_ty),
                     },
                 });
                 Ty::Unknown
@@ -4017,6 +5204,581 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     }
 }
 
+impl<'a> VarIdTyPass<'a> {
+    /// Types a `match` arm's pattern against the scrutinee's type, binding
+    /// each name it introduces in the current frame. A bare name is a unit
+    /// variant pattern when it resolves to a unit variant, and a binding
+    /// otherwise.
+    fn type_pattern(
+        &mut self,
+        pattern: &Pattern<Substr, ParseMetadata>,
+        scrutinee_ty: &Ty,
+    ) -> Pattern<Substr, VarIdTyMetadata> {
+        match pattern {
+            Pattern::Wildcard { span } => Pattern::Wildcard { span: *span },
+            Pattern::Binding { name, .. } => {
+                if let Some((id, Ty::Ctor(ctor))) = self.lookup(&name.name) {
+                    let path = IdentPath {
+                        path: vec![self.transform_ident(name)],
+                        generic_args: None,
+                        metadata: (None, Ty::Unknown),
+                        span: name.span,
+                    };
+                    return self.type_variant_pattern(
+                        path,
+                        Some((id, ctor)),
+                        &[],
+                        name.span,
+                        scrutinee_ty,
+                    );
+                }
+                let id = self.alloc(&name.name, scrutinee_ty.clone());
+                Pattern::Binding {
+                    name: self.transform_ident(name),
+                    metadata: (id, scrutinee_ty.clone()),
+                }
+            }
+            Pattern::Variant { path, fields, span } => {
+                let resolved = if path.path.len() == 1 {
+                    match self.lookup(&path.path[0].name) {
+                        Some((id, Ty::Ctor(ctor))) => Some((id, ctor)),
+                        Some(_) | None => {
+                            self.errors.push(StaticError {
+                                span: self.span(path.span),
+                                kind: StaticErrorKind::UndeclaredVar {
+                                    name: path.path[0].name.to_string(),
+                                },
+                            });
+                            None
+                        }
+                    }
+                } else {
+                    match self.resolve_qualified(&path.path) {
+                        Ok((id, Ty::Ctor(ctor))) => Some((id, ctor)),
+                        Ok(_) => {
+                            self.errors.push(StaticError {
+                                span: self.span(path.span),
+                                kind: StaticErrorKind::NotAnEnum,
+                            });
+                            None
+                        }
+                        Err(error) => {
+                            self.report_qualified_error(error, path.span);
+                            None
+                        }
+                    }
+                };
+                let explicit = self.explicit_args(path);
+                let output = IdentPath {
+                    path: path
+                        .path
+                        .iter()
+                        .map(|ident| self.transform_ident(ident))
+                        .collect(),
+                    generic_args: path
+                        .generic_args
+                        .as_ref()
+                        .map(|args| self.transform_generic_args(args)),
+                    metadata: (None, Ty::Unknown),
+                    span: path.span,
+                };
+                let resolved = resolved.map(|(id, ctor)| {
+                    (
+                        id,
+                        match explicit {
+                            Some(args) => Arc::new(CtorTy {
+                                args,
+                                ..(*ctor).clone()
+                            }),
+                            None => ctor,
+                        },
+                    )
+                });
+                self.type_variant_pattern(output, resolved, fields, *span, scrutinee_ty)
+            }
+        }
+    }
+
+    /// Types a variant pattern whose path resolved to `resolved`, if it did.
+    fn type_variant_pattern(
+        &mut self,
+        mut path: IdentPath<Substr, VarIdTyMetadata>,
+        resolved: Option<(VarId, Arc<CtorTy>)>,
+        fields: &[Pattern<Substr, ParseMetadata>],
+        span: cfgrammar::Span,
+        scrutinee_ty: &Ty,
+    ) -> Pattern<Substr, VarIdTyMetadata> {
+        let Some((id, ctor)) = resolved else {
+            let fields = fields
+                .iter()
+                .map(|field| self.type_pattern(field, &Ty::Unknown))
+                .collect();
+            return Pattern::Variant { path, fields, span };
+        };
+        let def = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned();
+        let Some(def) = def else {
+            return Pattern::Variant {
+                path,
+                fields: Vec::new(),
+                span,
+            };
+        };
+        // The scrutinee's arguments when it is this enum; fresh variables
+        // otherwise, which the arm's body or the scrutinee may then solve.
+        let args = match scrutinee_ty {
+            Ty::Enum(enum_ty) if enum_ty.def == ctor.def && ctor.args.is_empty() => {
+                enum_ty.args.clone()
+            }
+            _ => {
+                let explicit = (!ctor.args.is_empty()).then(|| ctor.args.clone());
+                let map = self.instantiate(&def.params, explicit, span, &ctor.enum_name);
+                def.params
+                    .iter()
+                    .map(|param| map[&param.id].clone())
+                    .collect()
+            }
+        };
+        let map = param_map(&def.params, &args);
+        path.metadata = (
+            Some(id),
+            Ty::Enum(Arc::new(EnumTy {
+                def: ctor.def,
+                name: ctor.enum_name.clone(),
+                args,
+            })),
+        );
+        let payload = def
+            .variants
+            .get(&ctor.variant)
+            .map(|variant| variant.payload.clone())
+            .unwrap_or_default();
+        if fields.len() != payload.len() {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::VariantPayloadArity {
+                    variant: ctor.variant.clone(),
+                    expected: payload.len(),
+                    found: fields.len(),
+                },
+            });
+        }
+        let fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let ty = payload
+                    .get(index)
+                    .map_or(Ty::Unknown, |payload| subst(payload, &map));
+                self.type_pattern(field, &ty)
+            })
+            .collect();
+        Pattern::Variant { path, fields, span }
+    }
+}
+
+/// Replaces every inference variable in the typed nodes of one unit by its
+/// solution, recording where the unsolved ones were.
+struct Zonker<'a> {
+    infer: &'a InferCtx,
+    /// Variables already recorded, so that each is reported once.
+    seen: IndexSet<InferId>,
+    /// Where an unsolved variable was first met, in order.
+    unsolved: IndexSet<cfgrammar::Span>,
+}
+
+impl Zonker<'_> {
+    /// `ty` with every variable replaced: solved ones by their solution,
+    /// unsolved ones by `Unknown`, which are recorded at `span`.
+    fn ty(&mut self, ty: &Ty, span: cfgrammar::Span) -> Ty {
+        let ty = self.infer.deep(ty);
+        if !self.infer.has_unsolved(&ty) {
+            return ty;
+        }
+        self.note_unsolved(&ty, span);
+        erase_infer(&ty)
+    }
+
+    fn note_unsolved(&mut self, ty: &Ty, span: cfgrammar::Span) {
+        let mut vars = Vec::new();
+        unsolved_vars(&self.infer.deep(ty), &mut vars);
+        for var in vars {
+            if self.seen.insert(var) {
+                self.unsolved.insert(span);
+            }
+        }
+    }
+}
+
+/// The unsolved variables in a deeply resolved type.
+fn unsolved_vars(ty: &Ty, out: &mut Vec<InferId>) {
+    match ty {
+        Ty::Infer(id) => out.push(*id),
+        Ty::Seq(inner) => unsolved_vars(inner, out),
+        Ty::Tuple(items) => items.iter().for_each(|item| unsolved_vars(item, out)),
+        Ty::Struct(s) => s.args.iter().for_each(|arg| unsolved_vars(arg, out)),
+        Ty::Enum(e) => e.args.iter().for_each(|arg| unsolved_vars(arg, out)),
+        Ty::Ctor(c) => c.args.iter().for_each(|arg| unsolved_vars(arg, out)),
+        Ty::Cell(cell) | Ty::Inst(cell) => {
+            cell.args.iter().for_each(|arg| unsolved_vars(arg, out));
+        }
+        _ => {}
+    }
+}
+
+/// `ty` with every remaining variable replaced by `Unknown`.
+fn erase_infer(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Infer(_) => Ty::Unknown,
+        Ty::Seq(inner) => Ty::Seq(Box::new(erase_infer(inner))),
+        Ty::Tuple(items) => Ty::Tuple(items.iter().map(erase_infer).collect()),
+        Ty::Struct(s) => Ty::Struct(Arc::new(StructTy {
+            def: s.def,
+            name: s.name.clone(),
+            args: s.args.iter().map(erase_infer).collect(),
+        })),
+        Ty::Enum(e) => Ty::Enum(Arc::new(EnumTy {
+            def: e.def,
+            name: e.name.clone(),
+            args: e.args.iter().map(erase_infer).collect(),
+        })),
+        Ty::Ctor(c) => Ty::Ctor(Arc::new(CtorTy {
+            def: c.def,
+            enum_name: c.enum_name.clone(),
+            variant: c.variant.clone(),
+            args: c.args.iter().map(erase_infer).collect(),
+        })),
+        Ty::Cell(cell) => Ty::Cell(Arc::new(CellTy {
+            args: cell.args.iter().map(erase_infer).collect(),
+            ..(**cell).clone()
+        })),
+        Ty::Inst(cell) => Ty::Inst(Arc::new(CellTy {
+            args: cell.args.iter().map(erase_infer).collect(),
+            ..(**cell).clone()
+        })),
+        _ => ty.clone(),
+    }
+}
+
+/// A typed unit that can be zonked.
+trait Zonk: Sized {
+    fn zonk(self, zonker: &mut Zonker<'_>) -> Self;
+}
+
+impl Zonk for FnDecl<Substr, VarIdTyMetadata> {
+    fn zonk(self, zonker: &mut Zonker<'_>) -> Self {
+        zonker.transform_fn_decl(&self)
+    }
+}
+
+impl Zonk for Vec<ArgDecl<Substr, VarIdTyMetadata>> {
+    fn zonk(self, zonker: &mut Zonker<'_>) -> Self {
+        self.iter()
+            .map(|arg| zonker.transform_arg_decl(arg))
+            .collect()
+    }
+}
+
+impl Zonk for Statement<Substr, VarIdTyMetadata> {
+    fn zonk(self, zonker: &mut Zonker<'_>) -> Self {
+        zonker.transform_statement(&self)
+    }
+}
+
+impl Zonk for Option<Expr<Substr, VarIdTyMetadata>> {
+    fn zonk(self, zonker: &mut Zonker<'_>) -> Self {
+        self.as_ref().map(|expr| zonker.transform_expr(expr))
+    }
+}
+
+impl AstTransformer for Zonker<'_> {
+    type InputMetadata = VarIdTyMetadata;
+    type OutputMetadata = VarIdTyMetadata;
+    type InputS = Substr;
+    type OutputS = Substr;
+
+    fn dispatch_ident(&mut self, _input: &Ident<Substr, VarIdTyMetadata>) {}
+
+    fn dispatch_ident_path(
+        &mut self,
+        input: &IdentPath<Substr, VarIdTyMetadata>,
+    ) -> (Option<VarId>, Ty) {
+        (input.metadata.0, self.ty(&input.metadata.1, input.span))
+    }
+
+    fn dispatch_enum_decl(
+        &mut self,
+        input: &EnumDecl<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _variants: &[EnumVariant<Substr, VarIdTyMetadata>],
+    ) -> Option<VarId> {
+        input.metadata
+    }
+
+    fn dispatch_enum_variant(
+        &mut self,
+        input: &EnumVariant<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _payload: &[TySpec<Substr, VarIdTyMetadata>],
+    ) -> Option<VarId> {
+        input.metadata
+    }
+
+    fn dispatch_pattern_binding(
+        &mut self,
+        input: &Pattern<Substr, VarIdTyMetadata>,
+        name: &Ident<Substr, VarIdTyMetadata>,
+    ) -> (VarId, Ty) {
+        match input {
+            Pattern::Binding { metadata, .. } => (metadata.0, self.ty(&metadata.1, name.span)),
+            _ => unreachable!("dispatched for a binding pattern"),
+        }
+    }
+
+    fn dispatch_struct_decl(
+        &mut self,
+        input: &StructDecl<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _fields: &[StructField<Substr, VarIdTyMetadata>],
+    ) -> Option<VarId> {
+        input.metadata
+    }
+
+    fn dispatch_struct_field(
+        &mut self,
+        input: &StructField<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _ty: &TySpec<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        input.metadata.clone()
+    }
+
+    fn dispatch_cell_decl(
+        &mut self,
+        input: &CellDecl<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _args: &[ArgDecl<Substr, VarIdTyMetadata>],
+        _scope: &Scope<Substr, VarIdTyMetadata>,
+    ) -> (PathBuf, VarId) {
+        input.metadata.clone()
+    }
+
+    fn dispatch_fn_decl(
+        &mut self,
+        input: &FnDecl<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _args: &[ArgDecl<Substr, VarIdTyMetadata>],
+        _return_ty: &Option<TySpec<Substr, VarIdTyMetadata>>,
+        _scope: &Scope<Substr, VarIdTyMetadata>,
+    ) -> (PathBuf, VarId, Ty) {
+        let (path, id, ty) = &input.metadata;
+        (path.clone(), *id, self.ty(ty, input.name.span))
+    }
+
+    fn dispatch_constant_decl(
+        &mut self,
+        _input: &ConstantDecl<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _ty: &Ident<Substr, VarIdTyMetadata>,
+        _value: &Expr<Substr, VarIdTyMetadata>,
+    ) {
+    }
+
+    fn transform_let_binding(
+        &mut self,
+        input: &LetBinding<Substr, VarIdTyMetadata>,
+    ) -> LetBinding<Substr, VarIdTyMetadata> {
+        // An unsolved variable in the binding's type is reported at the
+        // binding, ahead of the expressions that carry it.
+        self.note_unsolved(&input.value.ty(), input.name.span);
+        let name = self.transform_ident(&input.name);
+        let ty = input.ty.as_ref().map(|ty| self.transform_ty_spec(ty));
+        let value = self.transform_expr(&input.value);
+        LetBinding {
+            name,
+            ty,
+            value,
+            metadata: input.metadata,
+            span: input.span,
+        }
+    }
+
+    fn dispatch_let_binding(
+        &mut self,
+        input: &LetBinding<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _value: &Expr<Substr, VarIdTyMetadata>,
+    ) -> VarId {
+        input.metadata
+    }
+
+    fn dispatch_for_loop(
+        &mut self,
+        input: &ForLoop<Substr, VarIdTyMetadata>,
+        _var: &Ident<Substr, VarIdTyMetadata>,
+        _seq: &Expr<Substr, VarIdTyMetadata>,
+        _body: &Scope<Substr, VarIdTyMetadata>,
+    ) -> VarId {
+        input.metadata
+    }
+
+    fn dispatch_if_expr(
+        &mut self,
+        input: &IfExpr<Substr, VarIdTyMetadata>,
+        _cond: &Expr<Substr, VarIdTyMetadata>,
+        _then: &Scope<Substr, VarIdTyMetadata>,
+        _else_: &Scope<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_match_expr(
+        &mut self,
+        input: &MatchExpr<Substr, VarIdTyMetadata>,
+        _scrutinee: &Expr<Substr, VarIdTyMetadata>,
+        _arms: &[MatchArm<Substr, VarIdTyMetadata>],
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_bin_op_expr(
+        &mut self,
+        input: &BinOpExpr<Substr, VarIdTyMetadata>,
+        _left: &Expr<Substr, VarIdTyMetadata>,
+        _right: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_unary_op_expr(
+        &mut self,
+        input: &UnaryOpExpr<Substr, VarIdTyMetadata>,
+        _operand: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_cast(
+        &mut self,
+        input: &CastExpr<Substr, VarIdTyMetadata>,
+        _value: &Expr<Substr, VarIdTyMetadata>,
+        _ty: &TySpec<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_tuple_expr(
+        &mut self,
+        input: &crate::ast::TupleExpr<Substr, VarIdTyMetadata>,
+        _items: &[Expr<Substr, VarIdTyMetadata>],
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_struct_lit_expr(
+        &mut self,
+        input: &StructLitExpr<Substr, VarIdTyMetadata>,
+        _path: &IdentPath<Substr, VarIdTyMetadata>,
+        _fields: &[StructLitField<Substr, VarIdTyMetadata>],
+        _base: &Option<Expr<Substr, VarIdTyMetadata>>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_struct_lit_path(
+        &mut self,
+        input: &IdentPath<Substr, VarIdTyMetadata>,
+    ) -> (Option<VarId>, Ty) {
+        input.metadata.clone()
+    }
+
+    fn dispatch_field_access_expr(
+        &mut self,
+        input: &FieldAccessExpr<Substr, VarIdTyMetadata>,
+        _base: &Expr<Substr, VarIdTyMetadata>,
+        _field: &Ident<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_index_field_access_expr(
+        &mut self,
+        input: &IndexFieldAccessExpr<Substr, VarIdTyMetadata>,
+        _base: &Expr<Substr, VarIdTyMetadata>,
+        _field: &IntLiteral,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_index_expr(
+        &mut self,
+        input: &IndexExpr<Substr, VarIdTyMetadata>,
+        _base: &Expr<Substr, VarIdTyMetadata>,
+        _index: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_call_expr(
+        &mut self,
+        input: &CallExpr<Substr, VarIdTyMetadata>,
+        _func: &IdentPath<Substr, VarIdTyMetadata>,
+        _args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> (Option<VarId>, Ty) {
+        (input.metadata.0, self.ty(&input.metadata.1, input.span))
+    }
+
+    fn dispatch_emit_expr(
+        &mut self,
+        input: &crate::ast::EmitExpr<Substr, VarIdTyMetadata>,
+        _value: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_args(
+        &mut self,
+        _input: &crate::ast::Args<Substr, VarIdTyMetadata>,
+        _posargs: &[Expr<Substr, VarIdTyMetadata>],
+        _kwargs: &[KwArgValue<Substr, VarIdTyMetadata>],
+    ) {
+    }
+
+    fn dispatch_kw_arg_value(
+        &mut self,
+        input: &KwArgValue<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _value: &Expr<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_arg_decl(
+        &mut self,
+        input: &ArgDecl<Substr, VarIdTyMetadata>,
+        _name: &Ident<Substr, VarIdTyMetadata>,
+        _ty: &TySpec<Substr, VarIdTyMetadata>,
+        _default: &Option<Expr<Substr, VarIdTyMetadata>>,
+    ) -> (VarId, Ty) {
+        (
+            input.metadata.0,
+            self.ty(&input.metadata.1, input.name.span),
+        )
+    }
+
+    fn dispatch_scope(
+        &mut self,
+        input: &Scope<Substr, VarIdTyMetadata>,
+        _stmts: &[Statement<Substr, VarIdTyMetadata>],
+        _tail: &Option<Expr<Substr, VarIdTyMetadata>>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn transform_s(&mut self, s: &Substr) -> Substr {
+        s.clone()
+    }
+}
+
 /// A value passed to a cell.
 ///
 /// A cell is compiled on its own and named by its arguments, so an argument
@@ -4041,8 +5803,11 @@ pub enum CellArg {
     Int(i64),
     Bool(bool),
     String(String),
-    /// An enum variant, identified by name like [`Value::EnumValue`].
-    Enum(String),
+    /// An enum value, like [`Value::Enum`]: its variant and payload.
+    Enum {
+        variant: String,
+        payload: Vec<CellArg>,
+    },
     Seq(Vec<CellArg>),
     /// A struct value: the qualified name of its type and its fields in
     /// declaration order, like [`Value::Struct`].
@@ -4082,9 +5847,11 @@ pub enum CellArg {
 }
 
 impl CellArg {
-    fn matches_ty(&self, ty: &Ty) -> bool {
+    /// Whether this argument inhabits `ty`. Struct and enum types are looked up
+    /// in `defs`; a type parameter, like `Any`, admits anything.
+    fn matches_ty(&self, ty: &Ty, defs: &TypeDefs) -> bool {
         match (self, ty) {
-            (_, Ty::Any) => true,
+            (_, Ty::Any | Ty::Param(_)) => true,
             (Self::Float(_), Ty::Float)
             | (Self::Int(_), Ty::Int)
             | (Self::Bool(_), Ty::Bool)
@@ -4093,9 +5860,22 @@ impl CellArg {
             | (Self::Polygon { .. }, Ty::Polygon)
             | (Self::Path { .. }, Ty::Path)
             | (Self::Point(..), Ty::Point) => true,
-            (Self::Enum(variant), Ty::Enum(ty)) => ty.variants.contains(variant),
+            (Self::Enum { variant, payload }, Ty::Enum(ty)) => {
+                let Some(def) = defs.get(&ty.def).and_then(AdtDef::as_enum) else {
+                    return false;
+                };
+                let Some(variant) = def.variants.get(variant) else {
+                    return false;
+                };
+                let map = param_map(&def.params, &ty.args);
+                payload.len() == variant.payload.len()
+                    && payload
+                        .iter()
+                        .zip(&variant.payload)
+                        .all(|(value, ty)| value.matches_ty(&subst(ty, &map), defs))
+            }
             (Self::Seq(values), Ty::Seq(inner)) => {
-                values.iter().all(|value| value.matches_ty(inner))
+                values.iter().all(|value| value.matches_ty(inner, defs))
             }
             (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
             (Self::Tuple(values), Ty::Tuple(tys)) => {
@@ -4103,15 +5883,21 @@ impl CellArg {
                     && values
                         .iter()
                         .zip(tys)
-                        .all(|(value, ty)| value.matches_ty(ty))
+                        .all(|(value, ty)| value.matches_ty(ty, defs))
             }
             (Self::Struct { name, fields }, Ty::Struct(ty)) => {
+                let Some(def) = defs.get(&ty.def).and_then(AdtDef::as_struct) else {
+                    return false;
+                };
+                let map = param_map(&def.params, &ty.args);
                 *name == ty.name
-                    && fields.len() == ty.fields.len()
+                    && fields.len() == def.fields.len()
                     && fields
                         .iter()
-                        .zip(&ty.fields)
-                        .all(|((name, value), (field, ty))| name == field && value.matches_ty(ty))
+                        .zip(&def.fields)
+                        .all(|((name, value), (field, ty))| {
+                            name == field && value.matches_ty(&subst(ty, &map), defs)
+                        })
             }
             _ => false,
         }
@@ -4123,7 +5909,7 @@ impl CellArg {
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
             Self::String(_) => "String",
-            Self::Enum(_) => "enum variant",
+            Self::Enum { .. } => "enum value",
             Self::Seq(_) => "sequence",
             Self::Struct { .. } => "struct",
             Self::Rect { .. } => "Rect",
@@ -4150,7 +5936,8 @@ pub(crate) enum CellArgKey {
     Int(i64),
     Bool(bool),
     String(String),
-    Enum(String),
+    /// The variant and its payload.
+    Enum(String, Vec<CellArgKey>),
     Seq(Vec<CellArgKey>),
     Struct(String, Vec<(String, CellArgKey)>),
     /// Layer, drawability, and `x0, y0, x1, y1`.
@@ -4194,7 +5981,9 @@ impl From<&CellArg> for CellArgKey {
             CellArg::Int(i) => Self::Int(*i),
             CellArg::Bool(b) => Self::Bool(*b),
             CellArg::String(s) => Self::String(s.clone()),
-            CellArg::Enum(v) => Self::Enum(v.clone()),
+            CellArg::Enum { variant, payload } => {
+                Self::Enum(variant.clone(), payload.iter().map(Self::from).collect())
+            }
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
             CellArg::Struct { name, fields } => Self::Struct(
                 name.clone(),
@@ -4420,7 +6209,6 @@ pub struct Text<T> {
 type FrameId = u64;
 type ValueId = u64;
 pub type CellId = u64;
-pub type EnumId = u64;
 
 /// Sequence number.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize, Ord, PartialOrd)]
@@ -4575,6 +6363,9 @@ impl CellState {
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
+    /// Struct and enum definitions, read for cell-argument checks and struct
+    /// literal field order.
+    defs: &'a TypeDefs,
     tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
@@ -4690,10 +6481,11 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
 
 impl<'a> ExecPass<'a> {
     pub(crate) fn new(
-        ast: &'a WorkspaceAst<VarIdTyMetadata>,
+        workspace: &'a TypedWorkspace,
         tech: Technology,
         gds_imports: &[(String, PathBuf)],
     ) -> Self {
+        let ast = &workspace.ast;
         let gds_imports = gds_imports
             .iter()
             .filter_map(|(name, path)| {
@@ -4717,6 +6509,7 @@ impl<'a> ExecPass<'a> {
             .collect();
         Self {
             ast,
+            defs: &workspace.defs,
             tech,
             gds_imports,
             cell_states: IndexMap::new(),
@@ -4770,7 +6563,7 @@ impl<'a> ExecPass<'a> {
     /// Records that a runtime value did not have the concrete type its builtin
     /// requires.
     ///
-    /// `Ty::Any` satisfies every static check (`is_eq_ty` short-circuits on
+    /// `Ty::Any` satisfies every static check (`unify` short-circuits on
     /// it), and cell and instance types cannot be named, so `Any` is
     /// load-bearing rather than an escape hatch. Every builtin that reads a
     /// concrete runtime type therefore has to report through here instead of
@@ -5248,7 +7041,7 @@ impl<'a> ExecPass<'a> {
             .iter()
             .zip(&cell_decl.args)
             .enumerate()
-            .find(|(_, (arg, decl))| !arg.matches_ty(&decl.metadata.1))
+            .find(|(_, (arg, decl))| !arg.matches_ty(&decl.metadata.1, self.defs))
         {
             self.errors.push(ExecError {
                 span: None,
@@ -6322,6 +8115,36 @@ impl<'a> ExecPass<'a> {
                                 .is_none()
                         );
                     }
+                    // A unit variant is a value; a tuple variant is a
+                    // constructor awaiting its payload.
+                    Decl::Enum(e) => {
+                        for variant in &e.variants {
+                            let Some(id) = variant.metadata else {
+                                continue;
+                            };
+                            let name = variant.name.name.to_string();
+                            let value = if variant.payload.is_empty() {
+                                Value::Enum(Arc::new(EnumValue {
+                                    variant: name,
+                                    payload: Vec::new(),
+                                }))
+                            } else {
+                                Value::Ctor(Arc::new(CtorValue {
+                                    variant: name,
+                                    arity: variant.payload.len(),
+                                }))
+                            };
+                            let vid = self.new_ready_value(value);
+                            assert!(
+                                self.frames
+                                    .get_mut(&self.global_frame)
+                                    .unwrap()
+                                    .bindings
+                                    .insert(id, vid)
+                                    .is_none()
+                            );
+                        }
+                    }
                     _ => (),
                 }
             }
@@ -6556,15 +8379,13 @@ impl<'a> ExecPass<'a> {
             }
             Expr::StringLiteral(s) => self.new_ready_value(Value::String(s.value.to_string())),
             Expr::IdentPath(path) => {
-                if let Some(var_id) = path.metadata.0 {
-                    self.lookup(loc.frame, var_id).unwrap()
-                } else {
-                    // must be an enum value
-                    assert!(path.path.len() >= 2);
-                    self.new_ready_value(Value::EnumValue(
-                        path.path.last().unwrap().name.to_string(),
-                    ))
-                }
+                // Every name, a unit variant included, is bound to a value:
+                // variants live in the global frame.
+                let var_id = path
+                    .metadata
+                    .0
+                    .expect("no var ID assigned to a name being read");
+                self.lookup(loc.frame, var_id).unwrap()
             }
             Expr::Emit(e) => {
                 let value = self.visit_expr(loc, &e.value);
@@ -6668,6 +8489,20 @@ impl<'a> ExecPass<'a> {
                                         kwargs: Vec::new(),
                                     },
                                 }))
+                            })
+                        }
+                        ValueRef::Ctor(ctor) => {
+                            let variant = ctor.variant.clone();
+                            self.new_deferred_value(loc, |this| {
+                                PartialEvalState::Ctor(PartialCtor {
+                                    variant,
+                                    args: c
+                                        .args
+                                        .posargs
+                                        .iter()
+                                        .map(|arg| this.visit_expr(loc, arg))
+                                        .collect(),
+                                })
                             })
                         }
                         _ => {
@@ -6843,7 +8678,13 @@ impl<'a> ExecPass<'a> {
             CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
             CellArg::String(s) => Value::String(s.clone()),
-            CellArg::Enum(v) => Value::EnumValue(v.clone()),
+            CellArg::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: payload
+                    .iter()
+                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                    .collect(),
+            })),
             CellArg::Seq(v) => Value::Seq(
                 v.iter()
                     .map(|arg| self.bind_cell_arg(cell_id, span, arg))
@@ -7001,7 +8842,19 @@ impl<'a> ExecPass<'a> {
             Value::Int(i) => Some(CellArg::Int(*i)),
             Value::Bool(b) => Some(CellArg::Bool(*b)),
             Value::String(s) => Some(CellArg::String(s.clone())),
-            Value::EnumValue(v) => Some(CellArg::Enum(v.clone())),
+            Value::Enum(value) => {
+                let mut payload = Vec::with_capacity(value.payload.len());
+                for v in &value.payload {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        Some(arg) => payload.push(arg),
+                        None => return Ok(None),
+                    }
+                }
+                Some(CellArg::Enum {
+                    variant: value.variant.clone(),
+                    payload,
+                })
+            }
             Value::SeqNil => Some(CellArg::Seq(Vec::new())),
             Value::Seq(s) => {
                 let mut args = Vec::with_capacity(s.len());
@@ -8571,22 +10424,36 @@ impl<'a> ExecPass<'a> {
                         // A scrutinee typed `Any` was never proven to be an
                         // enum value, and even a genuine enum value may belong
                         // to a different enum than the arms name.
-                        let Some(variant) = val.get_enum_value() else {
+                        let Some(value) = val.get_enum().cloned() else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
                             return self.poison(cell_id, vid);
                         };
-                        let arm = match_
-                            .expr
-                            .arms
-                            .iter()
-                            .find(|arm| *variant == arm.pattern.path.last().unwrap().name);
+                        let arm =
+                            match_.expr.arms.iter().find(|arm| {
+                                pattern_matches(&arm.pattern, &Value::Enum(value.clone()))
+                            });
                         let Some(arm) = arm else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
                             return self.poison(cell_id, vid);
                         };
-                        let value = self.visit_expr(vref.loc, &arm.expr);
+                        // The pattern's bindings live in a frame of their own
+                        // under the arm's enclosing frame.
+                        let mut frame = Frame {
+                            bindings: Default::default(),
+                            parent: Some(vref.loc.frame),
+                        };
+                        self.bind_pattern(&arm.pattern, scrutinee, &Value::Enum(value), &mut frame);
+                        let fid = self.frame_id();
+                        self.frames.insert(fid, frame);
+                        let value = self.visit_expr(
+                            DynLoc {
+                                frame: fid,
+                                ..vref.loc
+                            },
+                            &arm.expr,
+                        );
                         match_.state = MatchExprState::Value(value);
                         self.values.insert(vid, Defer::Deferred(vref));
                         self.cell_state_mut(cell_id).deferred.insert(vid);
@@ -8698,7 +10565,7 @@ impl<'a> ExecPass<'a> {
                         }
                         (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
                         (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
-                        (Value::EnumValue(vl), Value::EnumValue(vr)) => equality(vl == vr),
+                        (Value::Enum(_), Value::Enum(_)) => values_equal(vl, vr).and_then(equality),
                         (Value::Nil, Value::Nil) => equality(true),
                         (Value::SeqNil, Value::SeqNil) => equality(true),
                         (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => {
@@ -9320,8 +11187,12 @@ impl<'a> ExecPass<'a> {
                     // Declaration order, whatever order the literal used:
                     // `CellArg::Struct` fields are matched pairwise against
                     // the type's.
-                    let fields = lit
-                        .ty
+                    let Some(def) = self.defs.get(&lit.ty.def).and_then(AdtDef::as_struct) else {
+                        let span = self.span(&vref.loc, lit.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(cell_id, vid);
+                    };
+                    let fields = def
                         .fields
                         .keys()
                         .map(|name| {
@@ -9349,6 +11220,32 @@ impl<'a> ExecPass<'a> {
                         DeferValue::Ready(Value::Struct(Box::new(StructValue {
                             name: lit.ty.name.clone(),
                             fields,
+                        }))),
+                    );
+                    true
+                }
+            }
+            PartialEvalState::Ctor(ctor) => {
+                let pending = ctor.args.iter().find(|arg| !self.values[*arg].is_ready());
+                if let Some(pending) = pending {
+                    self.add_value_dependent(*pending, vid);
+                    false
+                } else {
+                    let payload = ctor
+                        .args
+                        .iter()
+                        .map(|arg| {
+                            self.values[arg]
+                                .get_ready()
+                                .cloned()
+                                .expect("checked ready")
+                        })
+                        .collect();
+                    self.values.insert(
+                        vid,
+                        DeferValue::Ready(Value::Enum(Arc::new(EnumValue {
+                            variant: ctor.variant.clone(),
+                            payload,
                         }))),
                     );
                     true
@@ -9411,6 +11308,39 @@ impl<'a> ExecPass<'a> {
         Ok(progress)
     }
 
+    /// Binds the names of `pattern`, which matched `value`, in `frame`.
+    ///
+    /// A top-level binding reuses the scrutinee's value id; a payload element
+    /// becomes a fresh ready value.
+    fn bind_pattern(
+        &mut self,
+        pattern: &Pattern<Substr, VarIdTyMetadata>,
+        scrutinee: ValueId,
+        value: &Value,
+        frame: &mut Frame,
+    ) {
+        match pattern {
+            Pattern::Wildcard { .. } => {}
+            Pattern::Binding { metadata, .. } => {
+                frame.bindings.insert(metadata.0, scrutinee);
+            }
+            Pattern::Variant { fields, .. } => {
+                let Value::Enum(value) = value else {
+                    return;
+                };
+                for (field, element) in fields.iter().zip(&value.payload) {
+                    match field {
+                        Pattern::Binding { metadata, .. } => {
+                            let vid = self.new_ready_value(element.clone());
+                            frame.bindings.insert(metadata.0, vid);
+                        }
+                        Pattern::Wildcard { .. } | Pattern::Variant { .. } => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// The bounding box of `cell`'s exported geometry, in `cell`'s own
     /// coordinate frame.
     ///
@@ -9461,7 +11391,10 @@ type Seq = im::Vector<Value>;
 #[enumify]
 #[derive(Debug, Clone)]
 pub enum Value {
-    EnumValue(String),
+    /// An enum value. Shared because `match` and field reads clone values.
+    Enum(Arc<EnumValue>),
+    /// A tuple variant used as a callee, awaiting its payload.
+    Ctor(Arc<CtorValue>),
     String(String),
     Linear(LinearExpr),
     Int(i64),
@@ -9543,7 +11476,8 @@ impl Value {
     /// Name of this value's kind, for diagnostics.
     fn kind_name(&self) -> &'static str {
         match self {
-            Self::EnumValue(_) => "enum variant",
+            Self::Enum(_) => "enum value",
+            Self::Ctor(_) => "variant constructor",
             Self::String(_) => "String",
             Self::Linear(_) => "Float",
             Self::Int(_) => "Int",
@@ -9585,6 +11519,65 @@ impl Value {
             Arrayed::Elem(v) => v,
             Arrayed::Array(s) => Self::Seq(s.into_iter().map(Value::from_array).collect()),
         }
+    }
+}
+
+/// An enum value: a variant and its payload. See [`Value::Enum`].
+#[derive(Debug, Clone)]
+pub struct EnumValue {
+    pub variant: String,
+    /// Empty for a unit variant.
+    pub payload: Vec<Value>,
+}
+
+/// A tuple variant as a callable. See [`Value::Ctor`].
+#[derive(Debug, Clone)]
+pub struct CtorValue {
+    pub variant: String,
+    pub arity: usize,
+}
+
+/// Whether `pattern` matches `value`.
+fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) -> bool {
+    match pattern {
+        Pattern::Wildcard { .. } | Pattern::Binding { .. } => true,
+        Pattern::Variant { path, fields, .. } => {
+            let Value::Enum(value) = value else {
+                return false;
+            };
+            path.path
+                .last()
+                .is_some_and(|name| *name.name == *value.variant)
+                && fields.len() == value.payload.len()
+                && fields
+                    .iter()
+                    .zip(&value.payload)
+                    .all(|(field, element)| pattern_matches(field, element))
+        }
+    }
+}
+
+/// Structural equality of two values, or `None` for a pair the evaluator
+/// cannot compare.
+fn values_equal(left: &Value, right: &Value) -> Option<bool> {
+    match (left, right) {
+        (Value::Int(l), Value::Int(r)) => Some(l == r),
+        (Value::Bool(l), Value::Bool(r)) => Some(l == r),
+        (Value::Nil, Value::Nil) => Some(true),
+        (Value::Enum(l), Value::Enum(r)) => {
+            if l.variant != r.variant {
+                return Some(false);
+            }
+            if l.payload.len() != r.payload.len() {
+                return None;
+            }
+            let mut equal = true;
+            for (l, r) in l.payload.iter().zip(&r.payload) {
+                equal &= values_equal(l, r)?;
+            }
+            Some(equal)
+        }
+        _ => None,
     }
 }
 
@@ -10108,6 +12101,7 @@ enum PartialEvalState<T: AstMetadata> {
     Tuple(PartialTupleExpr),
     StructLit(Box<PartialStructLit<T>>),
     ForLoop(Box<PartialForLoop<T>>),
+    Ctor(PartialCtor),
 }
 
 impl<T: AstMetadata> PartialEvalState<T> {
@@ -10146,8 +12140,16 @@ impl<T: AstMetadata> PartialEvalState<T> {
             Self::Tuple(e) => e.items.clone(),
             Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
             Self::ForLoop(f) => vec![f.seq],
+            Self::Ctor(c) => c.args.clone(),
         }
     }
+}
+
+/// A tuple variant being constructed from its payload arguments.
+#[derive(Debug, Clone)]
+struct PartialCtor {
+    variant: String,
+    args: Vec<ValueId>,
 }
 
 #[derive(Debug, Clone)]
@@ -10276,8 +12278,8 @@ struct PartialTupleExpr {
 #[derive(Debug, Clone)]
 struct PartialStructLit<T: AstMetadata> {
     expr: StructLitExpr<Substr, T>,
-    /// The struct being built, from the literal's checked type; its field
-    /// order is the order the value's fields take.
+    /// The struct being built, from the literal's checked type; its
+    /// definition's field order is the order the value's fields take.
     ty: Arc<StructTy>,
     /// One value per entry of `expr.fields`.
     fields: Vec<ValueId>,

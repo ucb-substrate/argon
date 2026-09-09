@@ -1,0 +1,26 @@
+// `Option`, `Some`, and `None` are available in every module without a `use`.
+
+// A `None` keyword parameter makes the parameter optional.
+cell via(layer: String, w: Float, n: Option<Int> = None) {
+    let count = std::unwrap_or(n, 1);
+    let r = rect(layer, x0=0., y0=0., w=w * (count as Float), h=w);
+}
+
+fn widest(items: [Float]) -> Option<Float> {
+    if items == [] {
+        None
+    } else {
+        let rest = widest(tail(items));
+        let w = std::unwrap_or(rest, head(items));
+        Some(std::max(head(items), w))
+    }
+}
+
+cell top() {
+    let single = inst(via("met1", 100.), x=0., y=0.);
+    let triple = inst(via("met1", 100., n=Some(3)), x=0., y=200.);
+    let widths = cons(50., cons(400., cons(120., [])));
+    // A `None` with nothing to infer its argument from takes an annotation.
+    let empty: Option<Float> = None;
+    let outline = rect("met2", x0=0., y0=0., w=std::unwrap_or(widest(widths), 0.), h=std::unwrap_or(empty, 300.));
+}

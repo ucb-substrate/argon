@@ -22,10 +22,10 @@ use std::{
 use arc::Library;
 use argonc::{
     WorkspaceConfig,
-    ast::{Span, WorkspaceAst},
+    ast::Span,
     compile::{
         self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
-        VarIdTyMetadata,
+        TypedWorkspace,
     },
     diagnostics,
     nav::NavIndex,
@@ -481,7 +481,7 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
 }
 
 fn compile_open_cell(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
