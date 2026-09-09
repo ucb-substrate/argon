@@ -63,7 +63,7 @@ tech = "tech.toml"
 pdk = "../pdk"
 
 [gds]
-ring_osc = "~/Downloads/ring_osc.gds"
+ring_osc = "layout/ring_osc.gds"
 "macros::sram" = "layout/sram.gds"
 ```
 
@@ -154,6 +154,85 @@ including on the command line:
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
 ```
 
+Enum variants may carry values. A tuple variant is constructed like a call and
+taken apart by a `match` pattern that binds its payload; `_` skips an element,
+and a bare name or `_` arm matches anything. Every variant is also an item that
+`use` can import:
+
+```rust
+enum Shape {
+    Circle(Float),
+    Box(Float, Float),
+    Empty,
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle(r) => 2. * r,
+        Shape::Box(w, _) => w,
+        _ => 0.,
+    }
+}
+```
+
+Structs, enums, functions, and cells take type parameters, written in angle
+brackets after the name as in Rust. A type parameter is opaque: a value of
+type `T` can be stored, passed, and returned, but not added, compared, cast,
+emitted, indexed, or placed. Type arguments are inferred from the arguments
+and field values at each use, so `last(widths)` is a `Float` when `widths` is
+a `[Float]`:
+
+```rust
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    Pair { first: p.second, second: p.first }
+}
+
+fn second<T>(items: [T]) -> T {
+    head(tail(items))
+}
+
+cell row<T>(items: [T], pitch: Float) {
+    let first = head(items);
+    // ...
+}
+```
+
+The standard library declares `enum Option<T> { Some(T), None }`, and every
+module starts with `Option`, `Some`, and `None` in scope. An `Option`
+parameter with a `None` default is an optional cell parameter, `Option<Node>`
+lets a struct contain itself, and `std::unwrap_or`, `std::is_some`,
+`std::is_none`, `std::first`, and `std::last` work over any element type:
+
+```rust
+struct Node {
+    width: Float,
+    next: Option<Node>,
+}
+
+cell via(layer: String, w: Float, n: Option<Int> = None) {
+    let count = std::unwrap_or(n, 1);
+    // ...
+}
+
+cell top() {
+    let single = inst(via("met1", 100.));
+    let triple = inst(via("met1", 100., n=Some(3)));
+}
+```
+
+Inside a function body, inference spans the whole body, so `let o = None;`
+is fine when a later expression pins its type. Inside a cell, each top-level
+statement is typed on its own, so a value with nothing to infer from takes a
+type annotation or a turbofish: `let o: Option<Int> = None;` or
+`let o = None::<Int>;`. Type arguments in a type position are mandatory for a
+generic type (`Option<Float>`, never a bare `Option`) and forbidden for a
+non-generic one.
+
 Shapes are valid cell arguments too. A `Rect`, `Polygon`, `Path`, or `Point`
 parameter receives the shape by value: the caller's solver resolves its
 coordinates first, and the cell sees them as constants in its own coordinate
@@ -201,8 +280,7 @@ cell tree(n: Int) {
         let child = inst(tree(n - 1));
         eq(child.leaf.x0, leaf.x1 + 50.);
         eq(child.y, 0.);
-    } else {
-    };
+    }
 }
 ```
 

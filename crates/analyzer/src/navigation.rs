@@ -304,25 +304,25 @@ impl<'a> FileViews<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum CompletionContext {
+pub(crate) enum CompletionContext {
     Plain,
     Member { base_end: usize },
     Qualified { segments: Vec<String> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct CallContext {
+pub(crate) struct CallContext {
     callee: std::ops::Range<usize>,
-    path: Vec<String>,
+    pub(crate) path: Vec<String>,
     active_positional: usize,
     active_keyword: Option<String>,
 }
 
-fn is_ident_continue(byte: u8) -> bool {
+pub(crate) fn is_ident_continue(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
-fn completion_context(source: &str, cursor: usize) -> CompletionContext {
+pub(crate) fn completion_context(source: &str, cursor: usize) -> CompletionContext {
     let bytes = source.as_bytes();
     let cursor = cursor.min(bytes.len());
     let mut prefix_start = cursor;
@@ -454,7 +454,7 @@ fn callee_before(
     Some((final_start..end, path))
 }
 
-fn call_context(source: &str, cursor: usize) -> Option<CallContext> {
+pub(crate) fn call_context(source: &str, cursor: usize) -> Option<CallContext> {
     let cursor = cursor.min(source.len());
     let mask = code_mask(source, cursor);
     let mut stack = Vec::new();
@@ -549,14 +549,19 @@ fn completion_item(candidate: CompletionCandidate) -> CompletionItem {
     }
 }
 
-fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionResponse {
+/// Deduplicates candidates by label, keeping the last of each, and sorts them.
+pub(crate) fn completion_items(candidates: Vec<CompletionCandidate>) -> Vec<CompletionItem> {
     let mut unique = HashMap::new();
     for candidate in candidates {
         unique.insert(candidate.label.clone(), candidate);
     }
     let mut candidates = unique.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.label.cmp(&right.label));
-    CompletionResponse::Array(candidates.into_iter().map(completion_item).collect())
+    candidates.into_iter().map(completion_item).collect()
+}
+
+fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionResponse {
+    CompletionResponse::Array(completion_items(candidates))
 }
 
 fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> bool {
@@ -571,7 +576,9 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
                     "cell" | "enum" | "fn" | "mod" | "struct" | "use"
                 )
         }
-        CompletionSite::Statement => match candidate.kind {
+        // `StatementOrElse` also accepts an `else` continuing the `if` just
+        // closed.
+        CompletionSite::Statement | CompletionSite::StatementOrElse => match candidate.kind {
             Kind::Function
             | Kind::Cell
             | Kind::Variable
@@ -580,10 +587,12 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             | Kind::Variant
             | Kind::Struct
             | Kind::Module => true,
-            Kind::Keyword => matches!(
-                candidate.label.as_str(),
-                "false" | "for" | "if" | "let" | "match" | "true"
-            ),
+            Kind::Keyword => {
+                matches!(
+                    candidate.label.as_str(),
+                    "false" | "for" | "if" | "let" | "match" | "true"
+                ) || (site == CompletionSite::StatementOrElse && candidate.label == "else")
+            }
             Kind::Field | Kind::Type => false,
         },
         CompletionSite::Expression => match candidate.kind {
@@ -602,6 +611,17 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             candidate.kind,
             Kind::Cell | Kind::Enum | Kind::Struct | Kind::Type
         ),
+        CompletionSite::Pattern => match candidate.kind {
+            Kind::Enum | Kind::Variant | Kind::Module => true,
+            Kind::Keyword => candidate.label == "_",
+            Kind::Function
+            | Kind::Cell
+            | Kind::Variable
+            | Kind::Parameter
+            | Kind::Struct
+            | Kind::Field
+            | Kind::Type => false,
+        },
         CompletionSite::ImportPath => candidate.kind == Kind::Module,
         CompletionSite::Keyword(keyword) => {
             candidate.kind == Kind::Keyword && candidate.label == keyword
@@ -610,7 +630,7 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
     }
 }
 
-fn filter_completions(
+pub(crate) fn filter_completions(
     candidates: Vec<CompletionCandidate>,
     site: CompletionSite,
 ) -> Vec<CompletionCandidate> {
@@ -631,6 +651,7 @@ fn lsp_symbol_kind(kind: ArgonSymbolKind) -> SymbolKind {
         ArgonSymbolKind::Struct => SymbolKind::STRUCT,
         ArgonSymbolKind::Field => SymbolKind::FIELD,
         ArgonSymbolKind::Module => SymbolKind::MODULE,
+        ArgonSymbolKind::TypeParam => SymbolKind::TYPE_PARAMETER,
     }
 }
 
@@ -707,7 +728,7 @@ impl State {
         Uri::from_file_path(path)
     }
 
-    async fn nav_index(&self) -> Option<std::sync::Arc<NavIndex>> {
+    pub(crate) async fn nav_index(&self) -> Option<std::sync::Arc<NavIndex>> {
         self.published_state.lock().await.nav.clone()
     }
 
@@ -1196,6 +1217,8 @@ mod tests {
             candidate("lib", Kind::Module),
             candidate("width", Kind::Variable),
             candidate("Float", Kind::Type),
+            candidate("_", Kind::Keyword),
+            candidate("Some", Kind::Variant),
         ];
         let labels = |site| {
             filter_completions(candidates.clone(), site)
@@ -1212,15 +1235,28 @@ mod tests {
         );
         assert_eq!(
             labels(CompletionSite::Expression),
-            ["true", "rect", "Widget", "Mode", "Size", "lib", "width"]
+            [
+                "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
         );
         assert_eq!(
             labels(CompletionSite::Statement),
             [
-                "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width"
+                "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
             ]
         );
         assert_eq!(labels(CompletionSite::ImportPath), ["lib"]);
+        assert_eq!(
+            labels(CompletionSite::Pattern),
+            ["Mode", "lib", "_", "Some"]
+        );
+        // The statement candidates, plus `else`.
+        assert_eq!(
+            labels(CompletionSite::StatementOrElse),
+            [
+                "else", "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
+        );
         assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);
         assert!(labels(CompletionSite::Suppressed).is_empty());
     }

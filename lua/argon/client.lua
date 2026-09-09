@@ -52,6 +52,32 @@ M.buf_request = function(bufnr, method, params, handler)
   return client_found
 end
 
+---Send a request and block until it answers, for callers that cannot be
+---asynchronous, such as command-line completion.
+---
+---Prefers a client attached to the current buffer and widens to any client
+---serving `method`, the way |argon.client.any_buf_request| does.
+---@param method string LSP method name
+---@param params table|nil Parameters to send to the server
+---@param timeout_ms integer How long to wait for the response
+---@return table|nil result `nil` if no client answered in time
+M.request_sync_first = function(method, params, timeout_ms)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local clients = M.get_active_argon_lsp_clients(bufnr, { method = method })
+  if #clients == 0 then
+    clients = M.get_active_argon_lsp_clients(nil, { method = method })
+  end
+  local client = clients[1]
+  if not client then
+    return nil
+  end
+  local response = client:request_sync(method, params, timeout_ms, bufnr)
+  if not response or response.err then
+    return nil
+  end
+  return response.result
+end
+
 M.print_error = function(err)
     if err then
         vim.notify(tostring(err), vim.log.levels.ERROR)

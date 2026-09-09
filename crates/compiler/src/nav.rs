@@ -16,16 +16,20 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use arcstr::ArcStr;
 
 use crate::{
     ast::{
-        ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, Ident, IdentPath, ModPath, Scope,
-        Statement, StructDecl, TySpec, TySpecKind, UseDecl, WorkspaceAst,
+        ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, GenericArgs, Ident, IdentPath, ModPath,
+        Pattern, Scope, Statement, StructDecl, TyParam, TySpec, TySpecKind, UseDecl, WorkspaceAst,
     },
-    compile::{BUILTINS, EnumId, RESERVED_CELL_FIELDS, Ty, VarId, VarIdTyMetadata, module_prefix},
+    compile::{
+        AdtDef, BUILTINS, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs, TypedWorkspace, VarId,
+        VarIdTyMetadata, module_prefix, param_map, subst,
+    },
 };
 
 /// Identity of something that can be navigated to.
@@ -55,6 +59,7 @@ pub enum SymbolKind {
     Struct,
     Field,
     Module,
+    TypeParam,
 }
 
 /// Kind of an editor completion candidate.
@@ -213,11 +218,13 @@ pub struct NavIndex {
     /// order. Cell types are nominal and carry no fields of their own, so an
     /// instance's completions come from the declaring cell's `let` bindings.
     cell_field_types: HashMap<VarId, Vec<(String, Ty)>>,
+    /// Struct and enum definitions, for field completions on a struct.
+    type_defs: Arc<TypeDefs>,
 }
 
 impl NavIndex {
-    pub fn build(ast: &WorkspaceAst<VarIdTyMetadata>) -> Self {
-        Builder::new(ast).run()
+    pub fn build(workspace: &TypedWorkspace) -> Self {
+        Builder::new(workspace).run()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -477,17 +484,32 @@ impl NavIndex {
                 .into_iter()
                 .map(|(name, ty)| (name.to_owned(), ty))
                 .collect(),
-            Ty::Inst(cell) => RESERVED_CELL_FIELDS
-                .into_iter()
-                .map(|name| (name.to_owned(), Ty::Float))
-                .chain(
-                    cell.def
-                        .and_then(|cell| self.cell_field_types.get(&cell))
-                        .into_iter()
-                        .flatten()
-                        .cloned(),
-                )
-                .collect(),
+            Ty::Inst(cell) => {
+                let map = cell.param_map();
+                RESERVED_CELL_FIELDS
+                    .into_iter()
+                    .map(|name| (name.to_owned(), Ty::Float))
+                    .chain(
+                        cell.def
+                            .and_then(|cell| self.cell_field_types.get(&cell))
+                            .into_iter()
+                            .flatten()
+                            .map(|(name, ty)| (name.clone(), subst(ty, &map))),
+                    )
+                    .collect()
+            }
+            Ty::Struct(struct_ty) => self
+                .type_defs
+                .get(&struct_ty.def)
+                .and_then(AdtDef::as_struct)
+                .map(|def| {
+                    let map = param_map(&def.params, &struct_ty.args);
+                    def.fields
+                        .iter()
+                        .map(|(name, ty)| (name.clone(), subst(ty, &map)))
+                        .collect()
+                })
+                .unwrap_or_default(),
             Ty::Tuple(items) => items
                 .iter()
                 .cloned()
@@ -694,9 +716,9 @@ const PRIMITIVE_TYPES: [&str; 9] = [
     "Any", "Bool", "Float", "Int", "Path", "Point", "Polygon", "Rect", "String",
 ];
 
-const KEYWORDS: [&str; 15] = [
-    "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod", "true",
-    "struct", "use",
+const KEYWORDS: [&str; 16] = [
+    "_", "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
+    "true", "struct", "use",
 ];
 
 fn completion_kind(kind: SymbolKind) -> CompletionKind {
@@ -710,6 +732,7 @@ fn completion_kind(kind: SymbolKind) -> CompletionKind {
         SymbolKind::Struct => CompletionKind::Struct,
         SymbolKind::Field => CompletionKind::Field,
         SymbolKind::Module => CompletionKind::Module,
+        SymbolKind::TypeParam => CompletionKind::Type,
     }
 }
 
@@ -861,15 +884,35 @@ fn field_candidate(name: impl Into<String>, ty: &Ty) -> CompletionCandidate {
     }
 }
 
+/// Renders `<A, B>` for a generic declaration, or nothing.
+fn ty_params_label(params: &[Arc<TyParamTy>]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let names = params
+        .iter()
+        .map(|param| param.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("<{names}>")
+}
+
 fn declared_signature(
     keyword: &str,
     name: &str,
+    ty_params: &[Arc<TyParamTy>],
     args: &[ArgDecl<arcstr::Substr, VarIdTyMetadata>],
     return_ty: Option<&Ty>,
 ) -> SignatureInfo {
     let parameters = args
         .iter()
-        .map(|arg| parameter(&format!("{}: {}", arg.name.name, arg.metadata.1), false))
+        .map(|arg| {
+            // A parameter with a default can be named at the call site.
+            parameter(
+                &format!("{}: {}", arg.name.name, arg.metadata.1),
+                arg.default.is_some(),
+            )
+        })
         .collect::<Vec<_>>();
     let args = parameters
         .iter()
@@ -879,16 +922,18 @@ fn declared_signature(
     let return_ty = return_ty
         .filter(|ty| **ty != Ty::Nil)
         .map_or_else(String::new, |ty| format!(" -> {ty}"));
+    let ty_params = ty_params_label(ty_params);
     SignatureInfo {
-        label: format!("{keyword} {name}({args}){return_ty}"),
+        label: format!("{keyword} {name}{ty_params}({args}){return_ty}"),
         parameters,
     }
 }
 
 struct Builder<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
-    /// The `VarId` an enum's name is bound to, by the id inside its [`Ty`].
-    enums: HashMap<EnumId, VarId>,
+    defs: &'a TypeDefs,
+    /// Each variant's enum and name, by the variant's own `VarId`.
+    variants: HashMap<VarId, (VarId, String)>,
     /// Cell `VarId` to field name to the `VarId` of the `let` declaring it.
     cell_fields: HashMap<VarId, HashMap<String, VarId>>,
     /// Fn or cell `VarId` to parameter name to the parameter's `VarId`.
@@ -922,6 +967,19 @@ fn is_navigable(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "ar")
 }
 
+/// The id of the type parameter named `name` mentioned in `ty`, if any.
+fn find_param(ty: &Ty, name: &str) -> Option<VarId> {
+    match ty {
+        Ty::Param(param) if param.name == name => Some(param.id),
+        Ty::Seq(inner) => find_param(inner, name),
+        Ty::Tuple(items) => items.iter().find_map(|item| find_param(item, name)),
+        Ty::Struct(s) => s.args.iter().find_map(|arg| find_param(arg, name)),
+        Ty::Enum(e) => e.args.iter().find_map(|arg| find_param(arg, name)),
+        Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().find_map(|arg| find_param(arg, name)),
+        _ => None,
+    }
+}
+
 /// Whether a module contributes its source text to an index.
 ///
 /// A file that did not parse has an empty declaration list and no usable
@@ -932,23 +990,82 @@ fn indexes_source(module: &crate::ast::annotated::AnnotatedAst<VarIdTyMetadata>)
 }
 
 impl<'a> Builder<'a> {
-    fn new(ast: &'a WorkspaceAst<VarIdTyMetadata>) -> Self {
+    fn new(workspace: &'a TypedWorkspace) -> Self {
         let mut builder = Self {
-            ast,
-            enums: HashMap::new(),
+            ast: &workspace.ast,
+            defs: &workspace.defs,
+            variants: HashMap::new(),
             cell_fields: HashMap::new(),
             params: HashMap::new(),
             current: const { &Vec::new() },
             path: Path::new(""),
             visible: 0,
-            index: NavIndex::default(),
+            index: NavIndex {
+                type_defs: workspace.defs.clone(),
+                ..NavIndex::default()
+            },
         };
         builder.collect_declarations();
+        builder.collect_prelude();
         builder
     }
 
+    /// Adds `Option`, `Some`, and `None` to the items of every module that
+    /// does not declare them, as the type checker binds them.
+    fn collect_prelude(&mut self) {
+        let std = vec!["std".to_owned()];
+        let Some(option) = self.ast.get(&std).and_then(|ast| {
+            ast.ast.decls.iter().find_map(|decl| match decl {
+                Decl::Enum(decl) if decl.name.name == "Option" => Some(decl),
+                _ => None,
+            })
+        }) else {
+            return;
+        };
+        let Some(option_id) = option.metadata else {
+            return;
+        };
+        let modules = self
+            .index
+            .module_items
+            .keys()
+            .filter(|module| self.ast.contains_key(*module))
+            .cloned()
+            .collect::<Vec<_>>();
+        for module in modules {
+            let declared = |name: &str| {
+                self.index.module_items[&module]
+                    .iter()
+                    .any(|item| item.name == name && !matches!(item.key, DefKey::Module(_)))
+            };
+            let mut items = Vec::new();
+            if !declared("Option") {
+                items.push(ModuleItem {
+                    name: "Option".to_owned(),
+                    key: DefKey::Var(option_id),
+                    available_after: 0,
+                });
+            }
+            for variant in &option.variants {
+                let name = variant.name.name.to_string();
+                if !declared(&name) {
+                    items.push(ModuleItem {
+                        key: DefKey::Variant(option_id, name.clone()),
+                        name,
+                        available_after: 0,
+                    });
+                }
+            }
+            self.index
+                .module_items
+                .get_mut(&module)
+                .expect("listed above")
+                .extend(items);
+        }
+    }
+
     /// Records what the reference walk may need before it reaches the
-    /// declaring module: each enum's `VarId`, each cell's field bindings, and
+    /// declaring module: each variant's enum, each cell's field bindings, and
     /// each fn's or cell's parameters.
     fn collect_declarations(&mut self) {
         for (module, ast) in self.ast.iter() {
@@ -988,8 +1105,15 @@ impl<'a> Builder<'a> {
             for decl in &ast.ast.decls {
                 match decl {
                     Decl::Enum(decl) => {
-                        if let Some((name_id, enum_id)) = decl.metadata {
-                            self.enums.insert(enum_id, name_id);
+                        if let Some(name_id) = decl.metadata {
+                            for variant in &decl.variants {
+                                if let Some(variant_id) = variant.metadata {
+                                    self.variants.insert(
+                                        variant_id,
+                                        (name_id, variant.name.name.to_string()),
+                                    );
+                                }
+                            }
                             self.index
                                 .module_items
                                 .entry(module.clone())
@@ -1031,15 +1155,10 @@ impl<'a> Builder<'a> {
                             .push(ModuleItem {
                                 name: decl.name.name.to_string(),
                                 key: DefKey::Var(decl.metadata.1),
-                                // Cells enter the compiler's binding frame
-                                // only after their body is checked.
-                                available_after: if decl.span.end() <= ast.source_text.len() {
-                                    decl.span.end()
-                                } else {
-                                    // GDS declarations are generated before
-                                    // user source and are always in scope.
-                                    0
-                                },
+                                // Cells may be declared in any order and may
+                                // recurse, so one is in scope throughout its
+                                // module.
+                                available_after: 0,
                             });
                     }
                     Decl::Fn(decl) => {
@@ -1216,11 +1335,50 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Defines each declared type parameter, zipped with the checked
+    /// parameters of its declaration, in scope throughout `scope`.
+    fn ty_params(
+        &mut self,
+        decl_params: &'a [TyParam<arcstr::Substr, VarIdTyMetadata>],
+        params: &[Arc<TyParamTy>],
+        scope: cfgrammar::Span,
+    ) {
+        for (decl_param, param) in decl_params.iter().zip(params) {
+            let key = DefKey::Var(param.id);
+            self.define(
+                key.clone(),
+                SymbolKind::TypeParam,
+                &decl_param.name,
+                DefinitionInfo {
+                    detail: format!("type parameter {}", param.name),
+                    ty: None,
+                    signature: None,
+                    full_span: None,
+                },
+            );
+            self.index
+                .scope_bindings
+                .entry(self.path.to_path_buf())
+                .or_default()
+                .push(ScopeBinding {
+                    name: param.name.clone(),
+                    key,
+                    scope,
+                    available_after: scope.start(),
+                });
+        }
+    }
+
     fn struct_decl(&mut self, decl: &'a StructDecl<arcstr::Substr, VarIdTyMetadata>) {
         // As for an enum, a name the type pass rejected has no id.
         let Some(name_id) = decl.metadata else {
             return;
         };
+        let params = self
+            .defs
+            .get(&name_id)
+            .map(|def| def.params().to_vec())
+            .unwrap_or_default();
         let fields = decl
             .fields
             .iter()
@@ -1232,12 +1390,17 @@ impl<'a> Builder<'a> {
             SymbolKind::Struct,
             &decl.name,
             DefinitionInfo {
-                detail: format!("struct {} {{ {fields} }}", decl.name.name),
+                detail: format!(
+                    "struct {}{} {{ {fields} }}",
+                    decl.name.name,
+                    ty_params_label(&params)
+                ),
                 ty: None,
                 signature: None,
                 full_span: Some(decl.span),
             },
         );
+        self.ty_params(&decl.params, &params, decl.span);
         for field in &decl.fields {
             self.define(
                 DefKey::Field(name_id, field.name.name.to_string()),
@@ -1257,13 +1420,32 @@ impl<'a> Builder<'a> {
     fn enum_decl(&mut self, decl: &'a EnumDecl<arcstr::Substr, VarIdTyMetadata>) {
         // A name the type pass rejected has no id, so there is nothing to key
         // a definition by and nothing that could refer to it.
-        let Some((name_id, _)) = decl.metadata else {
+        let Some(name_id) = decl.metadata else {
             return;
+        };
+        let def = self.defs.get(&name_id).and_then(AdtDef::as_enum);
+        let params = def.map(|def| def.params.clone()).unwrap_or_default();
+        // A variant's rendering, `Some(T)` or `None`, from its checked payload.
+        let variant_label = |name: &str| {
+            let payload = def
+                .and_then(|def| def.variants.get(name))
+                .map(|variant| &variant.payload[..])
+                .unwrap_or_default();
+            if payload.is_empty() {
+                name.to_owned()
+            } else {
+                let payload = payload
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{name}({payload})")
+            }
         };
         let variants = decl
             .variants
             .iter()
-            .map(|variant| variant.name.as_str())
+            .map(|variant| variant_label(&variant.name.name))
             .collect::<Vec<_>>()
             .join(", ");
         self.define(
@@ -1271,29 +1453,53 @@ impl<'a> Builder<'a> {
             SymbolKind::Enum,
             &decl.name,
             DefinitionInfo {
-                detail: format!("enum {} {{ {variants} }}", decl.name.name),
+                detail: format!(
+                    "enum {}{} {{ {variants} }}",
+                    decl.name.name,
+                    ty_params_label(&params)
+                ),
                 ty: None,
                 signature: None,
-                full_span: None,
+                full_span: Some(decl.span),
             },
         );
+        self.ty_params(&decl.params, &params, decl.span);
         for variant in &decl.variants {
+            let name = variant.name.name.to_string();
+            let payload = def
+                .and_then(|def| def.variants.get(name.as_str()))
+                .map(|variant| variant.payload.clone())
+                .unwrap_or_default();
+            let label = format!("{}::{}", decl.name.name, variant_label(&name));
+            // A tuple variant is callable, so it has a signature: one
+            // positional parameter per payload element.
+            let signature = (!payload.is_empty()).then(|| SignatureInfo {
+                label: label.clone(),
+                parameters: payload
+                    .iter()
+                    .map(|ty| parameter(&ty.to_string(), false))
+                    .collect(),
+            });
             self.define(
-                DefKey::Variant(name_id, variant.name.to_string()),
+                DefKey::Variant(name_id, name),
                 SymbolKind::Variant,
-                variant,
+                &variant.name,
                 DefinitionInfo {
-                    detail: format!("{}::{}", decl.name.name, variant.name),
+                    detail: label,
                     ty: None,
-                    signature: None,
-                    full_span: None,
+                    signature,
+                    full_span: Some(variant.span),
                 },
             );
+            for (spec, ty) in variant.payload.iter().zip(&payload) {
+                self.ty_spec(spec, ty);
+            }
         }
     }
 
     fn cell_decl(&mut self, decl: &'a CellDecl<arcstr::Substr, VarIdTyMetadata>) {
-        let signature = declared_signature("cell", &decl.name.name, &decl.args, None);
+        let params = self.cell_ty_params(decl.metadata.1).unwrap_or_default();
+        let signature = declared_signature("cell", &decl.name.name, &params, &decl.args, None);
         self.define(
             DefKey::Var(decl.metadata.1),
             SymbolKind::Cell,
@@ -1305,18 +1511,65 @@ impl<'a> Builder<'a> {
                 full_span: Some(decl.span),
             },
         );
+        self.ty_params(&decl.params, &params, decl.span);
         for arg in &decl.args {
             self.arg_decl(arg, decl.scope.span);
         }
         self.scope(&decl.scope);
     }
 
+    /// The type parameters of the cell declared with `cell_id`, rebuilt from
+    /// its declaration since a cell's metadata carries no type of its own.
+    fn cell_ty_params(&self, cell_id: VarId) -> Option<Vec<Arc<TyParamTy>>> {
+        self.ast.values().find_map(|ast| {
+            ast.ast.decls.iter().find_map(|decl| match decl {
+                Decl::Cell(decl) if decl.metadata.1 == cell_id => Some(
+                    decl.params
+                        .iter()
+                        .map(|param| {
+                            Arc::new(TyParamTy {
+                                id: self.param_id(cell_id, &param.name.name),
+                                name: param.name.name.to_string(),
+                            })
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+        })
+    }
+
+    /// The id a type parameter `name` of the declaration `owner` resolves to,
+    /// recovered from the checked types that mention it.
+    fn param_id(&self, owner: VarId, name: &str) -> VarId {
+        self.ast
+            .values()
+            .find_map(|ast| {
+                ast.ast.decls.iter().find_map(|decl| match decl {
+                    Decl::Cell(decl) if decl.metadata.1 == owner => decl
+                        .args
+                        .iter()
+                        .find_map(|arg| find_param(&arg.metadata.1, name))
+                        .or_else(|| {
+                            decl.scope.stmts.iter().find_map(|stmt| match stmt {
+                                Statement::LetBinding(binding) => {
+                                    find_param(&binding.value.ty(), name)
+                                }
+                                _ => None,
+                            })
+                        }),
+                    _ => None,
+                })
+            })
+            .unwrap_or(0)
+    }
+
     fn fn_decl(&mut self, decl: &'a FnDecl<arcstr::Substr, VarIdTyMetadata>) {
-        let return_ty = match &decl.metadata.2 {
-            Ty::Fn(fn_ty) => Some(&fn_ty.ret),
-            _ => None,
+        let (params, return_ty) = match &decl.metadata.2 {
+            Ty::Fn(fn_ty) => (fn_ty.params.clone(), Some(&fn_ty.ret)),
+            _ => (Vec::new(), None),
         };
-        let signature = declared_signature("fn", &decl.name.name, &decl.args, return_ty);
+        let signature = declared_signature("fn", &decl.name.name, &params, &decl.args, return_ty);
         self.define(
             DefKey::Var(decl.metadata.1),
             SymbolKind::Function,
@@ -1328,6 +1581,7 @@ impl<'a> Builder<'a> {
                 full_span: Some(decl.span),
             },
         );
+        self.ty_params(&decl.params, &params, decl.span);
         for arg in &decl.args {
             self.arg_decl(arg, decl.scope.span);
         }
@@ -1346,18 +1600,41 @@ impl<'a> Builder<'a> {
         let Some((item, prefix)) = decl.path.split_last() else {
             return;
         };
-        self.module_path(prefix);
         // `use` has no metadata of its own; the imported binding reuses the
         // original declaration's `VarId`, so resolve it structurally against
-        // the exporting module's declarations.
+        // the exporting module's declarations. `module::Enum::Variant` names
+        // a variant when the module-plus-enum reading is not a module.
         let module = module_prefix(
             self.current,
             decl.path.iter().map(|ident| ident.name.as_str()),
             1,
         );
-        let target = self
-            .exported(&module, &item.name)
-            .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id)));
+        let target = if self.ast.contains_key(&module) {
+            self.module_path(prefix);
+            self.exported(&module, &item.name)
+                .map_or(Target::Unresolved, Target::Def)
+        } else {
+            let (enum_ident, modules) = prefix.split_last().expect("use paths have two segments");
+            self.module_path(modules);
+            let enum_module = module_prefix(
+                self.current,
+                decl.path.iter().map(|ident| ident.name.as_str()),
+                2,
+            );
+            let enum_id = match self.exported(&enum_module, &enum_ident.name) {
+                Some(DefKey::Var(id)) => Some(id),
+                _ => None,
+            };
+            self.record(
+                enum_ident.span,
+                enum_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id))),
+            );
+            let key = enum_id.map(|id| DefKey::Variant(id, item.name.to_string()));
+            match key {
+                Some(key) if self.index.defs.contains_key(&key) => Target::Def(key),
+                _ => Target::Unresolved,
+            }
+        };
         self.record(item.span, target.clone());
         // An alias is another name for the same binding, not a new definition,
         // so navigating from it lands on the original declaration.
@@ -1377,8 +1654,8 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// The `VarId` a module exports under `name`, if any.
-    fn exported(&self, module: &ModPath, name: &str) -> Option<VarId> {
+    /// What a module exports under `name`, if anything.
+    fn exported(&self, module: &ModPath, name: &str) -> Option<DefKey> {
         self.exported_within(module, name, 0)
     }
 
@@ -1390,18 +1667,18 @@ impl<'a> Builder<'a> {
     /// Declarations are checked first because they are bound last and so win.
     /// `depth` bounds the chase, since a cycle of re-exports is a user error
     /// the type checker reports rather than something to hang on.
-    fn exported_within(&self, module: &ModPath, name: &str, depth: usize) -> Option<VarId> {
+    fn exported_within(&self, module: &ModPath, name: &str, depth: usize) -> Option<DefKey> {
         const MAX_REEXPORT_DEPTH: usize = 16;
         let decls = &self.ast.get(module)?.ast.decls;
         let declared = decls.iter().find_map(|decl| match decl {
             Decl::Fn(decl) if decl.name.name == name => Some(decl.metadata.1),
             Decl::Cell(decl) if decl.name.name == name => Some(decl.metadata.1),
-            Decl::Enum(decl) if decl.name.name == name => decl.metadata.map(|(id, _)| id),
+            Decl::Enum(decl) if decl.name.name == name => decl.metadata,
             Decl::Struct(decl) if decl.name.name == name => decl.metadata,
             _ => None,
         });
         if declared.is_some() || depth == MAX_REEXPORT_DEPTH {
-            return declared;
+            return declared.map(DefKey::Var);
         }
         decls.iter().find_map(|decl| {
             let Decl::Use(decl) = decl else { return None };
@@ -1409,9 +1686,18 @@ impl<'a> Builder<'a> {
             if decl.alias.as_ref().unwrap_or(item).name != name {
                 return None;
             }
-            let exporter =
-                module_prefix(module, decl.path.iter().map(|ident| ident.name.as_str()), 1);
-            self.exported_within(&exporter, &item.name, depth + 1)
+            let names = || decl.path.iter().map(|ident| ident.name.as_str());
+            let exporter = module_prefix(module, names(), 1);
+            if self.ast.contains_key(&exporter) {
+                return self.exported_within(&exporter, &item.name, depth + 1);
+            }
+            // `use m::Enum::Variant`: the enum is an export of its module.
+            let enum_module = module_prefix(module, names(), 2);
+            let enum_ident = &decl.path[decl.path.len() - 2];
+            match self.exported_within(&enum_module, &enum_ident.name, depth + 1)? {
+                DefKey::Var(enum_id) => Some(DefKey::Variant(enum_id, item.name.to_string())),
+                _ => None,
+            }
         })
     }
 
@@ -1460,17 +1746,19 @@ impl<'a> Builder<'a> {
     /// to resolve, and its names are reported as unresolved.
     fn ty_spec(&mut self, spec: &'a TySpec<arcstr::Substr, VarIdTyMetadata>, ty: &Ty) {
         match (&spec.kind, ty) {
-            (TySpecKind::Ident(name), Ty::Enum(enum_ty)) => {
-                let target = self
-                    .enums
-                    .get(&enum_ty.id)
-                    .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id)));
-                self.record(name.span, target);
+            (TySpecKind::Path { name, args }, Ty::Enum(enum_ty)) => {
+                self.record(name.span, Target::Def(DefKey::Var(enum_ty.def)));
+                self.ty_args(args, &enum_ty.args);
             }
-            (TySpecKind::Ident(name), Ty::Struct(struct_ty)) => {
-                self.record(name.span, Target::Def(DefKey::Var(struct_ty.id)));
+            (TySpecKind::Path { name, args }, Ty::Struct(struct_ty)) => {
+                self.record(name.span, Target::Def(DefKey::Var(struct_ty.def)));
+                self.ty_args(args, &struct_ty.args);
             }
-            (TySpecKind::Ident(name), ty) => {
+            (TySpecKind::Path { name, args }, Ty::Param(param)) => {
+                self.record(name.span, Target::Def(DefKey::Var(param.id)));
+                self.ty_args(args, &[]);
+            }
+            (TySpecKind::Path { name, args }, ty) => {
                 // `ty_from_spec` resolves a name that is not a primitive by
                 // looking it up, so an annotation can also name a declaration.
                 // A cell's type carries the id of the cell that declared it,
@@ -1482,6 +1770,7 @@ impl<'a> Builder<'a> {
                     }),
                 };
                 self.record(name.span, target);
+                self.ty_args(args, &[]);
             }
             (TySpecKind::Seq(inner), Ty::Seq(element)) => self.ty_spec(inner, element),
             (TySpecKind::Tuple(items), Ty::Tuple(types)) if items.len() == types.len() => {
@@ -1498,6 +1787,31 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Walks type arguments alongside the types they resolved to, or alone
+    /// when the counts disagree.
+    fn ty_args(&mut self, specs: &'a [TySpec<arcstr::Substr, VarIdTyMetadata>], tys: &[Ty]) {
+        for (index, spec) in specs.iter().enumerate() {
+            let ty = if specs.len() == tys.len() {
+                &tys[index]
+            } else {
+                &Ty::Unknown
+            };
+            self.ty_spec(spec, ty);
+        }
+    }
+
+    /// Walks a turbofish, whose arguments are the type arguments of the value
+    /// the path names when that value's type carries them.
+    fn generic_args(&mut self, args: &'a GenericArgs<arcstr::Substr, VarIdTyMetadata>, ty: &Ty) {
+        let tys: &[Ty] = match ty {
+            Ty::Enum(enum_ty) => &enum_ty.args,
+            Ty::Struct(struct_ty) => &struct_ty.args,
+            Ty::Ctor(ctor) => &ctor.args,
+            _ => &[],
+        };
+        self.ty_args(&args.args, tys);
+    }
+
     // ----------------------------------------------------------- statements
 
     fn scope(&mut self, scope: &'a Scope<arcstr::Substr, VarIdTyMetadata>) {
@@ -1509,6 +1823,9 @@ impl<'a> Builder<'a> {
                     self.expr(&binding.value);
                     let key = DefKey::Var(binding.metadata);
                     let ty = binding.value.ty();
+                    if let Some(spec) = &binding.ty {
+                        self.ty_spec(spec, &ty);
+                    }
                     self.define(
                         key.clone(),
                         SymbolKind::Local,
@@ -1584,9 +1901,8 @@ impl<'a> Builder<'a> {
                 let Some((callee, prefix)) = call.func.path.split_last() else {
                     return;
                 };
-                self.module_path(prefix);
                 let target = match call.metadata.0 {
-                    Some(id) => Target::Def(DefKey::Var(id)),
+                    Some(id) => self.var_target(id),
                     // Builtins are matched by name and never bound, so an
                     // unbound single-segment call is one of them.
                     None if prefix.is_empty() => builtin_function(&callee.name)
@@ -1595,7 +1911,11 @@ impl<'a> Builder<'a> {
                         }),
                     None => Target::Unresolved,
                 };
+                self.qualifier(prefix, &target);
                 self.record(callee.span, target);
+                if let Some(args) = &call.func.generic_args {
+                    self.generic_args(args, &call.metadata.1);
+                }
                 for arg in &call.args.posargs {
                     self.expr(arg);
                 }
@@ -1627,14 +1947,16 @@ impl<'a> Builder<'a> {
             Expr::Match(match_) => {
                 self.expr(&match_.scrutinee);
                 for arm in &match_.arms {
-                    self.ident_path(&arm.pattern);
+                    self.pattern(&arm.pattern, arm.expr.span());
                     self.expr(&arm.expr);
                 }
             }
             Expr::If(if_) => {
                 self.expr(&if_.cond);
                 self.scope(&if_.then);
-                self.scope(&if_.else_);
+                if let Some(else_) = &if_.else_ {
+                    self.scope(else_);
+                }
             }
             // Comparisons are `BinOp::Cmp`, so this covers them too.
             Expr::BinOp(op) => {
@@ -1662,12 +1984,15 @@ impl<'a> Builder<'a> {
                 // The struct reaches us through the literal's checked type;
                 // like a call's callee, the path itself carries no `VarId`.
                 let struct_id = match &lit.metadata {
-                    Ty::Struct(struct_ty) => Some(struct_ty.id),
+                    Ty::Struct(struct_ty) => Some(struct_ty.def),
                     _ => None,
                 };
                 let target =
                     struct_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id)));
                 self.record(name.span, target);
+                if let Some(args) = &lit.path.generic_args {
+                    self.generic_args(args, &lit.metadata);
+                }
                 for field in &lit.fields {
                     // A shorthand field is one token naming both the field and
                     // a local. `target_at` keeps one target per span, and the
@@ -1694,35 +2019,91 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// What the binding `id` refers to: a variant of its enum, or the
+    /// declaration itself.
+    fn var_target(&self, id: VarId) -> Target {
+        match self.variants.get(&id) {
+            Some((enum_id, name)) => Target::Def(DefKey::Variant(*enum_id, name.clone())),
+            None => Target::Def(DefKey::Var(id)),
+        }
+    }
+
+    /// Records the segments qualifying an item resolved to `target`: modules,
+    /// and the enum of a variant.
+    fn qualifier(&mut self, prefix: &'a [Ident<arcstr::Substr, VarIdTyMetadata>], target: &Target) {
+        let Some((last, modules)) = prefix.split_last() else {
+            return;
+        };
+        if let Target::Def(DefKey::Variant(enum_id, _)) = target {
+            self.module_path(modules);
+            self.record(last.span, Target::Def(DefKey::Var(*enum_id)));
+        } else {
+            self.module_path(prefix);
+        }
+    }
+
     fn ident_path(&mut self, path: &'a IdentPath<arcstr::Substr, VarIdTyMetadata>) {
-        match path.path.as_slice() {
-            [] => {}
-            [name] => {
-                let target = path
-                    .metadata
-                    .0
-                    .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id)));
-                self.record(name.span, target);
+        let Some((name, prefix)) = path.path.split_last() else {
+            return;
+        };
+        let target = path
+            .metadata
+            .0
+            .map_or(Target::Unresolved, |id| self.var_target(id));
+        // A multi-segment path is `module::item` or `Enum::Variant`, the enum
+        // itself possibly module-qualified.
+        if !prefix.is_empty() && target == Target::Unresolved {
+            let (last, modules) = prefix.split_last().expect("non-empty");
+            self.module_path(modules);
+            self.record(last.span, Target::Unresolved);
+        } else {
+            self.qualifier(prefix, &target);
+        }
+        self.record(name.span, target);
+        if let Some(args) = &path.generic_args {
+            self.generic_args(args, &path.metadata.1);
+        }
+    }
+
+    /// Walks a `match` arm's pattern; a binding is a local scoped to the arm's
+    /// body.
+    fn pattern(
+        &mut self,
+        pattern: &'a Pattern<arcstr::Substr, VarIdTyMetadata>,
+        body: cfgrammar::Span,
+    ) {
+        match pattern {
+            Pattern::Wildcard { .. } => {}
+            Pattern::Binding { name, metadata } => {
+                let key = DefKey::Var(metadata.0);
+                let ty = metadata.1.clone();
+                self.define(
+                    key.clone(),
+                    SymbolKind::Local,
+                    name,
+                    DefinitionInfo {
+                        detail: format!("{}: {ty}", name.name),
+                        ty: Some(ty),
+                        signature: None,
+                        full_span: None,
+                    },
+                );
+                self.index
+                    .scope_bindings
+                    .entry(self.path.to_path_buf())
+                    .or_default()
+                    .push(ScopeBinding {
+                        name: name.name.to_string(),
+                        key,
+                        scope: body,
+                        available_after: body.start(),
+                    });
             }
-            // A multi-segment path is an enum variant, optionally qualified by
-            // the module the enum lives in.
-            segments => {
-                let (variant, rest) = segments.split_last().expect("non-empty");
-                let (enum_name, prefix) = rest.split_last().expect("at least two segments");
-                self.module_path(prefix);
-                let enum_id = match &path.metadata.1 {
-                    Ty::Enum(enum_ty) => self.enums.get(&enum_ty.id).copied(),
-                    _ => None,
-                };
-                let (enum_target, variant_target) = match enum_id {
-                    Some(id) => (
-                        Target::Def(DefKey::Var(id)),
-                        Target::Def(DefKey::Variant(id, variant.name.to_string())),
-                    ),
-                    None => (Target::Unresolved, Target::Unresolved),
-                };
-                self.record(enum_name.span, enum_target);
-                self.record(variant.span, variant_target);
+            Pattern::Variant { path, fields, .. } => {
+                self.ident_path(path);
+                for field in fields {
+                    self.pattern(field, body);
+                }
             }
         }
     }
@@ -1772,7 +2153,7 @@ impl<'a> Builder<'a> {
             Ty::Inst(_) | Ty::Rect | Ty::Polygon | Ty::Path | Ty::Point => {
                 Target::Builtin(Builtin::Field(name.to_string()))
             }
-            Ty::Struct(struct_ty) => Target::Def(DefKey::Field(struct_ty.id, name.to_string())),
+            Ty::Struct(struct_ty) => Target::Def(DefKey::Field(struct_ty.def, name.to_string())),
             _ => Target::Unresolved,
         }
     }
@@ -1868,6 +2249,32 @@ mod tests {
         assert!(!is_navigable(Path::new("/virtual/sram.gds")));
         assert!(is_navigable(Path::new(STD_PATH)));
         assert!(is_navigable(Path::new(ROOT)));
+    }
+
+    /// Bindings resolve inside an `else`-less `if` and an `else if` branch,
+    /// whose scope the parser synthesizes.
+    #[test]
+    fn names_resolve_inside_else_less_ifs_and_else_if_chains() {
+        check(
+            r#"
+cell top(flag: Bool, other: Bool) {
+    let base = 1.;
+    if fl$0ag {
+        let inner = ba$0se + 1.;
+        eq(inn$0er, 2.);
+    }
+    if other {
+        eq(ba$0se, 1.);
+    } else if fl$0ag {
+        let nested = ba$0se + 2.;
+        eq(nest$0ed, 3.);
+    }
+}
+"#,
+            &[
+                "flag#0", "base#0", "inner#0", "base#0", "flag#0", "base#0", "nested#0",
+            ],
+        );
     }
 
     #[test]
@@ -2023,6 +2430,98 @@ cell top() {
 "#,
             &["Mode#0", "Mode#0", "Fast#0", "Mode#0", "Slow#0"],
         );
+    }
+
+    #[test]
+    fn type_parameters_resolve_to_their_declaration() {
+        check(
+            r#"
+fn las$0t<T$0>(items: [T$0]) -> T$0 { head(items) }
+
+struct Pair<A$0, B> { first: A$0, second: B$0, }
+
+cell row<T$0>(items: [T$0]) {}
+"#,
+            &[
+                "last#0", "T#0", "T#0", "T#0", "A#0", "A#0", "B#0", "T#3", "T#3",
+            ],
+        );
+    }
+
+    #[test]
+    fn variants_with_payloads_and_pattern_bindings_resolve() {
+        check(
+            r#"
+enum Shape { Cir$0cle(Float), Empty, }
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Cir$0cle(rad$0ius) => rad$0ius,
+        wha$0tever => 0.,
+    }
+}
+
+"#,
+            &["Circle#0", "Circle#0", "radius#0", "radius#0", "whatever#0"],
+        );
+        // The prelude's `Some` is declared in the standard library.
+        let (_, index, offsets) = index("fn wrap(s: Int) -> Option<Int> { So$0me(s) }");
+        let definition = index
+            .definition_at(Path::new(ROOT), offsets[0])
+            .expect("Some resolves to the standard library's variant");
+        assert_eq!(definition.kind, SymbolKind::Variant);
+        let DefLocation::Source(span) = &definition.location else {
+            panic!("expected a source location, got {:?}", definition.location);
+        };
+        assert_eq!(span.path, Path::new(STD_PATH));
+        assert_eq!(&STD_SOURCE[span.span.start()..span.span.end()], "Some");
+        assert_eq!(definition.detail, "Option::Some(T)");
+    }
+
+    #[test]
+    fn generic_types_hover_and_complete() {
+        let source = r#"
+struct Pair<A, B> { first: A, second: B, }
+fn f<T>(items: [T]) -> T { head(items) }
+cell top() {
+    let p = Pair { first: 1, second: 2. };
+    let w = p.first;
+    let o: Option<Float> = None;
+    let v = match o { Some(inner) => inner, None => 0., };
+}
+"#;
+        let (source, index, _) = index(source);
+        let hover = |needle: &str| {
+            index
+                .hover_at(Path::new(ROOT), source.find(needle).unwrap())
+                .unwrap_or_else(|| panic!("hover on {needle}"))
+                .contents
+        };
+        assert_eq!(hover("T>(items"), "type parameter T");
+        assert_eq!(hover("f<T>"), "fn f<T>(items: [T]) -> T");
+        assert_eq!(
+            hover("Pair<A, B>"),
+            "struct Pair<A, B> { first: A, second: B }"
+        );
+        assert_eq!(hover("o: Option"), "let o: std::Option<Float>");
+        assert_eq!(hover("p = Pair"), "let p: Pair<Int, Float>");
+        assert_eq!(hover("inner) =>"), "inner: Float");
+
+        // Type-position completion lists the type parameter in scope.
+        let inside_f = source.find("[T]").unwrap() + 1;
+        let labels = labels(index.completions_at(Path::new(ROOT), inside_f));
+        assert!(labels.iter().any(|label| label == "T"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "Option"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "Some"), "{labels:?}");
+
+        // Field completion on a `Pair<Int, Float>` substitutes the arguments.
+        let after_p = source.find("p.first").unwrap() + 1;
+        let fields = index.member_completions_at(Path::new(ROOT), after_p);
+        let details = fields
+            .iter()
+            .map(|candidate| candidate.detail.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(details, ["field first: Int", "field second: Float"]);
     }
 
     /// A type annotation resolves through an ordinary lookup when it is not a
@@ -2412,8 +2911,10 @@ cell top() {
         }
     }
 
+    /// Declarations are visible throughout their module, wherever they sit,
+    /// including the one being completed in. Lexical bindings are not.
     #[test]
-    fn completion_respects_lexical_scope_and_declaration_order() {
+    fn completion_respects_lexical_scope_but_not_declaration_order() {
         let source = r#"
 struct Size { width: Float }
 fn helper(value: Float) -> Float { value }
@@ -2426,6 +2927,7 @@ cell top(arg: Float) {
     } else {};
     let later = 2.;
 }
+cell later_cell() {}
 "#;
         let (_, index, offsets) = index(source);
         let labels = labels(index.completions_at(Path::new(ROOT), offsets[0]));
@@ -2434,6 +2936,10 @@ cell top(arg: Float) {
             "earlier",
             "nested",
             "earlier_cell",
+            // A cell declared after the cursor, and the cell being completed
+            // in: cells may be declared out of order and may recurse.
+            "later_cell",
+            "top",
             "helper",
             "Size",
             "rect",
@@ -2443,12 +2949,10 @@ cell top(arg: Float) {
                 "missing {expected}: {labels:?}"
             );
         }
-        for hidden in ["later", "top"] {
-            assert!(
-                !labels.iter().any(|label| label == hidden),
-                "unexpected {hidden}: {labels:?}"
-            );
-        }
+        assert!(
+            !labels.iter().any(|label| label == "later"),
+            "a binding declared below the cursor is out of scope: {labels:?}"
+        );
     }
 
     #[test]

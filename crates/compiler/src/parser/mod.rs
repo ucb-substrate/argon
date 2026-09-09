@@ -31,10 +31,15 @@ pub enum CompletionSite {
     TopLevel,
     /// At the start of a statement or tail expression in a scope.
     Statement,
+    /// At the start of a statement that could instead be an `else`
+    /// continuing the `if` just closed. Both sets of candidates apply.
+    StatementOrElse,
     /// Somewhere an expression is expected.
     Expression,
     /// Somewhere a type specification is expected.
     Type,
+    /// The pattern of a `match` arm.
+    Pattern,
     /// A path in a `use` declaration.
     ImportPath,
     /// A name being introduced rather than referenced.
@@ -55,7 +60,10 @@ impl CompletionSite {
             // distinction, while a nested expression recorded later is not
             // overwritten when the scope closes at the same cursor.
             Self::Statement | Self::Expression => 2,
-            Self::Type | Self::ImportPath | Self::Keyword(_) => 3,
+            // Outranks `Statement`, which the statement loop records at the
+            // same offset.
+            Self::StatementOrElse => 3,
+            Self::Type | Self::Pattern | Self::ImportPath | Self::Keyword(_) => 3,
             Self::NewIdentifier => 4,
             Self::Suppressed => 5,
         }
@@ -237,7 +245,15 @@ mod tests {
             ("cell top() { re|; }", Statement),
             ("cell top() { rect(|); }", Expression),
             ("cell top() { for item | [] {} }", Keyword("in")),
-            ("cell top() { if true {} | {} }", Keyword("else")),
+            // The `else` is optional in statement position, required in
+            // expression position.
+            ("cell top() { if true {} | {} }", StatementOrElse),
+            ("cell top() { let x = if true {} | ; }", Keyword("else")),
+            ("cell top() { match m { | } }", Pattern),
+            ("cell top() { match m { Some(|) => 1, } }", Pattern),
+            ("fn f<|>() {}", NewIdentifier),
+            ("fn f(o: Option<|>) {}", Type),
+            ("cell top() { let n: | = 1; }", Type),
             ("// cell |", Suppressed),
             ("cell top() { let value = \"ce|ll\"; }", Suppressed),
             ("/* outer /* cell | */", Suppressed),
@@ -272,6 +288,20 @@ mod tests {
             "x.0.1;",
             "if c {} else {};",
             "if c {} else {}",
+            // An `if` with no `else` is a statement: bare, semicoloned, in
+            // last position, and followed by more statements.
+            "if c { }",
+            "if c { f(); }",
+            "if c { f(); };",
+            "if c { f(); } g();",
+            "if c { f(); } if d { g(); }",
+            "for i in s { if c { f(); } }",
+            // `else if` chains, ending with and without a final `else`.
+            "if c {} else if d {}",
+            "if c {} else if d {} else {}",
+            "if c {} else if d {} else if e {}",
+            "if c {} else if d {} else if e {} else {}",
+            "let x = if c { 1 } else if d { 2 } else { 3 };",
             "let v = (t.0, t.1,);",
             "foo();",
             "if a < b {} else {}",
@@ -338,10 +368,141 @@ mod tests {
             "let p = Point { ..b, x: 1. };", // the base must come last
             "let p = Point { x.y };",        // a field is a bare identifier
             "let p = Point { x: 1. y: 2. };",
+            // An `else`-less `if` is not accepted where a value is expected.
+            "let x = if c { };",
+            "let x = if c {} else if d {};",
+            "foo(if c { });",
+            "let x = if c { } + 1;",
+            "match k { A => if c { }, }",
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
         }
+    }
+
+    #[test]
+    fn generic_declarations_parse() {
+        for src in [
+            "struct Pair<A, B> { first: A, second: B, }",
+            "struct Wrap<T,> { item: T, }",
+            "enum Option<T> { Some(T), None, }",
+            "enum Shape { Circle(Float), Box(Float, Float,), Empty, }",
+            "fn last<T>(items: [T]) -> T { head(items) }",
+            "fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> { p }",
+            "cell row<T>(items: [T], pitch: Float) {}",
+            // Nested arguments never produce a `>>` token.
+            "fn f(o: Option<Option<T>>) -> [Option<(Int, Option<Int>)>] { [] }",
+            // `>=` is split when it closes a type argument list.
+            "fn f(n: Option<Int>=None) -> Int { 1 }",
+            "cell c() { let n: Option<Int>=None; }",
+        ] {
+            assert!(
+                parse(src).is_ok(),
+                "should parse: `{src}`: {:?}",
+                parse(src).err()
+            );
+        }
+        for src in [
+            "struct S<> { a: Int, }",
+            "fn f<>() {}",
+            "fn f(o: Option<) {}",
+            "fn f(o: Option<Int) {}",
+            "enum E { A( }",
+            "use lib::Option::<Int>::None;",
+        ] {
+            assert!(parse(src).is_err(), "should be rejected: `{src}`");
+        }
+    }
+
+    #[test]
+    fn turbofish_let_annotations_and_patterns_parse() {
+        let valid = [
+            "let n = None::<Int>;",
+            "let m = Option::<Int>::None;",
+            "let xs = empty::<Float>();",
+            "let p = Pair::<Int, Float> { first: 1, second: 2. };",
+            "let s = std::Option::<Int>::Some(1);",
+            "let empty: Option<Rect> = None;",
+            "let n: Int = 1;",
+            "let t: (Int, [Float]) = (1, [],);",
+            "match o { Some(x) => x, None => 0, }",
+            "match s { Shape::Circle(_) => 1, Shape::Box(w, h) => 2, _ => 3, }",
+            "match s { lib::shapes::Shape::Box(w, _,) => w, other => 0., }",
+            "match s { Shape::Empty() => 1, _ => 2, }",
+            // `a as Float < b` stays a comparison: the target of `as` takes no
+            // type arguments.
+            "if a as Float < b {} else {}",
+        ];
+        for body in valid {
+            assert!(snippet_ok(body), "should parse: `{body}`");
+        }
+        let invalid = [
+            "let n = None::<>;",
+            "let n = a::<Int>::<Float>::b;",
+            "let x: = 1;",
+            "match o { Some(Some(x)) => x, _ => 0, }",
+            "match o { Some(x:) => x, }",
+        ];
+        for body in invalid {
+            assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+    }
+
+    #[test]
+    fn generic_nodes_span_their_source_text() {
+        use crate::ast::{Decl, Expr, Pattern, Statement, TySpecKind};
+
+        let src = "enum Option<T> { Some(T), None, }\n\
+                   cell c() {\n  let n: Option<Int> = None::<Int>;\n  let v = match n { Some(x) => x, _ => 0, };\n}\n";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let text = |span: cfgrammar::Span| &src[span.start()..span.end()];
+
+        let Decl::Enum(option) = &ast.decls[0] else {
+            panic!("expected an enum");
+        };
+        assert_eq!(text(option.span), "enum Option<T> { Some(T), None, }");
+        assert_eq!(text(option.params[0].span), "T");
+        assert_eq!(text(option.variants[0].span), "Some(T)");
+        assert_eq!(option.variants[0].payload.len(), 1);
+        assert_eq!(text(option.variants[1].span), "None");
+        assert!(option.variants[1].payload.is_empty());
+
+        let Decl::Cell(cell) = &ast.decls[1] else {
+            panic!("expected a cell");
+        };
+        let Statement::LetBinding(n) = &cell.scope.stmts[0] else {
+            panic!("expected a let");
+        };
+        let ty = n.ty.as_ref().expect("annotated");
+        assert_eq!(text(ty.span), "Option<Int>");
+        let TySpecKind::Path { name, args } = &ty.kind else {
+            panic!("expected a path type");
+        };
+        assert_eq!(name.name, "Option");
+        assert_eq!(text(args[0].span), "Int");
+        let Expr::IdentPath(none) = &n.value else {
+            panic!("expected a path");
+        };
+        assert_eq!(text(none.span), "None::<Int>");
+        let turbofish = none.generic_args.as_ref().expect("turbofish");
+        assert_eq!(turbofish.segment, 0);
+        assert_eq!(text(turbofish.span), "<Int>");
+
+        let Statement::LetBinding(v) = &cell.scope.stmts[1] else {
+            panic!("expected a let");
+        };
+        let Expr::Match(m) = &v.value else {
+            panic!("expected a match");
+        };
+        let Pattern::Variant { path, fields, span } = &m.arms[0].pattern else {
+            panic!("expected a variant pattern");
+        };
+        assert_eq!(text(*span), "Some(x)");
+        assert_eq!(path.path[0].name, "Some");
+        assert!(matches!(&fields[0], Pattern::Binding { name, .. } if name.name == "x"));
+        assert!(matches!(&m.arms[1].pattern, Pattern::Wildcard { span } if text(*span) == "_"));
     }
 
     #[test]
@@ -384,6 +545,100 @@ mod tests {
             &ast.text[lit.span.start()..lit.span.end()],
             "Point { x, y: 1., ..q }"
         );
+    }
+
+    /// `else if` desugars into an else-scope holding only the nested `if` as
+    /// its tail.
+    #[test]
+    fn else_if_chains_desugar_to_nested_ifs() {
+        use crate::ast::{Decl, Expr};
+
+        let src = "cell __t__() { if a { } else if b { } else if c { } else { } }";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let text = |span: cfgrammar::Span| &src[span.start()..span.end()];
+
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        // With a final `else` the chain is an expression, so it lands in the
+        // tail.
+        let Some(Expr::If(outer)) = &cell.scope.tail else {
+            panic!("expected a trailing if, got {:?}", cell.scope.tail);
+        };
+        assert!(cell.scope.stmts.is_empty());
+
+        // Walk the chain, checking each link is a bare tail-only scope.
+        let mut orders = vec![outer.scope_order];
+        let mut link = outer;
+        for expected in ["if b { } else if c { } else { }", "if c { } else { }"] {
+            let else_ = link.else_.as_ref().expect("the chain continues");
+            assert!(else_.stmts.is_empty(), "a desugared else holds no stmts");
+            assert_eq!(text(else_.span), expected, "the else scope spans the if");
+            let Some(Expr::If(nested)) = &else_.tail else {
+                panic!("expected a nested if, got {:?}", else_.tail);
+            };
+            assert_eq!(text(nested.span), expected);
+            orders.push(nested.scope_order);
+            link = nested;
+        }
+        // The last `else` is a real scope, not another link.
+        let last = link.else_.as_ref().expect("the chain ends in an else");
+        assert!(last.tail.is_none() && last.stmts.is_empty());
+        assert_eq!(text(last.span), "{ }");
+
+        // The chain takes consecutive ordinals in lexical order.
+        assert_eq!(orders, [0, 1, 2]);
+    }
+
+    /// An `if` with no `else` is a statement even in last position, never a
+    /// tail.
+    #[test]
+    fn an_else_less_if_is_a_statement_never_a_tail() {
+        use crate::ast::{Decl, Expr, Statement};
+
+        let src = "cell __t__() { if a { f(); } if b { g(); } else { }; if c { } }";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        assert!(cell.scope.tail.is_none(), "{:?}", cell.scope.tail);
+        assert_eq!(cell.scope.stmts.len(), 3);
+        for (i, expected_else) in [false, true, false].into_iter().enumerate() {
+            let Statement::Expr {
+                value: Expr::If(if_),
+                semicolon,
+            } = &cell.scope.stmts[i]
+            else {
+                panic!("expected an if statement, got {:?}", cell.scope.stmts[i]);
+            };
+            assert_eq!(if_.else_.is_some(), expected_else, "stmt {i}");
+            // Only the middle one was written with a `;`.
+            assert_eq!(*semicolon, i == 1, "stmt {i}");
+        }
+
+        // A chain's missing `else` sits at its end, not on the outermost
+        // node: the first chain below is a statement, the second a tail.
+        let src = "cell __t__() { if a { } else if b { } if c { } else if d { } else { } }";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let Decl::Cell(cell) = &ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        assert_eq!(cell.scope.stmts.len(), 1);
+        assert!(matches!(
+            &cell.scope.stmts[0],
+            Statement::Expr {
+                value: Expr::If(_),
+                semicolon: false
+            }
+        ));
+        assert!(matches!(cell.scope.tail, Some(Expr::If(_))));
     }
 
     /// Renders an expression fully parenthesized.

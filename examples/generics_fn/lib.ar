@@ -1,0 +1,19 @@
+// A type parameter stands for one type per call: `last` returns whatever
+// element type its argument has, and the checker knows which.
+fn second<T>(items: [T]) -> T {
+    head(tail(items))
+}
+
+fn pair_up<A, B>(a: A, b: B) -> (A, B) {
+    (a, b,)
+}
+
+cell top() {
+    let widths = cons(100., cons(300., cons(200., [])));
+    let counts = cons(1, cons(2, []));
+    let r = rect("met1", x0=0., y0=0., x1=std::last(widths));
+    // `second(counts)` is an `Int`, so it can be cast; `second(widths)` is a
+    // `Float`, so it can constrain geometry directly.
+    let p = pair_up(second(counts), second(widths));
+    eq(r.y1, p.1 * (p.0 as Float));
+}

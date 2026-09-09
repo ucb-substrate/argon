@@ -311,7 +311,6 @@ dependencies = [
  "argon-analyzer",
  "argonc",
  "async-compat",
- "bincode",
  "bytes",
  "cfgrammar",
  "clap",

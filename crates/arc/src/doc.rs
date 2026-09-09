@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use arcstr::Substr;
 use argonc::{
     WorkspaceConfig,
-    ast::{ArgDecl, Decl, ModPath, TySpec, TySpecKind},
+    ast::{ArgDecl, Decl, ModPath, TyParam, TySpec, TySpecKind},
     parse::{self, AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
 };
 
@@ -312,6 +312,7 @@ fn render_module(
                 cells.push(render_callable(
                     "cell",
                     cell.name.name.as_str(),
+                    &cell.params,
                     &cell.args,
                     None,
                     cell.span.start(),
@@ -324,6 +325,7 @@ fn render_module(
                 functions.push(render_callable(
                     "fn",
                     function.name.name.as_str(),
+                    &function.params,
                     &function.args,
                     function.return_ty.as_ref(),
                     function.span.start(),
@@ -336,17 +338,33 @@ fn render_module(
                 let variants = enum_
                     .variants
                     .iter()
-                    .map(|variant| format!("<li><code>{}</code></li>", escape(&variant.name)))
+                    .map(|variant| {
+                        let payload = (!variant.payload.is_empty()).then(|| {
+                            let types = variant
+                                .payload
+                                .iter()
+                                .map(|ty| render_type(ty, module.path, targets))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!("({types})")
+                        });
+                        format!(
+                            "<li><code>{}{}</code></li>",
+                            escape(&variant.name.name),
+                            payload.unwrap_or_default()
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("");
                 enums.push(render_item(
                     "enum",
                     enum_.name.name.as_str(),
                     &format!(
-                        "<span class=\"kw\">enum</span> <span class=\"name\">{}</span>",
-                        escape(&enum_.name.name)
+                        "<span class=\"kw\">enum</span> <span class=\"name\">{}</span>{}",
+                        escape(&enum_.name.name),
+                        render_ty_params(&enum_.params)
                     ),
-                    enum_.name.span.start(),
+                    enum_.span.start(),
                     enum_.name.span.start(),
                     module,
                     &format!("<ul>{variants}</ul>"),
@@ -389,6 +407,7 @@ fn push_section(body: &mut String, title: &str, items: Vec<String>) {
 fn render_callable(
     kind: &str,
     name: &str,
+    params: &[TyParam<Substr, ParseMetadata>],
     args: &[ArgDecl<Substr, ParseMetadata>],
     return_ty: Option<&TySpec<Substr, ParseMetadata>>,
     declaration_start: usize,
@@ -411,9 +430,10 @@ fn render_callable(
         format!(" -&gt; {}", render_type(ty, module.path, targets))
     });
     let signature = format!(
-        "<span class=\"kw\">{}</span> <span class=\"name\">{}</span>({arguments}){returns}",
+        "<span class=\"kw\">{}</span> <span class=\"name\">{}</span>{}({arguments}){returns}",
         escape(kind),
-        escape(name)
+        escape(name),
+        render_ty_params(params)
     );
     let argument_table = (!args.is_empty()).then(|| {
         let rows = args
@@ -464,21 +484,34 @@ fn render_item(
     )
 }
 
+/// Renders a declaration's type parameter list, `&lt;A, B&gt;`, or nothing.
+fn render_ty_params(params: &[TyParam<Substr, ParseMetadata>]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let names = params
+        .iter()
+        .map(|param| escape(&param.name.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("&lt;{names}&gt;")
+}
+
 fn render_type(
     ty: &TySpec<Substr, ParseMetadata>,
     current_module: &ModPath,
     targets: &TypeTargets,
 ) -> String {
     match &ty.kind {
-        TySpecKind::Ident(ident) => {
-            let name = ident.name.as_str();
+        TySpecKind::Path { name, args } => {
+            let name = name.name.as_str();
             let target = targets.get(name).and_then(|candidates| {
                 candidates
                     .iter()
                     .find(|(path, _)| path == current_module)
                     .or_else(|| (candidates.len() == 1).then(|| &candidates[0]))
             });
-            target.map_or_else(
+            let rendered = target.map_or_else(
                 || format!("<span class=\"type\">{}</span>", escape(name)),
                 |(_, href)| {
                     format!(
@@ -487,7 +520,16 @@ fn render_type(
                         escape(name)
                     )
                 },
-            )
+            );
+            if args.is_empty() {
+                return rendered;
+            }
+            let args = args
+                .iter()
+                .map(|arg| render_type(arg, current_module, targets))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{rendered}&lt;{args}&gt;")
         }
         TySpecKind::Seq(inner) => format!("[{}]", render_type(inner, current_module, targets)),
         TySpecKind::Tuple(items) if items.is_empty() => "()".to_owned(),
@@ -598,7 +640,7 @@ mod tests {
         fs::write(directory.path().join("Argon.toml"), "name = \"demo\"\n").unwrap();
         fs::write(
             directory.path().join("lib.ar"),
-            "//! Demo cells.\n/// Routing modes.\nenum Mode { Fast, Quiet, }\n/// Builds a route.\n/// # Arguments\n/// - `mode`: routing mode.\ncell route(mode: Mode) {}\n",
+            "//! Demo cells.\n/// Routing modes.\nenum Mode { Fast, Quiet, }\n/// Builds a route.\n/// # Arguments\n/// - `mode`: routing mode.\ncell route(mode: Mode) {}\n/// A mode or nothing.\nenum Maybe<T> { Just(T, Mode), Nothing, }\n/// Picks a mode.\nfn pick<T>(m: Maybe<T>, n: Option<Int>) -> Mode { Mode::Fast }\n",
         )
         .unwrap();
         let library = Library::load(directory.path().join("Argon.toml")).unwrap();
@@ -611,6 +653,22 @@ mod tests {
         assert!(page.contains("id=\"cell.route\""));
         assert!(page.contains("href=\"module-root.html#enum.Mode\""));
         assert!(page.contains("routing mode"));
+        // Type parameters, payloads, and type arguments render, with the
+        // enum types linked.
+        assert!(page.contains("<span class=\"name\">Maybe</span>&lt;T&gt;"));
+        assert!(page.contains(
+            "<li><code>Just(<span class=\"type\">T</span>, <a class=\"type\" href=\"module-root.html#enum.Mode\">Mode</a>)</code></li>"
+        ));
+        assert!(page.contains("<li><code>Nothing</code></li>"));
+        assert!(page.contains("<span class=\"name\">pick</span>&lt;T&gt;("));
+        assert!(page.contains(
+            "<a class=\"type\" href=\"module-root.html#enum.Maybe\">Maybe</a>&lt;<span class=\"type\">T</span>&gt;"
+        ));
+        assert!(
+            page.contains(
+                "<span class=\"type\">Option</span>&lt;<span class=\"type\">Int</span>&gt;"
+            )
+        );
         assert!(!page.contains("<script"));
     }
 }

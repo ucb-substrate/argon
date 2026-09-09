@@ -21,12 +21,12 @@ cell strap(w: Float, h: Float, dummy: Bool) {
         eq(via.y0, met1.y0 + 10.);
         eq(via.x1, met1.x1 - 10.);
         eq(via.y1, met1.y1 - 10.);
-    } else { };
+    }
 
     // A marker layer for the "big enough, but not oversized" case.
     if square {
         let mark = rect("met2", x0=0., y0=h, x1=10., y1=h + 10.)!;
-    } else { };
+    }
 }
 
 cell top() {

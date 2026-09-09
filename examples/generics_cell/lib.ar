@@ -1,0 +1,17 @@
+fn count<T>(items: [T]) -> Int {
+    if items == [] { 0 } else { 1 + count(tail(items)) }
+}
+
+// A generic cell is compiled once per distinct argument tuple, like any
+// other cell; the type parameter only lets the checker follow the elements.
+cell row<T>(items: [T], pitch: Float) {
+    let first = head(items);
+    let r = rect("met1", x0=0., y0=0., w=pitch * (count(items) as Float), h=pitch);
+}
+
+cell top() {
+    let floats = inst(row(cons(1., cons(2., cons(3., []))), 100.), x=0., y=0.);
+    let names = inst(row(cons("a", cons("b", [])), 50.), x=0., y=200.);
+    eq(floats.r.w, 300.);
+    eq(names.r.w, 100.);
+}

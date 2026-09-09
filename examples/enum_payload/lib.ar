@@ -1,0 +1,29 @@
+enum Shape {
+    Circle(Float),
+    Box(Float, Float),
+    Empty,
+}
+
+// A tuple variant is constructed like a call and taken apart by a pattern
+// that binds its payload; `_` skips an element and a trailing `_` arm is a
+// catch-all.
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle(r) => 2. * r,
+        Shape::Box(w, _) => w,
+        Shape::Empty => 0.,
+    }
+}
+
+fn is_round(s: Shape) -> Bool {
+    match s {
+        Shape::Circle(_) => true,
+        _ => false,
+    }
+}
+
+cell top() {
+    let shapes = cons(Shape::Circle(50.), cons(Shape::Box(300., 20.), cons(Shape::Empty, [])));
+    let layer = if is_round(head(shapes)) { "met1" } else { "met2" };
+    let r = rect(layer, x0=0., y0=0., w=width(head(shapes)) + width(std::last(tail(shapes))), h=width(head(tail(shapes))));
+}

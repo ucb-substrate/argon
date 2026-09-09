@@ -1,4 +1,5 @@
 mod cell_edit;
+mod command_completion;
 mod compiler_worker;
 pub mod document;
 mod navigation;
@@ -22,10 +23,10 @@ use std::{
 use arc::Library;
 use argonc::{
     WorkspaceConfig,
-    ast::{Span, WorkspaceAst},
+    ast::Span,
     compile::{
         self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
-        VarIdTyMetadata,
+        TypedWorkspace,
     },
     diagnostics,
     nav::NavIndex,
@@ -51,6 +52,7 @@ use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+use crate::command_completion::{CommandCompletion, CommandCompletionParams};
 use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
@@ -482,7 +484,7 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
 }
 
 fn compile_open_cell(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
@@ -1507,6 +1509,13 @@ impl Backend {
         self.open_cell_view(identity).await;
     }
 
+    async fn command_completion(
+        &self,
+        params: CommandCompletionParams,
+    ) -> Result<CommandCompletion> {
+        Ok(self.state.command_completion(params).await)
+    }
+
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
         let state = self.state.clone();
         state
@@ -2011,6 +2020,7 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/newCell", Backend::new_cell)
     .custom_method("custom/renameCell", Backend::rename_cell)
     .custom_method("custom/inst", Backend::instantiate)
+    .custom_method("custom/commandCompletion", Backend::command_completion)
     .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/setConfig", Backend::set_config)
     .custom_method("custom/saveConfig", Backend::save_config)

@@ -131,9 +131,29 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         &mut self,
         input: &super::EnumDecl<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-        _variants: &[super::Ident<Self::OutputS, Self::OutputMetadata>],
+        _variants: &[super::EnumVariant<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::EnumDecl {
         input.metadata.clone()
+    }
+
+    fn dispatch_enum_variant(
+        &mut self,
+        input: &super::EnumVariant<Self::InputS, Self::InputMetadata>,
+        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+        _payload: &[super::TySpec<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
+        input.metadata.clone()
+    }
+
+    fn dispatch_pattern_binding(
+        &mut self,
+        input: &super::Pattern<Self::InputS, Self::InputMetadata>,
+        _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::PatternBinding {
+        match input {
+            super::Pattern::Binding { metadata, .. } => metadata.clone(),
+            _ => unreachable!("dispatched for a binding pattern"),
+        }
     }
 
     fn dispatch_struct_decl(
@@ -209,7 +229,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::IfExpr<Self::InputS, Self::InputMetadata>,
         _cond: &super::Expr<Self::OutputS, Self::OutputMetadata>,
         _then: &Scope<Self::OutputS, Self::OutputMetadata>,
-        _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _else_: &Option<Scope<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         input.metadata.clone()
     }

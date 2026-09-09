@@ -311,30 +311,6 @@ pub(super) mod tests {
     use gpui::{SharedString, rgb};
     use std::hash::{DefaultHasher, Hash, Hasher};
 
-    pub(in crate::editor) fn verify_prepared(
-        output: &CompiledData,
-        actual: &super::super::PreparedCompileOutput,
-    ) {
-        let mut expected = ProcessScopeState {
-            layers: actual.layers.clone(),
-            ..Default::default()
-        };
-        for layer in expected.layers.values_mut() {
-            layer.used = false;
-        }
-        let root = ScopeAddress {
-            cell: output.top,
-            scope: output.cells[&output.top].root,
-        };
-        Reference::process_scope_reference(output, root, &mut expected, None, None);
-        let actual = ProcessScopeState {
-            layers: actual.layers.clone(),
-            state: actual.state.clone(),
-            scope_paths: actual.scope_paths.clone(),
-        };
-        assert_equivalent(&actual, &expected);
-    }
-
     fn assert_equivalent(actual: &ProcessScopeState, expected: &ProcessScopeState) {
         assert_eq!(actual.scope_paths, expected.scope_paths);
         assert_eq!(actual.state.len(), expected.state.len());

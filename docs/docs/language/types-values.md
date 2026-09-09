@@ -7,6 +7,8 @@ description: Scalars, collections, tuples, and layout types.
 
 Argon's types fall into scalars, collections, tuples, and layout types. Write types out in cell and function signatures: some can be inferred, but explicit signatures make call sites and error messages clearer.
 
+Structs, enums, functions, and cells may take type parameters, written in angle brackets after the name: `struct Pair<A, B>`, `fn last<T>(items: [T]) -> T`. A type parameter stands for one type per use, which is inferred from the arguments, and a value of type `T` can only be stored, passed, and returned.
+
 | Type | Example | Used for |
 | --- | --- | --- |
 | [`Float`](/language/types/scalars#float) | `12.`, `-0.5` | Coordinates, distances, and linear expressions |
@@ -20,6 +22,7 @@ Argon's types fall into scalars, collections, tuples, and layout types. Write ty
 | [`Inst`](/language/types/instance) | `inst(child())` | A placed cell |
 | [`[T]`](/language/types/collections#sequences) | `[Float]` | A sequence of one type |
 | [`(A, B)`](/language/types/collections#tuples) | `(3, 5,)` | A fixed-size tuple of mixed types |
+| [`Option<T>`](/language/std#option) | `Some(3)`, `None` | A value that may be absent |
 | [`Any`](/language/types/scalars#any) | — | A value of any type |
 | [`()`](/language/types/scalars#unit) | `()` | The unit value and type |
 

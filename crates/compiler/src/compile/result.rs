@@ -56,9 +56,34 @@ pub enum StaticErrorKind {
     /// A struct literal without `..base` omits declared fields.
     #[error("missing fields {fields} in initializer of {ty}")]
     MissingStructFields { ty: String, fields: String },
-    /// A struct contains itself, directly or through its fields' types.
+    /// A struct contains itself through struct fields and tuple elements alone,
+    /// with no enum or sequence to end the recursion.
     #[error("struct `{name}` contains itself; recursive structs are not supported")]
     RecursiveStruct { name: String },
+    /// A type was given the wrong number of type arguments, including any
+    /// arguments on a non-generic type and none on a generic type.
+    #[error("type `{ty}` takes {expected} type arguments, found {found}")]
+    TypeArgArity {
+        ty: String,
+        expected: usize,
+        found: usize,
+    },
+    /// An inferred type was never determined within its unit of inference.
+    #[error("type annotations needed; the type of this expression cannot be inferred")]
+    TypeAnnotationsNeeded,
+    /// A type parameter of a struct or enum that no field or payload uses.
+    #[error("type parameter `{name}` is never used")]
+    UnusedTypeParam { name: String },
+    /// A constructor call or pattern with the wrong number of payload elements.
+    #[error("variant `{variant}` has {expected} payload elements, found {found}")]
+    VariantPayloadArity {
+        variant: String,
+        expected: usize,
+        found: usize,
+    },
+    /// A match arm after every variant is covered or after a catch-all.
+    #[error("unreachable match arm")]
+    UnreachableMatchArm,
     /// A cell had an expression in tail position, which is not permitted.
     #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
@@ -68,6 +93,12 @@ pub enum StaticErrorKind {
     /// Branches in expressions must evaluate to the same type.
     #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
+    /// An `if` with no `else` yields no value, so its `then` branch may not
+    /// produce one either.
+    #[error(
+        "an `if` without an `else` must have type `()`; end the branch with `;` or add an `else`"
+    )]
+    IfWithoutElseNotUnit,
     /// Multiple match arms have matching patterns.
     #[error("match arms must be distinct")]
     DuplicateMatchArm,

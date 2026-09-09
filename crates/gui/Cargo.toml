@@ -50,6 +50,5 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-bincode = "1"
 approx = { workspace = true }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev", features = ["test-support"] }
