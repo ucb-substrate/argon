@@ -192,6 +192,7 @@ fn prepare(
             layers: IndexMap::new(),
             selected_scope: None,
             scope_state: None,
+            previous: None,
         },
     );
     let prepared = snapshot.prepared_output.expect("prepared GDS layout");
@@ -203,6 +204,7 @@ fn prepare(
             selected_scope: prepared.selected_scope,
             state: Arc::new(prepared.state),
             scope_paths: Arc::new(prepared.scope_paths),
+            hierarchy: prepared.hierarchy,
         },
         Arc::new(prepared.layers),
     )
@@ -512,7 +514,9 @@ fn local_sram_render_benchmark(cx: &mut gpui::TestAppContext) {
                 .image
                 .as_bytes(0)
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[3] != 0),
             "zoom {zoom}: blank image"
         );
@@ -761,6 +765,7 @@ fn local_project_pan_lifecycle(cx: &mut gpui::TestAppContext) {
             layers: IndexMap::new(),
             selected_scope: None,
             scope_state: None,
+            previous: None,
         },
     );
     let prepared = snapshot.prepared_output.unwrap();
@@ -769,6 +774,7 @@ fn local_project_pan_lifecycle(cx: &mut gpui::TestAppContext) {
         selected_scope: prepared.selected_scope,
         state: Arc::new(prepared.state),
         scope_paths: Arc::new(prepared.scope_paths),
+        hierarchy: prepared.hierarchy,
     };
     eprintln!(
         "Project preparation: {:?}, {} unique cells",
@@ -917,7 +923,9 @@ fn local_project_pan_lifecycle(cx: &mut gpui::TestAppContext) {
                 .image
                 .as_bytes(0)
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[3] != 0)
         );
         eprintln!(
@@ -1410,9 +1418,161 @@ cell top() {
     }
 }
 
-#[test]
+#[gpui::test]
+fn edits_and_small_zoom_steps_keep_a_complete_frame(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let program = r#"
+cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
+cell top() {
+    for row in std::range(96) {
+        for col in std::range(96) {
+            let child = inst(leaf(), x=(col as Float)*12., y=(row as Float)*12.);
+        }
+    }
+}
+"#;
+    std::fs::write(&source, program).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    compiler.set_source_text(source.clone(), program);
+    let first = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let canvas = test_canvas(cx);
+    let editor = test_editor(&canvas, cx);
+    editor.update(cx, |editor, cx| {
+        let context = editor.begin_snapshot_preparation(cx, 1);
+        let prepared = editor::prepare_compilation_snapshot(
+            analyzer::rpc::CompilationSnapshot {
+                revision: 1,
+                output: first,
+            },
+            context,
+        );
+        editor.finish_snapshot_preparation(cx, 1, prepared);
+    });
+    let cx = cx.add_empty_window();
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |_, cx| cx.notify());
+        cx.draw(
+            Point::default(),
+            Size::new(px(1200.), px(800.)).map(gpui::AvailableSpace::Definite),
+            |_, _| div().size_full().child(editor.clone()),
+        );
+    };
+    let signature = |cx: &gpui::VisualTestContext| {
+        canvas.read_with(cx, |canvas, _| {
+            canvas
+                .last_presented_raster
+                .get()
+                .map(|display| (true, display))
+                .or_else(|| {
+                    canvas
+                        .retained_direct_frame
+                        .as_ref()
+                        .map(|frame| (false, frame.display))
+                })
+        })
+    };
+    let settle = |cx: &mut gpui::VisualTestContext, require_frame: bool| {
+        let mut previous = signature(cx);
+        let mut handoffs = 0;
+        for _ in 0..1024 {
+            draw(cx);
+            if require_frame {
+                assert!(
+                    canvas.read_with(cx, |canvas, _| canvas.painted_complete_frame),
+                    "layout disappeared during update"
+                );
+            }
+            let current = signature(cx);
+            if current != previous {
+                handoffs += 1;
+                if require_frame {
+                    assert!(
+                        handoffs <= 1,
+                        "multiple presentations for one stopped gesture: {previous:?} -> {current:?}"
+                    );
+                }
+                previous = current;
+            }
+            let pending = canvas.read_with(cx, |canvas, _| {
+                canvas.raster_worker_active
+                    || canvas.raster_decision_refinement.is_some()
+                    || canvas.raster_overview_requested_revision.is_some()
+            });
+            if !pending {
+                assert!(canvas.read_with(cx, |canvas, cx| !canvas.state.read(cx).rendering));
+                return;
+            }
+            assert!(cx.dispatcher.tick(false));
+        }
+        panic!("renderer did not settle");
+    };
+    settle(cx, false);
+    let bounds = canvas.read_with(cx, |canvas, _| canvas.screen_bounds);
+    // Cross the raster/direct threshold in small wheel-like increments, then
+    // return through it. Every input gets one completed presentation at most.
+    for factor in std::iter::repeat_n(1.08, 28).chain(std::iter::repeat_n(1. / 1.08, 28)) {
+        canvas.update(cx, |canvas, cx| {
+            canvas.zoom_about(bounds.center(), canvas.scale * factor, cx)
+        });
+        settle(cx, true);
+    }
+    canvas.update(cx, |canvas, cx| {
+        canvas.pan_view(Point::new(px(137.), px(29.)), cx)
+    });
+    settle(cx, true);
+    let old_top = canvas.read_with(cx, |canvas, cx| {
+        canvas
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .unwrap()
+            .output
+            .top
+    });
+    for (index, rectangle) in [
+        "let added = rect(\"met1\", x0=0., y0=0., x1=2000., y1=2000.);",
+        "",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let edited = program.replace("cell top() {", &format!("cell top() {{ {rectangle}"));
+        compiler.set_source_text(source.clone(), edited);
+        let output = compiler.compile_cell(&config, &["top".into()], vec![]);
+        assert_ne!(
+            match &output {
+                compile::CompileOutput::Valid(data) => data.top,
+                _ => panic!("compile failed"),
+            },
+            old_top,
+            "exercise changed compiler handles"
+        );
+        editor.update(cx, |editor, cx| {
+            let id = index as u64 + 2;
+            let context = editor.begin_snapshot_preparation(cx, id);
+            let prepared = editor::prepare_compilation_snapshot(
+                analyzer::rpc::CompilationSnapshot {
+                    revision: id,
+                    output,
+                },
+                context,
+            );
+            editor.finish_snapshot_preparation(cx, id, prepared);
+        });
+        settle(cx, true);
+    }
+}
+
+#[gpui::test]
 #[ignore = "requires ARGON_RENDER_GDS; measures a top-level edit through snapshot preparation"]
-fn local_sram_edit_pipeline() {
+fn local_sram_edit_pipeline(cx: &mut gpui::TestAppContext) {
     let gds = std::path::PathBuf::from(
         std::env::var_os("ARGON_RENDER_GDS").expect("set ARGON_RENDER_GDS"),
     );
@@ -1451,16 +1611,19 @@ cell top() { let bank = inst(bank(), x=0., y=0.); }
         compiler.stats()
     );
     let misses = compiler.stats().gds_cache.misses;
+    let sender_base = analyzer::rpc::CompilationSnapshot {
+        revision: 1,
+        output: first,
+    };
+    let receiver_base = roundtrip_update(&sender_base, None, None);
     let start = Instant::now();
     let mut first = editor::prepare_compilation_snapshot(
-        analyzer::rpc::CompilationSnapshot {
-            revision: 1,
-            output: first,
-        },
+        receiver_base.clone(),
         editor::CompilationPreparationContext {
             layers: IndexMap::new(),
             selected_scope: None,
             scope_state: None,
+            previous: None,
         },
     );
     eprintln!("Initial GUI preparation {:?}", start.elapsed());
@@ -1483,10 +1646,79 @@ cell top() { let bank = inst(bank(), x=0., y=0.); }
     }
     let context = editor::CompilationPreparationContext {
         layers: prepared.layers,
-        selected_scope: Some(prepared.selected_scope),
-        scope_state: Some(Arc::new(prepared.state)),
+        selected_scope: Some(prepared.selected_scope.clone()),
+        scope_state: Some(Arc::new(prepared.state.clone())),
+        previous: Some(CompileOutputState {
+            output: Arc::new(first.output.unwrap_valid()),
+            selected_scope: prepared.selected_scope.clone(),
+            state: Arc::new(prepared.state),
+            scope_paths: Arc::new(prepared.scope_paths),
+            hierarchy: prepared.hierarchy,
+        }),
     };
-    drop(first);
+
+    let canvas = test_canvas(cx);
+    load_canvas(
+        &canvas,
+        context.previous.clone().unwrap(),
+        Arc::new(context.layers.clone()),
+        cx,
+    );
+    let editor = test_editor(&canvas, cx);
+    let cx = cx.add_empty_window();
+    let settle = |cx: &mut gpui::VisualTestContext, require_frame: bool| {
+        let mut max_paint = std::time::Duration::ZERO;
+        let start_render = Instant::now();
+        let mut first_current_frame = None;
+        for _ in 0..2048 {
+            let start = Instant::now();
+            editor.update(cx, |_, cx| cx.notify());
+            cx.draw(
+                Point::default(),
+                Size::new(px(1200.), px(800.)).map(gpui::AvailableSpace::Definite),
+                |_, _| div().size_full().child(editor.clone()),
+            );
+            max_paint = max_paint.max(start.elapsed());
+            let pending = canvas.read_with(cx, |canvas, _| {
+                let current = canvas.raster_tiles.as_ref().is_some_and(|tiles| {
+                    canvas.last_presented_raster.get().is_some()
+                        && tiles.content_revision == canvas.raster_content_revision
+                }) || canvas
+                    .retained_direct_frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.content_revision == canvas.raster_content_revision);
+                if current && canvas.painted_complete_frame && first_current_frame.is_none() {
+                    first_current_frame = Some(start_render.elapsed());
+                }
+                if require_frame {
+                    assert!(
+                        canvas.painted_complete_frame,
+                        "SRAM disappeared during edit"
+                    );
+                }
+                canvas.raster_worker_active
+                    || canvas.raster_decision_refinement.is_some()
+                    || canvas.raster_overview_requested_revision.is_some()
+            });
+            if !pending {
+                assert!(canvas.read_with(cx, |canvas, cx| !canvas.state.read(cx).rendering));
+                if require_frame {
+                    eprintln!(
+                        "First current-revision frame {:?}",
+                        first_current_frame.expect("updated frame never appeared")
+                    );
+                }
+                return max_paint;
+            }
+            assert!(cx.dispatcher.tick(false));
+        }
+        panic!("SRAM renderer did not settle");
+    };
+    settle(cx, false);
+    canvas.update(cx, |canvas, cx| {
+        canvas.pan_view(Point::new(px(137.), px(29.)), cx)
+    });
+    settle(cx, true);
     let edited = program.replace("let bank = inst(bank(), x=0., y=0.);", "let bank = inst(bank(), x=0., y=0.); let added = rect(\"met1.drawing\", x0=0., y0=0., x1=1000., y1=1000.);");
     compiler.set_source_text(source, edited);
     let start = Instant::now();
@@ -1502,28 +1734,38 @@ cell top() { let bank = inst(bank(), x=0., y=0.); }
         misses,
         "editing the top must not re-import the SRAM"
     );
-    let artifact = directory.path().join("edit.bin");
+    let snapshot = analyzer::rpc::CompilationSnapshot {
+        revision: 2,
+        output,
+    };
+    let received = roundtrip_update(&snapshot, Some(&sender_base), Some(&receiver_base));
     let start = Instant::now();
-    argonc::artifact::write(&output, &artifact).unwrap();
-    eprintln!(
-        "Full snapshot encode + file write {:?}; {} bytes",
-        start.elapsed(),
-        std::fs::metadata(&artifact).unwrap().len()
-    );
-    drop(output);
-    let start = Instant::now();
-    let output = argonc::artifact::read(&artifact).unwrap();
-    eprintln!("Full snapshot read + decode {:?}", start.elapsed());
-    let start = Instant::now();
-    let prepared = editor::prepare_compilation_snapshot(
-        analyzer::rpc::CompilationSnapshot {
-            revision: 2,
-            output,
-        },
-        context,
-    );
+    let context = editor.update(cx, |editor, cx| editor.begin_snapshot_preparation(cx, 2));
+    let prepared = editor::prepare_compilation_snapshot(received, context);
     eprintln!("One-rectangle GUI preparation {:?}", start.elapsed());
     assert!(prepared.prepared_output.is_some());
+    if std::env::var_os("ARGON_VERIFY_HIERARCHY").is_some() {
+        editor::hierarchy::tests::verify_prepared(
+            match &prepared.output {
+                compile::CompileOutput::Valid(data) => data,
+                _ => unreachable!(),
+            },
+            prepared.prepared_output.as_ref().unwrap(),
+        );
+    }
+
+    let start = Instant::now();
+    editor.update(cx, |editor, cx| {
+        editor.finish_snapshot_preparation(cx, 2, prepared)
+    });
+    eprintln!("Apply edit on UI {:?}", start.elapsed());
+    let start = Instant::now();
+    let max_paint = settle(cx, true);
+    eprintln!(
+        "Render edit to idle {:?}; maximum UI paint {:?}",
+        start.elapsed(),
+        max_paint
+    );
 }
 
 #[gpui::test]
@@ -1644,4 +1886,569 @@ fn direct_frame_stays_visible_until_the_first_pan_raster_arrives(cx: &mut gpui::
         ));
         assert!(canvas.retained_direct_frame.is_none());
     });
+}
+
+/// Use independent sender/receiver caches and actual serialization, so the
+/// tests cannot accidentally reuse pointers that would be lost on the wire.
+fn roundtrip_update(
+    snapshot: &analyzer::rpc::CompilationSnapshot,
+    sender_base: Option<&analyzer::rpc::CompilationSnapshot>,
+    receiver_base: Option<&analyzer::rpc::CompilationSnapshot>,
+) -> analyzer::rpc::CompilationSnapshot {
+    let start = Instant::now();
+    let update = analyzer::rpc::CompilationUpdate::new(snapshot.clone(), sender_base);
+    let changed = update.snapshot.data().map_or(0, |data| data.cells.len());
+    let bytes = bincode::serialize(&update).unwrap();
+    eprintln!(
+        "Snapshot delta: {changed} cells, {} bytes; encode {:?}",
+        bytes.len(),
+        start.elapsed()
+    );
+    let start = Instant::now();
+    let decoded: analyzer::rpc::CompilationUpdate = bincode::deserialize(&bytes).unwrap();
+    let result = decoded.materialize(receiver_base).unwrap();
+    eprintln!("Decode + materialize {:?}", start.elapsed());
+    result
+}
+
+#[test]
+fn reused_render_indexes_invalidate_changed_children_and_match_fresh_pixels() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        r#"
+cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
+cell unchanged() { let r = rect("met2", x0=0., y0=0., x1=10., y1=10.); }
+cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., y=0.); }
+"#,
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (before, layers) = prepare(&source, &config);
+    let old_index = Arc::new(RasterSpatialIndex::default());
+    for cell in before.output.cells.keys() {
+        old_index.cell_index(&before, *cell);
+        old_index.layer_extents(&before, *cell);
+    }
+    let viewport = ViewportTransform {
+        size: Size::new(px(240.), px(120.)),
+        screen_size: Size::new(px(240.), px(120.)),
+        scale: 2.,
+        offset: Point::new(px(10.), px(100.)),
+    };
+    let before_pixels = build_navigation_raster(input(
+        before.clone(),
+        layers.clone(),
+        viewport,
+        old_index.clone(),
+    ))
+    .unwrap();
+    let mut output = before.output.as_ref().clone();
+    let leaf = *output
+        .cells
+        .iter()
+        .find(|(_, cell)| cell.name == "leaf")
+        .unwrap()
+        .0;
+    let unchanged = *output
+        .cells
+        .iter()
+        .find(|(_, cell)| cell.name == "unchanged")
+        .unwrap()
+        .0;
+    let changed_cell = Arc::make_mut(output.cells.get_mut(&leaf).unwrap());
+    for object in changed_cell.objects.values_mut() {
+        if let SolvedValue::Rect(rect) = object
+            && !rect.construction
+        {
+            rect.x1.0 = 40.;
+        }
+    }
+    let mut prepared = editor::prepare_compilation_snapshot(
+        analyzer::rpc::CompilationSnapshot {
+            revision: 2,
+            output: compile::CompileOutput::Valid(output),
+        },
+        editor::CompilationPreparationContext {
+            layers: layers.as_ref().clone(),
+            selected_scope: Some(before.selected_scope.clone()),
+            scope_state: Some(before.state.clone()),
+            previous: Some(before.clone()),
+        },
+    );
+    let metadata = prepared.prepared_output.take().unwrap();
+    let after = CompileOutputState {
+        output: Arc::new(prepared.output.unwrap_valid()),
+        selected_scope: metadata.selected_scope,
+        state: Arc::new(metadata.state),
+        scope_paths: Arc::new(metadata.scope_paths),
+        hierarchy: metadata.hierarchy,
+    };
+    let mut reused = RasterSpatialIndex::default();
+    reused.reuse_ready_cells(&old_index, |cell| {
+        after
+            .hierarchy
+            .same_cell(&before.hierarchy, &after.output, cell)
+    });
+    let cells = reused.cells.lock().unwrap();
+    assert!(!cells.contains_key(&leaf));
+    assert!(
+        !cells.contains_key(&after.output.top),
+        "an unchanged parent handle still depends on changed child bounds"
+    );
+    assert!(Arc::ptr_eq(
+        &cells[&unchanged],
+        &old_index.cells.lock().unwrap()[&unchanged]
+    ));
+    drop(cells);
+    let reused_pixels = build_navigation_raster(input(
+        after.clone(),
+        layers.clone(),
+        viewport,
+        Arc::new(reused),
+    ))
+    .unwrap();
+    let fresh_pixels =
+        build_navigation_raster(input(after, layers, viewport, Arc::default())).unwrap();
+    assert_eq!(
+        reused_pixels.image.as_bytes(0),
+        fresh_pixels.image.as_bytes(0)
+    );
+    assert_ne!(
+        before_pixels.image.as_bytes(0),
+        fresh_pixels.image.as_bytes(0)
+    );
+}
+
+#[gpui::test]
+fn placed_rectangle_stays_visible_until_direct_frame_arrives(cx: &mut gpui::TestAppContext) {
+    rectangle_placement_handoff(cx, false, None);
+}
+
+#[gpui::test]
+fn placed_rectangle_stays_visible_until_raster_frame_arrives(cx: &mut gpui::TestAppContext) {
+    rectangle_placement_handoff(cx, true, None);
+}
+
+#[gpui::test]
+#[ignore = "requires ARGON_RENDER_GDS; places a rectangle over the local SRAM"]
+fn local_sram_rectangle_placement(cx: &mut gpui::TestAppContext) {
+    let gds = std::env::var_os("ARGON_RENDER_GDS").expect("set ARGON_RENDER_GDS");
+    rectangle_placement_handoff(cx, true, Some(gds.into()));
+}
+
+fn rectangle_placement_handoff(
+    cx: &mut gpui::TestAppContext,
+    dense: bool,
+    gds: Option<std::path::PathBuf>,
+) {
+    use analyzer::rpc::{LangServerRequest, LangServerResponse, RectangleEditResult};
+    use futures::{FutureExt, SinkExt, StreamExt};
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let layer_name = if gds.is_some() {
+        "met1.drawing"
+    } else {
+        "met1"
+    };
+    let program = if gds.is_some() {
+        "cell top() { let memory = inst(sram(), x=0., y=0.); }"
+    } else if dense {
+        r#"
+cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
+cell top() { for row in std::range(96) { for col in std::range(96) {
+    let child = inst(leaf(), x=(col as Float)*12., y=(row as Float)*12.);
+} } }
+"#
+    } else {
+        "cell top() { let existing = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }"
+    };
+    std::fs::write(&source, program).unwrap();
+    let is_sram = gds.is_some();
+    let mut config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(if is_sram {
+            "../../pdks/sky130/sky130.tech.toml"
+        } else {
+            "../../examples/tech/basic.tech.toml"
+        }),
+    ));
+    if let Some(gds) = gds {
+        config = config.with_gds_imports([("sram".to_owned(), gds)]);
+    }
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    compiler.set_source_text(source.clone(), program);
+    let canvas = test_canvas(cx);
+    let (client, mut server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
+    canvas.update(cx, |canvas, cx| {
+        canvas
+            .state
+            .update(cx, |state, _| state.lang_server_client = client)
+    });
+    let editor = test_editor(&canvas, cx);
+    let cx = cx.add_empty_window();
+    let apply = |output, revision, cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            let context = editor.begin_snapshot_preparation(cx, revision);
+            let prepared = editor::prepare_compilation_snapshot(
+                analyzer::rpc::CompilationSnapshot { revision, output },
+                context,
+            );
+            editor.finish_snapshot_preparation(cx, revision, prepared);
+        })
+    };
+    apply(
+        compiler.compile_cell(&config, &["top".into()], vec![]),
+        1,
+        cx,
+    );
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |_, cx| cx.notify());
+        cx.draw(
+            Point::default(),
+            Size::new(px(1200.), px(800.)).map(gpui::AvailableSpace::Definite),
+            |_, _| div().size_full().child(editor.clone()),
+        );
+    };
+    let settle = |cx: &mut gpui::VisualTestContext, require_preview: bool| {
+        for _ in 0..1024 {
+            draw(cx);
+            let pending = canvas.read_with(cx, |canvas, _| {
+                if require_preview {
+                    assert_eq!(
+                        canvas.painted_rectangle_previews.len(),
+                        1,
+                        "placed rectangle disappeared"
+                    );
+                }
+                canvas.raster_worker_active
+                    || canvas.raster_decision_refinement.is_some()
+                    || canvas.raster_overview_requested_revision.is_some()
+            });
+            if !pending {
+                return;
+            }
+            assert!(cx.dispatcher.tick(false));
+        }
+        panic!("renderer did not settle");
+    };
+    settle(cx, false);
+    if !is_sram {
+        assert_eq!(
+            canvas.read_with(cx, |canvas, _| canvas.last_presented_raster.get().is_some()),
+            dense
+        );
+    }
+    canvas.update(cx, |canvas, cx| {
+        let state = canvas.state.read(cx);
+        let layers = state.layers.clone();
+        let tool = state.tool.clone();
+        layers.update(cx, |layers, _| {
+            layers.selected_layer = Some(layer_name.into())
+        });
+        tool.update(cx, |tool, _| {
+            *tool = ToolState::DrawRect(DrawRectToolState::default())
+        });
+    });
+    let bounds = canvas.read_with(cx, |canvas, _| canvas.screen_bounds);
+    let p0 = bounds.center();
+    let p1 = p0 + Point::new(px(80.), px(60.));
+    let click = |position, cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| {
+            canvas.update(cx, |canvas, cx| {
+                canvas.mouse_position = position;
+                canvas.on_left_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            })
+        })
+    };
+    let committed_rect_count = canvas.read_with(cx, |canvas, _| {
+        canvas
+            .retained_direct_frame
+            .as_ref()
+            .map(|frame| frame.rects.len())
+    });
+    click(p0, cx);
+    canvas.update(cx, |canvas, _| canvas.mouse_position = p1);
+    draw(cx);
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+        1
+    );
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas
+            .retained_direct_frame
+            .as_ref()
+            .map(|frame| frame.rects.len())),
+        committed_rect_count,
+        "uncommitted tool previews must not enter retained frames"
+    );
+    click(p1, cx);
+    draw(cx);
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+        1
+    );
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.pending_rectangles.len()),
+        1
+    );
+    // Actual RPC dispatch is stalled here. The second click must already have
+    // returned, and tool changes, panning, zooming, and painting must still work.
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            *tool = ToolState::default();
+            cx.notify();
+        });
+        canvas.pan_view(Point::new(px(12.), px(8.)), cx);
+        canvas.zoom_about(bounds.center(), canvas.scale * 1.02, cx);
+    });
+    settle(cx, true);
+    let request = loop {
+        if let Some(message) = server.next().now_or_never() {
+            let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap() else {
+                panic!("expected source edit")
+            };
+            break request;
+        }
+        assert!(cx.dispatcher.tick(false));
+        draw(cx);
+        assert_eq!(
+            canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+            1
+        );
+    };
+    let LangServerRequest::DrawRect {
+        scope_span,
+        var_name,
+        rect,
+    } = request.message
+    else {
+        panic!("expected rectangle RPC")
+    };
+    let edited = program.replace(
+        "cell top() {",
+        &format!(
+            "cell top() {{ let {var_name} = rect(\"{layer_name}\", x0i={}, y0i={}, x1i={}, y1i={})!;",
+            compile::format_initial_condition(rect.x0, 0.1),
+            compile::format_initial_condition(rect.y0, 0.1),
+            compile::format_initial_condition(rect.x1, 0.1),
+            compile::format_initial_condition(rect.y1, 0.1)
+        ),
+    );
+    let mut accepted = Some(tarpc::Response {
+        request_id: request.id,
+        message: Ok(LangServerResponse::DrawRect(Some(RectangleEditResult {
+            span: scope_span.clone(),
+            revision: 1,
+        }))),
+    });
+    if !dense {
+        server
+            .send(accepted.take().unwrap())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        // Paint after every task through the reply, before compilation begins.
+        for _ in 0..128 {
+            draw(cx);
+            assert_eq!(
+                canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+                1
+            );
+            if canvas.read_with(cx, |canvas, _| {
+                canvas.pending_rectangles[0].receipt.is_some()
+            }) {
+                break;
+            }
+            assert!(cx.dispatcher.tick(false));
+        }
+        assert!(canvas.read_with(cx, |canvas, _| {
+            canvas.pending_rectangles[0].receipt.is_some()
+        }));
+    }
+    compiler.set_source_text(source.clone(), edited);
+    apply(
+        compiler.compile_cell(&config, &["top".into()], vec![]),
+        2,
+        cx,
+    );
+    let target = canvas.read_with(cx, |canvas, _| canvas.raster_content_revision);
+    let mut showed_committed = false;
+    for _ in 0..1024 {
+        draw(cx);
+        let pending = canvas.read_with(cx, |canvas, _| {
+            assert!(canvas.painted_complete_frame);
+            let current = canvas
+                .last_presented_raster
+                .get()
+                .and_then(|_| {
+                    canvas
+                        .raster_tiles
+                        .as_ref()
+                        .map(|tiles| tiles.content_revision)
+                })
+                .or_else(|| {
+                    canvas
+                        .retained_direct_frame
+                        .as_ref()
+                        .map(|frame| frame.content_revision)
+                })
+                .unwrap();
+            if current < target {
+                assert_eq!(
+                    canvas.painted_rectangle_previews.len(),
+                    1,
+                    "preview retired before its frame arrived"
+                );
+            } else {
+                showed_committed = true;
+                assert_eq!(
+                    canvas.painted_rectangle_previews.len(),
+                    0,
+                    "preview double-painted the committed rectangle"
+                );
+                assert!(canvas.pending_rectangles.is_empty());
+            }
+            canvas.raster_worker_active
+                || canvas.raster_decision_refinement.is_some()
+                || canvas.raster_overview_requested_revision.is_some()
+        });
+        if !pending {
+            break;
+        }
+        assert!(cx.dispatcher.tick(false));
+    }
+    assert!(showed_committed);
+    if dense {
+        // Also exercise compilation and frame presentation before the edit
+        // receipt arrives. A late reply must not resurrect the retired preview.
+        server
+            .send(accepted.take().unwrap())
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        for _ in 0..8 {
+            cx.dispatcher.tick(false);
+            draw(cx);
+            assert!(canvas.read_with(cx, |canvas, _| canvas.pending_rectangles.is_empty()));
+            assert_eq!(
+                canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+                0
+            );
+        }
+    }
+    // Rapid placements reserve distinct names before either edit has compiled.
+    // Rejecting one drops only its preview; undoing the other before its first
+    // compiled frame must not leave an optimistic rectangle behind forever.
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.read(cx).tool.clone().update(cx, |tool, _| {
+            *tool = ToolState::DrawRect(DrawRectToolState::default())
+        })
+    });
+    click(p0, cx);
+    click(p1, cx);
+    draw(cx);
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+        1
+    );
+    click(p0 + Point::new(px(100.), px(0.)), cx);
+    click(p1 + Point::new(px(100.), px(0.)), cx);
+    draw(cx);
+    canvas.read_with(cx, |canvas, _| {
+        assert_eq!(canvas.painted_rectangle_previews.len(), 2);
+        assert_eq!(canvas.pending_rectangles.len(), 2);
+        assert_ne!(
+            canvas.pending_rectangles[0].name,
+            canvas.pending_rectangles[1].name
+        );
+    });
+    let request = loop {
+        if let Some(message) = server.next().now_or_never()
+            && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
+        {
+            break request;
+        }
+        assert!(cx.dispatcher.tick(false));
+    };
+    server
+        .send(tarpc::Response {
+            request_id: request.id,
+            message: Ok(LangServerResponse::DrawRect(None)),
+        })
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    for _ in 0..128 {
+        draw(cx);
+        if canvas.read_with(cx, |canvas, _| canvas.pending_rectangles.len() == 1) {
+            break;
+        }
+        assert!(cx.dispatcher.tick(false));
+    }
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.pending_rectangles.len()),
+        1
+    );
+    draw(cx);
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+        1
+    );
+    let request = loop {
+        if let Some(message) = server.next().now_or_never()
+            && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
+        {
+            break request;
+        }
+        assert!(cx.dispatcher.tick(false));
+    };
+    server
+        .send(tarpc::Response {
+            request_id: request.id,
+            message: Ok(LangServerResponse::DrawRect(Some(RectangleEditResult {
+                span: scope_span,
+                revision: 2,
+            }))),
+        })
+        .now_or_never()
+        .unwrap()
+        .unwrap();
+    for _ in 0..128 {
+        draw(cx);
+        if canvas.read_with(cx, |canvas, _| {
+            canvas.pending_rectangles[0].receipt.is_some()
+        }) {
+            break;
+        }
+        assert!(cx.dispatcher.tick(false));
+    }
+    assert!(canvas.read_with(cx, |canvas, _| {
+        canvas.pending_rectangles[0].receipt.is_some()
+    }));
+    // The newer snapshot omits the accepted insertion, as when undo wins the
+    // compilation race. It contains the previously committed layout unchanged.
+    apply(
+        compiler.compile_cell(&config, &["top".into()], vec![]),
+        3,
+        cx,
+    );
+    settle(cx, false);
+    assert!(canvas.read_with(cx, |canvas, _| canvas.pending_rectangles.is_empty()));
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
+        0
+    );
+    assert!(canvas.read_with(cx, |canvas, _| canvas.painted_complete_frame));
 }

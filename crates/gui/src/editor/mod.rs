@@ -66,8 +66,9 @@ pub struct ScopeAddress {
 pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
-    pub state: Arc<IndexMap<ScopePath, ScopeState>>,
-    pub scope_paths: Arc<IndexMap<ScopeAddress, ScopePath>>,
+    pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
+    pub scope_paths: Arc<imbl::HashMap<ScopeAddress, ScopePath>>,
+    hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
 pub struct Layers {
@@ -171,21 +172,24 @@ fn shape_fill(
 #[derive(Default)]
 struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
-    state: IndexMap<ScopePath, ScopeState>,
-    scope_paths: IndexMap<ScopeAddress, ScopePath>,
+    state: imbl::HashMap<ScopePath, ScopeState>,
+    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
 }
 
+#[derive(Default)]
 pub(crate) struct CompilationPreparationContext {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: Option<ScopePath>,
-    scope_state: Option<Arc<IndexMap<ScopePath, ScopeState>>>,
+    scope_state: Option<Arc<imbl::HashMap<ScopePath, ScopeState>>>,
+    previous: Option<CompileOutputState>,
 }
 
 struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
-    state: IndexMap<ScopePath, ScopeState>,
-    scope_paths: IndexMap<ScopeAddress, ScopePath>,
+    state: imbl::HashMap<ScopePath, ScopeState>,
+    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
+    hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
 pub(crate) struct PreparedCompilationSnapshot {
@@ -264,6 +268,7 @@ impl EditorState {
             layers: self.layers.read(cx).layers.clone(),
             selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope.clone()),
             scope_state: old_cell.as_ref().map(|cell| cell.state.clone()),
+            previous: old_cell.clone(),
         }
     }
 
@@ -308,6 +313,7 @@ impl EditorState {
             selected_scope,
             state,
             scope_paths,
+            hierarchy,
         }) = prepared_output
         else {
             return;
@@ -330,6 +336,7 @@ impl EditorState {
                 selected_scope,
                 state: Arc::new(state),
                 scope_paths: Arc::new(scope_paths),
+                hierarchy,
             });
             cx.notify();
         });
@@ -382,11 +389,12 @@ pub(crate) fn prepare_compilation_snapshot(
                 },
             );
         }
-        hierarchy::prepare(
+        let hierarchy = hierarchy::prepare(
             solved_cell,
             root_scope,
             &mut state,
             context.scope_state.as_deref(),
+            context.previous.as_ref(),
         );
         let ProcessScopeState {
             layers,
@@ -402,6 +410,7 @@ pub(crate) fn prepare_compilation_snapshot(
             selected_scope,
             state,
             scope_paths,
+            hierarchy: Arc::new(hierarchy),
         }
     });
     PreparedCompilationSnapshot {

@@ -93,12 +93,24 @@ ARGON_RENDER_GDS="$HOME/Downloads/sram22_1024x32m8w8.gds" \
   -- --ignored --nocapture --test-threads=1
 ```
 
-This separates incremental compilation, full-snapshot file encoding/decoding,
-and GUI hierarchy preparation, and checks that the edit reuses the GDS import.
-File timings include I/O and are not measurements of the live RPC connection.
+This separates incremental compilation, cell-delta encoding/decoding, GUI
+hierarchy preparation, application, and rendering. Independent sender/receiver
+caches exercise the real serialized update format; serialization timings exclude
+socket and LSP scheduling. The full editor is painted between background tasks,
+asserting that the layout stays visible until the updated frame appears. The
+benchmark checks that the edit reuses the GDS import.
 Add `ARGON_VERIFY_HIERARCHY=1` to compare every prepared scope, bound, path, and
 layer against the previous expanded traversal. That intentionally slow reference
 check is reported separately from preparation timing.
+
+To check that a newly placed rectangle stays visible while its edit and render
+are pending, using the actual rectangle tool and a delayed in-memory RPC reply:
+
+```bash
+ARGON_RENDER_GDS="$HOME/Downloads/sram22_512x32m4w8.gds" \
+  cargo test -p argone --lib --release local_sram_rectangle_placement \
+  -- --ignored --nocapture --test-threads=1
+```
 
 ### Compiler scaling
 

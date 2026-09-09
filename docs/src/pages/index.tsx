@@ -4,6 +4,7 @@ import Link from '@docusaurus/Link';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import GitHubIcon from '@theme/Icon/Socials/GitHub';
 import styles from './index.module.css';
 
 const INSTALL = 'cargo install --git https://github.com/ucb-substrate/argon --locked argon';
@@ -175,6 +176,10 @@ export default function Home(): ReactNode {
               </Link>
               <Link className={clsx(styles.btn, styles.btnSecondary)} to="/language/overview">
                 Language reference
+              </Link>
+              <Link className={clsx(styles.btn, styles.btnSecondary)} to="https://github.com/ucb-substrate/argon">
+                <GitHubIcon className={styles.githubIcon} aria-hidden="true" focusable="false" />
+                Source on GitHub
               </Link>
             </div>
             <InstallCommand command={INSTALL} />

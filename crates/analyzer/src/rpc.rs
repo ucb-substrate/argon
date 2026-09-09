@@ -83,12 +83,98 @@ pub struct InstancePreview {
     pub scope_span: Span,
 }
 
+/// Receipt for an accepted rectangle insertion. Later snapshots can supersede
+/// it (for example, an undo) even if its first compiled frame was never shown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RectangleEditResult {
+    pub span: Span,
+    pub revision: u64,
+}
+
 /// A compiled GUI result tied to the exact analyzer source revision that
 /// produced it. Diagnostics continue to travel over LSP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompilationSnapshot {
     pub revision: u64,
     pub output: CompileOutput,
+}
+
+impl CompilationSnapshot {
+    pub fn data(&self) -> Option<&CompiledData> {
+        match &self.output {
+            CompileOutput::Valid(data) => Some(data),
+            CompileOutput::ExecErrors(errors) => errors.output.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn data_mut(&mut self) -> Option<&mut CompiledData> {
+        match &mut self.output {
+            CompileOutput::Valid(data) => Some(data),
+            CompileOutput::ExecErrors(errors) => errors.output.as_mut(),
+            _ => None,
+        }
+    }
+}
+
+/// A connection-local delta. Cells are immutable: pointer identity in the
+/// compiler session proves reuse, including source spans and non-geometry data.
+/// A new connection always starts with a full snapshot. The ordered cell list
+/// also removes cells absent from the new result, without retaining old graphs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationUpdate {
+    pub snapshot: CompilationSnapshot,
+    pub base_revision: Option<u64>,
+    pub cell_order: Vec<CellId>,
+}
+
+impl CompilationUpdate {
+    pub fn new(snapshot: CompilationSnapshot, previous: Option<&CompilationSnapshot>) -> Self {
+        let mut update = Self {
+            snapshot,
+            base_revision: None,
+            cell_order: Vec::new(),
+        };
+        if let Some((previous, old)) = previous.and_then(|p| p.data().map(|data| (p, data)))
+            && let Some(data) = update.snapshot.data_mut()
+        {
+            update.base_revision = Some(previous.revision);
+            update.cell_order = data.cells.keys().copied().collect();
+            data.cells.retain(|id, cell| {
+                !old.cells
+                    .get(id)
+                    .is_some_and(|old| std::sync::Arc::ptr_eq(old, cell))
+            });
+        }
+        update
+    }
+
+    /// Reject an unknown base rather than ever applying a partial hierarchy.
+    /// The sender retries with a full snapshot when this returns None.
+    pub fn materialize(
+        mut self,
+        previous: Option<&CompilationSnapshot>,
+    ) -> Option<CompilationSnapshot> {
+        if let Some(revision) = self.base_revision {
+            let old = previous.filter(|p| p.revision == revision)?.data()?;
+            let data = self.snapshot.data_mut()?;
+            let mut cells = indexmap::IndexMap::with_capacity(self.cell_order.len());
+            for id in self.cell_order {
+                let cell = data
+                    .cells
+                    .swap_remove(&id)
+                    .or_else(|| old.cells.get(&id).cloned())?;
+                if cells.insert(id, cell).is_some() {
+                    return None;
+                }
+            }
+            if !data.cells.is_empty() || !cells.contains_key(&data.top) {
+                return None;
+            }
+            data.cells = cells;
+        }
+        Some(self.snapshot)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,7 +194,11 @@ pub struct FocusEditorParams {
 pub trait LangServer {
     async fn register(addr: SocketAddr);
     async fn select_rect(span: Span);
-    async fn draw_rect(scope_span: Span, var_name: String, rect: BasicRect<f64>) -> Option<Span>;
+    async fn draw_rect(
+        scope_span: Span,
+        var_name: String,
+        rect: BasicRect<f64>,
+    ) -> Option<RectangleEditResult>;
     async fn draw_polygon(
         scope_span: Span,
         var_name: String,
@@ -133,7 +223,7 @@ pub trait LangServer {
 pub trait Gui {
     async fn compilation_started(activity_id: u64);
     async fn compilation_finished(activity_id: u64);
-    async fn update_cell(snapshot: CompilationSnapshot);
+    async fn update_cell(update: CompilationUpdate) -> bool;
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
@@ -451,11 +541,12 @@ impl LangServer for State {
         }
         self.publish_workspace_modified(modified, Some(connection))
             .await;
-        Backend {
-            state: self.clone(),
-        }
-        .open_current()
-        .await;
+        // Acknowledge the connection before compiling/preparing its first
+        // snapshot. That work may need GUI callbacks or exceed the handshake
+        // deadline; neither should prevent the window from opening.
+        tokio::spawn(async move {
+            Backend { state: self }.open_current().await;
+        });
     }
 
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
@@ -488,7 +579,7 @@ impl LangServer for State {
         scope_span: Span,
         var_name: String,
         rect: BasicRect<f64>,
-    ) -> Option<Span> {
+    ) -> Option<RectangleEditResult> {
         let Some(workspace_ast) = self.current_editor_ast().await else {
             self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                 .await;
@@ -528,9 +619,13 @@ impl LangServer for State {
             path: scope_span.path.clone(),
             span: insertion.tracked_span,
         };
-        self.apply_source_edit(url, insertion.edit)
-            .await
-            .then_some(span)
+        if !self.apply_source_edit(url, insertion.edit).await {
+            return None;
+        }
+        Some(RectangleEditResult {
+            span,
+            revision: self.source_state.lock().await.revision,
+        })
     }
 
     async fn draw_polygon(
@@ -980,6 +1075,76 @@ impl LangServer for State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compilation_delta_preserves_identity_order_and_removes_old_cells() {
+        use super::{CompilationSnapshot, CompilationUpdate};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
+cell top() { let a = inst(leaf(), x=0., y=0.); }
+"#,
+        )
+        .unwrap();
+        let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        let base = CompilationSnapshot {
+            revision: 1,
+            output: compiler.compile_cell(&config, &["top".into()], vec![]),
+        };
+        let roundtrip = |update: CompilationUpdate| -> CompilationUpdate {
+            bincode::deserialize(&bincode::serialize(&update).unwrap()).unwrap()
+        };
+        let received_base = roundtrip(CompilationUpdate::new(base.clone(), None))
+            .materialize(None)
+            .unwrap();
+        let mut edited = base.clone();
+        edited.revision = 2;
+        let data = edited.data_mut().unwrap();
+        // The same ID with new data must be sent; an ID is never a cache key
+        // without immutable identity. This also exercises removal of a cell.
+        let top = data.top;
+        let top_cell = Arc::make_mut(data.cells.get_mut(&top).unwrap());
+        top_cell.name = "updated".into();
+        top_cell.objects.clear();
+        for scope in top_cell.scopes.values_mut() {
+            scope.emit.clear();
+        }
+        let update = CompilationUpdate::new(edited.clone(), Some(&base));
+        assert_eq!(update.snapshot.data().unwrap().cells.len(), 1);
+        let received = roundtrip(update.clone())
+            .materialize(Some(&received_base))
+            .unwrap();
+        assert_eq!(
+            received.data().unwrap().cells.keys().collect::<Vec<_>>(),
+            edited.data().unwrap().cells.keys().collect::<Vec<_>>()
+        );
+        for (id, cell) in &received.data().unwrap().cells {
+            if *id != top {
+                assert!(Arc::ptr_eq(cell, &received_base.data().unwrap().cells[id]));
+            }
+        }
+        assert_eq!(received.data().unwrap().cells[&top].name, "updated");
+        assert!(roundtrip(update.clone()).materialize(None).is_none());
+        assert!(roundtrip(update).materialize(Some(&received)).is_none());
+        edited.revision = 3;
+        edited.data_mut().unwrap().cells.retain(|id, _| *id == top);
+        let received = roundtrip(CompilationUpdate::new(edited.clone(), Some(&base)))
+            .materialize(Some(&received_base))
+            .unwrap();
+        assert_eq!(received.data().unwrap().cells.len(), 1);
+        assert_eq!(
+            received.data().unwrap().geometry_digest(),
+            edited.data().unwrap().geometry_digest()
+        );
+    }
+
     use argonc::{WorkspaceConfig, parse};
     use tower_lsp_server::ls_types::{Position, Uri};
 

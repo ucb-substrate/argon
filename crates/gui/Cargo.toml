@@ -33,6 +33,7 @@ futures = { workspace = true }
 tokio = { version = "1", features = ["net"] }
 geometry = { version = "0.7.1", registry = "substrate" }
 indexmap = { workspace = true }
+imbl = "7.0.1"
 image = { version = "0.25", default-features = false }
 rgb = { version = "0.8", features = ["serde"] }
 unicode-segmentation = "1"
@@ -49,5 +50,6 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+bincode = "1"
 approx = { workspace = true }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev", features = ["test-support"] }

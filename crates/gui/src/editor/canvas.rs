@@ -12,7 +12,7 @@ use std::{
 
 use analyzer::rpc::{
     DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, ValueEdit,
+    PolygonParams, RectangleEditResult, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -722,6 +722,47 @@ impl Polygon {
     }
 }
 
+/// Constraint status belongs to each source coordinate, including after an
+/// instance rotates/reflects it or the rectangle's endpoints are reversed.
+fn rectangle_border_styles(
+    rect: &compile::Rect<(f64, LinearExpr)>,
+    unsolved_vars: &IndexSet<Var>,
+    transform: TransformationMatrix,
+) -> Edges<BorderStyle> {
+    let mut styles = Edges::all(BorderStyle::Solid);
+    if unsolved_vars.is_empty() {
+        return styles;
+    }
+    let x_direction = if rect.x0.0 <= rect.x1.0 { 1. } else { -1. };
+    let y_direction = if rect.y0.0 <= rect.y1.0 { 1. } else { -1. };
+    for (coordinate, normal) in [
+        (&rect.x0.1, (-x_direction, 0.)),
+        (&rect.x1.1, (x_direction, 0.)),
+        (&rect.y0.1, (0., -y_direction)),
+        (&rect.y1.1, (0., y_direction)),
+    ] {
+        if !coordinate
+            .coeffs
+            .iter()
+            .any(|(_, var)| unsolved_vars.contains(var))
+        {
+            continue;
+        }
+        let (x, y) = ifmatvec(transform, normal);
+        let edge = if x < 0. {
+            &mut styles.left
+        } else if x > 0. {
+            &mut styles.right
+        } else if y < 0. {
+            &mut styles.bottom
+        } else {
+            &mut styles.top
+        };
+        *edge = BorderStyle::Dashed;
+    }
+    styles
+}
+
 fn polygon_edge_styles(
     point_count: usize,
     mut is_unconstrained: impl FnMut(usize) -> bool,
@@ -953,6 +994,41 @@ pub(crate) struct DrawRectToolState {
     p0: Option<Point<f32>>,
 }
 
+/// A placed rectangle stays separate from cached layout frames until a frame
+/// containing its accepted source edit is actually painted.
+#[derive(Clone, Debug)]
+struct PendingRectangle {
+    id: u64,
+    scope_path: editor::ScopePath,
+    source_path: std::path::PathBuf,
+    name: String,
+    rect: compile::BasicRect<f64>,
+    submitted_revision: Option<u64>,
+    receipt: Option<RectangleEditResult>,
+    resolved_content_revision: Option<u64>,
+}
+
+impl PendingRectangle {
+    fn preview(&self) -> Rect {
+        Rect {
+            object_path: Vec::new(),
+            x0: self.rect.x0 as f32,
+            y0: self.rect.y0 as f32,
+            x1: self.rect.x1 as f32,
+            y1: self.rect.y1 as f32,
+            id: None,
+            cvars: None,
+            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            border_styles: Edges::all(BorderStyle::Dashed),
+        }
+    }
+
+    fn included_in_frame(&self, revision: u64) -> bool {
+        self.resolved_content_revision
+            .is_some_and(|resolved| revision >= resolved)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DrawPolygonToolState {
     points: Vec<Point<f32>>,
@@ -1155,8 +1231,12 @@ pub struct LayoutCanvas {
     /// raster may only move monotonically closer to the requested camera.
     last_presented_raster: Cell<Option<RasterDisplayTransform>>,
     retained_direct_frame: Option<Arc<DirectFrame>>,
+    pending_rectangles: Vec<PendingRectangle>,
+    next_rectangle_id: u64,
     #[cfg(test)]
     painted_complete_frame: bool,
+    #[cfg(test)]
+    painted_rectangle_previews: Vec<Bounds<Pixels>>,
     raster_tile_target: Option<RasterTileTarget>,
     /// Sparse views are painted as geometry. Once the background-built BVHs
     /// are ready, viewport rasters are enabled only when the current view has
@@ -1194,7 +1274,8 @@ pub struct LayoutCanvas {
     raster_content_revision: u64,
     raster_content_revision_signal: Arc<AtomicU64>,
     raster_output: Option<Arc<CompiledData>>,
-    raster_scope_state: Option<Arc<IndexMap<editor::ScopePath, editor::ScopeState>>>,
+    raster_hierarchy: Arc<editor::hierarchy::PreparedHierarchy>,
+    raster_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
     raster_selected_scope: Option<editor::ScopePath>,
     raster_displayed_cell: Option<CellId>,
     raster_layer_visibility: Vec<bool>,
@@ -1929,6 +2010,8 @@ impl RasterCellSpatialIndex {
     }
 }
 
+type RasterLodQuery = (Vec<usize>, Vec<RasterLodOccupancy>);
+
 struct RasterSpatialIndex {
     cells: Mutex<HashMap<CellId, Arc<OnceLock<RasterCellSpatialIndex>>>>,
     // Coarse footprints do not require sorting every descendant's geometry
@@ -1952,13 +2035,40 @@ impl Default for RasterSpatialIndex {
 impl RasterSpatialIndex {
     fn for_presentation(
         hierarchy_depth: usize,
-        scopes: Option<&IndexMap<editor::ScopePath, editor::ScopeState>>,
+        scopes: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
     ) -> Self {
         Self {
             collapse_instances: hierarchy_depth == usize::MAX
                 && scopes.is_none_or(|scopes| scopes.values().all(|scope| scope.visible)),
             ..Self::default()
         }
+    }
+
+    fn reuse_ready_cells(&mut self, previous: &Self, unchanged: impl Fn(CellId) -> bool) {
+        if self.collapse_instances != previous.collapse_instances {
+            return;
+        }
+        // Clone ready handles under the map lock. Never wait for a OnceLock
+        // that an old worker is still building, or copy any geometry arrays.
+        *self.cells.get_mut().expect("raster spatial index poisoned") = previous
+            .cells
+            .lock()
+            .expect("raster spatial index poisoned")
+            .iter()
+            .filter(|(cell, index)| index.get().is_some() && unchanged(**cell))
+            .map(|(cell, index)| (*cell, index.clone()))
+            .collect();
+        *self
+            .footprints
+            .get_mut()
+            .expect("raster footprints poisoned") = previous
+            .footprints
+            .lock()
+            .expect("raster footprints poisoned")
+            .iter()
+            .filter(|(cell, index)| index.get().is_some() && unchanged(**cell))
+            .map(|(cell, index)| (*cell, index.clone()))
+            .collect();
     }
 
     /// Bounded LOD query for UI painting. A missing index is distinct from
@@ -1969,7 +2079,7 @@ impl RasterSpatialIndex {
         bounds: RasterBvhBounds,
         max_lod_span: f64,
         budget: &mut GeometryWorkBudget,
-    ) -> Result<Option<(Vec<usize>, Vec<RasterLodOccupancy>)>, ()> {
+    ) -> Result<Option<RasterLodQuery>, ()> {
         let cell_index = self
             .cells
             .lock()
@@ -2181,6 +2291,7 @@ struct RasterRectPrimitive {
     fill: ShapeFill,
     color: Rgba,
     border_color: Rgba,
+    border_styles: Edges<BorderStyle>,
 }
 
 struct RasterPolygonPrimitive {
@@ -3332,6 +3443,55 @@ fn stroke_raster_rect(
     bounds: Bounds<Pixels>,
     color: Rgba,
 ) {
+    stroke_styled_raster_rect(
+        target,
+        width,
+        height,
+        bounds,
+        color,
+        Edges::all(BorderStyle::Solid),
+    );
+}
+
+/// The same 2:1 dash/gap ratio as GPUI, sampled at raster resolution. Anchor
+/// the pattern to the full edge, before clipping, so adjacent tiles and pans
+/// cannot restart dashes at the viewport boundary.
+struct RasterEdgeDashes {
+    origin: f32,
+    period: f32,
+    length: f32,
+}
+
+impl RasterEdgeDashes {
+    fn new(origin: Pixels, extent: Pixels) -> Self {
+        let length = 2. * f32::from(DEFAULT_BORDER_WIDTH) * RASTER_CACHE_RESOLUTION;
+        let available = f32::from(extent) - length;
+        let count = (available / (1.5 * length)).floor();
+        let period = if count >= 1. {
+            available / count
+        } else {
+            available.max(length)
+        };
+        Self {
+            origin: f32::from(origin),
+            period,
+            length,
+        }
+    }
+
+    fn is_on(&self, position: i32) -> bool {
+        (position as f32 + 0.5 - self.origin).rem_euclid(self.period) < self.length
+    }
+}
+
+fn stroke_styled_raster_rect(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+    color: Rgba,
+    styles: Edges<BorderStyle>,
+) {
     let Some((x0, x1)) = raster_unclipped_pixel_range(
         f32::from(bounds.origin.x),
         f32::from(bounds.origin.x + bounds.size.width),
@@ -3347,14 +3507,23 @@ fn stroke_raster_rect(
 
     let bottom = y1 - 1;
     let right = x1 - 1;
+    let horizontal = RasterEdgeDashes::new(bounds.origin.x, bounds.size.width);
+    let vertical = RasterEdgeDashes::new(bounds.origin.y, bounds.size.height);
     let clipped_x0 = x0.clamp(0, width as i32);
     let clipped_x1 = x1.clamp(0, width as i32);
     if clipped_x0 < clipped_x1 {
         for x in clipped_x0..clipped_x1 {
-            if y0 >= 0 && y0 < height as i32 {
+            if y0 >= 0
+                && y0 < height as i32
+                && (styles.top == BorderStyle::Solid || horizontal.is_on(x))
+            {
                 target.pixel((y0 as u32 * width + x as u32) as usize, color);
             }
-            if bottom != y0 && bottom >= 0 && bottom < height as i32 {
+            if bottom != y0
+                && bottom >= 0
+                && bottom < height as i32
+                && (styles.bottom == BorderStyle::Solid || horizontal.is_on(x))
+            {
                 target.pixel((bottom as u32 * width + x as u32) as usize, color);
             }
         }
@@ -3363,10 +3532,15 @@ fn stroke_raster_rect(
     let clipped_y0 = (y0 + 1).clamp(0, height as i32);
     let clipped_y1 = bottom.clamp(0, height as i32);
     for y in clipped_y0..clipped_y1 {
-        if x0 >= 0 && x0 < width as i32 {
+        if x0 >= 0 && x0 < width as i32 && (styles.left == BorderStyle::Solid || vertical.is_on(y))
+        {
             target.pixel((y as u32 * width + x0 as u32) as usize, color);
         }
-        if right != x0 && right >= 0 && right < width as i32 {
+        if right != x0
+            && right >= 0
+            && right < width as i32
+            && (styles.right == BorderStyle::Solid || vertical.is_on(y))
+        {
             target.pixel((y as u32 * width + right as u32) as usize, color);
         }
     }
@@ -3758,6 +3932,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                         fill: layer.fill,
                         color: layer.color,
                         border_color: layer.border_color,
+                        border_styles: rectangle_border_styles(rect, &cell_info.unsolved_vars, mat),
                     });
                 }
                 SolvedValue::Polygon(polygon) => {
@@ -4210,12 +4385,13 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
                 }
-                stroke_raster_rect(
+                stroke_styled_raster_rect(
                     &mut outline_target,
                     width,
                     height,
                     primitive.bounds,
                     primitive.border_color,
+                    primitive.border_styles,
                 );
             }
             for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
@@ -4253,12 +4429,13 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
                 }
-                stroke_raster_rect(
+                stroke_styled_raster_rect(
                     &mut outline_target,
                     width,
                     height,
                     primitive.bounds,
                     primitive.border_color,
+                    primitive.border_styles,
                 );
             }
             for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
@@ -5646,6 +5823,7 @@ impl Element for CanvasElement {
             #[cfg(test)]
             {
                 inner.painted_complete_frame = false;
+                inner.painted_rectangle_previews.clear();
             }
             std::mem::take(&mut inner.raster_images_to_drop)
         });
@@ -6010,38 +6188,11 @@ impl Element for CanvasElement {
                                         id: rect.span.clone(),
                                         object_path,
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                        // TODO: this is wrong for transformed rects
-                                        border_styles: Edges {
-                                            // TODO: check constrained status and modify widths
-                                            top: if rect.y1.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            right: if rect.x1.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            bottom: if rect.y0.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            left: if rect.x0.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                        },
+                                        border_styles: rectangle_border_styles(
+                                            rect,
+                                            &cell_info.unsolved_vars,
+                                            mat,
+                                        ),
                                         cvars: (depth == 0).then(|| Edges {
                                             left: rect.x0.1.clone(),
                                             right: rect.x1.1.clone(),
@@ -6429,25 +6580,6 @@ impl Element for CanvasElement {
                         queue.push_back((scope_address, mat, ofs, depth + 1, show, path.clone()));
                     }
                 }
-
-                if !shallow && let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool {
-                    let mut layer = layers.layers[layers.selected_layer.as_ref().unwrap()].clone();
-                    layer.border_color = rgb(0xffff00);
-                    rects.push((
-                        Rect {
-                            object_path: Vec::new(),
-                            x0: p0.x.min(snapped_layout_mouse_position.x),
-                            y0: p0.y.min(snapped_layout_mouse_position.y),
-                            x1: p0.x.max(snapped_layout_mouse_position.x),
-                            y1: p0.y.max(snapped_layout_mouse_position.y),
-                            id: None,
-                            border_widths: Edges::all(SELECT_WIDTH),
-                            border_styles: Edges::all(BorderStyle::Dashed),
-                            cvars: None,
-                        },
-                        layer,
-                    ));
-                }
             }
             Some(())
         })()
@@ -6691,6 +6823,56 @@ impl Element for CanvasElement {
                 }
             }
         }
+        let presented_content_revision = match &presentation {
+            Presentation::Raster { tiles, .. } => tiles.content_revision,
+            Presentation::Direct => replay_direct
+                .as_ref()
+                .map_or(inner.raster_content_revision, |frame| {
+                    frame.content_revision
+                }),
+        };
+        let mut rectangle_previews = inner
+            .pending_rectangles
+            .iter()
+            .filter(|pending| {
+                !pending.included_in_frame(presented_content_revision)
+                    && solved_cell.as_ref().is_some_and(|solved| {
+                        solved.selected_scope == pending.scope_path
+                            && solved
+                                .state
+                                .get(&pending.scope_path)
+                                .is_some_and(|scope| scope.visible)
+                    })
+            })
+            .filter_map(|pending| {
+                let layer = layers.layers.get(pending.rect.layer.as_deref()?)?;
+                layer.visible.then(|| (pending.preview(), layer.clone()))
+            })
+            .collect::<Vec<_>>();
+        if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool
+            && let Some(layer) = layers
+                .selected_layer
+                .as_ref()
+                .and_then(|name| layers.layers.get(name))
+                .filter(|layer| layer.visible)
+        {
+            let mut layer = layer.clone();
+            layer.border_color = rgb(0xffff00);
+            rectangle_previews.push((
+                Rect {
+                    object_path: Vec::new(),
+                    x0: p0.x.min(snapped_layout_mouse_position.x),
+                    y0: p0.y.min(snapped_layout_mouse_position.y),
+                    x1: p0.x.max(snapped_layout_mouse_position.x),
+                    y1: p0.y.max(snapped_layout_mouse_position.y),
+                    id: None,
+                    cvars: None,
+                    border_widths: Edges::all(SELECT_WIDTH),
+                    border_styles: Edges::all(BorderStyle::Dashed),
+                },
+                layer,
+            ));
+        }
         let draw_layer = layers
             .selected_layer
             .as_ref()
@@ -6702,6 +6884,8 @@ impl Element for CanvasElement {
             offset.y * RASTER_CACHE_RESOLUTION,
         ));
         let mut transient_geometry_images = Vec::new();
+        #[cfg(test)]
+        let mut painted_rectangle_previews = Vec::new();
         let presentation_transform = match &presentation {
             Presentation::Raster { display, .. } => (display.scale, display.offset),
             Presentation::Direct => (scale, offset),
@@ -6988,25 +7172,12 @@ impl Element for CanvasElement {
                 }
 
                 window.paint_layer(bounds, |window| {
-                    if shallow
-                        && let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool
-                        && let Some(layer) = draw_layer.as_ref().filter(|layer| layer.visible)
-                    {
-                        // Preview with the retained raster's own resolution,
-                        // bitmap sampler, and layout-anchored phase so the
-                        // rectangle looks like the committed geometry will.
-                        let preview = Rect {
-                            object_path: Vec::new(),
-                            x0: p0.x.min(snapped_layout_mouse_position.x),
-                            y0: p0.y.min(snapped_layout_mouse_position.y),
-                            x1: p0.x.max(snapped_layout_mouse_position.x),
-                            y1: p0.y.max(snapped_layout_mouse_position.y),
-                            id: None,
-                            border_widths: Edges::all(SELECT_WIDTH),
-                            border_styles: Edges::all(BorderStyle::Dashed),
-                            cvars: None,
-                        };
-                        let preview_bounds = get_rect_bounds(&preview, bounds, scale, offset);
+                    for (preview, layer) in &rectangle_previews {
+                        // Pending placements use the displayed camera and the
+                        // raster sampler, including while older tiles are held.
+                        let preview_bounds = get_rect_bounds(preview, bounds, scale, offset);
+                        #[cfg(test)]
+                        if preview_bounds.intersects(&bounds) { painted_rectangle_previews.push(preview_bounds); }
                         let (preview_fill, preview_color) = shape_fill_for_screen_extent(
                             layer.fill,
                             layer.color,
@@ -7029,7 +7200,7 @@ impl Element for CanvasElement {
                                 preview_bounds,
                                 ShapeFill::Hollow,
                                 preview_color,
-                                rgb(0xffff00),
+                                layer.border_color,
                                 preview.border_widths,
                                 preview.border_styles,
                             ));
@@ -7056,7 +7227,7 @@ impl Element for CanvasElement {
                                 preview_bounds,
                                 ShapeFill::Hollow,
                                 preview_color,
-                                rgb(0xffff00),
+                                layer.border_color,
                                 preview.border_widths,
                                 preview.border_styles,
                             ));
@@ -7065,7 +7236,7 @@ impl Element for CanvasElement {
                                 preview_bounds,
                                 preview_fill,
                                 preview_color,
-                                rgb(0xffff00),
+                                layer.border_color,
                                 preview.border_widths,
                                 preview.border_styles,
                             ));
@@ -8108,6 +8279,9 @@ impl Element for CanvasElement {
                 // field must not reappear behind it.
                 inner.raster_stale_tiles_displayable = false;
             }
+            inner
+                .pending_rectangles
+                .retain(|pending| !pending.included_in_frame(presented_content_revision));
             if let Some(frame) = fresh_direct_frame {
                 inner.retained_direct_frame = Some(frame);
             } else if shallow {
@@ -8116,6 +8290,7 @@ impl Element for CanvasElement {
             #[cfg(test)]
             {
                 inner.painted_complete_frame = true;
+                inner.painted_rectangle_previews = painted_rectangle_previews;
             }
             inner.rects = rects;
             inner.polygons = polygons;
@@ -8277,11 +8452,14 @@ impl LayoutCanvas {
             screen_bounds: Bounds::default(),
             _subscriptions: vec![
                 cx.observe(state, |canvas, _, cx| {
+                    let previous_hierarchy = canvas.raster_hierarchy.clone();
                     let change = canvas.update_raster_presentation(cx);
                     if change == RasterPresentationChange::None {
+                        canvas.reconcile_pending_rectangles(cx);
                         return;
                     }
                     canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
+                    canvas.reconcile_pending_rectangles(cx);
                     canvas
                         .raster_content_revision_signal
                         .store(canvas.raster_content_revision, Ordering::Release);
@@ -8289,12 +8467,22 @@ impl LayoutCanvas {
                         &mut canvas.cell_raster_tiles,
                         Arc::new(Mutex::new(CellRasterTileCache::default())),
                     );
+                    let mut spatial_index = RasterSpatialIndex::for_presentation(
+                        canvas.raster_hierarchy_depth,
+                        canvas.raster_scope_state.as_deref(),
+                    );
+                    if change == RasterPresentationChange::Geometry
+                        && let Some(output) = &canvas.raster_output
+                    {
+                        spatial_index.reuse_ready_cells(&canvas.raster_spatial_index, |cell| {
+                            canvas
+                                .raster_hierarchy
+                                .same_cell(&previous_hierarchy, output, cell)
+                        });
+                    }
                     let stale_spatial_index = std::mem::replace(
                         &mut canvas.raster_spatial_index,
-                        Arc::new(RasterSpatialIndex::for_presentation(
-                            canvas.raster_hierarchy_depth,
-                            canvas.raster_scope_state.as_deref(),
-                        )),
+                        Arc::new(spatial_index),
                     );
                     // Large cell-tile bitmaps and BVHs can take long enough to
                     // destruct to stall animation. Retire the previous
@@ -8331,8 +8519,12 @@ impl LayoutCanvas {
             raster_stale_tiles_displayable: false,
             last_presented_raster: Cell::new(None),
             retained_direct_frame: None,
+            pending_rectangles: Vec::new(),
+            next_rectangle_id: 0,
             #[cfg(test)]
             painted_complete_frame: false,
+            #[cfg(test)]
+            painted_rectangle_previews: Vec::new(),
             raster_tile_target: None,
             raster_cache_enabled: false,
             raster_prefetch_enabled: false,
@@ -8348,6 +8540,7 @@ impl LayoutCanvas {
             raster_content_revision: 0,
             raster_content_revision_signal: Arc::new(AtomicU64::new(0)),
             raster_output: None,
+            raster_hierarchy: Arc::default(),
             raster_scope_state: None,
             raster_selected_scope: None,
             raster_displayed_cell: None,
@@ -8501,8 +8694,10 @@ impl LayoutCanvas {
             (None, None) => true,
             _ => false,
         };
+        // Source recompilation can allocate a new ID for the same selected
+        // path. Keep its old frame until replacement geometry is complete.
         let presentation_changed = self.raster_selected_scope != selected_scope
-            || self.raster_displayed_cell != displayed_cell
+            || (same_output && self.raster_displayed_cell != displayed_cell)
             || self.raster_layer_visibility != layer_visibility
             || self.raster_hierarchy_depth != hierarchy_depth
             || self.raster_hide_external_geometry != hide_external_geometry
@@ -8514,6 +8709,14 @@ impl LayoutCanvas {
             self.raster_output.is_some(),
         );
         self.raster_output = output;
+        self.raster_hierarchy = self
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|solved| solved.hierarchy.clone())
+            .unwrap_or_default();
         self.raster_scope_state = scope_state;
         self.raster_selected_scope = selected_scope;
         self.raster_displayed_cell = displayed_cell;
@@ -8635,6 +8838,7 @@ impl LayoutCanvas {
                 if let Some(decision) = decision {
                     canvas.set_raster_cache_requested(decision, cx);
                 }
+                canvas.promote_staging_tiles();
                 // A decision can reuse an already complete field, with no
                 // tile worker left to clear the activity flag. Recompute it
                 // from the remaining tasks even when raster mode stays on.
@@ -9077,7 +9281,7 @@ impl LayoutCanvas {
         }
 
         let can_stage_over_active = self.raster_tiles.as_ref().is_some_and(|tiles| {
-            tiles.content_revision == target.content_revision
+            self.raster_revision_displayable(tiles.content_revision)
                 && tiles.screen_viewport == target.screen_viewport
         });
         if !can_stage_over_active {
@@ -9143,6 +9347,18 @@ impl LayoutCanvas {
         }
         staging.center = target.center;
 
+        self.promote_staging_tiles();
+    }
+
+    fn promote_staging_tiles(&mut self) {
+        // A zoom's visibility query can choose direct geometry. Do not publish
+        // a new raster first and immediately replace it with that rendition.
+        if self.raster_decision_refinement.is_some() {
+            return;
+        }
+        let Some(staging) = self.raster_staging_tiles.as_ref() else {
+            return;
+        };
         let staging_covers_viewport = raster_tiles_cover_bounds(
             staging,
             self.screen_bounds,
@@ -9172,6 +9388,7 @@ impl LayoutCanvas {
             self.raster_images_to_drop
                 .extend(previous.tiles.into_values().map(|cache| cache.image));
         }
+        self.raster_stale_tiles_displayable = false;
         self.raster_display = Some(display);
     }
 
@@ -9561,6 +9778,153 @@ impl LayoutCanvas {
         cx.notify();
     }
 
+    fn place_rectangle(
+        &mut self,
+        p0: Point<f32>,
+        p1: Point<f32>,
+        grid: f64,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let Some(solved) = state.solved_cell.read(cx).as_ref() else {
+            return;
+        };
+        let address = solved.state[&solved.selected_scope].address;
+        let scope = &solved.output.cells[&address.cell].scopes[&address.scope];
+        let reachable = solved.output.reachable_objs(address.cell, address.scope);
+        let names: HashSet<&str> = reachable
+            .values()
+            .map(String::as_str)
+            .chain(
+                self.pending_rectangles
+                    .iter()
+                    .filter(|pending| pending.scope_path == solved.selected_scope)
+                    .map(|pending| pending.name.as_str()),
+            )
+            .collect();
+        let name = (0..)
+            .map(|i| format!("rect{i}"))
+            .find(|name| !names.contains(name.as_str()))
+            .expect("an unused rectangle name");
+        let rect = compile::BasicRect {
+            layer: state
+                .layers
+                .read(cx)
+                .selected_layer
+                .as_ref()
+                .map(ToString::to_string),
+            x0: draw_source_coordinate(p0.x.min(p1.x), grid),
+            y0: draw_source_coordinate(p0.y.min(p1.y), grid),
+            x1: draw_source_coordinate(p0.x.max(p1.x), grid),
+            y1: draw_source_coordinate(p0.y.max(p1.y), grid),
+            construction: false,
+        };
+        let client = state.lang_server_client.clone();
+        let scope_span = scope.span.clone();
+        let id = self.next_rectangle_id;
+        self.next_rectangle_id = self.next_rectangle_id.wrapping_add(1);
+        self.pending_rectangles.push(PendingRectangle {
+            id,
+            scope_path: solved.selected_scope.clone(),
+            source_path: scope_span.path.clone(),
+            name: name.clone(),
+            rect: rect.clone(),
+            submitted_revision: state.compilation_revision,
+            receipt: None,
+            resolved_content_revision: None,
+        });
+        cx.notify();
+        cx.spawn(async move |canvas, cx| {
+            let result = client.draw_rect(scope_span, name, rect).await;
+            let _ = canvas.update(cx, |canvas, cx| {
+                canvas.finish_rectangle_request(id, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn finish_rectangle_request(
+        &mut self,
+        id: u64,
+        result: anyhow::Result<Option<RectangleEditResult>>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(Some(receipt)) => {
+                if let Some(pending) = self
+                    .pending_rectangles
+                    .iter_mut()
+                    .find(|pending| pending.id == id)
+                {
+                    pending.receipt = Some(receipt);
+                }
+                // The compiler may have delivered its snapshot before the RPC
+                // reply. Reconcile either arrival order without a blank frame.
+                self.reconcile_pending_rectangles(cx);
+            }
+            result => {
+                self.pending_rectangles.retain(|pending| pending.id != id);
+                if matches!(result, Ok(None)) {
+                    self.state.update(cx, |state, cx| {
+                        if state.message.is_none() {
+                            state.show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn reconcile_pending_rectangles(&mut self, cx: &App) {
+        if self.pending_rectangles.is_empty() {
+            return;
+        }
+        let state = self.state.read(cx);
+        let revision = state.compilation_revision;
+        let solved = state.solved_cell.read(cx);
+        self.pending_rectangles.retain_mut(|pending| {
+            let contains_rectangle = solved.as_ref().is_some_and(|solved| {
+                solved
+                    .state
+                    .get(&pending.scope_path)
+                    .is_some_and(|scope_state| {
+                        let cell = &solved.output.cells[&scope_state.address.cell];
+                        let scope = &cell.scopes[&scope_state.address.scope];
+                        scope.span.path == pending.source_path
+                            && scope.bindings.values().any(|(name, object)| {
+                                name == &pending.name
+                                    && object
+                                        .get_elem()
+                                        .and_then(|id| cell.objects.get(id))
+                                        .is_some_and(|object| {
+                                            matches!(object, SolvedValue::Rect(_))
+                                        })
+                            })
+                    })
+            });
+            if contains_rectangle {
+                pending.resolved_content_revision = Some(self.raster_content_revision);
+            } else if state.compilation_error.is_some()
+                && revision.is_some_and(|revision| {
+                    snapshot_follows_revision(revision, pending.submitted_revision)
+                })
+            {
+                return false;
+            } else if pending
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| revision.is_some_and(|revision| revision > receipt.revision))
+            {
+                // A newer source revision superseded the insertion (undo,
+                // deletion, or opening another cell). Retire with that frame.
+                pending.resolved_content_revision = Some(self.raster_content_revision);
+            }
+            true
+        });
+    }
+
     pub(crate) fn on_left_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -9590,6 +9954,7 @@ impl LayoutCanvas {
             .unwrap_or(0.1);
         let layout_mouse_position = self.px_to_layout(event.position);
         let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
+        let mut rectangle = None;
         let edit_dim = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             let mut edit_dim = false;
             match tool {
@@ -9602,72 +9967,7 @@ impl LayoutCanvas {
                         if layer_info.visible {
                             if let Some(p0) = rect_tool.p0 {
                                 rect_tool.p0 = None;
-                                let p1 = snapped_layout_mouse_position;
-                                let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
-                                let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
-                                self.state.update(cx, |state, cx| {
-                                    let error: Option<SharedString> =
-                                        state.solved_cell.update(cx, {
-                                            |cell, cx| {
-                                                if let Some(cell) = cell.as_mut() {
-                                                    // TODO update in memory representation of code
-                                                    // TODO add solver to gui
-                                                    let scope_address =
-                                                        &cell.state[&cell.selected_scope].address;
-                                                    let reachable_objs =
-                                                        cell.output.reachable_objs(
-                                                            scope_address.cell,
-                                                            scope_address.scope,
-                                                        );
-                                                    let names: IndexSet<_> =
-                                                        reachable_objs.values().collect();
-                                                    let scope = cell
-                                                        .output
-                                                        .cells
-                                                        .get(&scope_address.cell)
-                                                        .unwrap()
-                                                        .scopes
-                                                        .get(&scope_address.scope)
-                                                        .unwrap();
-                                                    let rect_name = (0..)
-                                                        .map(|i| format!("rect{i}"))
-                                                        .find(|name| !names.contains(name))
-                                                        .unwrap();
-
-                                                    match state.lang_server_client.draw_rect(
-                                                        scope.span.clone(),
-                                                        rect_name,
-                                                        compile::BasicRect {
-                                                            layer: state
-                                                                .layers
-                                                                .read(cx)
-                                                                .selected_layer
-                                                                .clone()
-                                                                .map(|s| s.to_string()),
-                                                            x0: draw_source_coordinate(p0p.x, grid),
-                                                            y0: draw_source_coordinate(p0p.y, grid),
-                                                            x1: draw_source_coordinate(p1p.x, grid),
-                                                            y1: draw_source_coordinate(p1p.y, grid),
-                                                            construction: false,
-                                                        },
-                                                    ) {
-                                                        Ok(None) => Some(
-                                                            SOURCE_EDIT_REJECTED_MESSAGE.into(),
-                                                        ),
-                                                        Ok(Some(_)) => None,
-                                                        Err(_) => None,
-                                                    }
-                                                } else {
-                                                    Some("no cell to edit".into())
-                                                }
-                                            }
-                                        });
-                                    if state.message.is_none()
-                                        && let Some(error) = error
-                                    {
-                                        state.show_message(MessageType::ERROR, error);
-                                    }
-                                });
+                                rectangle = Some((p0, snapped_layout_mouse_position));
                             } else {
                                 rect_tool.p0 = Some(snapped_layout_mouse_position);
                             }
@@ -10282,6 +10582,9 @@ impl LayoutCanvas {
             }
             edit_dim
         });
+        if let Some((p0, p1)) = rectangle {
+            self.place_rectangle(p0, p1, grid, cx);
+        }
         if edit_dim {
             self.text_input
                 .update(cx, |input, cx| input.start_dimension_edit(cx));
@@ -12638,6 +12941,136 @@ cell top() {
     }
 
     #[test]
+    fn compiled_rectangle_rasters_preserve_constraints_and_dash_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+cell free() { let r = rect("met1", x0i=10., y0i=10., x1i=90., y1i=90.)!; }
+cell partial() { let r = rect("met1", x0i=10., y0i=10., x1=90., y1=90.)!; }
+cell fixed() { let r = rect("met1", x0=10., y0=10., x1=90., y1=90.); }
+cell reversed() { let r = rect("met1", x0i=90., y0i=90., x1=10., y1=10.)!; }
+cell rotated() { let child = inst(partial(), x=100., y=0., angle=90); }
+cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
+"#,
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        // Expected dashed edges: top, right, bottom, left. Every case has the
+        // same physical bounds, including the reversed and transformed ones.
+        for (cell, dashed) in [
+            ("free", [true, true, true, true]),
+            ("partial", [false, false, true, true]),
+            ("fixed", [false, false, false, false]),
+            ("reversed", [true, true, false, false]),
+            ("rotated", [false, true, true, false]),
+            ("reflected", [true, false, false, true]),
+        ] {
+            let result = compile(
+                &ast,
+                compile::CompileInput {
+                    cell: &[cell],
+                    args: vec![],
+                },
+            );
+            let output = match result {
+                compile::CompileOutput::Valid(output) => output,
+                compile::CompileOutput::ExecErrors(errors) => {
+                    assert!(
+                        errors.errors.iter().all(|error| matches!(
+                            error.kind,
+                            compile::ExecErrorKind::Underconstrained
+                        ) || (cell == "reversed"
+                            && matches!(error.kind, compile::ExecErrorKind::FlippedRect(_)))),
+                        "{cell}: {:?}",
+                        errors.errors
+                    );
+                    errors.output.unwrap()
+                }
+                other => panic!("{cell}: {other:?}"),
+            };
+            let solved = raster_test_compile_output_state(output);
+            let root = &solved.output.cells[&solved.output.top];
+            if let Some(rect) = root.objects.values().find_map(|object| object.get_rect()) {
+                let styles = rectangle_border_styles(
+                    rect,
+                    &root.unsolved_vars,
+                    TransformationMatrix::identity(),
+                );
+                assert_eq!(
+                    [styles.top, styles.right, styles.bottom, styles.left]
+                        .map(|style| style == BorderStyle::Dashed),
+                    dashed,
+                    "{cell}: direct rendering lost constraint state"
+                );
+            }
+            for fill in [ShapeFill::Hollow, ShapeFill::Solid, ShapeFill::Stippling] {
+                let layer = LayerState {
+                    name: "met1".into(),
+                    color: rgb(0x002233),
+                    fill,
+                    border_color: rgb(0xff0000),
+                    visible: true,
+                    used: true,
+                    z: 0,
+                };
+                let viewport = ViewportTransform {
+                    size: Size::new(px(240.), px(240.)),
+                    screen_size: Size::new(px(240.), px(240.)),
+                    scale: 2.,
+                    offset: Point::new(px(20.), px(220.)),
+                };
+                let input = raster_test_navigation_input(
+                    solved.clone(),
+                    Arc::new(IndexMap::from_iter([(layer.name.clone(), layer)])),
+                    viewport,
+                    true,
+                );
+                let first = build_navigation_raster(input.clone()).unwrap();
+                let pixels = first.image.as_bytes(0).unwrap();
+                let border = |x: usize, y: usize| {
+                    pixels[(y * 240 + x) * 4..(y * 240 + x + 1) * 4] == [0, 0, 255, 255]
+                };
+                for (edge, should_dash) in dashed.into_iter().enumerate() {
+                    let samples = (50..190)
+                        .map(|position| match edge {
+                            0 => border(position, 40),
+                            1 => border(198, position),
+                            2 => border(position, 198),
+                            _ => border(40, position),
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(
+                        samples.iter().any(|on| *on),
+                        "{cell}: edge {edge} disappeared"
+                    );
+                    assert_eq!(
+                        samples.iter().any(|on| !on),
+                        should_dash,
+                        "{cell}: cached edge {edge} lost its constraint style with {fill:?}"
+                    );
+                }
+                let mut panned_input = input;
+                panned_input.viewport.offset += Point::new(px(-64.), px(32.));
+                let panned = build_navigation_raster(panned_input).unwrap();
+                let panned_pixels = panned.image.as_bytes(0).unwrap();
+                for y in 40..232 {
+                    for x in 8..168 {
+                        let before = ((y - 32) * 240 + x + 64) * 4;
+                        let after = (y * 240 + x) * 4;
+                        assert_eq!(
+                            &pixels[before..before + 4],
+                            &panned_pixels[after..after + 4],
+                            "{cell}: clipped pan moved dash phase at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_rectangle_outline_stays_one_raster_pixel_wide() {
         let mut buffer = vec![0; 8 * 8 * 4];
         {
@@ -12934,8 +13367,8 @@ cell top() {
             address: ScopeAddress,
             parent: Option<ScopeAddress>,
             parent_path: &[String],
-            state: &mut IndexMap<editor::ScopePath, editor::ScopeState>,
-            scope_paths: &mut IndexMap<ScopeAddress, editor::ScopePath>,
+            state: &mut imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+            scope_paths: &mut imbl::HashMap<ScopeAddress, editor::ScopePath>,
         ) -> (editor::ScopePath, Option<compile::Rect<f64>>) {
             let scope_info = &output.cells[&address.cell].scopes[&address.scope];
             let mut path = parent_path.to_vec();
@@ -13036,8 +13469,8 @@ cell top() {
             cell: output.top,
             scope: output.cells[&output.top].root,
         };
-        let mut state = IndexMap::new();
-        let mut scope_paths = IndexMap::new();
+        let mut state = imbl::HashMap::new();
+        let mut scope_paths = imbl::HashMap::new();
         let (selected_scope, _) =
             visit_scope(&output, root, None, &[], &mut state, &mut scope_paths);
         CompileOutputState {
@@ -13045,6 +13478,7 @@ cell top() {
             selected_scope,
             state: Arc::new(state),
             scope_paths: Arc::new(scope_paths),
+            hierarchy: Arc::default(),
         }
     }
 
@@ -13865,6 +14299,7 @@ cell top() {
             selected_scope: Vec::new(),
             state: Arc::default(),
             scope_paths: Arc::default(),
+            hierarchy: Arc::default(),
         };
         let scope = ScopeAddress {
             cell: top,

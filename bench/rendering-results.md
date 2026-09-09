@@ -102,48 +102,87 @@ The full prefetched field can still take around 1.4–1.7 seconds to finish at
 closer zooms. That work runs in the background; it is separate from pan input
 and paint latency.
 
-## GUI hierarchy preparation
+## Incremental rectangle updates
 
 `local_sram_edit_pipeline` uses a persistent `IncrementalCompiler`, instantiates
 the same 4×4 bank, and adds one `met1.drawing` rectangle to the top-level cell.
 The GDS import cache has one miss initially and one hit after editing; the edit
-does not re-import the SRAM.
+does not re-import the SRAM. Measurements below are release builds on the same
+machine with a full 1200×800 editor window (798×692 canvas).
 
-| Preparation stage | Before | After |
+The first optimization prepared geometry once per unique scope within a
+snapshot, reducing hierarchy preparation from 28.829 s to 0.970 s. Updates now
+share metadata across snapshots, use persistent path maps, and transmit only
+changed cells. Geometry dependencies are checked before reusing bounds or
+renderer indexes; numerical IDs alone never prove that a cell is unchanged.
+
+| Edit stage | Previous snapshot preparation | Incremental update |
 | --- | ---: | ---: |
-| Initial hierarchy | 25.780 s | 0.937 s |
-| After adding one rectangle | 28.829 s | 0.970 s |
+| GUI hierarchy preparation | 970 ms | 25.7 ms |
+| Serialized update | 433.7 MB full graph | 160,414 bytes, 2 changed cells |
+| Encode delta | — | 0.30 ms |
+| Decode and materialize delta | — | 1.74 ms |
+| Incremental compilation | 37.7 ms | 38.7 ms |
+| Apply prepared update on UI | — | 6.62 ms |
+| First updated frame after application | 821 ms with index rebuilding* | 111 ms |
+| Render field complete / indicator idle | 872 ms with index rebuilding* | 163 ms |
+| Maximum UI paint during edit | — | 0.77 ms |
 
-The edited hierarchy prepares about 29.7× faster. Geometry bounds and layer
-usage are computed once per unique scope. A separate path traversal skips
-duplicate subtrees while preserving the old traversal's final path bindings,
-parent scopes, visibility, and selected scope. Layer lookup also avoids
-allocating a name for each already-known layer.
+\* Measured after adding delta transport but before reusing unchanged rendering
+indexes. The frame and idle times exclude compilation, serialization, and
+hierarchy preparation. Summing the measured stages gives roughly 183 ms to the
+first updated frame; this excludes live socket/LSP scheduling and native GPU
+submission. The retained previous layout stays visible throughout the update.
+These are individual runs, not statistical performance guarantees.
 
-The full stress fixture's 202,555 distinct paths and 11,930 scope addresses
-match the previous expanded reference, including every bound and layer. The
-reference verification took 25.50 s and is excluded from preparation timing.
-A regular test also checks repeated, rotated, and reflected instances under
-different parents, parameterized cells, and preservation of hidden paths.
+The full fixture's 202,555 paths and 11,930 scope addresses match the expanded
+reference before and after the edit, including every bound and layer. The slow
+reference check is excluded from preparation timing. Regular tests also cover
+changed children, removals, renamed scopes, hidden paths, and shared instances.
+A raster regression changes a child without changing its numeric ID, checks that
+its parent's dependent index is invalidated, and compares reused-index rendering
+with a fresh render pixel for pixel.
 
-In the verified run, initial compilation took 6.336 s, the incremental edit
-37.7 ms, snapshot encoding plus file write 236.6 ms, and file read plus decoding
-542.1 ms.
+New connections start with a full snapshot. Each connection keeps an acknowledged
+base for deltas, preserves cell ordering, removes absent cells, and falls back to
+a full snapshot if the receiver does not have the base. Source spans and other
+cell metadata travel with changed cells. Initial hierarchy preparation still
+takes about 1.03 s; structural hierarchy edits use the full path builder.
 
-The full-editor stress lifecycle passes after this change. Reading and preparing
-its compiled artifact now takes 1.51 s, and pan input plus paint remains under
-0.76 ms across 32 frames on GPUI's test platform.
+The disappearing-layout regression was caused by treating a newly allocated
+compiler cell ID as a presentation change, clearing the retained image. Geometry
+edits now retain it and stage replacement tiles until they cover the viewport.
+Zoom staging also waits for the density decision, preventing a new raster from
+being immediately replaced by direct geometry. The full-editor regression paints
+after every task through 56 small zoom steps crossing the raster/direct threshold
+and through rectangle addition/removal. Restoring the old ID comparison makes
+that test fail with a disappearing layout.
 
-The serialized artifact is 433,654,007 bytes. File timings include I/O and are
-not live RPC timings. These measurements exclude applying the prepared state
-and rebuilding the render cache, so they are not an end-to-end GUI latency.
+The original 512×32 SRAM also passes the edit lifecycle (a 4×4 bank) and the
+pixel-stability checks when opened directly at 1× through 128× fit. Its edit's
+hierarchy preparation was 22.9 ms and every intermediate paint stayed complete.
 
-The compiler is incremental, but the GUI protocol is not a geometry-delta
-protocol: `CompilationSnapshot` contains the entire `CompileOutput`.
-The new preparation reuses geometry metadata within each snapshot; it does not
-implement a cell-delta transport. Geometry updates still invalidate rendering
-indexes and tiles. Sharing metadata across snapshots and invalidating only
-changed geometry remain further opportunities to reduce small-edit latency.
+Placed rectangles now keep a separate preview until the displayed frame contains
+their compiled geometry. A source-edit acknowledgement or the arrival of a new
+snapshot alone does not retire it. Rectangle submission awaits the editor
+asynchronously so navigation and painting continue while that reply is pending.
+Tool previews stay outside retained layout frames to avoid caching uncommitted
+geometry.
+
+The direct and raster placement regressions paint between background tasks,
+including a delayed source-edit reply, tool changes, panning, and zooming. They
+verify continuous preview coverage through the frame handoff, both reply/snapshot
+arrival orders, distinct names for rapid placements, rejection of one placement
+without removing another, and undo before a compiled placement is displayed.
+The same placement lifecycle passes on the original 512×32 SRAM fixture.
+
+Cached rectangle outlines also preserve the compiler's per-edge constraint
+state. Previously the raster builder hard-coded solid borders, so unconstrained
+placements lost their dashes at the frame handoff. A pixel regression covers
+free, partially constrained, constrained, reversed, rotated, and reflected
+rectangles with hollow, solid, and patterned fills. It verifies unchanged pixels
+through a clipped pan, so tile boundaries cannot restart the dash pattern.
+Restoring the hard-coded solid style makes that regression fail.
 
 ## 512×32 correctness
 
@@ -161,13 +200,13 @@ instance and opening the SRAM directly, at 1× through 128× fit:
 First raster timing can include lazy index construction; the benchmark prints
 warm raster timing separately. Sparse close-up views retain direct geometry.
 
-133 regular GUI tests and 299 compiler tests pass, including regressions for
+140 regular GUI tests pass, including regressions for
 cold pan deferral, displayed-tile retention, layer and wire aggregation, visible
 gaps, hidden descendants, hierarchy cutoffs, invalidation, and source lookup.
 The release application builds successfully. Formatting and whitespace checks
 pass.
 
-Seven Neovim/analyzer integration tests also pass after removing Argon's
+Eight Neovim/analyzer integration tests also pass after removing Argon's
 message-area spinner. Standard LSP compilation progress still begins and ends
 correctly for Fidget and other progress UIs. Restart Neovim to unload an already
 running copy of the old spinner module. The local stress-project launcher uses
@@ -175,6 +214,14 @@ running copy of the old spinner module. The local stress-project launcher uses
 changed plugin while keeping the normal user configuration and Fidget. A
 headless launch with that configuration confirmed the local plugin and Fidget
 load without the removed spinner module.
+
+GUI startup now registers asynchronously and acknowledges the connection before
+compiling or preparing its initial snapshot. Previously, an initial source error
+could make the GUI wait for registration while the analyzer waited for a GUI
+snapshot callback, preventing the window constructor from returning. The startup
+regression holds the first error update until registration completes; restoring
+the old handshake makes it time out. A GPUI test also verifies that foreground
+tasks keep running while the registration reply is pending.
 
 Canvas measurements use GPUI's test platform and production rendering code.
 They do not measure Metal submission, monitor refresh, or visually certify the
