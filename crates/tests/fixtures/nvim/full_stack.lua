@@ -233,6 +233,76 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
     'expected the declaration and two uses, got ' .. tostring(#references.result)
   )
 
+  -- The `:Argon` command line has no document to complete against, so its
+  -- arguments are resolved from text alone.
+  local function command_completion(command, text)
+    local response = client:request_sync('custom/commandCompletion', {
+      command = command,
+      text = text,
+      cursor = #text,
+    }, 10000, bufnr)
+    assert(response and not response.err, 'command completion failed: ' .. vim.inspect(response))
+    local inserted = {}
+    for _, item in ipairs(response.result.items) do
+      inserted[item.label] = item.insertText or item.label
+    end
+    return inserted, response.result.prefixLen
+  end
+
+  -- Only a cell can open the argument, and completing one opens its
+  -- argument list.
+  local cells, prefix_len = command_completion('openCell', '')
+  assert(cells.top == 'top(', 'openCell should offer cells: ' .. vim.inspect(cells))
+  assert(cells.child == 'child(', 'openCell should offer cells: ' .. vim.inspect(cells))
+  assert(not cells.rect, 'a builtin cannot open a cell invocation')
+  assert(not cells.width, 'a cell body local is not in scope for openCell')
+  assert(not cells.Float, 'a type cannot open a cell invocation')
+  assert(prefix_len == 0, 'an empty argument replaces nothing, got ' .. tostring(prefix_len))
+
+  local _, typed_prefix_len = command_completion('openCell', 'ch')
+  assert(typed_prefix_len == 2, 'a candidate replaces the typed name, got ' .. tostring(typed_prefix_len))
+
+  -- Inside the parentheses, the callee's defaulted parameters can be named.
+  local arguments = command_completion('openCell', 'child(1., ')
+  assert(arguments.h == 'h=', 'a defaulted parameter should complete: ' .. vim.inspect(arguments))
+  assert(arguments.layer == 'layer=', 'a defaulted parameter should complete')
+  assert(not arguments.w, '`w` has no default, so it is positional only')
+  assert(arguments.double == nil and arguments.rect == 'rect', 'arguments are expressions')
+
+  -- `inst` is anchored at the scope the GUI has selected, so that scope's
+  -- bindings complete as well. The headless GUI reports the open cell's root
+  -- scope once a snapshot has reached it.
+  local instantiable
+  wait_for('the GUI to report a selected scope', function()
+    instantiable = command_completion('inst', 'child(')
+    return instantiable.width ~= nil
+  end)
+  assert(instantiable.w == nil, 'a callee parameter is not in the selected scope')
+  assert(
+    command_completion('openCell', 'child(').width == nil,
+    'openCell runs at the root module, where a cell body local is out of scope'
+  )
+  -- A finished invocation has nothing left to complete. Offering a name
+  -- there would splice it onto the closing parenthesis.
+  for _, finished in ipairs({
+    'child(1., 2.)',
+    'child()',
+    'child(1., 2.) ',
+    'child(2000.',
+    'child("met1',
+  }) do
+    local offered = command_completion('openCell', finished)
+    assert(vim.tbl_isempty(offered), finished .. ' should offer nothing: ' .. vim.inspect(offered))
+    offered = command_completion('inst', finished)
+    assert(vim.tbl_isempty(offered), finished .. ' should offer nothing for inst')
+  end
+
+  -- Cells may be declared in any order and may recurse, so the selected
+  -- scope can instantiate `child` even though it is declared after `top`.
+  local from_scope = command_completion('inst', '')
+  assert(from_scope.child == 'child(', 'inst should offer cells: ' .. vim.inspect(from_scope))
+  assert(from_scope.top == 'top(', 'a cell may instantiate itself')
+
   -- Navigation must survive an edit that does not parse. Break the file after
   -- the position under test, so the position itself is still meaningful.
   vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { 'cell broken( {' })
