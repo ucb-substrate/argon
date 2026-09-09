@@ -31,8 +31,8 @@ pub enum CompletionSite {
     TopLevel,
     /// At the start of a statement or tail expression in a scope.
     Statement,
-    /// At the start of a statement, where an `else` could also continue the
-    /// `if` that just closed. Both sets of candidates apply.
+    /// At the start of a statement that could instead be an `else`
+    /// continuing the `if` just closed. Both sets of candidates apply.
     StatementOrElse,
     /// Somewhere an expression is expected.
     Expression,
@@ -60,8 +60,8 @@ impl CompletionSite {
             // distinction, while a nested expression recorded later is not
             // overwritten when the scope closes at the same cursor.
             Self::Statement | Self::Expression => 2,
-            // Outranks `Statement` so the statement loop's own record, taken
-            // at the same offset once the `if` returns, does not erase it.
+            // Outranks `Statement`, which the statement loop records at the
+            // same offset.
             Self::StatementOrElse => 3,
             Self::Type | Self::Pattern | Self::ImportPath | Self::Keyword(_) => 3,
             Self::NewIdentifier => 4,
@@ -245,8 +245,8 @@ mod tests {
             ("cell top() { re|; }", Statement),
             ("cell top() { rect(|); }", Expression),
             ("cell top() { for item | [] {} }", Keyword("in")),
-            // In statement position the `else` is optional, so a statement
-            // may start here too; in expression position it is still required.
+            // The `else` is optional in statement position, required in
+            // expression position.
             ("cell top() { if true {} | {} }", StatementOrElse),
             ("cell top() { let x = if true {} | ; }", Keyword("else")),
             ("cell top() { match m { | } }", Pattern),
@@ -368,9 +368,7 @@ mod tests {
             "let p = Point { ..b, x: 1. };", // the base must come last
             "let p = Point { x.y };",        // a field is a bare identifier
             "let p = Point { x: 1. y: 2. };",
-            // An `else`-less `if` is a statement, so it is not accepted where
-            // a value is expected -- and an `else if` chain in expression
-            // position must still end in an `else` block.
+            // An `else`-less `if` is not accepted where a value is expected.
             "let x = if c { };",
             "let x = if c {} else if d {};",
             "foo(if c { });",
@@ -549,9 +547,8 @@ mod tests {
         );
     }
 
-    /// `else if` is desugared into an else-scope holding nothing but the
-    /// nested `if` as its tail, which is the same tree a hand-written
-    /// `else { if .. }` produces -- so no later pass needs to know about it.
+    /// `else if` desugars into an else-scope holding only the nested `if` as
+    /// its tail.
     #[test]
     fn else_if_chains_desugar_to_nested_ifs() {
         use crate::ast::{Decl, Expr};
@@ -565,8 +562,8 @@ mod tests {
         let Decl::Cell(cell) = &ast.decls[0] else {
             panic!("expected a cell");
         };
-        // With a final `else` the chain is an ordinary expression, so it is
-        // routed to the scope's tail like any other trailing expression.
+        // With a final `else` the chain is an expression, so it lands in the
+        // tail.
         let Some(Expr::If(outer)) = &cell.scope.tail else {
             panic!("expected a trailing if, got {:?}", cell.scope.tail);
         };
@@ -591,14 +588,12 @@ mod tests {
         assert!(last.tail.is_none() && last.stmts.is_empty());
         assert_eq!(text(last.span), "{ }");
 
-        // Ordinals come from the enclosing scope's counter, so the chain
-        // takes consecutive ones in lexical order.
+        // The chain takes consecutive ordinals in lexical order.
         assert_eq!(orders, [0, 1, 2]);
     }
 
-    /// An `if` with no `else` has no value, so it is a statement even in last
-    /// position -- where a tail expression would be rejected outright in a
-    /// cell body (`StaticErrorKind::CellWithTailExpr`).
+    /// An `if` with no `else` is a statement even in last position, never a
+    /// tail.
     #[test]
     fn an_else_less_if_is_a_statement_never_a_tail() {
         use crate::ast::{Decl, Expr, Statement};
@@ -626,10 +621,8 @@ mod tests {
             assert_eq!(*semicolon, i == 1, "stmt {i}");
         }
 
-        // The same holds for an `else if` chain, whose missing `else` sits at
-        // the end of the chain rather than on the outermost node: the first
-        // chain below is a statement, the second (which ends in an `else`) is
-        // an ordinary expression and so the scope's tail.
+        // A chain's missing `else` sits at its end, not on the outermost
+        // node: the first chain below is a statement, the second a tail.
         let src = "cell __t__() { if a { } else if b { } if c { } else if d { } else { } }";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();

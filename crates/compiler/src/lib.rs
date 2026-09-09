@@ -1216,10 +1216,8 @@ mod tests {
         assert_eq!(&source[span.span.start()..span.span.end()], "eq(a, 5.)");
     }
 
-    /// An `if` with no `else` builds only the branch it takes, both on its own
-    /// and as the last statement of a cell body, where a tail expression would
-    /// be rejected. An `else if` chain with no final `else` may build nothing
-    /// at all.
+    /// An `if` with no `else` builds only the branch it takes, and an
+    /// `else if` chain with no final `else` may build nothing at all.
     #[test]
     fn argon_if_no_else() {
         let o = parse_workspace_with_std(ARGON_IF_NO_ELSE);
@@ -1235,7 +1233,7 @@ mod tests {
         .unwrap_valid();
 
         // One rect per `strap` plus its single marker: the untaken branch
-        // builds nothing, so neither cell has both markers.
+        // builds nothing.
         let mut sizes = cells
             .cells
             .values()
@@ -1250,8 +1248,7 @@ mod tests {
             [
                 // the `!wide` marker on the narrow strap
                 (10., 10.),
-                // `band(1)`. `band(7)` matched no arm of the chain, and a
-                // chain with no final `else` builds nothing then.
+                // `band(1)`; `band(7)` matched no arm and built nothing.
                 (200., 20.),
                 // the narrow strap
                 (200., 100.),
@@ -2648,18 +2645,16 @@ cell top() {
             ))
         }
 
-        // A branch whose statements all end in `;` (or in a `let`) has no
-        // tail, so it is already `()`.
+        // A branch with no tail expression is already `()`.
         assert!(cell_errors("if c { eq(x, 1.); }").is_empty());
         assert!(cell_errors("if c { let r = x + 1.; }").is_empty());
         assert!(cell_errors("if c { }").is_empty());
         assert!(cell_errors("if c { } if d { }").is_empty());
         assert!(cell_errors("if c { } else if d { }").is_empty());
         assert!(cell_errors("if c { } else if d { } eq(x, 1.);").is_empty());
-        // A chain that *does* end in an `else` is an ordinary expression, so
-        // in last position it is the scope's tail -- which a cell may not
-        // have, exactly as for a plain trailing `if`/`else`. A `;` makes it a
-        // statement, as it always has.
+        // A chain ending in an `else` is an expression, so in last position
+        // it is the tail, which a cell may not have. A `;` makes it a
+        // statement.
         assert!(cell_errors("if c { } else if d { } else { };").is_empty());
         assert!(matches!(
             cell_errors("if c { } else if d { } else { }").as_slice(),
@@ -2679,9 +2674,7 @@ cell top() {
             "{:?}",
             cell_errors("if c { x }")
         );
-        // Reported once, on the `else if` that lacks the `else` -- an
-        // `Unknown` result keeps the enclosing `if` from also complaining
-        // that its branches disagree.
+        // Reported once, on the `else if` that lacks the `else`.
         assert!(
             matches!(
                 cell_errors("if c { } else if d { x }").as_slice(),
@@ -2703,8 +2696,7 @@ cell top() {
             "x + 1."
         );
 
-        // With an `else` the branches still have to agree, and a chain that
-        // ends in one is an ordinary expression of the branches' type.
+        // With an `else` the branches must still agree.
         assert!(
             cell_errors("let v = if c { 1. } else if d { 2. } else { 3. }; eq(v, x);").is_empty()
         );

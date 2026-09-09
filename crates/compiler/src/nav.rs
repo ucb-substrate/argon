@@ -2250,9 +2250,8 @@ mod tests {
         assert!(is_navigable(Path::new(ROOT)));
     }
 
-    /// Bindings resolve inside an `else`-less `if` and inside an `else if`
-    /// branch, whose scope the parser synthesizes -- so it has to be indexed
-    /// like any other, at a span of its own.
+    /// Bindings resolve inside an `else`-less `if` and an `else if` branch,
+    /// whose scope the parser synthesizes.
     #[test]
     fn names_resolve_inside_else_less_ifs_and_else_if_chains() {
         check(
