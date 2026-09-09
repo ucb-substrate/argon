@@ -67,6 +67,25 @@ fn infix_op(k: TokenKind) -> Option<(BinOp, u8, u8)> {
     })
 }
 
+/// Whether an `if` ends without an `else` block, and so has no value.
+///
+/// `else if` is desugared into an else-scope whose only content is the nested
+/// `if` as its tail, so the answer is at the end of the chain, not on the
+/// outermost node: `if a {} else if b {}` has an `else_`, but still produces
+/// nothing.
+fn ends_without_else<S, T: crate::ast::AstMetadata>(if_: &IfExpr<S, T>) -> bool {
+    let mut link = if_;
+    loop {
+        let Some(else_) = &link.else_ else {
+            return true;
+        };
+        match &else_.tail {
+            Some(Expr::If(nested)) if else_.stmts.is_empty() => link = nested,
+            _ => return false,
+        }
+    }
+}
+
 /// A single-pass recursive-descent + Pratt parser over the [`Lexer`] token
 /// stream.
 ///
@@ -854,12 +873,40 @@ impl<'a> Parser<'a> {
                     // Everything else is an expression. `if`/`match`/`{...}` are
                     // expression primaries, so the Pratt parser also extends
                     // them with trailing operators (e.g. `if c {a} else {b} + 1`).
-                    let e = self.parse_expr(0);
+                    let (e, else_less) = if self.at(TokenKind::KwIf) {
+                        // `if` is the one primary whose `else` may be omitted,
+                        // and only here, in statement position -- so parse it
+                        // directly rather than through `parse_expr`, which any
+                        // nested expression also goes through.
+                        let lo = self.cur.start;
+                        let scope_order = self.next_scope_order();
+                        let if_ = self.parse_if(scope_order, lo, false);
+                        let else_less = ends_without_else(&if_);
+                        let e = Expr::If(Box::new(if_));
+                        // With an `else` it is an ordinary expression, so let
+                        // the Pratt loop extend it as before.
+                        let e = if else_less {
+                            e
+                        } else {
+                            self.parse_expr_from(e, lo, 0)
+                        };
+                        (e, else_less)
+                    } else {
+                        (self.parse_expr(0), false)
+                    };
                     let is_block = matches!(e, Expr::If(_) | Expr::Match(_) | Expr::Scope(_));
                     if self.eat(TokenKind::Semi) {
                         stmts.push(Statement::Expr {
                             value: e,
                             semicolon: true,
+                        });
+                    } else if else_less {
+                        // An `if` with no `else` has no value, so it is always
+                        // a statement -- never the scope's tail, which a cell
+                        // body may not have at all.
+                        stmts.push(Statement::Expr {
+                            value: e,
+                            semicolon: false,
                         });
                     } else if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
                         tail = Some(e);
@@ -894,9 +941,10 @@ impl<'a> Parser<'a> {
 
         // No separate tail fixup is needed: the statement loop above already
         // routes a trailing un-semicoloned expression into `tail` (the
-        // `at(RBrace) || at(Eof)` arm), and only ever pushes a `semicolon: false`
-        // statement when more tokens follow it — so a `semicolon: false`
-        // statement is never the last element here.
+        // `at(RBrace) || at(Eof)` arm). A `semicolon: false` statement is
+        // otherwise only pushed when more tokens follow it, the one exception
+        // being an `if` with no `else`, which has no value and so is a
+        // statement even in last position.
 
         self.exit_depth();
         Scope {
@@ -945,18 +993,72 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_if(&mut self, scope_order: u64, lo: u32) -> IfExpr<&'a str, Md> {
+    /// `ifExpr : IF expr scope (ELSE (scope | ifExpr))?`
+    ///
+    /// The `else` may be omitted only when `require_else` is false, which the
+    /// statement loop passes and every expression position does not: an `if`
+    /// with no `else` has no value, so it is a statement. An `else if`
+    /// inherits the flag, so a chain in expression position must still end in
+    /// an `else` block.
+    fn parse_if(&mut self, scope_order: u64, lo: u32, require_else: bool) -> IfExpr<&'a str, Md> {
         self.expect(TokenKind::KwIf);
         let cond = self.with_struct_literals(false, |p| p.parse_expr(0));
         let then = self.parse_scope();
-        self.expect(TokenKind::KwElse);
-        let else_ = self.parse_scope();
+        let else_ = if require_else {
+            // `expect` records the `else` completion site itself.
+            self.expect(TokenKind::KwElse);
+            Some(self.parse_else_body(require_else))
+        } else {
+            // A statement may start here, and so may an `else` continuing
+            // this `if`, so offer both.
+            self.record_completion_site(CompletionSite::StatementOrElse);
+            self.eat(TokenKind::KwElse)
+                .then(|| self.parse_else_body(require_else))
+        };
         IfExpr {
             scope_order,
             cond,
             then,
             else_,
             span: self.finish_span(lo),
+            metadata: (),
+        }
+    }
+
+    /// The body of an `else`: a scope, or -- for `else if` -- a synthetic
+    /// scope whose tail is the nested `if`, so the rest of the compiler only
+    /// ever sees the two-branch shape it already handles. That is the same
+    /// tree a hand-written `else { if .. else .. }` produces.
+    fn parse_else_body(&mut self, require_else: bool) -> Scope<&'a str, Md> {
+        if !self.at(TokenKind::KwIf) {
+            return self.parse_scope();
+        }
+        // A chain is flat in scope nesting, so the scope guard never fires on
+        // it and this recursion needs a guard of its own.
+        if !self.enter_depth() {
+            self.error_at(self.span(self.cur), "nesting too deep".to_string());
+            let lo = self.cur.start as usize;
+            return Scope {
+                scope_order: 0,
+                span: Span::new(lo, lo),
+                stmts: Vec::new(),
+                tail: None,
+                metadata: (),
+            };
+        }
+        let lo = self.cur.start;
+        // Drawn from the enclosing scope's counter, so a chain takes
+        // consecutive ordinals in lexical order.
+        let scope_order = self.next_scope_order();
+        let nested = self.parse_if(scope_order, lo, require_else);
+        self.exit_depth();
+        Scope {
+            // Matches the ordinal `parse_scope` gives a then/else scope: only
+            // an `Expr::Scope` block reads a scope's own ordinal.
+            scope_order: 0,
+            span: nested.span,
+            stmts: Vec::new(),
+            tail: Some(Expr::If(Box::new(nested))),
             metadata: (),
         }
     }
@@ -1113,8 +1215,39 @@ impl<'a> Parser<'a> {
         // operand is unwrapped to its inner node (whose span excludes the
         // parens), while the enclosing operator's span must start at the `(`.
         let lhs_start = self.cur.start;
-        let mut lhs = self.parse_prefix();
+        let lhs = self.parse_prefix();
+        self.fold_operators(lhs, lhs_start, min_bp)
+    }
 
+    /// Parse a full expression whose head node is already built, as the
+    /// statement loop needs: it parses an `if` itself so the `else` may be
+    /// omitted, but an `if`/`else` must still pick up trailing operators.
+    fn parse_expr_from(
+        &mut self,
+        lhs: Expr<&'a str, Md>,
+        lhs_start: u32,
+        min_bp: u8,
+    ) -> Expr<&'a str, Md> {
+        if !self.enter_depth() {
+            self.error_at(
+                self.span(self.cur),
+                "expression nesting too deep".to_string(),
+            );
+            return lhs;
+        }
+        self.fold_operators(lhs, lhs_start, min_bp)
+    }
+
+    /// The Pratt operator loop. Takes over the one depth level the caller
+    /// entered on this expression's behalf and releases it, along with one per
+    /// fold. `lhs_start` is the lexical start of the whole expression (see
+    /// [`Self::parse_expr`]).
+    fn fold_operators(
+        &mut self,
+        mut lhs: Expr<&'a str, Md>,
+        lhs_start: u32,
+        min_bp: u8,
+    ) -> Expr<&'a str, Md> {
         // The loop folds each suffix/infix operator into `lhs`, so it deepens
         // the tree by one level per iteration *without* recursing. Charging
         // each fold to the same depth budget is what makes the guard measure
@@ -1283,7 +1416,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwIf => {
                 let lo = self.cur.start;
                 let scope_order = self.next_scope_order();
-                Expr::If(Box::new(self.parse_if(scope_order, lo)))
+                Expr::If(Box::new(self.parse_if(scope_order, lo, true)))
             }
             TokenKind::KwMatch => Expr::Match(Box::new(self.parse_match())),
             TokenKind::LBrace => {

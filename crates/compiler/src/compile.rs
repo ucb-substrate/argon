@@ -752,7 +752,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &IfExpr<Self::InputS, Self::InputMetadata>,
         _cond: &Expr<Self::OutputS, Self::OutputMetadata>,
         _then: &Scope<Self::OutputS, Self::OutputMetadata>,
-        _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _else_: &Option<Scope<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
     }
 
@@ -4524,7 +4524,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         input: &IfExpr<Substr, Self::InputMetadata>,
         cond: &Expr<Substr, Self::OutputMetadata>,
         then: &Scope<Substr, Self::OutputMetadata>,
-        else_: &Scope<Substr, Self::OutputMetadata>,
+        else_: &Option<Scope<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         let cond_ty = self.shallow(&cond.ty());
         // `Unknown` marks an expression that was already diagnosed, so it must
@@ -4542,6 +4542,29 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 kind: StaticErrorKind::IfCondNotBool,
             });
         }
+        let Some(else_) = else_ else {
+            // With no `else` the `if` yields nothing, so neither may the
+            // branch that runs. `Unknown` is again the already-diagnosed
+            // marker; an inference variable is solved to `()`.
+            let then_ty = self.shallow(&then.metadata);
+            let is_unit = match then_ty {
+                Ty::Infer(_) => self.unify(&then_ty, &Ty::Nil),
+                Ty::Unknown | Ty::Nil => true,
+                _ => false,
+            };
+            if is_unit {
+                return Ty::Nil;
+            }
+            // Point at the value the branch produces, not the whole `if`.
+            let span = then.tail.as_ref().map_or(input.span, Expr::span);
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::IfWithoutElseNotUnit,
+            });
+            // `Unknown`, not `Nil`, so an enclosing `else if` does not go on
+            // to report `BranchesDifferentTypes` for the same mistake.
+            return Ty::Unknown;
+        };
         let Some(ty) = self.join(&then.metadata, &else_.metadata) else {
             self.errors.push(StaticError {
                 span: self.span(input.span),
@@ -5626,7 +5649,7 @@ impl AstTransformer for Zonker<'_> {
         input: &IfExpr<Substr, VarIdTyMetadata>,
         _cond: &Expr<Substr, VarIdTyMetadata>,
         _then: &Scope<Substr, VarIdTyMetadata>,
-        _else_: &Scope<Substr, VarIdTyMetadata>,
+        _else_: &Option<Scope<Substr, VarIdTyMetadata>>,
     ) -> Ty {
         self.ty(&input.metadata, input.span)
     }
@@ -10364,7 +10387,10 @@ impl<'a> ExecPass<'a> {
             PartialEvalState::If(if_) => match if_.state {
                 IfExprState::Cond(cond) => {
                     if let Defer::Ready(val) = &self.values[&cond] {
-                        if *val.as_ref().unwrap_bool() {
+                        // The branch that runs, or `None` when the condition
+                        // is false and there is no `else` -- then the `if` is
+                        // `()` and opens no scope at all.
+                        let taken = if *val.as_ref().unwrap_bool() {
                             let scope = self.create_exec_scope_at_loc(
                                 vref.loc,
                                 format!("{} if", if_.expr.scope_order),
@@ -10376,23 +10402,35 @@ impl<'a> ExecPass<'a> {
                                 scope,
                                 &if_.expr.then,
                             );
-                            if_.state = IfExprState::Then(then);
-                        } else {
+                            Some(IfExprState::Then(then))
+                        } else if let Some(else_scope) = &if_.expr.else_ {
                             let scope = self.create_exec_scope_at_loc(
                                 vref.loc,
                                 format!("{} else", if_.expr.scope_order),
-                                self.span(&vref.loc, if_.expr.else_.span),
+                                self.span(&vref.loc, else_scope.span),
                             );
                             let else_ = self.visit_scope_expr_inner(
                                 cell_id,
                                 vref.loc.frame,
                                 scope,
-                                &if_.expr.else_,
+                                else_scope,
                             );
-                            if_.state = IfExprState::Else(else_);
+                            Some(IfExprState::Else(else_))
+                        } else {
+                            None
+                        };
+                        match taken {
+                            Some(state) => {
+                                if_.state = state;
+                                self.values.insert(vid, Defer::Deferred(vref));
+                                self.cell_state_mut(cell_id).deferred.insert(vid);
+                            }
+                            // Ready now, so the caller wakes this value's
+                            // dependents on the way out.
+                            None => {
+                                self.values.insert(vid, Defer::Ready(Value::Nil));
+                            }
                         }
-                        self.values.insert(vid, Defer::Deferred(vref));
-                        self.cell_state_mut(cell_id).deferred.insert(vid);
                         true
                     } else {
                         self.add_value_dependent(cond, vid);

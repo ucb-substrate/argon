@@ -93,6 +93,12 @@ pub enum StaticErrorKind {
     /// Branches in expressions must evaluate to the same type.
     #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
+    /// An `if` with no `else` yields no value, so its `then` branch may not
+    /// produce one either.
+    #[error(
+        "an `if` without an `else` must have type `()`; end the branch with `;` or add an `else`"
+    )]
+    IfWithoutElseNotUnit,
     /// Multiple match arms have matching patterns.
     #[error("match arms must be distinct")]
     DuplicateMatchArm,

@@ -1953,7 +1953,9 @@ impl<'a> Builder<'a> {
             Expr::If(if_) => {
                 self.expr(&if_.cond);
                 self.scope(&if_.then);
-                self.scope(&if_.else_);
+                if let Some(else_) = &if_.else_ {
+                    self.scope(else_);
+                }
             }
             // Comparisons are `BinOp::Cmp`, so this covers them too.
             Expr::BinOp(op) => {
@@ -2246,6 +2248,33 @@ mod tests {
         assert!(!is_navigable(Path::new("/virtual/sram.gds")));
         assert!(is_navigable(Path::new(STD_PATH)));
         assert!(is_navigable(Path::new(ROOT)));
+    }
+
+    /// Bindings resolve inside an `else`-less `if` and inside an `else if`
+    /// branch, whose scope the parser synthesizes -- so it has to be indexed
+    /// like any other, at a span of its own.
+    #[test]
+    fn names_resolve_inside_else_less_ifs_and_else_if_chains() {
+        check(
+            r#"
+cell top(flag: Bool, other: Bool) {
+    let base = 1.;
+    if fl$0ag {
+        let inner = ba$0se + 1.;
+        eq(inn$0er, 2.);
+    }
+    if other {
+        eq(ba$0se, 1.);
+    } else if fl$0ag {
+        let nested = ba$0se + 2.;
+        eq(nest$0ed, 3.);
+    }
+}
+"#,
+            &[
+                "flag#0", "base#0", "inner#0", "base#0", "flag#0", "base#0", "nested#0",
+            ],
+        );
     }
 
     #[test]

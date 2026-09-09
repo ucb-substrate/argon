@@ -229,7 +229,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::IfExpr<Self::InputS, Self::InputMetadata>,
         _cond: &super::Expr<Self::OutputS, Self::OutputMetadata>,
         _then: &Scope<Self::OutputS, Self::OutputMetadata>,
-        _else_: &Scope<Self::OutputS, Self::OutputMetadata>,
+        _else_: &Option<Scope<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr {
         input.metadata.clone()
     }
