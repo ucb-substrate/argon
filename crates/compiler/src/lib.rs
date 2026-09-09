@@ -182,6 +182,7 @@ mod tests {
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
+    const ARGON_IF_NO_ELSE: &str = concatcp!(EXAMPLES_DIR, "/if_no_else/lib.ar");
     const ARGON_VIA: &str = concatcp!(EXAMPLES_DIR, "/via/lib.ar");
     const ARGON_VIA_ARRAY: &str = concatcp!(EXAMPLES_DIR, "/via_array/lib.ar");
     const ARGON_FUNC_OUT_OF_ORDER: &str = concatcp!(EXAMPLES_DIR, "/func_out_of_order/lib.ar");
@@ -1213,6 +1214,53 @@ mod tests {
             .expect("inconsistent constraint should retain its source span");
         let source = std::fs::read_to_string(&span.path).unwrap();
         assert_eq!(&source[span.span.start()..span.span.end()], "eq(a, 5.)");
+    }
+
+    /// An `if` with no `else` builds only the branch it takes, both on its own
+    /// and as the last statement of a cell body, where a tail expression would
+    /// be rejected. An `else if` chain with no final `else` may build nothing
+    /// at all.
+    #[test]
+    fn argon_if_no_else() {
+        let o = parse_workspace_with_std(ARGON_IF_NO_ELSE);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+
+        // One rect per `strap` plus its single marker: the untaken branch
+        // builds nothing, so neither cell has both markers.
+        let mut sizes = cells
+            .cells
+            .values()
+            .flat_map(|cell| cell.objects.values())
+            .filter(|object| object.is_layout())
+            .filter_map(SolvedValue::get_rect)
+            .map(|r| (r.x1.0 - r.x0.0, r.y1.0 - r.y0.0))
+            .collect::<Vec<_>>();
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            sizes,
+            [
+                // the `!wide` marker on the narrow strap
+                (10., 10.),
+                // `band(1)`. `band(7)` matched no arm of the chain, and a
+                // chain with no final `else` builds nothing then.
+                (200., 20.),
+                // the narrow strap
+                (200., 100.),
+                // the wide strap's marker, and the strap
+                (600., 10.),
+                (600., 100.),
+            ],
+            "each `if` built only the branch it took"
+        );
     }
 
     #[test]
@@ -2586,6 +2634,84 @@ cell top() {
              struct Other {{ w: Float, h: Float, }}\n\
              fn f(s: Size, o: Other, n: Int) -> Float {{ {body} }}\n"
         ))
+    }
+
+    /// An `if` with no `else` yields nothing, so the branch that runs may not
+    /// produce a value either; `else if` inherits the same rule.
+    #[test]
+    fn an_if_without_an_else_must_have_type_unit() {
+        /// The static errors of `body` as the body of a cell that sees two
+        /// `Bool`s and a `Float`.
+        fn cell_errors(body: &str) -> Vec<StaticErrorKind> {
+            static_errors_of(&format!(
+                "cell top(c: Bool, d: Bool, x: Float) {{ {body} }}\n"
+            ))
+        }
+
+        // A branch whose statements all end in `;` (or in a `let`) has no
+        // tail, so it is already `()`.
+        assert!(cell_errors("if c { eq(x, 1.); }").is_empty());
+        assert!(cell_errors("if c { let r = x + 1.; }").is_empty());
+        assert!(cell_errors("if c { }").is_empty());
+        assert!(cell_errors("if c { } if d { }").is_empty());
+        assert!(cell_errors("if c { } else if d { }").is_empty());
+        assert!(cell_errors("if c { } else if d { } eq(x, 1.);").is_empty());
+        // A chain that *does* end in an `else` is an ordinary expression, so
+        // in last position it is the scope's tail -- which a cell may not
+        // have, exactly as for a plain trailing `if`/`else`. A `;` makes it a
+        // statement, as it always has.
+        assert!(cell_errors("if c { } else if d { } else { };").is_empty());
+        assert!(matches!(
+            cell_errors("if c { } else if d { } else { }").as_slice(),
+            [StaticErrorKind::CellWithTailExpr]
+        ));
+        assert!(matches!(
+            cell_errors("if c { } else { }").as_slice(),
+            [StaticErrorKind::CellWithTailExpr]
+        ));
+
+        // A branch that produces a value does not.
+        assert!(
+            matches!(
+                cell_errors("if c { x }").as_slice(),
+                [StaticErrorKind::IfWithoutElseNotUnit]
+            ),
+            "{:?}",
+            cell_errors("if c { x }")
+        );
+        // Reported once, on the `else if` that lacks the `else` -- an
+        // `Unknown` result keeps the enclosing `if` from also complaining
+        // that its branches disagree.
+        assert!(
+            matches!(
+                cell_errors("if c { } else if d { x }").as_slice(),
+                [StaticErrorKind::IfWithoutElseNotUnit]
+            ),
+            "{:?}",
+            cell_errors("if c { } else if d { x }")
+        );
+        // The diagnostic points at the value, not at the whole `if`.
+        let source = "cell top(c: Bool, x: Float) { if c { x + 1. } }\n";
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        let [error] = output.errors.as_slice() else {
+            panic!("expected one error, got {:?}", output.errors);
+        };
+        assert_eq!(
+            &source[error.span.span.start()..error.span.span.end()],
+            "x + 1."
+        );
+
+        // With an `else` the branches still have to agree, and a chain that
+        // ends in one is an ordinary expression of the branches' type.
+        assert!(
+            cell_errors("let v = if c { 1. } else if d { 2. } else { 3. }; eq(v, x);").is_empty()
+        );
+        assert!(matches!(
+            cell_errors("let v = if c { 1. } else { c };").as_slice(),
+            [StaticErrorKind::BranchesDifferentTypes]
+        ));
     }
 
     #[test]

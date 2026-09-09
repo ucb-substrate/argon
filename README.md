@@ -280,8 +280,7 @@ cell tree(n: Int) {
         let child = inst(tree(n - 1));
         eq(child.leaf.x0, leaf.x1 + 50.);
         eq(child.y, 0.);
-    } else {
-    };
+    }
 }
 ```
 

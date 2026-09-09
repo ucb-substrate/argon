@@ -443,7 +443,9 @@ impl Builder<'_> {
                 self.ty(&e.metadata, out);
                 self.expr(&e.cond, out);
                 self.scope(&e.then, out);
-                self.scope(&e.else_, out);
+                if let Some(else_) = &e.else_ {
+                    self.scope(else_, out);
+                }
             }
             Expr::Match(e) => {
                 self.ty(&e.metadata, out);

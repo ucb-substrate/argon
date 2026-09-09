@@ -310,7 +310,10 @@ pub struct IfExpr<S, T: AstMetadata> {
     pub scope_order: u64,
     pub cond: Expr<S, T>,
     pub then: Scope<S, T>,
-    pub else_: Scope<S, T>,
+    /// The `else` body, absent for an `if` used as a statement. An `else if`
+    /// is desugared by the parser into a statement-less scope whose tail is
+    /// the nested `if`, so this is never anything but a scope.
+    pub else_: Option<Scope<S, T>>,
     pub span: cfgrammar::Span,
     pub metadata: T::IfExpr,
 }
@@ -624,7 +627,7 @@ pub trait AstTransformer {
         input: &IfExpr<Self::InputS, Self::InputMetadata>,
         cond: &Expr<Self::OutputS, Self::OutputMetadata>,
         then: &Scope<Self::OutputS, Self::OutputMetadata>,
-        else_: &Scope<Self::OutputS, Self::OutputMetadata>,
+        else_: &Option<Scope<Self::OutputS, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::IfExpr;
     fn dispatch_match_expr(
         &mut self,
@@ -1039,7 +1042,7 @@ pub trait AstTransformer {
     ) -> IfExpr<Self::OutputS, Self::OutputMetadata> {
         let cond = self.transform_expr(&input.cond);
         let then = self.transform_scope(&input.then);
-        let else_ = self.transform_scope(&input.else_);
+        let else_ = input.else_.as_ref().map(|s| self.transform_scope(s));
         let metadata = self.dispatch_if_expr(input, &cond, &then, &else_);
         IfExpr {
             scope_order: input.scope_order,

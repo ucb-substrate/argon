@@ -571,7 +571,9 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
                     "cell" | "enum" | "fn" | "mod" | "struct" | "use"
                 )
         }
-        CompletionSite::Statement => match candidate.kind {
+        // `StatementOrElse` is a statement position that can additionally
+        // take an `else` continuing the `if` that just closed.
+        CompletionSite::Statement | CompletionSite::StatementOrElse => match candidate.kind {
             Kind::Function
             | Kind::Cell
             | Kind::Variable
@@ -580,10 +582,12 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             | Kind::Variant
             | Kind::Struct
             | Kind::Module => true,
-            Kind::Keyword => matches!(
-                candidate.label.as_str(),
-                "false" | "for" | "if" | "let" | "match" | "true"
-            ),
+            Kind::Keyword => {
+                matches!(
+                    candidate.label.as_str(),
+                    "false" | "for" | "if" | "let" | "match" | "true"
+                ) || (site == CompletionSite::StatementOrElse && candidate.label == "else")
+            }
             Kind::Field | Kind::Type => false,
         },
         CompletionSite::Expression => match candidate.kind {
@@ -1240,6 +1244,14 @@ mod tests {
         assert_eq!(
             labels(CompletionSite::Pattern),
             ["Mode", "lib", "_", "Some"]
+        );
+        // After an `else`-less `if`'s then-scope both are possible, so the
+        // statement candidates are offered with `else` added to them.
+        assert_eq!(
+            labels(CompletionSite::StatementOrElse),
+            [
+                "else", "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
         );
         assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);
         assert!(labels(CompletionSite::Suppressed).is_empty());

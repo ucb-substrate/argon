@@ -521,7 +521,8 @@ level).
     sequence-nil literal). A non-empty `[…]` is *not* an expression.
   - `if` / `match` / `{` → the block-form primaries `IfExpr`, `MatchExpr`,
     `Scope`. These are full expressions, so the Pratt loop can still attach
-    trailing operators to them.
+    trailing operators to them. An `if` reached here requires its `else`: only
+    the statement loop ([§10](#10-scopes-statements-and-tails)) may omit it.
   - identifier → an `identPath` (`a::b::c`); becomes a `Call` if followed by
     `(`, a `StructLit` if followed by `{` where a struct literal is allowed
     ([§9.5](#95-struct-literals)), otherwise an `IdentPath`. A path is
@@ -626,19 +627,38 @@ The statement loop dispatches on `cur`:
 
 - `let name (: tySpec)? = expr ;` → `Statement::LetBinding`
 - `for v in expr scope` → `Statement::ForLoop`
+- `if` → parsed by `parse_if` directly rather than through `parse_expr`, with
+  the `else` **optional**. This is the only position where it may be omitted,
+  because an `if` with no `else` has no value and so is a statement. If an
+  `else` does follow, the node is handed back to the Pratt loop
+  (`parse_expr_from`) so `if c {a} else {b} + 1` still parses, and then routed
+  like any other expression statement.
 - anything else → an expression statement. The expression is parsed, then:
   - followed by `;` → `Statement::Expr { semicolon: true }`
+  - an `if` whose chain ends without an `else` → `Statement::Expr`, whatever
+    follows: it has no value, so it must never become the tail (a cell body may
+    not have one at all). `else if` is desugared, so the missing `else` sits at
+    the end of the chain rather than on the outermost node.
   - followed by `}` or EOF → it becomes the scope's **tail** (and the loop
     breaks)
   - a block-form expression (`if`/`match`/`{…}`) followed by more tokens → a
     `Statement::Expr { semicolon: false }` (a bare block used as a statement)
   - otherwise → record a "expected ';'" error and treat it as a statement
 
-Because the loop already routes a trailing expression into the tail, and only
-pushes a `semicolon: false` statement when more tokens follow it, a
-`semicolon: false` statement is never the last element — so no separate
-"tail fixup" is needed after the loop. (The `Scope.span` covers only the braces;
-an annotation, if present, has its own span and is excluded.)
+No separate "tail fixup" is needed after the loop: it already routes a trailing
+expression into the tail, and otherwise only pushes a `semicolon: false`
+statement when more tokens follow it — the one exception being an `else`-less
+`if`, which is a statement even in last position. (The `Scope.span` covers only
+the braces; an annotation, if present, has its own span and is excluded.)
+
+**`else if`.** `else` takes either a scope or another `if`. The second form is
+desugared by `parse_else_body` into a statement-less scope whose tail is the
+nested `if`, which is the same tree a hand-written `else { if … }` produces —
+so no later pass has to know the chain exists. Each link takes its own ordinal
+from the enclosing scope's counter, in lexical order. The `require_else` flag
+is inherited down the chain, so a chain in expression position must still end
+in an `else` block. The recursion carries its own depth guard: a chain is flat
+in scope nesting, so the scope guard never fires on it.
 
 ---
 
