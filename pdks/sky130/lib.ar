@@ -1,4 +1,4 @@
-cell fet1v8(nfet: Bool, w: Float, nf: Int, tst: Bool = true) {
+cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
     let poly_bbox = std::array(poly, nf, 430., 0.);
     eq(poly_bbox.x0, 0.);
