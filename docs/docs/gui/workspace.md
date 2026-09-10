@@ -16,11 +16,11 @@ The GUI shows the cell compiled from your current Neovim buffers. It's built for
 | Tool strip | Select, rectangle, polygon, path, dimension, and instance tools. |
 | Hierarchy sidebar | Scopes and nested instances. Selecting one sets where new geometry is inserted. |
 | Layer sidebar | The drawing layer and per-layer visibility. |
-| Neovim command line | Where the GUI asks for text, such as a cell invocation or a name. |
+| Neovim command line | Where the GUI asks for text, such as a cell invocation or a name. Cell invocations complete with <kbd>Tab</kbd>. |
 
 ## Open a cell
 
-Press <kbd>O</kbd>, type an invocation such as `inverter(1200., 2000., 4)`, and press <kbd>Enter</kbd>. The arguments are parsed and type-checked in the library's scope.
+Press <kbd>O</kbd>, type an invocation such as `inverter(1200., 2000., 4)`, and press <kbd>Enter</kbd>. The arguments are parsed and type-checked in the library's scope. <kbd>Tab</kbd> completes cell names and, inside the parentheses, the cell's keyword parameters.
 
 What you open is an invocation, not just a cell name. If you change a cell's signature, reopen it with matching arguments.
 

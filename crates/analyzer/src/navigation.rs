@@ -304,25 +304,25 @@ impl<'a> FileViews<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum CompletionContext {
+pub(crate) enum CompletionContext {
     Plain,
     Member { base_end: usize },
     Qualified { segments: Vec<String> },
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct CallContext {
+pub(crate) struct CallContext {
     callee: std::ops::Range<usize>,
-    path: Vec<String>,
+    pub(crate) path: Vec<String>,
     active_positional: usize,
     active_keyword: Option<String>,
 }
 
-fn is_ident_continue(byte: u8) -> bool {
+pub(crate) fn is_ident_continue(byte: u8) -> bool {
     byte == b'_' || byte.is_ascii_alphanumeric()
 }
 
-fn completion_context(source: &str, cursor: usize) -> CompletionContext {
+pub(crate) fn completion_context(source: &str, cursor: usize) -> CompletionContext {
     let bytes = source.as_bytes();
     let cursor = cursor.min(bytes.len());
     let mut prefix_start = cursor;
@@ -454,7 +454,7 @@ fn callee_before(
     Some((final_start..end, path))
 }
 
-fn call_context(source: &str, cursor: usize) -> Option<CallContext> {
+pub(crate) fn call_context(source: &str, cursor: usize) -> Option<CallContext> {
     let cursor = cursor.min(source.len());
     let mask = code_mask(source, cursor);
     let mut stack = Vec::new();
@@ -549,14 +549,19 @@ fn completion_item(candidate: CompletionCandidate) -> CompletionItem {
     }
 }
 
-fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionResponse {
+/// Deduplicates candidates by label, keeping the last of each, and sorts them.
+pub(crate) fn completion_items(candidates: Vec<CompletionCandidate>) -> Vec<CompletionItem> {
     let mut unique = HashMap::new();
     for candidate in candidates {
         unique.insert(candidate.label.clone(), candidate);
     }
     let mut candidates = unique.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.label.cmp(&right.label));
-    CompletionResponse::Array(candidates.into_iter().map(completion_item).collect())
+    candidates.into_iter().map(completion_item).collect()
+}
+
+fn completion_response(candidates: Vec<CompletionCandidate>) -> CompletionResponse {
+    CompletionResponse::Array(completion_items(candidates))
 }
 
 fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> bool {
@@ -625,7 +630,7 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
     }
 }
 
-fn filter_completions(
+pub(crate) fn filter_completions(
     candidates: Vec<CompletionCandidate>,
     site: CompletionSite,
 ) -> Vec<CompletionCandidate> {
@@ -723,7 +728,7 @@ impl State {
         Uri::from_file_path(path)
     }
 
-    async fn nav_index(&self) -> Option<std::sync::Arc<NavIndex>> {
+    pub(crate) async fn nav_index(&self) -> Option<std::sync::Arc<NavIndex>> {
         self.published_state.lock().await.nav.clone()
     }
 

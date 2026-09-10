@@ -23,7 +23,7 @@ description: Keyboard shortcuts, the configuration file, and troubleshooting.
 | <kbd>Ctrl</kbd>+<kbd>R</kbd> | Redo |
 | Arrow keys | Pan |
 | <kbd>Cmd/Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> | Zoom in or out |
-| <kbd>:</kbd> | Focus the Neovim command line |
+| <kbd>:</kbd> | Focus the Neovim command line, where `:Argon` arguments complete with <kbd>Tab</kbd> |
 | <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> | Switch between the GUI and Neovim |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | Show diagnostics |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> | Show messages |

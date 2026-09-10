@@ -4,6 +4,8 @@
 local M = {}
 
 local argon_cmd_name = 'Argon'
+local completion_group = 'argon_command_completion'
+local completion = require('argon.commands.completion')
 local gui = require('argon.commands.gui')
 local diagnostics = require('argon.diagnostics')
 local config_keys = {
@@ -17,7 +19,7 @@ local config_keys = {
 
 ---@class argon.command_tbl
 ---@field impl fun(args: string[], opts: vim.api.keyset.user_command) The command implementation
----@field complete? fun(subcmd_arg_lead: string): string[] Command completions callback, taking the lead of the subcommand's arguments
+---@field complete? fun(subcmd_arg_lead: string, arg_lead: string, cmdline: string, cursor_pos: integer): string[] Command completions callback, taking the lead of the subcommand's arguments
 ---@field bang? boolean Whether this command supports a bang!
 
 ---@type argon.command_tbl[]
@@ -31,6 +33,7 @@ local argon_command_tbl = {
     impl = function(args, opts)
       gui.open_cell(table.concat(args, " "))
     end,
+    complete = completion.cell_expression('openCell'),
   },
   newCell = {
     impl = function(args)
@@ -54,6 +57,7 @@ local argon_command_tbl = {
     impl = function(args, opts)
       gui.instantiate(table.concat(args, " "))
     end,
+    complete = completion.cell_expression('inst'),
   },
   reload = {
     impl = function()
@@ -142,25 +146,33 @@ end
 
 ---Create the `:Argon` command
 function M.create_argon_command()
+  -- Warming the completion cache here keeps the first completion after the
+  -- GUI opens a command line from waiting on the analyzer.
+  vim.api.nvim_create_augroup(completion_group, { clear = true })
+  vim.api.nvim_create_autocmd('CmdlineEnter', {
+    group = completion_group,
+    pattern = ':',
+    callback = completion.warm,
+  })
   vim.api.nvim_create_user_command(argon_cmd_name, argon, {
     nargs = '+',
     range = true,
     bang = true,
     desc = 'Interacts with the Argon LSP client',
-    complete = function(arg_lead, cmdline, _)
+    complete = function(arg_lead, cmdline, cursor_pos)
       local commands = cmdline:match("^['<,'>]*" .. argon_cmd_name .. '!') ~= nil
           -- bang!
           and tbl_keys_by_value_filter(function(command)
             return command.bang == true
           end, argon_command_tbl)
         or vim.tbl_keys(argon_command_tbl)
-      local subcmd, subcmd_arg_lead = cmdline:match("^['<,'>]*" .. argon_cmd_name .. '[!]*%s(%S+)%s(.*)$')
+      local subcmd, subcmd_arg_lead = cmdline:match("^['<,'>]*" .. argon_cmd_name .. '[!]*%s+(%S+)%s(.*)$')
       if subcmd and subcmd_arg_lead and argon_command_tbl[subcmd] and argon_command_tbl[subcmd].complete then
-        return argon_command_tbl[subcmd].complete(subcmd_arg_lead)
+        return argon_command_tbl[subcmd].complete(subcmd_arg_lead, arg_lead, cmdline, cursor_pos)
       end
       if cmdline:match("^['<,'>]*" .. argon_cmd_name .. '[!]*%s+%w*$') then
         return vim.tbl_filter(function(command)
-          return command:find(arg_lead) ~= nil
+          return vim.startswith(command, arg_lead)
         end, commands)
       end
     end,

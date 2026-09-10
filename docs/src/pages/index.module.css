@@ -114,7 +114,10 @@
 
 /* Buttons */
 .btn {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
   padding: .8rem 1.5rem;
   border: 1px solid transparent;
   border-radius: 8px;
@@ -125,6 +128,13 @@
   line-height: 1.2;
   text-decoration: none;
   transition: background-color .15s ease, border-color .15s ease, color .15s ease;
+}
+
+.githubIcon {
+  flex-shrink: 0;
+  width: 1.1em;
+  height: 1.1em;
+  fill: currentColor;
 }
 
 .btn:hover {

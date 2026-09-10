@@ -28,6 +28,24 @@ cannot be recursive or forward-referenced).
 
 ## Running
 
+### Rendering regression checks
+
+The GUI tests generate their layouts in temporary directories and use technology
+files from this repository. They run with cold indexes, normal background render
+workers, and a full editor window on GPUI's test platform.
+
+```bash
+cargo test -p argone --lib --release
+```
+
+Coverage includes complete frames during pan and zoom, stable viewport size when
+rendering activity changes, bounded geometry traversal, subpixel aggregation,
+hierarchy visibility and invalidation, and rectangle placement through delayed
+source edits and frame handoffs. See [rendering coverage](rendering-results.md)
+for details and commands to run individual groups.
+
+### Compiler scaling
+
 The easiest way to run the benchmarks and regenerate every artifact is the
 wrapper script [`run_benchmarks.sh`](run_benchmarks.sh):
 

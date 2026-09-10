@@ -906,7 +906,13 @@ fn declared_signature(
 ) -> SignatureInfo {
     let parameters = args
         .iter()
-        .map(|arg| parameter(&format!("{}: {}", arg.name.name, arg.metadata.1), false))
+        .map(|arg| {
+            // A parameter with a default can be named at the call site.
+            parameter(
+                &format!("{}: {}", arg.name.name, arg.metadata.1),
+                arg.default.is_some(),
+            )
+        })
         .collect::<Vec<_>>();
     let args = parameters
         .iter()
@@ -1149,15 +1155,10 @@ impl<'a> Builder<'a> {
                             .push(ModuleItem {
                                 name: decl.name.name.to_string(),
                                 key: DefKey::Var(decl.metadata.1),
-                                // Cells enter the compiler's binding frame
-                                // only after their body is checked.
-                                available_after: if decl.span.end() <= ast.source_text.len() {
-                                    decl.span.end()
-                                } else {
-                                    // GDS declarations are generated before
-                                    // user source and are always in scope.
-                                    0
-                                },
+                                // Cells may be declared in any order and may
+                                // recurse, so one is in scope throughout its
+                                // module.
+                                available_after: 0,
                             });
                     }
                     Decl::Fn(decl) => {
@@ -2910,8 +2911,10 @@ cell top() {
         }
     }
 
+    /// Declarations are visible throughout their module, wherever they sit,
+    /// including the one being completed in. Lexical bindings are not.
     #[test]
-    fn completion_respects_lexical_scope_and_declaration_order() {
+    fn completion_respects_lexical_scope_but_not_declaration_order() {
         let source = r#"
 struct Size { width: Float }
 fn helper(value: Float) -> Float { value }
@@ -2924,6 +2927,7 @@ cell top(arg: Float) {
     } else {};
     let later = 2.;
 }
+cell later_cell() {}
 "#;
         let (_, index, offsets) = index(source);
         let labels = labels(index.completions_at(Path::new(ROOT), offsets[0]));
@@ -2932,6 +2936,10 @@ cell top(arg: Float) {
             "earlier",
             "nested",
             "earlier_cell",
+            // A cell declared after the cursor, and the cell being completed
+            // in: cells may be declared out of order and may recurse.
+            "later_cell",
+            "top",
             "helper",
             "Size",
             "rect",
@@ -2941,12 +2949,10 @@ cell top(arg: Float) {
                 "missing {expected}: {labels:?}"
             );
         }
-        for hidden in ["later", "top"] {
-            assert!(
-                !labels.iter().any(|label| label == hidden),
-                "unexpected {hidden}: {labels:?}"
-            );
-        }
+        assert!(
+            !labels.iter().any(|label| label == "later"),
+            "a binding declared below the cursor is out of scope: {labels:?}"
+        );
     }
 
     #[test]

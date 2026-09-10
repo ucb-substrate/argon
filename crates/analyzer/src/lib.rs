@@ -1,4 +1,5 @@
 mod cell_edit;
+mod command_completion;
 mod compiler_worker;
 pub mod document;
 mod navigation;
@@ -51,6 +52,7 @@ use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+use crate::command_completion::{CommandCompletion, CommandCompletionParams};
 use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
@@ -392,6 +394,7 @@ pub(crate) struct PublishedState {
 struct GuiConnection {
     id: u64,
     client: GuiClient,
+    snapshot: Arc<tokio::sync::Mutex<Option<CompilationSnapshot>>>,
 }
 
 #[derive(Debug, Default)]
@@ -738,6 +741,7 @@ impl State {
         let connection = GuiConnection {
             id: gui.next_connection_id,
             client,
+            snapshot: Arc::default(),
         };
         gui.connection = Some(connection.clone());
         connection
@@ -970,11 +974,29 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
+        // Serialize updates per connection so each delta names an acknowledged
+        // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
+        let mut previous = connection.snapshot.lock().await;
+        if !self.state.is_latest_compile_request(identity).await {
+            return None;
+        }
+        let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
         let result = connection
             .client
-            .update_cell(context::current(), snapshot)
+            .update_cell(context::current(), update)
             .await;
-        self.handle_gui_result(&connection, result).await?;
+        if !self.handle_gui_result(&connection, result).await? {
+            let full = rpc::CompilationUpdate::new(snapshot.clone(), None);
+            let result = connection
+                .client
+                .update_cell(context::current(), full)
+                .await;
+            if !self.handle_gui_result(&connection, result).await? {
+                return None;
+            }
+        }
+        *previous = Some(snapshot);
+        drop(previous);
         Some(connection)
     }
 
@@ -1487,6 +1509,13 @@ impl Backend {
         self.open_cell_view(identity).await;
     }
 
+    async fn command_completion(
+        &self,
+        params: CommandCompletionParams,
+    ) -> Result<CommandCompletion> {
+        Ok(self.state.command_completion(params).await)
+    }
+
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
         let state = self.state.clone();
         state
@@ -1991,6 +2020,7 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/newCell", Backend::new_cell)
     .custom_method("custom/renameCell", Backend::rename_cell)
     .custom_method("custom/inst", Backend::instantiate)
+    .custom_method("custom/commandCompletion", Backend::command_completion)
     .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/setConfig", Backend::set_config)
     .custom_method("custom/saveConfig", Backend::save_config)
