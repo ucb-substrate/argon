@@ -1897,7 +1897,8 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
-                                            for state in Arc::make_mut(&mut cell.state).values_mut()
+                                            for (_, state) in
+                                                Arc::make_mut(&mut cell.state).iter_mut()
                                             {
                                                 state.visible = true;
                                             }
@@ -1923,7 +1924,8 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
-                                            for state in Arc::make_mut(&mut cell.state).values_mut()
+                                            for (_, state) in
+                                                Arc::make_mut(&mut cell.state).iter_mut()
                                             {
                                                 state.visible = false;
                                             }

@@ -63,7 +63,7 @@ tech = "tech.toml"
 pdk = "../pdk"
 
 [gds]
-ring_osc = "~/Downloads/ring_osc.gds"
+ring_osc = "layout/ring_osc.gds"
 "macros::sram" = "layout/sram.gds"
 ```
 

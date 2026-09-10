@@ -47,7 +47,7 @@ vim.api.nvim_create_autocmd('LspProgress', {
   end,
 })
 
-if vim.env.ARGON_TEST_MODE ~= 'rpc_errors' then
+if vim.env.ARGON_TEST_MODE ~= 'rpc_errors' and vim.env.ARGON_TEST_MODE ~= 'startup_errors' then
   vim.cmd('Argon openCell top()')
 end
 
@@ -74,6 +74,11 @@ if vim.env.ARGON_TEST_MODE == 'roundtrip' then
     '    let editor_rect = rect("met1", x0i = 20., y0i = 20., x1i = 30., y1i = 30.)!;',
   })
   vim.cmd('write')
+elseif vim.env.ARGON_TEST_MODE == 'startup_errors' then
+  wait_for('initial analyzer diagnostics without a selected cell', function()
+    return #vim.diagnostic.get(bufnr) > 0
+  end)
+  vim.fn.writefile({ 'ready' }, vim.env.ARGON_TEST_READY)
 elseif vim.env.ARGON_TEST_MODE == 'diagnostics' then
   wait_for('analyzer diagnostics', function()
     return #vim.diagnostic.get(bufnr) > 0

@@ -48,6 +48,8 @@ are the ones that can be named at a call site.
 
 Neovim owns the source. The analyzer receives each change, recompiles the open cell, and publishes diagnostics. Edits made from the GUI arrive as ordinary buffer edits, so they mark the buffer modified and can be undone.
 
+Compilation progress is available to Fidget and other LSP progress plugins. Argon does not add a second spinner or completion message to Neovim's message area.
+
 ## Diagnostics
 
 The diagnostics panel lists parser, resolver, type, and execution errors across the workspace. It has mappings to refresh, jump to an entry, and close. For runtime detail, use `:Argon log`.

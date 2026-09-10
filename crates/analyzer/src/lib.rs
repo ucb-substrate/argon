@@ -394,6 +394,7 @@ pub(crate) struct PublishedState {
 struct GuiConnection {
     id: u64,
     client: GuiClient,
+    snapshot: Arc<tokio::sync::Mutex<Option<CompilationSnapshot>>>,
 }
 
 #[derive(Debug, Default)]
@@ -740,6 +741,7 @@ impl State {
         let connection = GuiConnection {
             id: gui.next_connection_id,
             client,
+            snapshot: Arc::default(),
         };
         gui.connection = Some(connection.clone());
         connection
@@ -972,11 +974,29 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
+        // Serialize updates per connection so each delta names an acknowledged
+        // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
+        let mut previous = connection.snapshot.lock().await;
+        if !self.state.is_latest_compile_request(identity).await {
+            return None;
+        }
+        let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
         let result = connection
             .client
-            .update_cell(context::current(), snapshot)
+            .update_cell(context::current(), update)
             .await;
-        self.handle_gui_result(&connection, result).await?;
+        if !self.handle_gui_result(&connection, result).await? {
+            let full = rpc::CompilationUpdate::new(snapshot.clone(), None);
+            let result = connection
+                .client
+                .update_cell(context::current(), full)
+                .await;
+            if !self.handle_gui_result(&connection, result).await? {
+                return None;
+            }
+        }
+        *previous = Some(snapshot);
+        drop(previous);
         Some(connection)
     }
 

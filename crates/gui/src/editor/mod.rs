@@ -7,14 +7,10 @@ use std::{
 };
 
 use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
-use argonc::compile::{
-    CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId, SolvedValue,
-    bbox_dim_union, bbox_text_union, bbox_union, ifmatvec,
-};
+use argonc::compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId};
 use canvas::{LayoutCanvas, ShapeFill, StipplePattern};
 use futures::StreamExt;
-use geometry::transform::TransformationMatrix;
-use gpui::*;
+use gpui::{prelude::FluentBuilder, *};
 use indexmap::{IndexMap, IndexSet};
 use rgb::Rgb;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
@@ -31,6 +27,7 @@ use crate::{
 };
 
 pub mod canvas;
+mod hierarchy;
 pub mod input;
 pub mod toolbars;
 
@@ -69,8 +66,9 @@ pub struct ScopeAddress {
 pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
-    pub state: Arc<IndexMap<ScopePath, ScopeState>>,
-    pub scope_paths: Arc<IndexMap<ScopeAddress, ScopePath>>,
+    pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
+    pub scope_paths: Arc<imbl::HashMap<ScopeAddress, ScopePath>>,
+    hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
 pub struct Layers {
@@ -174,21 +172,24 @@ fn shape_fill(
 #[derive(Default)]
 struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
-    state: IndexMap<ScopePath, ScopeState>,
-    scope_paths: IndexMap<ScopeAddress, ScopePath>,
+    state: imbl::HashMap<ScopePath, ScopeState>,
+    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
 }
 
+#[derive(Default)]
 pub(crate) struct CompilationPreparationContext {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: Option<ScopePath>,
-    scope_state: Option<Arc<IndexMap<ScopePath, ScopeState>>>,
+    scope_state: Option<Arc<imbl::HashMap<ScopePath, ScopeState>>>,
+    previous: Option<CompileOutputState>,
 }
 
 struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
-    state: IndexMap<ScopePath, ScopeState>,
-    scope_paths: IndexMap<ScopeAddress, ScopePath>,
+    state: imbl::HashMap<ScopePath, ScopeState>,
+    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
+    hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
 pub(crate) struct PreparedCompilationSnapshot {
@@ -199,27 +200,27 @@ pub(crate) struct PreparedCompilationSnapshot {
 }
 
 fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
-    let layer = SharedString::from(layer.to_owned());
-    if let Some(layer_info) = state.layers.get_mut(&layer) {
+    if let Some(layer_info) = state.layers.get_mut(layer) {
         layer_info.used = true;
-    } else {
-        let mut hasher = DefaultHasher::new();
-        layer.hash(&mut hasher);
-        let hash = hasher.finish() as usize;
-        let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-        state.layers.insert(
-            layer.clone(),
-            LayerState {
-                name: layer,
-                color,
-                fill: ShapeFill::Stippling,
-                border_color: color,
-                visible: true,
-                used: true,
-                z: state.layers.len(),
-            },
-        );
+        return;
     }
+    let layer = SharedString::from(layer.to_owned());
+    let mut hasher = DefaultHasher::new();
+    layer.hash(&mut hasher);
+    let hash = hasher.finish() as usize;
+    let color = rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
+    state.layers.insert(
+        layer.clone(),
+        LayerState {
+            name: layer,
+            color,
+            fill: ShapeFill::Stippling,
+            border_color: color,
+            visible: true,
+            used: true,
+            z: state.layers.len(),
+        },
+    );
 }
 
 impl EditorState {
@@ -240,162 +241,6 @@ impl EditorState {
             });
         }
     }
-    fn process_scope(
-        solved_cell: &CompiledData,
-        scope: ScopeAddress,
-        state: &mut ProcessScopeState,
-        parent: Option<ScopeAddress>,
-        old_scope_state: Option<&IndexMap<ScopePath, ScopeState>>,
-    ) {
-        let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
-        let mut scope_path = if let Some(parent) = &parent {
-            state.scope_paths[parent].clone()
-        } else {
-            vec![]
-        };
-        scope_path.push(scope_info.name.clone());
-        state.scope_paths.insert(scope, scope_path.clone());
-        let mut bbox = None;
-        for (obj, _) in &scope_info.emit {
-            let value = &solved_cell.cells[&scope.cell].objects[obj];
-            match value {
-                SolvedValue::Rect(rect) => {
-                    bbox = bbox_union(bbox, Some(rect.to_float()));
-                    if let Some(layer) = &rect.layer {
-                        mark_layer_used(state, layer);
-                    }
-                }
-                SolvedValue::Polygon(polygon) => {
-                    bbox = bbox_union(bbox, polygon.bbox());
-                    let layer = SharedString::from(&polygon.layer);
-                    if let Some(layer_info) = state.layers.get_mut(&layer) {
-                        layer_info.used = true;
-                    } else {
-                        let mut s = DefaultHasher::new();
-                        layer.hash(&mut s);
-                        let hash = s.finish() as usize;
-                        let color =
-                            rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-                        state.layers.insert(
-                            layer.clone(),
-                            LayerState {
-                                name: layer,
-                                color,
-                                fill: ShapeFill::Stippling,
-                                border_color: color,
-                                visible: true,
-                                used: true,
-                                z: state.layers.len(),
-                            },
-                        );
-                    }
-                }
-                SolvedValue::Path(path) => {
-                    bbox = bbox_union(bbox, path.bbox());
-                    let layer = SharedString::from(&path.layer);
-                    if let Some(layer_info) = state.layers.get_mut(&layer) {
-                        layer_info.used = true;
-                    } else {
-                        let mut s = DefaultHasher::new();
-                        layer.hash(&mut s);
-                        let hash = s.finish() as usize;
-                        let color =
-                            rgb([0xff0000, 0x0ff000, 0x00ff00, 0x000ff0, 0x0000ff][hash % 5]);
-                        state.layers.insert(
-                            layer.clone(),
-                            LayerState {
-                                name: layer,
-                                color,
-                                fill: ShapeFill::Stippling,
-                                border_color: color,
-                                visible: true,
-                                used: true,
-                                z: state.layers.len(),
-                            },
-                        );
-                    }
-                }
-                SolvedValue::Instance(inst) => {
-                    let inst_address = ScopeAddress {
-                        scope: solved_cell.cells[&inst.cell].root,
-                        cell: inst.cell,
-                    };
-                    Self::process_scope(
-                        solved_cell,
-                        inst_address,
-                        state,
-                        Some(scope),
-                        old_scope_state,
-                    );
-                    bbox = bbox_union(
-                        bbox,
-                        state.state[&state.scope_paths[&inst_address]]
-                            .bbox
-                            .as_ref()
-                            .map(|rect| {
-                                let mut inst_mat = TransformationMatrix::identity();
-                                if inst.reflect {
-                                    inst_mat = inst_mat.reflect_vert()
-                                }
-                                inst_mat = inst_mat.rotate(inst.angle);
-                                let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
-                                let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
-                                Rect {
-                                    layer: None,
-                                    x0: p0p.0.min(p1p.0) + inst.x,
-                                    y0: p0p.1.min(p1p.1) + inst.y,
-                                    x1: p0p.0.max(p1p.0) + inst.x,
-                                    y1: p0p.1.max(p1p.1) + inst.y,
-                                    id: inst.id,
-                                    construction: true,
-                                    span: rect.span.clone(),
-                                }
-                            }),
-                    );
-                }
-                SolvedValue::Dimension(dim) => {
-                    bbox = bbox_dim_union(bbox, dim);
-                }
-                SolvedValue::Text(t) => {
-                    bbox = bbox_text_union(bbox, t);
-                    mark_layer_used(state, &t.layer);
-                }
-            }
-        }
-
-        for child in &scope_info.children {
-            let scope_address = ScopeAddress {
-                scope: *child,
-                cell: scope.cell,
-            };
-            Self::process_scope(
-                solved_cell,
-                scope_address,
-                state,
-                Some(scope),
-                old_scope_state,
-            );
-            bbox = bbox_union(
-                bbox,
-                state.state[&state.scope_paths[&scope_address]].bbox.clone(),
-            );
-        }
-
-        let visible = old_scope_state
-            .and_then(|state| state.get(&scope_path).map(|scope| scope.visible))
-            .unwrap_or(true);
-        state.state.insert(
-            scope_path,
-            ScopeState {
-                name: scope_info.name.clone(),
-                address: scope,
-                visible,
-                bbox,
-                parent,
-            },
-        );
-    }
-
     /// Re-root the current compiled hierarchy at an already compiled child cell.
     ///
     /// This keeps the exact parameterization represented by the selected cell ID;
@@ -423,6 +268,7 @@ impl EditorState {
             layers: self.layers.read(cx).layers.clone(),
             selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope.clone()),
             scope_state: old_cell.as_ref().map(|cell| cell.state.clone()),
+            previous: old_cell.clone(),
         }
     }
 
@@ -467,6 +313,7 @@ impl EditorState {
             selected_scope,
             state,
             scope_paths,
+            hierarchy,
         }) = prepared_output
         else {
             return;
@@ -489,6 +336,7 @@ impl EditorState {
                 selected_scope,
                 state: Arc::new(state),
                 scope_paths: Arc::new(scope_paths),
+                hierarchy,
             });
             cx.notify();
         });
@@ -541,12 +389,12 @@ pub(crate) fn prepare_compilation_snapshot(
                 },
             );
         }
-        EditorState::process_scope(
+        let hierarchy = hierarchy::prepare(
             solved_cell,
             root_scope,
             &mut state,
-            None,
             context.scope_state.as_deref(),
+            context.previous.as_ref(),
         );
         let ProcessScopeState {
             layers,
@@ -562,6 +410,7 @@ pub(crate) fn prepare_compilation_snapshot(
             selected_scope,
             state,
             scope_paths,
+            hierarchy: Arc::new(hierarchy),
         }
     });
     PreparedCompilationSnapshot {
@@ -1078,37 +927,44 @@ impl Render for Editor {
                         })),
                 );
         }
-        if let Some(activity_label) = activity_label {
-            if !status_fills_space {
-                status_bar = status_bar.child(div().flex_1());
-            }
-            status_bar = status_bar.child(
-                div()
-                    .id("compilation_status")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .text_color(theme.subtext)
-                    .child(
-                        svg()
-                            .path("icons/arrow-rotate-right-solid-full.svg")
-                            .w(px(14.))
-                            .h_auto()
-                            .text_color(theme.subtext)
-                            .with_animation(
-                                "compilation_spinner",
-                                Animation::new(Duration::from_millis(800)).repeat(),
-                                |icon, delta| {
-                                    icon.with_transformation(Transformation::rotate(percentage(
-                                        delta,
-                                    )))
-                                },
-                            ),
-                    )
-                    .child(activity_label),
-            );
+        if !status_fills_space {
+            status_bar = status_bar.child(div().flex_1());
         }
+        // Keep the activity row's intrinsic height even while idle. Adding
+        // the label used to shrink the canvas, invalidating every raster tile;
+        // completing that raster hid the label and restarted the cycle.
+        // An invisible, non-animated row also respects custom font sizes.
+        let activity_icon = svg()
+            .path("icons/arrow-rotate-right-solid-full.svg")
+            .w(px(14.))
+            .h_auto()
+            .text_color(theme.subtext);
+        let activity_icon = if activity_label.is_some() {
+            activity_icon
+                .with_animation(
+                    "compilation_spinner",
+                    Animation::new(Duration::from_millis(800)).repeat(),
+                    |icon, delta| {
+                        icon.with_transformation(Transformation::rotate(percentage(delta)))
+                    },
+                )
+                .into_any_element()
+        } else {
+            activity_icon.into_any_element()
+        };
+        status_bar = status_bar.child(
+            div()
+                .id("compilation_status")
+                .flex()
+                .flex_row()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .text_color(theme.subtext)
+                .when(activity_label.is_none(), |row| row.invisible())
+                .child(activity_icon)
+                .child(activity_label.unwrap_or("Rendering")),
+        );
         let mut root = div()
             .id("top")
             .track_focus(&self.canvas.focus_handle(cx))
