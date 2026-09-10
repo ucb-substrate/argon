@@ -5927,6 +5927,84 @@ cell top() {
         );
     }
 
+    /// `[]` belongs to every sequence type, so unifying it with a type
+    /// parameter must leave the element type open rather than pinning the
+    /// parameter to the empty-sequence type, which would match any `[T]`.
+    #[test]
+    fn an_empty_sequence_does_not_pin_a_type_parameter() {
+        const PICK: &str = "fn pick<T>(c: Bool, a: T, b: T) -> T { if c { a } else { b } }\n";
+        for (source, expected, found) in [
+            (
+                "fn takei(xs: [Int]) -> Int { head(xs) }
+                 cell c() { let n = takei(pick(false, [], cons(7.5, []))); }",
+                "[Int]",
+                "[Float]",
+            ),
+            (
+                "fn takef(xs: [Float]) -> Float { head(xs) }
+                 cell c() { let v = takef(pick(false, [], cons(\"a\", []))); }",
+                "[Float]",
+                "[String]",
+            ),
+            // The element type is compared at every depth.
+            (
+                "fn takeii(xs: [[Int]]) -> Int { head(head(xs)) }
+                 cell c() { let n = takeii(pick(false, [], cons(cons(7.5, []), []))); }",
+                "[[Int]]",
+                "[[Float]]",
+            ),
+        ] {
+            let source = format!("{PICK}{source}");
+            let errors = generic_errors(&source);
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    StaticErrorKind::IncorrectTy { found: f, expected: e }
+                        if e == expected && f == found
+                )),
+                "{source}\n{errors:?}"
+            );
+        }
+
+        // A consistent element type checks, whichever side `[]` is on.
+        for args in ["false, [], cons(1, [])", "false, cons(1, []), []"] {
+            let source = format!(
+                "{PICK}fn takei(xs: [Int]) -> Int {{ head(xs) }}\n\
+                 cell c() {{ let n = takei(pick({args})); }}"
+            );
+            assert!(generic_errors(&source).is_empty(), "{source}");
+        }
+
+        // The other argument alone fixes the element type, so the sequence
+        // needs no annotation.
+        assert!(
+            generic_errors(&format!(
+                "{PICK}cell c() {{ let n = head(pick(true, [], cons(1, []))); }}"
+            ))
+            .is_empty()
+        );
+
+        // `[]` still never matches a non-sequence type, and the mismatch is the
+        // only error: the open element type must not also be reported.
+        assert!(matches!(
+            generic_errors(&format!("{PICK}cell c() {{ let n = pick(false, [], 5); }}")).as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+
+        // `[]` remains a value of every declared sequence type.
+        assert!(
+            generic_errors("fn e<T>() -> [T] { [] }\ncell c() { let v = e::<Float>(); }")
+                .is_empty()
+        );
+
+        // With nothing to fix the element type, an annotation is required.
+        assert!(
+            generic_errors("fn id<T>(x: T) -> T { x }\ncell c() { let e = id([]); }")
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::TypeAnnotationsNeeded))
+        );
+    }
+
     #[test]
     fn generic_sequence_functions_run_on_rects() {
         let data = compile_top(

@@ -3729,7 +3729,15 @@ impl<'a> VarIdTyPass<'a> {
                 if self.infer.occurs(*var, other) {
                     return false;
                 }
-                self.infer.solutions[*var as usize] = Some(other.clone());
+                // `[]` belongs to every sequence type, so solving a variable to
+                // `SeqNil` would let any element type through unchecked. Record
+                // only that the variable is a sequence, leaving its element to
+                // the next unification.
+                let solution = match other {
+                    Ty::SeqNil => Ty::Seq(Box::new(self.infer.fresh())),
+                    other => other.clone(),
+                };
+                self.infer.solutions[*var as usize] = Some(solution);
                 true
             }
             _ if a.is_wildcard() => {
@@ -3788,6 +3796,11 @@ impl<'a> VarIdTyPass<'a> {
                     expected: self.display(expected),
                 },
             });
+            // A failed unification can leave variables on either side unsolved.
+            // They follow from the mismatch just reported, so solve them to
+            // `Unknown` rather than reporting them again.
+            self.infer.solve_unsolved(found, &Ty::Unknown);
+            self.infer.solve_unsolved(expected, &Ty::Unknown);
         }
     }
 
