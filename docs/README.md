@@ -49,9 +49,10 @@ directory name is also the URL prefix.
 Sidebar entries in `sidebars.ts` are paths relative to `docs/docs/`. Links within
 pages use absolute URL paths such as `/language/types/rect`.
 
-`static/img/gui.png` is a screenshot of the GUI with `diff_vco_top()` from
-`pdks/sky130` open in dark mode, cropped to remove the window title bar. Retake
-it after visible GUI changes.
+`static/img/gui-light.png` and `static/img/gui.png` show `diff_vco_top()` from
+`pdks/sky130` in light and dark mode. The front page follows the site's theme.
+Retake both after visible GUI changes, keeping the same dimensions and framing
+and excluding the window title bar.
 
 ## Contributor notes
 

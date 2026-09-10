@@ -182,7 +182,8 @@
 }
 
 .shot img {
-  display: block;
+  /* Leave display to ThemedImage so only the active theme is visible. */
+  vertical-align: bottom;
   width: 100%;
   height: auto;
   border: 1px solid var(--ifm-color-emphasis-300);
@@ -298,7 +299,6 @@
 }
 
 .involved {
-  max-width: 44rem;
   margin: 0;
   font-size: 1.05rem;
   line-height: 1.65;

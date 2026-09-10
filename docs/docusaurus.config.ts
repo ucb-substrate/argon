@@ -88,7 +88,8 @@ const config: Config = {
       // The [Ar] mark alone; no title text beside it.
       logo: {
         alt: 'Argon',
-        src: 'img/argon-mark.svg',
+        src: 'img/argon-mark-light.svg',
+        srcDark: 'img/argon-mark.svg',
       },
       items: [
         {type: 'docSidebar', sidebarId: 'guides', label: 'Guides', position: 'left'},

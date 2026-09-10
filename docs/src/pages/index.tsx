@@ -4,6 +4,7 @@ import Link from '@docusaurus/Link';
 import useBaseUrl from '@docusaurus/useBaseUrl';
 import Layout from '@theme/Layout';
 import Heading from '@theme/Heading';
+import ThemedImage from '@theme/ThemedImage';
 import GitHubIcon from '@theme/Icon/Socials/GitHub';
 import styles from './index.module.css';
 
@@ -174,9 +175,6 @@ export default function Home(): ReactNode {
               <Link className={clsx(styles.btn, styles.btnPrimary)} to="/guides/getting-started/installation">
                 Get started
               </Link>
-              <Link className={clsx(styles.btn, styles.btnSecondary)} to="/language/overview">
-                Language reference
-              </Link>
               <Link className={clsx(styles.btn, styles.btnSecondary)} to="https://github.com/ucb-substrate/argon">
                 <GitHubIcon className={styles.githubIcon} aria-hidden="true" focusable="false" />
                 Source on GitHub
@@ -188,11 +186,14 @@ export default function Home(): ReactNode {
 
         <div className={clsx(styles.container, styles.shotWrap)}>
           <figure className={styles.shot}>
-            <img
-              src={useBaseUrl('/img/gui.png')}
+            <ThemedImage
+              sources={{
+                light: useBaseUrl('/img/gui-light.png'),
+                dark: useBaseUrl('/img/gui.png'),
+              }}
               alt="The Argon GUI showing a differential ring oscillator in the sky130 process, with the scope tree on the left and the layer list on the right."
-              width={1886}
-              height={1486}
+              width={1112}
+              height={810}
             />
             <figcaption>A differential ring oscillator for the sky130 process, written in Argon and shown in the GUI.</figcaption>
           </figure>
