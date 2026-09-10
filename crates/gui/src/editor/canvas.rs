@@ -360,7 +360,6 @@ struct TextLabel {
 /// A bounded, fully collected direct frame. Keep it at its original camera
 /// while the first raster is pending, including pans into uncached geometry.
 struct DirectFrame {
-    viewport: Size<Pixels>,
     display: RasterDisplayTransform,
     content_revision: u64,
     rects: Vec<(Rect, LayerState)>,
@@ -5831,6 +5830,7 @@ impl Element for CanvasElement {
             cx.drop_image(image, Some(window));
         }
         self.inner.update(cx, |inner, cx| {
+            let resized = inner.screen_bounds.size != bounds.size;
             inner.offset =
                 offset_after_horizontal_reflow(inner.offset, inner.screen_bounds, bounds);
             inner.screen_bounds = bounds;
@@ -5844,17 +5844,16 @@ impl Element for CanvasElement {
                 .raster_tiles
                 .as_ref()
                 .is_some_and(|tiles| tiles.screen_viewport == bounds.size);
-            // A paint notification is also emitted after each background tile
-            // finishes or is cancelled. Retargeting an already-running first
-            // tile here advances its generation, causing that tile to cancel
-            // and notify again forever. Navigation input still explicitly
-            // retargets the worker when the viewport actually changes.
-            if paint_should_start_navigation_worker(
-                has_solved_layout,
-                inner.raster_prefetch_enabled,
-                raster_matches_viewport,
-                inner.raster_worker_active,
-            ) {
+            // Retarget on an actual resize, not on tile-completion paints
+            // that would repeatedly cancel and restart the worker.
+            if (resized && has_solved_layout && inner.raster_prefetch_enabled)
+                || paint_should_start_navigation_worker(
+                    has_solved_layout,
+                    inner.raster_prefetch_enabled,
+                    raster_matches_viewport,
+                    inner.raster_worker_active,
+                )
+            {
                 inner.request_navigation_raster(cx);
             }
         });
@@ -5869,26 +5868,18 @@ impl Element for CanvasElement {
                 .then(|| inner.raster_display_transform_for_current_view())
                 .flatten()
         });
-        // Retained cameras may lag a gesture, but the submitted tile field
-        // must cover the complete viewport. When the requested camera would
-        // expose an unfinished edge, keep the last covered camera until a
-        // closer full-screen raster is ready.
+        // Navigation keeps a covered camera until its replacement is ready.
+        // Resizing also retains the old field while newly exposed edges render.
         let previous_presentation = inner.last_presented_raster.get();
         let retained_direct = inner
             .retained_direct_frame
             .as_ref()
-            .filter(|frame| {
-                frame.viewport == bounds.size
-                    && inner.raster_revision_displayable(frame.content_revision)
-            })
+            .filter(|frame| inner.raster_revision_displayable(frame.content_revision))
             .cloned();
         let tile_candidate = inner
             .raster_tiles
             .clone()
-            .filter(|tiles| {
-                inner.raster_revision_displayable(tiles.content_revision)
-                    && tiles.screen_viewport == bounds.size
-            })
+            .filter(|tiles| inner.raster_revision_displayable(tiles.content_revision))
             .and_then(|tiles| {
                 // Only advance to the exact requested camera once that LOD
                 // covers the viewport. A capture-centered intermediate or a
@@ -5909,7 +5900,14 @@ impl Element for CanvasElement {
                     previous_presentation,
                     inner.scale,
                     inner.offset,
-                )?;
+                )
+                .or_else(|| {
+                    // A larger window can outgrow the retained overscan.
+                    // Keep the visible layout while the new margins render.
+                    (tiles.screen_viewport != bounds.size)
+                        .then_some(previous_presentation)
+                        .flatten()
+                })?;
                 Some((tiles, display))
             });
         // The presentation follows the density decision alone. Tools,
@@ -6627,7 +6625,6 @@ impl Element for CanvasElement {
         }
         let fresh_direct_frame = (!shallow && replay_direct.is_none()).then(|| {
             Arc::new(DirectFrame {
-                viewport: bounds.size,
                 display: RasterDisplayTransform {
                     scale: inner.scale,
                     offset: inner.offset,
@@ -9280,14 +9277,13 @@ impl LayoutCanvas {
             return;
         }
 
-        let can_stage_over_active = self.raster_tiles.as_ref().is_some_and(|tiles| {
-            self.raster_revision_displayable(tiles.content_revision)
-                && tiles.screen_viewport == target.screen_viewport
-        });
+        let can_stage_over_active = self
+            .raster_tiles
+            .as_ref()
+            .is_some_and(|tiles| self.raster_revision_displayable(tiles.content_revision));
         if !can_stage_over_active {
-            // There is no compatible previous frame to retain (initial load,
-            // content invalidation, or resize), so make the center visible as
-            // soon as possible instead of waiting for nine tiles.
+            // With no displayable previous frame, show the center tile as
+            // soon as possible instead of waiting for the surrounding tiles.
             if index != target.center {
                 self.raster_images_to_drop.push(cache.image);
                 return;
