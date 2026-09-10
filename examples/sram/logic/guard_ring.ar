@@ -1,0 +1,110 @@
+// Native Sky130 double guard ring used by the assembled SRAM.
+// `inner` is the hole of the VSS ring (the SRAM bounding box plus 1 um).
+
+fn ring_left(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x0 - width, inner.y0 - width, inner.x0, inner.y1 + width)
+}
+
+fn ring_right(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x1, inner.y0 - width, inner.x1 + width, inner.y1 + width)
+}
+
+fn ring_bottom(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x0 - width, inner.y0 - width, inner.x1 + width, inner.y0)
+}
+
+fn ring_top(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x0 - width, inner.y1, inner.x1 + width, inner.y1 + width)
+}
+
+fn ring_inner_left(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x0 - width, inner.y0, inner.x0, inner.y1)
+}
+
+fn ring_inner_right(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x1, inner.y0, inner.x1 + width, inner.y1)
+}
+
+fn ring_inner_bottom(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x0, inner.y0 - width, inner.x1, inner.y0)
+}
+
+fn ring_inner_top(inner: Rect, width: Float) -> Rect {
+    lib::columns::util::cbox(inner.x0, inner.y1, inner.x1, inner.y1 + width)
+}
+
+fn shrink_rect(r: Rect, amount: Float) -> Rect {
+    lib::columns::util::cbox(r.x0 + amount, r.y0 + amount, r.x1 - amount, r.y1 - amount)
+}
+
+fn expand_rect(r: Rect, amount: Float) -> Rect {
+    lib::columns::util::cbox(r.x0 - amount, r.y0 - amount, r.x1 + amount, r.y1 + amount)
+}
+
+fn draw_ring_via_stack(inner: Rect, width: Float) -> Rect {
+    let left = shrink_rect(ring_inner_left(inner, width), 340.);
+    let right = shrink_rect(ring_inner_right(inner, width), 340.);
+    lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", left, left, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", left, left, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", right, right, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", right, right, 0, 0, false);
+    let bottom = shrink_rect(ring_inner_bottom(inner, width), 340.);
+    let top = shrink_rect(ring_inner_top(inner, width), 340.);
+    let bottom_via = lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", bottom, bottom, 0, 0, false);
+    let top_via = lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", top, top, 0, 0, false);
+    lib::columns::util::draw_box("li1.pin", bottom_via.1);
+    lib::columns::util::draw_box("li1.pin", top_via.1);
+    inner
+}
+
+fn draw_one_supply_ring(inner: Rect, width: Float, implant: Any) -> Rect {
+    let left = ring_left(inner, width);
+    let right = ring_right(inner, width);
+    let bottom = ring_bottom(inner, width);
+    let top = ring_top(inner, width);
+    lib::columns::util::draw_box("met1.drawing", left);
+    lib::columns::util::draw_box("met1.pin", left);
+    lib::columns::util::draw_box(implant, left);
+    lib::columns::util::draw_box("li1.drawing", shrink_rect(left, 345.));
+    lib::columns::util::draw_box("tap.drawing", shrink_rect(left, 425.));
+    lib::columns::util::draw_box("met1.drawing", right);
+    lib::columns::util::draw_box("met1.pin", right);
+    lib::columns::util::draw_box(implant, right);
+    lib::columns::util::draw_box("li1.drawing", shrink_rect(right, 345.));
+    lib::columns::util::draw_box("tap.drawing", shrink_rect(right, 425.));
+
+    lib::columns::util::draw_box("met2.drawing", bottom);
+    lib::columns::util::draw_box("met2.pin", bottom);
+    lib::columns::util::draw_box(implant, bottom);
+    lib::columns::util::draw_box("li1.drawing", shrink_rect(bottom, 345.));
+    lib::columns::util::draw_box("tap.drawing", shrink_rect(bottom, 425.));
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", left, bottom, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", right, bottom, 0, 0, false);
+    lib::columns::util::draw_box("met2.drawing", top);
+    lib::columns::util::draw_box("met2.pin", top);
+    lib::columns::util::draw_box(implant, top);
+    lib::columns::util::draw_box("li1.drawing", shrink_rect(top, 345.));
+    lib::columns::util::draw_box("tap.drawing", shrink_rect(top, 425.));
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", left, top, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", right, top, 0, 0, false);
+    draw_ring_via_stack(inner, width)
+}
+
+cell guard_ring(x0: Float, y0: Float, x1: Float, y1: Float) {
+    let ring_width = 1360.;
+    let ring_space = 2. * ring_width;
+    let vss_inner = lib::columns::util::cbox(x0, y0, x1, y1);
+    let vdd_inner = expand_rect(vss_inner, ring_space);
+    draw_one_supply_ring(vss_inner, ring_width, "psdm.drawing");
+    draw_one_supply_ring(vdd_inner, ring_width, "nsdm.drawing");
+
+    // Deep-nwell covers the VDD-ring hole plus 1.08 um. The ordinary nwell
+    // is a 1.52 um frame around that same hole.
+    let dnw = expand_rect(vdd_inner, 1080.);
+    lib::columns::util::draw_box("dnwell.drawing", dnw);
+    let outer = expand_rect(vdd_inner, 1520.);
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(outer.x0, outer.y0, outer.x1, vdd_inner.y0));
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(outer.x0, vdd_inner.y1, outer.x1, outer.y1));
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(outer.x0, vdd_inner.y0, vdd_inner.x0, vdd_inner.y1));
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(vdd_inner.x1, vdd_inner.y0, outer.x1, vdd_inner.y1));
+}

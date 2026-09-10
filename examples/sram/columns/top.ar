@@ -33,7 +33,7 @@ fn column_mux_tap_y(p: ColParams) -> Float {
 }
 
 fn column_precharge_y(p: ColParams) -> Float {
-    column_mux_y(p) + lib::columns::mux::tgm_group_height(p.mux) + 90.
+    column_mux_y(p) + lib::columns::mux::tgm_group_height(p.mux) - lib::columns::precharge::pc_outline_bottom(p.pc)
 }
 
 fn column_outline_top(p: ColParams) -> Float {

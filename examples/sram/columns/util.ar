@@ -249,7 +249,12 @@ fn contact_bot_enc(via: Int) -> (Float, Float) {
     if via == 0 {
         (0., 0.,)
     } else {
-        if via == 1 { (55., 85.,) } else { (40., 60.,) }
+        if via == 1 {
+            (55., 85.,)
+        } else {
+            // Via 2 is tap-to-LI; via 3 is poly-to-LI.
+            if via == 2 { (0., 120.,) } else { (50., 80.,) }
+        }
     }
 }
 
@@ -354,6 +359,20 @@ fn better_contact(
     }
 }
 
+fn better_contact_later(
+    old: (Int, Int, Float, Float, Float, Float, Int, Float),
+    new: (Int, Int, Float, Float, Float, Float, Int, Float),
+) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
+    if new.6 > old.6 {
+        new
+    } else {
+        // MaxViaArray uses `diff <= min_diff`, so the later extension
+        // transpose wins an exact tie. This variant is used by geometry whose
+        // integer-coordinate reference exercises that behavior.
+        if band(new.6 == old.6, new.7 <= old.7 + 0.5) { new } else { old }
+    }
+}
+
 fn contact_choice(
     via: Int,
     bot: Rect,
@@ -367,6 +386,21 @@ fn contact_choice(
     let c10 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, false, true, longer);
     let c11 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, true, true, longer);
     better_contact(better_contact(better_contact(c00, c01), c10), c11)
+}
+
+fn contact_choice_later(
+    via: Int,
+    bot: Rect,
+    top: Rect,
+    bot_ext_dir: Int,
+    top_ext_dir: Int,
+    longer: Bool,
+) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
+    let c00 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, false, false, longer);
+    let c01 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, true, false, longer);
+    let c10 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, false, true, longer);
+    let c11 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, true, true, longer);
+    better_contact_later(better_contact_later(better_contact_later(c00, c01), c10), c11)
 }
 
 fn draw_contact_clip(
@@ -441,6 +475,74 @@ fn draw_contact_full(
     draw_box(bot_layer, bot_rect);
     draw_box(top_layer, top_rect);
     (bot_rect, top_rect, rect_union(bot_rect, top_rect),)
+}
+
+fn draw_contact_full_later(
+    via: Int,
+    bot_layer: Any,
+    top_layer: Any,
+    bot: Rect,
+    top: Rect,
+    bot_ext_dir: Int,
+    top_ext_dir: Int,
+    longer: Bool,
+) -> (Rect, Rect, Rect) {
+    let choice = contact_choice_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
+    let size = contact_size(via);
+    let space = contact_space(via);
+    let nx = choice.0;
+    let ny = choice.1;
+    let center = contact_center(bot, top);
+    let aw = size * nx as Float + space * (nx - 1) as Float;
+    let ah = size * ny as Float + space * (ny - 1) as Float;
+    let ax0 = snap5(rect_cx_i(center) - aw / 2.);
+    let ay0 = snap5(rect_cy_i(center) - ah / 2.);
+    for ix in std::range(nx) {
+        for iy in std::range(ny) {
+            draw_box(
+                if via == 1 { "via.drawing" } else { if via == 0 { "mcon.drawing" } else { "licon1.drawing" } },
+                cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size),
+            );
+        }
+    }
+    let arr = cbox(ax0, ay0, ax0 + aw, ay0 + ah);
+    let bot_rect = rect_expand_xy(arr, choice.2, choice.3);
+    let top_rect = rect_expand_xy(arr, choice.4, choice.5);
+    draw_box(bot_layer, bot_rect);
+    draw_box(top_layer, top_rect);
+    (bot_rect, top_rect, rect_union(bot_rect, top_rect),)
+}
+
+fn contact_cut_bbox_later(
+    via: Int,
+    bot: Rect,
+    top: Rect,
+    bot_ext_dir: Int,
+    top_ext_dir: Int,
+    longer: Bool,
+) -> Rect {
+    let choice = contact_choice_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
+    let size = contact_size(via);
+    let space = contact_space(via);
+    let center = contact_center(bot, top);
+    let aw = size * choice.0 as Float + space * (choice.0 - 1) as Float;
+    let ah = size * choice.1 as Float + space * (choice.1 - 1) as Float;
+    let x0 = snap5(rect_cx_i(center) - aw / 2.);
+    let y0 = snap5(rect_cy_i(center) - ah / 2.);
+    cbox(x0, y0, x0 + aw, y0 + ah)
+}
+
+fn contact_top_bbox_later(
+    via: Int,
+    bot: Rect,
+    top: Rect,
+    bot_ext_dir: Int,
+    top_ext_dir: Int,
+    longer: Bool,
+) -> Rect {
+    let choice = contact_choice_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
+    let cuts = contact_cut_bbox_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
+    rect_expand_xy(cuts, choice.4, choice.5)
 }
 
 fn contact_bbox(

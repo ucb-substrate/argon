@@ -1,0 +1,18 @@
+// The tapped DFF tile has a 6.1um pitch, matching four 1.2um columns plus
+// the 1.3um substrate-tap width used throughout the SRAM.
+fn dff_pitch() -> Float { 6100. }
+
+fn dff_origin_x(index: Int) -> Float {
+    4715. + index as Float * dff_pitch()
+}
+
+fn dff_array_width(count: Int) -> Float {
+    count as Float * dff_pitch()
+}
+
+cell dff_array(count: Int) {
+    for index in std::range(count) {
+        let dff = inst(lib::logic::fixed_macros::tapped_dff(), x=dff_origin_x(index), y=0.);
+    }
+    let outline = crect(x0=0., y0=0., x1=dff_array_width(count), y1=13920.);
+}
