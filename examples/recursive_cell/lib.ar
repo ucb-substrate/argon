@@ -1,0 +1,12 @@
+// A cell may instantiate itself. `tree(n)` places a copy of `tree(n - 1)` to
+// the right of its own square, so `tree(n)` is a row of `n + 1` squares. The
+// recursion ends at `tree(0)`, whose `if` body is never evaluated.
+cell tree(n: Int) {
+    let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
+    if n > 0 {
+        let child = inst(tree(n - 1));
+        eq(child.leaf.x0, leaf.x1 + 50.);
+        eq(child.y, 0.);
+    } else {
+    };
+}

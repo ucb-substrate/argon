@@ -1,0 +1,48 @@
+// An `if` with no `else` is a statement: it produces no value, so it is only
+// allowed where a statement is expected.
+
+// One rect always, plus a marker chosen by `wide`. The last `if` in the body
+// needs no `;`, being a statement rather than a tail expression.
+cell strap(w: Float, wide: Bool) {
+    let met1 = rect("met1", x0=0., y0=0., x1=w, y1=100.)!;
+
+    if !wide {
+        let narrow_mark = rect("met2", x0=0., y0=100., x1=10., y1=110.)!;
+    }
+
+    if wide {
+        let mark = rect("met2", x0=0., y0=100., x1=w, y1=110.)!;
+        eq(mark.x1, met1.x1);
+    }
+}
+
+// An `else if` chain may also end without an `else`, making the whole chain a
+// statement: one band is drawn, or none when `n` is out of range.
+cell band(n: Int) {
+    if n == 0 {
+        rect("met1", x0=0., y0=0., x1=100., y1=20.);
+    } else if n == 1 {
+        rect("met1", x0=0., y0=0., x1=200., y1=20.);
+    } else if n == 2 {
+        rect("met1", x0=0., y0=0., x1=300., y1=20.);
+    }
+}
+
+cell top() {
+    let narrow = inst(strap(200., false));
+    eq(narrow.x, 0.);
+    eq(narrow.y, 0.);
+
+    let wide = inst(strap(600., true));
+    eq(wide.x, 400.);
+    eq(wide.y, 0.);
+
+    let first = inst(band(1));
+    eq(first.x, 0.);
+    eq(first.y, 300.);
+
+    // Outside the chain's range, so `band` draws nothing.
+    let none = inst(band(7));
+    eq(none.x, 0.);
+    eq(none.y, 500.);
+}

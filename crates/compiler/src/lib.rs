@@ -182,6 +182,7 @@ mod tests {
     const ARGON_IMMEDIATE: &str = concatcp!(EXAMPLES_DIR, "/immediate/lib.ar");
     const ARGON_IF: &str = concatcp!(EXAMPLES_DIR, "/if/lib.ar");
     const ARGON_IF_INCONSISTENT: &str = concatcp!(EXAMPLES_DIR, "/if_inconsistent/lib.ar");
+    const ARGON_IF_NO_ELSE: &str = concatcp!(EXAMPLES_DIR, "/if_no_else/lib.ar");
     const ARGON_VIA: &str = concatcp!(EXAMPLES_DIR, "/via/lib.ar");
     const ARGON_VIA_ARRAY: &str = concatcp!(EXAMPLES_DIR, "/via_array/lib.ar");
     const ARGON_FUNC_OUT_OF_ORDER: &str = concatcp!(EXAMPLES_DIR, "/func_out_of_order/lib.ar");
@@ -200,7 +201,6 @@ mod tests {
     const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
-    const ARGON_SEQ_ANY: &str = concatcp!(EXAMPLES_DIR, "/seq_any/lib.ar");
     const ARGON_SEQ_FN: &str = concatcp!(EXAMPLES_DIR, "/seq_fn/lib.ar");
     const ARGON_SEQ_RECUR: &str = concatcp!(EXAMPLES_DIR, "/seq_recur/lib.ar");
     const ARGON_LUB_MATCH: &str = concatcp!(EXAMPLES_DIR, "/lub_match/lib.ar");
@@ -218,7 +218,6 @@ mod tests {
         concatcp!(EXAMPLES_DIR, "/partially_constrained_inst/lib.ar");
     const ARGON_INVALID_CAST: &str = concatcp!(EXAMPLES_DIR, "/invalid_cast/lib.ar");
     const ARGON_TUPLE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/tuple_basic/lib.ar");
-    const ARGON_TUPLE_ANY: &str = concatcp!(EXAMPLES_DIR, "/tuple_any/lib.ar");
     const ARGON_FOR_LOOP_BASIC: &str = concatcp!(EXAMPLES_DIR, "/for_loop_basic/lib.ar");
     const ARGON_RANGE_PERF: &str = concatcp!(EXAMPLES_DIR, "/range_perf/lib.ar");
     const ARGON_SSE_BASIC: &str = concatcp!(EXAMPLES_DIR, "/sse_basic/lib.ar");
@@ -228,7 +227,14 @@ mod tests {
     const ARGON_KWARGS_FN: &str = concatcp!(EXAMPLES_DIR, "/kwargs_fn/lib.ar");
     const ARGON_KWARGS_CELL: &str = concatcp!(EXAMPLES_DIR, "/kwargs_cell/lib.ar");
     const ARGON_STRUCTS: &str = concatcp!(EXAMPLES_DIR, "/structs/lib.ar");
+    const ARGON_RECURSIVE_CELL: &str = concatcp!(EXAMPLES_DIR, "/recursive_cell/lib.ar");
     const ARGON_SHAPE_CELL_ARGS: &str = concatcp!(EXAMPLES_DIR, "/shape_cell_args/lib.ar");
+    const ARGON_GENERICS_FN: &str = concatcp!(EXAMPLES_DIR, "/generics_fn/lib.ar");
+    const ARGON_GENERICS_STRUCT: &str = concatcp!(EXAMPLES_DIR, "/generics_struct/lib.ar");
+    const ARGON_OPTION: &str = concatcp!(EXAMPLES_DIR, "/option/lib.ar");
+    const ARGON_ENUM_PAYLOAD: &str = concatcp!(EXAMPLES_DIR, "/enum_payload/lib.ar");
+    const ARGON_RECURSIVE_STRUCT: &str = concatcp!(EXAMPLES_DIR, "/recursive_struct/lib.ar");
+    const ARGON_GENERICS_CELL: &str = concatcp!(EXAMPLES_DIR, "/generics_cell/lib.ar");
 
     // ---------------------------------------------------------------------
     // Scaling / stress benchmarks.
@@ -748,9 +754,9 @@ mod tests {
 
     /// Axis 4: depth of cell hierarchy. Two series are produced: `single_ref`
     /// references each child once and `double_ref` references it twice. Both
-    /// are linear in depth because the structural cell type is shared across
-    /// references rather than copied (see `CellFnTy::cell`); `double_ref` is
-    /// kept as a regression guard against the old exponential expansion.
+    /// are linear in depth because a cell type is nominal and names its
+    /// declaration rather than carrying its fields; `double_ref` is kept as a
+    /// regression guard against the old exponential expansion.
     #[test]
     #[ignore = "scaling benchmark; run in release, serially: cargo test -p argonc --release -- --ignored --test-threads=1 bench_"]
     fn bench_hierarchy() {
@@ -808,11 +814,11 @@ mod tests {
         }
         write_bench_csv("hierarchy_single_ref", &rows);
 
-        // `double_ref` binds the child cell twice. With the shared (`Arc`)
-        // structural cell type this scales the same as `single_ref`, so it is
-        // swept over the same depths. (Before that fix it expanded
-        // exponentially and had to be capped near depth 18.) Override
-        // `ARGON_BENCH_HIER_DOUBLE` to push deeper.
+        // `double_ref` binds the child cell twice. With nominal cell types
+        // this scales the same as `single_ref`, so it is swept over the same
+        // depths. (Before that fix it expanded exponentially and had to be
+        // capped near depth 18.) Override `ARGON_BENCH_HIER_DOUBLE` to push
+        // deeper.
         let mut rows = Vec::new();
         for depth in bench_sizes(
             "ARGON_BENCH_HIER_DOUBLE",
@@ -1210,6 +1216,50 @@ mod tests {
         assert_eq!(&source[span.span.start()..span.span.end()], "eq(a, 5.)");
     }
 
+    /// An `if` with no `else` builds only the branch it takes, and an
+    /// `else if` chain with no final `else` may build nothing at all.
+    #[test]
+    fn argon_if_no_else() {
+        let o = parse_workspace_with_std(ARGON_IF_NO_ELSE);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        let ast = o.ast();
+        let cells = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+
+        // One rect per `strap` plus its single marker: the untaken branch
+        // builds nothing.
+        let mut sizes = cells
+            .cells
+            .values()
+            .flat_map(|cell| cell.objects.values())
+            .filter(|object| object.is_layout())
+            .filter_map(SolvedValue::get_rect)
+            .map(|r| (r.x1.0 - r.x0.0, r.y1.0 - r.y0.0))
+            .collect::<Vec<_>>();
+        sizes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            sizes,
+            [
+                // the `!wide` marker on the narrow strap
+                (10., 10.),
+                // `band(1)`; `band(7)` matched no arm and built nothing.
+                (200., 20.),
+                // the narrow strap
+                (200., 100.),
+                // the wide strap's marker, and the strap
+                (600., 10.),
+                (600., 100.),
+            ],
+            "each `if` built only the branch it took"
+        );
+    }
+
     #[test]
     fn argon_via() {
         let o = parse_workspace_with_std(ARGON_VIA);
@@ -1316,32 +1366,315 @@ mod tests {
         assert!(scope_names.contains(&"2 else"));
     }
 
+    /// `examples/cell_out_of_order` is `examples/hierarchy` with `top` moved
+    /// above the `bot` it instantiates. Declaration order does not matter, so
+    /// the two produce the same layout.
     #[test]
-    fn argon_cell_out_of_order_reports_use_before_declaration() {
-        let o = parse_workspace_with_std(ARGON_CELL_OUT_OF_ORDER);
+    fn argon_cell_out_of_order() {
+        let digest = |path: &str| {
+            let o = parse_workspace_with_std(path);
+            assert!(o.static_errors().is_empty());
+            let ast = o.ast();
+            compile(
+                &ast,
+                CompileInput {
+                    cell: &["top"],
+                    args: Vec::new(),
+                },
+            )
+            .unwrap_valid()
+            .geometry_digest()
+        };
+        assert_eq!(
+            digest(ARGON_CELL_OUT_OF_ORDER),
+            digest(ARGON_HIERARCHY),
+            "reordering declarations changed the layout"
+        );
+    }
+
+    /// The drawn rectangles across every compiled cell.
+    fn rect_count(data: &CompiledData) -> usize {
+        data.cells
+            .values()
+            .flat_map(|cell| cell.objects.values())
+            .filter(|object| matches!(object, SolvedValue::Rect(rect) if !rect.construction))
+            .count()
+    }
+
+    #[test]
+    fn a_cell_may_read_fields_of_a_cell_declared_below_it() {
+        let errors = static_errors_of(
+            "cell top() {\n\
+                 let l = inst(bot());\n\
+                 eq(l.met1.x0, 0.);\n\
+                 let w = l.met1.w;\n\
+             }\n\
+             cell bot() {\n\
+                 let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        // A misspelled field of a later cell is still a plain field error.
+        assert!(matches!(
+            static_errors_of(
+                "cell top() {\n\
+                     let l = inst(bot());\n\
+                     eq(l.met2.x0, 0.);\n\
+                 }\n\
+                 cell bot() {\n\
+                     let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
+                 }\n"
+            )
+            .as_slice(),
+            [StaticErrorKind::NoFieldOnTy { .. }]
+        ));
+    }
+
+    /// `examples/recursive_cell`: `tree(n)` instantiates `tree(n - 1)`, so
+    /// `tree(3)` draws four squares across four compiled cells.
+    #[test]
+    fn a_cell_may_instantiate_itself() {
+        let o = parse_workspace_with_std(ARGON_RECURSIVE_CELL);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        let cells = compile(
+        let data = compile(
             &ast,
             CompileInput {
-                cell: &["top"],
-                args: Vec::new(),
+                cell: &["tree"],
+                args: vec![CellArg::Int(3)],
             },
+        )
+        .unwrap_valid();
+        assert_eq!(data.cells.len(), 4);
+        assert_eq!(rect_count(&data), 4);
+    }
+
+    /// Recursion that never ends is a run-time error, not a hang.
+    #[test]
+    fn unbounded_cell_recursion_is_reported() {
+        // The same arguments name the same cell, so the cycle is caught as
+        // soon as it closes.
+        let errors = compile_source(
+            "cell forever() {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 let again = inst(forever());\n\
+             }\n",
+            "forever",
+            Vec::new(),
+        )
+        .unwrap_exec_errors()
+        .errors;
+        assert!(
+            errors.iter().any(|error| matches!(
+                &error.kind,
+                ExecErrorKind::RecursiveInstantiation { cell } if cell == "forever"
+            )),
+            "{errors:?}"
         );
-        let errors = cells.unwrap_static_errors();
-        let error = errors
+        // Ever-changing arguments run into the depth limit instead.
+        let errors = crate::run_with_stack("argon-compile", || {
+            compile_source(
+                "cell forever(n: Int) {\n\
+                     let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     let again = inst(forever(n + 1));\n\
+                 }\n",
+                "forever",
+                vec![CellArg::Int(0)],
+            )
+            .unwrap_exec_errors()
             .errors
-            .iter()
-            .find(|error| {
-                matches!(
-                    &error.kind,
-                    StaticErrorKind::UseBeforeDeclaration { name } if name == "bot"
-                )
-            })
-            .expect("expected an explicit use-before-declaration error for `bot`");
-        assert_eq!(
-            error.kind.to_string(),
-            "cannot use `bot` before its declaration; move the `cell bot ...` declaration above this use"
+        });
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, ExecErrorKind::RecursionLimitExceeded { .. })),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn cells_may_instantiate_each_other() {
+        let data = compile_source(
+            "cell a(n: Int) {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 if n > 0 {\n\
+                     let b = inst(b(n - 1));\n\
+                     eq(b.r.x0, r.x1);\n\
+                     eq(b.y, 0.);\n\
+                 } else {\n\
+                 };\n\
+             }\n\
+             cell b(n: Int) {\n\
+                 let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 if n > 0 {\n\
+                     let a = inst(a(n - 1));\n\
+                     eq(a.r.x0, r.x1);\n\
+                     eq(a.y, 0.);\n\
+                 } else {\n\
+                 };\n\
+             }\n",
+            "a",
+            vec![CellArg::Int(3)],
+        )
+        .unwrap_valid();
+        assert_eq!(rect_count(&data), 4);
+    }
+
+    /// A field is typed when it is first read, so a statement may read a
+    /// field declared below it through an instance of the enclosing cell.
+    #[test]
+    fn a_field_declared_later_in_the_same_cell_is_typed_on_demand() {
+        let errors = static_errors_of(
+            "cell a(n: Int) {\n\
+                 let k = if n > 0 { inst(a(n - 1)).z.w } else { 0. };\n\
+                 let z = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A statement that reads two untyped fields queues a goal for each. When
+    /// the second field's statement reads the first, the first's queued goal
+    /// is worked before the second statement is retried.
+    #[test]
+    fn a_queued_field_read_again_is_typed_before_its_reader_is_retried() {
+        let errors = static_errors_of(
+            "cell x() {\n\
+                 eq(inst(a()).f.x0, inst(b()).g.x0);\n\
+             }\n\
+             cell a() {\n\
+                 let f = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n\
+             cell b() {\n\
+                 let g = inst(a()).f;\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A top-level `let` that is in scope but not yet typed hides a module
+    /// declaration of the same name, so a statement typed on demand reads the
+    /// local rather than the cell.
+    #[test]
+    fn an_untyped_local_hides_a_module_declaration_of_the_same_name() {
+        let errors = static_errors_of(
+            "cell user() {\n\
+                 let v = inst(top()).a;\n\
+             }\n\
+             cell top() {\n\
+                 let bot = 5.;\n\
+                 let a = bot + 1.;\n\
+             }\n\
+             cell bot() {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A statement typed on demand, ahead of the statements above it, sees the
+    /// same bindings it would when typed in order: the nearest `let` of each
+    /// name above it, typed as it is needed.
+    #[test]
+    fn a_statement_typed_out_of_order_sees_the_nearest_lets_above_it() {
+        let errors = static_errors_of(
+            "cell user() {\n\
+                 eq(inst(top()).c, 1.);\n\
+             }\n\
+             cell top() {\n\
+                 let r = 1.;\n\
+                 let s = r + 1.;\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 let c = r.w + s;\n\
+             }\n",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A field whose type depends on itself is reported once, at the read that
+    /// closes the cycle, and nothing else cascades from it.
+    #[test]
+    fn a_field_whose_type_depends_on_itself_is_an_error() {
+        let errors = static_errors_of("cell a(n: Int) {\n    let f = inst(a(n - 1)).f;\n}\n");
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::CyclicCellField { cell, field }] if cell == "a" && field == "f"
+            ),
+            "{errors:?}"
+        );
+
+        let source =
+            "cell a() {\n    let f = inst(b()).g;\n}\ncell b() {\n    let g = inst(a()).f;\n}\n";
+        let errors = static_errors(source);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [crate::compile::StaticError { kind: StaticErrorKind::CyclicCellField { cell, field }, span }]
+                    if cell == "a" && field == "f" && span.span.start() == source.rfind(".f").unwrap() + 1
+            ),
+            "{errors:?}"
+        );
+
+        // Through a local: `z` reads `k`, whose type needs `z`.
+        let errors = static_errors_of(
+            "cell a(n: Int) {\n    let k = inst(a(n - 1)).z;\n    let z = k;\n}\n",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::CyclicCellField { cell, field }] if cell == "a" && field == "k"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    /// Cell types are nominal: two cells with identical fields are different
+    /// types, and `Any` is how code accepts either.
+    #[test]
+    fn cell_types_are_nominal() {
+        let cells = "cell a() {\n\
+                         let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     }\n\
+                     cell b() {\n\
+                         let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     }\n";
+        let errors = static_errors_of(&format!(
+            "{cells}cell top(flag: Bool) {{\n    let c = if flag {{ a() }} else {{ b() }};\n}}\n"
+        ));
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::BranchesDifferentTypes]),
+            "{errors:?}"
+        );
+        let errors = static_errors_of(&format!(
+            "{cells}fn erase(c: Any) -> Any {{ c }}\n\
+             cell top(flag: Bool) {{\n    let c = inst(if flag {{ erase(a()) }} else {{ erase(b()) }});\n}}\n"
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A top-level `let` may re-bind a name: each statement sees the nearest
+    /// `let` above it, and the field an instance answers is the last one.
+    #[test]
+    fn a_repeated_top_level_let_rebinds_sequentially() {
+        let cells = "cell top() {\n\
+                         let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                         let s = r.w;\n\
+                         let r = 5.;\n\
+                         let t = r + 1.;\n\
+                     }\n";
+        let errors = static_errors_of(cells);
+        assert!(errors.is_empty(), "{errors:?}");
+        let errors = static_errors_of(&format!(
+            "{cells}cell user() {{\n    let i = inst(top());\n    let v = i.r + 1.;\n}}\n"
+        ));
+        assert!(errors.is_empty(), "{errors:?}");
+        let errors = static_errors_of(&format!(
+            "{cells}cell user() {{\n    let i = inst(top());\n    let v = i.r.w;\n}}\n"
+        ));
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::NoFieldOnTy { .. }]),
+            "{errors:?}"
         );
     }
 
@@ -2300,6 +2633,79 @@ cell top() {
         ))
     }
 
+    /// An `if` with no `else` yields nothing, so the branch that runs may not
+    /// produce a value either; `else if` inherits the same rule.
+    #[test]
+    fn an_if_without_an_else_must_have_type_unit() {
+        /// The static errors of `body` as the body of a cell that sees two
+        /// `Bool`s and a `Float`.
+        fn cell_errors(body: &str) -> Vec<StaticErrorKind> {
+            static_errors_of(&format!(
+                "cell top(c: Bool, d: Bool, x: Float) {{ {body} }}\n"
+            ))
+        }
+
+        // A branch with no tail expression is already `()`.
+        assert!(cell_errors("if c { eq(x, 1.); }").is_empty());
+        assert!(cell_errors("if c { let r = x + 1.; }").is_empty());
+        assert!(cell_errors("if c { }").is_empty());
+        assert!(cell_errors("if c { } if d { }").is_empty());
+        assert!(cell_errors("if c { } else if d { }").is_empty());
+        assert!(cell_errors("if c { } else if d { } eq(x, 1.);").is_empty());
+        // A chain ending in an `else` is an expression, so in last position
+        // it is the tail, which a cell may not have. A `;` makes it a
+        // statement.
+        assert!(cell_errors("if c { } else if d { } else { };").is_empty());
+        assert!(matches!(
+            cell_errors("if c { } else if d { } else { }").as_slice(),
+            [StaticErrorKind::CellWithTailExpr]
+        ));
+        assert!(matches!(
+            cell_errors("if c { } else { }").as_slice(),
+            [StaticErrorKind::CellWithTailExpr]
+        ));
+
+        // A branch that produces a value does not.
+        assert!(
+            matches!(
+                cell_errors("if c { x }").as_slice(),
+                [StaticErrorKind::IfWithoutElseNotUnit]
+            ),
+            "{:?}",
+            cell_errors("if c { x }")
+        );
+        // Reported once, on the `else if` that lacks the `else`.
+        assert!(
+            matches!(
+                cell_errors("if c { } else if d { x }").as_slice(),
+                [StaticErrorKind::IfWithoutElseNotUnit]
+            ),
+            "{:?}",
+            cell_errors("if c { } else if d { x }")
+        );
+        // The diagnostic points at the value, not at the whole `if`.
+        let source = "cell top(c: Bool, x: Float) { if c { x + 1. } }\n";
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        let [error] = output.errors.as_slice() else {
+            panic!("expected one error, got {:?}", output.errors);
+        };
+        assert_eq!(
+            &source[error.span.span.start()..error.span.span.end()],
+            "x + 1."
+        );
+
+        // With an `else` the branches must still agree.
+        assert!(
+            cell_errors("let v = if c { 1. } else if d { 2. } else { 3. }; eq(v, x);").is_empty()
+        );
+        assert!(matches!(
+            cell_errors("let v = if c { 1. } else { c };").as_slice(),
+            [StaticErrorKind::BranchesDifferentTypes]
+        ));
+    }
+
     #[test]
     fn struct_literals_are_checked_against_the_declaration() {
         assert!(struct_errors("Size { w: 1., h: 2. }.w").is_empty());
@@ -2312,11 +2718,11 @@ cell top() {
         assert!(matches!(
             struct_errors("Size { w: 1. }.w").as_slice(),
             [StaticErrorKind::MissingStructFields { ty, fields }]
-                if ty == "struct Size" && fields == "`h`"
+                if ty == "Size" && fields == "`h`"
         ));
         assert!(matches!(
             struct_errors("Size { w: 1., h: 2., d: 3. }.w").as_slice(),
-            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "struct Size"
+            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "Size"
         ));
         assert!(matches!(
             struct_errors("Size { w: 1., w: 2., h: 3. }.w").as_slice(),
@@ -2331,7 +2737,7 @@ cell top() {
         assert!(matches!(
             struct_errors("Size { w: 1., ..o }.w").as_slice(),
             [StaticErrorKind::IncorrectTy { expected, found }]
-                if expected == "struct Size" && found == "struct Other"
+                if expected == "Size" && found == "Other"
         ));
         assert!(matches!(
             struct_errors("Size { w: 1., ..n }.w").as_slice(),
@@ -2347,7 +2753,7 @@ cell top() {
         ));
         assert!(matches!(
             struct_errors("s.d").as_slice(),
-            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "struct Size"
+            [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "d" && ty == "Size"
         ));
         // A shorthand field reads a local of the same name.
         assert!(matches!(
@@ -2375,10 +2781,23 @@ cell top() {
             static_errors_of("struct Node { next: Node, }\n").as_slice(),
             [StaticErrorKind::RecursiveStruct { name }] if name == "Node"
         ));
-        let errors = static_errors_of("struct A { b: [B], }\nstruct B { a: (Int, A), }\n");
+        // A cycle through struct fields and tuple elements alone has no finite
+        // value; one through a sequence or an enum payload does, since `[]`
+        // or `None` ends it.
+        let errors = static_errors_of("struct A { b: B, }\nstruct B { a: (Int, A), }\n");
         assert!(
-            matches!(errors.as_slice(), [StaticErrorKind::RecursiveStruct { .. }]),
+            errors
+                .iter()
+                .all(|error| matches!(error, StaticErrorKind::RecursiveStruct { .. }))
+                && !errors.is_empty(),
             "{errors:?}"
+        );
+        assert!(static_errors_of("struct A { b: [B], }\nstruct B { a: (Int, A), }\n").is_empty());
+        assert!(
+            static_errors_of(
+                "enum Option<T> { Some(T), None, }\nstruct Node { next: Option<Node>, }\n"
+            )
+            .is_empty()
         );
         assert!(matches!(
             static_errors_of("struct S { a: Nope, }\n").as_slice(),
@@ -2755,28 +3174,96 @@ cell top() {
         assert_relative_eq!(r.y1.0, 200., epsilon = EPSILON);
     }
 
-    #[test]
-    fn argon_seq_any() {
-        let o = parse_workspace_with_std(ARGON_SEQ_ANY);
-        assert!(o.static_errors().is_empty());
-        let ast = o.ast();
-        let cells = compile(
-            &ast,
+    /// Compiles `top()` of an example library and returns its layout.
+    fn compile_example(path: &str) -> CompiledData {
+        let o = parse_workspace_with_std(path);
+        assert!(o.static_errors().is_empty(), "{:?}", o.static_errors());
+        compile(
+            &o.ast(),
             CompileInput {
                 cell: &["top"],
                 args: Vec::new(),
             },
-        );
-        println!("{cells:#?}");
-        let cells = cells.unwrap_valid();
-        let cell = &cells.cells[&cells.top];
-        assert_eq!(cell.objects.len(), 1);
-        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
-        assert_eq!(r.layer.as_ref().unwrap(), "met1");
-        assert_relative_eq!(r.x0.0, 0., epsilon = EPSILON);
-        assert_relative_eq!(r.y0.0, 0., epsilon = EPSILON);
-        assert_relative_eq!(r.x1.0, 400., epsilon = EPSILON);
-        assert_relative_eq!(r.y1.0, 200., epsilon = EPSILON);
+        )
+        .unwrap_valid()
+    }
+
+    /// The `(w, h)` of every rect the top cell draws, in creation order.
+    fn top_rect_sizes(data: &CompiledData) -> Vec<(f64, f64)> {
+        layout_objects(data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .map(|r| (r.x1.0 - r.x0.0, r.y1.0 - r.y0.0))
+            .collect()
+    }
+
+    /// The width of the one rect each cell named `name` draws, ascending.
+    fn rect_widths_of(data: &CompiledData, name: &str) -> Vec<f64> {
+        let mut widths = data
+            .cells
+            .values()
+            .filter(|cell| cell.name == name)
+            .map(|cell| {
+                let rect = cell
+                    .objects
+                    .values()
+                    .find_map(SolvedValue::get_rect)
+                    .unwrap_or_else(|| panic!("{name} draws a rect"));
+                rect.x1.0 - rect.x0.0
+            })
+            .collect::<Vec<_>>();
+        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        widths
+    }
+
+    #[test]
+    fn argon_generics_fn() {
+        let data = compile_example(ARGON_GENERICS_FN);
+        // `last(widths)` is `200.`; `second(counts) * second(widths)` is `600.`.
+        assert_eq!(top_rect_sizes(&data), [(200., 600.)]);
+    }
+
+    #[test]
+    fn argon_generics_struct() {
+        let data = compile_example(ARGON_GENERICS_STRUCT);
+        // `swap` turns `Pair { 2, 150. }` into `Pair { 150., 2 }`.
+        assert_eq!(top_rect_sizes(&data), [(150., 75.)]);
+    }
+
+    #[test]
+    fn argon_option() {
+        let data = compile_example(ARGON_OPTION);
+        // `widest` is `400.`, and the annotated `None` falls back to `300.`.
+        assert_eq!(top_rect_sizes(&data), [(400., 300.)]);
+        // `via` with `None` and with `Some(3)` are distinct cells.
+        assert_eq!(rect_widths_of(&data, "via"), [100., 300.]);
+    }
+
+    #[test]
+    fn argon_enum_payload() {
+        let data = compile_example(ARGON_ENUM_PAYLOAD);
+        let rect = layout_objects(&data, data.top)
+            .into_iter()
+            .find_map(SolvedValue::get_rect)
+            .expect("top draws a rect");
+        // The first shape is round, so the rect is on `met1`; its width is
+        // the circle's diameter plus the empty shape, its height the box's.
+        assert_eq!(rect.layer.as_deref(), Some("met1"));
+        assert_eq!(top_rect_sizes(&data), [(100., 300.)]);
+    }
+
+    #[test]
+    fn argon_recursive_struct() {
+        let data = compile_example(ARGON_RECURSIVE_STRUCT);
+        assert_eq!(top_rect_sizes(&data), [(350., 100.)]);
+    }
+
+    #[test]
+    fn argon_generics_cell() {
+        let data = compile_example(ARGON_GENERICS_CELL);
+        // One `row` per distinct argument tuple, plus `top`.
+        assert_eq!(data.cells.len(), 3);
+        assert_eq!(rect_widths_of(&data, "row"), [100., 300.]);
     }
 
     #[test]
@@ -3419,50 +3906,6 @@ cell top() {
         assert!(static_errors(&call("1., b=2.")).is_empty());
     }
 
-    /// Cell typing is structural. `CellTy` carries the declaring cell's `VarId`
-    /// so that a field access can be navigated back to its `let`, and that id
-    /// is deliberately excluded from `PartialEq`: if it were not, two cells
-    /// with identical fields would stop being interchangeable and a branch
-    /// over them would silently widen to `Ty::Any`.
-    #[test]
-    fn structurally_identical_cells_remain_interchangeable() {
-        let source = |field: &str| {
-            format!(
-                r#"
-                cell left() {{
-                    let met = rect("met1", x0=0., y0=0., x1=10., y1=10.);
-                }}
-
-                cell right() {{
-                    let met = rect("met1", x0=0., y0=0., x1=20., y1=20.);
-                }}
-
-                cell top(pick: Bool) {{
-                    let chosen = if pick {{ left() }} else {{ right() }};
-                    let placed = inst(chosen);
-                    eq(placed.{field}.x0, 0.);
-                }}
-                "#
-            )
-        };
-
-        // The branches share a cell type, so the common field type-checks.
-        let errors = static_errors(&source("met"));
-        assert!(errors.is_empty(), "{errors:#?}");
-
-        // And the type is still a cell rather than `Ty::Any`: an unknown field
-        // is caught. Were the declaring cell's id part of `CellTy` equality,
-        // the two branches would no longer unify, `Ty::lub` would widen the
-        // branch to `Ty::Any`, and this error would silently disappear.
-        let errors = static_errors(&source("missing"));
-        assert!(
-            errors
-                .iter()
-                .any(|error| matches!(error.kind, StaticErrorKind::NoFieldOnTy { .. })),
-            "{errors:#?}"
-        );
-    }
-
     fn comparison_source(comparison: &str) -> String {
         format!(
             r#"
@@ -3763,32 +4206,6 @@ cell top() {
         assert_relative_eq!(bbox.y0, -10., epsilon = EPSILON);
         assert_relative_eq!(bbox.x1, 163.85563301818058, epsilon = EPSILON);
         assert_relative_eq!(bbox.y1, 88.86750490563072, epsilon = EPSILON);
-    }
-
-    #[test]
-    fn argon_tuple_any() {
-        let o = parse_workspace_with_std(ARGON_TUPLE_ANY);
-        assert!(o.static_errors().is_empty());
-        let ast = o.ast();
-        let cells = compile(
-            &ast,
-            CompileInput {
-                cell: &["top"],
-                args: Vec::new(),
-            },
-        );
-        println!("{cells:#?}");
-
-        let cells = cells.unwrap_valid();
-        let cell = &cells.cells[&cells.top];
-        assert_eq!(cell.objects.len(), 1);
-
-        let r = cell.objects.iter().find_map(|(_, v)| v.get_rect()).unwrap();
-        assert_eq!(r.layer.as_ref().unwrap(), "met1");
-        assert_relative_eq!(r.x0.0, 60., epsilon = EPSILON);
-        assert_relative_eq!(r.y0.0, 40., epsilon = EPSILON);
-        assert_relative_eq!(r.x1.0, 140., epsilon = EPSILON);
-        assert_relative_eq!(r.y1.0, 150., epsilon = EPSILON);
     }
 
     #[test]
@@ -5167,6 +5584,408 @@ cell top() {
                 "{source}: {errors:#?}"
             );
         }
+    }
+    // ---------------------------------------------------------------------
+    // Generics.
+
+    /// Every static error kind `source` reports, with the standard library.
+    fn generic_errors(source: &str) -> Vec<StaticErrorKind> {
+        static_errors(source)
+            .into_iter()
+            .map(|error| error.kind)
+            .collect()
+    }
+
+    #[test]
+    fn type_arguments_are_arity_checked() {
+        for (source, ty, expected, found) in [
+            (
+                "struct P<A, B> { a: A, b: B, }\nfn f(p: P<Int>) -> Int { 1 }",
+                "P",
+                2,
+                1,
+            ),
+            (
+                "struct S { a: Int, }\nfn f(s: S<Int>) -> Int { 1 }",
+                "S",
+                0,
+                1,
+            ),
+            ("fn f(x: Float<Int>) -> Int { 1 }", "Float", 0, 1),
+            ("fn f(o: Option) -> Int { 1 }", "std::Option", 1, 0),
+            ("fn f<T>(x: T<Int>) -> Int { 1 }", "T", 0, 1),
+            (
+                "fn e<T>() -> [T] { [] }\ncell c() { let v = e::<Float, Int>(); }",
+                "e",
+                1,
+                2,
+            ),
+            (
+                "cell c() { let v = None::<Int, Int>; }",
+                "std::Option",
+                1,
+                2,
+            ),
+        ] {
+            let errors = generic_errors(source);
+            assert!(
+                errors.iter().any(|error| matches!(
+                    error,
+                    StaticErrorKind::TypeArgArity { ty: t, expected: e, found: f }
+                        if t == ty && *e == expected && *f == found
+                )),
+                "{source}\n{errors:?}"
+            );
+            // The arity error is the only one: a wrong turbofish does not also
+            // leave a variable unsolved.
+            assert!(
+                !errors
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::TypeAnnotationsNeeded)),
+                "{source}\n{errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unused_type_parameters_are_reported_on_structs_and_enums() {
+        assert!(matches!(
+            generic_errors("struct Only<T> { a: Int, }").as_slice(),
+            [StaticErrorKind::UnusedTypeParam { name }] if name == "T"
+        ));
+        assert!(matches!(
+            generic_errors("enum E<T, U> { A(T), B, }").as_slice(),
+            [StaticErrorKind::UnusedTypeParam { name }] if name == "U"
+        ));
+        // A function may leave a parameter unused; it is reachable by turbofish.
+        assert!(
+            generic_errors("fn e<T>() -> Int { 1 }\ncell c() { let n = e::<Float>(); }").is_empty()
+        );
+        // Parameter names are unique and may not spell a builtin type.
+        assert!(matches!(
+            generic_errors("fn f<T, T>(v: T) -> T { v }").as_slice(),
+            [StaticErrorKind::DuplicateNameDeclaration]
+        ));
+        assert!(matches!(
+            generic_errors("fn f<Float>(v: Float) -> Float { v }").as_slice(),
+            [StaticErrorKind::RedeclarationOfBuiltin]
+        ));
+    }
+
+    #[test]
+    fn a_type_parameter_is_opaque() {
+        // `T` can be stored, passed, and returned, and nothing else.
+        assert!(
+            generic_errors(
+                "struct Box<T> { item: T, }
+                 fn f<T>(v: T, vs: [T]) -> (T, [T], Box<T>, Option<T>) {
+                     let w = v;
+                     (w, cons(v, vs), Box { item: v }, Some(head(vs)),)
+                 }"
+            )
+            .is_empty()
+        );
+        let rejects = |body: &str, matches: fn(&StaticErrorKind) -> bool| {
+            let errors = generic_errors(&format!("fn f<T>(v: T) -> T {{ {body} }}"));
+            assert!(errors.iter().any(matches), "`{body}`: {errors:?}");
+        };
+        rejects(
+            "v + v",
+            |e| matches!(e, StaticErrorKind::ArithInvalidType(ty) if ty == "T"),
+        );
+        rejects("if v == v { v } else { v }", |e| {
+            matches!(e, StaticErrorKind::ComparisonInvalidType)
+        });
+        rejects("v as Float", |e| matches!(e, StaticErrorKind::InvalidCast));
+        rejects(
+            "v.field",
+            |e| matches!(e, StaticErrorKind::NoFieldOnTy { ty, .. } if ty == "T"),
+        );
+        rejects(
+            "v[0]",
+            |e| matches!(e, StaticErrorKind::CannotIndex { ty } if ty == "T"),
+        );
+        rejects(
+            "{ v!; v }",
+            |e| matches!(e, StaticErrorKind::CannotEmit(ty) if ty == "T"),
+        );
+        rejects(
+            "{ inst(v); v }",
+            |e| matches!(e, StaticErrorKind::IncorrectTyCategory { found, .. } if found == "T"),
+        );
+        rejects(
+            "{ for i in v { let n = 1; } v }",
+            |e| matches!(e, StaticErrorKind::CannotIterate { ty } if ty == "T"),
+        );
+    }
+
+    #[test]
+    fn inference_spans_a_fn_body_but_one_cell_statement() {
+        assert!(
+            generic_errors(
+                "fn f() -> Int {
+                     let o = None;
+                     match o { Some(v) => v, None => 0, }
+                 }
+                 fn g() -> [Float] {
+                     let vs = [];
+                     cons(1., vs)
+                 }"
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            generic_errors("cell c() { let o = None; let v = std::unwrap_or(o, 0); }").as_slice(),
+            [StaticErrorKind::TypeAnnotationsNeeded]
+        ));
+        assert!(
+            generic_errors("cell c() { let o: Option<Int> = None; let v = std::unwrap_or(o, 0); }")
+                .is_empty()
+        );
+        // The annotation is checked against the initializer.
+        assert!(matches!(
+            generic_errors("cell c() { let o: Option<Int> = Some(1.); }").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "std::Option<Int>" && found == "std::Option<Float>"
+        ));
+    }
+
+    #[test]
+    fn turbofish_fixes_type_arguments() {
+        assert!(
+            generic_errors(
+                "fn e<T>() -> [T] { [] }
+                 struct P<A, B> { a: A, b: B, }
+                 cell c() {
+                     let vs = e::<Float>();
+                     let n = None::<Int>;
+                     let m = Option::<Int>::None;
+                     let p = P::<Int, Float> { a: 1, b: 2. };
+                     let s = Some::<Float>(1.);
+                 }"
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            generic_errors("cell c() { let s = Some::<Float>(1); }").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "Float" && found == "Int"
+        ));
+        assert!(matches!(
+            generic_errors("cell c() { let n = std::max::<Int>(1., 2.); }").as_slice(),
+            [StaticErrorKind::TypeArgArity {
+                expected: 0,
+                found: 1,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn variant_constructors_are_checked() {
+        let source = |body: &str| {
+            format!(
+                "enum Shape {{ Circle(Float), Box(Float, Float), Empty, }}\ncell c() {{ {body} }}"
+            )
+        };
+        assert!(
+            generic_errors(&source(
+                "let a = Shape::Circle(1.); let b = Shape::Box(1., 2.); let c = Shape::Empty;"
+            ))
+            .is_empty()
+        );
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle();")).as_slice(),
+            [StaticErrorKind::VariantPayloadArity { variant, expected: 1, found: 0 }]
+                if variant == "Circle"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Box(1.);")).as_slice(),
+            [StaticErrorKind::VariantPayloadArity {
+                expected: 2,
+                found: 1,
+                ..
+            }]
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Empty();")).as_slice(),
+            [StaticErrorKind::CannotCall(ty)] if ty == "Shape::Empty"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle(1);")).as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "Float" && found == "Int"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a: Shape = Shape::Circle;")).as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Nope;")).as_slice(),
+            [StaticErrorKind::InvalidVariant(variant)] if variant == "Nope"
+        ));
+        // A pattern supplies exactly as many sub-patterns as payload elements.
+        assert!(matches!(
+            generic_errors(&source(
+                "let n = match Shape::Empty { Shape::Circle(a, b) => 1, _ => 2, };"
+            ))
+            .as_slice(),
+            [StaticErrorKind::VariantPayloadArity {
+                expected: 1,
+                found: 2,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn match_arms_after_a_catch_all_are_unreachable() {
+        let source = |arms: &str| {
+            format!("enum E {{ A, B, }}\nfn f(e: E) -> Int {{ match e {{ {arms} }} }}")
+        };
+        assert!(generic_errors(&source("E::A => 1, E::B => 2,")).is_empty());
+        assert!(generic_errors(&source("E::A => 1, _ => 2,")).is_empty());
+        assert!(generic_errors(&source("E::A => 1, other => 2,")).is_empty());
+        assert!(matches!(
+            generic_errors(&source("_ => 1, E::A => 2,")).as_slice(),
+            [StaticErrorKind::UnreachableMatchArm]
+        ));
+        assert!(matches!(
+            generic_errors(&source("E::A => 1, E::B => 2, E::A => 3,")).as_slice(),
+            [StaticErrorKind::UnreachableMatchArm]
+        ));
+        assert!(matches!(
+            generic_errors(&source("E::A => 1, E::A => 2, E::B => 3,")).as_slice(),
+            [StaticErrorKind::DuplicateMatchArm]
+        ));
+        assert!(matches!(
+            generic_errors(&source("E::A => 1,")).as_slice(),
+            [StaticErrorKind::MatchArmsNotComprehensive]
+        ));
+        // A bare name that is not a variant in scope binds, so it is a
+        // catch-all; an imported variant is a variant pattern.
+        assert!(matches!(
+            generic_errors(&source("A => 1, E::B => 2,")).as_slice(),
+            [StaticErrorKind::UnreachableMatchArm]
+        ));
+        assert!(
+            generic_errors(
+                "enum E { A, B, }\nuse lib::E::A;\nfn f(e: E) -> Int { match e { A => 1, E::B => 2, } }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn enum_equality_requires_comparable_payloads() {
+        assert!(generic_errors("fn f(o: Option<Int>) -> Bool { o == o }").is_empty());
+        assert!(
+            generic_errors("fn f(o: Option<Bool>, p: Option<Bool>) -> Bool { o != p }").is_empty()
+        );
+        assert!(matches!(
+            generic_errors("fn f(o: Option<Float>) -> Bool { o == o }").as_slice(),
+            [StaticErrorKind::FloatEquality]
+        ));
+        assert!(matches!(
+            generic_errors("fn f(o: Option<[Int]>) -> Bool { o == o }").as_slice(),
+            [StaticErrorKind::ComparisonInvalidType]
+        ));
+        assert!(matches!(
+            generic_errors("fn f(o: Option<Int>) -> Bool { o < o }").as_slice(),
+            [StaticErrorKind::EnumsNotOrd]
+        ));
+    }
+
+    #[test]
+    fn the_prelude_is_shadowed_by_local_declarations() {
+        assert!(
+            generic_errors(
+                "struct None { a: Int, }
+                 fn f() -> Int { None { a: 1 }.a }
+                 fn g() -> Option<Int> { Option::None }
+                 fn h() -> Option<Int> { std::Option::Some(1) }"
+            )
+            .is_empty()
+        );
+        assert!(
+            generic_errors(
+                "enum Option<T> { Just(T), Nothing, }
+                 fn f() -> Option<Int> { Option::Just(1) }
+                 fn g(o: Option<Int>) -> Int {
+                     match o { Option::Just(v) => v, Option::Nothing => 0, }
+                 }"
+            )
+            .is_empty()
+        );
+        // Variants are importable items, from the standard library too.
+        assert!(
+            generic_errors(
+                "use std::Option::Some as Just;
+                 fn f() -> Option<Int> { Just(1) }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn generic_sequence_functions_run_on_rects() {
+        let data = compile_top(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., w=10., h=10.);
+                 let b = rect(\"met1\", x0=20., y0=0., w=30., h=10.);
+                 let rects = cons(a, cons(b, []));
+                 let last = std::last(rects);
+                 let first = std::unwrap_or(std::first(rects), b);
+                 let none: Option<Rect> = None;
+                 let fallback = std::unwrap_or(none, b);
+                 let r = rect(\"met2\", x0=first.x0, y0=20., x1=last.x1 + fallback.w, y1=30.);
+             }",
+        );
+        let widths = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some("met2"))
+            .map(|rect| rect.x1.0 - rect.x0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [80.]);
+    }
+
+    #[test]
+    fn option_cell_arguments_distinguish_cells() {
+        let data = compile_top(
+            "cell via(n: Option<Int>) {
+                 let count = std::unwrap_or(n, 1);
+                 let r = rect(\"met1\", x0=0., y0=0., w=10. * (count as Float), h=10.);
+             }
+             cell top() {
+                 let a = inst(via(Some(1)), x=0., y=0.);
+                 let b = inst(via(Some(2)), x=0., y=20.);
+                 let c = inst(via(None), x=0., y=40.);
+                 let d = inst(via(Some(1)), x=0., y=60.);
+             }",
+        );
+        // A cell is compiled per call site and argument tuple: `Some(1)` and
+        // `None` both count one via, `Some(2)` counts two.
+        assert_eq!(data.cells.len(), 5);
+        assert_eq!(rect_widths_of(&data, "via"), [10., 10., 10., 20.]);
+    }
+
+    #[test]
+    fn enum_payloads_are_matched_and_compared_at_run_time() {
+        let data = compile_top(
+            "enum Shape { Circle(Float), Box(Float, Float), Empty, }
+             fn width(s: Shape) -> Float {
+                 match s { Shape::Circle(r) => 2. * r, Shape::Box(w, _) => w, Shape::Empty => 0., }
+             }
+             fn pick(o: Option<Int>) -> Float {
+                 if o == Some(2) { 100. } else { 50. }
+             }
+             cell top() {
+                 let w = width(Shape::Box(30., 1.)) + width(Shape::Circle(5.));
+                 let r = rect(\"met1\", x0=0., y0=0., w=w, h=pick(Some(2)) + pick(None));
+             }",
+        );
+        assert_eq!(top_rect_sizes(&data), [(40., 150.)]);
     }
 }
 pub mod cli;

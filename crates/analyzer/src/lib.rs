@@ -1,3 +1,5 @@
+mod cell_edit;
+mod command_completion;
 mod compiler_worker;
 pub mod document;
 mod navigation;
@@ -21,10 +23,10 @@ use std::{
 use arc::Library;
 use argonc::{
     WorkspaceConfig,
-    ast::{Span, WorkspaceAst},
+    ast::Span,
     compile::{
         self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
-        VarIdTyMetadata,
+        TypedWorkspace,
     },
     diagnostics,
     nav::NavIndex,
@@ -50,6 +52,7 @@ use tracing_subscriber::{
     EnvFilter, Registry, layer::SubscriberExt, reload, util::SubscriberInitExt,
 };
 
+use crate::command_completion::{CommandCompletion, CommandCompletionParams};
 use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
@@ -391,6 +394,7 @@ pub(crate) struct PublishedState {
 struct GuiConnection {
     id: u64,
     client: GuiClient,
+    snapshot: Arc<tokio::sync::Mutex<Option<CompilationSnapshot>>>,
 }
 
 #[derive(Debug, Default)]
@@ -480,7 +484,7 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
 }
 
 fn compile_open_cell(
-    ast: &WorkspaceAst<VarIdTyMetadata>,
+    ast: &TypedWorkspace,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
 ) -> CompileOutput {
@@ -737,6 +741,7 @@ impl State {
         let connection = GuiConnection {
             id: gui.next_connection_id,
             client,
+            snapshot: Arc::default(),
         };
         gui.connection = Some(connection.clone());
         connection
@@ -969,11 +974,29 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
+        // Serialize updates per connection so each delta names an acknowledged
+        // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
+        let mut previous = connection.snapshot.lock().await;
+        if !self.state.is_latest_compile_request(identity).await {
+            return None;
+        }
+        let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
         let result = connection
             .client
-            .update_cell(context::current(), snapshot)
+            .update_cell(context::current(), update)
             .await;
-        self.handle_gui_result(&connection, result).await?;
+        if !self.handle_gui_result(&connection, result).await? {
+            let full = rpc::CompilationUpdate::new(snapshot.clone(), None);
+            let result = connection
+                .client
+                .update_cell(context::current(), full)
+                .await;
+            if !self.handle_gui_result(&connection, result).await? {
+                return None;
+            }
+        }
+        *previous = Some(snapshot);
+        drop(previous);
         Some(connection)
     }
 
@@ -1341,6 +1364,12 @@ struct InstantiateParams {
     cell: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct CellNameParams {
+    name: String,
+    uri: Uri,
+}
+
 const PREVIEW_BINDING_PREFIX: &str = "__argon_preview_instance";
 
 fn preview_instance_cell(
@@ -1480,6 +1509,13 @@ impl Backend {
         self.open_cell_view(identity).await;
     }
 
+    async fn command_completion(
+        &self,
+        params: CommandCompletionParams,
+    ) -> Result<CommandCompletion> {
+        Ok(self.state.command_completion(params).await)
+    }
+
     async fn open_cell(&self, params: OpenCellParams) -> Result<()> {
         let state = self.state.clone();
         state
@@ -1487,6 +1523,81 @@ impl Backend {
             .show_message(MessageType::LOG, &format!("cell {}", params.cell))
             .await;
         self.select_and_open_cell(params.cell).await;
+        Ok(())
+    }
+
+    async fn new_cell(&self, params: CellNameParams) -> Result<()> {
+        let Some(source_path) = params.uri.to_file_path().map(|path| path.into_owned()) else {
+            self.state
+                .report_message(
+                    MessageType::ERROR,
+                    "The active buffer does not have a file path",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(ast) = self.state.current_editor_ast().await else {
+            self.state
+                .report_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return Ok(());
+        };
+        let edit = match cell_edit::new_cell_edit(
+            &ast,
+            &source_path,
+            &params.name,
+            self.state.position_encoding(),
+        ) {
+            Ok(edit) => edit,
+            Err(error) => {
+                self.state.report_message(MessageType::ERROR, error).await;
+                return Ok(());
+            }
+        };
+        let invocation = format!("{}()", params.name);
+        let previous = {
+            let mut source = self.state.source_state.lock().await;
+            source.cell.replace(invocation)
+        };
+        if !self.state.apply_source_edit(params.uri, edit).await {
+            self.state.source_state.lock().await.cell = previous;
+        }
+        Ok(())
+    }
+
+    async fn rename_cell(&self, params: CellNameParams) -> Result<()> {
+        let Some(ast) = self.state.current_editor_ast().await else {
+            self.state
+                .report_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return Ok(());
+        };
+        let current_invocation = self.state.source_state.lock().await.cell.clone();
+        let Some(current_invocation) = current_invocation else {
+            self.state
+                .report_message(MessageType::ERROR, "Open a cell before renaming it")
+                .await;
+            return Ok(());
+        };
+        let rename = match cell_edit::rename_cell_edits(
+            &ast,
+            &current_invocation,
+            &params.name,
+            self.state.position_encoding(),
+        ) {
+            Ok(rename) => rename,
+            Err(error) => {
+                self.state.report_message(MessageType::ERROR, error).await;
+                return Ok(());
+            }
+        };
+        let previous = {
+            let mut source = self.state.source_state.lock().await;
+            source.cell.replace(rename.invocation)
+        };
+        if !self.state.apply_source_changes(rename.changes, None).await {
+            self.state.source_state.lock().await.cell = previous;
+        }
         Ok(())
     }
 
@@ -1906,7 +2017,10 @@ pub async fn main_with_io_on_listener<I, O>(
     })
     .custom_method("custom/startGui", Backend::start_gui)
     .custom_method("custom/openCell", Backend::open_cell)
+    .custom_method("custom/newCell", Backend::new_cell)
+    .custom_method("custom/renameCell", Backend::rename_cell)
     .custom_method("custom/inst", Backend::instantiate)
+    .custom_method("custom/commandCompletion", Backend::command_completion)
     .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/setConfig", Backend::set_config)
     .custom_method("custom/saveConfig", Backend::save_config)

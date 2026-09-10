@@ -17,11 +17,12 @@ use cfgrammar::Span;
 
 use crate::ast::{
     ArgDecl, Args, ArithOp, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, CallExpr, CastExpr,
-    CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, Expr, FieldAccessExpr,
-    FloatLiteral, FnDecl, ForLoop, Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr,
-    IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr, ModDecl, NilLiteral, Scope,
-    SeqNilLiteral, Statement, StringLiteral, StructDecl, StructField, StructLitExpr,
-    StructLitField, TupleExpr, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, EnumVariant, Expr,
+    FieldAccessExpr, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath, IfExpr,
+    IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr,
+    ModDecl, NilLiteral, Pattern, Scope, SeqNilLiteral, Statement, StringLiteral, StructDecl,
+    StructField, StructLitExpr, StructLitField, TupleExpr, TyParam, TySpec, TySpecKind, UnaryOp,
+    UnaryOpExpr, UseDecl,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -64,6 +65,24 @@ fn infix_op(k: TokenKind) -> Option<(BinOp, u8, u8)> {
         Percent => (BinOp::Arith(ArithOp::Rem), 9, 10),
         _ => return None,
     })
+}
+
+/// Whether an `if` chain ends without an `else` block, and so has no value.
+///
+/// An `else if` link is a scope holding only the nested `if`, so the answer
+/// lies at the end of the chain: `if a {} else if b {}` has an `else_` but
+/// still produces nothing.
+fn ends_without_else<S, T: crate::ast::AstMetadata>(if_: &IfExpr<S, T>) -> bool {
+    let mut link = if_;
+    loop {
+        let Some(else_) = &link.else_ else {
+            return true;
+        };
+        match &else_.tail {
+            Some(Expr::If(nested)) if else_.stmts.is_empty() => link = nested,
+            _ => return false,
+        }
+    }
 }
 
 /// A single-pass recursive-descent + Pratt parser over the [`Lexer`] token
@@ -239,6 +258,83 @@ impl<'a> Parser<'a> {
             // still derive a (degraded) span. Loop progress guards prevent stalls.
             Token::new(k, t.start, t.start)
         }
+    }
+
+    /// Whether the current token closes a type argument list: a `>`, or a `>=`
+    /// whose first byte is that `>`.
+    #[inline]
+    fn at_gt(&self) -> bool {
+        matches!(self.cur.kind, TokenKind::Gt | TokenKind::Geq)
+    }
+
+    /// Consumes the `>` closing a type argument or parameter list.
+    ///
+    /// A `>=` is split: its `>` is consumed here and a synthetic `=` at its
+    /// second byte becomes the current token, so `Option<Int>=None` reads as
+    /// `Option<Int> = None`. No other two-character token starts with `>`.
+    fn expect_gt(&mut self) {
+        if self.at(TokenKind::Gt) {
+            self.bump();
+            return;
+        }
+        if self.at(TokenKind::Geq) {
+            let t = self.cur;
+            self.cur = Token::new(TokenKind::Eq, t.start + 1, t.end);
+            self.prev_end = t.start + 1;
+            if let Some(completion) = &mut self.completion {
+                completion.window_start = (t.start + 1) as usize;
+            }
+            self.ntok += 1;
+            return;
+        }
+        self.expect(TokenKind::Gt);
+    }
+
+    /// `LT item (COMMA item)* COMMA? GT`, for type parameters and type
+    /// arguments. An empty list is an error: `<>` never means anything.
+    fn angle_list<T>(
+        &mut self,
+        completion_site: CompletionSite,
+        what: &str,
+        mut parse_item: impl FnMut(&mut Self) -> T,
+    ) -> Vec<T> {
+        let open = self.expect(TokenKind::Lt);
+        let mut items = Vec::new();
+        self.record_completion_site(completion_site);
+        while !self.at_gt() && !self.at(TokenKind::Eof) {
+            items.push(parse_item(self));
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+            self.record_completion_site(completion_site);
+        }
+        if items.is_empty() {
+            self.error_at(
+                Span::new(open.start as usize, self.cur.end as usize),
+                format!("expected at least one {what}"),
+            );
+        }
+        self.expect_gt();
+        items
+    }
+
+    /// `genericParams : (LT ident (COMMA ident)* COMMA? GT)?`
+    fn parse_generic_params(&mut self) -> Vec<TyParam<&'a str, Md>> {
+        if !self.at(TokenKind::Lt) {
+            return Vec::new();
+        }
+        self.angle_list(CompletionSite::NewIdentifier, "type parameter", |p| {
+            let name = p.ident(CompletionSite::NewIdentifier);
+            TyParam {
+                span: name.span,
+                name,
+            }
+        })
+    }
+
+    /// `LT tySpecList GT`, the arguments of a generic type or a turbofish.
+    fn parse_ty_args(&mut self) -> Vec<TySpec<&'a str, Md>> {
+        self.angle_list(CompletionSite::Type, "type argument", |p| p.parse_ty_spec())
     }
 
     /// Parse a comma-separated list `item (',' item)* ','?` up to `close` (or
@@ -456,25 +552,53 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `enumDecl : ENUM ident LBRACE enumVariants RBRACE`
+    /// `enumDecl : ENUM ident genericParams? LBRACE enumVariants RBRACE`
     fn parse_enum_decl(&mut self) -> EnumDecl<&'a str, Md> {
+        let lo = self.cur.start;
         self.expect(TokenKind::KwEnum);
         let name = self.ident(CompletionSite::NewIdentifier);
+        let params = self.parse_generic_params();
         self.expect(TokenKind::LBrace);
-        let variants = self.parse_ident_list();
+        let variants = self.separated_list(TokenKind::RBrace, CompletionSite::NewIdentifier, |p| {
+            p.parse_enum_variant()
+        });
         self.expect(TokenKind::RBrace);
         EnumDecl {
             name,
+            params,
             variants,
+            span: self.finish_span(lo),
             metadata: (),
         }
     }
 
-    /// `structDecl : STRUCT ident LBRACE structFields RBRACE`
+    /// `enumVariant : ident (LPAREN tySpecList RPAREN)?`
+    fn parse_enum_variant(&mut self) -> EnumVariant<&'a str, Md> {
+        let lo = self.cur.start;
+        let name = self.ident(CompletionSite::NewIdentifier);
+        let payload = if self.eat(TokenKind::LParen) {
+            let payload = self.separated_list(TokenKind::RParen, CompletionSite::Type, |p| {
+                p.parse_ty_spec()
+            });
+            self.expect(TokenKind::RParen);
+            payload
+        } else {
+            Vec::new()
+        };
+        EnumVariant {
+            name,
+            payload,
+            span: self.finish_span(lo),
+            metadata: (),
+        }
+    }
+
+    /// `structDecl : STRUCT ident genericParams? LBRACE structFields RBRACE`
     fn parse_struct_decl(&mut self) -> StructDecl<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwStruct);
         let name = self.ident(CompletionSite::NewIdentifier);
+        let params = self.parse_generic_params();
         self.expect(TokenKind::LBrace);
         let fields = self.separated_list(TokenKind::RBrace, CompletionSite::NewIdentifier, |p| {
             p.parse_struct_field()
@@ -482,6 +606,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RBrace);
         StructDecl {
             name,
+            params,
             fields,
             span: self.finish_span(lo),
             metadata: (),
@@ -542,6 +667,12 @@ impl<'a> Parser<'a> {
                 "a use path must name an item in a module".to_string(),
             );
         }
+        if let Some(args) = &path.generic_args {
+            self.error_at(
+                args.span,
+                "a use path cannot take type arguments".to_string(),
+            );
+        }
         self.record_completion_site(CompletionSite::Keyword("as"));
         let alias = if self.eat(TokenKind::KwAs) {
             Some(self.ident(CompletionSite::NewIdentifier))
@@ -556,17 +687,19 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `cellDecl : CELL ident LPAREN argDecls RPAREN scope`
+    /// `cellDecl : CELL ident genericParams? LPAREN argDecls RPAREN scope`
     fn parse_cell_decl(&mut self) -> CellDecl<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwCell);
         let name = self.ident(CompletionSite::NewIdentifier);
+        let params = self.parse_generic_params();
         self.expect(TokenKind::LParen);
         let args = self.parse_arg_decls();
         self.expect(TokenKind::RParen);
         let scope = self.parse_scope();
         CellDecl {
             name,
+            params,
             args,
             scope,
             span: self.finish_span(lo),
@@ -574,11 +707,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `fnDecl : FN ident LPAREN argDecls RPAREN (ARROW tySpec)? scope`
+    /// `fnDecl : FN ident genericParams? LPAREN argDecls RPAREN (ARROW tySpec)? scope`
     fn parse_fn_decl(&mut self) -> FnDecl<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwFn);
         let name = self.ident(CompletionSite::NewIdentifier);
+        let params = self.parse_generic_params();
         self.expect(TokenKind::LParen);
         let args = self.parse_arg_decls();
         self.expect(TokenKind::RParen);
@@ -591,6 +725,7 @@ impl<'a> Parser<'a> {
         let scope = self.parse_scope();
         FnDecl {
             name,
+            params,
             args,
             return_ty,
             scope,
@@ -625,15 +760,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `enumVariants : (ident (COMMA ident)* COMMA?)?`
-    fn parse_ident_list(&mut self) -> Vec<Ident<&'a str, Md>> {
-        self.separated_list(TokenKind::RBrace, CompletionSite::NewIdentifier, |p| {
-            p.ident(CompletionSite::NewIdentifier)
-        })
+    /// `tySpec : tyPath | LBRACK tySpec RBRACK | LPAREN tySpecList RPAREN`, where
+    /// `tyPath : ident (LT tySpecList GT)?`.
+    fn parse_ty_spec(&mut self) -> TySpec<&'a str, Md> {
+        self.parse_ty_spec_inner(true)
     }
 
-    /// `tySpec : ident | LBRACK tySpec RBRACK | LPAREN tySpecList RPAREN`
-    fn parse_ty_spec(&mut self) -> TySpec<&'a str, Md> {
+    /// [`Self::parse_ty_spec`] with `allow_args` deciding whether a named type
+    /// may take arguments. The target of `as` may not, so that `a as Float <
+    /// b` stays a comparison.
+    fn parse_ty_spec_inner(&mut self, allow_args: bool) -> TySpec<&'a str, Md> {
         self.record_completion_site(CompletionSite::Type);
         let lo = self.cur.start;
         // `[..]`/`(..)` nest recursively; guard the native stack like parse_expr.
@@ -664,7 +800,15 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::RParen);
                 TySpecKind::Tuple(list)
             }
-            TokenKind::Ident => TySpecKind::Ident(self.ident(CompletionSite::Type)),
+            TokenKind::Ident => {
+                let name = self.ident(CompletionSite::Type);
+                let args = if allow_args && self.at(TokenKind::Lt) {
+                    self.parse_ty_args()
+                } else {
+                    Vec::new()
+                };
+                TySpecKind::Path { name, args }
+            }
             _ => {
                 self.error_at(
                     self.span(self.cur),
@@ -728,12 +872,36 @@ impl<'a> Parser<'a> {
                     // Everything else is an expression. `if`/`match`/`{...}` are
                     // expression primaries, so the Pratt parser also extends
                     // them with trailing operators (e.g. `if c {a} else {b} + 1`).
-                    let e = self.parse_expr(0);
+                    let (e, else_less) = if self.at(TokenKind::KwIf) {
+                        // An `if` may omit its `else` here, in statement
+                        // position, and nowhere else.
+                        let lo = self.cur.start;
+                        let scope_order = self.next_scope_order();
+                        let if_ = self.parse_if(scope_order, lo, false);
+                        let else_less = ends_without_else(&if_);
+                        let e = Expr::If(Box::new(if_));
+                        // With an `else` it is an ordinary expression.
+                        let e = if else_less {
+                            e
+                        } else {
+                            self.parse_expr_from(e, lo, 0)
+                        };
+                        (e, else_less)
+                    } else {
+                        (self.parse_expr(0), false)
+                    };
                     let is_block = matches!(e, Expr::If(_) | Expr::Match(_) | Expr::Scope(_));
                     if self.eat(TokenKind::Semi) {
                         stmts.push(Statement::Expr {
                             value: e,
                             semicolon: true,
+                        });
+                    } else if else_less {
+                        // An `if` with no `else` has no value, so it is a
+                        // statement even in last position, never the tail.
+                        stmts.push(Statement::Expr {
+                            value: e,
+                            semicolon: false,
                         });
                     } else if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
                         tail = Some(e);
@@ -767,10 +935,9 @@ impl<'a> Parser<'a> {
         self.scope_orders.pop();
 
         // No separate tail fixup is needed: the statement loop above already
-        // routes a trailing un-semicoloned expression into `tail` (the
-        // `at(RBrace) || at(Eof)` arm), and only ever pushes a `semicolon: false`
-        // statement when more tokens follow it — so a `semicolon: false`
-        // statement is never the last element here.
+        // routes a trailing un-semicoloned expression into `tail`. The only
+        // `semicolon: false` statement that can come last is an `if` with no
+        // `else`, which has no value to offer as a tail.
 
         self.exit_depth();
         Scope {
@@ -782,16 +949,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `letBinding : LET ident EQ expr` (span excludes the trailing SEMI, which
-    /// belongs to the enclosing `statement`).
+    /// `letBinding : LET ident (COLON tySpec)? EQ expr` (span excludes the
+    /// trailing SEMI, which belongs to the enclosing `statement`).
     fn parse_let_binding(&mut self) -> LetBinding<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwLet);
         let name = self.ident(CompletionSite::NewIdentifier);
+        let ty = self.eat(TokenKind::Colon).then(|| self.parse_ty_spec());
         self.expect(TokenKind::Eq);
         let value = self.parse_expr(0);
         LetBinding {
             name,
+            ty,
             value,
             metadata: (),
             span: self.finish_span(lo),
@@ -817,18 +986,65 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_if(&mut self, scope_order: u64, lo: u32) -> IfExpr<&'a str, Md> {
+    /// `ifExpr : IF expr scope (ELSE (scope | ifExpr))?`
+    ///
+    /// The `else` may be omitted only when `require_else` is false, which
+    /// only the statement loop passes. An `else if` inherits the flag, so a
+    /// chain must end in an `else` block wherever one is required.
+    fn parse_if(&mut self, scope_order: u64, lo: u32, require_else: bool) -> IfExpr<&'a str, Md> {
         self.expect(TokenKind::KwIf);
         let cond = self.with_struct_literals(false, |p| p.parse_expr(0));
         let then = self.parse_scope();
-        self.expect(TokenKind::KwElse);
-        let else_ = self.parse_scope();
+        let else_ = if require_else {
+            // `expect` records the `else` completion site itself.
+            self.expect(TokenKind::KwElse);
+            Some(self.parse_else_body(require_else))
+        } else {
+            // Either a statement or an `else` may follow.
+            self.record_completion_site(CompletionSite::StatementOrElse);
+            self.eat(TokenKind::KwElse)
+                .then(|| self.parse_else_body(require_else))
+        };
         IfExpr {
             scope_order,
             cond,
             then,
             else_,
             span: self.finish_span(lo),
+            metadata: (),
+        }
+    }
+
+    /// The body of an `else`: a scope, or -- for `else if` -- a synthetic
+    /// scope whose only content is the nested `if` as its tail.
+    fn parse_else_body(&mut self, require_else: bool) -> Scope<&'a str, Md> {
+        if !self.at(TokenKind::KwIf) {
+            return self.parse_scope();
+        }
+        // A chain nests no scopes, so it needs a depth guard of its own.
+        if !self.enter_depth() {
+            self.error_at(self.span(self.cur), "nesting too deep".to_string());
+            let lo = self.cur.start as usize;
+            return Scope {
+                scope_order: 0,
+                span: Span::new(lo, lo),
+                stmts: Vec::new(),
+                tail: None,
+                metadata: (),
+            };
+        }
+        let lo = self.cur.start;
+        // From the enclosing scope's counter, so a chain takes consecutive
+        // ordinals in lexical order.
+        let scope_order = self.next_scope_order();
+        let nested = self.parse_if(scope_order, lo, require_else);
+        self.exit_depth();
+        Scope {
+            // Only an `Expr::Scope` block reads a scope's own ordinal.
+            scope_order: 0,
+            span: nested.span,
+            stmts: Vec::new(),
+            tail: Some(Expr::If(Box::new(nested))),
             metadata: (),
         }
     }
@@ -840,10 +1056,10 @@ impl<'a> Parser<'a> {
         let scrutinee = self.with_struct_literals(false, |p| p.parse_expr(0));
         let lbrace = self.expect(TokenKind::LBrace);
         let mut arms = Vec::new();
-        self.record_completion_site(CompletionSite::Expression);
+        self.record_completion_site(CompletionSite::Pattern);
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let mark = self.ntok;
-            self.record_completion_site(CompletionSite::Expression);
+            self.record_completion_site(CompletionSite::Pattern);
             arms.push(self.parse_match_arm());
             if self.ntok == mark {
                 self.bump();
@@ -867,10 +1083,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `matchArm : identPath FAT_ARROW expr COMMA` (span includes the comma).
+    /// `matchArm : pattern FAT_ARROW expr COMMA` (span includes the comma).
     fn parse_match_arm(&mut self) -> MatchArm<&'a str, Md> {
         let lo = self.cur.start;
-        let pattern = self.parse_ident_path(CompletionSite::Expression);
+        let pattern = self.parse_pattern();
         self.expect(TokenKind::FatArrow);
         // An arm body is bounded by its comma, not by `{`, so a struct
         // literal is unambiguous here even when the whole `match` sits in
@@ -882,6 +1098,74 @@ impl<'a> Parser<'a> {
             expr,
             span: self.finish_span(lo),
         }
+    }
+
+    /// `pattern : UNDERSCORE | identPath (LPAREN patternList RPAREN)?`
+    ///
+    /// A bare name is a [`Pattern::Binding`]; whether it names a unit variant
+    /// instead is decided by the type checker, as in Rust.
+    fn parse_pattern(&mut self) -> Pattern<&'a str, Md> {
+        self.record_completion_site(CompletionSite::Pattern);
+        if self.at_wildcard() {
+            let t = self.bump();
+            return Pattern::Wildcard { span: self.span(t) };
+        }
+        let lo = self.cur.start;
+        let path = self.parse_ident_path(CompletionSite::Pattern);
+        if self.eat(TokenKind::LParen) {
+            let fields = self.separated_list(TokenKind::RParen, CompletionSite::Pattern, |p| {
+                p.parse_sub_pattern()
+            });
+            self.expect(TokenKind::RParen);
+            return Pattern::Variant {
+                path,
+                fields,
+                span: self.finish_span(lo),
+            };
+        }
+        if path.path.len() == 1 && path.generic_args.is_none() {
+            let name = path.path.into_iter().next().expect("one segment");
+            return Pattern::Binding { name, metadata: () };
+        }
+        Pattern::Variant {
+            path,
+            fields: Vec::new(),
+            span: self.finish_span(lo),
+        }
+    }
+
+    /// A payload element pattern: `_` or a name. Nested variant patterns are
+    /// not supported.
+    fn parse_sub_pattern(&mut self) -> Pattern<&'a str, Md> {
+        self.record_completion_site(CompletionSite::Pattern);
+        if self.at_wildcard() {
+            let t = self.bump();
+            return Pattern::Wildcard { span: self.span(t) };
+        }
+        let name = self.ident(CompletionSite::Pattern);
+        if self.at(TokenKind::LParen) || self.at(TokenKind::PathSep) {
+            self.error_at(
+                self.span(self.cur),
+                "nested patterns are not supported; a payload element pattern is a name or `_`"
+                    .to_string(),
+            );
+            // Consume the rest of the nested pattern so the arm resynchronizes.
+            while self.eat(TokenKind::PathSep) {
+                self.ident(CompletionSite::Pattern);
+            }
+            if self.eat(TokenKind::LParen) {
+                self.separated_list(TokenKind::RParen, CompletionSite::Pattern, |p| {
+                    p.parse_sub_pattern()
+                });
+                self.expect(TokenKind::RParen);
+            }
+        }
+        Pattern::Binding { name, metadata: () }
+    }
+
+    /// Whether the current token is the `_` identifier.
+    fn at_wildcard(&self) -> bool {
+        self.at(TokenKind::Ident) && self.slice_tok(self.cur) == "_"
     }
 
     // ------------------------------------------------------------------
@@ -917,8 +1201,36 @@ impl<'a> Parser<'a> {
         // operand is unwrapped to its inner node (whose span excludes the
         // parens), while the enclosing operator's span must start at the `(`.
         let lhs_start = self.cur.start;
-        let mut lhs = self.parse_prefix();
+        let lhs = self.parse_prefix();
+        self.fold_operators(lhs, lhs_start, min_bp)
+    }
 
+    /// Parse a full expression from an already-built head node.
+    fn parse_expr_from(
+        &mut self,
+        lhs: Expr<&'a str, Md>,
+        lhs_start: u32,
+        min_bp: u8,
+    ) -> Expr<&'a str, Md> {
+        if !self.enter_depth() {
+            self.error_at(
+                self.span(self.cur),
+                "expression nesting too deep".to_string(),
+            );
+            return lhs;
+        }
+        self.fold_operators(lhs, lhs_start, min_bp)
+    }
+
+    /// The Pratt operator loop. The caller must have entered one depth level,
+    /// which this releases along with one per fold; `lhs_start` is the lexical
+    /// start of the whole expression.
+    fn fold_operators(
+        &mut self,
+        mut lhs: Expr<&'a str, Md>,
+        lhs_start: u32,
+        min_bp: u8,
+    ) -> Expr<&'a str, Md> {
         // The loop folds each suffix/infix operator into `lhs`, so it deepens
         // the tree by one level per iteration *without* recursing. Charging
         // each fold to the same depth budget is what makes the guard measure
@@ -1061,7 +1373,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::KwAs => {
                 self.bump();
-                let ty = self.parse_ty_spec();
+                let ty = self.parse_ty_spec_inner(false);
                 Expr::Cast(Box::new(CastExpr {
                     value: lhs,
                     ty,
@@ -1087,7 +1399,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwIf => {
                 let lo = self.cur.start;
                 let scope_order = self.next_scope_order();
-                Expr::If(Box::new(self.parse_if(scope_order, lo)))
+                Expr::If(Box::new(self.parse_if(scope_order, lo, true)))
             }
             TokenKind::KwMatch => Expr::Match(Box::new(self.parse_match())),
             TokenKind::LBrace => {
@@ -1180,6 +1492,7 @@ impl<'a> Parser<'a> {
             // one token the user wrote.
             let value = Expr::IdentPath(IdentPath {
                 path: vec![name.clone()],
+                generic_args: None,
                 metadata: (),
                 span: name.span,
             });
@@ -1241,16 +1554,38 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `identPath : ident (PATHSEP ident)*`
+    /// `identPath : pathSeg (PATHSEP pathSeg)*` where
+    /// `pathSeg : ident (PATHSEP LT tySpecList GT)?`.
+    ///
+    /// The turbofish is attached to the segment before it; a second one on
+    /// the same path is an error, since a path names one generic item.
     fn parse_ident_path(&mut self, completion_site: CompletionSite) -> IdentPath<&'a str, Md> {
         let lo = self.cur.start;
         let mut path = vec![self.ident(completion_site)];
+        let mut generic_args: Option<GenericArgs<&'a str, Md>> = None;
         while self.at(TokenKind::PathSep) {
+            if self.nxt.kind == TokenKind::Lt {
+                self.bump();
+                let args_lo = self.cur.start;
+                let args = self.parse_ty_args();
+                let span = self.finish_span(args_lo);
+                if generic_args.is_some() {
+                    self.error_at(span, "a path may have only one turbofish".to_string());
+                } else {
+                    generic_args = Some(GenericArgs {
+                        segment: path.len() - 1,
+                        args,
+                        span,
+                    });
+                }
+                continue;
+            }
             self.bump();
             path.push(self.ident(completion_site));
         }
         IdentPath {
             path,
+            generic_args,
             metadata: (),
             span: self.finish_span(lo),
         }

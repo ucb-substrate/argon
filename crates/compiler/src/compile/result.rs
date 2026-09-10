@@ -56,9 +56,34 @@ pub enum StaticErrorKind {
     /// A struct literal without `..base` omits declared fields.
     #[error("missing fields {fields} in initializer of {ty}")]
     MissingStructFields { ty: String, fields: String },
-    /// A struct contains itself, directly or through its fields' types.
+    /// A struct contains itself through struct fields and tuple elements alone,
+    /// with no enum or sequence to end the recursion.
     #[error("struct `{name}` contains itself; recursive structs are not supported")]
     RecursiveStruct { name: String },
+    /// A type was given the wrong number of type arguments, including any
+    /// arguments on a non-generic type and none on a generic type.
+    #[error("type `{ty}` takes {expected} type arguments, found {found}")]
+    TypeArgArity {
+        ty: String,
+        expected: usize,
+        found: usize,
+    },
+    /// An inferred type was never determined within its unit of inference.
+    #[error("type annotations needed; the type of this expression cannot be inferred")]
+    TypeAnnotationsNeeded,
+    /// A type parameter of a struct or enum that no field or payload uses.
+    #[error("type parameter `{name}` is never used")]
+    UnusedTypeParam { name: String },
+    /// A constructor call or pattern with the wrong number of payload elements.
+    #[error("variant `{variant}` has {expected} payload elements, found {found}")]
+    VariantPayloadArity {
+        variant: String,
+        expected: usize,
+        found: usize,
+    },
+    /// A match arm after every variant is covered or after a catch-all.
+    #[error("unreachable match arm")]
+    UnreachableMatchArm,
     /// A cell had an expression in tail position, which is not permitted.
     #[error("cells may not have an expression in tail position")]
     CellWithTailExpr,
@@ -68,6 +93,12 @@ pub enum StaticErrorKind {
     /// Branches in expressions must evaluate to the same type.
     #[error("branches must evaluate to same type")]
     BranchesDifferentTypes,
+    /// An `if` with no `else` yields no value, so its `then` branch may not
+    /// produce one either.
+    #[error(
+        "an `if` without an `else` must have type `()`; end the branch with `;` or add an `else`"
+    )]
+    IfWithoutElseNotUnit,
     /// Multiple match arms have matching patterns.
     #[error("match arms must be distinct")]
     DuplicateMatchArm,
@@ -156,11 +187,20 @@ pub enum StaticErrorKind {
     /// An identifier was used without being declared in the current scope.
     #[error("`{name}` is not declared in this scope")]
     UndeclaredVar { name: String },
-    /// A cell was referenced before its declaration was processed.
+    /// The type of a cell field depends on itself.
+    ///
+    /// Cells may refer to one another in any order, and a field's type is
+    /// computed on demand, so the only reference that cannot be resolved is
+    /// one that leads back to the field being typed: `a.f` reads `b.g`, which
+    /// reads `a.f`. Reported at the reference that closes the cycle.
     #[error(
-        "cannot use `{name}` before its declaration; move the `cell {name} ...` declaration above this use"
+        "the type of `{cell}.{field}` depends on itself, directly or through the fields of other cells"
     )]
-    UseBeforeDeclaration { name: String },
+    CyclicCellField { cell: String, field: String },
+    /// Typing a cell field required more nested field types than the compiler
+    /// allows.
+    #[error("cell field types depend on each other more than {limit} levels deep")]
+    CellTypingLimitExceeded { limit: usize },
     /// A value of the given type cannot be called.
     #[error("cannot call type {0}")]
     CannotCall(String),
@@ -310,6 +350,10 @@ pub enum ExecErrorKind {
     /// Function inlining or cell instantiation nested too deeply.
     #[error("recursion limit of {limit} exceeded")]
     RecursionLimitExceeded { limit: u32 },
+    /// A cell instantiated itself with the arguments it was itself called
+    /// with, which no depth limit would end.
+    #[error("cell `{cell}` instantiates itself with its own arguments")]
+    RecursiveInstantiation { cell: String },
     /// A shape, sequence, or iteration count exceeded a compiler limit.
     #[error("{what} exceeds the maximum of {limit}")]
     LimitExceeded { what: String, limit: usize },

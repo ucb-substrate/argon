@@ -12,7 +12,7 @@ use std::{
 
 use analyzer::rpc::{
     DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, ValueEdit,
+    PolygonParams, RectangleEditResult, ValueEdit,
 };
 use argonc::{
     ast::Span,
@@ -128,14 +128,25 @@ impl ShapeFill {
 
 const SELECT_WIDTH: Pixels = px(3.);
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
-/// Start building navigation tiles in the background before the raster becomes
-/// the primary renderer. The geometry path remains visible while idle; once
-/// ready, these tiles make mouse and keyboard panning a cheap image transform.
-const RASTER_PREFETCH_GEOMETRY_THRESHOLD: usize = 2_048;
 /// Above this visible primitive count, retain a viewport raster for interactive
 /// redraws. Sparse and screen-space-aggregated views stay on the geometry path
 /// so their CPU cost follows visible geometry rather than screen area.
-const RASTER_CACHE_GEOMETRY_THRESHOLD: usize = 50_000;
+/// The SRAM's intermediate zooms already exceed a frame budget well below
+/// 50,000 primitives, especially with patterned fills and dimension overlays.
+const RASTER_CACHE_GEOMETRY_THRESHOLD: usize = 2_048;
+// Bound traversal as well as visible geometry: cold indexes, overlapping
+// instances and invisible objects can otherwise expand an entire SRAM on the
+// UI thread before the density decision has a chance to start a raster.
+const UI_GEOMETRY_WORK_LIMIT: usize = 8_192;
+
+struct GeometryWorkBudget(usize);
+
+impl GeometryWorkBudget {
+    fn spend(&mut self, work: usize) -> Option<()> {
+        self.0 = self.0.checked_sub(work)?;
+        Some(())
+    }
+}
 /// Rasterize geometry at half resolution so complex fills remain cheap. The
 /// completed pixels are expanded with nearest-neighbor sampling before GPUI
 /// sees them; this preserves discrete layer colors despite GPUI's hard-coded
@@ -158,6 +169,11 @@ const GEOMETRY_LOD_SIZE_PX: f32 = 8.;
 /// occupy most of that box. Sparse nodes must be refined; otherwise empty
 /// space between unrelated shapes turns into visible teeth at macro edges.
 const MIN_DENSE_LOD_BOUNDS_COVERAGE: f64 = 0.75;
+/// A BVH node made only of screen-unresolvable instances may span this many
+/// LOD cells and still collapse into one box per layer, provided its members
+/// leave less than one LOD cell of it uncovered. This is what turns a bitcell
+/// array into a handful of boxes instead of one box per layer per cell.
+const INSTANCE_LOD_NODE_SPAN: f64 = 4.;
 /// Custom technology patterns are cached as a moderately large repeating tile.
 /// Painting a large rectangle then submits a few clipped sprites instead of
 /// constructing and coloring a screen-sized CPU bitmap on every frame.
@@ -228,6 +244,29 @@ fn layer_lod_color(layer: &LayerState) -> Rgba {
         ShapeFill::Hollow => layer.border_color,
         _ => layer.color,
     }
+}
+
+/// A screen-space aggregate painted as one solid box in the layer's LOD color.
+fn lod_box(bounds: RasterBvhBounds, layer: &LayerState) -> (Rect, LayerState) {
+    let lod_color = layer_lod_color(layer);
+    let mut layer = layer.clone();
+    layer.fill = ShapeFill::Solid;
+    layer.color = lod_color;
+    layer.border_color = lod_color;
+    (
+        Rect {
+            x0: bounds.min_x as f32,
+            y0: bounds.min_y as f32,
+            x1: bounds.max_x as f32,
+            y1: bounds.max_y as f32,
+            id: None,
+            object_path: Vec::new(),
+            border_widths: Edges::all(px(0.)),
+            border_styles: Edges::all(BorderStyle::Solid),
+            cvars: None,
+        },
+        layer,
+    )
 }
 
 /// One expression controlled by a solution-space drag and the layout-space
@@ -316,6 +355,19 @@ struct TextLabel {
     text: SharedString,
     position: Point<f32>,
     layer: LayerState,
+}
+
+/// A bounded, fully collected direct frame. Keep it at its original camera
+/// while the first raster is pending, including pans into uncached geometry.
+struct DirectFrame {
+    viewport: Size<Pixels>,
+    display: RasterDisplayTransform,
+    content_revision: u64,
+    rects: Vec<(Rect, LayerState)>,
+    polygons: Vec<(Polygon, LayerState)>,
+    texts: Vec<TextLabel>,
+    dims: Vec<compile::Dimension<(f64, LinearExpr)>>,
+    scope_rects: Vec<LabeledBbox>,
 }
 
 fn corner_sse_targets(x: &LinearExpr, y: &LinearExpr) -> Vec<SseDragTarget> {
@@ -670,6 +722,47 @@ impl Polygon {
     }
 }
 
+/// Constraint status belongs to each source coordinate, including after an
+/// instance rotates/reflects it or the rectangle's endpoints are reversed.
+fn rectangle_border_styles(
+    rect: &compile::Rect<(f64, LinearExpr)>,
+    unsolved_vars: &IndexSet<Var>,
+    transform: TransformationMatrix,
+) -> Edges<BorderStyle> {
+    let mut styles = Edges::all(BorderStyle::Solid);
+    if unsolved_vars.is_empty() {
+        return styles;
+    }
+    let x_direction = if rect.x0.0 <= rect.x1.0 { 1. } else { -1. };
+    let y_direction = if rect.y0.0 <= rect.y1.0 { 1. } else { -1. };
+    for (coordinate, normal) in [
+        (&rect.x0.1, (-x_direction, 0.)),
+        (&rect.x1.1, (x_direction, 0.)),
+        (&rect.y0.1, (0., -y_direction)),
+        (&rect.y1.1, (0., y_direction)),
+    ] {
+        if !coordinate
+            .coeffs
+            .iter()
+            .any(|(_, var)| unsolved_vars.contains(var))
+        {
+            continue;
+        }
+        let (x, y) = ifmatvec(transform, normal);
+        let edge = if x < 0. {
+            &mut styles.left
+        } else if x > 0. {
+            &mut styles.right
+        } else if y < 0. {
+            &mut styles.bottom
+        } else {
+            &mut styles.top
+        };
+        *edge = BorderStyle::Dashed;
+    }
+    styles
+}
+
 fn polygon_edge_styles(
     point_count: usize,
     mut is_unconstrained: impl FnMut(usize) -> bool,
@@ -901,6 +994,41 @@ pub(crate) struct DrawRectToolState {
     p0: Option<Point<f32>>,
 }
 
+/// A placed rectangle stays separate from cached layout frames until a frame
+/// containing its accepted source edit is actually painted.
+#[derive(Clone, Debug)]
+struct PendingRectangle {
+    id: u64,
+    scope_path: editor::ScopePath,
+    source_path: std::path::PathBuf,
+    name: String,
+    rect: compile::BasicRect<f64>,
+    submitted_revision: Option<u64>,
+    receipt: Option<RectangleEditResult>,
+    resolved_content_revision: Option<u64>,
+}
+
+impl PendingRectangle {
+    fn preview(&self) -> Rect {
+        Rect {
+            object_path: Vec::new(),
+            x0: self.rect.x0 as f32,
+            y0: self.rect.y0 as f32,
+            x1: self.rect.x1 as f32,
+            y1: self.rect.y1 as f32,
+            id: None,
+            cvars: None,
+            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            border_styles: Edges::all(BorderStyle::Dashed),
+        }
+    }
+
+    fn included_in_frame(&self, revision: u64) -> bool {
+        self.resolved_content_revision
+            .is_some_and(|resolved| revision >= resolved)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DrawPolygonToolState {
     points: Vec<Point<f32>>,
@@ -1095,9 +1223,20 @@ pub struct LayoutCanvas {
     raster_overview_requested_revision: Option<u64>,
     raster_overview_refinement: Option<Task<()>>,
     raster_display: Option<RasterDisplayTransform>,
+    /// After a geometry edit the retained tiles belong to the previous content
+    /// revision. They stay on screen, instead of a blank canvas, until tiles of
+    /// the new revision replace them or direct geometry is painted.
+    raster_stale_tiles_displayable: bool,
     /// Camera of the raster submitted by the previous paint. A new retained
     /// raster may only move monotonically closer to the requested camera.
     last_presented_raster: Cell<Option<RasterDisplayTransform>>,
+    retained_direct_frame: Option<Arc<DirectFrame>>,
+    pending_rectangles: Vec<PendingRectangle>,
+    next_rectangle_id: u64,
+    #[cfg(test)]
+    painted_complete_frame: bool,
+    #[cfg(test)]
+    painted_rectangle_previews: Vec<Bounds<Pixels>>,
     raster_tile_target: Option<RasterTileTarget>,
     /// Sparse views are painted as geometry. Once the background-built BVHs
     /// are ready, viewport rasters are enabled only when the current view has
@@ -1135,8 +1274,10 @@ pub struct LayoutCanvas {
     raster_content_revision: u64,
     raster_content_revision_signal: Arc<AtomicU64>,
     raster_output: Option<Arc<CompiledData>>,
-    raster_scope_state: Option<Arc<IndexMap<editor::ScopePath, editor::ScopeState>>>,
+    raster_hierarchy: Arc<editor::hierarchy::PreparedHierarchy>,
+    raster_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
     raster_selected_scope: Option<editor::ScopePath>,
+    raster_displayed_cell: Option<CellId>,
     raster_layer_visibility: Vec<bool>,
     raster_hierarchy_depth: usize,
     raster_hide_external_geometry: bool,
@@ -1188,6 +1329,31 @@ struct LayoutRasterTileSet {
     scale: f32,
     content_revision: u64,
     center: RasterTileIndex,
+}
+
+/// What the canvas draws underneath the tool overlays this frame.
+enum Presentation {
+    /// Retained tiles at a (possibly lagging) camera.
+    Raster {
+        tiles: LayoutRasterTileSet,
+        display: RasterDisplayTransform,
+    },
+    /// Geometry painted directly at the requested camera.
+    Direct,
+}
+
+/// How a state notification affects the retained raster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RasterPresentationChange {
+    /// Nothing that changes raster pixels.
+    None,
+    /// Only the compiled geometry changed. The previous tiles remain a
+    /// faithful stand-in for everything except the edit until the first tile
+    /// of the new revision lands.
+    Geometry,
+    /// Layer visibility, theme, hierarchy depth, scope visibility, or the
+    /// displayed cell changed. Every retained pixel is wrong immediately.
+    Presentation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1350,8 +1516,12 @@ struct RasterBvhItem {
     emit_index: usize,
     bounds: RasterBvhBounds,
     /// A shape can participate in a sub-pixel aggregate when its layer is
-    /// known. Instances and text remain exact traversal boundaries.
+    /// known. Text remains an exact traversal boundary.
     lod_layer: Option<SharedString>,
+    /// Every layer drawn anywhere inside an instance. A node made only of
+    /// screen-unresolvable instances collapses into one box per layer, which
+    /// keeps an array of thousands of cells from being visited cell by cell.
+    instance_layers: Option<Arc<[SharedString]>>,
 }
 
 enum RasterBvhNode {
@@ -1360,6 +1530,9 @@ enum RasterBvhNode {
         items: Box<[RasterBvhItem]>,
         lod_layers: Option<Arc<[SharedString]>>,
         lod_bounds_area: Option<f64>,
+        max_shape_span: Option<(f64, f64)>,
+        /// Largest member span when every member is an instance.
+        instance_lod: Option<f64>,
     },
     Branch {
         bounds: RasterBvhBounds,
@@ -1367,6 +1540,8 @@ enum RasterBvhNode {
         right: Box<RasterBvhNode>,
         lod_layers: Option<Arc<[SharedString]>>,
         lod_bounds_area: Option<f64>,
+        max_shape_span: Option<(f64, f64)>,
+        instance_lod: Option<f64>,
     },
 }
 
@@ -1382,12 +1557,28 @@ impl RasterBvhNode {
     fn item_lod_layers(items: &[RasterBvhItem]) -> Option<Arc<[SharedString]>> {
         let mut layers = Vec::new();
         for item in items {
-            let layer = item.lod_layer.as_ref()?;
-            if !layers.contains(layer) {
-                layers.push(layer.clone());
+            let item_layers: &[SharedString] = match (&item.lod_layer, &item.instance_layers) {
+                (Some(layer), _) => std::slice::from_ref(layer),
+                (None, Some(layers)) => layers,
+                (None, None) => return None,
+            };
+            for layer in item_layers {
+                if !layers.contains(layer) {
+                    layers.push(layer.clone());
+                }
             }
         }
         Some(layers.into())
+    }
+
+    /// Largest member span if every member is an instance with known layers.
+    fn item_instance_lod(items: &[RasterBvhItem]) -> Option<f64> {
+        items.iter().try_fold(0_f64, |span, item| {
+            item.instance_layers.as_ref()?;
+            let width = item.bounds.max_x - item.bounds.min_x;
+            let height = item.bounds.max_y - item.bounds.min_y;
+            Some(span.max(width).max(height))
+        })
     }
 
     fn bounds(&self) -> RasterBvhBounds {
@@ -1411,6 +1602,63 @@ impl RasterBvhNode {
                 lod_bounds_area, ..
             } => *lod_bounds_area,
         }
+    }
+
+    fn instance_lod(&self) -> Option<f64> {
+        match self {
+            Self::Leaf { instance_lod, .. } | Self::Branch { instance_lod, .. } => *instance_lod,
+        }
+    }
+
+    fn max_shape_span(&self) -> Option<(f64, f64)> {
+        match self {
+            Self::Leaf { max_shape_span, .. } | Self::Branch { max_shape_span, .. } => {
+                *max_shape_span
+            }
+        }
+    }
+
+    /// Whether the whole node may be painted as one box per layer.
+    fn collapses_at(&self, max_lod_span: f64) -> bool {
+        let bounds = self.bounds();
+        let width = bounds.max_x - bounds.min_x;
+        let height = bounds.max_y - bounds.min_y;
+        // Gaps inside a single display pixel are not resolvable. Requiring
+        // 75% physical area coverage here made subpixel SRAM wiring descend
+        // to millions of leaves despite contributing the same screen pixel.
+        let pixel_span = max_lod_span / f64::from(GEOMETRY_LOD_SIZE_PX * RASTER_CACHE_RESOLUTION);
+        if self.lod_layers().is_some_and(|layers| layers.len() == 1) {
+            if width <= pixel_span && height <= pixel_span {
+                return true;
+            }
+            // Parallel wires thinner than one interaction pixel are also
+            // indistinguishable when one member spans the long axis. Do not
+            // merge separated short segments merely because the row is thin.
+            if let Some((member_width, member_height)) = self.max_shape_span()
+                && ((height <= pixel_span && width <= member_width + pixel_span)
+                    || (width <= pixel_span && height <= member_height + pixel_span))
+            {
+                return true;
+            }
+        }
+        if width <= max_lod_span && height <= max_lod_span && self.has_dense_single_layer_lod() {
+            return true;
+        }
+        // An array: every member is an instance too small to resolve, the
+        // node is at most a few LOD cells wide, and its members leave less
+        // than one LOD cell of it uncovered. Painting the node's box is then
+        // indistinguishable from painting the members one by one.
+        let Some(item_span) = self.instance_lod() else {
+            return false;
+        };
+        let Some(member_area) = self.lod_bounds_area() else {
+            return false;
+        };
+        let node_span = max_lod_span * INSTANCE_LOD_NODE_SPAN;
+        item_span <= max_lod_span
+            && width <= node_span
+            && height <= node_span
+            && width * height - member_area <= max_lod_span * max_lod_span
     }
 
     fn has_dense_single_layer_lod(&self) -> bool {
@@ -1445,16 +1693,48 @@ impl RasterBvhNode {
                     })
                     .sum()
             });
+            let instance_lod = Self::item_instance_lod(&items);
+            let max_shape_span = items
+                .iter()
+                .try_fold((0_f64, 0_f64), |(width, height), item| {
+                    item.lod_layer.as_ref()?;
+                    Some((
+                        width.max(item.bounds.max_x - item.bounds.min_x),
+                        height.max(item.bounds.max_y - item.bounds.min_y),
+                    ))
+                });
             return Some(Self::Leaf {
                 bounds,
                 items: items.into_boxed_slice(),
                 lod_layers,
                 lod_bounds_area,
+                max_shape_span,
+                instance_lod,
             });
         }
-        let x_axis = bounds.max_x - bounds.min_x >= bounds.max_y - bounds.min_y;
-        items.sort_unstable_by(|a, b| a.bounds.center(x_axis).total_cmp(&b.bounds.center(x_axis)));
-        let right = items.split_off(items.len() / 2);
+        // Split by the spread of object centers, not their full extents.
+        // Long parallel wires can all span the cell horizontally; their
+        // vertical separation is what makes useful culling/LOD partitions.
+        let mut centers = RasterBvhBounds {
+            min_x: f64::INFINITY,
+            min_y: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            max_y: f64::NEG_INFINITY,
+        };
+        for item in &items {
+            let x = item.bounds.center(true);
+            let y = item.bounds.center(false);
+            centers.min_x = centers.min_x.min(x);
+            centers.max_x = centers.max_x.max(x);
+            centers.min_y = centers.min_y.min(y);
+            centers.max_y = centers.max_y.max(y);
+        }
+        let x_axis = centers.max_x - centers.min_x >= centers.max_y - centers.min_y;
+        let midpoint = items.len() / 2;
+        items.select_nth_unstable_by(midpoint, |a, b| {
+            a.bounds.center(x_axis).total_cmp(&b.bounds.center(x_axis))
+        });
+        let right = items.split_off(midpoint);
         let left = Box::new(Self::build(items).expect("non-empty BVH half"));
         let right = Box::new(Self::build(right).expect("non-empty BVH half"));
         let lod_layers = match (left.lod_layers(), right.lod_layers()) {
@@ -1473,15 +1753,26 @@ impl RasterBvhNode {
             .lod_bounds_area()
             .zip(right.lod_bounds_area())
             .map(|(left, right)| left + right);
+        let instance_lod = left
+            .instance_lod()
+            .zip(right.instance_lod())
+            .map(|(left, right)| left.max(right));
+        let max_shape_span = left
+            .max_shape_span()
+            .zip(right.max_shape_span())
+            .map(|((lx, ly), (rx, ry))| (lx.max(rx), ly.max(ry)));
         Some(Self::Branch {
             bounds,
             left,
             right,
             lod_layers,
             lod_bounds_area,
+            max_shape_span,
+            instance_lod,
         })
     }
 
+    #[cfg(test)]
     fn query(&self, query: RasterBvhBounds, output: &mut Vec<usize>) {
         let bounds = self.bounds();
         if !bounds.intersects(query) {
@@ -1508,25 +1799,42 @@ impl RasterBvhNode {
         emits: &mut Vec<usize>,
         occupancies: &mut Vec<RasterLodOccupancy>,
     ) {
+        let _ = self.query_lod_bounded(
+            query,
+            max_lod_span,
+            emits,
+            occupancies,
+            &mut GeometryWorkBudget(usize::MAX),
+        );
+    }
+
+    fn query_lod_bounded(
+        &self,
+        query: RasterBvhBounds,
+        max_lod_span: f64,
+        emits: &mut Vec<usize>,
+        occupancies: &mut Vec<RasterLodOccupancy>,
+        budget: &mut GeometryWorkBudget,
+    ) -> Option<()> {
+        budget.spend(1)?;
         let bounds = self.bounds();
         if !bounds.intersects(query) {
-            return;
+            return Some(());
         }
-        let fits_lod = bounds.max_x - bounds.min_x <= max_lod_span
-            && bounds.max_y - bounds.min_y <= max_lod_span;
-        if fits_lod
-            && self.has_dense_single_layer_lod()
+        if self.collapses_at(max_lod_span)
             && let Some(layers) = self.lod_layers()
         {
+            budget.spend(layers.len())?;
             occupancies.push(RasterLodOccupancy {
                 bounds,
                 layers: layers.clone(),
             });
-            return;
+            return Some(());
         }
         match self {
             Self::Leaf { items, .. } => {
                 for item in items.iter().filter(|item| item.bounds.intersects(query)) {
+                    budget.spend(1)?;
                     let item_fits_lod = item.bounds.max_x - item.bounds.min_x <= max_lod_span
                         && item.bounds.max_y - item.bounds.min_y <= max_lod_span;
                     if item_fits_lod && let Some(layer) = &item.lod_layer {
@@ -1540,16 +1848,44 @@ impl RasterBvhNode {
                 }
             }
             Self::Branch { left, right, .. } => {
-                left.query_lod(query, max_lod_span, emits, occupancies);
-                right.query_lod(query, max_lod_span, emits, occupancies);
+                left.query_lod_bounded(query, max_lod_span, emits, occupancies, budget)?;
+                right.query_lod_bounded(query, max_lod_span, emits, occupancies, budget)?;
             }
         }
+        Some(())
     }
 }
 
 struct RasterScopeBvh {
-    root: Option<RasterBvhNode>,
+    // Interleaved metal/via geometry prevents a mixed-layer BVH from ever
+    // forming dense single-layer LOD nodes. Partition by layer first so a
+    // zoomed-out SRAM reduces to visible footprints rather than leaf shapes.
+    roots: Vec<RasterBvhNode>,
     unbounded: Box<[usize]>,
+}
+
+/// Footprint of every layer drawn anywhere inside one cell, including its
+/// instantiated children, in that cell's own coordinates.
+type CellLayerExtents = Arc<[(SharedString, RasterBvhBounds)]>;
+
+fn extend_layer_extents(
+    extents: &mut IndexMap<SharedString, RasterBvhBounds>,
+    layer: SharedString,
+    bounds: RasterBvhBounds,
+) {
+    extents
+        .entry(layer)
+        .and_modify(|extent| *extent = extent.union(bounds))
+        .or_insert(bounds);
+}
+
+/// Whether an instance is too small on screen to resolve any of its contents.
+/// Such an instance is painted as one occupancy box per layer instead of being
+/// descended into, which bounds the traversal by what is visible rather than by
+/// the size of the hierarchy.
+fn instance_fits_lod(pixel_bounds: Bounds<Pixels>, lod_size: f32) -> bool {
+    f32::from(pixel_bounds.size.width).abs() <= lod_size
+        && f32::from(pixel_bounds.size.height).abs() <= lod_size
 }
 
 struct RasterCellSpatialIndex {
@@ -1557,11 +1893,11 @@ struct RasterCellSpatialIndex {
 }
 
 impl RasterCellSpatialIndex {
-    fn build(solved: &CompileOutputState, cell: CellId) -> Self {
+    fn build(solved: &CompileOutputState, cell: CellId, index: &RasterSpatialIndex) -> Self {
         let mut scopes = HashMap::new();
         let cell_info = &solved.output.cells[&cell];
         for (&scope, scope_info) in &cell_info.scopes {
-            let mut items = Vec::new();
+            let mut items: IndexMap<Option<SharedString>, Vec<RasterBvhItem>> = IndexMap::new();
             let mut unbounded = Vec::new();
             for (emit_index, (object, _)) in scope_info.emit.iter().enumerate() {
                 let value = &cell_info.objects[object];
@@ -1630,12 +1966,29 @@ impl RasterCellSpatialIndex {
                     SolvedValue::Dimension(_) => None,
                     _ => continue,
                 };
+                let mut instance_layers = None;
+                if index.collapse_instances
+                    && let SolvedValue::Instance(instance) = value
+                    && !instance.construction
+                {
+                    let child_extents = index.layer_extents(solved, instance.cell);
+                    instance_layers = Some(
+                        child_extents
+                            .iter()
+                            .map(|(layer, _)| layer.clone())
+                            .collect::<Arc<[SharedString]>>(),
+                    );
+                }
                 if let Some(bounds) = bounds {
-                    items.push(RasterBvhItem {
-                        emit_index,
-                        bounds,
-                        lod_layer,
-                    });
+                    items
+                        .entry(lod_layer.clone())
+                        .or_default()
+                        .push(RasterBvhItem {
+                            emit_index,
+                            bounds,
+                            lod_layer,
+                            instance_layers,
+                        });
                 } else {
                     // An instance without a solved child bbox must remain
                     // queryable; its descendants are clipped normally.
@@ -1645,7 +1998,10 @@ impl RasterCellSpatialIndex {
             scopes.insert(
                 ScopeAddress { cell, scope },
                 RasterScopeBvh {
-                    root: RasterBvhNode::build(items),
+                    roots: items
+                        .into_values()
+                        .filter_map(RasterBvhNode::build)
+                        .collect(),
                     unbounded: unbounded.into_boxed_slice(),
                 },
             );
@@ -1654,57 +2010,207 @@ impl RasterCellSpatialIndex {
     }
 }
 
-#[derive(Default)]
+type RasterLodQuery = (Vec<usize>, Vec<RasterLodOccupancy>);
+
 struct RasterSpatialIndex {
     cells: Mutex<HashMap<CellId, Arc<OnceLock<RasterCellSpatialIndex>>>>,
+    // Coarse footprints do not require sorting every descendant's geometry
+    // into a BVH. Build detailed indexes lazily as those cells become visible.
+    footprints: Mutex<HashMap<CellId, Arc<OnceLock<CellLayerExtents>>>>,
+    /// Whole-instance footprints cannot represent hidden descendants or a
+    /// finite hierarchy cutoff. Those presentations keep instance boundaries.
+    collapse_instances: bool,
+}
+
+impl Default for RasterSpatialIndex {
+    fn default() -> Self {
+        Self {
+            cells: Mutex::default(),
+            footprints: Mutex::default(),
+            collapse_instances: true,
+        }
+    }
 }
 
 impl RasterSpatialIndex {
-    /// Query an index that has already been constructed by the background
-    /// renderer. UI painting must never build a large cell index synchronously.
-    fn query_ready(&self, address: ScopeAddress, bounds: RasterBvhBounds) -> Option<Vec<usize>> {
-        let cell_index = self
+    fn for_presentation(
+        hierarchy_depth: usize,
+        scopes: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+    ) -> Self {
+        Self {
+            collapse_instances: hierarchy_depth == usize::MAX
+                && scopes.is_none_or(|scopes| scopes.values().all(|scope| scope.visible)),
+            ..Self::default()
+        }
+    }
+
+    fn reuse_ready_cells(&mut self, previous: &Self, unchanged: impl Fn(CellId) -> bool) {
+        if self.collapse_instances != previous.collapse_instances {
+            return;
+        }
+        // Clone ready handles under the map lock. Never wait for a OnceLock
+        // that an old worker is still building, or copy any geometry arrays.
+        *self.cells.get_mut().expect("raster spatial index poisoned") = previous
             .cells
             .lock()
             .expect("raster spatial index poisoned")
-            .get(&address.cell)?
-            .clone();
-        let cell_index = cell_index.get()?;
-        let scope = cell_index.scopes.get(&address)?;
-        let mut emits = Vec::new();
-        if let Some(root) = &scope.root {
-            root.query(bounds, &mut emits);
-        }
-        emits.extend_from_slice(&scope.unbounded);
-        emits.sort_unstable();
-        Some(emits)
+            .iter()
+            .filter(|(cell, index)| index.get().is_some() && unchanged(**cell))
+            .map(|(cell, index)| (*cell, index.clone()))
+            .collect();
+        *self
+            .footprints
+            .get_mut()
+            .expect("raster footprints poisoned") = previous
+            .footprints
+            .lock()
+            .expect("raster footprints poisoned")
+            .iter()
+            .filter(|(cell, index)| index.get().is_some() && unchanged(**cell))
+            .map(|(cell, index)| (*cell, index.clone()))
+            .collect();
     }
 
-    /// LOD query for UI painting. Like `query_ready`, this never constructs a
-    /// cell index on the UI thread; the background raster worker owns that
-    /// initialization work.
-    fn query_lod_ready(
+    /// Bounded LOD query for UI painting. A missing index is distinct from
+    /// exhausting the work budget; neither builds an index on the UI thread.
+    fn query_lod_ready_bounded(
         &self,
         address: ScopeAddress,
         bounds: RasterBvhBounds,
         max_lod_span: f64,
-    ) -> Option<(Vec<usize>, Vec<RasterLodOccupancy>)> {
+        budget: &mut GeometryWorkBudget,
+    ) -> Result<Option<RasterLodQuery>, ()> {
         let cell_index = self
             .cells
             .lock()
             .expect("raster spatial index poisoned")
-            .get(&address.cell)?
-            .clone();
-        let cell_index = cell_index.get()?;
-        let scope = cell_index.scopes.get(&address)?;
+            .get(&address.cell)
+            .cloned();
+        let Some(cell_index) = cell_index else {
+            return Ok(None);
+        };
+        let Some(cell_index) = cell_index.get() else {
+            return Ok(None);
+        };
+        let Some(scope) = cell_index.scopes.get(&address) else {
+            return Ok(None);
+        };
         let mut emits = Vec::new();
         let mut occupancies = Vec::new();
-        if let Some(root) = &scope.root {
-            root.query_lod(bounds, max_lod_span, &mut emits, &mut occupancies);
+        for root in &scope.roots {
+            root.query_lod_bounded(bounds, max_lod_span, &mut emits, &mut occupancies, budget)
+                .ok_or(())?;
         }
+        budget.spend(scope.unbounded.len()).ok_or(())?;
         emits.extend_from_slice(&scope.unbounded);
         emits.sort_unstable();
-        Some((emits, occupancies))
+        Ok(Some((emits, occupancies)))
+    }
+
+    /// Build one visible cell's index on a background thread. Its children's
+    /// coarse footprints are sufficient; their detailed BVHs remain lazy.
+    fn cell_index(
+        &self,
+        solved: &CompileOutputState,
+        cell: CellId,
+    ) -> Arc<OnceLock<RasterCellSpatialIndex>> {
+        let cell_index = {
+            let mut cells = self.cells.lock().expect("raster spatial index poisoned");
+            cells
+                .entry(cell)
+                .or_insert_with(|| Arc::new(OnceLock::new()))
+                .clone()
+        };
+        cell_index.get_or_init(|| RasterCellSpatialIndex::build(solved, cell, self));
+        cell_index
+    }
+
+    fn layer_extents(&self, solved: &CompileOutputState, cell: CellId) -> CellLayerExtents {
+        let footprint = {
+            let mut footprints = self.footprints.lock().expect("raster footprints poisoned");
+            footprints
+                .entry(cell)
+                .or_insert_with(|| Arc::new(OnceLock::new()))
+                .clone()
+        };
+        footprint
+            .get_or_init(|| {
+                let mut extents = IndexMap::new();
+                let cell_info = &solved.output.cells[&cell];
+                for scope in cell_info.scopes.values() {
+                    for (object, _) in &scope.emit {
+                        let (layer, bounds) = match &cell_info.objects[object] {
+                            SolvedValue::Instance(instance) if !instance.construction => {
+                                let mut mat = TransformationMatrix::identity();
+                                if instance.reflect {
+                                    mat = mat.reflect_vert();
+                                }
+                                mat = mat.rotate(instance.angle);
+                                for (layer, bounds) in
+                                    self.layer_extents(solved, instance.cell).iter()
+                                {
+                                    extend_layer_extents(
+                                        &mut extents,
+                                        layer.clone(),
+                                        bounds.transformed(mat, (instance.x, instance.y)),
+                                    );
+                                }
+                                continue;
+                            }
+                            SolvedValue::Rect(rect) if !rect.construction => {
+                                let Some(layer) = &rect.layer else { continue };
+                                (
+                                    SharedString::from(layer.to_string()),
+                                    RasterBvhBounds {
+                                        min_x: rect.x0.0.min(rect.x1.0),
+                                        min_y: rect.y0.0.min(rect.y1.0),
+                                        max_x: rect.x0.0.max(rect.x1.0),
+                                        max_y: rect.y0.0.max(rect.y1.0),
+                                    },
+                                )
+                            }
+                            SolvedValue::Polygon(polygon) => {
+                                let Some(bounds) = RasterBvhBounds::from_points(
+                                    polygon.points.iter().map(|(x, y)| (x.0, y.0)),
+                                ) else {
+                                    continue;
+                                };
+                                (SharedString::from(polygon.layer.clone()), bounds)
+                            }
+                            SolvedValue::Path(path) => {
+                                let Some(bbox) = path.bbox() else { continue };
+                                (
+                                    SharedString::from(path.layer.clone()),
+                                    RasterBvhBounds {
+                                        min_x: bbox.x0.min(bbox.x1),
+                                        min_y: bbox.y0.min(bbox.y1),
+                                        max_x: bbox.x0.max(bbox.x1),
+                                        max_y: bbox.y0.max(bbox.y1),
+                                    },
+                                )
+                            }
+                            _ => continue,
+                        };
+                        extend_layer_extents(&mut extents, layer, bounds);
+                    }
+                }
+                extents.into_iter().collect::<Vec<_>>().into()
+            })
+            .clone()
+    }
+
+    /// UI queries never initialize footprints or wait for their construction.
+    fn layer_extents_ready(&self, cell: CellId) -> Option<CellLayerExtents> {
+        if !self.collapse_instances {
+            return None;
+        }
+        let footprint = self
+            .footprints
+            .lock()
+            .expect("raster footprints poisoned")
+            .get(&cell)?
+            .clone();
+        footprint.get().cloned()
     }
 
     fn query_lod(
@@ -1715,21 +2221,14 @@ impl RasterSpatialIndex {
         emit_len: usize,
         max_lod_span: f64,
     ) -> (Vec<usize>, Vec<RasterLodOccupancy>) {
-        let cell_index = {
-            let mut cells = self.cells.lock().expect("raster spatial index poisoned");
-            cells
-                .entry(address.cell)
-                .or_insert_with(|| Arc::new(OnceLock::new()))
-                .clone()
-        };
-        let cell_index =
-            cell_index.get_or_init(|| RasterCellSpatialIndex::build(solved, address.cell));
+        let cell_index = self.cell_index(solved, address.cell);
+        let cell_index = cell_index.get().expect("cell index initialized above");
         let Some(scope) = cell_index.scopes.get(&address) else {
             return ((0..emit_len).collect(), Vec::new());
         };
         let mut emits = Vec::new();
         let mut occupancies = Vec::new();
-        if let Some(root) = &scope.root {
+        for root in &scope.roots {
             root.query_lod(bounds, max_lod_span, &mut emits, &mut occupancies);
         }
         emits.extend_from_slice(&scope.unbounded);
@@ -1750,6 +2249,24 @@ fn raster_viewport_world_bounds(viewport: ViewportTransform) -> RasterBvhBounds 
         max_x: (width - offset_x) / scale,
         max_y: offset_y / scale,
     }
+}
+
+/// Screen (or raster) bounds of a world-space box under a camera transform.
+fn raster_bounds_for_world(
+    bounds: RasterBvhBounds,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Bounds<Pixels> {
+    Bounds::from_corners(
+        Point::new(
+            px(scale * bounds.min_x as f32 + f32::from(offset.x)),
+            px(-scale * bounds.max_y as f32 + f32::from(offset.y)),
+        ),
+        Point::new(
+            px(scale * bounds.max_x as f32 + f32::from(offset.x)),
+            px(-scale * bounds.min_y as f32 + f32::from(offset.y)),
+        ),
+    )
 }
 
 fn raster_scope_query_bounds(
@@ -1774,6 +2291,7 @@ struct RasterRectPrimitive {
     fill: ShapeFill,
     color: Rgba,
     border_color: Rgba,
+    border_styles: Edges<BorderStyle>,
 }
 
 struct RasterPolygonPrimitive {
@@ -2925,6 +3443,55 @@ fn stroke_raster_rect(
     bounds: Bounds<Pixels>,
     color: Rgba,
 ) {
+    stroke_styled_raster_rect(
+        target,
+        width,
+        height,
+        bounds,
+        color,
+        Edges::all(BorderStyle::Solid),
+    );
+}
+
+/// The same 2:1 dash/gap ratio as GPUI, sampled at raster resolution. Anchor
+/// the pattern to the full edge, before clipping, so adjacent tiles and pans
+/// cannot restart dashes at the viewport boundary.
+struct RasterEdgeDashes {
+    origin: f32,
+    period: f32,
+    length: f32,
+}
+
+impl RasterEdgeDashes {
+    fn new(origin: Pixels, extent: Pixels) -> Self {
+        let length = 2. * f32::from(DEFAULT_BORDER_WIDTH) * RASTER_CACHE_RESOLUTION;
+        let available = f32::from(extent) - length;
+        let count = (available / (1.5 * length)).floor();
+        let period = if count >= 1. {
+            available / count
+        } else {
+            available.max(length)
+        };
+        Self {
+            origin: f32::from(origin),
+            period,
+            length,
+        }
+    }
+
+    fn is_on(&self, position: i32) -> bool {
+        (position as f32 + 0.5 - self.origin).rem_euclid(self.period) < self.length
+    }
+}
+
+fn stroke_styled_raster_rect(
+    target: &mut RasterPaintTarget<'_>,
+    width: u32,
+    height: u32,
+    bounds: Bounds<Pixels>,
+    color: Rgba,
+    styles: Edges<BorderStyle>,
+) {
     let Some((x0, x1)) = raster_unclipped_pixel_range(
         f32::from(bounds.origin.x),
         f32::from(bounds.origin.x + bounds.size.width),
@@ -2940,14 +3507,23 @@ fn stroke_raster_rect(
 
     let bottom = y1 - 1;
     let right = x1 - 1;
+    let horizontal = RasterEdgeDashes::new(bounds.origin.x, bounds.size.width);
+    let vertical = RasterEdgeDashes::new(bounds.origin.y, bounds.size.height);
     let clipped_x0 = x0.clamp(0, width as i32);
     let clipped_x1 = x1.clamp(0, width as i32);
     if clipped_x0 < clipped_x1 {
         for x in clipped_x0..clipped_x1 {
-            if y0 >= 0 && y0 < height as i32 {
+            if y0 >= 0
+                && y0 < height as i32
+                && (styles.top == BorderStyle::Solid || horizontal.is_on(x))
+            {
                 target.pixel((y0 as u32 * width + x as u32) as usize, color);
             }
-            if bottom != y0 && bottom >= 0 && bottom < height as i32 {
+            if bottom != y0
+                && bottom >= 0
+                && bottom < height as i32
+                && (styles.bottom == BorderStyle::Solid || horizontal.is_on(x))
+            {
                 target.pixel((bottom as u32 * width + x as u32) as usize, color);
             }
         }
@@ -2956,10 +3532,15 @@ fn stroke_raster_rect(
     let clipped_y0 = (y0 + 1).clamp(0, height as i32);
     let clipped_y1 = bottom.clamp(0, height as i32);
     for y in clipped_y0..clipped_y1 {
-        if x0 >= 0 && x0 < width as i32 {
+        if x0 >= 0 && x0 < width as i32 && (styles.left == BorderStyle::Solid || vertical.is_on(y))
+        {
             target.pixel((y as u32 * width + x0 as u32) as usize, color);
         }
-        if right != x0 && right >= 0 && right < width as i32 {
+        if right != x0
+            && right >= 0
+            && right < width as i32
+            && (styles.right == BorderStyle::Solid || vertical.is_on(y))
+        {
             target.pixel((y as u32 * width + right as u32) as usize, color);
         }
     }
@@ -3125,6 +3706,14 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         f64::from(DEFAULT_BORDER_WIDTH) / viewport.scale.abs() as f64
     };
 
+    let cull_margin = px((query_margin * f64::from(raster_scale.abs())) as f32);
+    let cull_bounds = Bounds::new(
+        Point::new(-cull_margin, -cull_margin),
+        Size::new(
+            local_bounds.size.width + cull_margin * 2.,
+            local_bounds.size.height + cull_margin * 2.,
+        ),
+    );
     let selected = &input.solved_cell.state[&input.solved_cell.selected_scope].address;
     let mut queue = VecDeque::from_iter([(
         ScopeAddress {
@@ -3163,6 +3752,9 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 cvars: None,
             };
             let pixel_bounds = get_rect_bounds(&rect, local_bounds, raster_scale, raster_offset);
+            if depth > 0 && !pixel_bounds.intersects(&cull_bounds) {
+                continue;
+            }
             if depth >= input.hierarchy_depth || !scope_state.visible {
                 if pixel_bounds.intersects(&local_bounds) {
                     scope_rects.push(LabeledBbox {
@@ -3170,6 +3762,40 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                         label: scope_state.name.clone().into(),
                         origin: None,
                     });
+                }
+                continue;
+            }
+            if input.use_spatial_index
+                && input.spatial_index.collapse_instances
+                && depth > 0
+                && scope == cell_info.root
+                && instance_fits_lod(pixel_bounds, geometry_lod_size)
+            {
+                // A screen-unresolvable instance contributes only the
+                // footprint of each of its layers. Descending into it would
+                // visit every shape of a hierarchy that cannot be seen.
+                if pixel_bounds.intersects(&local_bounds) {
+                    for (layer_name, extent) in input
+                        .spatial_index
+                        .layer_extents(&input.solved_cell, cell)
+                        .iter()
+                    {
+                        let Some(layer) =
+                            input.layers.get(layer_name).filter(|layer| layer.visible)
+                        else {
+                            continue;
+                        };
+                        mark_raster_occupancy(
+                            &mut coalesced_fill_occupancy[layer.z],
+                            width,
+                            height,
+                            raster_bounds_for_world(
+                                extent.transformed(mat, ofs),
+                                raster_scale,
+                                raster_offset,
+                            ),
+                        );
+                    }
                 }
                 continue;
             }
@@ -3231,16 +3857,10 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             ((0..scope_info.emit.len()).collect(), Vec::new())
         };
         for occupancy in lod_occupancies {
-            let bounds = occupancy.bounds.transformed(mat, ofs);
-            let raster_bounds = Bounds::from_corners(
-                Point::new(
-                    px(raster_scale * bounds.min_x as f32 + f32::from(raster_offset.x)),
-                    px(-raster_scale * bounds.max_y as f32 + f32::from(raster_offset.y)),
-                ),
-                Point::new(
-                    px(raster_scale * bounds.max_x as f32 + f32::from(raster_offset.x)),
-                    px(-raster_scale * bounds.min_y as f32 + f32::from(raster_offset.y)),
-                ),
+            let raster_bounds = raster_bounds_for_world(
+                occupancy.bounds.transformed(mat, ofs),
+                raster_scale,
+                raster_offset,
             );
             for layer_name in occupancy.layers.iter() {
                 let Some(layer) = input.layers.get(layer_name).filter(|layer| layer.visible) else {
@@ -3312,6 +3932,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                         fill: layer.fill,
                         color: layer.color,
                         border_color: layer.border_color,
+                        border_styles: rectangle_border_styles(rect, &cell_info.unsolved_vars, mat),
                     });
                 }
                 SolvedValue::Polygon(polygon) => {
@@ -3764,12 +4385,13 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
                 }
-                stroke_raster_rect(
+                stroke_styled_raster_rect(
                     &mut outline_target,
                     width,
                     height,
                     primitive.bounds,
                     primitive.border_color,
+                    primitive.border_styles,
                 );
             }
             for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
@@ -3807,12 +4429,13 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 if primitive_index % 256 == 0 && navigation_raster_cancelled(&input) {
                     return None;
                 }
-                stroke_raster_rect(
+                stroke_styled_raster_rect(
                     &mut outline_target,
                     width,
                     height,
                     primitive.bounds,
                     primitive.border_color,
+                    primitive.border_styles,
                 );
             }
             for (primitive_index, primitive) in polygon_layer.iter().enumerate() {
@@ -4259,6 +4882,23 @@ fn raster_tiles_cover_bounds(
         .all(|y| (min_x..=max_x).all(|x| tiles.tiles.contains_key(&RasterTileIndex { x, y })))
 }
 
+/// Paint every retained tile covering the presented camera, including tiles
+/// kept outside the new prefetch ring while a fast pan's replacement loads.
+fn visible_raster_tiles(
+    tiles: &LayoutRasterTileSet,
+    canvas: Bounds<Pixels>,
+    scale: f32,
+    offset: Point<Pixels>,
+) -> Vec<&LayoutRasterCache> {
+    let mut visible = tiles
+        .tiles
+        .iter()
+        .filter(|(_, cache)| raster_bounds(cache, canvas, scale, offset).intersects(&canvas))
+        .collect::<Vec<_>>();
+    visible.sort_unstable_by_key(|(index, _)| (index.y, index.x));
+    visible.into_iter().map(|(_, cache)| cache).collect()
+}
+
 fn raster_tiles_visible_lod_is_scale_safe(
     tiles: &LayoutRasterTileSet,
     canvas: Bounds<Pixels>,
@@ -4415,8 +5055,11 @@ fn paint_should_start_navigation_worker(
     has_solved_layout && raster_cache_enabled && !raster_matches_viewport && !raster_worker_active
 }
 
-fn visible_geometry_uses_raster_cache(select_overview: bool, visible_count: usize) -> bool {
-    select_overview && visible_count >= RASTER_CACHE_GEOMETRY_THRESHOLD
+/// The renderer follows only the density of the visible geometry. Tools and
+/// selections paint their overlays on top of whichever presentation is active,
+/// so activating a tool never swaps renderers.
+fn visible_geometry_uses_raster_cache(visible_count: usize) -> bool {
+    visible_count >= RASTER_CACHE_GEOMETRY_THRESHOLD
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4425,13 +5068,14 @@ struct VisibleGeometryRenderDecision {
     prefetch_raster: bool,
 }
 
-fn visible_geometry_render_decision(
-    select_overview: bool,
-    visible_count: usize,
-) -> VisibleGeometryRenderDecision {
+fn visible_geometry_render_decision(visible_count: usize) -> VisibleGeometryRenderDecision {
+    // Tiles are built only for views that display them. Prefetching them for
+    // medium views and showing them only while the pan button was held made
+    // every pan start and end a visible renderer swap.
+    let use_raster = visible_geometry_uses_raster_cache(visible_count);
     VisibleGeometryRenderDecision {
-        use_raster: visible_geometry_uses_raster_cache(select_overview, visible_count),
-        prefetch_raster: select_overview && visible_count >= RASTER_PREFETCH_GEOMETRY_THRESHOLD,
+        use_raster,
+        prefetch_raster: use_raster,
     }
 }
 
@@ -4545,8 +5189,15 @@ fn visible_geometry_render_decision_indexed(
     let mut queue =
         VecDeque::from_iter([(root, TransformationMatrix::identity(), (0., 0.), 0_usize)]);
     let mut visible = 0_usize;
+    let mut budget = GeometryWorkBudget(UI_GEOMETRY_WORK_LIMIT);
+    let exceeds_ui_budget = Some(visible_geometry_render_decision(
+        RASTER_CACHE_GEOMETRY_THRESHOLD,
+    ));
 
     while let Some((address @ ScopeAddress { cell, scope }, mat, ofs, depth)) = queue.pop_front() {
+        if budget.spend(1).is_none() {
+            return exceeds_ui_budget;
+        }
         let scope_path = solved.scope_paths.get(&address)?;
         let scope_state = solved.state.get(scope_path)?;
         if let Some(bbox) = &scope_state.bbox {
@@ -4563,7 +5214,32 @@ fn visible_geometry_render_decision_indexed(
             if depth >= hierarchy_depth || !scope_state.visible {
                 visible += 1;
                 if visible >= RASTER_CACHE_GEOMETRY_THRESHOLD {
-                    return Some(visible_geometry_render_decision(true, visible));
+                    return Some(visible_geometry_render_decision(visible));
+                }
+                continue;
+            }
+            if spatial_index.collapse_instances
+                && depth > 0
+                && scope == solved.output.cells[&cell].root
+                && instance_fits_lod(
+                    raster_bounds_for_world(bounds, viewport.scale, viewport.offset),
+                    GEOMETRY_LOD_SIZE_PX,
+                )
+            {
+                let extents = if build_missing_indexes {
+                    spatial_index.layer_extents(solved, cell)
+                } else {
+                    spatial_index.layer_extents_ready(cell)?
+                };
+                if budget.spend(extents.len()).is_none() {
+                    return exceeds_ui_budget;
+                }
+                visible += extents
+                    .iter()
+                    .filter(|(name, _)| layers.get(name).is_some_and(|layer| layer.visible))
+                    .count();
+                if visible >= RASTER_CACHE_GEOMETRY_THRESHOLD {
+                    return Some(visible_geometry_render_decision(visible));
                 }
                 continue;
             }
@@ -4573,26 +5249,36 @@ fn visible_geometry_render_decision_indexed(
         let scope_info = &cell_info.scopes[&scope];
         let local_query = raster_scope_query_bounds(world_query, mat, ofs, query_margin);
         let max_lod_span = f64::from(GEOMETRY_LOD_SIZE_PX / viewport.scale.abs().max(f32::EPSILON));
-        let (emit_indices, lod_occupancies) = if build_missing_indexes {
-            spatial_index.query_lod(
-                solved,
-                address,
-                local_query,
-                scope_info.emit.len(),
-                max_lod_span,
-            )
-        } else {
-            spatial_index.query_lod_ready(address, local_query, max_lod_span)?
+        if build_missing_indexes {
+            spatial_index.cell_index(solved, cell);
+        }
+        let (emit_indices, lod_occupancies) = match spatial_index.query_lod_ready_bounded(
+            address,
+            local_query,
+            max_lod_span,
+            &mut budget,
+        ) {
+            Ok(result) => result?,
+            Err(()) => return exceeds_ui_budget,
         };
+        if budget
+            .spend(lod_occupancies.iter().map(|lod| lod.layers.len()).sum())
+            .is_none()
+        {
+            return exceeds_ui_budget;
+        }
         visible += lod_occupancies
             .iter()
             .flat_map(|occupancy| occupancy.layers.iter())
             .filter(|name| layers.get(*name).is_some_and(|layer| layer.visible))
             .count();
         if visible >= RASTER_CACHE_GEOMETRY_THRESHOLD {
-            return Some(visible_geometry_render_decision(true, visible));
+            return Some(visible_geometry_render_decision(visible));
         }
         for emit_index in emit_indices {
+            if budget.spend(1).is_none() {
+                return exceeds_ui_budget;
+            }
             let (object, _) = &scope_info.emit[emit_index];
             match &cell_info.objects[object] {
                 SolvedValue::Rect(rect) if !rect.construction => {
@@ -4603,6 +5289,9 @@ fn visible_geometry_render_decision_indexed(
                     }
                 }
                 SolvedValue::Polygon(polygon) => {
+                    if budget.spend(polygon.points.len()).is_none() {
+                        return exceeds_ui_budget;
+                    }
                     if layers
                         .get(polygon.layer.as_str())
                         .is_some_and(|layer| layer.visible)
@@ -4611,6 +5300,9 @@ fn visible_geometry_render_decision_indexed(
                     }
                 }
                 SolvedValue::Path(path) => {
+                    if budget.spend(path.points.len()).is_none() {
+                        return exceeds_ui_budget;
+                    }
                     if layers
                         .get(path.layer.as_str())
                         .is_some_and(|layer| layer.visible)
@@ -4638,8 +5330,11 @@ fn visible_geometry_render_decision_indexed(
                 _ => {}
             }
             if visible >= RASTER_CACHE_GEOMETRY_THRESHOLD {
-                return Some(visible_geometry_render_decision(true, visible));
+                return Some(visible_geometry_render_decision(visible));
             }
+        }
+        if budget.spend(scope_info.children.len()).is_none() {
+            return exceeds_ui_budget;
         }
         queue.extend(scope_info.children.iter().map(|scope| {
             (
@@ -4653,7 +5348,27 @@ fn visible_geometry_render_decision_indexed(
             )
         }));
     }
-    Some(visible_geometry_render_decision(true, visible))
+    Some(visible_geometry_render_decision(visible))
+}
+
+/// Classify a state change for the retained raster. A recompile always
+/// produces a new scope-state table alongside its output, so that pair is a
+/// geometry edit; a scope-state change on its own is a visibility toggle.
+fn raster_presentation_change(
+    presentation_changed: bool,
+    output_changed: bool,
+    scope_state_changed: bool,
+    had_output: bool,
+) -> RasterPresentationChange {
+    if presentation_changed || (output_changed && !had_output) {
+        RasterPresentationChange::Presentation
+    } else if output_changed {
+        RasterPresentationChange::Geometry
+    } else if scope_state_changed {
+        RasterPresentationChange::Presentation
+    } else {
+        RasterPresentationChange::None
+    }
 }
 
 fn sort_initial_condition_pair(
@@ -5105,6 +5820,11 @@ impl Element for CanvasElement {
         cx: &mut gpui::App,
     ) {
         let stale_images = self.inner.update(cx, |inner, _| {
+            #[cfg(test)]
+            {
+                inner.painted_complete_frame = false;
+                inner.painted_rectangle_previews.clear();
+            }
             std::mem::take(&mut inner.raster_images_to_drop)
         });
         for image in stale_images {
@@ -5144,386 +5864,78 @@ impl Element for CanvasElement {
         let state = inner.state.read(cx);
         let pattern_tiles = inner.pattern_tiles.clone();
         let tool = state.tool.read(cx).clone();
-        let select_overview = matches!(
-            &tool,
-            ToolState::Select(SelectToolState { selected_obj: None })
-        );
-        let activity_animation_active = state.rendering
-            || !state.compilation_activities.is_empty()
-            || !state.snapshot_preparations.is_empty();
-        let activity_raster_available = activity_animation_active
-            && inner.raster_tiles.as_ref().is_some_and(|tiles| {
-                tiles.content_revision == inner.raster_content_revision
-                    && tiles.screen_viewport == bounds.size
-            });
-        let use_prefetched_pan_raster = inner.raster_prefetch_enabled
-            && (inner.is_dragging || inner.keyboard_pan_active)
-            && inner.raster_tiles_cover_canvas();
         let coalesced_lod_display = inner.raster_tiles.as_ref().and_then(|tiles| {
             (raster_tiles_visible_lod_is_scale_safe(tiles, bounds, inner.scale, inner.offset))
                 .then(|| inner.raster_display_transform_for_current_view())
                 .flatten()
         });
-        let use_raster_cache = (inner.raster_cache_enabled
-            || use_prefetched_pan_raster
-            || activity_raster_available
-            || coalesced_lod_display.is_some())
-            && (inner.navigation_cache_active
-                || select_overview
-                || matches!(&tool, ToolState::DrawRect(_) | ToolState::PlaceInstance(_)));
         // Retained cameras may lag a gesture, but the submitted tile field
         // must cover the complete viewport. When the requested camera would
         // expose an unfinished edge, keep the last covered camera until a
         // closer full-screen raster is ready.
         let previous_presentation = inner.last_presented_raster.get();
+        let retained_direct = inner
+            .retained_direct_frame
+            .as_ref()
+            .filter(|frame| {
+                frame.viewport == bounds.size
+                    && inner.raster_revision_displayable(frame.content_revision)
+            })
+            .cloned();
         let tile_candidate = inner
             .raster_tiles
             .clone()
             .filter(|tiles| {
-                tiles.content_revision == inner.raster_content_revision
+                inner.raster_revision_displayable(tiles.content_revision)
                     && tiles.screen_viewport == bounds.size
             })
             .and_then(|tiles| {
-                let capture = navigation_raster_capture_transform(&tiles);
+                // Only advance to the exact requested camera once that LOD
+                // covers the viewport. A capture-centered intermediate or a
+                // scaled old LOD creates another visible handoff after input
+                // stops. Keep the last presented camera until the final one.
+                let requested = (tiles.scale == inner.scale).then_some(RasterDisplayTransform {
+                    scale: inner.scale,
+                    offset: inner.offset,
+                });
+                let initial = (previous_presentation.is_none() && retained_direct.is_none())
+                    .then(|| navigation_raster_capture_transform(&tiles));
                 let display = best_covered_raster_display(
                     &tiles,
                     bounds,
-                    [
-                        coalesced_lod_display.or(inner.raster_display),
-                        previous_presentation,
-                        Some(capture),
-                    ]
-                    .into_iter()
-                    .flatten(),
+                    [requested, previous_presentation, initial]
+                        .into_iter()
+                        .flatten(),
                     previous_presentation,
                     inner.scale,
                     inner.offset,
                 )?;
                 Some((tiles, display))
             });
-        if use_raster_cache && let Some((tiles, display)) = tile_candidate {
-            inner.last_presented_raster.set(Some(display));
-            let theme = state.theme();
-            let bg_style = inner.bg_style.clone();
-            let scale = display.scale;
-            let offset = display.offset;
-            let origin_coords = offset + bounds.origin;
-            let navigation_cache_active = inner.navigation_cache_active;
-            let hover_hit = (!navigation_cache_active && coalesced_lod_display.is_none())
-                .then(|| inner.hover_hit.clone())
-                .flatten();
-            let layout_mouse_position = inner.px_to_layout(inner.mouse_position);
-            let grid = solved_cell
-                .as_ref()
-                .map(|cell| cell.output.tech.grid_step())
-                .unwrap_or(0.1);
-            let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
-            let draw_rect_preview =
-                if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool {
-                    let layers = state.layers.read(cx);
-                    layers
-                        .selected_layer
-                        .as_ref()
-                        .and_then(|name| layers.layers.get(name))
-                        .filter(|layer| layer.visible)
-                        .map(|layer| {
-                            (
-                                Rect {
-                                    object_path: Vec::new(),
-                                    x0: p0.x.min(snapped_layout_mouse_position.x),
-                                    y0: p0.y.min(snapped_layout_mouse_position.y),
-                                    x1: p0.x.max(snapped_layout_mouse_position.x),
-                                    y1: p0.y.max(snapped_layout_mouse_position.y),
-                                    id: None,
-                                    border_widths: Edges::all(SELECT_WIDTH),
-                                    border_styles: Edges::all(BorderStyle::Dashed),
-                                    cvars: None,
-                                },
-                                layer.clone(),
-                            )
-                        })
-                } else {
-                    None
-                };
-            let mut transient_preview_image = None;
-            bg_style.paint(bounds, window, cx, |window, cx| {
-                window.paint_layer(bounds, |window| {
-                    window.paint_quad(get_paint_path(
-                        Bounds::new(
-                            Point::new(origin_coords.x, bounds.origin.y),
-                            Size::new(px(0.), bounds.size.height),
-                        ),
-                        theme.axes,
-                        DEFAULT_BORDER_WIDTH,
-                    ));
-                    window.paint_quad(get_paint_path(
-                        Bounds::new(
-                            Point::new(bounds.origin.x, origin_coords.y),
-                            Size::new(bounds.size.width, px(0.)),
-                        ),
-                        theme.axes,
-                        DEFAULT_BORDER_WIDTH,
-                    ));
-                    let visible_tiles = navigation_tile_order(tiles.center)
-                        .into_iter()
-                        .filter_map(|index| tiles.tiles.get(&index))
-                        .filter(|cache| {
-                            raster_bounds(cache, bounds, scale, offset).intersects(&bounds)
-                        })
-                        .collect::<Vec<_>>();
-                    for cache in &visible_tiles {
-                        window
-                            .paint_image(
-                                raster_bounds(cache, bounds, scale, offset),
-                                Corners::all(px(0.)),
-                                cache.image.clone(),
-                                0,
-                                false,
-                            )
-                            .unwrap();
-                    }
-                    if let Some((font_size, line_height)) =
-                        layout_text_metrics(scale, TEXT_LAYOUT_SIZE)
-                    {
-                        let mut painted = HashSet::new();
-                        for label in visible_tiles.iter().flat_map(|cache| cache.texts.iter()) {
-                            let key = (
-                                label.position.x.to_bits(),
-                                label.position.y.to_bits(),
-                                label.layer.z,
-                                label.text.clone(),
-                            );
-                            if !painted.insert(key) {
-                                continue;
-                            }
-                            let runs = &[TextRun {
-                                len: label.text.len(),
-                                font: window.text_style().font(),
-                                color: label.layer.border_color.into(),
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            }];
-                            window
-                                .text_system()
-                                .shape_line(label.text.clone(), font_size, runs, None)
-                                .paint(
-                                    Point::new(
-                                        scale * px(label.position.x),
-                                        scale * px(-label.position.y),
-                                    ) + offset
-                                        + bounds.origin,
-                                    line_height,
-                                    window,
-                                    cx,
-                                )
-                                .unwrap();
-                        }
-                    }
-                    if let Some((font_size, line_height)) =
-                        layout_text_metrics(scale, SCOPE_TEXT_LAYOUT_SIZE)
-                    {
-                        let mut painted = HashSet::new();
-                        for bbox in visible_tiles
-                            .iter()
-                            .flat_map(|cache| cache.scope_labels.iter())
-                        {
-                            let key = (
-                                bbox.rect.x0.to_bits(),
-                                bbox.rect.y0.to_bits(),
-                                bbox.rect.x1.to_bits(),
-                                bbox.rect.y1.to_bits(),
-                                bbox.label.clone(),
-                            );
-                            if !painted.insert(key) {
-                                continue;
-                            }
-                            let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset)
-                                .origin
-                                + Point::new(px(4.), px(2.));
-                            let runs = &[TextRun {
-                                len: bbox.label.len(),
-                                font: window.text_style().font(),
-                                color: theme.text.into(),
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            }];
-                            window
-                                .text_system()
-                                .shape_line(bbox.label.clone(), font_size, runs, None)
-                                .paint(text_origin, line_height, window, cx)
-                                .unwrap();
-                        }
-                    }
-                    if let Some((preview, layer)) = &draw_rect_preview {
-                        let preview_bounds = get_rect_bounds(preview, bounds, scale, offset);
-                        let (preview_fill, preview_color) = shape_fill_for_screen_extent(
-                            layer.fill,
-                            layer.color,
-                            preview_bounds.size,
-                        );
-                        if let ShapeFill::Pattern(pattern) = preview_fill {
-                            paint_tiled_pattern_rect(
-                                window,
-                                preview_bounds,
-                                bounds,
-                                pattern,
-                                cached_pattern_tile(&pattern_tiles, pattern, preview_color),
-                                raster_stipple_phase(Point::new(
-                                    offset.x * RASTER_CACHE_RESOLUTION,
-                                    offset.y * RASTER_CACHE_RESOLUTION,
-                                )),
-                            );
-                            window.paint_quad(get_paint_quad(
-                                preview_bounds,
-                                ShapeFill::Hollow,
-                                preview_color,
-                                rgb(0xffff00),
-                                preview.border_widths,
-                                preview.border_styles,
-                            ));
-                        } else if let Some((image_bounds, image)) =
-                            rasterized_patterned_rect_preview(
-                                preview_bounds,
-                                bounds,
-                                preview_fill,
-                                preview_color,
-                                raster_stipple_phase(Point::new(
-                                    offset.x * RASTER_CACHE_RESOLUTION,
-                                    offset.y * RASTER_CACHE_RESOLUTION,
-                                )),
-                            )
-                        {
-                            window
-                                .paint_image(
-                                    image_bounds,
-                                    Corners::all(px(0.)),
-                                    image.clone(),
-                                    0,
-                                    false,
-                                )
-                                .unwrap();
-                            transient_preview_image = Some(image);
-                            window.paint_quad(get_paint_quad(
-                                preview_bounds,
-                                ShapeFill::Hollow,
-                                preview_color,
-                                rgb(0xffff00),
-                                preview.border_widths,
-                                preview.border_styles,
-                            ));
-                        } else {
-                            window.paint_quad(get_paint_quad(
-                                preview_bounds,
-                                preview_fill,
-                                preview_color,
-                                rgb(0xffff00),
-                                preview.border_widths,
-                                preview.border_styles,
-                            ));
-                        }
-                    }
-                    if let ToolState::PlaceInstance(placement) = &tool {
-                        let translation = (
-                            snapped_layout_mouse_position.x as f64,
-                            snapped_layout_mouse_position.y as f64,
-                        );
-                        for rect in &placement.rects {
-                            let rect =
-                                rect.transform(TransformationMatrix::identity(), translation);
-                            window.paint_quad(get_paint_quad(
-                                get_rect_bounds(&rect, bounds, scale, offset),
-                                ShapeFill::Solid,
-                                Rgba {
-                                    a: 0.,
-                                    ..rgb(0xffff00)
-                                },
-                                rgb(0xffff00),
-                                rect.border_widths,
-                                rect.border_styles,
-                            ));
-                        }
-                        for polygon in &placement.polygons {
-                            let polygon =
-                                polygon.transform(TransformationMatrix::identity(), translation);
-                            let points = polygon
-                                .points
-                                .iter()
-                                .map(|point| {
-                                    Point::new(scale * px(point.x), scale * px(-point.y))
-                                        + offset
-                                        + bounds.origin
-                                })
-                                .collect::<Vec<_>>();
-                            let mut border = PathBuilder::stroke(DEFAULT_BORDER_WIDTH);
-                            border.add_polygon(&points, true);
-                            if let Ok(path) = border.build() {
-                                window.paint_path(path, rgb(0xffff00));
-                            }
-                        }
-                    }
-                    if let Some(hit) = hover_hit {
-                        match hit.outline {
-                            SelectionOutline::Rect {
-                                bounds,
-                                border_styles,
-                            } => window.paint_quad(get_paint_quad(
-                                bounds,
-                                ShapeFill::Solid,
-                                Rgba {
-                                    a: 0.,
-                                    ..rgb(0xffff00)
-                                },
-                                rgb(0xffff00),
-                                Edges::all(SELECT_WIDTH),
-                                border_styles,
-                            )),
-                            SelectionOutline::Polygon {
-                                points,
-                                edge_styles,
-                            } => paint_polygon_border(
-                                window,
-                                &points,
-                                &edge_styles,
-                                SELECT_WIDTH,
-                                rgb(0xffff00),
-                            ),
-                            SelectionOutline::Polyline {
-                                points,
-                                segment_styles,
-                            } => paint_polyline(
-                                window,
-                                &points,
-                                &segment_styles,
-                                SELECT_WIDTH,
-                                rgb(0xffff00),
-                            ),
-                        }
-                    }
-                });
-            });
-            if let Some(image) = transient_preview_image {
-                let canvas = self.inner.clone();
-                cx.defer(move |cx| {
-                    canvas.update(cx, |inner, _| inner.raster_images_to_drop.push(image));
-                });
+        // The presentation follows the density decision alone. Tools,
+        // selections, drags, and edits paint their overlays on top of it, so
+        // none of them can swap renderers and flash a different rendition of
+        // the same geometry.
+        let mut presentation = match tile_candidate.clone() {
+            Some((tiles, display)) if inner.raster_cache_enabled => {
+                Presentation::Raster { tiles, display }
             }
-            return;
-        }
-        if activity_animation_active
-            && inner.raster_tiles.is_none()
-            && (inner.raster_decision_refinement.is_some() || inner.raster_worker_active)
-        {
+            _ => Presentation::Direct,
+        };
+        let mut shallow = matches!(presentation, Presentation::Raster { .. });
+        let awaiting_first_raster = !shallow
+            && inner.raster_cache_enabled
+            && (inner.raster_decision_refinement.is_some() || inner.raster_worker_active);
+        let mut replay_direct = awaiting_first_raster
+            .then(|| retained_direct.clone())
+            .flatten();
+        if awaiting_first_raster && replay_direct.is_none() {
             // A new hierarchy is still being classified or rasterized. Keep
             // the window responsive (including the status spinner) instead of
             // flattening that hierarchy synchronously in this paint pass.
             inner.bg_style.clone().paint(bounds, window, cx, |_, _| {});
             return;
         }
-        // Direct geometry is already at the requested camera. Once it has
-        // been shown, no older retained raster may replace it.
-        inner.last_presented_raster.set(None);
         let layers = state.layers.read(cx);
         let mut sse_dv = None;
 
@@ -5543,197 +5955,232 @@ impl Element for CanvasElement {
             .map(|cell| cell.output.tech.grid_step())
             .unwrap_or(0.1);
         let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
-        if let Some(solved_cell) = solved_cell {
-            let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
-            let editable_cell = &solved_cell.output.cells[&scope_address.cell];
-            if inner.is_sse_dragging || inner.is_sse_persisting {
-                sse_dv = inner.sse_drag_delta(editable_cell);
+        let mut budget = GeometryWorkBudget(UI_GEOMETRY_WORK_LIMIT);
+        let collected = (|| -> Option<()> {
+            if let Some(frame) = &replay_direct {
+                rects = frame.rects.clone();
+                polygons = frame.polygons.clone();
+                texts = frame.texts.clone();
+                dims = frame.dims.clone();
+                scope_rects = frame.scope_rects.clone();
+                return Some(());
             }
-            let direct_world_query = raster_viewport_world_bounds(ViewportTransform {
-                size: bounds.size,
-                screen_size: bounds.size,
-                scale: inner.scale,
-                offset: inner.offset,
-            });
-            let direct_query_margin =
-                MAX_TEXT_PX as f64 / inner.scale.abs().max(f32::EPSILON) as f64;
-            let mut queue = VecDeque::from_iter([(
-                ScopeAddress {
-                    cell: scope_address.cell,
-                    scope: if *hide_external_geometry {
-                        scope_address.scope
-                    } else {
-                        solved_cell.output.cells[&scope_address.cell].root
-                    },
-                },
-                TransformationMatrix::identity(),
-                (0., 0.),
-                0,
-                true,
-                vec![],
-            )]);
-            while let Some((
-                curr_address @ ScopeAddress { scope, cell },
-                mat,
-                ofs,
-                depth,
-                show,
-                path,
-            )) = queue.pop_front()
-            {
-                let cell_info = &solved_cell.output.cells[&cell];
-                let scope_info = &cell_info.scopes[&scope];
-                let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
-                if let Some(bbox) = &scope_state.bbox {
-                    let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
-                    let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
-                    let rect = Rect {
-                        x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
-                        y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
-                        x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
-                        y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                        id: Some(scope_info.span.clone()),
-                        object_path: Vec::new(),
-                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                        border_styles: Edges::all(BorderStyle::Solid),
-                        cvars: None,
-                    };
-                    let pixel_bounds = get_rect_bounds(&rect, bounds, inner.scale, inner.offset);
-                    if depth > 0 && !pixel_bounds.intersects(&bounds) {
-                        continue;
-                    }
-                    if depth >= state.hierarchy_depth || !scope_state.visible {
-                        if let ToolState::Select(SelectToolState { selected_obj }) = &tool
-                            && &rect.id == selected_obj
-                        {
-                            select_rects.push(Rect {
-                                border_widths: Edges::all(SELECT_WIDTH),
-                                ..rect.clone()
-                            });
-                        }
-                        if show {
-                            scope_rects.push(LabeledBbox {
-                                rect,
-                                label: scope_info.name.clone().into(),
-                                origin: None,
-                            });
-                        }
-                        continue;
-                    }
+            if let Some(solved_cell) = solved_cell {
+                let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
+                let editable_cell = &solved_cell.output.cells[&scope_address.cell];
+                if inner.is_sse_dragging || inner.is_sse_persisting {
+                    sse_dv = inner.sse_drag_delta(editable_cell);
                 }
-                let (emit_indices, lod_occupancies) = if sse_dv.is_some() || !select_overview {
-                    (
-                        if sse_dv.is_some() {
-                            (0..scope_info.emit.len()).collect()
+                let direct_world_query = raster_viewport_world_bounds(ViewportTransform {
+                    size: bounds.size,
+                    screen_size: bounds.size,
+                    scale: inner.scale,
+                    offset: inner.offset,
+                });
+                let direct_query_margin =
+                    MAX_TEXT_PX as f64 / inner.scale.abs().max(f32::EPSILON) as f64;
+                let mut queue = VecDeque::from_iter([(
+                    ScopeAddress {
+                        cell: scope_address.cell,
+                        scope: if *hide_external_geometry {
+                            scope_address.scope
                         } else {
-                            let local_query = raster_scope_query_bounds(
-                                direct_world_query,
-                                mat,
-                                ofs,
-                                direct_query_margin,
-                            );
-                            inner
-                                .raster_spatial_index
-                                .query_ready(curr_address, local_query)
-                                .unwrap_or_else(|| (0..scope_info.emit.len()).collect())
+                            solved_cell.output.cells[&scope_address.cell].root
                         },
-                        Vec::new(),
-                    )
-                } else {
-                    let local_query = raster_scope_query_bounds(
-                        direct_world_query,
-                        mat,
-                        ofs,
-                        direct_query_margin,
-                    );
-                    inner
-                        .raster_spatial_index
-                        .query_lod_ready(
-                            curr_address,
-                            local_query,
-                            f64::from(GEOMETRY_LOD_SIZE_PX / inner.scale.abs().max(f32::EPSILON)),
-                        )
-                        .unwrap_or_else(|| ((0..scope_info.emit.len()).collect(), Vec::new()))
-                };
-                for occupancy in lod_occupancies {
-                    let bounds = occupancy.bounds.transformed(mat, ofs);
-                    let rect = Rect {
-                        x0: bounds.min_x as f32,
-                        y0: bounds.min_y as f32,
-                        x1: bounds.max_x as f32,
-                        y1: bounds.max_y as f32,
-                        id: None,
-                        object_path: Vec::new(),
-                        border_widths: Edges::all(px(0.)),
-                        border_styles: Edges::all(BorderStyle::Solid),
-                        cvars: None,
-                    };
-                    for layer_name in occupancy.layers.iter() {
-                        let Some(layer) =
-                            layers.layers.get(layer_name).filter(|layer| layer.visible)
-                        else {
-                            continue;
-                        };
-                        let lod_color = layer_lod_color(layer);
-                        let mut layer = layer.clone();
-                        layer.fill = ShapeFill::Solid;
-                        layer.color = lod_color;
-                        layer.border_color = lod_color;
-                        rects.push((rect.clone(), layer));
+                    },
+                    TransformationMatrix::identity(),
+                    (0., 0.),
+                    0,
+                    true,
+                    vec![],
+                )]);
+                while let Some((
+                    curr_address @ ScopeAddress { scope, cell },
+                    mat,
+                    ofs,
+                    depth,
+                    show,
+                    path,
+                )) = queue.pop_front()
+                {
+                    budget.spend(1)?;
+                    let cell_info = &solved_cell.output.cells[&cell];
+                    let scope_info = &cell_info.scopes[&scope];
+                    let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
+                    if shallow && depth > 0 && scope == cell_info.root {
+                        // Retained tiles already show every expanded instance and
+                        // the outlines of collapsed ones. Only the editable cell's
+                        // own objects are collected, so tools can hit-test and
+                        // outline them on top of the image without walking the
+                        // hierarchy the image was built from.
+                        continue;
                     }
-                }
-                for emit_index in emit_indices {
-                    let (obj, _) = &scope_info.emit[emit_index];
-                    let mut object_path = path.clone();
-                    object_path.push(*obj);
-                    let value = &cell_info.objects[obj];
-                    match value {
-                        SolvedValue::Rect(rect) => {
-                            if depth == 0
-                                && let Some(span) = &rect.span
+                    if let Some(bbox) = &scope_state.bbox {
+                        let p0p = ifmatvec(mat, (bbox.x0, bbox.y0));
+                        let p1p = ifmatvec(mat, (bbox.x1, bbox.y1));
+                        let rect = Rect {
+                            x0: (p0p.0.min(p1p.0) + ofs.0) as f32,
+                            y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
+                            x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
+                            y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
+                            id: Some(scope_info.span.clone()),
+                            object_path: Vec::new(),
+                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                            border_styles: Edges::all(BorderStyle::Solid),
+                            cvars: None,
+                        };
+                        let pixel_bounds =
+                            get_rect_bounds(&rect, bounds, inner.scale, inner.offset);
+                        if depth > 0 && !pixel_bounds.intersects(&bounds) {
+                            continue;
+                        }
+                        if depth >= state.hierarchy_depth || !scope_state.visible {
+                            if let ToolState::Select(SelectToolState { selected_obj }) = &tool
+                                && &rect.id == selected_obj
                             {
-                                source_coordinates.insert(
-                                    span.clone(),
-                                    [
-                                        (&rect.x0, "x0i"),
-                                        (&rect.x1, "x1i"),
-                                        (&rect.y0, "y0i"),
-                                        (&rect.y1, "y1i"),
-                                    ]
-                                    .into_iter()
-                                    .map(|(coordinate, name)| {
-                                        (coordinate.1.clone(), name.to_owned(), coordinate.0)
-                                    })
-                                    .collect(),
-                                );
+                                select_rects.push(Rect {
+                                    border_widths: Edges::all(SELECT_WIDTH),
+                                    ..rect.clone()
+                                });
                             }
-                            let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
-                            let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
-                            let layer = rect
-                                .layer
-                                .as_ref()
-                                .and_then(|layer| layers.layers.get(layer.as_str()));
-                            if let Some(layer) = layer
-                                && !rect.construction
-                            {
-                                let (sse_dx0, sse_dx1, sse_dy0, sse_dy1) = if let Some(ref sse_dv) =
-                                    sse_dv
+                            if show {
+                                scope_rects.push(LabeledBbox {
+                                    rect,
+                                    label: scope_info.name.clone().into(),
+                                    origin: None,
+                                });
+                            }
+                            continue;
+                        }
+                        if depth > 0
+                            && scope == cell_info.root
+                            && instance_fits_lod(pixel_bounds, GEOMETRY_LOD_SIZE_PX)
+                            && let Some(extents) =
+                                inner.raster_spatial_index.layer_extents_ready(cell)
+                        {
+                            // A screen-unresolvable instance is one box per layer.
+                            // Descending into it would visit every shape of a
+                            // hierarchy that cannot be seen.
+                            if show {
+                                budget.spend(extents.len())?;
+                                for (layer_name, extent) in extents.iter() {
+                                    let Some(layer) =
+                                        layers.layers.get(layer_name).filter(|layer| layer.visible)
+                                    else {
+                                        continue;
+                                    };
+                                    rects.push(lod_box(extent.transformed(mat, ofs), layer));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // The same screen-space LOD applies whichever tool is active.
+                    // Switching to exact geometry for a selection or a drawing tool
+                    // repainted every dense layer in a different rendition.
+                    let (emit_indices, lod_occupancies) = if sse_dv.is_some() && depth == 0 {
+                        // A drag moves the editable cell's solved coordinates, so
+                        // its static index cannot cull; every object is visited.
+                        budget.spend(scope_info.emit.len())?;
+                        ((0..scope_info.emit.len()).collect(), Vec::new())
+                    } else {
+                        let local_query = raster_scope_query_bounds(
+                            direct_world_query,
+                            mat,
+                            ofs,
+                            direct_query_margin,
+                        );
+                        inner
+                            .raster_spatial_index
+                            .query_lod_ready_bounded(
+                                curr_address,
+                                local_query,
+                                f64::from(
+                                    GEOMETRY_LOD_SIZE_PX / inner.scale.abs().max(f32::EPSILON),
+                                ),
+                                &mut budget,
+                            )
+                            .ok()?
+                            .or_else(|| {
+                                budget.spend(scope_info.emit.len())?;
+                                Some(((0..scope_info.emit.len()).collect(), Vec::new()))
+                            })?
+                    };
+                    for occupancy in lod_occupancies.iter().filter(|_| show) {
+                        let bounds = occupancy.bounds.transformed(mat, ofs);
+                        budget.spend(occupancy.layers.len())?;
+                        for layer_name in occupancy.layers.iter() {
+                            let Some(layer) =
+                                layers.layers.get(layer_name).filter(|layer| layer.visible)
+                            else {
+                                continue;
+                            };
+                            rects.push(lod_box(bounds, layer));
+                        }
+                    }
+                    for emit_index in emit_indices {
+                        budget.spend(1)?;
+                        let (obj, _) = &scope_info.emit[emit_index];
+                        let mut object_path = path.clone();
+                        object_path.push(*obj);
+                        let value = &cell_info.objects[obj];
+                        match value {
+                            SolvedValue::Rect(rect) => {
+                                if depth == 0
+                                    && let Some(span) = &rect.span
                                 {
-                                    if depth == 0 {
-                                        (
-                                            crate::sse::dot(&SparseVec::from(&rect.x0.1), sse_dv),
-                                            crate::sse::dot(&SparseVec::from(&rect.x1.1), sse_dv),
-                                            crate::sse::dot(&SparseVec::from(&rect.y0.1), sse_dv),
-                                            crate::sse::dot(&SparseVec::from(&rect.y1.1), sse_dv),
-                                        )
-                                    } else {
-                                        (0., 0., 0., 0.)
-                                    }
-                                } else {
-                                    (0., 0., 0., 0.)
-                                };
-                                let rect =
-                                    Rect {
+                                    source_coordinates.insert(
+                                        span.clone(),
+                                        [
+                                            (&rect.x0, "x0i"),
+                                            (&rect.x1, "x1i"),
+                                            (&rect.y0, "y0i"),
+                                            (&rect.y1, "y1i"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(coordinate, name)| {
+                                            (coordinate.1.clone(), name.to_owned(), coordinate.0)
+                                        })
+                                        .collect(),
+                                    );
+                                }
+                                let p0p = ifmatvec(mat, (rect.x0.0, rect.y0.0));
+                                let p1p = ifmatvec(mat, (rect.x1.0, rect.y1.0));
+                                let layer = rect
+                                    .layer
+                                    .as_ref()
+                                    .and_then(|layer| layers.layers.get(layer.as_str()));
+                                if let Some(layer) = layer
+                                    && !rect.construction
+                                {
+                                    let (sse_dx0, sse_dx1, sse_dy0, sse_dy1) =
+                                        if let Some(ref sse_dv) = sse_dv {
+                                            if depth == 0 {
+                                                (
+                                                    crate::sse::dot(
+                                                        &SparseVec::from(&rect.x0.1),
+                                                        sse_dv,
+                                                    ),
+                                                    crate::sse::dot(
+                                                        &SparseVec::from(&rect.x1.1),
+                                                        sse_dv,
+                                                    ),
+                                                    crate::sse::dot(
+                                                        &SparseVec::from(&rect.y0.1),
+                                                        sse_dv,
+                                                    ),
+                                                    crate::sse::dot(
+                                                        &SparseVec::from(&rect.y1.1),
+                                                        sse_dv,
+                                                    ),
+                                                )
+                                            } else {
+                                                (0., 0., 0., 0.)
+                                            }
+                                        } else {
+                                            (0., 0., 0., 0.)
+                                        };
+                                    let rect = Rect {
                                         x0: (p0p.0.min(p1p.0) + ofs.0 + sse_dx0) as f32,
                                         y0: (p0p.1.min(p1p.1) + ofs.1 + sse_dy0) as f32,
                                         x1: (p0p.0.max(p1p.0) + ofs.0 + sse_dx1) as f32,
@@ -5741,38 +6188,11 @@ impl Element for CanvasElement {
                                         id: rect.span.clone(),
                                         object_path,
                                         border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                        // TODO: this is wrong for transformed rects
-                                        border_styles: Edges {
-                                            // TODO: check constrained status and modify widths
-                                            top: if rect.y1.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            right: if rect.x1.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            bottom: if rect.y0.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            left: if rect.x0.1.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            }) {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                        },
+                                        border_styles: rectangle_border_styles(
+                                            rect,
+                                            &cell_info.unsolved_vars,
+                                            mat,
+                                        ),
                                         cvars: (depth == 0).then(|| Edges {
                                             left: rect.x0.1.clone(),
                                             right: rect.x1.1.clone(),
@@ -5781,285 +6201,6 @@ impl Element for CanvasElement {
                                         }),
                                     }
                                     .normalized();
-                                if let ToolState::Select(SelectToolState { selected_obj }) = &tool
-                                    && rect.id.is_some()
-                                    && &rect.id == selected_obj
-                                {
-                                    select_rects.push(Rect {
-                                        border_widths: Edges::all(SELECT_WIDTH),
-                                        ..rect.clone()
-                                    });
-                                }
-                                if show && layer.visible {
-                                    rects.push((rect, layer.clone()));
-                                }
-                            }
-                        }
-                        SolvedValue::Polygon(polygon) => {
-                            if depth == 0
-                                && let Some(span) = &polygon.span
-                            {
-                                source_coordinates.insert(
-                                    span.clone(),
-                                    polygon
-                                        .points
-                                        .iter()
-                                        .enumerate()
-                                        .flat_map(|(index, (x, y))| {
-                                            [
-                                                (x.1.clone(), format!("x{index}i"), x.0),
-                                                (y.1.clone(), format!("y{index}i"), y.0),
-                                            ]
-                                        })
-                                        .collect(),
-                                );
-                            }
-                            let Some(layer) = layers.layers.get(polygon.layer.as_str()) else {
-                                continue;
-                            };
-                            let edge_styles = if depth == 0 {
-                                polygon_edge_styles(polygon.points.len(), |index| {
-                                    let (x, y) = &polygon.points[index];
-                                    x.1.coeffs
-                                        .iter()
-                                        .chain(&y.1.coeffs)
-                                        .any(|(_, var)| cell_info.unsolved_vars.contains(var))
-                                })
-                            } else {
-                                vec![BorderStyle::Solid; polygon.points.len()]
-                            };
-                            let points = polygon
-                                .points
-                                .iter()
-                                .map(|(x, y)| {
-                                    let (dx, dy) = if depth == 0 {
-                                        sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
-                                            (
-                                                crate::sse::dot(&SparseVec::from(&x.1), sse_dv),
-                                                crate::sse::dot(&SparseVec::from(&y.1), sse_dv),
-                                            )
-                                        })
-                                    } else {
-                                        (0., 0.)
-                                    };
-                                    let point = ifmatvec(mat, (x.0 + dx, y.0 + dy));
-                                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
-                                })
-                                .collect();
-                            let polygon = Polygon {
-                                points,
-                                edge_styles,
-                                id: polygon.span.clone(),
-                                object_path,
-                                cvars: (depth == 0).then(|| {
-                                    polygon
-                                        .points
-                                        .iter()
-                                        .map(|(x, y)| (x.1.clone(), y.1.clone()))
-                                        .collect()
-                                }),
-                                centerline: None,
-                            };
-                            if show && layer.visible {
-                                polygons.push((polygon, layer.clone()));
-                            }
-                        }
-                        SolvedValue::Path(path) => {
-                            if depth == 0
-                                && let Some(span) = &path.span
-                            {
-                                let mut coordinates = path
-                                    .points
-                                    .iter()
-                                    .enumerate()
-                                    .flat_map(|(index, (x, y))| {
-                                        [
-                                            (x.1.clone(), format!("x{index}i"), x.0),
-                                            (y.1.clone(), format!("y{index}i"), y.0),
-                                        ]
-                                    })
-                                    .collect::<Vec<_>>();
-                                coordinates.push((
-                                    path.width.1.clone(),
-                                    "widthi".to_owned(),
-                                    path.width.0,
-                                ));
-                                coordinates.push((
-                                    path.begin_extension.1.clone(),
-                                    "begin_extensioni".to_owned(),
-                                    path.begin_extension.0,
-                                ));
-                                coordinates.push((
-                                    path.end_extension.1.clone(),
-                                    "end_extensioni".to_owned(),
-                                    path.end_extension.0,
-                                ));
-                                source_coordinates.insert(span.clone(), coordinates);
-                            }
-                            let Some(layer) = layers.layers.get(path.layer.as_str()) else {
-                                continue;
-                            };
-                            let mut displayed = path.clone();
-                            if depth == 0
-                                && let Some(sse_dv) = &sse_dv
-                            {
-                                displayed.width.0 +=
-                                    crate::sse::dot(&SparseVec::from(&path.width.1), sse_dv);
-                                displayed.begin_extension.0 += crate::sse::dot(
-                                    &SparseVec::from(&path.begin_extension.1),
-                                    sse_dv,
-                                );
-                                displayed.end_extension.0 += crate::sse::dot(
-                                    &SparseVec::from(&path.end_extension.1),
-                                    sse_dv,
-                                );
-                                for ((x, y), (display_x, display_y)) in
-                                    path.points.iter().zip(&mut displayed.points)
-                                {
-                                    display_x.0 += crate::sse::dot(&SparseVec::from(&x.1), sse_dv);
-                                    display_y.0 += crate::sse::dot(&SparseVec::from(&y.1), sse_dv);
-                                }
-                            }
-                            let Some(outline) = displayed.outline() else {
-                                continue;
-                            };
-                            let segment_styles = if depth == 0 {
-                                path_segment_styles(path.points.len(), |index| {
-                                    let (x, y) = &path.points[index];
-                                    x.1.coeffs
-                                        .iter()
-                                        .chain(&y.1.coeffs)
-                                        .any(|(_, var)| cell_info.unsolved_vars.contains(var))
-                                })
-                            } else {
-                                vec![BorderStyle::Solid; path.points.len().saturating_sub(1)]
-                            };
-                            let centerline = PathCenterline {
-                                points: displayed
-                                    .points
-                                    .iter()
-                                    .map(|(x, y)| {
-                                        let point = ifmatvec(mat, (x.0, y.0));
-                                        Point::new(
-                                            (point.0 + ofs.0) as f32,
-                                            (point.1 + ofs.1) as f32,
-                                        )
-                                    })
-                                    .collect(),
-                                segment_styles,
-                                cvars: (depth == 0).then(|| {
-                                    path.points
-                                        .iter()
-                                        .map(|(x, y)| (x.1.clone(), y.1.clone()))
-                                        .collect()
-                                }),
-                            };
-                            let polygon = Polygon {
-                                edge_styles: vec![BorderStyle::Solid; outline.len()],
-                                points: outline
-                                    .into_iter()
-                                    .map(|point| {
-                                        let point = ifmatvec(mat, point);
-                                        Point::new(
-                                            (point.0 + ofs.0) as f32,
-                                            (point.1 + ofs.1) as f32,
-                                        )
-                                    })
-                                    .collect(),
-                                id: path.span.clone(),
-                                object_path,
-                                cvars: None,
-                                centerline: Some(centerline),
-                            };
-                            if show && layer.visible {
-                                polygons.push((polygon, layer.clone()));
-                            }
-                        }
-                        SolvedValue::Instance(inst) => {
-                            if inst.construction {
-                                continue;
-                            }
-                            if depth == 0 {
-                                source_coordinates.insert(
-                                    inst.span.clone(),
-                                    vec![
-                                        (inst.x_expr.clone(), "xi".to_owned(), inst.x),
-                                        (inst.y_expr.clone(), "yi".to_owned(), inst.y),
-                                    ],
-                                );
-                            }
-                            let mut inst_mat = TransformationMatrix::identity();
-                            if inst.reflect {
-                                inst_mat = inst_mat.reflect_vert()
-                            }
-                            inst_mat = inst_mat.rotate(inst.angle);
-                            let (sse_dx, sse_dy) = if depth == 0 {
-                                sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
-                                    (
-                                        crate::sse::dot(&SparseVec::from(&inst.x_expr), sse_dv),
-                                        crate::sse::dot(&SparseVec::from(&inst.y_expr), sse_dv),
-                                    )
-                                })
-                            } else {
-                                (0., 0.)
-                            };
-                            let inst_ofs = ifmatvec(mat, (inst.x + sse_dx, inst.y + sse_dy));
-
-                            let inst_address = ScopeAddress {
-                                scope: solved_cell.output.cells[&inst.cell].root,
-                                cell: inst.cell,
-                            };
-                            let new_mat = mat * inst_mat;
-                            let new_ofs = (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1);
-                            let scope_state =
-                                &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
-                            let mut show = show;
-                            if depth + 1 >= state.hierarchy_depth || !scope_state.visible {
-                                if let Some(bbox) = &scope_state.bbox {
-                                    let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
-                                    let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
-                                    let x_unconstrained =
-                                        depth == 0
-                                            && inst.x_expr.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            });
-                                    let y_unconstrained =
-                                        depth == 0
-                                            && inst.y_expr.coeffs.iter().any(|(_, var)| {
-                                                cell_info.unsolved_vars.contains(var)
-                                            });
-                                    let rect = Rect {
-                                        x0: (p0p.0.min(p1p.0) + new_ofs.0) as f32,
-                                        y0: (p0p.1.min(p1p.1) + new_ofs.1) as f32,
-                                        x1: (p0p.0.max(p1p.0) + new_ofs.0) as f32,
-                                        y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
-                                        id: Some(inst.span.clone()),
-                                        object_path: object_path.clone(),
-                                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                                        border_styles: Edges {
-                                            top: if y_unconstrained {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            right: if x_unconstrained {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            bottom: if y_unconstrained {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                            left: if x_unconstrained {
-                                                BorderStyle::Dashed
-                                            } else {
-                                                BorderStyle::Solid
-                                            },
-                                        },
-                                        cvars: None,
-                                    };
                                     if let ToolState::Select(SelectToolState { selected_obj }) =
                                         &tool
                                         && rect.id.is_some()
@@ -6070,108 +6211,459 @@ impl Element for CanvasElement {
                                             ..rect.clone()
                                         });
                                     }
-                                    if show {
-                                        if depth == 0 {
-                                            instance_sse_candidates.push((
-                                                rect.clone(),
-                                                inst.span.clone(),
-                                                Point::new(new_ofs.0 as f32, new_ofs.1 as f32),
-                                                [
-                                                    SseDragTarget {
-                                                        expr: inst.x_expr.clone(),
-                                                        normal: Point::new(1., 0.),
-                                                        source: Some(SseSourceTarget {
-                                                            call_span: inst.span.clone(),
-                                                            name: "xi".to_owned(),
-                                                            value: inst.x,
-                                                        }),
-                                                    },
-                                                    SseDragTarget {
-                                                        expr: inst.y_expr.clone(),
-                                                        normal: Point::new(0., 1.),
-                                                        source: Some(SseSourceTarget {
-                                                            call_span: inst.span.clone(),
-                                                            name: "yi".to_owned(),
-                                                            value: inst.y,
-                                                        }),
-                                                    },
-                                                ],
-                                            ));
-                                        }
-                                        scope_rects.push(LabeledBbox {
-                                            rect,
-                                            label: scope_state.name.clone().into(),
-                                            origin: Some(Point::new(
-                                                new_ofs.0 as f32,
-                                                new_ofs.1 as f32,
-                                            )),
-                                        });
+                                    if show && layer.visible {
+                                        rects.push((rect, layer.clone()));
                                     }
                                 }
-                                show = false;
                             }
-                            queue.push_back((
-                                inst_address,
-                                new_mat,
-                                new_ofs,
-                                depth + 1,
-                                show,
-                                object_path,
-                            ));
-                        }
-                        SolvedValue::Dimension(dimension) => {
-                            if cell == scope_address.cell && dim_objects.insert(*obj) {
-                                dims.push(dimension.clone());
+                            SolvedValue::Polygon(polygon) => {
+                                budget.spend(polygon.points.len())?;
+                                if depth == 0
+                                    && let Some(span) = &polygon.span
+                                {
+                                    source_coordinates.insert(
+                                        span.clone(),
+                                        polygon
+                                            .points
+                                            .iter()
+                                            .enumerate()
+                                            .flat_map(|(index, (x, y))| {
+                                                [
+                                                    (x.1.clone(), format!("x{index}i"), x.0),
+                                                    (y.1.clone(), format!("y{index}i"), y.0),
+                                                ]
+                                            })
+                                            .collect(),
+                                    );
+                                }
+                                let Some(layer) = layers.layers.get(polygon.layer.as_str()) else {
+                                    continue;
+                                };
+                                let edge_styles = if depth == 0 {
+                                    polygon_edge_styles(polygon.points.len(), |index| {
+                                        let (x, y) = &polygon.points[index];
+                                        x.1.coeffs
+                                            .iter()
+                                            .chain(&y.1.coeffs)
+                                            .any(|(_, var)| cell_info.unsolved_vars.contains(var))
+                                    })
+                                } else {
+                                    vec![BorderStyle::Solid; polygon.points.len()]
+                                };
+                                let points = polygon
+                                    .points
+                                    .iter()
+                                    .map(|(x, y)| {
+                                        let (dx, dy) = if depth == 0 {
+                                            sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
+                                                (
+                                                    crate::sse::dot(&SparseVec::from(&x.1), sse_dv),
+                                                    crate::sse::dot(&SparseVec::from(&y.1), sse_dv),
+                                                )
+                                            })
+                                        } else {
+                                            (0., 0.)
+                                        };
+                                        let point = ifmatvec(mat, (x.0 + dx, y.0 + dy));
+                                        Point::new(
+                                            (point.0 + ofs.0) as f32,
+                                            (point.1 + ofs.1) as f32,
+                                        )
+                                    })
+                                    .collect();
+                                let polygon = Polygon {
+                                    points,
+                                    edge_styles,
+                                    id: polygon.span.clone(),
+                                    object_path,
+                                    cvars: (depth == 0).then(|| {
+                                        polygon
+                                            .points
+                                            .iter()
+                                            .map(|(x, y)| (x.1.clone(), y.1.clone()))
+                                            .collect()
+                                    }),
+                                    centerline: None,
+                                };
+                                if show && layer.visible {
+                                    polygons.push((polygon, layer.clone()));
+                                }
                             }
-                        }
-                        SolvedValue::Text(text) => {
-                            let position = ifmatvec(mat, (text.x, text.y));
-                            let layer = layers.layers.get(text.layer.as_str());
-                            if let Some(layer) = layer
-                                && show
-                                && layer.visible
-                                && layout_text_metrics(inner.scale, TEXT_LAYOUT_SIZE).is_some()
-                            {
-                                texts.push(TextLabel {
-                                    text: text.text.clone().into(),
-                                    position: Point::new(
-                                        (position.0 + ofs.0) as f32,
-                                        (position.1 + ofs.1) as f32,
-                                    ),
-                                    layer: layer.clone(),
-                                });
+                            SolvedValue::Path(path) => {
+                                budget.spend(path.points.len())?;
+                                if depth == 0
+                                    && let Some(span) = &path.span
+                                {
+                                    let mut coordinates = path
+                                        .points
+                                        .iter()
+                                        .enumerate()
+                                        .flat_map(|(index, (x, y))| {
+                                            [
+                                                (x.1.clone(), format!("x{index}i"), x.0),
+                                                (y.1.clone(), format!("y{index}i"), y.0),
+                                            ]
+                                        })
+                                        .collect::<Vec<_>>();
+                                    coordinates.push((
+                                        path.width.1.clone(),
+                                        "widthi".to_owned(),
+                                        path.width.0,
+                                    ));
+                                    coordinates.push((
+                                        path.begin_extension.1.clone(),
+                                        "begin_extensioni".to_owned(),
+                                        path.begin_extension.0,
+                                    ));
+                                    coordinates.push((
+                                        path.end_extension.1.clone(),
+                                        "end_extensioni".to_owned(),
+                                        path.end_extension.0,
+                                    ));
+                                    source_coordinates.insert(span.clone(), coordinates);
+                                }
+                                let Some(layer) = layers.layers.get(path.layer.as_str()) else {
+                                    continue;
+                                };
+                                let mut displayed = path.clone();
+                                if depth == 0
+                                    && let Some(sse_dv) = &sse_dv
+                                {
+                                    displayed.width.0 +=
+                                        crate::sse::dot(&SparseVec::from(&path.width.1), sse_dv);
+                                    displayed.begin_extension.0 += crate::sse::dot(
+                                        &SparseVec::from(&path.begin_extension.1),
+                                        sse_dv,
+                                    );
+                                    displayed.end_extension.0 += crate::sse::dot(
+                                        &SparseVec::from(&path.end_extension.1),
+                                        sse_dv,
+                                    );
+                                    for ((x, y), (display_x, display_y)) in
+                                        path.points.iter().zip(&mut displayed.points)
+                                    {
+                                        display_x.0 +=
+                                            crate::sse::dot(&SparseVec::from(&x.1), sse_dv);
+                                        display_y.0 +=
+                                            crate::sse::dot(&SparseVec::from(&y.1), sse_dv);
+                                    }
+                                }
+                                let Some(outline) = displayed.outline() else {
+                                    continue;
+                                };
+                                let segment_styles = if depth == 0 {
+                                    path_segment_styles(path.points.len(), |index| {
+                                        let (x, y) = &path.points[index];
+                                        x.1.coeffs
+                                            .iter()
+                                            .chain(&y.1.coeffs)
+                                            .any(|(_, var)| cell_info.unsolved_vars.contains(var))
+                                    })
+                                } else {
+                                    vec![BorderStyle::Solid; path.points.len().saturating_sub(1)]
+                                };
+                                let centerline = PathCenterline {
+                                    points: displayed
+                                        .points
+                                        .iter()
+                                        .map(|(x, y)| {
+                                            let point = ifmatvec(mat, (x.0, y.0));
+                                            Point::new(
+                                                (point.0 + ofs.0) as f32,
+                                                (point.1 + ofs.1) as f32,
+                                            )
+                                        })
+                                        .collect(),
+                                    segment_styles,
+                                    cvars: (depth == 0).then(|| {
+                                        path.points
+                                            .iter()
+                                            .map(|(x, y)| (x.1.clone(), y.1.clone()))
+                                            .collect()
+                                    }),
+                                };
+                                let polygon = Polygon {
+                                    edge_styles: vec![BorderStyle::Solid; outline.len()],
+                                    points: outline
+                                        .into_iter()
+                                        .map(|point| {
+                                            let point = ifmatvec(mat, point);
+                                            Point::new(
+                                                (point.0 + ofs.0) as f32,
+                                                (point.1 + ofs.1) as f32,
+                                            )
+                                        })
+                                        .collect(),
+                                    id: path.span.clone(),
+                                    object_path,
+                                    cvars: None,
+                                    centerline: Some(centerline),
+                                };
+                                if show && layer.visible {
+                                    polygons.push((polygon, layer.clone()));
+                                }
+                            }
+                            SolvedValue::Instance(inst) => {
+                                if inst.construction {
+                                    continue;
+                                }
+                                if depth == 0 {
+                                    source_coordinates.insert(
+                                        inst.span.clone(),
+                                        vec![
+                                            (inst.x_expr.clone(), "xi".to_owned(), inst.x),
+                                            (inst.y_expr.clone(), "yi".to_owned(), inst.y),
+                                        ],
+                                    );
+                                }
+                                let mut inst_mat = TransformationMatrix::identity();
+                                if inst.reflect {
+                                    inst_mat = inst_mat.reflect_vert()
+                                }
+                                inst_mat = inst_mat.rotate(inst.angle);
+                                let (sse_dx, sse_dy) = if depth == 0 {
+                                    sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
+                                        (
+                                            crate::sse::dot(&SparseVec::from(&inst.x_expr), sse_dv),
+                                            crate::sse::dot(&SparseVec::from(&inst.y_expr), sse_dv),
+                                        )
+                                    })
+                                } else {
+                                    (0., 0.)
+                                };
+                                let inst_ofs = ifmatvec(mat, (inst.x + sse_dx, inst.y + sse_dy));
+
+                                let inst_address = ScopeAddress {
+                                    scope: solved_cell.output.cells[&inst.cell].root,
+                                    cell: inst.cell,
+                                };
+                                let new_mat = mat * inst_mat;
+                                let new_ofs = (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1);
+                                let scope_state =
+                                    &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
+                                let mut show = show;
+                                if depth + 1 >= state.hierarchy_depth || !scope_state.visible {
+                                    if let Some(bbox) = &scope_state.bbox {
+                                        let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
+                                        let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
+                                        let x_unconstrained = depth == 0
+                                            && inst.x_expr.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            });
+                                        let y_unconstrained = depth == 0
+                                            && inst.y_expr.coeffs.iter().any(|(_, var)| {
+                                                cell_info.unsolved_vars.contains(var)
+                                            });
+                                        let rect = Rect {
+                                            x0: (p0p.0.min(p1p.0) + new_ofs.0) as f32,
+                                            y0: (p0p.1.min(p1p.1) + new_ofs.1) as f32,
+                                            x1: (p0p.0.max(p1p.0) + new_ofs.0) as f32,
+                                            y1: (p0p.1.max(p1p.1) + new_ofs.1) as f32,
+                                            id: Some(inst.span.clone()),
+                                            object_path: object_path.clone(),
+                                            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+                                            border_styles: Edges {
+                                                top: if y_unconstrained {
+                                                    BorderStyle::Dashed
+                                                } else {
+                                                    BorderStyle::Solid
+                                                },
+                                                right: if x_unconstrained {
+                                                    BorderStyle::Dashed
+                                                } else {
+                                                    BorderStyle::Solid
+                                                },
+                                                bottom: if y_unconstrained {
+                                                    BorderStyle::Dashed
+                                                } else {
+                                                    BorderStyle::Solid
+                                                },
+                                                left: if x_unconstrained {
+                                                    BorderStyle::Dashed
+                                                } else {
+                                                    BorderStyle::Solid
+                                                },
+                                            },
+                                            cvars: None,
+                                        };
+                                        if let ToolState::Select(SelectToolState { selected_obj }) =
+                                            &tool
+                                            && rect.id.is_some()
+                                            && &rect.id == selected_obj
+                                        {
+                                            select_rects.push(Rect {
+                                                border_widths: Edges::all(SELECT_WIDTH),
+                                                ..rect.clone()
+                                            });
+                                        }
+                                        if show {
+                                            if depth == 0 {
+                                                instance_sse_candidates.push((
+                                                    rect.clone(),
+                                                    inst.span.clone(),
+                                                    Point::new(new_ofs.0 as f32, new_ofs.1 as f32),
+                                                    [
+                                                        SseDragTarget {
+                                                            expr: inst.x_expr.clone(),
+                                                            normal: Point::new(1., 0.),
+                                                            source: Some(SseSourceTarget {
+                                                                call_span: inst.span.clone(),
+                                                                name: "xi".to_owned(),
+                                                                value: inst.x,
+                                                            }),
+                                                        },
+                                                        SseDragTarget {
+                                                            expr: inst.y_expr.clone(),
+                                                            normal: Point::new(0., 1.),
+                                                            source: Some(SseSourceTarget {
+                                                                call_span: inst.span.clone(),
+                                                                name: "yi".to_owned(),
+                                                                value: inst.y,
+                                                            }),
+                                                        },
+                                                    ],
+                                                ));
+                                            }
+                                            scope_rects.push(LabeledBbox {
+                                                rect,
+                                                label: scope_state.name.clone().into(),
+                                                origin: Some(Point::new(
+                                                    new_ofs.0 as f32,
+                                                    new_ofs.1 as f32,
+                                                )),
+                                            });
+                                        }
+                                    }
+                                    show = false;
+                                }
+                                queue.push_back((
+                                    inst_address,
+                                    new_mat,
+                                    new_ofs,
+                                    depth + 1,
+                                    show,
+                                    object_path,
+                                ));
+                            }
+                            SolvedValue::Dimension(dimension) => {
+                                if cell == scope_address.cell && dim_objects.insert(*obj) {
+                                    dims.push(dimension.clone());
+                                }
+                            }
+                            SolvedValue::Text(text) => {
+                                let position = ifmatvec(mat, (text.x, text.y));
+                                let layer = layers.layers.get(text.layer.as_str());
+                                if let Some(layer) = layer
+                                    && show
+                                    && !shallow
+                                    && layer.visible
+                                    && layout_text_metrics(inner.scale, TEXT_LAYOUT_SIZE).is_some()
+                                {
+                                    texts.push(TextLabel {
+                                        text: text.text.clone().into(),
+                                        position: Point::new(
+                                            (position.0 + ofs.0) as f32,
+                                            (position.1 + ofs.1) as f32,
+                                        ),
+                                        layer: layer.clone(),
+                                    });
+                                }
                             }
                         }
                     }
-                }
-                for child in &scope_info.children {
-                    let scope_address = ScopeAddress {
-                        scope: *child,
-                        cell,
-                    };
-                    queue.push_back((scope_address, mat, ofs, depth + 1, show, path.clone()));
+                    budget.spend(scope_info.children.len())?;
+                    for child in &scope_info.children {
+                        let scope_address = ScopeAddress {
+                            scope: *child,
+                            cell,
+                        };
+                        queue.push_back((scope_address, mat, ofs, depth + 1, show, path.clone()));
+                    }
                 }
             }
-
-            if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = tool {
-                let mut layer = layers.layers[layers.selected_layer.as_ref().unwrap()].clone();
-                layer.border_color = rgb(0xffff00);
-                rects.push((
-                    Rect {
-                        object_path: Vec::new(),
-                        x0: p0.x.min(snapped_layout_mouse_position.x),
-                        y0: p0.y.min(snapped_layout_mouse_position.y),
-                        x1: p0.x.max(snapped_layout_mouse_position.x),
-                        y1: p0.y.max(snapped_layout_mouse_position.y),
-                        id: None,
-                        border_widths: Edges::all(SELECT_WIDTH),
-                        border_styles: Edges::all(BorderStyle::Dashed),
-                        cvars: None,
-                    },
-                    layer,
-                ));
+            Some(())
+        })()
+        .is_some();
+        let needs_raster = !collected && !shallow;
+        if !collected {
+            rects.clear();
+            polygons.clear();
+            texts.clear();
+            dims.clear();
+            scope_rects.clear();
+            instance_sse_candidates.clear();
+            select_rects.clear();
+            source_coordinates.clear();
+            if let Some((tiles, display)) = tile_candidate {
+                presentation = Presentation::Raster { tiles, display };
+                shallow = true;
+            } else if let Some(frame) = retained_direct {
+                rects = frame.rects.clone();
+                polygons = frame.polygons.clone();
+                texts = frame.texts.clone();
+                dims = frame.dims.clone();
+                scope_rects = frame.scope_rects.clone();
+                replay_direct = Some(frame);
+            } else {
+                inner.bg_style.clone().paint(bounds, window, cx, |_, _| {});
+                self.inner.update(cx, |inner, cx| {
+                    inner.rects.clear();
+                    inner.polygons.clear();
+                    inner.scope_rects.clear();
+                    inner.dim_hitboxes.clear();
+                    inner.sse_handles.clear();
+                    inner.sse_bodies.clear();
+                    inner.set_raster_cache_requested(
+                        visible_geometry_render_decision(RASTER_CACHE_GEOMETRY_THRESHOLD),
+                        cx,
+                    );
+                    if inner.raster_decision_refinement.is_none() {
+                        inner.request_visible_raster_decision(cx);
+                    }
+                    cx.notify();
+                });
+                return;
             }
         }
+        let fresh_direct_frame = (!shallow && replay_direct.is_none()).then(|| {
+            Arc::new(DirectFrame {
+                viewport: bounds.size,
+                display: RasterDisplayTransform {
+                    scale: inner.scale,
+                    offset: inner.offset,
+                },
+                content_revision: inner.raster_content_revision,
+                rects: rects.clone(),
+                polygons: polygons.clone(),
+                texts: texts.clone(),
+                dims: dims.clone(),
+                scope_rects: scope_rects.clone(),
+            })
+        });
+        // Overlays are positioned at the requested camera. While retained
+        // tiles still show an earlier camera they would float away from the
+        // image, so they wait for the tiles to catch up.
+        let overlays_aligned = match &presentation {
+            Presentation::Raster { display, .. } => {
+                inner.last_presented_raster.set(Some(*display));
+                raster_display_matches_camera(*display, inner.scale, inner.offset)
+            }
+            Presentation::Direct => {
+                // A held direct frame keeps its original camera. Wait to draw
+                // current interaction overlays until a fresh frame is ready.
+                inner.last_presented_raster.set(None);
+                replay_direct.is_none()
+            }
+        };
+        // A scale-safe raster deliberately coalesces objects smaller than a
+        // display pixel; highlighting one of them would flash below-LOD detail.
+        let hover_hit = if replay_direct.is_some()
+            || (shallow && (inner.navigation_cache_active || coalesced_lod_display.is_some()))
+        {
+            None
+        } else {
+            inner.hover_hit.clone()
+        };
 
         let rects = rects
             .into_iter()
@@ -6181,8 +6673,11 @@ impl Element for CanvasElement {
             .into_iter()
             .sorted_by_key(|(_, layer)| layer.z)
             .collect_vec();
-        let scale = inner.scale;
-        let offset = inner.offset;
+        let (scale, offset) = replay_direct
+            .as_ref()
+            .map_or((inner.scale, inner.offset), |frame| {
+                (frame.display.scale, frame.display.offset)
+            });
         let visible_geometry_count = rects
             .iter()
             .filter(|(rect, _)| get_rect_bounds(rect, bounds, scale, offset).intersects(&bounds))
@@ -6200,16 +6695,18 @@ impl Element for CanvasElement {
                     get_rect_bounds(&bbox.rect, bounds, scale, offset).intersects(&bounds)
                 })
                 .count();
-        let raster_render_decision =
-            visible_geometry_render_decision(select_overview, visible_geometry_count);
+        let raster_render_decision = visible_geometry_render_decision(visible_geometry_count);
         let mut dim_hitboxes = Vec::new();
         let mut sse_handles: Vec<SseHandle> = Vec::new();
         let mut vertex_handle_points = Vec::new();
         let mut sse_bodies: Vec<SseBody> = Vec::new();
-        let sse_cell = solved_cell.as_ref().map(|solved| {
-            let selected = &solved.state[&solved.selected_scope].address;
-            &solved.output.cells[&selected.cell]
-        });
+        let sse_cell = solved_cell
+            .as_ref()
+            .filter(|_| replay_direct.is_none())
+            .map(|solved| {
+                let selected = &solved.state[&solved.selected_scope].address;
+                &solved.output.cells[&selected.cell]
+            });
         let mut movable_corners = HashMap::new();
         for (rect, _) in &rects {
             let (Some(span), Some(cvars), Some(sse_cell)) = (&rect.id, &rect.cvars, sse_cell)
@@ -6326,6 +6823,56 @@ impl Element for CanvasElement {
                 }
             }
         }
+        let presented_content_revision = match &presentation {
+            Presentation::Raster { tiles, .. } => tiles.content_revision,
+            Presentation::Direct => replay_direct
+                .as_ref()
+                .map_or(inner.raster_content_revision, |frame| {
+                    frame.content_revision
+                }),
+        };
+        let mut rectangle_previews = inner
+            .pending_rectangles
+            .iter()
+            .filter(|pending| {
+                !pending.included_in_frame(presented_content_revision)
+                    && solved_cell.as_ref().is_some_and(|solved| {
+                        solved.selected_scope == pending.scope_path
+                            && solved
+                                .state
+                                .get(&pending.scope_path)
+                                .is_some_and(|scope| scope.visible)
+                    })
+            })
+            .filter_map(|pending| {
+                let layer = layers.layers.get(pending.rect.layer.as_deref()?)?;
+                layer.visible.then(|| (pending.preview(), layer.clone()))
+            })
+            .collect::<Vec<_>>();
+        if let ToolState::DrawRect(DrawRectToolState { p0: Some(p0) }) = &tool
+            && let Some(layer) = layers
+                .selected_layer
+                .as_ref()
+                .and_then(|name| layers.layers.get(name))
+                .filter(|layer| layer.visible)
+        {
+            let mut layer = layer.clone();
+            layer.border_color = rgb(0xffff00);
+            rectangle_previews.push((
+                Rect {
+                    object_path: Vec::new(),
+                    x0: p0.x.min(snapped_layout_mouse_position.x),
+                    y0: p0.y.min(snapped_layout_mouse_position.y),
+                    x1: p0.x.max(snapped_layout_mouse_position.x),
+                    y1: p0.y.max(snapped_layout_mouse_position.y),
+                    id: None,
+                    cvars: None,
+                    border_widths: Edges::all(SELECT_WIDTH),
+                    border_styles: Edges::all(BorderStyle::Dashed),
+                },
+                layer,
+            ));
+        }
         let draw_layer = layers
             .selected_layer
             .as_ref()
@@ -6337,11 +6884,18 @@ impl Element for CanvasElement {
             offset.y * RASTER_CACHE_RESOLUTION,
         ));
         let mut transient_geometry_images = Vec::new();
+        #[cfg(test)]
+        let mut painted_rectangle_previews = Vec::new();
+        let presentation_transform = match &presentation {
+            Presentation::Raster { display, .. } => (display.scale, display.offset),
+            Presentation::Direct => (scale, offset),
+        };
         inner
             .bg_style
             .clone()
             .paint(bounds, window, cx, |window, cx| {
-                let origin_coords = self.inner.read(cx).layout_to_px(Point::new(0., 0.));
+                let (scale, offset) = presentation_transform;
+                let origin_coords = offset + bounds.origin;
                 let y_axis = Edge {
                     dir: Dir::Vert,
                     coord: origin_coords.x,
@@ -6368,6 +6922,103 @@ impl Element for CanvasElement {
                     ));
                 });
 
+                if let Presentation::Raster { tiles, .. } = &presentation {
+                    window.paint_layer(bounds, |window| {
+                        let visible_tiles = visible_raster_tiles(tiles, bounds, scale, offset);
+                        for cache in &visible_tiles {
+                            window
+                                .paint_image(
+                                    raster_bounds(cache, bounds, scale, offset),
+                                    Corners::all(px(0.)),
+                                    cache.image.clone(),
+                                    0,
+                                    false,
+                                )
+                                .unwrap();
+                        }
+                        if let Some((font_size, line_height)) =
+                            layout_text_metrics(scale, TEXT_LAYOUT_SIZE)
+                        {
+                            let mut painted = HashSet::new();
+                            for label in visible_tiles.iter().flat_map(|cache| cache.texts.iter())
+                            {
+                                let key = (
+                                    label.position.x.to_bits(),
+                                    label.position.y.to_bits(),
+                                    label.layer.z,
+                                    label.text.clone(),
+                                );
+                                if !painted.insert(key) {
+                                    continue;
+                                }
+                                let runs = &[TextRun {
+                                    len: label.text.len(),
+                                    font: window.text_style().font(),
+                                    color: label.layer.border_color.into(),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }];
+                                window
+                                    .text_system()
+                                    .shape_line(label.text.clone(), font_size, runs, None)
+                                    .paint(
+                                        Point::new(
+                                            scale * px(label.position.x),
+                                            scale * px(-label.position.y),
+                                        ) + offset
+                                            + bounds.origin,
+                                        line_height,
+                                        window,
+                                        cx,
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        if let Some((font_size, line_height)) =
+                            layout_text_metrics(scale, SCOPE_TEXT_LAYOUT_SIZE)
+                        {
+                            let mut painted = HashSet::new();
+                            for bbox in visible_tiles
+                                .iter()
+                                .flat_map(|cache| cache.scope_labels.iter())
+                            {
+                                let key = (
+                                    bbox.rect.x0.to_bits(),
+                                    bbox.rect.y0.to_bits(),
+                                    bbox.rect.x1.to_bits(),
+                                    bbox.rect.y1.to_bits(),
+                                    bbox.label.clone(),
+                                );
+                                if !painted.insert(key) {
+                                    continue;
+                                }
+                                let text_origin =
+                                    get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
+                                        + Point::new(px(4.), px(2.));
+                                let runs = &[TextRun {
+                                    len: bbox.label.len(),
+                                    font: window.text_style().font(),
+                                    color: theme.text.into(),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }];
+                                window
+                                    .text_system()
+                                    .shape_line(bbox.label.clone(), font_size, runs, None)
+                                    .paint(text_origin, line_height, window, cx)
+                                    .unwrap();
+                            }
+                        }
+                    });
+                }
+
+                // With retained tiles underneath, the collected geometry is the
+                // editable cell's own objects. It is painted on top only while a
+                // drag previews their new positions; otherwise the tiles already
+                // show it at the same LOD.
+                let paint_geometry = !shallow || sse_dv.is_some();
                 // GPUI batches quads, paths, and image sprites by primitive
                 // kind inside one paint layer, not by submission order. Give
                 // each technology layer its own fill and outline stacking
@@ -6375,7 +7026,8 @@ impl Element for CanvasElement {
                 // a later solid layer (for example licon over mcon).
                 let mut rect_start = 0;
                 let mut polygon_start = 0;
-                while rect_start < rects.len() || polygon_start < polygons.len() {
+                while paint_geometry && (rect_start < rects.len() || polygon_start < polygons.len())
+                {
                     let rect_z = rects.get(rect_start).map(|(_, layer)| layer.z);
                     let polygon_z = polygons.get(polygon_start).map(|(_, layer)| layer.z);
                     let z = match (rect_z, polygon_z) {
@@ -6520,6 +7172,76 @@ impl Element for CanvasElement {
                 }
 
                 window.paint_layer(bounds, |window| {
+                    for (preview, layer) in &rectangle_previews {
+                        // Pending placements use the displayed camera and the
+                        // raster sampler, including while older tiles are held.
+                        let preview_bounds = get_rect_bounds(preview, bounds, scale, offset);
+                        #[cfg(test)]
+                        if preview_bounds.intersects(&bounds) { painted_rectangle_previews.push(preview_bounds); }
+                        let (preview_fill, preview_color) = shape_fill_for_screen_extent(
+                            layer.fill,
+                            layer.color,
+                            preview_bounds.size,
+                        );
+                        let preview_phase = raster_stipple_phase(Point::new(
+                            offset.x * RASTER_CACHE_RESOLUTION,
+                            offset.y * RASTER_CACHE_RESOLUTION,
+                        ));
+                        if let ShapeFill::Pattern(pattern) = preview_fill {
+                            paint_tiled_pattern_rect(
+                                window,
+                                preview_bounds,
+                                bounds,
+                                pattern,
+                                cached_pattern_tile(&pattern_tiles, pattern, preview_color),
+                                preview_phase,
+                            );
+                            window.paint_quad(get_paint_quad(
+                                preview_bounds,
+                                ShapeFill::Hollow,
+                                preview_color,
+                                layer.border_color,
+                                preview.border_widths,
+                                preview.border_styles,
+                            ));
+                        } else if let Some((image_bounds, image)) =
+                            rasterized_patterned_rect_preview(
+                                preview_bounds,
+                                bounds,
+                                preview_fill,
+                                preview_color,
+                                preview_phase,
+                            )
+                        {
+                            window
+                                .paint_image(
+                                    image_bounds,
+                                    Corners::all(px(0.)),
+                                    image.clone(),
+                                    0,
+                                    false,
+                                )
+                                .unwrap();
+                            transient_geometry_images.push(image);
+                            window.paint_quad(get_paint_quad(
+                                preview_bounds,
+                                ShapeFill::Hollow,
+                                preview_color,
+                                layer.border_color,
+                                preview.border_widths,
+                                preview.border_styles,
+                            ));
+                        } else {
+                            window.paint_quad(get_paint_quad(
+                                preview_bounds,
+                                preview_fill,
+                                preview_color,
+                                layer.border_color,
+                                preview.border_widths,
+                                preview.border_styles,
+                            ));
+                        }
+                    }
                     if let ToolState::DrawPolygon(polygon_tool) = &tool
                         && !polygon_tool.points.is_empty()
                         && let Some(layer) = &draw_layer
@@ -6733,38 +7455,41 @@ impl Element for CanvasElement {
                             .unwrap();
                     }
                     for bbox in &scope_rects {
-                        window.paint_quad(get_paint_quad(
-                            get_rect_bounds(&bbox.rect, bounds, scale, offset),
-                            ShapeFill::Solid,
-                            Rgba {
-                                a: 0.,
-                                ..theme.text
-                            },
-                            theme.text,
-                            bbox.rect.border_widths,
-                            bbox.rect.border_styles,
-                        ));
-                        let Some((font_size, line_height)) =
-                            layout_text_metrics(scale, SCOPE_TEXT_LAYOUT_SIZE)
-                        else {
-                            continue;
-                        };
-                        let text_origin = get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
-                            + Point::new(px(4.), px(2.));
-                        let runs = &[TextRun {
-                            len: bbox.label.len(),
-                            font: window.text_style().font(),
-                            color: theme.text.into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        }];
-                        window
-                            .text_system()
-                            .shape_line(bbox.label.clone(), font_size, runs, None)
-                            .paint(text_origin, line_height, window, cx)
-                            .unwrap();
-                        if let Some(origin) = bbox.origin
+                        if !shallow {
+                            window.paint_quad(get_paint_quad(
+                                get_rect_bounds(&bbox.rect, bounds, scale, offset),
+                                ShapeFill::Solid,
+                                Rgba {
+                                    a: 0.,
+                                    ..theme.text
+                                },
+                                theme.text,
+                                bbox.rect.border_widths,
+                                bbox.rect.border_styles,
+                            ));
+                            if let Some((font_size, line_height)) =
+                                layout_text_metrics(scale, SCOPE_TEXT_LAYOUT_SIZE)
+                            {
+                                let text_origin =
+                                    get_rect_bounds(&bbox.rect, bounds, scale, offset).origin
+                                        + Point::new(px(4.), px(2.));
+                                let runs = &[TextRun {
+                                    len: bbox.label.len(),
+                                    font: window.text_style().font(),
+                                    color: theme.text.into(),
+                                    background_color: None,
+                                    underline: None,
+                                    strikethrough: None,
+                                }];
+                                window
+                                    .text_system()
+                                    .shape_line(bbox.label.clone(), font_size, runs, None)
+                                    .paint(text_origin, line_height, window, cx)
+                                    .unwrap();
+                            }
+                        }
+                        if overlays_aligned
+                            && let Some(origin) = bbox.origin
                             && matches!(
                                 &tool,
                                 ToolState::Select(SelectToolState {
@@ -6825,6 +7550,7 @@ impl Element for CanvasElement {
                             }
                         }
                     }
+                    if overlays_aligned {
                     for mid in &vertex_handle_points {
                         let draw_half = HANDLE_SIZE.half();
                         window.paint_quad(get_paint_quad(
@@ -7479,7 +8205,7 @@ impl Element for CanvasElement {
                                     ));
                                 }
                             }
-                            if let Some(hit) = inner.hover_hit.clone() {
+                            if let Some(hit) = hover_hit.clone() {
                                 match hit.outline {
                                     SelectionOutline::Rect {
                                         bounds,
@@ -7519,6 +8245,7 @@ impl Element for CanvasElement {
                         }
                         _ => {}
                     }
+                    }
                 })
             });
         if !transient_geometry_images.is_empty() {
@@ -7532,11 +8259,38 @@ impl Element for CanvasElement {
             });
         }
         self.inner.update(cx, |inner, cx| {
-            if select_overview
-                && (inner.raster_cache_enabled != raster_render_decision.use_raster
-                    || inner.raster_prefetch_enabled != raster_render_decision.prefetch_raster)
+            if needs_raster {
+                inner.set_raster_cache_requested(
+                    visible_geometry_render_decision(RASTER_CACHE_GEOMETRY_THRESHOLD),
+                    cx,
+                );
+                if inner.raster_decision_refinement.is_none() {
+                    inner.request_visible_raster_decision(cx);
+                }
+            } else if !shallow && replay_direct.is_none() {
+                // Only a full traversal knows the visible density. Retained
+                // tiles are re-evaluated by the camera-driven decision.
+                if inner.raster_cache_enabled != raster_render_decision.use_raster
+                    || inner.raster_prefetch_enabled != raster_render_decision.prefetch_raster
+                {
+                    inner.set_raster_cache_requested(raster_render_decision, cx);
+                }
+                // Once direct geometry has shown the current content, an older
+                // field must not reappear behind it.
+                inner.raster_stale_tiles_displayable = false;
+            }
+            inner
+                .pending_rectangles
+                .retain(|pending| !pending.included_in_frame(presented_content_revision));
+            if let Some(frame) = fresh_direct_frame {
+                inner.retained_direct_frame = Some(frame);
+            } else if shallow {
+                inner.retained_direct_frame = None;
+            }
+            #[cfg(test)]
             {
-                inner.set_raster_cache_requested(raster_render_decision, cx);
+                inner.painted_complete_frame = true;
+                inner.painted_rectangle_previews = painted_rectangle_previews;
             }
             inner.rects = rects;
             inner.polygons = polygons;
@@ -7698,12 +8452,14 @@ impl LayoutCanvas {
             screen_bounds: Bounds::default(),
             _subscriptions: vec![
                 cx.observe(state, |canvas, _, cx| {
-                    if !canvas.update_raster_presentation(cx) {
+                    let previous_hierarchy = canvas.raster_hierarchy.clone();
+                    let change = canvas.update_raster_presentation(cx);
+                    if change == RasterPresentationChange::None {
+                        canvas.reconcile_pending_rectangles(cx);
                         return;
                     }
-                    canvas.raster_cache_enabled = false;
-                    canvas.raster_prefetch_enabled = false;
                     canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
+                    canvas.reconcile_pending_rectangles(cx);
                     canvas
                         .raster_content_revision_signal
                         .store(canvas.raster_content_revision, Ordering::Release);
@@ -7711,9 +8467,22 @@ impl LayoutCanvas {
                         &mut canvas.cell_raster_tiles,
                         Arc::new(Mutex::new(CellRasterTileCache::default())),
                     );
+                    let mut spatial_index = RasterSpatialIndex::for_presentation(
+                        canvas.raster_hierarchy_depth,
+                        canvas.raster_scope_state.as_deref(),
+                    );
+                    if change == RasterPresentationChange::Geometry
+                        && let Some(output) = &canvas.raster_output
+                    {
+                        spatial_index.reuse_ready_cells(&canvas.raster_spatial_index, |cell| {
+                            canvas
+                                .raster_hierarchy
+                                .same_cell(&previous_hierarchy, output, cell)
+                        });
+                    }
                     let stale_spatial_index = std::mem::replace(
                         &mut canvas.raster_spatial_index,
-                        Arc::new(RasterSpatialIndex::default()),
+                        Arc::new(spatial_index),
                     );
                     // Large cell-tile bitmaps and BVHs can take long enough to
                     // destruct to stall animation. Retire the previous
@@ -7722,37 +8491,14 @@ impl LayoutCanvas {
                         drop((stale_cell_tiles, stale_spatial_index));
                     })
                     .detach();
-                    // Presentation changes invalidate every old pixel immediately.
-                    // In particular, a hidden layer must never survive in a
-                    // transformed or retained navigation image.
-                    if let Some(previous) = canvas.raster_tiles.take() {
-                        canvas
-                            .raster_images_to_drop
-                            .extend(previous.tiles.into_values().map(|cache| cache.image));
+                    match change {
+                        RasterPresentationChange::Geometry => {
+                            canvas.retain_stale_raster_for_geometry_edit(cx);
+                        }
+                        RasterPresentationChange::Presentation | RasterPresentationChange::None => {
+                            canvas.drop_raster_for_presentation_change(cx);
+                        }
                     }
-                    if let Some(previous) = canvas.raster_staging_tiles.take() {
-                        canvas
-                            .raster_images_to_drop
-                            .extend(previous.tiles.into_values().map(|cache| cache.image));
-                    }
-                    if let Some(previous) = canvas.raster_overview.take() {
-                        canvas.raster_images_to_drop.push(previous.image);
-                    }
-                    canvas.raster_overview_requested_revision = None;
-                    canvas.raster_overview_refinement = None;
-                    canvas.raster_display = None;
-                    canvas.last_presented_raster.set(None);
-                    canvas.raster_tile_target = None;
-                    canvas.navigation_cache_active = false;
-                    canvas.raster_navigation_direction = RasterTileIndex { x: 0, y: 0 };
-                    let can_render = canvas.raster_output.is_some()
-                        && canvas.screen_bounds.size.width > px(0.)
-                        && canvas.screen_bounds.size.height > px(0.);
-                    if can_render {
-                        canvas.request_navigation_overview(cx);
-                    }
-                    canvas.advance_raster_generation();
-                    canvas.request_initial_raster_decision(cx);
                     cx.notify();
                 }),
                 cx.observe(&tool, |_, _, cx| cx.notify()),
@@ -7770,7 +8516,15 @@ impl LayoutCanvas {
             raster_overview_requested_revision: None,
             raster_overview_refinement: None,
             raster_display: None,
+            raster_stale_tiles_displayable: false,
             last_presented_raster: Cell::new(None),
+            retained_direct_frame: None,
+            pending_rectangles: Vec::new(),
+            next_rectangle_id: 0,
+            #[cfg(test)]
+            painted_complete_frame: false,
+            #[cfg(test)]
+            painted_rectangle_previews: Vec::new(),
             raster_tile_target: None,
             raster_cache_enabled: false,
             raster_prefetch_enabled: false,
@@ -7786,8 +8540,10 @@ impl LayoutCanvas {
             raster_content_revision: 0,
             raster_content_revision_signal: Arc::new(AtomicU64::new(0)),
             raster_output: None,
+            raster_hierarchy: Arc::default(),
             raster_scope_state: None,
             raster_selected_scope: None,
+            raster_displayed_cell: None,
             raster_layer_visibility: Vec::new(),
             raster_hierarchy_depth: usize::MAX,
             raster_hide_external_geometry: false,
@@ -7799,13 +8555,81 @@ impl LayoutCanvas {
         }
     }
 
-    /// Records the exact state that changes raster pixels. UI-only changes,
-    /// such as selecting a layer in the sidebar, do not force a rebuild.
-    fn update_raster_presentation(&mut self, cx: &gpui::App) -> bool {
+    /// Drops every retained pixel. A hidden layer or scope must never survive
+    /// in a transformed or retained navigation image, so presentation changes
+    /// cannot keep the previous field on screen.
+    fn drop_raster_for_presentation_change(&mut self, cx: &mut Context<Self>) {
+        self.retained_direct_frame = None;
+        self.raster_cache_enabled = false;
+        self.raster_prefetch_enabled = false;
+        if let Some(previous) = self.raster_tiles.take() {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        if let Some(previous) = self.raster_staging_tiles.take() {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        if let Some(previous) = self.raster_overview.take() {
+            self.raster_images_to_drop.push(previous.image);
+        }
+        self.raster_stale_tiles_displayable = false;
+        self.raster_overview_requested_revision = None;
+        self.raster_overview_refinement = None;
+        self.raster_display = None;
+        self.last_presented_raster.set(None);
+        self.raster_tile_target = None;
+        self.navigation_cache_active = false;
+        self.raster_navigation_direction = RasterTileIndex { x: 0, y: 0 };
+        let can_render = self.raster_output.is_some()
+            && self.screen_bounds.size.width > px(0.)
+            && self.screen_bounds.size.height > px(0.);
+        if can_render {
+            self.request_navigation_overview(cx);
+        }
+        self.advance_raster_generation();
+        self.request_initial_raster_decision(cx);
+    }
+
+    /// A source edit produced new geometry but changed nothing about how it is
+    /// presented. The previous tiles show the unedited layout, which is a far
+    /// better stand-in than a blank canvas while the new revision renders, so
+    /// they stay visible and the worker is retargeted at the new content.
+    fn retain_stale_raster_for_geometry_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(previous) = self.raster_staging_tiles.take() {
+            self.raster_images_to_drop
+                .extend(previous.tiles.into_values().map(|cache| cache.image));
+        }
+        self.raster_stale_tiles_displayable =
+            self.raster_tiles.is_some() || self.retained_direct_frame.is_some();
+        self.raster_overview_requested_revision = None;
+        self.raster_overview_refinement = None;
+        self.raster_tile_target = None;
+        self.advance_raster_generation();
+        let can_render = self.raster_output.is_some()
+            && self.screen_bounds.size.width > px(0.)
+            && self.screen_bounds.size.height > px(0.);
+        if can_render {
+            self.request_navigation_overview(cx);
+            self.request_navigation_raster(cx);
+        }
+        self.request_initial_raster_decision(cx);
+    }
+
+    /// Whether tiles rendered for `revision` may be shown this frame.
+    fn raster_revision_displayable(&self, revision: u64) -> bool {
+        revision == self.raster_content_revision || self.raster_stale_tiles_displayable
+    }
+
+    /// Records the exact state that changes raster pixels and classifies what
+    /// changed. UI-only changes, such as selecting a layer in the sidebar, do
+    /// not force a rebuild.
+    fn update_raster_presentation(&mut self, cx: &gpui::App) -> RasterPresentationChange {
         let (
             output,
             scope_state,
             selected_scope,
+            displayed_cell,
             layout_bbox,
             layer_visibility,
             hierarchy_depth,
@@ -7815,7 +8639,7 @@ impl LayoutCanvas {
             let state = self.state.read(cx);
             let hide_external_geometry = state.hide_external_geometry;
             let solved_cell = state.solved_cell.read(cx);
-            let (output, scope_state, selected_scope, layout_bbox) = solved_cell
+            let (output, scope_state, selected_scope, displayed_cell, layout_bbox) = solved_cell
                 .as_ref()
                 .map(|solved| {
                     let selected = solved.state[&solved.selected_scope].address;
@@ -7836,10 +8660,11 @@ impl LayoutCanvas {
                         Some(solved.output.clone()),
                         Some(solved.state.clone()),
                         Some(solved.selected_scope.clone()),
+                        Some(displayed.cell),
                         layout_bbox,
                     )
                 })
-                .unwrap_or((None, None, None, None));
+                .unwrap_or((None, None, None, None, None));
             let layer_visibility = state
                 .layers
                 .read(cx)
@@ -7851,6 +8676,7 @@ impl LayoutCanvas {
                 output,
                 scope_state,
                 selected_scope,
+                displayed_cell,
                 layout_bbox,
                 layer_visibility,
                 state.hierarchy_depth,
@@ -7868,22 +8694,38 @@ impl LayoutCanvas {
             (None, None) => true,
             _ => false,
         };
-        let changed = !same_output
-            || !same_scope_state
-            || self.raster_selected_scope != selected_scope
+        // Source recompilation can allocate a new ID for the same selected
+        // path. Keep its old frame until replacement geometry is complete.
+        let presentation_changed = self.raster_selected_scope != selected_scope
+            || (same_output && self.raster_displayed_cell != displayed_cell)
             || self.raster_layer_visibility != layer_visibility
             || self.raster_hierarchy_depth != hierarchy_depth
             || self.raster_hide_external_geometry != hide_external_geometry
             || self.raster_dark_mode != dark_mode;
+        let change = raster_presentation_change(
+            presentation_changed,
+            !same_output,
+            !same_scope_state,
+            self.raster_output.is_some(),
+        );
         self.raster_output = output;
+        self.raster_hierarchy = self
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|solved| solved.hierarchy.clone())
+            .unwrap_or_default();
         self.raster_scope_state = scope_state;
         self.raster_selected_scope = selected_scope;
+        self.raster_displayed_cell = displayed_cell;
         self.raster_layout_bbox = layout_bbox;
         self.raster_layer_visibility = layer_visibility;
         self.raster_hierarchy_depth = hierarchy_depth;
         self.raster_hide_external_geometry = hide_external_geometry;
         self.raster_dark_mode = dark_mode;
-        changed
+        change
     }
 
     fn request_initial_raster_decision(&mut self, cx: &mut Context<Self>) {
@@ -7902,24 +8744,19 @@ impl LayoutCanvas {
             self.set_rendering(false, cx);
             return;
         };
+        self.set_rendering(true, cx);
         let content_revision = self.raster_content_revision;
         self.raster_decision_refinement = Some(cx.spawn(async move |canvas, cx| {
             let decision = cx
                 .background_spawn(async move {
-                    let prefetch_raster = solved_geometry_reaches_threshold(
+                    let use_raster = solved_geometry_uses_raster_cache(
                         &solved,
                         hierarchy_depth,
                         hide_external_geometry,
-                        RASTER_PREFETCH_GEOMETRY_THRESHOLD,
                     );
                     VisibleGeometryRenderDecision {
-                        use_raster: prefetch_raster
-                            && solved_geometry_uses_raster_cache(
-                                &solved,
-                                hierarchy_depth,
-                                hide_external_geometry,
-                            ),
-                        prefetch_raster,
+                        use_raster,
+                        prefetch_raster: use_raster,
                     }
                 })
                 .await;
@@ -7946,31 +8783,25 @@ impl LayoutCanvas {
     }
 
     fn request_visible_raster_decision(&mut self, cx: &mut Context<Self>) {
-        if !self.raster_prefetch_enabled {
-            return;
-        }
-        let (solved, layers, hierarchy_depth, hide_external_geometry, select_overview) = {
+        let (solved, layers, hierarchy_depth, hide_external_geometry) = {
             let state = self.state.read(cx);
             (
                 state.solved_cell.read(cx).clone(),
                 state.layers.read(cx).layers.clone(),
                 state.hierarchy_depth,
                 state.hide_external_geometry,
-                matches!(
-                    state.tool.read(cx),
-                    ToolState::Select(SelectToolState { selected_obj: None })
-                ),
             )
         };
         let Some(solved) = solved else {
             return;
         };
-        if !select_overview || self.screen_bounds.size.width <= px(0.) {
+        if self.screen_bounds.size.width <= px(0.) {
             return;
         }
         self.raster_decision_refinement = None;
         self.raster_decision_generation = self.raster_decision_generation.wrapping_add(1);
         let decision_generation = self.raster_decision_generation;
+        self.set_rendering(true, cx);
         let content_revision = self.raster_content_revision;
         let viewport = ViewportTransform {
             size: self.screen_bounds.size,
@@ -7996,30 +8827,22 @@ impl LayoutCanvas {
             let _ = canvas.update(cx, |canvas, cx| {
                 if canvas.raster_content_revision != content_revision
                     || canvas.raster_decision_generation != decision_generation
-                    || canvas.scale != viewport.scale
-                    || canvas.offset != viewport.offset
                 {
                     return;
                 }
                 canvas.raster_decision_refinement = None;
-                let Some(mut decision) = decision else {
+                if canvas.scale != viewport.scale || canvas.offset != viewport.offset {
+                    canvas.request_visible_raster_decision(cx);
                     return;
-                };
-                // A completed solid LOD remains cheap and visually valid to
-                // scale, but still needs a fresh target at the settled camera.
-                if !decision.prefetch_raster
-                    && canvas.raster_tiles.as_ref().is_some_and(|tiles| {
-                        raster_tiles_visible_lod_is_scale_safe(
-                            tiles,
-                            canvas.screen_bounds,
-                            canvas.scale,
-                            canvas.offset,
-                        ) && canvas.raster_display_transform_for_current_view().is_some()
-                    })
-                {
-                    decision.prefetch_raster = true;
                 }
-                canvas.set_raster_cache_requested(decision, cx);
+                if let Some(decision) = decision {
+                    canvas.set_raster_cache_requested(decision, cx);
+                }
+                canvas.promote_staging_tiles();
+                // A decision can reuse an already complete field, with no
+                // tile worker left to clear the activity flag. Recompute it
+                // from the remaining tasks even when raster mode stays on.
+                canvas.set_rendering(false, cx);
                 cx.notify();
             });
         }));
@@ -8032,6 +8855,10 @@ impl LayoutCanvas {
     }
 
     fn set_rendering(&self, rendering: bool, cx: &mut Context<Self>) {
+        let rendering = rendering
+            || self.raster_worker_active
+            || self.raster_decision_refinement.is_some()
+            || self.raster_overview_requested_revision.is_some();
         self.state.update(cx, |state, cx| {
             if state.rendering != rendering {
                 state.rendering = rendering;
@@ -8120,9 +8947,20 @@ impl LayoutCanvas {
             let retained = navigation_tile_order(center)
                 .into_iter()
                 .collect::<HashSet<_>>();
+            let display = self
+                .last_presented_raster
+                .get()
+                .or(self.raster_display)
+                .unwrap_or_else(|| navigation_raster_capture_transform(tiles));
             let mut discarded = Vec::new();
             tiles.tiles.retain(|index, cache| {
-                if retained.contains(index) {
+                // A fast pan can move the target ring past the camera still
+                // on screen. Keep that camera's tiles until its replacement
+                // has actually been presented, even outside the new ring.
+                if retained.contains(index)
+                    || raster_bounds(cache, self.screen_bounds, display.scale, display.offset)
+                        .intersects(&self.screen_bounds)
+                {
                     true
                 } else {
                     discarded.push(cache.image.clone());
@@ -8214,7 +9052,7 @@ impl LayoutCanvas {
         let cache = self
             .raster_overview
             .as_ref()
-            .filter(|cache| cache.content_revision == self.raster_content_revision)?;
+            .filter(|cache| self.raster_revision_displayable(cache.content_revision))?;
         let bbox = self.raster_layout_bbox.as_ref()?;
         let current = ViewportTransform {
             size: self.screen_bounds.size,
@@ -8333,6 +9171,7 @@ impl LayoutCanvas {
             cancel_if_generation_changes: None,
         };
         self.raster_overview_requested_revision = Some(content_revision);
+        self.set_rendering(true, cx);
         self.raster_overview_refinement = Some(cx.spawn(async move |canvas, cx| {
             let cache = cx
                 .background_spawn(async move { build_navigation_raster(input) })
@@ -8345,6 +9184,7 @@ impl LayoutCanvas {
                     return;
                 }
                 canvas.raster_overview_requested_revision = None;
+                canvas.set_rendering(false, cx);
                 if let Some(cache) = cache {
                     if let Some(previous) = canvas.raster_overview.replace(cache) {
                         canvas.raster_images_to_drop.push(previous.image);
@@ -8441,7 +9281,7 @@ impl LayoutCanvas {
         }
 
         let can_stage_over_active = self.raster_tiles.as_ref().is_some_and(|tiles| {
-            tiles.content_revision == target.content_revision
+            self.raster_revision_displayable(tiles.content_revision)
                 && tiles.screen_viewport == target.screen_viewport
         });
         if !can_stage_over_active {
@@ -8466,6 +9306,7 @@ impl LayoutCanvas {
                 self.raster_images_to_drop
                     .extend(previous.tiles.into_values().map(|cache| cache.image));
             }
+            self.raster_stale_tiles_displayable = false;
             self.raster_display = self
                 .raster_tiles
                 .as_ref()
@@ -8506,6 +9347,18 @@ impl LayoutCanvas {
         }
         staging.center = target.center;
 
+        self.promote_staging_tiles();
+    }
+
+    fn promote_staging_tiles(&mut self) {
+        // A zoom's visibility query can choose direct geometry. Do not publish
+        // a new raster first and immediately replace it with that rendition.
+        if self.raster_decision_refinement.is_some() {
+            return;
+        }
+        let Some(staging) = self.raster_staging_tiles.as_ref() else {
+            return;
+        };
         let staging_covers_viewport = raster_tiles_cover_bounds(
             staging,
             self.screen_bounds,
@@ -8535,6 +9388,7 @@ impl LayoutCanvas {
             self.raster_images_to_drop
                 .extend(previous.tiles.into_values().map(|cache| cache.image));
         }
+        self.raster_stale_tiles_displayable = false;
         self.raster_display = Some(display);
     }
 
@@ -8591,7 +9445,7 @@ impl LayoutCanvas {
                         canvas.navigation_cache_active = canvas.raster_cache_enabled
                             || (canvas.raster_prefetch_enabled
                                 && (canvas.is_dragging || canvas.keyboard_pan_active));
-                        canvas.set_rendering(false, cx);
+                        canvas.set_rendering(canvas.raster_decision_refinement.is_some(), cx);
                         cx.notify();
                     });
                     return;
@@ -8877,23 +9731,14 @@ impl LayoutCanvas {
 
     pub(crate) fn fit_to_screen(&mut self, cx: &mut Context<Self>) {
         self.advance_raster_generation();
-        if let Some(previous) = self.raster_tiles.take() {
-            self.raster_images_to_drop
-                .extend(previous.tiles.into_values().map(|cache| cache.image));
-        }
         if let Some(previous) = self.raster_staging_tiles.take() {
             self.raster_images_to_drop
                 .extend(previous.tiles.into_values().map(|cache| cache.image));
         }
-        self.raster_display = None;
-        self.last_presented_raster.set(None);
         self.raster_tile_target = None;
-        self.navigation_cache_active = false;
-        self.raster_refinement = None;
-        self.raster_worker_active = false;
-        // Fitting invalidates the old worker but immediately schedules a
-        // replacement on the next paint. Keep the activity handoff continuous
-        // while a solved layout is still waiting to be rasterized.
+        self.raster_navigation_direction = RasterTileIndex { x: 0, y: 0 };
+        // Fit is a camera change. Keep the previous complete image while the
+        // same worker renders the new view, just as for a zoom gesture.
         let has_solved_layout = self.state.read(cx).solved_cell.read(cx).is_some();
         self.set_rendering(has_solved_layout, cx);
         self.hover_hit = None;
@@ -8926,7 +9771,158 @@ impl LayoutCanvas {
         }
         self.raster_scale_signal
             .store(self.scale.to_bits() as u64, Ordering::Release);
+        self.update_raster_display_for_camera();
+        self.request_navigation_overview(cx);
+        self.request_navigation_raster(cx);
+        self.request_visible_raster_decision(cx);
         cx.notify();
+    }
+
+    fn place_rectangle(
+        &mut self,
+        p0: Point<f32>,
+        p1: Point<f32>,
+        grid: f64,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.state.read(cx);
+        let Some(solved) = state.solved_cell.read(cx).as_ref() else {
+            return;
+        };
+        let address = solved.state[&solved.selected_scope].address;
+        let scope = &solved.output.cells[&address.cell].scopes[&address.scope];
+        let reachable = solved.output.reachable_objs(address.cell, address.scope);
+        let names: HashSet<&str> = reachable
+            .values()
+            .map(String::as_str)
+            .chain(
+                self.pending_rectangles
+                    .iter()
+                    .filter(|pending| pending.scope_path == solved.selected_scope)
+                    .map(|pending| pending.name.as_str()),
+            )
+            .collect();
+        let name = (0..)
+            .map(|i| format!("rect{i}"))
+            .find(|name| !names.contains(name.as_str()))
+            .expect("an unused rectangle name");
+        let rect = compile::BasicRect {
+            layer: state
+                .layers
+                .read(cx)
+                .selected_layer
+                .as_ref()
+                .map(ToString::to_string),
+            x0: draw_source_coordinate(p0.x.min(p1.x), grid),
+            y0: draw_source_coordinate(p0.y.min(p1.y), grid),
+            x1: draw_source_coordinate(p0.x.max(p1.x), grid),
+            y1: draw_source_coordinate(p0.y.max(p1.y), grid),
+            construction: false,
+        };
+        let client = state.lang_server_client.clone();
+        let scope_span = scope.span.clone();
+        let id = self.next_rectangle_id;
+        self.next_rectangle_id = self.next_rectangle_id.wrapping_add(1);
+        self.pending_rectangles.push(PendingRectangle {
+            id,
+            scope_path: solved.selected_scope.clone(),
+            source_path: scope_span.path.clone(),
+            name: name.clone(),
+            rect: rect.clone(),
+            submitted_revision: state.compilation_revision,
+            receipt: None,
+            resolved_content_revision: None,
+        });
+        cx.notify();
+        cx.spawn(async move |canvas, cx| {
+            let result = client.draw_rect(scope_span, name, rect).await;
+            let _ = canvas.update(cx, |canvas, cx| {
+                canvas.finish_rectangle_request(id, result, cx)
+            });
+        })
+        .detach();
+    }
+
+    fn finish_rectangle_request(
+        &mut self,
+        id: u64,
+        result: anyhow::Result<Option<RectangleEditResult>>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(Some(receipt)) => {
+                if let Some(pending) = self
+                    .pending_rectangles
+                    .iter_mut()
+                    .find(|pending| pending.id == id)
+                {
+                    pending.receipt = Some(receipt);
+                }
+                // The compiler may have delivered its snapshot before the RPC
+                // reply. Reconcile either arrival order without a blank frame.
+                self.reconcile_pending_rectangles(cx);
+            }
+            result => {
+                self.pending_rectangles.retain(|pending| pending.id != id);
+                if matches!(result, Ok(None)) {
+                    self.state.update(cx, |state, cx| {
+                        if state.message.is_none() {
+                            state.show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn reconcile_pending_rectangles(&mut self, cx: &App) {
+        if self.pending_rectangles.is_empty() {
+            return;
+        }
+        let state = self.state.read(cx);
+        let revision = state.compilation_revision;
+        let solved = state.solved_cell.read(cx);
+        self.pending_rectangles.retain_mut(|pending| {
+            let contains_rectangle = solved.as_ref().is_some_and(|solved| {
+                solved
+                    .state
+                    .get(&pending.scope_path)
+                    .is_some_and(|scope_state| {
+                        let cell = &solved.output.cells[&scope_state.address.cell];
+                        let scope = &cell.scopes[&scope_state.address.scope];
+                        scope.span.path == pending.source_path
+                            && scope.bindings.values().any(|(name, object)| {
+                                name == &pending.name
+                                    && object
+                                        .get_elem()
+                                        .and_then(|id| cell.objects.get(id))
+                                        .is_some_and(|object| {
+                                            matches!(object, SolvedValue::Rect(_))
+                                        })
+                            })
+                    })
+            });
+            if contains_rectangle {
+                pending.resolved_content_revision = Some(self.raster_content_revision);
+            } else if state.compilation_error.is_some()
+                && revision.is_some_and(|revision| {
+                    snapshot_follows_revision(revision, pending.submitted_revision)
+                })
+            {
+                return false;
+            } else if pending
+                .receipt
+                .as_ref()
+                .is_some_and(|receipt| revision.is_some_and(|revision| revision > receipt.revision))
+            {
+                // A newer source revision superseded the insertion (undo,
+                // deletion, or opening another cell). Retire with that frame.
+                pending.resolved_content_revision = Some(self.raster_content_revision);
+            }
+            true
+        });
     }
 
     pub(crate) fn on_left_mouse_down(
@@ -8958,6 +9954,7 @@ impl LayoutCanvas {
             .unwrap_or(0.1);
         let layout_mouse_position = self.px_to_layout(event.position);
         let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
+        let mut rectangle = None;
         let edit_dim = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             let mut edit_dim = false;
             match tool {
@@ -8970,72 +9967,7 @@ impl LayoutCanvas {
                         if layer_info.visible {
                             if let Some(p0) = rect_tool.p0 {
                                 rect_tool.p0 = None;
-                                let p1 = snapped_layout_mouse_position;
-                                let p0p = Point::new(f32::min(p0.x, p1.x), f32::min(p0.y, p1.y));
-                                let p1p = Point::new(f32::max(p0.x, p1.x), f32::max(p0.y, p1.y));
-                                self.state.update(cx, |state, cx| {
-                                    let error: Option<SharedString> =
-                                        state.solved_cell.update(cx, {
-                                            |cell, cx| {
-                                                if let Some(cell) = cell.as_mut() {
-                                                    // TODO update in memory representation of code
-                                                    // TODO add solver to gui
-                                                    let scope_address =
-                                                        &cell.state[&cell.selected_scope].address;
-                                                    let reachable_objs =
-                                                        cell.output.reachable_objs(
-                                                            scope_address.cell,
-                                                            scope_address.scope,
-                                                        );
-                                                    let names: IndexSet<_> =
-                                                        reachable_objs.values().collect();
-                                                    let scope = cell
-                                                        .output
-                                                        .cells
-                                                        .get(&scope_address.cell)
-                                                        .unwrap()
-                                                        .scopes
-                                                        .get(&scope_address.scope)
-                                                        .unwrap();
-                                                    let rect_name = (0..)
-                                                        .map(|i| format!("rect{i}"))
-                                                        .find(|name| !names.contains(name))
-                                                        .unwrap();
-
-                                                    match state.lang_server_client.draw_rect(
-                                                        scope.span.clone(),
-                                                        rect_name,
-                                                        compile::BasicRect {
-                                                            layer: state
-                                                                .layers
-                                                                .read(cx)
-                                                                .selected_layer
-                                                                .clone()
-                                                                .map(|s| s.to_string()),
-                                                            x0: draw_source_coordinate(p0p.x, grid),
-                                                            y0: draw_source_coordinate(p0p.y, grid),
-                                                            x1: draw_source_coordinate(p1p.x, grid),
-                                                            y1: draw_source_coordinate(p1p.y, grid),
-                                                            construction: false,
-                                                        },
-                                                    ) {
-                                                        Ok(None) => Some(
-                                                            SOURCE_EDIT_REJECTED_MESSAGE.into(),
-                                                        ),
-                                                        Ok(Some(_)) => None,
-                                                        Err(_) => None,
-                                                    }
-                                                } else {
-                                                    Some("no cell to edit".into())
-                                                }
-                                            }
-                                        });
-                                    if state.message.is_none()
-                                        && let Some(error) = error
-                                    {
-                                        state.show_message(MessageType::ERROR, error);
-                                    }
-                                });
+                                rectangle = Some((p0, snapped_layout_mouse_position));
                             } else {
                                 rect_tool.p0 = Some(snapped_layout_mouse_position);
                             }
@@ -9650,6 +10582,9 @@ impl LayoutCanvas {
             }
             edit_dim
         });
+        if let Some((p0, p1)) = rectangle {
+            self.place_rectangle(p0, p1, grid, cx);
+        }
         if edit_dim {
             self.text_input
                 .update(cx, |input, cx| input.start_dimension_edit(cx));
@@ -10490,10 +11425,9 @@ pub(crate) fn find_obj_path(
         panic!("need non-empty object path");
     }
     for obj in &path[0..path.len() - 1] {
-        let mut reachable_objs = cell
-            .output
-            .reachable_objs(current_scope.cell, current_scope.scope);
-        if let Some(name) = reachable_objs.swap_remove(obj)
+        if let Some(name) =
+            cell.output
+                .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
             && let Some(inst) = cell.output.cells[&current_scope.cell].objects[obj].get_instance()
         {
             string_path.push(name);
@@ -10507,10 +11441,10 @@ pub(crate) fn find_obj_path(
         }
     }
     let obj = path.last().unwrap();
-    let mut reachable_objs = cell
-        .output
-        .reachable_objs(current_scope.cell, current_scope.scope);
-    if let Some(name) = reachable_objs.swap_remove(obj) {
+    if let Some(name) =
+        cell.output
+            .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
+    {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
             SolvedValue::Rect(_) | SolvedValue::Polygon(_) | SolvedValue::Path(_) => {
                 string_path.push(name)
@@ -10526,6 +11460,10 @@ pub(crate) fn find_obj_path(
     }
     (reachable, string_path)
 }
+
+#[cfg(test)]
+#[path = "render_regression.rs"]
+mod render_regression;
 
 #[cfg(test)]
 mod tests {
@@ -10737,6 +11675,7 @@ mod tests {
                     max_y: 110.,
                 },
                 lod_layer: Some("met1".into()),
+                instance_layers: None,
             },
             RasterBvhItem {
                 emit_index: 3,
@@ -10747,6 +11686,7 @@ mod tests {
                     max_y: 10.,
                 },
                 lod_layer: Some("met1".into()),
+                instance_layers: None,
             },
             RasterBvhItem {
                 emit_index: 1,
@@ -10757,6 +11697,7 @@ mod tests {
                     max_y: 6.,
                 },
                 lod_layer: Some("met1".into()),
+                instance_layers: None,
             },
         ])
         .unwrap();
@@ -10789,6 +11730,7 @@ mod tests {
                         max_y: 0.01,
                     },
                     lod_layer: Some(layer.clone()),
+                    instance_layers: None,
                 })
                 .collect(),
         )
@@ -10819,6 +11761,7 @@ mod tests {
                         max_y: emit_index as f64 / 16. + 0.01,
                     },
                     lod_layer: Some(layer.clone()),
+                    instance_layers: None,
                 })
                 .collect(),
         )
@@ -10829,8 +11772,8 @@ mod tests {
         assert!(emits.is_empty());
         assert!(occupancies.len() > 1, "sparse BVH nodes must be refined");
         assert!(occupancies.iter().all(|occupancy| {
-            occupancy.bounds.max_x - occupancy.bounds.min_x < 0.1
-                && occupancy.bounds.max_y - occupancy.bounds.min_y < 0.1
+            occupancy.bounds.max_x - occupancy.bounds.min_x <= 0.25
+                && occupancy.bounds.max_y - occupancy.bounds.min_y <= 0.25
         }));
 
         let separated_leaf = RasterBvhNode::build(vec![
@@ -10843,6 +11786,7 @@ mod tests {
                     max_y: 0.1,
                 },
                 lod_layer: Some(layer.clone()),
+                instance_layers: None,
             },
             RasterBvhItem {
                 emit_index: 21,
@@ -10853,6 +11797,7 @@ mod tests {
                     max_y: 0.1,
                 },
                 lod_layer: Some(layer.clone()),
+                instance_layers: None,
             },
         ])
         .unwrap();
@@ -10871,6 +11816,7 @@ mod tests {
                 max_y: 0.01,
             },
             lod_layer: None,
+            instance_layers: None,
         }])
         .unwrap();
         emits.clear();
@@ -11103,16 +12049,7 @@ cell top() {
         let layers = Arc::new(IndexMap::from_iter([(layer.name.clone(), layer)]));
         let ready_index = RasterSpatialIndex::default();
         for cell in solved.output.cells.keys().copied() {
-            let index = OnceLock::new();
-            index
-                .set(RasterCellSpatialIndex::build(&solved, cell))
-                .ok()
-                .expect("fresh cell index");
-            ready_index
-                .cells
-                .lock()
-                .unwrap()
-                .insert(cell, Arc::new(index));
+            ready_index.cell_index(&solved, cell);
         }
         let sparse_instance_view = ViewportTransform {
             size: Size::new(px(64.), px(64.)),
@@ -11236,30 +12173,24 @@ cell top() {
 
     #[test]
     fn sparse_visible_geometry_stays_on_the_direct_paint_path() {
-        assert!(!visible_geometry_uses_raster_cache(true, 0));
+        assert!(!visible_geometry_uses_raster_cache(0));
         assert!(!visible_geometry_uses_raster_cache(
-            true,
             RASTER_CACHE_GEOMETRY_THRESHOLD - 1
         ));
         assert!(visible_geometry_uses_raster_cache(
-            true,
             RASTER_CACHE_GEOMETRY_THRESHOLD
         ));
-        assert!(!visible_geometry_uses_raster_cache(
-            false,
-            RASTER_CACHE_GEOMETRY_THRESHOLD
-        ));
-        assert!(!visible_geometry_uses_raster_cache(true, 45_749));
+        assert!(visible_geometry_uses_raster_cache(45_749));
         assert_eq!(
-            visible_geometry_render_decision(true, RASTER_PREFETCH_GEOMETRY_THRESHOLD),
+            visible_geometry_render_decision(RASTER_CACHE_GEOMETRY_THRESHOLD - 1),
             VisibleGeometryRenderDecision {
                 use_raster: false,
-                prefetch_raster: true,
+                prefetch_raster: false,
             },
-            "medium views prebuild pan tiles without replacing idle geometry"
+            "sparse views neither display nor prebuild tiles, so a pan never swaps renderers"
         );
         assert_eq!(
-            visible_geometry_render_decision(true, RASTER_CACHE_GEOMETRY_THRESHOLD),
+            visible_geometry_render_decision(RASTER_CACHE_GEOMETRY_THRESHOLD),
             VisibleGeometryRenderDecision {
                 use_raster: true,
                 prefetch_raster: true,
@@ -12010,6 +12941,136 @@ cell top() {
     }
 
     #[test]
+    fn compiled_rectangle_rasters_preserve_constraints_and_dash_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+cell free() { let r = rect("met1", x0i=10., y0i=10., x1i=90., y1i=90.)!; }
+cell partial() { let r = rect("met1", x0i=10., y0i=10., x1=90., y1=90.)!; }
+cell fixed() { let r = rect("met1", x0=10., y0=10., x1=90., y1=90.); }
+cell reversed() { let r = rect("met1", x0i=90., y0i=90., x1=10., y1=10.)!; }
+cell rotated() { let child = inst(partial(), x=100., y=0., angle=90); }
+cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
+"#,
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        // Expected dashed edges: top, right, bottom, left. Every case has the
+        // same physical bounds, including the reversed and transformed ones.
+        for (cell, dashed) in [
+            ("free", [true, true, true, true]),
+            ("partial", [false, false, true, true]),
+            ("fixed", [false, false, false, false]),
+            ("reversed", [true, true, false, false]),
+            ("rotated", [false, true, true, false]),
+            ("reflected", [true, false, false, true]),
+        ] {
+            let result = compile(
+                &ast,
+                compile::CompileInput {
+                    cell: &[cell],
+                    args: vec![],
+                },
+            );
+            let output = match result {
+                compile::CompileOutput::Valid(output) => output,
+                compile::CompileOutput::ExecErrors(errors) => {
+                    assert!(
+                        errors.errors.iter().all(|error| matches!(
+                            error.kind,
+                            compile::ExecErrorKind::Underconstrained
+                        ) || (cell == "reversed"
+                            && matches!(error.kind, compile::ExecErrorKind::FlippedRect(_)))),
+                        "{cell}: {:?}",
+                        errors.errors
+                    );
+                    errors.output.unwrap()
+                }
+                other => panic!("{cell}: {other:?}"),
+            };
+            let solved = raster_test_compile_output_state(output);
+            let root = &solved.output.cells[&solved.output.top];
+            if let Some(rect) = root.objects.values().find_map(|object| object.get_rect()) {
+                let styles = rectangle_border_styles(
+                    rect,
+                    &root.unsolved_vars,
+                    TransformationMatrix::identity(),
+                );
+                assert_eq!(
+                    [styles.top, styles.right, styles.bottom, styles.left]
+                        .map(|style| style == BorderStyle::Dashed),
+                    dashed,
+                    "{cell}: direct rendering lost constraint state"
+                );
+            }
+            for fill in [ShapeFill::Hollow, ShapeFill::Solid, ShapeFill::Stippling] {
+                let layer = LayerState {
+                    name: "met1".into(),
+                    color: rgb(0x002233),
+                    fill,
+                    border_color: rgb(0xff0000),
+                    visible: true,
+                    used: true,
+                    z: 0,
+                };
+                let viewport = ViewportTransform {
+                    size: Size::new(px(240.), px(240.)),
+                    screen_size: Size::new(px(240.), px(240.)),
+                    scale: 2.,
+                    offset: Point::new(px(20.), px(220.)),
+                };
+                let input = raster_test_navigation_input(
+                    solved.clone(),
+                    Arc::new(IndexMap::from_iter([(layer.name.clone(), layer)])),
+                    viewport,
+                    true,
+                );
+                let first = build_navigation_raster(input.clone()).unwrap();
+                let pixels = first.image.as_bytes(0).unwrap();
+                let border = |x: usize, y: usize| {
+                    pixels[(y * 240 + x) * 4..(y * 240 + x + 1) * 4] == [0, 0, 255, 255]
+                };
+                for (edge, should_dash) in dashed.into_iter().enumerate() {
+                    let samples = (50..190)
+                        .map(|position| match edge {
+                            0 => border(position, 40),
+                            1 => border(198, position),
+                            2 => border(position, 198),
+                            _ => border(40, position),
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(
+                        samples.iter().any(|on| *on),
+                        "{cell}: edge {edge} disappeared"
+                    );
+                    assert_eq!(
+                        samples.iter().any(|on| !on),
+                        should_dash,
+                        "{cell}: cached edge {edge} lost its constraint style with {fill:?}"
+                    );
+                }
+                let mut panned_input = input;
+                panned_input.viewport.offset += Point::new(px(-64.), px(32.));
+                let panned = build_navigation_raster(panned_input).unwrap();
+                let panned_pixels = panned.image.as_bytes(0).unwrap();
+                for y in 40..232 {
+                    for x in 8..168 {
+                        let before = ((y - 32) * 240 + x + 64) * 4;
+                        let after = (y * 240 + x) * 4;
+                        assert_eq!(
+                            &pixels[before..before + 4],
+                            &panned_pixels[after..after + 4],
+                            "{cell}: clipped pan moved dash phase at {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_rectangle_outline_stays_one_raster_pixel_wide() {
         let mut buffer = vec![0; 8 * 8 * 4];
         {
@@ -12306,8 +13367,8 @@ cell top() {
             address: ScopeAddress,
             parent: Option<ScopeAddress>,
             parent_path: &[String],
-            state: &mut IndexMap<editor::ScopePath, editor::ScopeState>,
-            scope_paths: &mut IndexMap<ScopeAddress, editor::ScopePath>,
+            state: &mut imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+            scope_paths: &mut imbl::HashMap<ScopeAddress, editor::ScopePath>,
         ) -> (editor::ScopePath, Option<compile::Rect<f64>>) {
             let scope_info = &output.cells[&address.cell].scopes[&address.scope];
             let mut path = parent_path.to_vec();
@@ -12408,8 +13469,8 @@ cell top() {
             cell: output.top,
             scope: output.cells[&output.top].root,
         };
-        let mut state = IndexMap::new();
-        let mut scope_paths = IndexMap::new();
+        let mut state = imbl::HashMap::new();
+        let mut scope_paths = imbl::HashMap::new();
         let (selected_scope, _) =
             visit_scope(&output, root, None, &[], &mut state, &mut scope_paths);
         CompileOutputState {
@@ -12417,6 +13478,7 @@ cell top() {
             selected_scope,
             state: Arc::new(state),
             scope_paths: Arc::new(scope_paths),
+            hierarchy: Arc::default(),
         }
     }
 
@@ -13237,6 +14299,7 @@ cell top() {
             selected_scope: Vec::new(),
             state: Arc::default(),
             scope_paths: Arc::default(),
+            hierarchy: Arc::default(),
         };
         let scope = ScopeAddress {
             cell: top,

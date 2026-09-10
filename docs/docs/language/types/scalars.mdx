@@ -1,0 +1,50 @@
+---
+title: Scalar and utility types
+description: Float, Int, Bool, String, Any, and unit values.
+sidebar_label: Scalars
+---
+
+# Scalar and utility types
+
+## `Float` {#float}
+
+`Float` is the type of coordinates, distances, and other solver expressions. A float literal has a decimal point: `12.` or `-0.5`.
+
+Used by the [geometry constructors](/language/builtins/geometry), [constraints](/language/builtins/constraints), and instance positions.
+
+:::warning
+`12` is an `Int`. Write `12.` for a float.
+:::
+
+## `Int` {#int}
+
+`Int` is for counts, indices, point counts, and rotation angles.
+
+Cast to a float with `value as Float`.
+
+## `Bool` {#bool}
+
+`Bool` is `true` or `false`. Conditions must be booleans, and built-ins use them for flags such as `reflect` and `construction`.
+
+## `String` {#string}
+
+`String` is text. Layer names and labels are strings.
+
+```argon
+rect("met1");
+text("VDD", "text.label", 0., 0.);
+```
+
+## `Any` {#any}
+
+`Any` erases a value's static type. It's occasionally useful for mixed or generic sequences, but concrete types give you field access and better error messages.
+
+## Unit `()` {#unit}
+
+`()` is the return type of functions that produce nothing useful, such as ones that only emit geometry or constraints.
+
+```argon
+fn align_left(a: Rect, b: Rect) -> () {
+    eq(a.x0, b.x0);
+}
+```

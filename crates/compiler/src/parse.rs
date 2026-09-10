@@ -38,6 +38,8 @@ impl AstMetadata for ParseMetadata {
     type Ident = ();
     type IdentPath = ();
     type EnumDecl = ();
+    type EnumVariant = ();
+    type PatternBinding = ();
     type StructDecl = ();
     type StructField = ();
     type CellDecl = ();

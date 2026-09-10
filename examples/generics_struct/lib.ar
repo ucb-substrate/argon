@@ -1,0 +1,20 @@
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    Pair { first: p.second, second: p.first }
+}
+
+// The type arguments are inferred from the field values, so the literal
+// needs no annotation; `Pair::<Int, Float> { .. }` spells them out.
+fn origin() -> Pair<Int, Float> {
+    Pair { first: 0, second: 0. }
+}
+
+cell top() {
+    let p = swap(Pair { first: 2, second: 150. });
+    let o = origin();
+    let r = rect("met1", x0=o.second, y0=0., w=p.first, h=p.first / (p.second as Float));
+}

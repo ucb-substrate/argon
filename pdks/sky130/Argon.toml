@@ -1,5 +1,2 @@
 name = "sky130"
 tech = "sky130.tech.toml"
-
-[gds]
-ring_osc = "~/Downloads/ring_osc.gds"

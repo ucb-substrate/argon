@@ -32,10 +32,10 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     ast::{
-        ArgDecl, Decl, Expr, IdentPath, ModPath, Scope, Statement, WorkspaceAst,
+        ArgDecl, Decl, Expr, IdentPath, ModPath, Pattern, Scope, Statement, WorkspaceAst,
         annotated::AnnotatedAst,
     },
-    compile::{EnumId, Ty, VarId, VarIdTyMetadata},
+    compile::{Ty, TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata},
 };
 
 /// A declaration's content fingerprint.
@@ -75,10 +75,6 @@ pub struct ItemSite {
     pub path: PathBuf,
     /// Byte range of the declaration within its module's backing text, which
     /// is what every `cfgrammar::Span` in that module indexes.
-    ///
-    /// An `enum` declaration carries no span of its own, so its name's span
-    /// stands in; an enum body contains no executable code, so no compiled
-    /// span can fall inside one.
     pub span: Range<usize>,
 }
 
@@ -89,10 +85,14 @@ pub struct ItemIndex {
 }
 
 impl ItemIndex {
-    pub fn build(ast: &WorkspaceAst<VarIdTyMetadata>) -> Self {
-        let mut builder = Builder::default();
-        builder.collect_declarations(ast);
-        builder.collect_dependencies(ast);
+    pub fn build(workspace: &TypedWorkspace) -> Self {
+        let mut builder = Builder {
+            items: IndexMap::new(),
+            variants: HashMap::new(),
+            defs: &workspace.defs,
+        };
+        builder.collect_declarations(&workspace.ast);
+        builder.collect_dependencies(&workspace.ast);
         Self {
             sites: builder.finish(),
         }
@@ -128,15 +128,13 @@ struct Item {
     deps: IndexSet<VarId>,
 }
 
-#[derive(Default)]
-struct Builder {
+struct Builder<'a> {
     items: IndexMap<VarId, Item>,
-    /// The `VarId` an enum's name is bound to, by the id carried in its [`Ty`].
-    ///
-    /// A reference to an enum *variant* is a multi-segment path, which
-    /// `dispatch_ident_path` reports as `(None, ty)` with no `VarId` at all,
-    /// so this map is the only way such a reference reaches a fingerprint.
-    enums: HashMap<EnumId, VarId>,
+    /// The `VarId` of each variant's enum, by the variant's own `VarId`. A
+    /// reference to a variant is a dependency on its enum.
+    variants: HashMap<VarId, VarId>,
+    /// Struct and enum definitions, for the payload types an enum depends on.
+    defs: &'a TypeDefs,
 }
 
 fn hasher() -> fnv::FnvHasher {
@@ -158,18 +156,22 @@ fn write_module(hasher: &mut impl Hasher, module: &ModPath) {
     }
 }
 
-impl Builder {
+impl Builder<'_> {
     /// Records every declaration and its own hash, without looking at what it
     /// refers to.
     fn collect_declarations(&mut self, ast: &WorkspaceAst<VarIdTyMetadata>) {
-        // Enums first: a declaration walked below may name a variant of an enum
-        // declared in any module, and resolving that needs the whole map.
+        // Variants first: a declaration walked below may name a variant of an
+        // enum declared in any module, and resolving that needs the whole map.
         for annotated in ast.values() {
             for decl in declarations(annotated) {
                 if let Decl::Enum(decl) = decl
-                    && let Some((name_id, enum_id)) = decl.metadata
+                    && let Some(enum_id) = decl.metadata
                 {
-                    self.enums.insert(enum_id, name_id);
+                    for variant in &decl.variants {
+                        if let Some(variant_id) = variant.metadata {
+                            self.variants.insert(variant_id, enum_id);
+                        }
+                    }
                 }
             }
         }
@@ -190,14 +192,14 @@ impl Builder {
                         span_range(decl.span),
                     ),
                     Decl::Enum(decl) => {
-                        let Some((var, _)) = decl.metadata else {
+                        let Some(var) = decl.metadata else {
                             continue;
                         };
                         (
                             var,
                             ItemKind::Enum,
                             decl.name.name.as_str(),
-                            span_range(decl.name.span),
+                            span_range(decl.span),
                         )
                     }
                     Decl::Struct(decl) => {
@@ -227,25 +229,10 @@ impl Builder {
                 write_str(&mut hasher, &annotated.path.to_string_lossy());
                 write_module(&mut hasher, module);
                 write_str(&mut hasher, name);
-                match decl {
-                    // A cell's, function's, or struct's declaration span runs
-                    // from its keyword to its closing brace with no surrounding
-                    // trivia, so this is exactly the declaration's text.
-                    Decl::Cell(_) | Decl::Fn(_) | Decl::Struct(_) => {
-                        write_str(&mut hasher, &annotated.text[span.clone()]);
-                    }
-                    // An `enum` has no span to slice, and its structure is its
-                    // whole declaration anyway.
-                    Decl::Enum(decl) => {
-                        hasher.write_usize(decl.variants.len());
-                        for variant in &decl.variants {
-                            write_str(&mut hasher, &variant.name);
-                        }
-                    }
-                    Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => {
-                        unreachable!("filtered above")
-                    }
-                }
+                // A declaration's span runs from its keyword to its closing
+                // brace with no surrounding trivia, so this is exactly the
+                // declaration's text.
+                write_str(&mut hasher, &annotated.text[span.clone()]);
 
                 self.items.insert(
                     var,
@@ -299,8 +286,22 @@ impl Builder {
                         }
                         (var, deps)
                     }
-                    // An enum's meaning is entirely its own variant list.
-                    Decl::Enum(_) | Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => continue,
+                    // An enum means what its payload types mean.
+                    Decl::Enum(decl) => {
+                        let Some(var) = decl.metadata else {
+                            continue;
+                        };
+                        let mut deps = IndexSet::new();
+                        if let Some(def) = self.defs.get(&var).and_then(|def| def.as_enum()) {
+                            for variant in def.variants.values() {
+                                for payload in &variant.payload {
+                                    self.ty(payload, &mut deps);
+                                }
+                            }
+                        }
+                        (var, deps)
+                    }
+                    Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => continue,
                 };
                 deps.shift_remove(&var);
                 deps.retain(|dep| self.items.contains_key(dep));
@@ -320,34 +321,41 @@ impl Builder {
         }
     }
 
+    /// Records a reference to the declaration bound to `var`: a variant counts
+    /// as a reference to its enum.
+    fn var(&self, var: VarId, out: &mut IndexSet<VarId>) {
+        out.insert(self.variants.get(&var).copied().unwrap_or(var));
+    }
+
     /// Collects the declarations a checked type refers to.
+    ///
+    /// A struct, enum, or cell type is nominal: it names the declaring item,
+    /// whose own fingerprint covers its fields, plus its type arguments.
     fn ty(&self, ty: &Ty, out: &mut IndexSet<VarId>) {
         match ty {
             Ty::Enum(enum_ty) => {
-                if let Some(var) = self.enums.get(&enum_ty.id) {
-                    out.insert(*var);
-                }
+                out.insert(enum_ty.def);
+                self.tys(&enum_ty.args, out);
             }
-            // Stop at the declaring cell. `CellTy::data` is an `Arc`-shared DAG
-            // of every field's type, including instantiated sub-cells, so
-            // descending it is exponential in hierarchy depth -- the exact
-            // blow-up `CellFnTy::cell`'s sharing exists to prevent. The
-            // declaring cell is itself an item whose own fingerprint covers its
-            // fields.
+            Ty::Struct(struct_ty) => {
+                out.insert(struct_ty.def);
+                self.tys(&struct_ty.args, out);
+            }
+            Ty::Ctor(ctor) => {
+                out.insert(ctor.def);
+                self.tys(&ctor.args, out);
+            }
             Ty::Cell(cell) | Ty::Inst(cell) => {
                 if let Some(def) = cell.def {
                     out.insert(def);
                 }
+                self.tys(&cell.args, out);
             }
             Ty::CellFn(cell_fn) => {
                 if let Some(def) = cell_fn.cell.def {
                     out.insert(def);
                 }
-            }
-            // Stop at the declaring struct for the same reason as a cell: the
-            // struct is itself an item whose own fingerprint covers its fields.
-            Ty::Struct(struct_ty) => {
-                out.insert(struct_ty.id);
+                self.tys(&cell_fn.cell.args, out);
             }
             Ty::Seq(inner) => self.ty(inner, out),
             Ty::Tuple(items) => {
@@ -361,7 +369,10 @@ impl Builder {
                 }
                 self.ty(&fn_ty.ret, out);
             }
-            Ty::Unknown
+            // A type parameter is covered by the declaring item's own text.
+            Ty::Param(_)
+            | Ty::Infer(_)
+            | Ty::Unknown
             | Ty::Any
             | Ty::Bool
             | Ty::Float
@@ -376,15 +387,37 @@ impl Builder {
         }
     }
 
+    fn tys(&self, tys: &[Ty], out: &mut IndexSet<VarId>) {
+        for ty in tys {
+            self.ty(ty, out);
+        }
+    }
+
     fn ident_path(
         &self,
         path: &IdentPath<arcstr::Substr, VarIdTyMetadata>,
         out: &mut IndexSet<VarId>,
     ) {
         if let Some(var) = path.metadata.0 {
-            out.insert(var);
+            self.var(var, out);
         }
         self.ty(&path.metadata.1, out);
+    }
+
+    fn pattern(
+        &self,
+        pattern: &Pattern<arcstr::Substr, VarIdTyMetadata>,
+        out: &mut IndexSet<VarId>,
+    ) {
+        match pattern {
+            Pattern::Wildcard { .. } | Pattern::Binding { .. } => {}
+            Pattern::Variant { path, fields, .. } => {
+                self.ident_path(path, out);
+                for field in fields {
+                    self.pattern(field, out);
+                }
+            }
+        }
     }
 
     fn scope(&self, scope: &Scope<arcstr::Substr, VarIdTyMetadata>, out: &mut IndexSet<VarId>) {
@@ -410,15 +443,15 @@ impl Builder {
                 self.ty(&e.metadata, out);
                 self.expr(&e.cond, out);
                 self.scope(&e.then, out);
-                self.scope(&e.else_, out);
+                if let Some(else_) = &e.else_ {
+                    self.scope(else_, out);
+                }
             }
             Expr::Match(e) => {
                 self.ty(&e.metadata, out);
                 self.expr(&e.scrutinee, out);
                 for arm in &e.arms {
-                    // A match pattern is an enum variant, and the enum reaches
-                    // us only through the pattern's checked type.
-                    self.ident_path(&arm.pattern, out);
+                    self.pattern(&arm.pattern, out);
                     self.expr(&arm.expr, out);
                 }
             }
@@ -433,7 +466,7 @@ impl Builder {
             }
             Expr::Call(e) => {
                 if let Some(var) = e.metadata.0 {
-                    out.insert(var);
+                    self.var(var, out);
                 }
                 self.ty(&e.metadata.1, out);
                 self.ident_path(&e.func, out);
@@ -733,7 +766,7 @@ mod tests {
                     Decl::Cell(decl) => (decl.metadata.1, decl.name.name.to_string()),
                     Decl::Fn(decl) => (decl.metadata.1, decl.name.name.to_string()),
                     Decl::Enum(decl) => match decl.metadata {
-                        Some((var, _)) => (var, decl.name.name.to_string()),
+                        Some(var) => (var, decl.name.name.to_string()),
                         None => continue,
                     },
                     Decl::Struct(decl) => match decl.metadata {
@@ -911,8 +944,8 @@ fn untouched() -> Float { 5. }
         );
     }
 
-    /// An enum used only as a parameter type, never matched on. The reference
-    /// carries no `VarId`, so this only works through the `EnumId` map.
+    /// An enum used only as a parameter type, never matched on, is still a
+    /// dependency through the parameter's checked type.
     #[test]
     fn an_enum_named_only_as_a_type_is_still_a_dependency() {
         let base = "\
@@ -924,6 +957,43 @@ enum Mode { Fast, Slow, Medium, }
 fn takes(m: Mode) -> Float { 1. }
 ";
         assert_eq!(changed(base, after), ["Mode", "takes"]);
+    }
+
+    /// An enum's payload types and a generic type's arguments are
+    /// dependencies, and a variant referenced by name is a reference to its
+    /// enum.
+    #[test]
+    fn payload_types_and_type_arguments_are_dependencies() {
+        let base = "\
+struct Size { w: Float, }
+enum Shape { Circle(Float), Sized(Size), }
+struct Pair<A, B> { first: A, second: B, }
+fn width(s: Shape) -> Float { match s { Shape::Circle(r) => r, Shape::Sized(z) => z.w, } }
+fn make() -> Shape { Shape::Circle(1.) }
+fn pair() -> Pair<Int, Shape> { Pair { first: 1, second: make() } }
+fn untouched<T>(v: T) -> T { v }
+";
+        assert_eq!(
+            changed(
+                base,
+                &base.replace(
+                    "struct Size { w: Float, }",
+                    "struct Size { w: Float, h: Float, }"
+                )
+            ),
+            ["Shape", "Size", "make", "pair", "width"]
+        );
+        assert_eq!(
+            changed(base, &base.replace("Circle(Float)", "Circle(Float,)")),
+            ["Shape", "make", "pair", "width"]
+        );
+        assert_eq!(
+            changed(
+                base,
+                &base.replace("{ first: A, second: B, }", "{ second: B, first: A, }")
+            ),
+            ["Pair", "pair"]
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 //! Neovim, analyzer, and headless-GUI test scenarios.
 
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 
 use analyzer::{
     ArgonConfig,
-    rpc::{CompilationSnapshot, Gui, InstancePreview, LangServerClient},
+    rpc::{CompilationSnapshot, CompilationUpdate, Gui, InstancePreview, LangServerClient},
 };
 use argonc::{
     ast::Span,
@@ -46,6 +46,10 @@ pub enum GuiEvent {
 #[derive(Clone)]
 struct HeadlessGui {
     events: mpsc::UnboundedSender<GuiEvent>,
+    snapshot: Arc<std::sync::Mutex<Option<CompilationSnapshot>>>,
+    update_gate: Arc<tokio::sync::Semaphore>,
+    /// The last compiled cell's scope, used for selection-dependent requests.
+    selected_scope: Arc<std::sync::Mutex<Option<Span>>>,
 }
 
 impl Gui for HeadlessGui {
@@ -61,16 +65,30 @@ impl Gui for HeadlessGui {
             .expect("full-stack test should still be receiving GUI events");
     }
 
-    async fn update_cell(self, _: context::Context, snapshot: CompilationSnapshot) {
-        let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
+    async fn update_cell(self, _: context::Context, update: CompilationUpdate) -> bool {
+        let (kind, scope, rect_count, revision) = {
+            let mut previous = self.snapshot.lock().unwrap();
+            let Some(snapshot) = update.materialize(previous.as_ref()) else {
+                return false;
+            };
+            *previous = Some(snapshot.clone());
+            let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
+            (kind, scope, rect_count, snapshot.revision)
+        };
+        if let Some(scope) = scope.clone() {
+            *self.selected_scope.lock().expect("selected scope") = Some(scope);
+        }
+
         self.events
             .send(GuiEvent::UpdateCell {
-                revision: snapshot.revision,
+                revision,
                 kind,
                 scope,
                 rect_count,
             })
             .expect("full-stack test should still be receiving GUI events");
+        let _permit = self.update_gate.acquire().await.unwrap();
+        true
     }
 
     async fn show_message(
@@ -103,7 +121,7 @@ impl Gui for HeadlessGui {
     }
 
     async fn selected_scope(self, _: context::Context) -> Option<Span> {
-        None
+        self.selected_scope.lock().expect("selected scope").clone()
     }
 
     async fn place_instance(self, _: context::Context, _: InstancePreview) {}
@@ -149,6 +167,8 @@ pub struct Session {
     lsp_listener: Option<tokio::net::TcpListener>,
     gui_addr: std::net::SocketAddr,
     events: mpsc::UnboundedReceiver<GuiEvent>,
+    #[cfg(test)]
+    update_gate: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl Session {
@@ -182,12 +202,15 @@ impl Session {
             .expect("read analyzer LSP address")
             .port();
         let (events_tx, events) = mpsc::unbounded_channel();
+        let selected_scope = Arc::new(std::sync::Mutex::new(None));
         let mut listener =
             tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Bincode::default)
                 .await
                 .expect("bind headless GUI RPC listener");
         listener.config_mut().max_frame_length(usize::MAX);
         let gui_addr = listener.local_addr();
+        let update_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let server_update_gate = update_gate.clone();
         tokio::spawn(async move {
             listener
                 .filter_map(|connection| futures::future::ready(connection.ok()))
@@ -195,6 +218,9 @@ impl Session {
                 .map(move |channel| {
                     let server = HeadlessGui {
                         events: events_tx.clone(),
+                        snapshot: Default::default(),
+                        update_gate: server_update_gate.clone(),
+                        selected_scope: selected_scope.clone(),
                     };
                     channel
                         .execute(server.serve())
@@ -222,6 +248,8 @@ impl Session {
             lsp_listener: Some(lsp_listener),
             gui_addr,
             events,
+            #[cfg(test)]
+            update_gate,
         }
     }
 
@@ -254,6 +282,7 @@ impl Session {
             .env("ARGON_TEST_GUI_EDIT_ACK", &self.gui_edit_ack)
             .env("ARGON_TEST_DIAGNOSTIC_ACK", &self.diagnostic_ack)
             .env("ARGON_TEST_MODE", mode)
+            .env("ARGON_TEST_READY", self.project.join("startup.ready"))
             .arg("--cmd")
             .arg(format!(
                 "set runtimepath+={}",
@@ -426,6 +455,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn gui_registration_does_not_wait_for_initial_error_presentation() {
+        assert_completes("registering GUI with initial source errors", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() { missing; }\n").await;
+            let gate = session.update_gate.clone().acquire_owned().await.unwrap();
+            session.start_analyzer();
+            let child = session.spawn_nvim("startup_errors");
+            while !session.project.join("startup.ready").exists() {
+                time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let analyzer = session.connect_analyzer().await;
+            // A real GUI cannot service initial snapshot callbacks until its
+            // constructor returns. Registration must acknowledge independently
+            // of that first presentation, including when no cell is selected.
+            time::timeout(
+                std::time::Duration::from_secs(1),
+                analyzer.register(context::current(), session.gui_addr()),
+            )
+            .await
+            .expect("GUI registration waited for presentation")
+            .expect("register headless GUI");
+            loop {
+                if matches!(
+                    session.next_event().await,
+                    GuiEvent::UpdateCell {
+                        kind: OutputKind::StaticErrors,
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+            drop(gate);
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn diagnostic_recovery() {
         assert_completes("waiting for diagnostic recovery", async {
             let _guard = FULL_STACK_LOCK.lock().await;
@@ -469,7 +538,7 @@ mod tests {
         assert_completes("waiting for navigation requests", async {
             let _guard = FULL_STACK_LOCK.lock().await;
             let mut session = Session::new(
-                "cell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\n",
+                "cell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\ncell child(w: Float, h: Float = w, layer: String = \"met1\") {\n    let body = rect(layer, x0=0., y0=0., x1=w, y1=h);\n}\n",
             )
             .await;
             session.start_analyzer();

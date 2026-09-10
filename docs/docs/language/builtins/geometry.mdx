@@ -1,0 +1,135 @@
+---
+title: Geometry built-ins
+description: The rect, crect, polygon, path, and text constructors.
+sidebar_label: Geometry
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# Geometry built-ins
+
+These constructors add geometry to the current cell. Coordinate arguments are [`Float`](/language/types/scalars#float) expressions.
+
+## `rect`
+
+<ApiItem id="rect" name="rect" signature={'rect(layer: String, x0?, y0?, x1?, y1?, w?, h?, x0i?, y0i?, x1i?, y1i?) -> Rect'} summary={<>Draws an axis-aligned rectangle on a layer.</>}>
+
+<ParameterTable rows={[
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'A drawing layer from the technology file.'},
+  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the left edge.'},
+  {name: 'y0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the bottom edge.'},
+  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the right edge.'},
+  {name: 'y1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the top edge.'},
+  {name: 'w', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the width, x1 - x0.'},
+  {name: 'h', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the height, y1 - y0.'},
+  {name: 'x0i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial left edge, used when x0 is otherwise free.'},
+  {name: 'y0i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial bottom edge, used when y0 is otherwise free.'},
+  {name: 'x1i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial right edge, used when x1 is otherwise free.'},
+  {name: 'y1i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial top edge, used when y1 is otherwise free.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">The rectangle.</Returns>
+
+```argon
+let gate = rect("poly", x0=0., y0=0., w=80., h=400.);
+```
+
+Give enough values or constraints to pin the rectangle down. If you drag an under-constrained rectangle in the GUI, it adds the missing initial values.
+
+</ApiItem>
+
+## `crect`
+
+<ApiItem id="crect" name="crect" signature={'crect(x0?, y0?, x1?, y1?, w?, h?, layer?, x0i?, y0i?, x1i?, y1i?) -> Rect'} summary={<>Creates a construction rectangle: usable in constraints and as bounds, but not exported.</>}>
+
+<ParameterTable rows={[
+  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the left edge.'},
+  {name: 'y0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the bottom edge.'},
+  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the right edge.'},
+  {name: 'y1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the top edge.'},
+  {name: 'w', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the width.'},
+  {name: 'h', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Constrains the height.'},
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Optional keyword', description: 'Optional layer to associate with the rectangle.'},
+  {name: 'x0i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial value for x0.'},
+  {name: 'y0i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial value for y0.'},
+  {name: 'x1i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial value for x1.'},
+  {name: 'y1i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial value for y1.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">The construction rectangle. It takes part in constraints but is left out of layout export.</Returns>
+
+```argon
+let bounds = crect(x0=0., y0=0., w=1000., h=800.);
+```
+
+</ApiItem>
+
+## `polygon`
+
+<ApiItem id="polygon" name="polygon" signature={'polygon(layer: String, points: Int, x0?, y0?, …, x0i?, y0i?, …) -> Polygon'} summary={<>Creates a polygon with a fixed number of vertices, each constrained on its own.</>}>
+
+<ParameterTable rows={[
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'A drawing layer.'},
+  {name: 'points', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Number of vertices. Coordinate indices run from 0 to points - 1.'},
+  {name: 'xN', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'x coordinate of vertex N.'},
+  {name: 'yN', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'y coordinate of vertex N.'},
+  {name: 'xNi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial x coordinate of vertex N.'},
+  {name: 'yNi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial y coordinate of vertex N.'},
+]} />
+
+<Returns type="Polygon" href="/language/types/polygon">The polygon.</Returns>
+
+```argon
+let triangle = polygon("met1", 3,
+    x0=0., y0=0.,
+    x1=100., y1=0.,
+    x2=50., y2=80.,
+);
+```
+
+</ApiItem>
+
+## `path`
+
+<ApiItem id="path" name="path" signature={'path(layer: String, points: Int, width?, begin_extension?, end_extension?, x0?, y0?, …) -> Path'} summary={<>Creates a constant-width path along a centerline.</>}>
+
+<ParameterTable rows={[
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'A drawing layer.'},
+  {name: 'points', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Number of centerline points.'},
+  {name: 'width', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'Full width of the path. Must not solve to a negative value.'},
+  {name: 'begin_extension', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'How far the path extends past its first point.'},
+  {name: 'end_extension', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'How far the path extends past its last point.'},
+  {name: 'xN', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'x coordinate of centerline point N.'},
+  {name: 'yN', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'y coordinate of centerline point N.'},
+  {name: 'widthi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial width.'},
+  {name: 'begin_extensioni', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial begin extension.'},
+  {name: 'end_extensioni', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial end extension.'},
+  {name: 'xNi / yNi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial coordinates of centerline point N.'},
+]} />
+
+<Returns type="Path" href="/language/types/path">The path.</Returns>
+
+```argon
+let route = path("met2", 2, width=20., x0=0., y0=0., x1=300., y1=0.);
+```
+
+</ApiItem>
+
+## `text`
+
+<ApiItem id="text" name="text" signature={'text(value: String, layer: String, x: Float, y: Float) -> ()'} summary={<>Places a text label on a layer.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The text.'},
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'Layer for the label.'},
+  {name: 'x', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'x coordinate of the label origin.'},
+  {name: 'y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'y coordinate of the label origin.'},
+]} />
+
+<Returns type="()">Nothing; the label is added to the current cell.</Returns>
+
+```argon
+text("VDD", "text.label", 40., 80.);
+```
+
+</ApiItem>

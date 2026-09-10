@@ -1,0 +1,26 @@
+// A struct may contain itself through an `Option`, since `None` ends the
+// recursion; `struct Node { next: Node }` has no finite value and is rejected.
+struct Node {
+    width: Float,
+    next: Option<Node>,
+}
+
+fn total(n: Option<Node>) -> Float {
+    match n {
+        Some(node) => node.width + total(node.next),
+        None => 0.,
+    }
+}
+
+fn chain(widths: [Float]) -> Option<Node> {
+    if widths == [] {
+        None
+    } else {
+        Some(Node { width: head(widths), next: chain(tail(widths)) })
+    }
+}
+
+cell top() {
+    let nodes = chain(cons(100., cons(200., cons(50., []))));
+    let r = rect("met1", x0=0., y0=0., w=total(nodes), h=100.);
+}

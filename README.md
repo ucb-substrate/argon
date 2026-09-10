@@ -12,6 +12,24 @@ general-purpose programming language. The main goal of Argon is to allow interop
 enable the creation of most practical parametric cells, and allow for performance optimizations such
 as caching and incremental compilation.
 
+## Documentation
+
+The documentation site is published at <https://ucb-substrate.github.io/argon/>.
+It is built with Docusaurus and lives in [`docs/`](docs). Its pages are
+under [`docs/docs/`](docs/docs), split into [guides](docs/docs/guides/index.md), a
+[language reference](docs/docs/language/overview.md), a
+[GUI manual](docs/docs/gui/workspace.md), and a
+[tools reference](docs/docs/tools/overview.md), each with its own sidebar.
+
+```bash
+cd docs
+npm install
+npm start
+```
+
+Run `npm run build` for a production build with strict internal-link and anchor checks.
+See [`docs/README.md`](docs/README.md) for the layout of the site.
+
 ## Installation
 
 To use Argon, you will need:
@@ -45,7 +63,7 @@ tech = "tech.toml"
 pdk = "../pdk"
 
 [gds]
-ring_osc = "~/Downloads/ring_osc.gds"
+ring_osc = "layout/ring_osc.gds"
 "macros::sram" = "layout/sram.gds"
 ```
 
@@ -136,6 +154,85 @@ including on the command line:
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
 ```
 
+Enum variants may carry values. A tuple variant is constructed like a call and
+taken apart by a `match` pattern that binds its payload; `_` skips an element,
+and a bare name or `_` arm matches anything. Every variant is also an item that
+`use` can import:
+
+```rust
+enum Shape {
+    Circle(Float),
+    Box(Float, Float),
+    Empty,
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle(r) => 2. * r,
+        Shape::Box(w, _) => w,
+        _ => 0.,
+    }
+}
+```
+
+Structs, enums, functions, and cells take type parameters, written in angle
+brackets after the name as in Rust. A type parameter is opaque: a value of
+type `T` can be stored, passed, and returned, but not added, compared, cast,
+emitted, indexed, or placed. Type arguments are inferred from the arguments
+and field values at each use, so `last(widths)` is a `Float` when `widths` is
+a `[Float]`:
+
+```rust
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    Pair { first: p.second, second: p.first }
+}
+
+fn second<T>(items: [T]) -> T {
+    head(tail(items))
+}
+
+cell row<T>(items: [T], pitch: Float) {
+    let first = head(items);
+    // ...
+}
+```
+
+The standard library declares `enum Option<T> { Some(T), None }`, and every
+module starts with `Option`, `Some`, and `None` in scope. An `Option`
+parameter with a `None` default is an optional cell parameter, `Option<Node>`
+lets a struct contain itself, and `std::unwrap_or`, `std::is_some`,
+`std::is_none`, `std::first`, and `std::last` work over any element type:
+
+```rust
+struct Node {
+    width: Float,
+    next: Option<Node>,
+}
+
+cell via(layer: String, w: Float, n: Option<Int> = None) {
+    let count = std::unwrap_or(n, 1);
+    // ...
+}
+
+cell top() {
+    let single = inst(via("met1", 100.));
+    let triple = inst(via("met1", 100., n=Some(3)));
+}
+```
+
+Inside a function body, inference spans the whole body, so `let o = None;`
+is fine when a later expression pins its type. Inside a cell, each top-level
+statement is typed on its own, so a value with nothing to infer from takes a
+type annotation or a turbofish: `let o: Option<Int> = None;` or
+`let o = None::<Int>;`. Type arguments in a type position are mandatory for a
+generic type (`Option<Float>`, never a bare `Option`) and forbidden for a
+non-generic one.
+
 Shapes are valid cell arguments too. A `Rect`, `Polygon`, `Path`, or `Point`
 parameter receives the shape by value: the caller's solver resolves its
 coordinates first, and the cell sees them as constants in its own coordinate
@@ -169,6 +266,29 @@ Shapes built on the command line work the same way:
 ```bash
 arc run --cell 'via_array(crect(x0=0., y0=0., w=90., h=40.), 10., 20.)'
 ```
+
+Top-level declarations may appear in any order: a cell, function, struct, or
+enum can be used above the line that declares it. Cells may also instantiate
+themselves or one another, which is how a recursive layout is written. The
+recursion has to end on a parameter, since the compiler stops at a fixed
+nesting depth:
+
+```rust
+cell tree(n: Int) {
+    let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
+    if n > 0 {
+        let child = inst(tree(n - 1));
+        eq(child.leaf.x0, leaf.x1 + 50.);
+        eq(child.y, 0.);
+    }
+}
+```
+
+Cell types are nominal: two cells with the same fields are different types,
+and a function that accepts either takes `Any`. The type of an instance field
+is worked out when it is first read, so the one thing that cannot be resolved
+is a field whose type depends on itself through the fields of other cells,
+which is reported as an error at the read that closes the cycle.
 
 GDS imports are zero-argument cells. A module-qualified entry such as
 `"macros::sram"` can be referenced as `lib::macros::sram()` or imported with

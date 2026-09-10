@@ -28,6 +28,24 @@ cannot be recursive or forward-referenced).
 
 ## Running
 
+### Rendering regression checks
+
+The GUI tests generate their layouts in temporary directories and use technology
+files from this repository. They run with cold indexes, normal background render
+workers, and a full editor window on GPUI's test platform.
+
+```bash
+cargo test -p argone --lib --release
+```
+
+Coverage includes complete frames during pan and zoom, stable viewport size when
+rendering activity changes, bounded geometry traversal, subpixel aggregation,
+hierarchy visibility and invalidation, and rectangle placement through delayed
+source edits and frame handoffs. See [rendering coverage](rendering-results.md)
+for details and commands to run individual groups.
+
+### Compiler scaling
+
 The easiest way to run the benchmarks and regenerate every artifact is the
 wrapper script [`run_benchmarks.sh`](run_benchmarks.sh):
 
@@ -212,15 +230,14 @@ parameter; "peak" is peak heap allocated during compilation.
   the top-level README now bites only for genuinely dense coupled blocks, not
   for the common sparse-but-coupled case.
 
-- **Hierarchy depth scales linearly.** A cell's static type (`CellTy`) records
-  the structural type of every field, including instantiated sub-cells. That
-  type is now **shared** (`Arc`-interned via `CellFnTy::cell`) instead of being
-  copied into each reference, so the type representation is a DAG rather than a
-  tree: whether a cell references its child **once** (`let i = inst(child());`)
-  or **twice** (the `let c = child(); let i = inst(c);` idiom from the tutorial),
-  `h{k}` holds shared pointers to the single type of `h{k-1}`, and both variants
-  cost the same — linear in depth (≈160 MiB / 0.15 s at depth 2048, the two
-  series within ~2% of each other). Before this fix the type was deep-copied per
+- **Hierarchy depth scales linearly.** A cell's static type (`CellTy`) is
+  nominal: it names the declaring cell and carries no field types, so a
+  reference to a cell costs the same however deep the hierarchy below it is,
+  and whether a cell references its child **once** (`let i = inst(child());`)
+  or **twice** (the `let c = child(); let i = inst(c);` idiom from the
+  tutorial) — linear in depth (≈160 MiB / 0.15 s at depth 2048, the two series
+  within ~2% of each other). The type used to record the structural type of
+  every field, including instantiated sub-cells, and was deep-copied per
   reference, so the single-ref chain was quadratic (`~depth^1.4`) and the
   double-ref chain **doubled with every level** (`×1.9` measured), exhausting
   memory beyond ~depth 20 (depth 18 alone took ~3.6 GiB / 11.5 s). The remaining

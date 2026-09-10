@@ -753,9 +753,10 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
                 3_u8.hash(hasher);
                 value.hash(hasher);
             }
-            CellArg::Enum(value) => {
+            CellArg::Enum { variant, payload } => {
                 4_u8.hash(hasher);
-                value.hash(hasher);
+                variant.hash(hasher);
+                hash_cell_args(payload, hasher);
             }
             CellArg::Seq(values) => {
                 5_u8.hash(hasher);

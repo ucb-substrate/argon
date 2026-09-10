@@ -180,6 +180,7 @@ name = "arc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arcstr",
  "argonc",
  "clap",
  "indexmap",
@@ -318,6 +319,7 @@ dependencies = [
  "geometry 0.7.2 (registry+https://github.com/substrate-labs/crates-index)",
  "gpui",
  "image",
+ "imbl",
  "indexmap",
  "itertools 0.15.0",
  "lazy_static",
