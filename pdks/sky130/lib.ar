@@ -139,7 +139,7 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     centered_via_array(vdd_m1, xcoupled_p.ntap.li1, via, 360., 360.);
     centered_via_array(vss2, main_n.ptap.li1, via, 360., 360.);
     centered_via_array(vss2, xcoupled_n.ptap.li1, via, 360., 360.);
-    
+
     let vdd_m2 = rect("met2.drawing", y0=vss1.y0, y1=vss2.y1, w=300.);
     let vss_m2 = rect("met2.drawing", y0=vss1.y0, y1=vss2.y1, w=300.);
     eq(vss_m2.x1, m2p.x0-300.);

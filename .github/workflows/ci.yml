@@ -25,10 +25,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check Argon examples
+      - name: Check Argon examples and PDKs
         run: |
+          set -uo pipefail
           cargo build -p argon --bin arc
-          find examples -name Argon.toml -exec target/debug/arc fmt --check --manifest-path {} \;
+          arc="$PWD/target/debug/arc"
+          status=0
+          while IFS= read -r manifest; do
+            dir=$(dirname "$manifest")
+            if ! "$arc" fmt --check --manifest-path "$manifest"; then
+              echo "::error file=$manifest::not formatted; run 'arc fmt --manifest-path $manifest'"
+              status=1
+            fi
+            # A directory holding `expect-check-failure` is a negative test:
+            # the compiler must reject it, so a clean check is the failure.
+            if [ -f "$dir/expect-check-failure" ]; then
+              if (cd "$dir" && "$arc" check >/dev/null 2>&1); then
+                echo "::error file=$manifest::expected 'arc check' to fail here, but it succeeded"
+                status=1
+              fi
+            elif ! (cd "$dir" && "$arc" check); then
+              echo "::error file=$manifest::'arc check' failed"
+              status=1
+            fi
+          done < <(find examples pdks -name Argon.toml | sort)
+          exit $status
 
   # Lint
   clippy:
