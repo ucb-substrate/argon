@@ -1,0 +1,6 @@
+This example is expected to fail `arc check`.
+
+It is a negative test: the compiler must report an error for it. The assertions
+live in `crates/compiler/src/lib.rs`. CI inverts its expectation for any example
+directory containing this file, so a run that unexpectedly succeeds fails the
+build.
