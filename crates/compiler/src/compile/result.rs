@@ -123,12 +123,9 @@ pub enum StaticErrorKind {
     /// Nil values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
-    /// Empty sequence values cannot be ordered.
-    #[error("cannot perform greater/less than comparisons on seq nil")]
-    SeqNilNotOrd,
-    /// Sequences may only be compared with an empty sequence for equality.
-    #[error("sequences can only be compared for equality/inequality to seq nil (`[]`)")]
-    SeqMustCompareEqSeqNil,
+    /// Sequences may only be compared for equality against a written `[]`.
+    #[error("sequences can only be compared for equality/inequality to the literal `[]`")]
+    SeqMustCompareEqEmpty,
     /// A type cannot be used in an arithmetic expression.
     ///
     /// Carries the rendered type rather than the `Ty`: `{0:?}` printed the

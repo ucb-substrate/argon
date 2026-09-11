@@ -794,6 +794,12 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
     }
 
+    fn dispatch_seq_nil_expr(
+        &mut self,
+        _input: &crate::ast::SeqNilLiteral<Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr {
+    }
+
     fn dispatch_field_access_expr(
         &mut self,
         _input: &FieldAccessExpr<Self::InputS, Self::InputMetadata>,
@@ -1430,7 +1436,6 @@ pub enum Ty {
     Cell(Arc<CellTy>),
     Inst(Arc<CellTy>),
     Nil,
-    SeqNil,
     Fn(Box<FnTy>),
     /// A user-declared `enum`: the declaring enum and its type arguments.
     Enum(Arc<EnumTy>),
@@ -1631,7 +1636,6 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         | Ty::Point
         | Ty::String
         | Ty::Nil
-        | Ty::SeqNil
         | Ty::Infer(_) => ty.clone(),
     }
 }
@@ -1846,7 +1850,6 @@ impl std::fmt::Display for Ty {
             Ty::Point => write!(f, "Point"),
             Ty::String => write!(f, "String"),
             Ty::Nil => write!(f, "()"),
-            Ty::SeqNil => write!(f, "[]"),
             Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
             Ty::CellFn(cell_fn) => {
@@ -1888,8 +1891,6 @@ impl Ty {
             "Point" => Some(Ty::Point),
             "Any" => Some(Ty::Any),
             "String" => Some(Ty::String),
-            "()" => Some(Ty::Nil),
-            "[]" => Some(Ty::SeqNil),
             _ => None,
         }
     }
@@ -1899,8 +1900,7 @@ impl Ty {
     ///
     /// The inverse of [`Self::from_name`], so that anything reporting what a
     /// type annotation resolved to reads the same table the annotation was
-    /// resolved against. `()` and `[]` are spellings the grammar produces
-    /// rather than identifiers, so they have no name here.
+    /// resolved against.
     pub fn primitive_name(&self) -> Option<&'static str> {
         Some(match self {
             Ty::Bool => "Bool",
@@ -2200,6 +2200,8 @@ impl AstMetadata for VarIdTyMetadata {
     type Typ = ();
     type CastExpr = Ty;
     type TupleExpr = Ty;
+    /// The sequence type the literal was inferred to have.
+    type SeqNilExpr = Ty;
     type StructLitExpr = Ty;
 }
 
@@ -3671,21 +3673,16 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::NilNotOrd,
             });
         }
-        if matches!(left_ty, Ty::SeqNil) && matches!(right_ty, Ty::SeqNil) && !is_equality {
+        // A sequence may only be compared for equality/inequality against a
+        // written `[]`: the evaluator has no arm for two populated sequences,
+        // and none for ordering a sequence at all. The test is on the operand
+        // rather than its type, which no longer distinguishes an empty
+        // sequence from any other.
+        let against_empty = matches!(left, Expr::SeqNil(_)) || matches!(right, Expr::SeqNil(_));
+        if matches!(self.shallow(&join_ty), Ty::Seq(_)) && !(is_equality && against_empty) {
             self.errors.push(StaticError {
                 span: self.span(span),
-                kind: StaticErrorKind::SeqNilNotOrd,
-            });
-        }
-        // A sequence may only be compared for equality/inequality against `[]`:
-        // the evaluator has no arm for two populated sequences, and none for
-        // ordering a sequence at all.
-        if matches!(self.shallow(&join_ty), Ty::Seq(_))
-            && !(is_equality && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
-        {
-            self.errors.push(StaticError {
-                span: self.span(span),
-                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+                kind: StaticErrorKind::SeqMustCompareEqEmpty,
             });
         }
         // `Ty::Any` is deliberately *not* admitted here: the evaluator has no
@@ -3702,7 +3699,6 @@ impl<'a> VarIdTyPass<'a> {
                     | Ty::Enum(_)
                     | Ty::Seq(_)
                     | Ty::Nil
-                    | Ty::SeqNil
                     | Ty::Unknown
                     | Ty::Infer(_)
             ) {
@@ -3718,8 +3714,7 @@ impl<'a> VarIdTyPass<'a> {
 
     /// Makes `a` and `b` the same type, solving inference variables as needed.
     /// A wildcard (`Any` or `Unknown`) equals every type and solves the
-    /// variables on the other side to itself; `[]` belongs to every sequence
-    /// type.
+    /// variables on the other side to itself.
     fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
         let a = self.shallow(a);
         let b = self.shallow(b);
@@ -3729,15 +3724,7 @@ impl<'a> VarIdTyPass<'a> {
                 if self.infer.occurs(*var, other) {
                     return false;
                 }
-                // `[]` belongs to every sequence type, so solving a variable to
-                // `SeqNil` would let any element type through unchecked. Record
-                // only that the variable is a sequence, leaving its element to
-                // the next unification.
-                let solution = match other {
-                    Ty::SeqNil => Ty::Seq(Box::new(self.infer.fresh())),
-                    other => other.clone(),
-                };
-                self.infer.solutions[*var as usize] = Some(solution);
+                self.infer.solutions[*var as usize] = Some(other.clone());
                 true
             }
             _ if a.is_wildcard() => {
@@ -3748,7 +3735,6 @@ impl<'a> VarIdTyPass<'a> {
                 self.infer.solve_unsolved(&a, &b);
                 true
             }
-            (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil) => true,
             (Ty::Seq(a), Ty::Seq(b)) => self.unify(a, b),
             (Ty::Tuple(a), Ty::Tuple(b)) => self.unify_all(a, b),
             (Ty::Struct(a), Ty::Struct(b)) => a.def == b.def && self.unify_all(&a.args, &b.args),
@@ -3773,16 +3759,13 @@ impl<'a> VarIdTyPass<'a> {
 
     /// The common type of two branches, or `None` when they have none.
     ///
-    /// A wildcard absorbs the other branch, and `[]` widens to the other
-    /// branch's sequence type; otherwise the two are unified.
+    /// A wildcard absorbs the other branch; otherwise the two are unified.
     fn join(&mut self, a: &Ty, b: &Ty) -> Option<Ty> {
         let a = self.shallow(a);
         let b = self.shallow(b);
         match (&a, &b) {
             (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
             (Ty::Any, _) | (_, Ty::Any) => Some(Ty::Any),
-            (Ty::SeqNil, Ty::Seq(_)) => Some(b),
-            (Ty::Seq(_), Ty::SeqNil) => Some(a),
             _ => self.unify(&a, &b).then(|| self.shallow(&a)),
         }
     }
@@ -4085,7 +4068,6 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         | Ty::Point
         | Ty::String
         | Ty::Nil
-        | Ty::SeqNil
         | Ty::Infer(_) => false,
     }
 }
@@ -4105,7 +4087,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             }
             Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
-            Expr::SeqNil(_) => Ty::SeqNil,
+            Expr::SeqNil(lit) => lit.metadata.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -5117,6 +5099,15 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         Ty::Tuple(items.iter().map(|i| i.ty()).collect())
     }
 
+    /// `[]` is a sequence of an element type its spelling leaves open, so it
+    /// takes a fresh variable that whatever the literal meets solves.
+    fn dispatch_seq_nil_expr(
+        &mut self,
+        _input: &crate::ast::SeqNilLiteral<Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr {
+        Ty::Seq(Box::new(self.fresh()))
+    }
+
     fn dispatch_kw_arg_value(
         &mut self,
         _input: &crate::ast::KwArgValue<Substr, Self::InputMetadata>,
@@ -5192,7 +5183,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             Ty::Seq(t) => (*t).clone(),
-            Ty::SeqNil => Ty::Any,
             // Iterating makes the sequence one of a still-unknown element.
             Ty::Infer(_) => {
                 let element = self.fresh();
@@ -5708,6 +5698,10 @@ impl AstTransformer for Zonker<'_> {
         self.ty(&input.metadata, input.span)
     }
 
+    fn dispatch_seq_nil_expr(&mut self, input: &crate::ast::SeqNilLiteral<VarIdTyMetadata>) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
     fn dispatch_struct_lit_expr(
         &mut self,
         input: &StructLitExpr<Substr, VarIdTyMetadata>,
@@ -5911,7 +5905,6 @@ impl CellArg {
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner, defs))
             }
-            (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
             (Self::Tuple(values), Ty::Tuple(tys)) => {
                 values.len() == tys.len()
                     && values
@@ -6551,7 +6544,7 @@ impl<'a> ExecPass<'a> {
                 (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
-                (4, DeferValue::Ready(Value::SeqNil)),
+                (4, DeferValue::Ready(Value::Seq(Seq::new()))),
             ]),
             value_dependents: IndexMap::new(),
             frames: IndexMap::from_iter([(
@@ -8889,7 +8882,6 @@ impl<'a> ExecPass<'a> {
                     payload,
                 })
             }
-            Value::SeqNil => Some(CellArg::Seq(Vec::new())),
             Value::Seq(s) => {
                 let mut args = Vec::with_capacity(s.len());
                 for v in s.iter() {
@@ -9726,11 +9718,6 @@ impl<'a> ExecPass<'a> {
                         &self.values[&c.state.posargs[1]],
                     ) {
                         let val = match tail {
-                            Value::SeqNil => {
-                                let mut s = Seq::new();
-                                s.push_back(head.clone());
-                                s
-                            }
                             Value::Seq(s) => {
                                 // O(1) structural clone + O(log n) prepend (was O(n) deep
                                 // clone + O(n) front-insert, making `range` O(n^2)).
@@ -9848,15 +9835,6 @@ impl<'a> ExecPass<'a> {
                 "head" => {
                     if let Defer::Ready(head) = &self.values[&c.state.posargs[0]] {
                         let val = match head {
-                            Value::SeqNil => {
-                                let span = self.span(&vref.loc, c.expr.span);
-                                self.errors.push(ExecError {
-                                    span: Some(span.clone()),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::HeadEmptyList,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
                             Value::Seq(s) => {
                                 if let Some(s) = s.front() {
                                     s.clone()
@@ -9890,15 +9868,6 @@ impl<'a> ExecPass<'a> {
                 "tail" => {
                     if let Defer::Ready(lst) = &self.values[&c.state.posargs[0]] {
                         let val = match lst {
-                            Value::SeqNil => {
-                                let span = self.span(&vref.loc, c.expr.span);
-                                self.errors.push(ExecError {
-                                    span: Some(span.clone()),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::TailEmptyList,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
                             Value::Seq(s) => {
                                 if !s.is_empty() {
                                     // Drop the head: O(1) structural clone + O(log n)
@@ -10614,9 +10583,8 @@ impl<'a> ExecPass<'a> {
                         (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
                         (Value::Enum(_), Value::Enum(_)) => values_equal(vl, vr).and_then(equality),
                         (Value::Nil, Value::Nil) => equality(true),
-                        (Value::SeqNil, Value::SeqNil) => equality(true),
-                        (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => {
-                            equality(x.is_empty())
+                        (Value::Seq(x), Value::Seq(y)) if x.is_empty() || y.is_empty() => {
+                            equality(x.is_empty() && y.is_empty())
                         }
                         _ => None,
                     };
@@ -11303,7 +11271,6 @@ impl<'a> ExecPass<'a> {
                     let seq = match val.as_ref() {
                         // `s.clone()` is now an O(1) refcount bump (was an O(n) deep copy).
                         ValueRef::Seq(s) => s.clone(),
-                        ValueRef::SeqNil => Seq::new(),
                         _ => {
                             let span = self.span(&vref.loc, f.for_loop.seq.span());
                             self.errors.push(ExecError {
@@ -11497,7 +11464,6 @@ pub enum Value {
     /// per sequence element, and its field map is large relative to the
     /// scalar variants.
     Struct(Box<StructValue>),
-    SeqNil,
     Nil,
     /// A value whose diagnostic has already been reported.
     ///
@@ -11537,7 +11503,7 @@ impl Value {
             Self::CellFn(_) => "cell generator",
             Self::Cell(_) => "cell",
             Self::Inst(_) => "instance",
-            Self::Seq(_) | Self::SeqNil => "sequence",
+            Self::Seq(_) => "sequence",
             Self::Tuple(_) => "tuple",
             Self::Struct(_) => "struct",
             Self::Nil => "nil",

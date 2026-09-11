@@ -33,7 +33,7 @@ let widths = list(80., 120., 160.);
 
 <ParameterTable rows={[
   {name: 'value', type: 'T', requirement: 'Required, positional', description: 'New first element.'},
-  {name: 'tail', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required, positional', description: 'The rest of the sequence. The empty literal [] works for any element type.'},
+  {name: 'tail', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required, positional', description: 'The rest of the sequence. The empty literal [] takes its element type from the head.'},
 ]} />
 
 <Returns type="[T]" href="/language/types/collections#sequences">A new sequence starting with value.</Returns>
