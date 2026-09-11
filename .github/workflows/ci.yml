@@ -28,7 +28,7 @@ jobs:
       - name: Check Argon examples and PDKs
         run: |
           set -uo pipefail
-          cargo build -p argon --bin arc
+          cargo build -p argon --bin arc --bin argonc
           arc="$PWD/target/debug/arc"
           status=0
           while IFS= read -r manifest; do
