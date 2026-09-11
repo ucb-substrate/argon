@@ -1566,6 +1566,7 @@ impl<'a> Parser<'a> {
         let rb = self.expect(TokenKind::RBrack);
         Expr::SeqNil(SeqNilLiteral {
             span: Span::new(lb.start as usize, rb.end as usize),
+            metadata: (),
         })
     }
 

@@ -14,7 +14,13 @@ let values: [Float] = list(10., 20., 30.);
 let first = values[0];
 ```
 
-The empty literal `[]` works as an empty sequence of any element type. Build and take apart sequences with [`list`, `cons`, `head`, and `tail`](/language/builtins/collections).
+The empty literal `[]` takes its element type from its surroundings — a declared type, or whatever it is combined with. Where nothing fixes it, annotate the binding:
+
+```argon
+let empty: [Float] = [];
+```
+
+Build and take apart sequences with [`list`, `cons`, `head`, and `tail`](/language/builtins/collections).
 
 ## Tuples
 
