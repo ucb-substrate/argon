@@ -33,7 +33,7 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
-bincode = "1"
+bincode = "3"
 
 [dev-dependencies]
 const_format = "0.2"
