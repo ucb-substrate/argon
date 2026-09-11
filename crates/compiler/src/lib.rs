@@ -3917,7 +3917,7 @@ cell top() {
                     let anything = ident(3);
                     let s = cons(1, []);
                     let t = cons(2, []);
-                    let empty = [];
+                    let empty: [Int] = [];
                     if {comparison} {{ eq(r.x1, 100.); }} else {{ eq(r.x1, 200.); }};
                 }}
             "#
@@ -3950,15 +3950,25 @@ cell top() {
     }
 
     #[test]
-    fn sequences_only_compare_for_equality_against_seq_nil() {
+    fn sequences_only_compare_for_equality_against_an_empty_literal() {
         // The evaluator has no arm for two populated sequences, and none for
         // ordering a sequence, so everything but `seq == []` must be rejected.
-        for comparison in ["s == t", "s != t", "s < t", "s < []", "[] > s"] {
+        for comparison in [
+            "s == t",
+            "s != t",
+            "s < t",
+            "s < []",
+            "[] > s",
+            "[] < []",
+            // The operand has to be written `[]`; a binding that holds an
+            // empty sequence has the same type as any other sequence.
+            "s == empty",
+        ] {
             let errors = static_errors(&comparison_source(comparison));
             assert!(
                 errors
                     .iter()
-                    .any(|error| matches!(error.kind, StaticErrorKind::SeqMustCompareEqSeqNil)),
+                    .any(|error| matches!(error.kind, StaticErrorKind::SeqMustCompareEqEmpty)),
                 "`{comparison}` should be rejected as a sequence comparison: {errors:?}"
             );
         }
@@ -4030,7 +4040,7 @@ cell top() {
             "fn f() -> E { E::A }",
             "fn f(x: Int) -> Int { x }",
             "fn f() -> [Int] { cons(1, []) }",
-            // An empty sequence inhabits every sequence type, as `is_eq_ty` allows.
+            // `[]` takes its element type from the declared return type.
             "fn f() -> [Int] { [] }",
             "fn f() -> (Int, Float) { (1, 2.,) }",
             // A trailing semicolon makes the body's value `()`, matching no return type.
@@ -6003,6 +6013,46 @@ cell top() {
                 .iter()
                 .any(|error| matches!(error, StaticErrorKind::TypeAnnotationsNeeded))
         );
+    }
+
+    /// `[]` is a sequence of an element type nothing about the literal fixes,
+    /// so it needs something to fix it, exactly as `None` does.
+    #[test]
+    fn an_empty_sequence_takes_its_element_type_from_its_context() {
+        // A declared type fixes it, on either side of the binding.
+        for source in [
+            "cell c() { let v: [Int] = []; }",
+            "fn f() -> [Int] { [] }\ncell c() { let v = f(); }",
+            "cell c() { let v = cons(1, []); }",
+            "fn f(xs: [Int] = []) -> [Int] { xs }\ncell c() { let v = f(); }",
+            // Inference spans a whole function body, so a later statement in
+            // one fixes an earlier `[]`.
+            "fn f() -> [Float] { let vs = []; cons(1., vs) }\ncell c() { let v = f(); }",
+        ] {
+            assert!(generic_errors(source).is_empty(), "{source}");
+        }
+
+        // A cell statement is its own inference unit, so nothing later in the
+        // cell can fix it.
+        for source in [
+            "cell c() { let v = []; }",
+            "cell c() { let v = []; let w = cons(1, v); }",
+            "cell c() { for x in [] { let n = 1; } }",
+        ] {
+            assert!(
+                generic_errors(source)
+                    .iter()
+                    .any(|error| matches!(error, StaticErrorKind::TypeAnnotationsNeeded)),
+                "{source}"
+            );
+        }
+
+        // The element type is checked, not widened away.
+        assert!(matches!(
+            generic_errors("cell c() { let v: [Int] = cons(1., []); }").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "[Int]" && found == "[Float]"
+        ));
     }
 
     #[test]

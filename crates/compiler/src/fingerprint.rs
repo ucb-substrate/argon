@@ -382,8 +382,7 @@ impl Builder<'_> {
             | Ty::Path
             | Ty::Point
             | Ty::String
-            | Ty::Nil
-            | Ty::SeqNil => {}
+            | Ty::Nil => {}
         }
     }
 
@@ -518,8 +517,8 @@ impl Builder<'_> {
                     self.expr(base, out);
                 }
             }
+            Expr::SeqNil(e) => self.ty(&e.metadata, out),
             Expr::Nil(_)
-            | Expr::SeqNil(_)
             | Expr::FloatLiteral(_)
             | Expr::IntLiteral(_)
             | Expr::StringLiteral(_)

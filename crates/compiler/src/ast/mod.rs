@@ -90,9 +90,10 @@ pub struct NilLiteral {
     pub span: cfgrammar::Span,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct SeqNilLiteral {
+#[derive_where(Debug, Clone, Serialize, Deserialize)]
+pub struct SeqNilLiteral<T: AstMetadata> {
     pub span: cfgrammar::Span,
+    pub metadata: T::SeqNilExpr,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -293,7 +294,7 @@ pub enum Expr<S, T: AstMetadata> {
     Index(Box<IndexExpr<S, T>>),
     IdentPath(IdentPath<S, T>),
     Nil(NilLiteral),
-    SeqNil(SeqNilLiteral),
+    SeqNil(SeqNilLiteral<T>),
     FloatLiteral(FloatLiteral),
     IntLiteral(IntLiteral),
     StringLiteral(StringLiteral<S>),
@@ -540,6 +541,8 @@ pub trait AstMetadata {
     type Typ: Debug + Clone + Serialize + DeserializeOwned;
     type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
     type TupleExpr: Debug + Clone + Serialize + DeserializeOwned;
+    /// The type of an empty sequence literal, which its spelling leaves open.
+    type SeqNilExpr: Debug + Clone + Serialize + DeserializeOwned;
     type StructLitExpr: Debug + Clone + Serialize + DeserializeOwned;
 }
 
@@ -657,6 +660,10 @@ pub trait AstTransformer {
         input: &TupleExpr<Self::InputS, Self::InputMetadata>,
         items: &[Expr<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr;
+    fn dispatch_seq_nil_expr(
+        &mut self,
+        input: &SeqNilLiteral<Self::InputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr;
     fn dispatch_struct_lit_expr(
         &mut self,
         input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
@@ -1306,6 +1313,16 @@ pub trait AstTransformer {
         }
     }
 
+    fn transform_seq_nil_expr(
+        &mut self,
+        input: &SeqNilLiteral<Self::InputMetadata>,
+    ) -> SeqNilLiteral<Self::OutputMetadata> {
+        SeqNilLiteral {
+            span: input.span,
+            metadata: self.dispatch_seq_nil_expr(input),
+        }
+    }
+
     fn transform_tuple_expr(
         &mut self,
         input: &TupleExpr<Self::InputS, Self::InputMetadata>,
@@ -1398,7 +1415,7 @@ pub trait AstTransformer {
             Expr::Index(index_expr) => Expr::Index(Box::new(self.transform_index_expr(index_expr))),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::Nil(nil) => Expr::Nil(*nil),
-            Expr::SeqNil(nil) => Expr::SeqNil(*nil),
+            Expr::SeqNil(nil) => Expr::SeqNil(self.transform_seq_nil_expr(nil)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
             Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),

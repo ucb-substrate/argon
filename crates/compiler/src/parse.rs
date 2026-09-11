@@ -63,6 +63,7 @@ impl AstMetadata for ParseMetadata {
     type FnDecl = ();
     type CastExpr = ();
     type TupleExpr = ();
+    type SeqNilExpr = ();
     type StructLitExpr = ();
 }
 
