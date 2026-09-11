@@ -453,8 +453,8 @@ fn parse_expr(&mut self, min_bp: u8) -> Expr {
     let mut lhs = self.parse_prefix();          // a prefix op or a primary
     loop {
         let k = self.cur.kind;
-        // suffix cluster — binds tighter than any binary operator
-        if SUFFIX_BP >= min_bp && k is one of { . [ ! as } {
+        // suffixes — both levels bind tighter than any binary operator
+        if suffix_bp(k).is_some_and(|bp| bp >= min_bp) {
             lhs = self.parse_suffix(lhs, lhs_start);
             continue;
         }
@@ -480,7 +480,9 @@ point. A top-level call passes `min_bp == 0` (anything binds).
 `infix_op(kind)` is the single source of truth for the infix operator set: it
 returns `(BinOp, left_bp, right_bp)` or `None`. `BinOp` is the AST's own operator
 enum (`Arith(ArithOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`), carried
-alongside its precedence, so the two cannot drift apart.
+alongside its precedence, so the two cannot drift apart. `suffix_bp(kind)` is
+the matching table for the suffixes, which have no right operand and so need
+only a left binding power.
 
 | Operators                         | (left, right) | Notes |
 |-----------------------------------|---------------|-------|
@@ -489,8 +491,9 @@ alongside its precedence, so the two cannot drift apart.
 | `== != >= > <= <`  (comparison)   | `(5, 6)`      | |
 | `+ -`  (additive)                 | `(7, 8)`      | |
 | `* / %`  (multiplicative)         | `(9, 10)`     | |
-| suffix cluster `. [] ! as`        | `SUFFIX_BP = 11` | tighter than any binary op |
+| trailing suffixes `! as`          | `TRAILING_BP = 11` | tighter than any binary op |
 | prefix unary operand `! -`        | `PREFIX_BP = 13` | see §9.4 |
+| access suffixes `. .0 []`         | `ACCESS_BP = 15` | tighter than a prefix op |
 
 The boolean operations sit below the comparisons so `a < b && c < d` reads as
 `(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust.
@@ -512,8 +515,10 @@ level).
 ### 9.2 Prefixes, primaries, and suffixes
 
 - **`parse_prefix`** handles the prefix unary operators `!` (logical not) and `-`
-  (negate). It parses its operand with `min_bp = PREFIX_BP`. Otherwise it falls
-  through to `parse_primary`.
+  (negate). It parses its operand with `min_bp = PREFIX_BP`, which lets the
+  access suffixes bind inside the operand but not the trailing ones
+  ([§9.4](#94-the-lhs_start-span-subtlety-and-prefix-vs-suffix)). Otherwise it
+  falls through to `parse_primary`.
 - **`parse_primary`** parses an atomic operand (the Pratt "null denotation"):
   - `(` → `parse_paren`: `()` is `nil`; `(e)` is a parenthesized group
     (unwrapped, no node); `(e, …,)` is a tuple.
@@ -577,11 +582,17 @@ reason: a parenthesized operand is unwrapped to its inner node, whose span
 excludes the `(`; but the rest of the compiler expects the enclosing operator to
 span from the `(`. Using the lexical start of the first token gets this right.
 
-A consequence of `PREFIX_BP (13) > SUFFIX_BP (11)` is that a prefix operator's
-operand is a bare primary — suffixes do **not** bind inside it. So `-a.b` parses
-as `(-a).b` (`FieldAccess(Neg(a), b)`), and `-a!` as `(-a)!`. The suffix cluster
-binds tighter than the binary operators, but a prefix operator grabs only its
-immediate primary and the suffix then applies to the whole unary expression.
+`PREFIX_BP (13)` sits *between* the two suffix levels, which is what decides
+where a prefix operator's operand ends. The access suffixes bind inside it, so
+`-a.b` parses as `-(a.b)` (`Neg(FieldAccess(a, b))`), `-t.0` as `-(t.0)` and
+`-s[i]` as `-(s[i])` — negating a coordinate is the common case, and this is
+Rust's rule too. The trailing suffixes do not, so `-a as Float` is
+`(-a) as Float` (Rust's rule again) and `-a!` is `(-a)!`.
+
+Suffixes never compete with *each other*: they take no right operand, so the
+loop applies them left to right in source order whatever their level. `r.x0!.y`
+is `((r.x0)!).y` and `x as Float.y` is `(x as Float).y`. The split matters only
+where a prefix operator is deciding how much to take.
 
 ### 9.5 Struct literals
 
