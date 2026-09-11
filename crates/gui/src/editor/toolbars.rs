@@ -1414,13 +1414,11 @@ impl HierarchySideBar {
             .flex()
             .min_w_full()
             .flex_shrink_0()
-            .bg(
-                if scope == solved_cell.state[&solved_cell.selected_scope].address {
-                    theme.selection
-                } else {
-                    theme.sidebar
-                },
-            )
+            .bg(if scope == solved_cell.selected_scope {
+                theme.selection
+            } else {
+                theme.sidebar
+            })
             .child(div().w(px(12. * depth as f32)).flex_shrink_0())
             .child(
                 icon_div()

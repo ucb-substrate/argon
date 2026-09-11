@@ -47,13 +47,17 @@ pub struct LayerState {
 
 #[derive(Clone, Debug)]
 pub struct ScopeState {
-    pub name: String,
-    pub address: ScopeAddress,
     pub visible: bool,
-    /// Shared because long chains of function/control-flow scopes commonly
-    /// have exactly the same bounds as their only child.
-    pub bbox: Option<Arc<Rect<f64>>>,
     pub parent: Option<ScopeAddress>,
+    prepared: Arc<hierarchy::PreparedScope>,
+}
+
+impl std::ops::Deref for ScopeState {
+    type Target = hierarchy::PreparedScope;
+
+    fn deref(&self) -> &Self::Target {
+        &self.prepared
+    }
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
@@ -71,7 +75,25 @@ pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
     pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
-    hierarchy: Arc<hierarchy::PreparedHierarchy>,
+}
+
+impl CompileOutputState {
+    /// Whether a cell's prepared geometry, including every referenced child,
+    /// is shared with a previous presentation.
+    #[cfg(test)]
+    pub(crate) fn same_cell(&self, previous: &Self, cell: CellId) -> bool {
+        let Some(cell_info) = self.output.cells.get(&cell) else {
+            return false;
+        };
+        let address = ScopeAddress {
+            cell,
+            scope: cell_info.root,
+        };
+        self.state
+            .get(&address)
+            .zip(previous.state.get(&address))
+            .is_some_and(|(new, old)| Arc::ptr_eq(&new.prepared, &old.prepared))
+    }
 }
 
 pub struct Layers {
@@ -190,7 +212,6 @@ struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
     state: imbl::HashMap<ScopePath, ScopeState>,
-    hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
 pub(crate) struct PreparedCompilationSnapshot {
@@ -313,7 +334,6 @@ impl EditorState {
             layers,
             selected_scope,
             state,
-            hierarchy,
         }) = prepared_output
         else {
             return;
@@ -335,7 +355,6 @@ impl EditorState {
                 output: Arc::new(solved_cell),
                 selected_scope,
                 state: Arc::new(state),
-                hierarchy,
             });
             cx.notify();
         });
@@ -412,7 +431,6 @@ pub(crate) fn prepare_compilation_snapshot(
             layers,
             selected_scope,
             state,
-            hierarchy: Arc::new(hierarchy),
         }
     });
     PreparedCompilationSnapshot {
@@ -654,7 +672,7 @@ impl Editor {
         let state = self.state.read(cx);
         let solved = state.solved_cell.read(cx);
         let solved = solved.as_ref()?;
-        let scope = solved.state.get(&solved.selected_scope)?.address;
+        let scope = solved.selected_scope;
         let cell = solved.output.cells.get(&scope.cell)?;
         cell.scopes.get(&scope.scope)?;
         Some(cell.scope_span(scope.scope).clone())

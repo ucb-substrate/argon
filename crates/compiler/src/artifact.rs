@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::compile::CompileOutput;
 
-const MAGIC: &[u8; 8] = b"ARGON\0\0\x01";
+// Version 2 stores the overwhelmingly empty scope vectors in their compact
+// optional representation. Keep the wire version explicit so an old artifact
+// fails cleanly instead of being mis-deserialized as the new layout.
+const MAGIC: &[u8; 8] = b"ARGON\0\0\x02";
 
 /// Writes a successful compiler result in Argon's versioned binary format.
 pub fn write(output: &CompileOutput, path: impl AsRef<Path>) -> Result<()> {

@@ -1027,15 +1027,22 @@ impl Backend {
             ))
             .await;
         let gui_started = Instant::now();
-        let result = connection
-            .client
-            .update_cell(gui_snapshot_context(), update)
-            .await;
-        if self.handle_gui_result(&connection, result).await? {
+        let result = self
+            .await_gui_update(&connection, update, progress, gui_started)
+            .await?;
+        if result.accepted {
+            let gui_seconds = gui_started.elapsed().as_secs_f64();
+            let other_seconds = (gui_seconds
+                - result.decode_seconds
+                - result.materialize_seconds
+                - result.prepare_seconds)
+                .max(0.);
             progress
                 .report(format!(
-                    "Layout ready; GUI transfer/preparation took {:.1}s ({:.1}s total)",
-                    gui_started.elapsed().as_secs_f64(),
+                    "Layout accepted in {gui_seconds:.1}s: transfer/dispatch {other_seconds:.1}s, decode {:.1}s, materialize {:.1}s, hierarchy {:.1}s ({:.1}s total)",
+                    result.decode_seconds,
+                    result.materialize_seconds,
+                    result.prepare_seconds,
                     pipeline_started.elapsed().as_secs_f64(),
                 ))
                 .await;
@@ -1052,17 +1059,19 @@ impl Backend {
                     full.encoded_len() as f64 / (1024. * 1024.),
                 ))
                 .await;
-            let result = connection
-                .client
-                .update_cell(gui_snapshot_context(), full)
-                .await;
-            if !self.handle_gui_result(&connection, result).await? {
+            let result = self
+                .await_gui_update(&connection, full, progress, retry_started)
+                .await?;
+            if !result.accepted {
                 return None;
             }
             progress
                 .report(format!(
-                    "Layout ready; full-snapshot retry took {:.1}s ({:.1}s total)",
+                    "Layout accepted; full retry {:.1}s (decode {:.1}s, materialize {:.1}s, hierarchy {:.1}s; {:.1}s total)",
                     retry_started.elapsed().as_secs_f64(),
+                    result.decode_seconds,
+                    result.materialize_seconds,
+                    result.prepare_seconds,
                     pipeline_started.elapsed().as_secs_f64(),
                 ))
                 .await;
@@ -1070,6 +1079,35 @@ impl Backend {
         *previous = Some(snapshot);
         drop(previous);
         Some(connection)
+    }
+
+    async fn await_gui_update(
+        &self,
+        connection: &GuiConnection,
+        update: CompressedCompilationUpdate,
+        progress: &OngoingProgress<Unbounded, NotCancellable>,
+        started: Instant,
+    ) -> Option<rpc::GuiUpdateResult> {
+        let mut request = Box::pin(
+            connection
+                .client
+                .update_cell(gui_snapshot_context(), update),
+        );
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        let result = loop {
+            tokio::select! {
+                result = &mut request => break result,
+                _ = heartbeat.tick() => {
+                    progress.report(format!(
+                        "GUI is receiving/decompressing/preparing layout ({:.0}s elapsed)",
+                        started.elapsed().as_secs_f64(),
+                    )).await;
+                }
+            }
+        };
+        self.handle_gui_result(connection, result).await
     }
 
     async fn compress_gui_update(
@@ -1125,7 +1163,28 @@ impl Backend {
         let pipeline_started = Instant::now();
         let activity = self.state.begin_compilation(&identity).await;
         let result = async {
-            let snapshot = self.compile_snapshot(identity.clone()).await?;
+            // The compiler runs on its dedicated worker thread, so the async
+            // language-server task remains free to publish a heartbeat. Large
+            // cells used to leave Neovim showing an undifferentiated spinner
+            // for tens of seconds, making healthy evaluation indistinguishable
+            // from a wedged worker.
+            let mut compilation = Box::pin(self.compile_snapshot(identity.clone()));
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval`'s first tick is immediate; the begin notification
+            // already describes that instant.
+            heartbeat.tick().await;
+            let snapshot = loop {
+                tokio::select! {
+                    snapshot = &mut compilation => break snapshot?,
+                    _ = heartbeat.tick() => {
+                        activity.editor_progress.report(format!(
+                            "Evaluating layout ({:.0}s elapsed)",
+                            pipeline_started.elapsed().as_secs_f64(),
+                        )).await;
+                    }
+                }
+            };
             self.send_cell_update(
                 &identity,
                 snapshot,
@@ -1916,8 +1975,7 @@ impl Backend {
             return Ok(());
         };
         let preview = InstancePreview {
-            output,
-            cell,
+            geometry: output.preview_geometry(cell),
             invocation: params.cell,
             scope_span,
         };

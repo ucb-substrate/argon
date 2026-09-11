@@ -7,9 +7,10 @@
 //!
 //! Entries are keyed by the content [`CellId`] from
 //! `gdscache::source_cell_id`, which folds in the fingerprint, the arguments
-//! and the scope name. They survive edits, and are dropped only when the
-//! execution environment changes, which is what tracks the technology file and
-//! the imported GDS libraries.
+//! and the scope name. Unchanged reachable cells survive edits; obsolete source
+//! versions are pruned after the next successful execution. The whole cache is
+//! dropped when the execution environment changes, which is what tracks the
+//! technology file and imported GDS libraries.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -70,6 +71,18 @@ impl CellCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.stats.entries = 0;
+    }
+
+    /// Retain only cells reachable from the current revision's compiled outputs.
+    ///
+    /// Content IDs make old entries correct forever, but an editor can create
+    /// a new version of a very large top cell on every keystroke. Keeping all
+    /// of those unreachable versions would make session memory grow without
+    /// bound. Every unchanged dependency used by a retained output is present
+    /// in `live`, so pruning here does not reduce reuse for its next edit.
+    pub(crate) fn retain(&mut self, live: &HashSet<CellId>) {
+        self.entries.retain(|id, _| live.contains(id));
+        self.stats.entries = self.entries.len() as u64;
     }
 
     /// The entry for `id` and its whole instantiation closure, with every span

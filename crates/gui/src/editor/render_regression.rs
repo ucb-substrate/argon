@@ -202,7 +202,6 @@ fn prepare(
             output: Arc::new(output),
             selected_scope: prepared.selected_scope,
             state: Arc::new(prepared.state),
-            hierarchy: prepared.hierarchy,
         },
         Arc::new(prepared.layers),
     )
@@ -364,8 +363,8 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
             let scopes = Arc::make_mut(&mut solved.state);
             let (_, scope) = scopes
                 .iter_mut()
-                .find(|(_, scope)| {
-                    solved.output.cells[&scope.address.cell]
+                .find(|(address, _)| {
+                    solved.output.cells[&address.cell]
                         .objects
                         .values()
                         .any(|value| matches!(value, SolvedValue::Rect(_)))
@@ -572,7 +571,7 @@ fn interleaved_layers_coalesce_before_visiting_sram_leaf_shapes() {
     ));
     let (solved, _) = prepare(&source, &config);
     let index = RasterSpatialIndex::default();
-    let root = solved.state[&solved.selected_scope].address;
+    let root = solved.selected_scope;
     let extents = index.layer_extents(&solved, root.cell);
     assert_eq!(extents.len(), 2);
     assert!(
@@ -633,7 +632,7 @@ cell top() {
             .join("../../examples/tech/basic.tech.toml"),
     ));
     let (solved, layers) = prepare(&source, &config);
-    let root = solved.state[&solved.selected_scope].address;
+    let root = solved.selected_scope;
     assert!(solved.output.cells[&root.cell].scopes.len() > 64);
 
     let spatial_index = Arc::new(RasterSpatialIndex::default());
@@ -1276,14 +1275,9 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         output: Arc::new(prepared.output.unwrap_valid()),
         selected_scope: metadata.selected_scope,
         state: Arc::new(metadata.state),
-        hierarchy: metadata.hierarchy,
     };
     let mut reused = RasterSpatialIndex::default();
-    reused.reuse_ready_cells(&old_index, |cell| {
-        after
-            .hierarchy
-            .same_cell(&before.hierarchy, &after.output, cell)
-    });
+    reused.reuse_ready_cells(&old_index, |cell| after.same_cell(&before, cell));
     let cells = reused.cells.lock().unwrap();
     assert!(!cells.contains_key(&leaf));
     assert!(

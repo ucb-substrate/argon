@@ -1274,7 +1274,9 @@ pub struct LayoutCanvas {
     raster_content_revision: u64,
     raster_content_revision_signal: Arc<AtomicU64>,
     raster_output: Option<Arc<CompiledData>>,
-    raster_hierarchy: Arc<editor::hierarchy::PreparedHierarchy>,
+    /// One prepared root per compiled cell, used to retain unchanged spatial
+    /// indexes without keeping a second map containing every execution scope.
+    raster_cell_roots: HashMap<CellId, Arc<editor::hierarchy::PreparedScope>>,
     raster_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
     raster_selected_scope: Option<editor::ScopePath>,
     raster_displayed_cell: Option<CellId>,
@@ -3906,7 +3908,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             local_bounds.size.height + cull_margin * 2.,
         ),
     );
-    let selected = &input.solved_cell.state[&input.solved_cell.selected_scope].address;
+    let selected = &input.solved_cell.selected_scope;
     let mut queue = VecDeque::from_iter([(
         ScopeAddress {
             cell: selected.cell,
@@ -5314,7 +5316,7 @@ fn solved_geometry_reaches_threshold(
     if threshold == 0 {
         return true;
     }
-    let selected = &solved.state[&solved.selected_scope].address;
+    let selected = &solved.selected_scope;
     let root = ScopeAddress {
         cell: selected.cell,
         scope: if hide_external_geometry {
@@ -5381,7 +5383,7 @@ fn visible_geometry_render_decision_indexed(
     viewport: ViewportTransform,
     build_missing_indexes: bool,
 ) -> Option<VisibleGeometryRenderDecision> {
-    let selected = &solved.state[&solved.selected_scope].address;
+    let selected = &solved.selected_scope;
     let root = ScopeAddress {
         cell: selected.cell,
         scope: if hide_external_geometry {
@@ -5864,101 +5866,35 @@ fn offset_after_horizontal_reflow(
     )
 }
 
-/// Flatten the solved geometry of one compiled cell into rectangles relative
-/// to that cell's origin. Placement paints these as a single pointer-following
-/// outline without disturbing the layout currently open in the editor.
-fn instance_preview_geometry(output: &CompiledData, cell: CellId) -> (Vec<Rect>, Vec<Polygon>) {
-    let mut rects = Vec::new();
-    let mut polygons = Vec::new();
-    let mut queue = VecDeque::from_iter([(
-        cell,
-        output.cells[&cell].root,
-        TransformationMatrix::identity(),
-        (0., 0.),
-    )]);
-
-    while let Some((cell, scope, mat, ofs)) = queue.pop_front() {
-        let compiled_cell = &output.cells[&cell];
-        let compiled_scope = &compiled_cell.scopes[&scope];
-        let mut emitted = HashSet::new();
-        for (object, _) in &compiled_scope.emit {
-            if !emitted.insert(*object) {
-                continue;
-            }
-            match &compiled_cell.objects[object] {
-                SolvedValue::Rect(rect) if !rect.construction => {
-                    let p0 = ifmatvec(mat, (rect.x0.0, rect.y0.0));
-                    let p1 = ifmatvec(mat, (rect.x1.0, rect.y1.0));
-                    rects.push(Rect {
-                        x0: (p0.0.min(p1.0) + ofs.0) as f32,
-                        y0: (p0.1.min(p1.1) + ofs.1) as f32,
-                        x1: (p0.0.max(p1.0) + ofs.0) as f32,
-                        y1: (p0.1.max(p1.1) + ofs.1) as f32,
-                        id: None,
-                        object_path: Vec::new(),
-                        border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
-                        border_styles: Edges::all(BorderStyle::Dashed),
-                        cvars: None,
-                    });
-                }
-                SolvedValue::Polygon(polygon) => {
-                    polygons.push(Polygon {
-                        points: polygon
-                            .points
-                            .iter()
-                            .map(|(x, y)| {
-                                let point = ifmatvec(mat, (x.0, y.0));
-                                Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
-                            })
-                            .collect(),
-                        edge_styles: vec![BorderStyle::Dashed; polygon.points.len()],
-                        id: None,
-                        object_path: Vec::new(),
-                        cvars: None,
-                        centerline: None,
-                    });
-                }
-                SolvedValue::Path(path) => {
-                    if let Some(outline) = path.outline() {
-                        let point_count = outline.len();
-                        polygons.push(Polygon {
-                            points: outline
-                                .into_iter()
-                                .map(|point| {
-                                    let point = ifmatvec(mat, point);
-                                    Point::new((point.0 + ofs.0) as f32, (point.1 + ofs.1) as f32)
-                                })
-                                .collect(),
-                            edge_styles: vec![BorderStyle::Dashed; point_count],
-                            id: None,
-                            object_path: Vec::new(),
-                            cvars: None,
-                            centerline: None,
-                        });
-                    }
-                }
-                SolvedValue::Instance(instance) if !instance.construction => {
-                    let mut instance_mat = TransformationMatrix::identity();
-                    if instance.reflect {
-                        instance_mat = instance_mat.reflect_vert();
-                    }
-                    instance_mat = instance_mat.rotate(instance.angle);
-                    let instance_ofs = ifmatvec(mat, (instance.x, instance.y));
-                    let child = instance.cell;
-                    queue.push_back((
-                        child,
-                        output.cells[&child].root,
-                        mat * instance_mat,
-                        (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1),
-                    ));
-                }
-                _ => {}
-            }
-        }
-        for child in &compiled_scope.children {
-            queue.push_back((cell, *child, mat, ofs));
-        }
-    }
+/// Convert the analyzer's compact numeric preview into paint-ready shapes.
+fn instance_preview_geometry(geometry: compile::PreviewGeometry) -> (Vec<Rect>, Vec<Polygon>) {
+    let rects = geometry
+        .rects
+        .into_iter()
+        .map(|[x0, y0, x1, y1]| Rect {
+            x0,
+            y0,
+            x1,
+            y1,
+            id: None,
+            object_path: Vec::new(),
+            border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            border_styles: Edges::all(BorderStyle::Dashed),
+            cvars: None,
+        })
+        .collect();
+    let polygons = geometry
+        .polygons
+        .into_iter()
+        .map(|points| Polygon {
+            edge_styles: vec![BorderStyle::Dashed; points.len()],
+            points: points.into_iter().map(|(x, y)| Point::new(x, y)).collect(),
+            id: None,
+            object_path: Vec::new(),
+            cvars: None,
+            centerline: None,
+        })
+        .collect();
     (rects, polygons)
 }
 
@@ -6207,7 +6143,7 @@ impl Element for CanvasElement {
                 return Some(());
             }
             if let Some(solved_cell) = solved_cell {
-                let scope_address = &solved_cell.state[&solved_cell.selected_scope].address;
+                let scope_address = &solved_cell.selected_scope;
                 let editable_cell = &solved_cell.output.cells[&scope_address.cell];
                 if inner.is_sse_dragging || inner.is_sse_persisting {
                     sse_dv = inner.sse_drag_delta(editable_cell);
@@ -6980,7 +6916,7 @@ impl Element for CanvasElement {
             .as_ref()
             .filter(|_| replay_direct.is_none())
             .map(|solved| {
-                let selected = &solved.state[&solved.selected_scope].address;
+                let selected = &solved.selected_scope;
                 &solved.output.cells[&selected.cell]
             });
         let mut movable_corners = HashMap::new();
@@ -8364,8 +8300,7 @@ impl Element for CanvasElement {
                                         let path = {
                                             let cell = inner.state.read(cx).solved_cell.read(cx);
                                             if let Some(cell) = cell
-                                                && let selected_scope_addr =
-                                                    cell.state[&cell.selected_scope].address
+                                                && let selected_scope_addr = cell.selected_scope
                                                 && let (true, path) = find_obj_path(
                                                     &r.object_path,
                                                     cell,
@@ -8728,7 +8663,7 @@ impl LayoutCanvas {
             screen_bounds: Bounds::default(),
             _subscriptions: vec![
                 cx.observe(state, |canvas, _, cx| {
-                    let previous_hierarchy = canvas.raster_hierarchy.clone();
+                    let previous_cell_roots = canvas.raster_cell_roots.clone();
                     let change = canvas.update_raster_presentation(cx);
                     if change == RasterPresentationChange::None {
                         canvas.reconcile_pending_rectangles(cx);
@@ -8748,13 +8683,12 @@ impl LayoutCanvas {
                         canvas.raster_scope_state.as_deref(),
                         canvas.raster_hide_external_geometry,
                     );
-                    if change == RasterPresentationChange::Geometry
-                        && let Some(output) = &canvas.raster_output
-                    {
+                    if change == RasterPresentationChange::Geometry {
                         spatial_index.reuse_ready_cells(&canvas.raster_spatial_index, |cell| {
-                            canvas
-                                .raster_hierarchy
-                                .same_cell(&previous_hierarchy, output, cell)
+                            previous_cell_roots
+                                .get(&cell)
+                                .zip(canvas.raster_cell_roots.get(&cell))
+                                .is_some_and(|(old, new)| Arc::ptr_eq(old, new))
                         });
                     }
                     let stale_spatial_index = std::mem::replace(
@@ -8817,7 +8751,7 @@ impl LayoutCanvas {
             raster_content_revision: 0,
             raster_content_revision_signal: Arc::new(AtomicU64::new(0)),
             raster_output: None,
-            raster_hierarchy: Arc::default(),
+            raster_cell_roots: HashMap::new(),
             raster_scope_state: None,
             raster_selected_scope: None,
             raster_displayed_cell: None,
@@ -8919,7 +8853,7 @@ impl LayoutCanvas {
             let (output, scope_state, selected_scope, displayed_cell, layout_bbox) = solved_cell
                 .as_ref()
                 .map(|solved| {
-                    let selected = solved.state[&solved.selected_scope].address;
+                    let selected = solved.selected_scope;
                     let displayed = if hide_external_geometry {
                         selected
                     } else {
@@ -9009,15 +8943,26 @@ impl LayoutCanvas {
             !same_scope_state,
             self.raster_output.is_some(),
         );
-        self.raster_output = output;
-        self.raster_hierarchy = self
-            .state
-            .read(cx)
-            .solved_cell
-            .read(cx)
+        self.raster_cell_roots = output
             .as_ref()
-            .map(|solved| solved.hierarchy.clone())
+            .zip(scope_state.as_ref())
+            .map(|(output, state)| {
+                output
+                    .cells
+                    .iter()
+                    .filter_map(|(cell, info)| {
+                        let address = editor::ScopeAddress {
+                            cell: *cell,
+                            scope: info.root,
+                        };
+                        state
+                            .get(&address)
+                            .map(|scope| (*cell, Arc::clone(&scope.prepared)))
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
+        self.raster_output = output;
         self.raster_scope_state = scope_state;
         self.raster_selected_scope = selected_scope;
         self.raster_displayed_cell = displayed_cell;
@@ -9810,7 +9755,7 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn place_instance(&mut self, preview: InstancePreview, cx: &mut Context<Self>) {
-        let (rects, polygons) = instance_preview_geometry(&preview.output, preview.cell);
+        let (rects, polygons) = instance_preview_geometry(preview.geometry);
         let tool = self.state.read(cx).tool.clone();
         tool.update(cx, |tool, cx| {
             *tool = ToolState::PlaceInstance(PlaceInstanceToolState {
@@ -10045,7 +9990,7 @@ impl LayoutCanvas {
         self.hover_hit = None;
         if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
-                let scope_address = &cell.state[&cell.selected_scope].address;
+                let scope_address = &cell.selected_scope;
                 cell.state[&ScopeAddress {
                     cell: scope_address.cell,
                     scope: cell.output.cells[&scope_address.cell].root,
@@ -10090,7 +10035,7 @@ impl LayoutCanvas {
         let Some(solved) = state.solved_cell.read(cx).as_ref() else {
             return;
         };
-        let address = solved.state[&solved.selected_scope].address;
+        let address = solved.selected_scope;
         let cell = &solved.output.cells[&address.cell];
         let reachable = solved.output.reachable_objs(address.cell, address.scope);
         let names: HashSet<&str> = reachable
@@ -10187,23 +10132,19 @@ impl LayoutCanvas {
         let solved = state.solved_cell.read(cx);
         self.pending_rectangles.retain_mut(|pending| {
             let contains_rectangle = solved.as_ref().is_some_and(|solved| {
-                solved
-                    .state
-                    .get(&pending.scope_path)
-                    .is_some_and(|scope_state| {
-                        let cell = &solved.output.cells[&scope_state.address.cell];
-                        let scope = &cell.scopes[&scope_state.address.scope];
-                        cell.scope_span(scope_state.address.scope).path == pending.source_path
-                            && scope.bindings.iter().any(|(_, (name, object))| {
-                                name == &pending.name
-                                    && object
-                                        .get_elem()
-                                        .and_then(|id| cell.objects.get(id))
-                                        .is_some_and(|object| {
-                                            matches!(object, SolvedValue::Rect(_))
-                                        })
-                            })
-                    })
+                solved.state.get(&pending.scope_path).is_some_and(|_| {
+                    let address = pending.scope_path;
+                    let cell = &solved.output.cells[&address.cell];
+                    let scope = &cell.scopes[&address.scope];
+                    cell.scope_span(address.scope).path == pending.source_path
+                        && scope.bindings.iter().any(|(_, (name, object))| {
+                            name == &pending.name
+                                && object
+                                    .get_elem()
+                                    .and_then(|id| cell.objects.get(id))
+                                    .is_some_and(|object| matches!(object, SolvedValue::Rect(_)))
+                        })
+                })
             });
             if contains_rectangle {
                 pending.resolved_content_revision = Some(self.raster_content_revision);
@@ -10486,8 +10427,7 @@ impl LayoutCanvas {
                                 let resolved = {
                                     let cell = self.state.read(cx).solved_cell.read(cx);
                                     if let Some(cell) = cell
-                                        && let selected_scope_addr =
-                                            cell.state[&cell.selected_scope].address
+                                        && let selected_scope_addr = cell.selected_scope
                                         && let (true, path) =
                                             find_obj_path(&r.object_path, cell, selected_scope_addr)
                                         && let Some(exact) = exact_object_bounds(
@@ -10572,7 +10512,7 @@ impl LayoutCanvas {
                     let state = self.state.read(cx);
 
                     if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
-                        let selected_scope_addr = cell.state[&cell.selected_scope].address;
+                        let selected_scope_addr = cell.selected_scope;
                         let grid = cell.output.tech.grid_step();
 
                         let pending = if dim_tool.edges.len() == 1
@@ -11013,7 +10953,7 @@ impl LayoutCanvas {
                     let Some(cell) = cell.as_mut() else {
                         return Some("no cell to edit".into());
                     };
-                    let scope_address = &cell.state[&cell.selected_scope].address;
+                    let scope_address = &cell.selected_scope;
                     let reachable_objs = cell
                         .output
                         .reachable_objs(scope_address.cell, scope_address.scope);
@@ -11469,7 +11409,7 @@ impl LayoutCanvas {
         let Some(solved) = solved.as_ref() else {
             return DragPersistenceEdits::default();
         };
-        let selected = &solved.state[&solved.selected_scope].address;
+        let selected = &solved.selected_scope;
         let editable_cell = &solved.output.cells[&selected.cell];
         let Some(dv) = self.sse_drag_delta(editable_cell) else {
             return DragPersistenceEdits::default();
@@ -13668,7 +13608,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         ) -> (editor::ScopePath, Option<compile::Rect<f64>>) {
             let cell = &output.cells[&address.cell];
             let scope_info = &cell.scopes[&address.scope];
-            let scope_name = cell.scope_name(address.scope).to_owned();
+            let scope_name = cell.scope_name_shared(address.scope);
             let emit = scope_info
                 .emit
                 .iter()
@@ -13736,11 +13676,13 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             state.insert(
                 address,
                 editor::ScopeState {
-                    name: scope_name,
-                    address,
                     visible: true,
-                    bbox: bbox.clone().map(Arc::new),
                     parent,
+                    prepared: Arc::new(editor::hierarchy::PreparedScope {
+                        name: scope_name,
+                        bbox: bbox.clone().map(Arc::new),
+                        children: smallvec::SmallVec::new(),
+                    }),
                 },
             );
             (address, bbox)
@@ -13757,7 +13699,6 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             output,
             selected_scope,
             state: Arc::new(state),
-            hierarchy: Arc::default(),
         }
     }
 
@@ -14524,7 +14465,8 @@ cell top() {
             output => panic!("preview fixture should compile: {output:?}"),
         };
 
-        let (rects, polygons) = instance_preview_geometry(&output, output.top);
+        let geometry = output.preview_geometry(output.top);
+        let (rects, polygons) = instance_preview_geometry(geometry);
         assert_eq!(rects.len(), 1);
         assert!(polygons.is_empty());
         assert_eq!(
@@ -14581,7 +14523,6 @@ cell top() {
             output: Arc::new(output),
             selected_scope: scope,
             state: Arc::default(),
-            hierarchy: Arc::default(),
         };
 
         assert_eq!(

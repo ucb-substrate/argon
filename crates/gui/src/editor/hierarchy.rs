@@ -14,12 +14,14 @@ use super::{
 };
 
 #[derive(Debug)]
-struct PreparedScope {
-    name: String,
-    bbox: Option<Arc<Rect<f64>>>,
+pub struct PreparedScope {
+    pub name: Arc<str>,
+    /// Shared because long chains of function/control-flow scopes commonly
+    /// have exactly the same bounds as their only child.
+    pub bbox: Option<Arc<Rect<f64>>>,
     // Most generated execution scopes have zero or one child. Keep those
     // inline instead of performing a heap allocation per scope.
-    children: smallvec::SmallVec<[ScopeAddress; 2]>,
+    pub children: smallvec::SmallVec<[ScopeAddress; 2]>,
 }
 
 #[derive(Debug, Default)]
@@ -28,28 +30,6 @@ pub(super) struct PreparedHierarchy {
 }
 
 impl PreparedHierarchy {
-    /// Root identity includes immutable cell data and every dependency used to
-    /// compute its bounds. It is safe to reuse a renderer index only if all of
-    /// those inputs survived the edit, not merely if its numeric ID survived.
-    pub(super) fn same_cell(
-        &self,
-        previous: &Self,
-        output: &CompiledData,
-        cell: argonc::compile::CellId,
-    ) -> bool {
-        let Some(cell_info) = output.cells.get(&cell) else {
-            return false;
-        };
-        let address = ScopeAddress {
-            cell,
-            scope: cell_info.root,
-        };
-        self.scopes
-            .get(&address)
-            .zip(previous.scopes.get(&address))
-            .is_some_and(|(new, old)| Arc::ptr_eq(new, old))
-    }
-
     /// Resolve a selection from the preceding snapshot by its displayed name
     /// path. Addresses include a content-derived cell ID and can therefore
     /// change after an otherwise non-structural source edit.
@@ -63,11 +43,11 @@ impl PreparedHierarchy {
         let mut current = Some(old_selected);
         while let Some(address) = current {
             let scope = old_state.get(&address)?;
-            names.push(scope.name.as_str());
+            names.push(scope.name.as_ref());
             current = scope.parent;
         }
         let mut names = names.into_iter().rev();
-        if self.scopes.get(&root)?.name != names.next()? {
+        if self.scopes.get(&root)?.name.as_ref() != names.next()? {
             return None;
         }
         let mut address = root;
@@ -77,7 +57,7 @@ impl PreparedHierarchy {
                 .iter()
                 .rev()
                 .copied()
-                .find(|child| self.scopes[child].name == name)?;
+                .find(|child| self.scopes[child].name.as_ref() == name)?;
         }
         Some(address)
     }
@@ -96,12 +76,16 @@ fn prepare_geometry(
     let cell = &output.cells[&address.cell];
     let source_scope = &cell.scopes[&address.scope];
     if let Some(old) = previous
-        && let Some(cached) = old.hierarchy.scopes.get(&address).filter(|_| {
-            old.output
-                .cells
-                .get(&address.cell)
-                .is_some_and(|old| Arc::ptr_eq(old, cell))
-        })
+        && let Some(cached) = old
+            .state
+            .get(&address)
+            .map(|scope| &scope.prepared)
+            .filter(|_| {
+                old.output
+                    .cells
+                    .get(&address.cell)
+                    .is_some_and(|old| Arc::ptr_eq(old, cell))
+            })
     {
         // An immutable parent's bounds can still change if a referenced
         // child changed. Walk dependencies in emit order both to validate them
@@ -148,10 +132,9 @@ fn prepare_geometry(
             );
         }
         if cached.children.iter().all(|child| {
-            old.hierarchy
-                .scopes
+            old.state
                 .get(child)
-                .is_some_and(|old| Arc::ptr_eq(old, &scopes[child]))
+                .is_some_and(|old| Arc::ptr_eq(&old.prepared, &scopes[child]))
         }) {
             scopes.insert(address, cached.clone());
             return;
@@ -227,7 +210,7 @@ fn prepare_geometry(
     scopes.insert(
         address,
         Arc::new(PreparedScope {
-            name: cell.scope_name(address.scope).to_owned(),
+            name: cell.scope_name_shared(address.scope),
             bbox,
             children,
         }),
@@ -259,15 +242,13 @@ fn prepare_paths(
     if state.state.contains_key(&address) {
         return;
     }
-    path.push(scope.name.clone());
+    path.push(scope.name.to_string());
     state.state.insert(
         address,
         ScopeState {
-            name: scope.name.clone(),
-            address,
             parent,
             visible: !hidden_paths.contains(path),
-            bbox: scope.bbox.clone(),
+            prepared: Arc::clone(scope),
         },
     );
     for child in scope.children.iter().rev() {
@@ -276,20 +257,49 @@ fn prepare_paths(
     path.pop();
 }
 
+/// Populate the overwhelmingly common all-visible hierarchy without building
+/// and allocating a displayed-name path for every execution scope. Name paths
+/// are needed only to remap the small set of user-hidden scopes across edits.
+fn prepare_visible_paths(
+    address: ScopeAddress,
+    parent: Option<ScopeAddress>,
+    scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+    state: &mut ProcessScopeState,
+) {
+    if state.state.contains_key(&address) {
+        return;
+    }
+    let scope = &scopes[&address];
+    state.state.insert(
+        address,
+        ScopeState {
+            parent,
+            visible: true,
+            prepared: Arc::clone(scope),
+        },
+    );
+    for child in scope.children.iter().rev() {
+        prepare_visible_paths(*child, Some(address), scopes, state);
+    }
+}
+
 fn hidden_paths(old: Option<&imbl::HashMap<ScopePath, ScopeState>>) -> HashSet<Vec<String>> {
     old.into_iter()
         .flat_map(|state| {
-            state.values().filter(|scope| !scope.visible).map(|scope| {
-                let mut path = Vec::new();
-                let mut current = Some(scope.address);
-                while let Some(address) = current {
-                    let scope = &state[&address];
-                    path.push(scope.name.clone());
-                    current = scope.parent;
-                }
-                path.reverse();
-                path
-            })
+            state
+                .iter()
+                .filter(|(_, scope)| !scope.visible)
+                .map(|(address, _)| {
+                    let mut path = Vec::new();
+                    let mut current = Some(*address);
+                    while let Some(address) = current {
+                        let scope = &state[&address];
+                        path.push(scope.name.to_string());
+                        current = scope.parent;
+                    }
+                    path.reverse();
+                    path
+                })
         })
         .collect()
 }
@@ -321,7 +331,7 @@ fn reuse_paths(
         if inverse.insert(after, before).is_some() {
             return false;
         }
-        let Some(a) = old.hierarchy.scopes.get(&before) else {
+        let Some(a) = old.state.get(&before).map(|scope| &scope.prepared) else {
             return false;
         };
         let b = &scopes[&after];
@@ -334,24 +344,23 @@ fn reuse_paths(
     let changed: HashSet<_> = remap
         .iter()
         .filter_map(|(before, after)| {
-            (!Arc::ptr_eq(&old.hierarchy.scopes[before], &scopes[after])).then_some(*before)
+            (!Arc::ptr_eq(&old.state[before].prepared, &scopes[after])).then_some(*before)
         })
         .collect();
     state.state = old.state.as_ref().clone();
     for (before, after) in &remap {
         let scope = &old.state[before];
-        let address = remap[&scope.address];
+        let address = remap[before];
         let parent = scope.parent.map(|parent| remap[&parent]);
         if before != after {
             state.state.remove(before);
         }
-        if changed.contains(&scope.address) || address != scope.address || parent != scope.parent {
+        if changed.contains(before) || address != *before || parent != scope.parent {
             state.state.insert(
                 *after,
                 ScopeState {
-                    address,
                     parent,
-                    bbox: scopes[&address].bbox.clone(),
+                    prepared: Arc::clone(&scopes[&address]),
                     ..scope.clone()
                 },
             );
@@ -374,14 +383,12 @@ pub(super) fn prepare(
         mark_layer_used(state, layer);
     }
     if !previous.is_some_and(|previous| reuse_paths(root, &scopes, state, previous)) {
-        prepare_paths(
-            root,
-            None,
-            &mut Vec::new(),
-            &hidden_paths(old),
-            &scopes,
-            state,
-        );
+        let hidden_paths = hidden_paths(old);
+        if hidden_paths.is_empty() {
+            prepare_visible_paths(root, None, &scopes, state);
+        } else {
+            prepare_paths(root, None, &mut Vec::new(), &hidden_paths, &scopes, state);
+        }
     }
     PreparedHierarchy { scopes }
 }
@@ -399,7 +406,6 @@ pub(super) mod tests {
         for (path, expected) in &expected.state {
             let actual = &actual.state[path];
             assert_eq!(actual.name, expected.name);
-            assert_eq!(actual.address, expected.address);
             assert_eq!(actual.parent, expected.parent);
             assert_eq!(actual.visible, expected.visible);
             assert_eq!(
@@ -516,7 +522,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             };
             let mut actual = ProcessScopeState::default();
             let old_state = previous.as_ref().map(|old| old.state.as_ref());
-            let hierarchy = prepare(&output, root, &mut actual, old_state, previous.as_ref());
+            prepare(&output, root, &mut actual, old_state, previous.as_ref());
             let mut expected = ProcessScopeState::default();
             Reference::process_scope_reference(&output, root, &mut expected, None, old_state);
             if previous.is_some() {
@@ -531,7 +537,6 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                 selected_scope: root,
                 output: Arc::new(output),
                 state: Arc::new(actual.state),
-                hierarchy: Arc::new(hierarchy),
             });
         }
     }
@@ -547,7 +552,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
         ) {
             let cell = &solved_cell.cells[&scope.cell];
             let scope_info = &cell.scopes[&scope.scope];
-            let scope_name = cell.scope_name(scope.scope).to_owned();
+            let scope_name = cell.scope_name_shared(scope.scope);
             let mut bbox = None;
             for (obj, _) in &scope_info.emit {
                 let value = &solved_cell.cells[&scope.cell].objects[obj];
@@ -674,11 +679,13 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             state.state.insert(
                 scope,
                 ScopeState {
-                    name: scope_name,
-                    address: scope,
                     visible,
-                    bbox: bbox.map(Arc::new),
                     parent,
+                    prepared: Arc::new(PreparedScope {
+                        name: scope_name,
+                        bbox: bbox.map(Arc::new),
+                        children: smallvec::SmallVec::new(),
+                    }),
                 },
             );
         }

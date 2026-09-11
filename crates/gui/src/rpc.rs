@@ -6,14 +6,14 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use analyzer::ArgonConfig;
 use analyzer::rpc::{
     CompilationSnapshot, CompressedCompilationUpdate, DimensionParams, FocusEditorParams, Gui,
-    InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PathParams,
-    PolygonParams, RectangleEditResult, ValueEdit,
+    GuiUpdateResult, InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient,
+    PathParams, PolygonParams, RectangleEditResult, ValueEdit,
 };
 use anyhow::{Result, anyhow};
 use argonc::{ast::Span, compile::BasicRect};
@@ -593,22 +593,29 @@ impl Gui for GuiServer {
         mut self,
         _: context::Context,
         update: CompressedCompilationUpdate,
-    ) -> bool {
+    ) -> GuiUpdateResult {
+        let decode_started = Instant::now();
         let update = match update.decode() {
             Ok(update) => update,
             Err(error) => {
                 error!("could not decode compilation update: {error}");
-                return false;
+                return GuiUpdateResult::default();
             }
         };
+        let decode_seconds = decode_started.elapsed().as_secs_f64();
+        let materialize_started = Instant::now();
         let snapshot = {
             let mut previous = lock_unpoisoned(&self.snapshot);
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
-                return false;
+                return GuiUpdateResult {
+                    decode_seconds,
+                    ..GuiUpdateResult::default()
+                };
             };
             *previous = Some(snapshot.clone());
             snapshot
         };
+        let materialize_seconds = materialize_started.elapsed().as_secs_f64();
         let preparation_id = NEXT_SNAPSHOT_PREPARATION_ID.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.to_exec
@@ -621,14 +628,21 @@ impl Gui for GuiServer {
             .await
             .unwrap();
         let Ok(Some(preparation_context)) = receiver.await else {
-            return true;
+            return GuiUpdateResult {
+                accepted: true,
+                decode_seconds,
+                materialize_seconds,
+                prepare_seconds: 0.,
+            };
         };
 
         // Hierarchy metadata, bounding boxes, and layer usage can be expensive
         // for a large cell. This RPC future runs on GPUI's background executor, so
         // prepare the immutable presentation data here instead of blocking the
         // UI thread and freezing its activity animation.
+        let prepare_started = Instant::now();
         let snapshot = prepare_compilation_snapshot(snapshot, preparation_context);
+        let prepare_seconds = prepare_started.elapsed().as_secs_f64();
         self.to_exec
             .send(Box::new(move |editor, app| {
                 let _ = app
@@ -636,7 +650,12 @@ impl Gui for GuiServer {
             }))
             .await
             .unwrap();
-        true
+        GuiUpdateResult {
+            accepted: true,
+            decode_seconds,
+            materialize_seconds,
+            prepare_seconds,
+        }
     }
 
     async fn fit(mut self, _: context::Context) {

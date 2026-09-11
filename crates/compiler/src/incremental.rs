@@ -6,7 +6,7 @@
 //! made finer grained without changing this public synchronization API.
 
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
@@ -414,6 +414,7 @@ impl IncrementalCompiler {
             )
         });
         self.execution_cache.insert(key, output.clone());
+        self.prune_execution_caches();
         output
     }
 
@@ -498,7 +499,30 @@ impl IncrementalCompiler {
             compile::execute_cell_invocation_cached(&typed_ast, &invocation, config, None)
         });
         self.execution_cache.insert(key, output.clone());
+        self.prune_execution_caches();
         Ok(output)
+    }
+
+    /// Drop compiled source-cell versions no longer reachable from any output
+    /// cached for the current source revision. Failed parses/checks keep the
+    /// last useful cache intact.
+    fn prune_execution_caches(&mut self) {
+        let live = self
+            .execution_cache
+            .values()
+            .filter_map(|output| match output {
+                CompileOutput::Valid(data) => Some(data),
+                CompileOutput::ExecErrors(errors) => errors.output.as_ref(),
+                CompileOutput::FatalParseErrors | CompileOutput::StaticErrors(_) => None,
+            })
+            .flat_map(|data| data.cells.keys().copied())
+            .collect::<HashSet<_>>();
+        if live.is_empty() {
+            return;
+        }
+        self.cell_cache.retain(&live);
+        self.check_cache.retain(&live);
+        self.stats.cell_cache = self.cell_cache.stats();
     }
 
     /// Recompiles the same cell with empty caches and asserts the two agree,
@@ -1535,6 +1559,35 @@ mod tests {
         assert_eq!(edited.len(), before.len());
         let kept = edited.iter().filter(|id| before.contains(id)).count();
         assert_eq!(kept, 1, "only the untouched leaf keeps its id");
+    }
+
+    #[test]
+    fn obsolete_source_cell_versions_are_pruned_after_an_edit() {
+        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
+        let (_dir, config) = scratch_workspace(source);
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let root = config.root_lib().to_path_buf();
+        let cell = vec!["top".to_owned()];
+        let mut session = IncrementalCompiler::new();
+
+        session.set_source_text(root.clone(), source);
+        assert!(matches!(
+            session.compile_cell(&config, &cell, Vec::new()),
+            CompileOutput::Valid(_)
+        ));
+        assert_eq!(session.stats().cell_cache.entries, 2);
+
+        // The leaf remains reusable, while the changed top gets a new content
+        // ID. The old top must not remain resident beside the new one.
+        session.set_source_text(root, source.replace("x = 0., y = 0.", "x = 5., y = 0."));
+        assert!(matches!(
+            session.compile_cell(&config, &cell, Vec::new()),
+            CompileOutput::Valid(_)
+        ));
+        assert_eq!(session.stats().cell_cache.entries, 2);
     }
 
     /// Every cell reached from a named entry point is named by content, and so

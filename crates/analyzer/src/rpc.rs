@@ -4,7 +4,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use argonc::{
     ast::Span,
-    compile::{BasicRect, CellId, CompileOutput, CompiledData},
+    compile::{BasicRect, CellId, CompileOutput, CompiledData, PreviewGeometry},
     parse::WorkspaceParseAst,
 };
 
@@ -72,13 +72,12 @@ pub enum DrawSegmentConstraint {
     DiagonalNegative(usize),
 }
 
-/// A solved cell and the source location where placing it will insert an
+/// Flattened geometry and the source location where placing it will insert an
 /// instance. The GUI keeps this separate from the currently open layout and
 /// uses it only for the cursor-following placement outline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstancePreview {
-    pub output: CompiledData,
-    pub cell: CellId,
+    pub geometry: PreviewGeometry,
     pub invocation: String,
     pub scope_span: Span,
 }
@@ -136,6 +135,17 @@ pub struct CompilationUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressedCompilationUpdate {
     bytes: Vec<u8>,
+}
+
+/// GUI-side costs for accepting a compilation snapshot. Returning these to the
+/// language server makes a long transfer distinguishable from decompression,
+/// delta materialization, and hierarchy preparation in editor progress.
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+pub struct GuiUpdateResult {
+    pub accepted: bool,
+    pub decode_seconds: f64,
+    pub materialize_seconds: f64,
+    pub prepare_seconds: f64,
 }
 
 impl CompressedCompilationUpdate {
@@ -253,7 +263,7 @@ pub trait LangServer {
 pub trait Gui {
     async fn compilation_started(activity_id: u64);
     async fn compilation_finished(activity_id: u64);
-    async fn update_cell(update: CompressedCompilationUpdate) -> bool;
+    async fn update_cell(update: CompressedCompilationUpdate) -> GuiUpdateResult;
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
