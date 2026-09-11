@@ -1,0 +1,14 @@
+[package]
+name = "argon-sram-sizing"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+name = "argon_sram_sizing"
+
+[dependencies]
+geometry.workspace = true
+
+[lints]
+workspace = true

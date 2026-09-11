@@ -128,6 +128,36 @@ pub struct CompilationUpdate {
     pub cell_order: Vec<CellId>,
 }
 
+/// A losslessly compressed compilation update for the analyzer-to-GUI RPC.
+///
+/// Scope-heavy layouts contain millions of repeated names and source paths.
+/// Compressing the bincode stream directly avoids first allocating a second,
+/// equally large uncompressed byte buffer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressedCompilationUpdate {
+    bytes: Vec<u8>,
+}
+
+impl CompressedCompilationUpdate {
+    pub fn encode(update: &CompilationUpdate) -> Result<Self, String> {
+        let mut encoder =
+            zstd::stream::write::Encoder::new(Vec::new(), 1).map_err(|error| error.to_string())?;
+        bincode::serialize_into(&mut encoder, update).map_err(|error| error.to_string())?;
+        let bytes = encoder.finish().map_err(|error| error.to_string())?;
+        Ok(Self { bytes })
+    }
+
+    pub fn decode(self) -> Result<CompilationUpdate, String> {
+        let decoder = zstd::stream::read::Decoder::new(self.bytes.as_slice())
+            .map_err(|error| error.to_string())?;
+        bincode::deserialize_from(decoder).map_err(|error| error.to_string())
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 impl CompilationUpdate {
     pub fn new(snapshot: CompilationSnapshot, previous: Option<&CompilationSnapshot>) -> Self {
         let mut update = Self {
@@ -223,7 +253,7 @@ pub trait LangServer {
 pub trait Gui {
     async fn compilation_started(activity_id: u64);
     async fn compilation_finished(activity_id: u64);
-    async fn update_cell(update: CompilationUpdate) -> bool;
+    async fn update_cell(update: CompressedCompilationUpdate) -> bool;
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
@@ -1077,7 +1107,7 @@ impl LangServer for State {
 mod tests {
     #[test]
     fn compilation_delta_preserves_identity_order_and_removes_old_cells() {
-        use super::{CompilationSnapshot, CompilationUpdate};
+        use super::{CompilationSnapshot, CompilationUpdate, CompressedCompilationUpdate};
         use std::sync::Arc;
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("lib.ar");
@@ -1099,7 +1129,11 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             output: compiler.compile_cell(&config, &["top".into()], vec![]),
         };
         let roundtrip = |update: CompilationUpdate| -> CompilationUpdate {
-            bincode::deserialize(&bincode::serialize(&update).unwrap()).unwrap()
+            let raw_len = bincode::serialized_size(&update).unwrap();
+            let compressed = CompressedCompilationUpdate::encode(&update).unwrap();
+            assert!(compressed.encoded_len() > 0);
+            assert!((compressed.encoded_len() as u64) < raw_len);
+            compressed.decode().unwrap()
         };
         let received_base = roundtrip(CompilationUpdate::new(base.clone(), None))
             .materialize(None)

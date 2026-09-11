@@ -1,0 +1,225 @@
+// Native replica-column devices. This follows SRAM22's capacitance-emulation
+// structure: three single-finger MOS devices share one vertical bitline.
+
+use lib::params::ReplicaColumnParams;
+use lib::params::ReplicaRoutingParams;
+
+fn mos_raw_right(width: Int) -> Float { width as Float + 130. }
+fn mos_raw_bot(pmos: Bool) -> Float { if pmos { -180. } else { -125. } }
+fn mos_raw_top(pmos: Bool) -> Float { if pmos { 860. } else { 805. } }
+
+fn mos_raw_bbox(pmos: Bool, width: Int) -> Rect {
+    lib::columns::util::cbox(-540., mos_raw_bot(pmos), mos_raw_right(width), mos_raw_top(pmos))
+}
+
+fn mos_xf(r: Rect, clockwise: Bool, dx: Float, dy: Float) -> Rect {
+    if clockwise {
+        lib::columns::mux::xf_q1(r, dx, dy)
+    } else {
+        lib::columns::mux::xf_q3(r, dx, dy)
+    }
+}
+
+fn draw_mos_xf(layer: Any, r: Rect, clockwise: Bool, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::draw_box(layer, mos_xf(r, clockwise, dx, dy))
+}
+
+fn mos_contact_count(width: Int) -> Int {
+    lib::columns::util::contact_n_dir(width as Float, width as Float, width as Float, 60., 80., 170., 170.)
+}
+
+fn mos_sd_raw(width: Int, row: Int) -> Rect {
+    let count = mos_contact_count(width);
+    let array_width = 170. * count as Float + 170. * (count - 1) as Float;
+    let x0 = lib::columns::util::snap5(width as Float / 2. - array_width / 2.);
+    let y0 = row as Float * 430.;
+    lib::columns::util::cbox(x0 - 80., y0 + 40., x0 + array_width + 80., y0 + 210.)
+}
+
+fn mos_gate_raw() -> Rect {
+    lib::columns::util::cbox(-520., 255., -190., 425.)
+}
+
+fn draw_single_mos(pmos: Bool, width: Int, clockwise: Bool, dx: Float, dy: Float, enabled: Bool) -> (Rect, Rect, Rect, Rect, Rect, Rect) {
+    let raw_bbox = mos_raw_bbox(pmos, width);
+    let bbox = mos_xf(raw_bbox, clockwise, dx, dy);
+    let gate = mos_xf(mos_gate_raw(), clockwise, dx, dy);
+    let sd0 = mos_xf(mos_sd_raw(width, 0), clockwise, dx, dy);
+    let sd1 = mos_xf(mos_sd_raw(width, 1), clockwise, dx, dy);
+    let well = mos_xf(lib::columns::util::cbox(-180., -180., width as Float + 180., 860.), clockwise, dx, dy);
+    let implant = mos_xf(lib::columns::util::cbox(-125., -125., width as Float + 125., 805.), clockwise, dx, dy);
+    if enabled {
+        if pmos {
+            draw_mos_xf("psdm.drawing", lib::columns::util::cbox(-125., -125., width as Float + 125., 805.), clockwise, dx, dy);
+            draw_mos_xf("nwell.drawing", lib::columns::util::cbox(-180., -180., width as Float + 180., 860.), clockwise, dx, dy);
+        } else {
+            draw_mos_xf("nsdm.drawing", lib::columns::util::cbox(-125., -125., width as Float + 125., 805.), clockwise, dx, dy);
+        };
+        draw_mos_xf("diff.drawing", lib::columns::util::cbox(0., 0., width as Float, 680.), clockwise, dx, dy);
+        draw_mos_xf("poly.drawing", lib::columns::util::cbox(-190., 265., width as Float + 130., 415.), clockwise, dx, dy);
+        draw_mos_xf("poly.drawing", lib::columns::util::cbox(-520., 205., -190., 475.), clockwise, dx, dy);
+        draw_mos_xf("licon1.drawing", lib::columns::util::cbox(-440., 255., -270., 425.), clockwise, dx, dy);
+        draw_mos_xf("li1.drawing", mos_gate_raw(), clockwise, dx, dy);
+        draw_mos_xf("li1.pin", mos_gate_raw(), clockwise, dx, dy);
+        draw_mos_xf("npc.drawing", lib::columns::util::cbox(-540., 155., -170., 525.), clockwise, dx, dy);
+        let count = mos_contact_count(width);
+        let array_width = 170. * count as Float + 170. * (count - 1) as Float;
+        let contact_x = lib::columns::util::snap5(width as Float / 2. - array_width / 2.);
+        for row in std::range(2) {
+            for contact in std::range(count) {
+                let cut = lib::columns::util::cbox(contact_x + contact as Float * 340., row as Float * 430. + 40., contact_x + contact as Float * 340. + 170., row as Float * 430. + 210.);
+                draw_mos_xf("licon1.drawing", cut, clockwise, dx, dy);
+            }
+            let diffusion = lib::columns::util::cbox(contact_x - 60., row as Float * 430., contact_x + array_width + 60., row as Float * 430. + 250.);
+            draw_mos_xf("diff.drawing", diffusion, clockwise, dx, dy);
+            draw_mos_xf("li1.drawing", mos_sd_raw(width, row), clockwise, dx, dy);
+            draw_mos_xf("li1.pin", mos_sd_raw(width, row), clockwise, dx, dy);
+        }
+    } else {
+        crect(x0=0., y0=0., x1=0., y1=0.);
+    };
+    (bbox, gate, sd0, sd1, well, implant,)
+}
+
+fn draw_positive_vertical_jog(src: Rect, dst: Rect) -> Rect {
+    let line = lib::columns::util::rect_w(src);
+    let jog_top = src.y1 + 170. + line;
+    let horizontal = lib::columns::util::cbox(src.x0, jog_top - line, dst.x1, jog_top);
+    lib::columns::util::draw_box("li1.drawing", lib::columns::util::cbox(src.x0, src.y0, src.x1, jog_top));
+    lib::columns::util::draw_box("li1.drawing", horizontal);
+    lib::columns::util::draw_box("li1.drawing", lib::columns::util::cbox(dst.x0, horizontal.y0, dst.x1, dst.y1))
+}
+
+fn draw_mos_to_bitline(port: Rect, bitline: Rect) -> Rect {
+    let route = lib::columns::util::rect_with_hspan(port, lib::columns::util::span_union(lib::columns::util::rect_hspan(port), lib::columns::util::rect_hspan(bitline)));
+    lib::columns::util::draw_box("li1.drawing", route);
+    lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", route, bitline, 0, 0, true).2
+}
+
+fn draw_mos_power(port: Rect, power: Rect, enabled: Bool) -> Rect {
+    if enabled {
+        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", port, power, 0, 0, true);
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", port, power, 0, 0, true).2
+    } else {
+        crect(x0=0., y0=0., x1=0., y1=0.)
+    }
+}
+
+fn clamped_power_span(port: Rect) -> (Float, Float) {
+    let height = lib::columns::util::fmin(lib::columns::util::fmax(lib::columns::util::rect_h(port), 320.), 3600.);
+    lib::columns::util::center_span_gridded(lib::columns::util::rect_cy_i(port), height)
+}
+
+fn column_mos_top(gate_width: Int, drain_n_width: Int, drain_p_width: Int) -> Float {
+    let drain_n_y = gate_width as Float + drain_n_width as Float + 470.;
+    let drain_p_y = drain_n_y + drain_p_width as Float + 930.;
+    drain_p_y + 540.
+}
+
+fn column_mos_center_y(gate_width: Int, drain_n_width: Int, drain_p_width: Int) -> Float {
+    (column_mos_top(gate_width, drain_n_width, drain_p_width) - 540.) / 2.
+}
+
+cell column_mos(gate_width: Int, drain_n_width: Int, drain_p_width: Int, include_gate: Bool, include_drain_n: Bool, include_drain_p: Bool) {
+    let gate_dx = 940.;
+    let drain_dx = 260.;
+    let drain_n_y = gate_width as Float + drain_n_width as Float + 470.;
+    let drain_p_y = drain_n_y + drain_p_width as Float + 930.;
+    let gate = draw_single_mos(false, gate_width, true, gate_dx, 0., include_gate);
+    let drain_n = draw_single_mos(false, drain_n_width, false, drain_dx, drain_n_y, include_drain_n);
+    let drain_p = draw_single_mos(true, drain_p_width, false, drain_dx, drain_p_y, include_drain_p);
+
+    if include_gate {
+        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_union(gate.2, gate.3));
+    } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    if include_drain_n { draw_positive_vertical_jog(drain_n.2, drain_n.1); } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    if include_drain_p { draw_positive_vertical_jog(drain_p.2, drain_p.1); } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+
+    let nsdm_top = drain_n_y + 125.;
+    if lib::columns::util::bor(include_gate, include_drain_n) {
+        lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::cbox(0., -125., 1200., nsdm_top));
+    } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    if include_drain_p {
+        lib::columns::util::draw_box("psdm.drawing", lib::columns::util::cbox(0., drain_p_y - drain_p_width as Float - 125., 1200., drain_p_y + 125.));
+    } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(0., drain_p_y - drain_p_width as Float - 180., 1200., drain_p_y + 180.));
+
+    let bitline = lib::columns::util::met1_port(900., -540., 1040., drain_p_y + 540.);
+    if include_gate { draw_mos_to_bitline(gate.1, bitline); } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    if include_drain_n { draw_mos_to_bitline(drain_n.3, bitline); } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    if include_drain_p { draw_mos_to_bitline(drain_p.3, bitline); } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+
+    let vss0 = lib::columns::util::rect_from_spans((0., 1200.,), clamped_power_span(gate.3));
+    let vss1 = lib::columns::util::rect_from_spans((0., 1200.,), clamped_power_span(drain_n.2));
+    let vdd = lib::columns::util::rect_from_spans((0., 1200.,), clamped_power_span(drain_p.2));
+    lib::columns::util::draw_box("met2.drawing", vss0);
+    lib::columns::util::draw_box("met2.pin", vss0);
+    lib::columns::util::draw_box("met2.drawing", vss1);
+    lib::columns::util::draw_box("met2.pin", vss1);
+    lib::columns::util::draw_box("met2.drawing", vdd);
+    lib::columns::util::draw_box("met2.pin", vdd);
+    draw_mos_power(gate.3, vss0, include_gate);
+    draw_mos_power(drain_n.2, vss1, include_drain_n);
+    draw_mos_power(drain_p.2, vdd, include_drain_p);
+    let bl = bitline;
+}
+
+fn draw_replica_tap_contact(region: Rect, power: Rect) -> Rect {
+    let area = lib::columns::util::cbox(region.x0 + 300., region.y0 + 300., region.x1 - 300., region.y1 - 300.);
+    let tap_li = lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", area, area, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", tap_li.1, power, 0, 0, false);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", tap_li.1, power, 0, 0, false).2
+}
+
+cell column_mos_tap(gate_width: Int, drain_n_width: Int, drain_p_width: Int) {
+    let drain_n_y = gate_width as Float + drain_n_width as Float + 470.;
+    let drain_p_y = drain_n_y + drain_p_width as Float + 930.;
+    let n_region = lib::columns::util::cbox(0., -125., 1300., drain_n_y + 125.);
+    let p_region = lib::columns::util::cbox(0., drain_p_y - drain_p_width as Float - 125., 1300., drain_p_y + 125.);
+    lib::columns::util::draw_box("psdm.drawing", n_region);
+    lib::columns::util::draw_box("nsdm.drawing", p_region);
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(0., drain_p_y - drain_p_width as Float - 180., 1300., drain_p_y + 180.));
+    let vss0 = lib::columns::util::rect_from_spans((0., 1300.,), clamped_power_span(mos_xf(mos_sd_raw(gate_width, 1), true, 940., 0.)));
+    let vss1 = lib::columns::util::rect_from_spans((0., 1300.,), clamped_power_span(mos_xf(mos_sd_raw(drain_n_width, 0), false, 260., drain_n_y)));
+    let vdd = lib::columns::util::rect_from_spans((0., 1300.,), clamped_power_span(mos_xf(mos_sd_raw(drain_p_width, 0), false, 260., drain_p_y)));
+    lib::columns::util::met2_port(vss0.x0, vss0.y0, vss0.x1, vss0.y1);
+    lib::columns::util::met2_port(vss1.x0, vss1.y0, vss1.x1, vss1.y1);
+    lib::columns::util::met2_port(vdd.x0, vdd.y0, vdd.x1, vdd.y1);
+    draw_replica_tap_contact(n_region, vss0);
+    draw_replica_tap_contact(n_region, vss1);
+    draw_replica_tap_contact(p_region, vdd);
+    lib::columns::util::draw_box("layout_boundary.boundary", lib::columns::util::cbox(0., -540., 1300., drain_p_y + 540.));
+}
+
+cell replica_column_mos(p: ReplicaColumnParams) {
+    let offset_y = -column_mos_center_y(p.gate_width, p.drain_n_width, p.drain_p_width);
+    let first_tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=0., y=offset_y);
+    for unit in std::range(p.units) {
+        let x = 1300. + unit as Float * 1200. + (unit / 8) as Float * 1300.;
+        let body = inst(column_mos(p.gate_width, p.drain_n_width, p.drain_p_width, unit * p.gate_width < p.gate_target, unit * p.drain_n_width < p.drain_n_target, unit * p.drain_p_width < p.drain_p_target), x=x, y=offset_y);
+        if unit % 8 == 7 {
+            let tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=x + 1200., y=offset_y);
+        } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    }
+    if p.units % 8 != 0 {
+        let final_tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=1300. + p.units as Float * 1200. + (p.units / 8) as Float * 1300., y=offset_y);
+    } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+}
+
+// Metal-only load used to make the replica bitline see the same first-order
+// interconnect capacitance as a main bitline. The sparse 680 nm track pitch is
+// intentional: it is the same routing pitch used by SRAM22's column tracks.
+cell replica_metal_routing(p: ReplicaRoutingParams) {
+    let m0 = lib::columns::util::cbox(0., 0., p.m0_width as Float, p.m0_height as Float);
+    lib::columns::util::draw_box("li1.drawing", m0);
+    for track in std::range(p.tracks) {
+        let width = if track == p.tracks - 1 { 320 + p.m1_width % 320 } else { 320 };
+        let x0 = 680. * track as Float;
+        let m1 = lib::columns::util::cbox(x0, 0., x0 + width as Float, p.m1_height as Float);
+        lib::columns::util::draw_box("met1.drawing", m1);
+        lib::columns::util::draw_box("met1.pin", m1);
+        if lib::columns::util::band(m0.x1 > m1.x0, m1.x1 > m0.x0) {
+            lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", m0, m1, 0, 0, true);
+        } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    }
+}

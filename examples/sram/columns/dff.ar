@@ -1,0 +1,80 @@
+cell dff_column_placed() {
+    let w = lib::columns::util::column_w(4) + 1300.;
+    let dff_x = 0.;
+    let outline = rect("layout_boundary.boundary", x0=-650., y0=0., x1=w - 650., y1=16840.);
+    let dfrbp = inst(lib::columns::dff_macro::sky130_fd_sc_hs__dfrbp_2(), x=dff_x + 4065., y=1460., angle=90);
+
+    rect("nwell.drawing", x0=dff_x - 650., y0=1270., x1=dff_x + 545., y1=15570.);
+    rect("nsdm.drawing", x0=dff_x - 340., y0=1625., x1=dff_x + 430., y1=15215.);
+    rect("psdm.drawing", x0=dff_x + 4370., y0=1625., x1=dff_x + 5140., y1=15215.);
+    rect("tap.drawing", x0=dff_x - 210., y0=1755., x1=dff_x + 300., y1=15085.);
+    rect("tap.drawing", x0=dff_x + 4500., y0=1755., x1=dff_x + 5010., y1=15085.);
+    rect("li1.drawing", x0=dff_x - 210., y0=1795., x1=dff_x + 735., y1=15045.);
+    rect("li1.drawing", x0=dff_x + 4065., y0=1795., x1=dff_x + 5010., y1=15045.);
+    for i in std::range(39) {
+        let y = 1875. + i as Float * 340.;
+        rect("licon1.drawing", x0=dff_x - 210., y0=y, x1=dff_x - 40., y1=y + 170.);
+        rect("licon1.drawing", x0=dff_x + 130., y0=y, x1=dff_x + 300., y1=y + 170.);
+        rect("licon1.drawing", x0=dff_x + 4500., y0=y, x1=dff_x + 4670., y1=y + 170.);
+        rect("licon1.drawing", x0=dff_x + 4840., y0=y, x1=dff_x + 5010., y1=y + 170.);
+    }
+
+    let vdd_m1 = lib::columns::util::met1_port(dff_x + 490., 1460., dff_x + 980., 15380.);
+    let vdd = lib::columns::util::met2_port(dff_x - 650., 5650., dff_x + 5450., 7450.);
+    for i in std::range(5) {
+        let y = 5835. + i as Float * 320.;
+        rect("via.drawing", x0=dff_x + 660., y0=y, x1=dff_x + 810., y1=y + 150.);
+    }
+
+    let vss_m1 = lib::columns::util::met1_port(dff_x + 3820., 1460., dff_x + 4310., 15380.);
+    let vss = lib::columns::util::met2_port(dff_x - 650., 9390., dff_x + 5450., 11190.);
+    for i in std::range(5) {
+        let y = 9575. + i as Float * 320.;
+        rect("via.drawing", x0=dff_x + 3990., y0=y, x1=dff_x + 4140., y1=y + 150.);
+    }
+
+    rect("mcon.drawing", x0=dff_x + 2665., y0=8250., x1=dff_x + 2835., y1=8420.);
+    rect("met1.drawing", x0=dff_x + 2635., y0=8190., x1=dff_x + 2865., y1=8480.);
+    let clk = lib::columns::util::met2_port(dff_x - 650., 8175., dff_x + 5450., 8495.);
+    rect("via.drawing", x0=dff_x + 2675., y0=8260., x1=dff_x + 2825., y1=8410.);
+
+    rect("met1.drawing", x0=dff_x + 2270., y0=3940., x1=dff_x + 2530., y1=4260.);
+    let rstb = lib::columns::util::met2_port(dff_x - 650., 3940., dff_x + 5450., 4260.);
+    rect("via.drawing", x0=dff_x + 2325., y0=4025., x1=dff_x + 2475., y1=4175.);
+
+    let d = lib::columns::util::li1_port(dff_x + 2495., 1585., dff_x + 3255., 1975.);
+    let q = lib::columns::util::li1_port(dff_x + 1085., 14595., dff_x + 3735., 14765.);
+    let q_b = lib::columns::util::li1_port(dff_x + 1165., 12355., dff_x + 2745., 12525.);
+}
+
+cell dff_column(mux: Int) {
+    let placed = inst(dff_column_placed(), x=-4065., y=-1460.);
+    let outline = rect("layout_boundary.boundary", x0=placed.outline.x0, y0=placed.outline.y0, x1=placed.outline.x1, y1=placed.outline.y1);
+    let vdd = placed.vdd;
+    let vss = placed.vss;
+    let vdd_m1 = placed.vdd_m1;
+    let vss_m1 = placed.vss_m1;
+    let clk = placed.clk;
+    let rstb = placed.rstb;
+    let d = placed.d;
+    let q = placed.q;
+    let q_b = placed.q_b;
+}
+
+
+cell tapped_dff() {
+    let base = inst(dff_column(4), x=0., y=0.);
+    let outline = rect("layout_boundary.boundary", x0=0., y0=1270., x1=4800. + 1300., y1=15570.);
+}
+
+cell dff_column_cent() {
+    let vdd0 = lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., 4190., 1300., 5990.));
+    lib::columns::util::draw_box("met2.pin", lib::columns::util::cbox(0., 4190., 1300., 5990.));
+    let vss0 = lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., 7930., 1300., 9730.));
+    lib::columns::util::draw_box("met2.pin", lib::columns::util::cbox(0., 7930., 1300., 9730.));
+    let clk = lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., 6715., 1300., 7035.));
+    lib::columns::util::draw_box("met2.pin", lib::columns::util::cbox(0., 6715., 1300., 7035.));
+    let rstb = lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(0., 2480., 1300., 2800.));
+    lib::columns::util::draw_box("met2.pin", lib::columns::util::cbox(0., 2480., 1300., 2800.));
+    let outline = rect("layout_boundary.boundary", x0=0., y0=-1460., x1=1300., y1=15380.);
+}

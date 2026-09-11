@@ -521,7 +521,7 @@ mod tests {
         // The generated entry cell is an implementation detail and must not
         // reach the output, and the target keeps its own root scope name.
         assert_eq!(output.cells.len(), 1, "entry cell should not be emitted");
-        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.scope_name(top.root), "cell top");
         top.objects
             .values()
             .find_map(|object| object.get_rect())
@@ -542,6 +542,19 @@ mod tests {
         assert_eq!(rect.x0.0, -5.);
         assert_eq!(rect.y0.0, -2.);
         assert_eq!(rect.y1.0, 18.);
+    }
+
+    #[test]
+    fn float_to_int_cast_does_not_snap_to_the_layout_grid() {
+        let source = temp_source(
+            "float-to-int-exact",
+            "cell top() {\n\
+             let n = 7.9 as Int;\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=n as Float, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("float-to-int-exact", source, "top()");
+        assert_eq!(rect.x1.0, 7.);
     }
 
     #[test]
@@ -697,7 +710,7 @@ mod tests {
             panic!("GDS import should compile successfully");
         };
         let top = &output.cells[&output.top];
-        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.scope_name(top.root), "cell top");
         assert_eq!(top.objects.len(), 2);
         let imported = top
             .objects

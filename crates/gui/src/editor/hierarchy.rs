@@ -16,9 +16,10 @@ use super::{
 #[derive(Debug)]
 struct PreparedScope {
     name: String,
-    bbox: Option<Rect<f64>>,
-    children: Vec<ScopeAddress>,
-    layers: indexmap::IndexSet<String>,
+    bbox: Option<Arc<Rect<f64>>>,
+    // Most generated execution scopes have zero or one child. Keep those
+    // inline instead of performing a heap allocation per scope.
+    children: smallvec::SmallVec<[ScopeAddress; 2]>,
 }
 
 #[derive(Debug, Default)]
@@ -48,18 +49,52 @@ impl PreparedHierarchy {
             .zip(previous.scopes.get(&address))
             .is_some_and(|(new, old)| Arc::ptr_eq(new, old))
     }
+
+    /// Resolve a selection from the preceding snapshot by its displayed name
+    /// path. Addresses include a content-derived cell ID and can therefore
+    /// change after an otherwise non-structural source edit.
+    pub(super) fn remap_path(
+        &self,
+        root: ScopeAddress,
+        old_state: &imbl::HashMap<ScopePath, ScopeState>,
+        old_selected: ScopeAddress,
+    ) -> Option<ScopeAddress> {
+        let mut names = Vec::new();
+        let mut current = Some(old_selected);
+        while let Some(address) = current {
+            let scope = old_state.get(&address)?;
+            names.push(scope.name.as_str());
+            current = scope.parent;
+        }
+        let mut names = names.into_iter().rev();
+        if self.scopes.get(&root)?.name != names.next()? {
+            return None;
+        }
+        let mut address = root;
+        for name in names {
+            address = self.scopes[&address]
+                .children
+                .iter()
+                .rev()
+                .copied()
+                .find(|child| self.scopes[child].name == name)?;
+        }
+        Some(address)
+    }
 }
 
 fn prepare_geometry(
     output: &CompiledData,
     address: ScopeAddress,
     scopes: &mut HashMap<ScopeAddress, Arc<PreparedScope>>,
+    layers: &mut indexmap::IndexSet<String>,
     previous: Option<&CompileOutputState>,
 ) {
     if scopes.contains_key(&address) {
         return;
     }
     let cell = &output.cells[&address.cell];
+    let source_scope = &cell.scopes[&address.scope];
     if let Some(old) = previous
         && let Some(cached) = old.hierarchy.scopes.get(&address).filter(|_| {
             old.output
@@ -69,9 +104,48 @@ fn prepare_geometry(
         })
     {
         // An immutable parent's bounds can still change if a referenced
-        // child changed. Validate dependencies before reusing its bounds.
-        for child in &cached.children {
-            prepare_geometry(output, *child, scopes, previous);
+        // child changed. Walk dependencies in emit order both to validate them
+        // and to preserve the renderer's first-use layer ordering.
+        for (object, _) in &source_scope.emit {
+            match &cell.objects[object] {
+                SolvedValue::Rect(rect) => {
+                    if let Some(layer) = &rect.layer {
+                        layers.insert(layer.clone());
+                    }
+                }
+                SolvedValue::Polygon(polygon) => {
+                    layers.insert(polygon.layer.clone());
+                }
+                SolvedValue::Path(path) => {
+                    layers.insert(path.layer.clone());
+                }
+                SolvedValue::Text(text) => {
+                    layers.insert(text.layer.clone());
+                }
+                SolvedValue::Instance(instance) => prepare_geometry(
+                    output,
+                    ScopeAddress {
+                        cell: instance.cell,
+                        scope: output.cells[&instance.cell].root,
+                    },
+                    scopes,
+                    layers,
+                    previous,
+                ),
+                SolvedValue::Dimension(_) => {}
+            }
+        }
+        for child in &source_scope.children {
+            prepare_geometry(
+                output,
+                ScopeAddress {
+                    cell: address.cell,
+                    scope: *child,
+                },
+                scopes,
+                layers,
+                previous,
+            );
         }
         if cached.children.iter().all(|child| {
             old.hierarchy
@@ -83,42 +157,40 @@ fn prepare_geometry(
             return;
         }
     }
-    let scope = &cell.scopes[&address.scope];
+    let scope = source_scope;
     let mut bbox = None;
-    let mut children = Vec::new();
-    let mut layers = indexmap::IndexSet::new();
+    let mut children = smallvec::SmallVec::new();
     for (object, _) in &scope.emit {
         match &cell.objects[object] {
             SolvedValue::Rect(rect) => {
-                bbox = bbox_union(bbox, Some(rect.to_float()));
+                bbox = shared_bbox_union(bbox, Some(Arc::new(rect.to_float())));
                 if let Some(layer) = &rect.layer {
                     layers.insert(layer.clone());
                 }
             }
             SolvedValue::Polygon(polygon) => {
-                bbox = bbox_union(bbox, polygon.bbox());
+                bbox = shared_bbox_union(bbox, polygon.bbox().map(Arc::new));
                 layers.insert(polygon.layer.clone());
             }
             SolvedValue::Path(path) => {
-                bbox = bbox_union(bbox, path.bbox());
+                bbox = shared_bbox_union(bbox, path.bbox().map(Arc::new));
                 layers.insert(path.layer.clone());
             }
             SolvedValue::Text(text) => {
-                bbox = bbox_text_union(bbox, text);
+                bbox = shared_bbox_union(bbox, bbox_text_union(None, text).map(Arc::new));
                 layers.insert(text.layer.clone());
             }
             SolvedValue::Dimension(dimension) => {
-                bbox = bbox_dim_union(bbox, dimension);
+                bbox = shared_bbox_union(bbox, bbox_dim_union(None, dimension).map(Arc::new));
             }
             SolvedValue::Instance(instance) => {
                 let child = ScopeAddress {
                     cell: instance.cell,
                     scope: output.cells[&instance.cell].root,
                 };
-                prepare_geometry(output, child, scopes, previous);
+                prepare_geometry(output, child, scopes, layers, previous);
                 children.push(child);
-                layers.extend(scopes[&child].layers.iter().cloned());
-                bbox = bbox_union(
+                bbox = shared_bbox_union(
                     bbox,
                     scopes[&child].bbox.as_ref().map(|rect| {
                         let mut matrix = TransformationMatrix::identity();
@@ -128,7 +200,7 @@ fn prepare_geometry(
                         matrix = matrix.rotate(instance.angle);
                         let p0 = ifmatvec(matrix, (rect.x0, rect.y0));
                         let p1 = ifmatvec(matrix, (rect.x1, rect.y1));
-                        Rect {
+                        Arc::new(Rect {
                             layer: None,
                             x0: p0.0.min(p1.0) + instance.x,
                             y0: p0.1.min(p1.1) + instance.y,
@@ -137,7 +209,7 @@ fn prepare_geometry(
                             id: instance.id,
                             construction: true,
                             span: rect.span.clone(),
-                        }
+                        })
                     }),
                 );
             }
@@ -148,58 +220,78 @@ fn prepare_geometry(
             cell: address.cell,
             scope: *child,
         };
-        prepare_geometry(output, child, scopes, previous);
+        prepare_geometry(output, child, scopes, layers, previous);
         children.push(child);
-        layers.extend(scopes[&child].layers.iter().cloned());
-        bbox = bbox_union(bbox, scopes[&child].bbox.clone());
+        bbox = shared_bbox_union(bbox, scopes[&child].bbox.clone());
     }
     scopes.insert(
         address,
         Arc::new(PreparedScope {
-            name: scope.name.clone(),
+            name: cell.scope_name(address.scope).to_owned(),
             bbox,
             children,
-            layers,
         }),
     );
+}
+
+fn shared_bbox_union(
+    left: Option<Arc<Rect<f64>>>,
+    right: Option<Arc<Rect<f64>>>,
+) -> Option<Arc<Rect<f64>>> {
+    match (left, right) {
+        (None, right) => right,
+        (left, None) => left,
+        (Some(left), Some(right)) => Some(Arc::new(
+            bbox_union(Some((*left).clone()), Some((*right).clone())).unwrap(),
+        )),
+    }
 }
 
 fn prepare_paths(
     address: ScopeAddress,
     parent: Option<ScopeAddress>,
-    parent_path: &ScopePath,
+    path: &mut Vec<String>,
+    hidden_paths: &HashSet<Vec<String>>,
     scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
-    visited: &mut HashSet<(ScopeAddress, ScopePath)>,
     state: &mut ProcessScopeState,
-    old: Option<&imbl::HashMap<ScopePath, ScopeState>>,
 ) {
     let scope = &scopes[&address];
-    let mut path = parent_path.clone();
-    path.push(scope.name.clone());
-    if !visited.insert((address, path.clone())) {
+    if state.state.contains_key(&address) {
         return;
     }
-    // Reverse siblings preserve the expanded walk's last-writer semantics,
-    // including colliding names and multiple paths to a shared scope.
-    state
-        .scope_paths
-        .entry(address)
-        .or_insert_with(|| path.clone());
-    state
-        .state
-        .entry(path.clone())
-        .or_insert_with(|| ScopeState {
+    path.push(scope.name.clone());
+    state.state.insert(
+        address,
+        ScopeState {
             name: scope.name.clone(),
             address,
             parent,
-            visible: old
-                .and_then(|old| old.get(&path))
-                .is_none_or(|scope| scope.visible),
+            visible: !hidden_paths.contains(path),
             bbox: scope.bbox.clone(),
-        });
+        },
+    );
     for child in scope.children.iter().rev() {
-        prepare_paths(*child, Some(address), &path, scopes, visited, state, old);
+        prepare_paths(*child, Some(address), path, hidden_paths, scopes, state);
     }
+    path.pop();
+}
+
+fn hidden_paths(old: Option<&imbl::HashMap<ScopePath, ScopeState>>) -> HashSet<Vec<String>> {
+    old.into_iter()
+        .flat_map(|state| {
+            state.values().filter(|scope| !scope.visible).map(|scope| {
+                let mut path = Vec::new();
+                let mut current = Some(scope.address);
+                while let Some(address) = current {
+                    let scope = &state[&address];
+                    path.push(scope.name.clone());
+                    current = scope.parent;
+                }
+                path.reverse();
+                path
+            })
+        })
+        .collect()
 }
 
 /// Geometry edits usually preserve the named hierarchy, even when source cells
@@ -246,13 +338,16 @@ fn reuse_paths(
         })
         .collect();
     state.state = old.state.as_ref().clone();
-    state.scope_paths = old.scope_paths.as_ref().clone();
-    for (path, scope) in old.state.iter() {
+    for (before, after) in &remap {
+        let scope = &old.state[before];
         let address = remap[&scope.address];
         let parent = scope.parent.map(|parent| remap[&parent]);
+        if before != after {
+            state.state.remove(before);
+        }
         if changed.contains(&scope.address) || address != scope.address || parent != scope.parent {
             state.state.insert(
-                path.clone(),
+                *after,
                 ScopeState {
                     address,
                     parent,
@@ -260,18 +355,6 @@ fn reuse_paths(
                     ..scope.clone()
                 },
             );
-        }
-    }
-    for (before, after) in &remap {
-        if before != after {
-            state.scope_paths.remove(before);
-        }
-    }
-    for (before, after) in &remap {
-        if before != after {
-            state
-                .scope_paths
-                .insert(*after, old.scope_paths[before].clone());
         }
     }
     true
@@ -285,19 +368,19 @@ pub(super) fn prepare(
     previous: Option<&CompileOutputState>,
 ) -> PreparedHierarchy {
     let mut scopes = HashMap::new();
-    prepare_geometry(output, root, &mut scopes, previous);
-    for layer in &scopes[&root].layers {
+    let mut used_layers = indexmap::IndexSet::new();
+    prepare_geometry(output, root, &mut scopes, &mut used_layers, previous);
+    for layer in &used_layers {
         mark_layer_used(state, layer);
     }
     if !previous.is_some_and(|previous| reuse_paths(root, &scopes, state, previous)) {
         prepare_paths(
             root,
             None,
-            &Vec::new(),
+            &mut Vec::new(),
+            &hidden_paths(old),
             &scopes,
-            &mut HashSet::new(),
             state,
-            old,
         );
     }
     PreparedHierarchy { scopes }
@@ -312,7 +395,6 @@ pub(super) mod tests {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     fn assert_equivalent(actual: &ProcessScopeState, expected: &ProcessScopeState) {
-        assert_eq!(actual.scope_paths, expected.scope_paths);
         assert_eq!(actual.state.len(), expected.state.len());
         for (path, expected) in &expected.state {
             let actual = &actual.state[path];
@@ -437,20 +519,18 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             let hierarchy = prepare(&output, root, &mut actual, old_state, previous.as_ref());
             let mut expected = ProcessScopeState::default();
             Reference::process_scope_reference(&output, root, &mut expected, None, old_state);
+            if previous.is_some() {
+                // The compact address changes when the top cell is rebuilt,
+                // while the original name path remains `top`.
+                expected.state.get_mut(&root).unwrap().visible = false;
+            }
             assert_equivalent(&actual, &expected);
             // A visibility override must survive every compatible path change.
-            let hidden = actual
-                .state
-                .keys()
-                .find(|path| path.len() == 2)
-                .cloned()
-                .unwrap();
-            actual.state.get_mut(&hidden).unwrap().visible = false;
+            actual.state.get_mut(&root).unwrap().visible = false;
             previous = Some(CompileOutputState {
-                selected_scope: actual.scope_paths[&root].clone(),
+                selected_scope: root,
                 output: Arc::new(output),
                 state: Arc::new(actual.state),
-                scope_paths: Arc::new(actual.scope_paths),
                 hierarchy: Arc::new(hierarchy),
             });
         }
@@ -465,14 +545,9 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             parent: Option<ScopeAddress>,
             old_scope_state: Option<&imbl::HashMap<ScopePath, ScopeState>>,
         ) {
-            let scope_info = &solved_cell.cells[&scope.cell].scopes[&scope.scope];
-            let mut scope_path = if let Some(parent) = &parent {
-                state.scope_paths[parent].clone()
-            } else {
-                vec![]
-            };
-            scope_path.push(scope_info.name.clone());
-            state.scope_paths.insert(scope, scope_path.clone());
+            let cell = &solved_cell.cells[&scope.cell];
+            let scope_info = &cell.scopes[&scope.scope];
+            let scope_name = cell.scope_name(scope.scope).to_owned();
             let mut bbox = None;
             for (obj, _) in &scope_info.emit {
                 let value = &solved_cell.cells[&scope.cell].objects[obj];
@@ -547,28 +622,25 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                         );
                         bbox = bbox_union(
                             bbox,
-                            state.state[&state.scope_paths[&inst_address]]
-                                .bbox
-                                .as_ref()
-                                .map(|rect| {
-                                    let mut inst_mat = TransformationMatrix::identity();
-                                    if inst.reflect {
-                                        inst_mat = inst_mat.reflect_vert()
-                                    }
-                                    inst_mat = inst_mat.rotate(inst.angle);
-                                    let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
-                                    let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
-                                    Rect {
-                                        layer: None,
-                                        x0: p0p.0.min(p1p.0) + inst.x,
-                                        y0: p0p.1.min(p1p.1) + inst.y,
-                                        x1: p0p.0.max(p1p.0) + inst.x,
-                                        y1: p0p.1.max(p1p.1) + inst.y,
-                                        id: inst.id,
-                                        construction: true,
-                                        span: rect.span.clone(),
-                                    }
-                                }),
+                            state.state[&inst_address].bbox.as_ref().map(|rect| {
+                                let mut inst_mat = TransformationMatrix::identity();
+                                if inst.reflect {
+                                    inst_mat = inst_mat.reflect_vert()
+                                }
+                                inst_mat = inst_mat.rotate(inst.angle);
+                                let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
+                                let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
+                                Rect {
+                                    layer: None,
+                                    x0: p0p.0.min(p1p.0) + inst.x,
+                                    y0: p0p.1.min(p1p.1) + inst.y,
+                                    x1: p0p.0.max(p1p.0) + inst.x,
+                                    y1: p0p.1.max(p1p.1) + inst.y,
+                                    id: inst.id,
+                                    construction: true,
+                                    span: rect.span.clone(),
+                                }
+                            }),
                         );
                     }
                     SolvedValue::Dimension(dim) => {
@@ -593,22 +665,19 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                     Some(scope),
                     old_scope_state,
                 );
-                bbox = bbox_union(
-                    bbox,
-                    state.state[&state.scope_paths[&scope_address]].bbox.clone(),
-                );
+                bbox = bbox_union(bbox, state.state[&scope_address].bbox.as_deref().cloned());
             }
 
             let visible = old_scope_state
-                .and_then(|state| state.get(&scope_path).map(|scope| scope.visible))
+                .and_then(|state| state.get(&scope).map(|scope| scope.visible))
                 .unwrap_or(true);
             state.state.insert(
-                scope_path,
+                scope,
                 ScopeState {
-                    name: scope_info.name.clone(),
+                    name: scope_name,
                     address: scope,
                     visible,
-                    bbox,
+                    bbox: bbox.map(Arc::new),
                     parent,
                 },
             );

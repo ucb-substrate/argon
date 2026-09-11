@@ -1,4 +1,7 @@
-use std::ops::{Deref, DerefMut, Mul};
+use std::{
+    hash::BuildHasher,
+    ops::{Deref, DerefMut, Mul},
+};
 
 use argonc::solver::{LinearExpr, Var};
 use indexmap::{IndexMap, IndexSet};
@@ -99,10 +102,10 @@ pub(crate) fn edge_drag_distance(pixel_delta: (f32, f32), normal: (f32, f32), sc
 /// requested distances simultaneously. With one target this implements the
 /// edge-drag form of Algorithm 3; multiple targets support corner handles and
 /// whole-rectangle translation.
-pub(crate) fn drag_delta_multi(
+pub(crate) fn drag_delta_multi<S: BuildHasher>(
     edges: &[SparseVec],
     rowspace: &[SparseVec],
-    unsolved: &IndexSet<Var>,
+    unsolved: &IndexSet<Var, S>,
     deltas: &[f64],
 ) -> Option<SparseVec> {
     if edges.is_empty() || edges.len() != deltas.len() {
@@ -281,10 +284,10 @@ mod tests {
         SparseVec::from(&LinearExpr::from(var))
     }
 
-    fn drag_one(
+    fn drag_one<S: BuildHasher>(
         edge: &SparseVec,
         rowspace: &[SparseVec],
-        unsolved: &IndexSet<Var>,
+        unsolved: &IndexSet<Var, S>,
         delta: f64,
     ) -> Option<SparseVec> {
         drag_delta_multi(std::slice::from_ref(edge), rowspace, unsolved, &[delta])

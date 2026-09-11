@@ -1,0 +1,1225 @@
+use lib::params::ColParams;
+
+// Placement and interconnect for the representative 64-word x 24-bit,
+// mux-4 SRAM.  Geometry is kept in the same untranslated coordinate system as
+// SRAM22's SramInner; the outer guard-ring cell performs the final translation.
+
+fn bitcell_x() -> Float { 0. }
+fn bitcell_y() -> Float { 0. }
+fn column_x() -> Float { 2500. }
+fn column_y() -> Float { -79240. }
+fn row_decoder_x() -> Float { -79160. }
+fn row_decoder_y() -> Float { 3635. }
+fn replica_cells_x() -> Float { -92590. }
+fn replica_cells_y() -> Float { -30295. }
+fn replica_precharge_x() -> Float { -92590. }
+fn replica_precharge_y() -> Float { -5740. }
+fn replica_mos_x() -> Float { -109390. }
+fn replica_mos_y() -> Float { -6455. }
+fn replica_routing_x() -> Float { -114390. }
+fn replica_routing_y() -> Float { -2365. }
+fn dff_x() -> Float { -68800. }
+fn dff_y() -> Float { -128215. }
+fn precharge_buffer_x() -> Float { -45740. }
+fn precharge_buffer_y() -> Float { -9240. }
+fn sense_buffer_x() -> Float { -45310. }
+fn sense_buffer_y() -> Float { -30590. }
+fn write_buffer_x() -> Float { -30910. }
+fn write_buffer_y() -> Float { -88890. }
+fn column_decoder_x() -> Float { -50070. }
+fn column_decoder_y() -> Float { -45700. }
+fn control_x() -> Float { -76085. }
+fn control_y() -> Float { -96255. }
+// GreedyRouter's area is edge-aligned; 320 nm tracks extend half a line width
+// beyond it and establish the final physical SRAM bbox.
+fn router_left() -> Float { -125800. }
+fn router_bottom() -> Float { -133960. }
+fn route_pitch() -> Float { 680. }
+fn route_width() -> Float { 320. }
+
+fn m1_track(index: Int) -> (Float, Float) {
+    let x0 = router_left() - route_width() / 2. + index as Float * route_pitch();
+    (x0, x0 + route_width(),)
+}
+
+fn m2_track(index: Int) -> (Float, Float) {
+    let y0 = router_bottom() - route_width() / 2. + index as Float * route_pitch();
+    (y0, y0 + route_width(),)
+}
+
+fn track_starts_after(pos: Float, start: Float) -> Int {
+    ((pos - start - 1.) / route_pitch()) as Int + 1
+}
+
+fn track_ends_before(pos: Float, start: Float) -> Int {
+    ((pos - route_width() - start) / route_pitch()) as Int
+}
+
+fn nearest_track_index(pos: Float, start: Float) -> Int {
+    let before = ((pos - start) / route_pitch()) as Int;
+    let remainder = pos - start - before as Float * route_pitch();
+    if remainder <= route_width() + (route_pitch() - route_width()) / 2. { before } else { before + 1 }
+}
+
+fn nearest_m1_track(x: Float) -> (Float, Float) {
+    let index = nearest_track_index(x, router_left() - route_width() / 2.);
+    m1_track(index)
+}
+
+
+// Equivalent to SRAM22 draw_route for an M1 -> M1 route with horizontal,
+// vertical, horizontal routing tracks. Routing vias use the default (not
+// longer-direction) MaxViaArray expansion policy.
+fn draw_route_hvh(start: Rect, end: Rect, m2_a: Int, m1: Int, m2_b: Int) -> Rect {
+    let y_a = m2_track(m2_a);
+    let x_mid = m1_track(m1);
+    let y_b = m2_track(m2_b);
+    let start_expanded = lib::columns::util::rect_with_vspan(start, lib::columns::util::span_union(lib::columns::util::rect_vspan(start), y_a));
+    let first = lib::columns::util::rect_from_spans(lib::columns::util::span_union(lib::columns::util::rect_hspan(start), x_mid), y_a);
+    let middle = lib::columns::util::rect_from_spans(x_mid, lib::columns::util::span_union(y_a, y_b));
+    let last = lib::columns::util::rect_from_spans(lib::columns::util::span_union(x_mid, lib::columns::util::rect_hspan(end)), y_b);
+    let end_expanded = lib::columns::util::rect_with_vspan(end, lib::columns::util::span_union(lib::columns::util::rect_vspan(end), y_b));
+    lib::columns::util::draw_box("met1.drawing", start_expanded);
+    lib::columns::util::draw_box("met2.drawing", first);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", start_expanded, first, 0, 0, false);
+    lib::columns::util::draw_box("met1.drawing", middle);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", middle, first, 0, 0, false);
+    lib::columns::util::draw_box("met2.drawing", last);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", middle, last, 0, 0, false);
+    lib::columns::util::draw_box("met1.drawing", end_expanded);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", end_expanded, last, 0, 0, false);
+    end_expanded
+}
+
+fn draw_route_h_m1(start: Rect, end: Rect, m2_index: Int) -> Rect {
+    let track = m2_track(m2_index);
+    let start_expanded = lib::columns::util::rect_with_vspan(start, lib::columns::util::span_union(lib::columns::util::rect_vspan(start), track));
+    let end_expanded = lib::columns::util::rect_with_vspan(end, lib::columns::util::span_union(lib::columns::util::rect_vspan(end), track));
+    let horizontal = lib::columns::util::rect_from_spans(lib::columns::util::span_union(lib::columns::util::rect_hspan(start), lib::columns::util::rect_hspan(end)), track);
+    lib::columns::util::draw_box("met1.drawing", start_expanded);
+    lib::columns::util::draw_box("met2.drawing", horizontal);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", start_expanded, horizontal, 0, 0, false);
+    lib::columns::util::draw_box("met1.drawing", end_expanded);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", end_expanded, horizontal, 0, 0, false);
+    end_expanded
+}
+
+fn draw_route_v_m2_to_m1(start: Rect, end: Rect, m1_index: Int, m2_end_index: Int) -> Rect {
+    let vertical_track = m1_track(m1_index);
+    let horizontal_track = m2_track(m2_end_index);
+    let start_expanded = lib::columns::util::rect_with_hspan(start, lib::columns::util::span_union(lib::columns::util::rect_hspan(start), vertical_track));
+    let vertical = lib::columns::util::rect_from_spans(vertical_track, lib::columns::util::span_union(lib::columns::util::rect_vspan(start), horizontal_track));
+    let end_expanded = lib::columns::util::rect_with_vspan(end, lib::columns::util::span_union(lib::columns::util::rect_vspan(end), horizontal_track));
+    lib::columns::util::draw_box("met2.drawing", start_expanded);
+    lib::columns::util::draw_box("met1.drawing", vertical);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", vertical, start_expanded, 0, 0, false);
+    lib::columns::util::draw_box("met1.drawing", end_expanded);
+    end_expanded
+}
+
+fn draw_route_vh_m1(start: Rect, end: Rect, m1_index: Int, m2_index: Int) -> Rect {
+    let x_track = m1_track(m1_index);
+    let y_track = m2_track(m2_index);
+    let start_expanded = lib::columns::util::rect_with_hspan(start, lib::columns::util::span_union(lib::columns::util::rect_hspan(start), x_track));
+    let vertical = lib::columns::util::rect_from_spans(x_track, lib::columns::util::span_union(lib::columns::util::rect_vspan(start), y_track));
+    let horizontal = lib::columns::util::rect_from_spans(lib::columns::util::span_union(x_track, lib::columns::util::rect_hspan(end)), y_track);
+    let end_expanded = lib::columns::util::rect_with_vspan(end, lib::columns::util::span_union(lib::columns::util::rect_vspan(end), y_track));
+    lib::columns::util::draw_box("met1.drawing", start_expanded);
+    lib::columns::util::draw_box("met1.drawing", vertical);
+    lib::columns::util::draw_box("met2.drawing", horizontal);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", vertical, horizontal, 0, 0, false);
+    lib::columns::util::draw_box("met1.drawing", end_expanded);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", end_expanded, horizontal, 0, 0, false);
+    end_expanded
+}
+
+// M2 -> M2 route with a single vertical M1 track.
+fn draw_route_v_m2(start: Rect, end: Rect, m1_index: Int) -> Rect {
+    let track = m1_track(m1_index);
+    let start_expanded = lib::columns::util::rect_with_hspan(start, lib::columns::util::span_union(lib::columns::util::rect_hspan(start), track));
+    let end_expanded = lib::columns::util::rect_with_hspan(end, lib::columns::util::span_union(lib::columns::util::rect_hspan(end), track));
+    let vertical = lib::columns::util::rect_from_spans(track, lib::columns::util::span_union(lib::columns::util::rect_vspan(start), lib::columns::util::rect_vspan(end)));
+    lib::columns::util::draw_box("met2.drawing", start_expanded);
+    lib::columns::util::draw_box("met1.drawing", vertical);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", vertical, start_expanded, 0, 0, false);
+    lib::columns::util::draw_box("met2.drawing", end_expanded);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", vertical, end_expanded, 0, 0, false);
+    end_expanded
+}
+
+// M1 -> M2 route: horizontal M2, vertical M1, then the destination M2.
+fn draw_route_hv_m1_to_m2(start: Rect, end: Rect, m2_index: Int, m1_index: Int) -> Rect {
+    let horizontal_track = m2_track(m2_index);
+    let vertical_track = m1_track(m1_index);
+    let start_expanded = lib::columns::util::rect_with_vspan(start, lib::columns::util::span_union(lib::columns::util::rect_vspan(start), horizontal_track));
+    let horizontal = lib::columns::util::rect_from_spans(lib::columns::util::span_union(lib::columns::util::rect_hspan(start), vertical_track), horizontal_track);
+    let vertical = lib::columns::util::rect_from_spans(vertical_track, lib::columns::util::span_union(horizontal_track, lib::columns::util::rect_vspan(end)));
+    let end_expanded = lib::columns::util::rect_with_hspan(end, lib::columns::util::span_union(lib::columns::util::rect_hspan(end), vertical_track));
+    lib::columns::util::draw_box("met1.drawing", start_expanded);
+    lib::columns::util::draw_box("met2.drawing", horizontal);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", start_expanded, horizontal, 0, 0, false);
+    lib::columns::util::draw_box("met1.drawing", vertical);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", vertical, horizontal, 0, 0, false);
+    lib::columns::util::draw_box("met2.drawing", end_expanded);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", vertical, end_expanded, 0, 0, false);
+    end_expanded
+}
+
+fn main_bitline_x(index: Int, right: Bool) -> Float {
+    let group = index / 4;
+    let bit = index % 4;
+    let group_x = group as Float * 6100.;
+    let bit_x = bit as Float * 1200.;
+    if right {
+        group_x + bit_x + if bit % 2 == 0 { 4515. } else { 4145. }
+    } else {
+        group_x + bit_x + if bit % 2 == 0 { 4150. } else { 4510. }
+    }
+}
+
+fn main_bitline_port(index: Int, right: Bool) -> Rect {
+    let x = main_bitline_x(index, right);
+    lib::columns::util::cbox(x, 1650., x + 140., 1780.)
+}
+
+fn column_bitline_port(index: Int, right: Bool) -> Rect {
+    let group = index / 4;
+    let bit = index % 4;
+    let group_x = group as Float * 6100.;
+    let bit_x = bit as Float * 1200.;
+    let x = column_x() + group_x + bit_x + if right {
+        if bit % 2 == 0 { 2015. } else { 1645. }
+    } else {
+        if bit % 2 == 0 { 1645. } else { 2015. }
+    };
+    lib::columns::util::cbox(x, column_y() + 75100., x + 140., column_y() + 75240.)
+}
+
+fn draw_main_bitlines() -> Rect {
+    for index in std::range(96) {
+        let bl = lib::columns::util::rect_union(column_bitline_port(index, false), main_bitline_port(index, false));
+        let br = lib::columns::util::rect_union(column_bitline_port(index, true), main_bitline_port(index, true));
+        lib::columns::util::draw_box("met1.drawing", bl);
+        lib::columns::util::draw_box("met1.drawing", br);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+// Wordlines are ordered top-to-bottom in groups of four around each horizontal
+// strap row.  The decoder output pitch includes one 1.58 um tap after every
+// four outputs.
+fn bitcell_wordline(index: Int) -> Rect {
+    let group = index / 4;
+    let row = index % 4;
+    let row_offset = if row == 0 { 0. } else { if row == 1 { -760. } else { if row == 2 { -3160. } else { -3920. } } };
+    let y = 33950. - group as Float * 7900. + row_offset;
+    lib::columns::util::cbox(0., y, 1300., y + 170.)
+}
+
+fn row_decoder_output(index: Int) -> Rect {
+    let local_x0 = -30895. + index as Float * 1580. + (index / 4) as Float * 1580.;
+    let local_x1 = local_x0 + 240.;
+    // R90 clockwise: (x, y) -> (y, -x), followed by placement translation.
+    lib::columns::util::cbox(
+        row_decoder_x() + 34675.,
+        row_decoder_y() - local_x1,
+        row_decoder_x() + 71740.,
+        row_decoder_y() - local_x0,
+    )
+}
+
+fn draw_wordlines() -> Rect {
+    for index in std::range(16) {
+        let decoder = row_decoder_output(index);
+        let via_area = lib::columns::util::cbox(decoder.x1 - 600., decoder.y0, decoder.x1 + 600., decoder.y1);
+        let via = lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", via_area, via_area, 0, 0, true);
+        let wordline = bitcell_wordline(index);
+        let vertical = lib::columns::util::rect_with_vspan(via.1, lib::columns::util::span_union(lib::columns::util::rect_vspan(via.1), lib::columns::util::rect_vspan(wordline)));
+        let horizontal = lib::columns::util::rect_with_hspan(wordline, lib::columns::util::span_union(lib::columns::util::rect_hspan(vertical), lib::columns::util::rect_hspan(wordline)));
+        lib::columns::util::draw_box("met2.drawing", vertical);
+        lib::columns::util::draw_box("met2.drawing", horizontal);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn replica_array_bitline(index: Int, right: Bool) -> Rect {
+    let x0 = if index == 0 {
+        if right { 1650. } else { 2010. }
+    } else {
+        if right { 3210. } else { 2850. }
+    };
+    lib::columns::util::cbox(
+        replica_cells_x() + x0,
+        replica_cells_y() + 3995.,
+        replica_cells_x() + x0 + 140.,
+        replica_cells_y() + 4175.,
+    )
+}
+
+fn replica_precharge_bitline(index: Int, right: Bool) -> Rect {
+    let x0 = if index == 0 {
+        if right { 1645. } else { 2015. }
+    } else {
+        if right { 3215. } else { 2845. }
+    };
+    // Replica precharge is reflected vertically at placement.
+    lib::columns::util::cbox(
+        replica_precharge_x() + x0,
+        replica_precharge_y() - 2465.,
+        replica_precharge_x() + x0 + 140.,
+        replica_precharge_y() - 2325.,
+    )
+}
+
+fn draw_replica_array_bitlines() -> Rect {
+    for index in std::range(2) {
+        let bl = lib::columns::util::rect_union(replica_array_bitline(index, false), replica_precharge_bitline(index, false));
+        let br = lib::columns::util::rect_union(replica_array_bitline(index, true), replica_precharge_bitline(index, true));
+        lib::columns::util::draw_box("met1.drawing", bl);
+        lib::columns::util::draw_box("met1.drawing", br);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn replica_precharge_rbl() -> Rect {
+    lib::columns::util::cbox(replica_precharge_x(), -3225., replica_precharge_x() + 5000., -2865.)
+}
+
+fn replica_routing_bitline(index: Int) -> Rect {
+    let x0 = if index < 5 { index as Float * 680. } else { 3400. };
+    let x1 = if index < 5 { x0 + 320. } else { 4000. };
+    lib::columns::util::cbox(
+        replica_routing_x() + x0,
+        replica_routing_y() - 6250.,
+        replica_routing_x() + x1,
+        replica_routing_y(),
+    )
+}
+
+fn replica_mos_bitline() -> Rect {
+    lib::columns::util::cbox(
+        replica_mos_x() + 2200.,
+        replica_mos_y() - 3090.,
+        replica_mos_x() + 2340.,
+        replica_mos_y() + 3090.,
+    )
+}
+
+fn draw_replica_load_route() -> Rect {
+    let rbl = replica_precharge_rbl();
+    let left = replica_routing_bitline(0);
+    let horizontal = lib::columns::util::rect_with_hspan(rbl, lib::columns::util::span_union(lib::columns::util::rect_hspan(left), lib::columns::util::rect_hspan(rbl)));
+    lib::columns::util::draw_box("met2.drawing", horizontal);
+    for index in std::range(6) {
+        let load = replica_routing_bitline(index);
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", load, horizontal, 0, 0, true);
+    }
+    let mos = replica_mos_bitline();
+    let mos_route = lib::columns::util::rect_with_vspan(mos, lib::columns::util::span_union(lib::columns::util::rect_vspan(mos), lib::columns::util::rect_vspan(horizontal)));
+    lib::columns::util::draw_box("met1.drawing", mos_route);
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", mos_route, horizontal, 0, 0, true);
+    horizontal
+}
+
+fn dff_input(index: Int) -> Rect {
+    let x0 = dff_x() + 3145. + index as Float * 6100.;
+    lib::columns::util::cbox(x0, dff_y() + 125., x0 + 760., dff_y() + 515.)
+}
+
+fn draw_dff_input_pins() -> Rect {
+    for index in std::range(8) {
+        let source = dff_input(index);
+        let track = nearest_m1_track(lib::columns::util::rect_cx(source));
+        let pin = lib::columns::util::rect_from_spans(track, (router_bottom(), source.y1,));
+        lib::columns::util::draw_box("met1.drawing", pin);
+        let via = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", source, source, 0, 0, true);
+        let landing = lib::columns::util::rect_with_hspan(via.1, lib::columns::util::span_union(lib::columns::util::rect_hspan(via.1), track));
+        lib::columns::util::draw_box("met1.drawing", landing);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn address_gate_output(index: Int) -> Rect {
+    let local_x0 = -6115. + index as Float * 1580. + (index / 4) as Float * 1000.;
+    // FlipYx swaps x/y before applying the instance translation.
+    lib::columns::util::cbox(-107355., 23255. + local_x0, -100115., 23255. + local_x0 + 170.)
+}
+
+fn row_decoder_predecode(row_bit: Int, complement: Int) -> Rect {
+    // Each of the decoder's two four-input leaves owns four local tracks.
+    let track = 2 * (row_bit % 2) + complement;
+    let local_top = -11890. - track as Float * 480.;
+    let local_left = if row_bit < 2 { -9480. } else { -25280. };
+    let local_right = if row_bit < 2 { 0. } else { -15800. };
+    // Row decoder is rotated 90 degrees clockwise.
+    lib::columns::util::cbox(
+        row_decoder_x() + local_top - 320.,
+        row_decoder_y() - local_right,
+        row_decoder_x() + local_top,
+        row_decoder_y() - local_left,
+    )
+}
+
+fn draw_address_predecode_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    let addr_gate_right = -99810.;
+    let first_vertical = track_starts_after(addr_gate_right + 700., m1_start);
+    let low_bus_first = track_starts_after(row_decoder_predecode(0, 0).y0, m2_start);
+    let high_bus_first = track_starts_after(row_decoder_predecode(2, 0).y0, m2_start);
+    for row_bit in std::range(4) {
+        for complement in std::range(2) {
+            let index = 2 * row_bit + complement;
+            let output = address_gate_output(index);
+            let expanded = lib::columns::util::cbox(output.x0, output.y0, output.x1 + 340., output.y1);
+            lib::columns::util::draw_box("li1.drawing", expanded);
+            let contact = lib::columns::util::cbox(expanded.x1 - 340., expanded.y0, expanded.x1, expanded.y1);
+            let via = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", contact, contact, 0, 0, true);
+            let predecode = row_decoder_predecode(row_bit, complement);
+            let final_horizontal = if row_bit < 2 {
+                low_bus_first + index
+            } else {
+                high_bus_first + index - 4
+            };
+            let jog_horizontal = nearest_track_index(output.y1, m2_start);
+            let vertical = if final_horizontal < jog_horizontal {
+                first_vertical + index
+            } else {
+                first_vertical + 7 - index
+            };
+            draw_route_hvh(via.1, predecode, jog_horizontal, vertical, final_horizontal);
+        }
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+// Kinds follow the placed control buffers: 0=precharge, 1=sense-enable,
+// 2=write-enable. All three use two adjacent M1 routing tracks at this sizing.
+fn buffer_output_count(kind: Int) -> Int {
+    if kind == 0 { 6 } else { if kind == 1 { 9 } else { 1 } }
+}
+
+fn buffer_output_local_x(kind: Int, fold: Int) -> Float {
+    if kind == 0 {
+        -4535. + fold as Float * 1580. + (fold / 4) as Float * 1000.
+    } else {
+        if kind == 1 {
+            -7405. + fold as Float * 1580. + (fold / 4) as Float * 1000.
+        } else {
+            -85.
+        }
+    }
+}
+
+fn buffer_output_local_y(kind: Int) -> (Float, Float) {
+    if kind == 0 { (18335., 25300.,) } else { if kind == 1 { (18335., 24870.,) } else { (3955., 10490.,) } }
+}
+
+fn buffer_origin(kind: Int) -> (Float, Float) {
+    if kind == 0 {
+        (precharge_buffer_x(), precharge_buffer_y(),)
+    } else {
+        if kind == 1 { (sense_buffer_x(), sense_buffer_y(),) } else { (write_buffer_x(), write_buffer_y(),) }
+    }
+}
+
+fn buffer_output(kind: Int, fold: Int) -> Rect {
+    let origin = buffer_origin(kind);
+    let local_x = buffer_output_local_x(kind, fold);
+    let local_y = buffer_output_local_y(kind);
+    // Each buffer is rotated 90 degrees clockwise.
+    lib::columns::util::cbox(origin.0 + local_y.0, origin.1 - local_x - 240., origin.0 + local_y.1, origin.1 - local_x)
+}
+
+fn buffer_bus_track(kind: Int) -> (Float, Float) {
+    if kind == 0 {
+        lib::columns::util::span_union(m1_track(160), m1_track(161))
+    } else {
+        if kind == 1 {
+            lib::columns::util::span_union(m1_track(158), m1_track(159))
+        } else {
+            lib::columns::util::span_union(m1_track(179), m1_track(180))
+        }
+    }
+}
+
+fn column_control_port(kind: Int, index: Int) -> Rect {
+    if kind == 0 {
+        let y0 = if index == 0 { -5400. } else { -10120. };
+        lib::columns::util::cbox(2500., y0, 150200., y0 + 1000.)
+    } else {
+        if kind == 1 {
+            lib::columns::util::cbox(2500., -29915., 150200., -29625.)
+        } else {
+            lib::columns::util::cbox(3150., -101170., 106850., -100850.)
+        }
+    }
+}
+
+fn draw_buffer_column_route(kind: Int) -> Rect {
+    let bus = buffer_bus_track(kind);
+    let outputs = buffer_output_count(kind);
+    for fold in std::range(outputs) {
+        let output = buffer_output(kind, fold);
+        lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(output.x0, output.y0, output.x1 + 200., output.y1));
+    }
+
+    let column_ports = if kind == 0 { 2 } else { 1 };
+    for index in std::range(column_ports) {
+        let column = column_control_port(kind, index);
+        let horizontal = lib::columns::util::rect_from_spans(lib::columns::util::span_add_point(bus, column.x0 + 1400.), lib::columns::util::rect_vspan(column));
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", lib::columns::util::rect_from_spans(bus, lib::columns::util::rect_vspan(horizontal)), horizontal, 0, 0, true);
+        lib::columns::util::draw_box("met2.drawing", horizontal);
+        if kind == 2 {
+            lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", column, horizontal, 0, 0, true);
+        } else {
+            crect(x0=0., y0=0., x1=0., y1=0.);
+        };
+    }
+
+    let first = buffer_output(kind, 0);
+    let last = buffer_output(kind, outputs - 1);
+    let output_vspan = lib::columns::util::span_union(lib::columns::util::rect_vspan(first), lib::columns::util::rect_vspan(last));
+    let output_right = first.x1 + 200.;
+    let chunks = if output_vspan.1 - output_vspan.0 < 2000. { 1 } else { ((output_vspan.1 - output_vspan.0 - 2000.) / 4000.) as Int + 1 };
+    for index in std::range(chunks) {
+        let y0 = output_vspan.0 + index as Float * 4000.;
+        let y1 = lib::columns::util::fmin(y0 + 2000., output_vspan.1);
+        if y1 - y0 > 140. {
+            lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::span_add_point(bus, output_right), (y0, y1,)));
+        } else {
+            crect(x0=0., y0=0., x1=0., y1=0.);
+        };
+    }
+
+    let first_column = column_control_port(kind, 0);
+    let last_column = column_control_port(kind, column_ports - 1);
+    let column_vspan = lib::columns::util::span_union(lib::columns::util::rect_vspan(first_column), lib::columns::util::rect_vspan(last_column));
+    let vertical = lib::columns::util::rect_from_spans(bus, lib::columns::util::span_union(output_vspan, column_vspan));
+    lib::columns::util::draw_box("met1.drawing", vertical)
+}
+
+fn draw_column_control_routes() -> Rect {
+    for kind in std::range(3) {
+        draw_buffer_column_route(kind);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn column_decoder_output(select: Int, complement: Bool, fold: Int) -> Rect {
+    let local_x0 = if complement {
+        -33090. + select as Float * 8600. + fold as Float * 1900.
+    } else {
+        -33535. + select as Float * 8600. + fold as Float * 1900.
+    };
+    let width = if complement { 330. } else { 240. };
+    // FlipYx swaps x/y before translation.
+    lib::columns::util::cbox(
+        column_decoder_x() + 21395.,
+        column_decoder_y() + local_x0,
+        column_decoder_x() + 29650.,
+        column_decoder_y() + local_x0 + width,
+    )
+}
+
+fn column_select_port(select: Int, complement: Bool) -> Rect {
+    let local_y0 = if complement {
+        54540. - select as Float * 1250.
+    } else {
+        63870. + select as Float * 1250.
+    };
+    lib::columns::util::cbox(column_x(), column_y() + local_y0, column_x() + 147700., column_y() + local_y0 + 1000.)
+}
+
+fn draw_column_decoder_routes() -> Rect {
+    for select in std::range(4) {
+        for polarity in std::range(2) {
+            let complement = polarity == 0;
+            let pair = 2 * select + polarity;
+            let bus = lib::columns::util::span_union(m1_track(164 + 2 * pair), m1_track(165 + 2 * pair));
+            let first_output = column_decoder_output(select, complement, 0);
+            let last_output = column_decoder_output(select, complement, 3);
+            for fold in std::range(4) {
+                let output = column_decoder_output(select, complement, fold);
+                let expanded = lib::columns::util::cbox(output.x0, output.y0, output.x1 + 1620., output.y1);
+                lib::columns::util::draw_box("met1.drawing", expanded);
+                let landing_hspan = lib::columns::util::span_with_stop_and_length(expanded.x1, 1400.);
+                let horizontal = lib::columns::util::rect_from_spans(lib::columns::util::span_union(landing_hspan, bus), lib::columns::util::rect_vspan(expanded));
+                lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", expanded, horizontal, 0, 0, true);
+                lib::columns::util::draw_box("met2.drawing", horizontal);
+                lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", lib::columns::util::rect_from_spans(bus, lib::columns::util::rect_vspan(horizontal)), horizontal, 0, 0, true);
+            }
+            let select_port = column_select_port(select, complement);
+            let select_route = lib::columns::util::rect_from_spans(lib::columns::util::span_union(bus, lib::columns::util::rect_hspan(select_port)), lib::columns::util::rect_vspan(select_port));
+            lib::columns::util::draw_box("met2.drawing", select_route);
+            lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", lib::columns::util::rect_from_spans(bus, lib::columns::util::rect_vspan(select_route)), select_route, 0, 0, true);
+            let output_vspan = lib::columns::util::span_union(lib::columns::util::rect_vspan(first_output), lib::columns::util::rect_vspan(last_output));
+            lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(bus, lib::columns::util::span_union(output_vspan, lib::columns::util::rect_vspan(select_port))));
+        }
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn control_input(clock: Bool) -> Rect {
+    let local_y0 = if clock { -1335. } else { -4095. };
+    let local_y1 = local_y0 + 320.;
+    // R90 counter-clockwise: (x, y) -> (-y, x).
+    lib::columns::util::cbox(control_x() - local_y1, control_y() - 3950., control_x() - local_y0, control_y() - 3630.)
+}
+
+fn dff_clock_port(clock: Bool) -> Rect {
+    let local_y0 = if clock { 6715. } else { 2480. };
+    lib::columns::util::cbox(dff_x(), dff_y() + local_y0, dff_x() + 48800., dff_y() + local_y0 + 320.)
+}
+
+fn column_clock_port(clock: Bool, index: Int) -> Rect {
+    let local_x0 = if index == 0 { 0. } else { 650. };
+    let local_x1 = if index == 0 { 147700. } else { 104350. };
+    let local_y0 = if clock {
+        if index == 0 { 8175. } else { -31075. }
+    } else {
+        if index == 0 { 3940. } else { -35310. }
+    };
+    lib::columns::util::cbox(column_x() + local_x0, column_y() + local_y0, column_x() + local_x1, column_y() + local_y0 + 320.)
+}
+
+fn draw_clock_reset_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    let dff_route_first = track_starts_after(dff_y() + 14110., m2_start);
+    let control_route_first = dff_route_first + 12;
+    let connect_first = track_ends_before(dff_y() - 190., m2_start);
+    let left_first = track_starts_after(dff_x() + 48800., m1_start);
+    let right_first = track_ends_before(column_x() - 300., m1_start);
+    for signal in std::range(2) {
+        let clock = signal == 0;
+        let left_track = left_first + signal;
+        let right_track = right_first - signal;
+        let control_track = control_route_first + signal;
+        let connect_track = connect_first - signal;
+        let pin = lib::columns::util::rect_from_spans(m1_track(left_track), (router_bottom(), router_bottom() + route_width(),));
+        lib::columns::util::draw_box("met1.drawing", pin);
+        draw_route_h_m1(control_input(clock), pin, control_track);
+        draw_route_v_m2_to_m1(dff_clock_port(clock), pin, left_track, connect_track);
+        for index in std::range(2) {
+            draw_route_v_m2_to_m1(column_clock_port(clock, index), pin, right_track, connect_track);
+        }
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn control_ce_we(write: Bool) -> Rect {
+    let local_y0 = if write { -3175. } else { -2255. };
+    let local_y1 = local_y0 + 320.;
+    lib::columns::util::cbox(control_x() - local_y1, control_y() - 3950., control_x() - local_y0, control_y() - 3630.)
+}
+
+fn dff_q(index: Int) -> Rect {
+    let x0 = dff_x() + 1735. + index as Float * 6100.;
+    lib::columns::util::cbox(x0, dff_y() + 13135., x0 + 2650., dff_y() + 13305.)
+}
+
+fn draw_ce_we_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    let dff_route_first = track_starts_after(dff_y() + 14110., m2_start);
+    let control_route_first = dff_route_first + 12;
+    for signal in std::range(2) {
+        let write = signal == 1;
+        let q = dff_q(6 + signal);
+        let via = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", q, q, 0, 0, true);
+        let vertical_track = nearest_track_index(lib::columns::util::rect_cx(via.1), m1_start);
+        draw_route_vh_m1(via.1, control_ce_we(write), vertical_track, control_route_first + 2 + signal);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn control_rwl() -> Rect {
+    // Control is R90 counter-clockwise; this port is M2.
+    lib::columns::util::cbox(-80590., -49605., -80270., -49285.)
+}
+
+fn replica_wordline() -> Rect {
+    // The timing replica uses the center wordline (index 2) of its four rows.
+    lib::columns::util::cbox(replica_cells_x(), replica_cells_y() + 7090., replica_cells_x() + 1300., replica_cells_y() + 7260.)
+}
+
+fn control_replica_signal(kind: Int) -> Rect {
+    // 0=rbl, 1=pc_b, 2=wlen. All are M1 ports on the absent control block.
+    let x0 = if kind == 0 { -74150. } else { if kind == 1 { -73230. } else { -75070. } };
+    lib::columns::util::cbox(x0, -2685., x0 + 320., -2365.)
+}
+
+fn replica_precharge_enable(index: Int) -> Rect {
+    // The replica precharge is reflected vertically at placement.
+    let y0 = if index == 0 { -3725. } else { -7805. };
+    lib::columns::util::cbox(replica_precharge_x(), y0, replica_precharge_x() + 5000., y0 + 360.)
+}
+
+fn draw_replica_control_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+
+    let rwl = control_rwl();
+    let rwl_track = track_ends_before(rwl.x1, m1_start);
+    draw_route_v_m2(rwl, replica_wordline(), rwl_track);
+
+    let rbl_control = control_replica_signal(0);
+    let pc_control = control_replica_signal(1);
+    let rbl_m2 = track_starts_after(rbl_control.y0, m2_start);
+    let pc_m2 = rbl_m2 + 1;
+    let rbl_m1 = track_starts_after(replica_precharge_rbl().x1, m1_start);
+    draw_route_hv_m1_to_m2(rbl_control, replica_precharge_rbl(), rbl_m2, rbl_m1);
+    for index in std::range(2) {
+        draw_route_hv_m1_to_m2(pc_control, replica_precharge_enable(index), pc_m2, rbl_m1 + 1);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn wordline_enable_input() -> Rect {
+    lib::columns::util::cbox(-106970., 3635., -101810., 3955.)
+}
+
+fn wordline_enable_output(index: Int) -> Rect {
+    let x0 = if index == 0 { -105265. } else { -103685. };
+    lib::columns::util::cbox(x0, 7750., x0 + 240., 12995.)
+}
+
+fn address_gate_wordline_enable() -> Rect {
+    lib::columns::util::cbox(-114550., 15435., -114230., 31075.)
+}
+
+fn precharge_buffer_input() -> Rect {
+    lib::columns::util::cbox(-45900., -15480., -45580., -3000.)
+}
+
+fn draw_enable_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    let rbl_m2 = track_starts_after(control_replica_signal(0).y0, m2_start);
+    let pc_m2 = rbl_m2 + 1;
+    let wlen_m2 = rbl_m2 + 2;
+
+    let wlen_input = wordline_enable_input();
+    let wlen_m1 = track_ends_before(wlen_input.x1, m1_start);
+    draw_route_hv_m1_to_m2(control_replica_signal(2), wlen_input, wlen_m2, wlen_m1);
+
+    // OffsetJog(dir=Vert, sign=Pos, space=200): the 240 nm-wide output
+    // rises 440 nm before jogging left into the address-gate enable rail.
+    let wlen_y = wordline_enable_output(0);
+    let jog_top = wlen_y.y1 + 440.;
+    let jog_bottom = wlen_y.y1 + 200.;
+    let addr_wlen = address_gate_wordline_enable();
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(wlen_y.x0, wlen_y.y0, wlen_y.x1, jog_top));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(addr_wlen.x0, jog_bottom, wlen_y.x1, jog_top));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(addr_wlen.x0, jog_bottom, addr_wlen.x1, addr_wlen.y1));
+
+    draw_route_h_m1(control_replica_signal(1), precharge_buffer_input(), pc_m2);
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn control_buffer_enable(kind: Int) -> Rect {
+    // 0=sense-enable, 1=write-driver-enable. Both are M2 ports.
+    let y0 = if kind == 0 { -73065. } else { -73985. };
+    lib::columns::util::cbox(-55290., y0, -54970., y0 + 320.)
+}
+
+fn buffer_input(kind: Int) -> Rect {
+    if kind == 0 {
+        lib::columns::util::cbox(-45470., -39700., -45150., -21480.)
+    } else {
+        lib::columns::util::cbox(-31070., -90680., -30750., -87100.)
+    }
+}
+
+fn draw_sense_write_enable_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    // Tracks immediately to the right of the (omitted) control-logic bbox.
+    let write_m1 = track_starts_after(-54970. + 140., m1_start);
+    let sense_m1 = write_m1 + 1;
+    let sense_input = buffer_input(0);
+    let write_input = buffer_input(1);
+    let sense_m2 = track_starts_after(sense_input.y0, m2_start);
+    let write_m2 = track_ends_before(write_input.y1, m2_start);
+    draw_route_hv_m1_to_m2(sense_input, control_buffer_enable(0), sense_m2, sense_m1);
+    draw_route_hv_m1_to_m2(write_input, control_buffer_enable(1), write_m2, write_m1);
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn column_decoder_predecode(select_bit: Int, complement: Int) -> Rect {
+    let x0 = if select_bit == 0 {
+        if complement == 0 { -48630. } else { -49110. }
+    } else {
+        if complement == 0 { -49590. } else { -50070. }
+    };
+    lib::columns::util::cbox(x0, -81100., x0 + 320., -45700.)
+}
+
+fn dff_qn(index: Int) -> Rect {
+    let x0 = dff_x() + 1815. + index as Float * 6100.;
+    lib::columns::util::cbox(x0, dff_y() + 10895., x0 + 1580., dff_y() + 11065.)
+}
+
+fn draw_column_address_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    let dff_m2_first = track_starts_after(dff_y() + 14110., m2_start);
+    let write_enable_m1 = track_starts_after(-54970. + 140., m1_start);
+    for select_bit in std::range(2) {
+        for complement in std::range(2) {
+            let index = 2 * select_bit + complement;
+            let dff_index = 5 - select_bit;
+            let predecode = column_decoder_predecode(select_bit, complement);
+            let dff_rect = if complement == 0 { dff_qn(dff_index) } else { dff_q(dff_index) };
+            let adjacent_m1 = if complement == 0 {
+                track_starts_after(dff_rect.x0 + 140., m1_start)
+            } else {
+                track_ends_before(dff_rect.x1 - 140., m1_start)
+            };
+            let expanded_m0 = lib::columns::util::rect_with_hspan(dff_rect, m1_track(adjacent_m1));
+            let via = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", expanded_m0, expanded_m0, 0, 0, false);
+            let dff_port = lib::columns::util::rect_from_spans(m1_track(adjacent_m1), lib::columns::util::rect_vspan(via.1));
+            lib::columns::util::draw_box("met1.drawing", dff_port);
+
+            let first_m2 = track_starts_after(predecode.y0, m2_start) + index;
+            let vertical_m1 = write_enable_m1 + 2 + index;
+            let final_m2 = dff_m2_first + 11 - index;
+            draw_route_hvh(predecode, dff_port, first_m2, vertical_m1, final_m2);
+        }
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn address_gate_input(index: Int) -> Rect {
+    let y0 = if index < 4 {
+        16900. + index as Float * 1580.
+    } else {
+        24220. + (index - 4) as Float * 1580.
+    };
+    lib::columns::util::cbox(-114070., y0, -113740., y0 + 170.)
+}
+
+fn span_centered_320(center: Float) -> (Float, Float) {
+    (center - 160., center + 160.,)
+}
+
+fn draw_row_address_routes() -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let m2_start = router_bottom() - route_width() / 2.;
+    let dff_m2_first = track_starts_after(dff_y() + 14110., m2_start);
+    // Left edge of the union of the expanded address gate, replica MOS,
+    // replica routing, and wordline-enable buffer, with 140 nm clearance.
+    let first_route_m1 = track_ends_before(-115530., m1_start);
+    for row_bit in std::range(4) {
+        for complement in std::range(2) {
+            let index = 2 * row_bit + complement;
+            let dff_index = 3 - row_bit;
+            let gate_port = address_gate_input(index);
+            let dff_rect = if complement == 0 { dff_q(dff_index) } else { dff_qn(dff_index) };
+            let adjacent_m1 = if complement == 0 {
+                track_ends_before(dff_rect.x1 - 140., m1_start)
+            } else {
+                track_starts_after(dff_rect.x0 + 140., m1_start)
+            };
+            let expanded_dff_m0 = lib::columns::util::rect_with_hspan(dff_rect, m1_track(adjacent_m1));
+            let dff_via = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", expanded_dff_m0, expanded_dff_m0, 0, 0, false);
+            let dff_port = lib::columns::util::rect_from_spans(m1_track(adjacent_m1), lib::columns::util::rect_vspan(dff_via.1));
+            lib::columns::util::draw_box("met1.drawing", dff_port);
+
+            let route_m1 = first_route_m1 - index;
+            let route_m2 = dff_m2_first + 7 - index;
+            let route_x = m1_track(route_m1);
+            let gate_jog_right = gate_port.x0 - 620.;
+            let gate_jog_y = span_centered_320(lib::columns::util::rect_cy(gate_port));
+            let gate_jog_m2 = lib::columns::util::rect_from_spans(lib::columns::util::span_add_point(route_x, gate_jog_right), gate_jog_y);
+            let gate_landing = lib::columns::util::cbox(gate_jog_right - 320., gate_port.y0, gate_port.x1, gate_port.y1);
+            lib::columns::util::draw_box("li1.drawing", gate_landing);
+            lib::columns::util::draw_box("met2.drawing", gate_jog_m2);
+            lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", gate_landing, gate_jog_m2, 0, 0, false);
+            lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", gate_landing, gate_jog_m2, 0, 0, false);
+            let route_via = lib::columns::util::rect_from_spans(route_x, lib::columns::util::rect_vspan(gate_jog_m2));
+            lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", route_via, gate_jog_m2, 0, 0, false);
+
+            let dff_bus = m2_track(route_m2);
+            lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(route_x, lib::columns::util::span_union(lib::columns::util::rect_vspan(gate_jog_m2), dff_bus)));
+            lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::span_union(route_x, m1_track(adjacent_m1)), dff_bus));
+            lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(m1_track(adjacent_m1), lib::columns::util::span_union(dff_bus, lib::columns::util::rect_vspan(dff_port))));
+        }
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn column_data_port(index: Int, kind: Int) -> Rect {
+    let x0 = column_x() + if kind == 0 {
+        4350. + index as Float * 6100.
+    } else {
+        if kind == 1 { 4770. + index as Float * 6100. } else { 4000. + index as Float * 48800. }
+    };
+    let y1 = column_y() + if kind == 2 { -37275. } else { -23770. };
+    lib::columns::util::cbox(x0, column_y() - 39250., x0 + 140., y1)
+}
+
+fn draw_column_data_pins(p: ColParams) -> Rect {
+    let words = p.cols / p.mux.mux_ratio;
+    for index in std::range(words) {
+        let din = column_data_port(index, 0);
+        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_with_vspan(din, (router_bottom(), din.y1,)));
+
+        let dout = column_data_port(index, 1);
+        let dout_pin = lib::columns::util::rect_with_vspan(dout, (router_bottom(), router_bottom() + route_width(),));
+        let dout_m2 = lib::columns::util::rect_with_vspan(dout, (dout_pin.y1 - route_width(), dout_pin.y1 - route_width() + 800.,));
+        let dout_m1 = lib::columns::util::rect_with_vspan(dout, (dout_m2.y1 - route_width(), dout.y0,));
+        lib::columns::util::draw_box("met1.drawing", dout_m1);
+        lib::columns::util::draw_box("met2.drawing", dout_m2);
+        lib::columns::util::draw_box("met1.drawing", dout_pin);
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", dout_m1, dout_m2, 0, 0, true);
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", dout_pin, dout_m2, 0, 0, true);
+    }
+    let masks = words / p.wmask_granularity;
+    for index in std::range(masks) {
+        let wmask = column_data_port(index, 2);
+        let wmask_m2 = lib::columns::util::rect_with_vspan(wmask, (wmask.y0 - 480., wmask.y0 + 320.,));
+        let wmask_pin = lib::columns::util::rect_with_vspan(wmask_m2, (router_bottom(), wmask_m2.y0 + route_width(),));
+        lib::columns::util::draw_box("met2.drawing", wmask_m2);
+        lib::columns::util::draw_box("met1.drawing", wmask_pin);
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", wmask, wmask_m2, 0, 0, true);
+        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", wmask_pin, wmask_m2, 0, 0, true);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+// The power mesh deliberately uses only the edge track banks. Those banks are
+// disjoint from every signal track used above: M1[7..180] carries address and
+// control signals, while M2[0..1] is occupied by the bottom data-pin jogs.
+// Keeping these reservations explicit makes power generation deterministic
+// without reproducing SRAM22's greedy strap search.
+fn left_power_track(supply: Int) -> Int { if supply == 0 { 4 } else { 5 } }
+fn right_power_track(supply: Int) -> Int { if supply == 0 { 420 } else { 421 } }
+fn bottom_power_track(supply: Int) -> Int { if supply == 0 { 4 } else { 5 } }
+fn top_power_track(supply: Int) -> Int { if supply == 0 { 260 } else { 261 } }
+
+fn power_via(m1_rect: Rect, m2_rect: Rect) -> Rect {
+    let via = lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", m1_rect, m2_rect, 0, 0, false);
+    via.2
+}
+
+fn draw_power_mesh() -> Rect {
+    // Six alternating rails on each unobstructed vertical edge bank.
+    for index in std::range(6) {
+        let left = m1_track(index);
+        let right = m1_track(418 + index);
+        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(left, (m2_track(2).0, m2_track(265).1,)));
+        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(right, (m2_track(2).0, m2_track(265).1,)));
+    }
+    // Four alternating rails at the bottom and six at the top. The two lowest
+    // M2 tracks are blocked by dout/wmask pin jogs and are intentionally skipped.
+    for offset in std::range(4) {
+        let track = m2_track(2 + offset);
+        lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_from_spans((m1_track(0).0, m1_track(423).1,), track));
+    }
+    for offset in std::range(6) {
+        let track = m2_track(260 + offset);
+        lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_from_spans((m1_track(0).0, m1_track(423).1,), track));
+    }
+    // Stitch only like-polarity crossings; track parity encodes VDD/VSS.
+    for xoff in std::range(6) {
+        for yoff in std::range(4) {
+            if xoff % 2 == yoff % 2 {
+                let bottom = lib::columns::util::rect_from_spans(m1_track(xoff), m2_track(2 + yoff));
+                let bottom_right = lib::columns::util::rect_from_spans(m1_track(418 + xoff), m2_track(2 + yoff));
+                power_via(bottom, bottom);
+                power_via(bottom_right, bottom_right);
+            } else {
+                crect(x0=0., y0=0., x1=0., y1=0.);
+            };
+        }
+        for yoff in std::range(6) {
+            if xoff % 2 == yoff % 2 {
+                let top = lib::columns::util::rect_from_spans(m1_track(xoff), m2_track(260 + yoff));
+                let top_right = lib::columns::util::rect_from_spans(m1_track(418 + xoff), m2_track(260 + yoff));
+                power_via(top, top);
+                power_via(top_right, top_right);
+            } else {
+                crect(x0=0., y0=0., x1=0., y1=0.);
+            };
+        }
+    }
+    // Expose compact pin shapes at the lower-left edge of the mesh.
+    let vdd = m1_track(left_power_track(0));
+    let vss = m1_track(left_power_track(1));
+    lib::columns::util::met1_port(vdd.0, m2_track(2).0, vdd.1, m2_track(2).0 + 1000.);
+    lib::columns::util::met1_port(vss.0, m2_track(2).0, vss.1, m2_track(2).0 + 1000.)
+}
+
+fn feed_m2_to_side(source: Rect, supply: Int, right: Bool) -> Rect {
+    let index = if right { right_power_track(supply) } else { left_power_track(supply) };
+    let strap = m1_track(index);
+    let feeder = lib::columns::util::rect_with_hspan(source, lib::columns::util::span_union(lib::columns::util::rect_hspan(source), strap));
+    lib::columns::util::draw_box("met2.drawing", feeder);
+    power_via(lib::columns::util::rect_from_spans(strap, lib::columns::util::rect_vspan(feeder)), feeder)
+}
+
+fn feed_m1_to_edge(source: Rect, supply: Int, top: Bool) -> Rect {
+    let index = if top { top_power_track(supply) } else { bottom_power_track(supply) };
+    let rail = m2_track(index);
+    let feeder = lib::columns::util::rect_with_vspan(source, lib::columns::util::span_union(lib::columns::util::rect_vspan(source), rail));
+    lib::columns::util::draw_box("met1.drawing", feeder);
+    power_via(feeder, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(feeder), rail))
+}
+
+fn feed_main_array_power() -> Rect {
+    let right = (151400., 152700.,);
+    // VPWR boundary rails: two top rails, five repeated rails per four-row
+    // group, and the bottom boundary rail.
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (38975., 39425.,)), 0, true);
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (37110., 37370.,)), 0, true);
+    for group in std::range(5) {
+        let shift = group as Float * 7900.;
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (35530. - shift, 35790. - shift,)), 0, true);
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (34680. - shift, 34940. - shift,)), 0, true);
+    }
+    for group in std::range(4) {
+        let shift = group as Float * 7900.;
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (32370. - shift, 32630. - shift,)), 0, true);
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (31520. - shift, 31780. - shift,)), 0, true);
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (29210. - shift, 29470. - shift,)), 0, true);
+    }
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (1025., 1475.,)), 0, true);
+
+    // VGND follows the same row grouping with its complementary rail offsets.
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (39995., 40450.,)), 1, true);
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (37540., 37760.,)), 1, true);
+    for group in std::range(5) {
+        let shift = group as Float * 7900.;
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (35960. - shift, 36180. - shift,)), 1, true);
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (34290. - shift, 34510. - shift,)), 1, true);
+    }
+    for group in std::range(4) {
+        let shift = group as Float * 7900.;
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (32800. - shift, 33020. - shift,)), 1, true);
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (31130. - shift, 31350. - shift,)), 1, true);
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (29640. - shift, 29860. - shift,)), 1, true);
+    }
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (0., 455.,)), 1, true);
+
+    // Well ties are supply-equivalent to VPWR/VGND.
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (39575., 39855.,)), 0, true);
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (595., 875.,)), 0, true);
+    for index in std::range(6) {
+        let y0 = 36350. - index as Float * 7900.;
+        feed_m2_to_side(lib::columns::util::rect_from_spans(right, (y0, y0 + 170.,)), 1, true);
+    }
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (38415., 38800.,)), 1, true);
+    feed_m2_to_side(lib::columns::util::rect_from_spans(right, (1650., 2035.,)), 1, true);
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn feed_column_power_rail(y0: Float, height: Float, supply: Int) -> Rect {
+    let xspan = (column_x(), column_x() + 147700.,);
+    feed_m2_to_side(lib::columns::util::rect_from_spans(xspan, (column_y() + y0, column_y() + y0 + height,)), supply, true)
+}
+
+fn feed_column_power() -> Rect {
+    feed_column_power_rail(5650., 1800., 0);
+    feed_column_power_rail(57580., 870., 0);
+    feed_column_power_rail(25020., 800., 0);
+    feed_column_power_rail(17120., 800., 0);
+    feed_column_power_rail(71905., 800., 0);
+    feed_column_power_rail(31245., 800., 0);
+    feed_column_power_rail(35325., 290., 0);
+    feed_column_power_rail(20130., 800., 0);
+    feed_column_power_rail(-33600., 1800., 0);
+    feed_column_power_rail(47885., 290., 1);
+    feed_column_power_rail(21450., 800., 1);
+    feed_column_power_rail(23130., 800., 1);
+    feed_column_power_rail(29525., 800., 1);
+    feed_column_power_rail(18440., 800., 1);
+    feed_column_power_rail(9390., 1800., 1);
+    feed_column_power_rail(26340., 800., 1);
+    feed_column_power_rail(61860., 245., 1);
+    feed_column_power_rail(-29860., 1800., 1);
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn feed_dff_power() -> Rect {
+    for index in std::range(8) {
+        let dx = index as Float * 6100.;
+        feed_m1_to_edge(lib::columns::util::cbox(dff_x() + dx + 1140., dff_y(), dff_x() + dx + 1630., dff_y() + 13920.), 0, false);
+        feed_m1_to_edge(lib::columns::util::cbox(dff_x() + dx + 4470., dff_y(), dff_x() + dx + 4960., dff_y() + 13920.), 1, false);
+    }
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn feed_decoder_and_buffer_power() -> Rect {
+    // Row decoder and address gate connect upward through their existing M1
+    // rails. Their x ranges lie outside the main-array blockage.
+    feed_m1_to_edge(lib::columns::util::cbox(-71190., 3635., -69570., 36815.), 0, true);
+    feed_m1_to_edge(lib::columns::util::cbox(-74260., 3635., -72940., 36815.), 1, true);
+    feed_m1_to_edge(lib::columns::util::cbox(-103450., 15435., -101530., 31075.), 0, true);
+    feed_m1_to_edge(lib::columns::util::cbox(-107070., 15435., -105950., 31075.), 1, true);
+
+    // The wordline-enable M2 rails land directly on the corresponding address
+    // gate M1 power rails, so the same vertical feeders serve both blocks.
+    let wlen_vdd = lib::columns::util::cbox(-106970., 10530., -101810., 12280.);
+    let wlen_vss = lib::columns::util::cbox(-106970., 8035., -101810., 8925.);
+    let wlen_vdd_feeder = lib::columns::util::cbox(-103200., wlen_vdd.y0, -102880., 15435.);
+    power_via(wlen_vdd_feeder, wlen_vdd);
+    lib::columns::util::draw_box("met1.drawing", wlen_vdd_feeder);
+    // The M1 path above this VSS rail is blocked by the wordline-enable signal
+    // jog, so escape left on M2 instead.
+    feed_m2_to_side(wlen_vss, 1, false);
+
+    // Precharge and sense buffers share clear vertical corridors. Column
+    // decoder rails are bridged through the placement gap into those feeders.
+    feed_m1_to_edge(lib::columns::util::cbox(-43630., -15480., -42880., -3000.), 0, true);
+    feed_m1_to_edge(lib::columns::util::cbox(-44835., -15480., -44465., -3000.), 1, true);
+    feed_m1_to_edge(lib::columns::util::cbox(-43200., -39700., -42450., -21480.), 0, true);
+    feed_m1_to_edge(lib::columns::util::cbox(-44405., -39700., -44035., -21480.), 1, true);
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(-43495., -45700., -43175., -42680.));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(-43200., -43000., -42880., -39700.));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(-43495., -43000., -42880., -42680.));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(-46390., -45700., -46070., -42680.));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(-44405., -43000., -44085., -39700.));
+    lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(-46390., -43000., -44085., -42680.));
+
+    // The write-enable buffer has a clear horizontal escape to the left mesh.
+    let write_vdd = lib::columns::util::cbox(-28800., -90680., -28050., -87100.);
+    let write_vss = lib::columns::util::cbox(-30005., -90680., -29635., -87100.);
+    let write_vdd_m2 = m2_track(65);
+    let write_vss_m2 = m2_track(66);
+    let write_vdd_via = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(write_vdd), write_vdd_m2);
+    let write_vss_via = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(write_vss), write_vss_m2);
+    power_via(write_vdd, write_vdd_via);
+    power_via(write_vss, write_vss_via);
+    feed_m2_to_side(write_vdd_via, 0, false);
+    feed_m2_to_side(write_vss_via, 1, false);
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+fn feed_replica_power() -> Rect {
+    // Replica precharge and MOS power rails face the open left routing channel.
+    feed_m2_to_side(lib::columns::util::cbox(-92590., -6310., -87590., -5510.), 0, false);
+    feed_m2_to_side(lib::columns::util::cbox(-109390., -5600., -105590., -3910.), 0, false);
+    feed_m2_to_side(lib::columns::util::cbox(-109390., -8940., -105590., -8270.), 1, false);
+    feed_m2_to_side(lib::columns::util::cbox(-109390., -7640., -105590., -6630.), 1, false);
+    // Representative top rails of the replica cell array; its internal rails
+    // already tie the repeated cell supplies to these exported boundaries.
+    feed_m2_to_side(lib::columns::util::cbox(-92590., -15020., -91290., -14570.), 0, false);
+    feed_m2_to_side(lib::columns::util::cbox(-92590., -14000., -91290., -13545.), 1, false);
+    lib::columns::util::cbox(0., 0., 0., 0.)
+}
+
+cell dense_power_grid_64x24() {
+    draw_power_mesh();
+    feed_main_array_power();
+    feed_column_power();
+    feed_dff_power();
+    feed_decoder_and_buffer_power();
+    feed_replica_power();
+}
+
+fn guard_bottom() -> Float { -139360. }
+
+fn draw_guard_power_connections() -> Rect {
+    // Ring geometry matches guard_ring(-126960, -135120, 163000, 47400).
+    let vss_left = (-128320., -126960.,);
+    let vss_right = (163000., 164360.,);
+    let vss_bottom = (-136480., -135120.,);
+    let vss_top = (47400., 48760.,);
+    let vdd_left = (-131040., -129680.,);
+    let vdd_right = (165720., 167080.,);
+    let vdd_bottom = (-139200., -137840.,);
+    let vdd_top = (50120., 51480.,);
+
+    // Vertical mesh rails terminate on the horizontal ring rails.
+    let vdd_vertical = lib::columns::util::rect_from_spans(m1_track(left_power_track(0)), lib::columns::util::span_union(vdd_bottom, vdd_top));
+    let vss_vertical = lib::columns::util::rect_from_spans(m1_track(left_power_track(1)), lib::columns::util::span_union(vss_bottom, vss_top));
+    lib::columns::util::draw_box("met1.drawing", vdd_vertical);
+    lib::columns::util::draw_box("met1.drawing", vss_vertical);
+    power_via(vdd_vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vdd_vertical), vdd_bottom));
+    power_via(vdd_vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vdd_vertical), vdd_top));
+    power_via(vss_vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vss_vertical), vss_bottom));
+    power_via(vss_vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vss_vertical), vss_top));
+
+    // Horizontal mesh rails terminate on both vertical sides of each ring.
+    let vdd_bottom_feed = lib::columns::util::rect_from_spans(lib::columns::util::span_union(vdd_left, vdd_right), m2_track(bottom_power_track(0)));
+    let vss_bottom_feed = lib::columns::util::rect_from_spans(lib::columns::util::span_union(vss_left, vss_right), m2_track(bottom_power_track(1)));
+    let vdd_top_feed = lib::columns::util::rect_from_spans(lib::columns::util::span_union(vdd_left, vdd_right), m2_track(top_power_track(0)));
+    let vss_top_feed = lib::columns::util::rect_from_spans(lib::columns::util::span_union(vss_left, vss_right), m2_track(top_power_track(1)));
+    lib::columns::util::draw_box("met2.drawing", vdd_bottom_feed);
+    lib::columns::util::draw_box("met2.drawing", vss_bottom_feed);
+    lib::columns::util::draw_box("met2.drawing", vdd_top_feed);
+    lib::columns::util::draw_box("met2.drawing", vss_top_feed);
+    power_via(lib::columns::util::rect_from_spans(vdd_left, lib::columns::util::rect_vspan(vdd_bottom_feed)), vdd_bottom_feed);
+    power_via(lib::columns::util::rect_from_spans(vdd_right, lib::columns::util::rect_vspan(vdd_bottom_feed)), vdd_bottom_feed);
+    power_via(lib::columns::util::rect_from_spans(vss_left, lib::columns::util::rect_vspan(vss_bottom_feed)), vss_bottom_feed);
+    power_via(lib::columns::util::rect_from_spans(vss_right, lib::columns::util::rect_vspan(vss_bottom_feed)), vss_bottom_feed);
+    power_via(lib::columns::util::rect_from_spans(vdd_left, lib::columns::util::rect_vspan(vdd_top_feed)), vdd_top_feed);
+    power_via(lib::columns::util::rect_from_spans(vdd_right, lib::columns::util::rect_vspan(vdd_top_feed)), vdd_top_feed);
+    power_via(lib::columns::util::rect_from_spans(vss_left, lib::columns::util::rect_vspan(vss_top_feed)), vss_top_feed);
+    power_via(lib::columns::util::rect_from_spans(vss_right, lib::columns::util::rect_vspan(vss_top_feed)), vss_top_feed)
+}
+
+fn guard_dff_pin(index: Int) -> Rect {
+    let source = dff_input(index);
+    let track = nearest_m1_track(lib::columns::util::rect_cx(source));
+    lib::columns::util::met1_port(track.0, guard_bottom(), track.1, router_bottom() + route_width())
+}
+
+fn guard_addr_pins(index: Int) -> [Rect] {
+    if index == 6 { [] } else { cons(guard_dff_pin(index), guard_addr_pins(index + 1)) }
+}
+
+fn guard_control_pin(signal: Int) -> Rect {
+    let m1_start = router_left() - route_width() / 2.;
+    let clk_first = track_starts_after(dff_x() + 48800., m1_start);
+    let track = m1_track(clk_first + signal);
+    lib::columns::util::met1_port(track.0, guard_bottom(), track.1, router_bottom() + route_width())
+}
+
+fn guard_data_pins(index: Int, count: Int, kind: Int) -> [Rect] {
+    if index == count {
+        []
+    } else {
+        let source = column_data_port(index, kind);
+        cons(
+            lib::columns::util::met1_port(source.x0, guard_bottom(), source.x1, router_bottom() + route_width()),
+            guard_data_pins(index + 1, count, kind),
+        )
+    }
+}
+
+cell guard_connections_64x24(p: ColParams) {
+    draw_guard_power_connections();
+    let words = p.cols / p.mux.mux_ratio;
+    let addr = guard_addr_pins(0);
+    let ce = guard_dff_pin(6);
+    let we = guard_dff_pin(7);
+    let clk = guard_control_pin(0);
+    let rstb = guard_control_pin(1);
+    let din = guard_data_pins(0, words, 0);
+    let dout = guard_data_pins(0, words, 1);
+    let wmask = guard_data_pins(0, words / p.wmask_granularity, 2);
+    let vdd = lib::columns::util::met1_port(-131040., -139200., -129680., 51480.);
+    let vss = lib::columns::util::met1_port(-128320., -136480., -126960., 48760.);
+}
+
+cell core_routes_64x24(p: ColParams) {
+    draw_main_bitlines();
+    draw_wordlines();
+    draw_replica_array_bitlines();
+    draw_replica_load_route();
+    draw_dff_input_pins();
+    draw_address_predecode_routes();
+    draw_column_control_routes();
+    draw_column_decoder_routes();
+    draw_clock_reset_routes();
+    draw_ce_we_routes();
+    draw_replica_control_routes();
+    draw_enable_routes();
+    draw_sense_write_enable_routes();
+    draw_column_address_routes();
+    draw_row_address_routes();
+    draw_column_data_pins(p);
+}

@@ -1,0 +1,387 @@
+fn lat_sd_port_raw(x: Float, w: Float, row: Int, length: Float) -> Rect {
+    let cy = row as Float * (length + 280.);
+    let nx = if w < 800. { 1 } else { 2 };
+    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
+    lib::columns::util::cbox(ax0 - 80., cy + 40., ax0 + aw + 80., cy + 210.)
+}
+
+fn lat_gate_raw() -> Rect {
+    lib::columns::util::cbox(-520., 470., -190., 640.)
+}
+
+fn lat_gate_poly() -> Rect {
+    lib::columns::util::cbox(-520., 420., -190., 690.)
+}
+
+fn lat_gate_cut() -> Rect {
+    lib::columns::util::cbox(-440., 470., -270., 640.)
+}
+
+fn lat_gate_npc() -> Rect {
+    lib::columns::util::cbox(-540., 370., -170., 740.)
+}
+
+fn lat_q3(r: Rect) -> Rect {
+    lib::columns::mux::xf_q3(r, 0., 0.)
+}
+
+fn draw_lat_q3(layer: Any, r: Rect) -> Rect {
+    lib::columns::util::draw_box(layer, lat_q3(r))
+}
+
+fn draw_lat_sd_contact(x: Float, w: Float, row: Int, length: Float) -> Rect {
+    let cy = row as Float * (length + 280.);
+    let nx = if w < 800. { 1 } else { 2 };
+    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
+    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
+    for i in std::range(nx) {
+        draw_lat_q3("licon1.drawing", lib::columns::util::cbox(ax0 + i as Float * 340., cy + 40., ax0 + i as Float * 340. + 170., cy + 210.));
+    }
+    draw_lat_q3("diff.drawing", lib::columns::util::cbox(ax0 - 60., cy, ax0 + aw + 60., cy + 250.));
+    let li = lat_sd_port_raw(x, w, row, length);
+    draw_lat_q3("li1.drawing", li);
+    lat_q3(li)
+}
+
+fn lat_finv_raw_y() -> Rect {
+    lib::columns::util::rect_union(lat_sd_port_raw(0., 600., 1, 150.), lat_sd_port_raw(1120., 1000., 1, 150.))
+}
+
+fn lat_finv_port(name: Int) -> Rect {
+    if name == 0 {
+        lat_q3(lat_gate_raw())
+    } else {
+        if name == 1 {
+            lat_q3(lat_finv_raw_y())
+        } else {
+            if name == 2 {
+                lat_q3(lat_sd_port_raw(0., 600., 0, 150.))
+            } else {
+                if name == 3 {
+                    lat_q3(lat_sd_port_raw(0., 600., 2, 150.))
+                } else {
+                    if name == 4 {
+                        lat_q3(lat_sd_port_raw(1120., 1000., 0, 150.))
+                    } else {
+                        lat_q3(lat_sd_port_raw(1120., 1000., 2, 150.))
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn lat_nmos_port(name: Int) -> Rect {
+    if name == 0 {
+        lat_q3(lat_gate_raw())
+    } else {
+        if name == 1 {
+            lat_q3(lat_sd_port_raw(0., 1000., 0, 150.))
+        } else {
+            if name == 2 {
+                lat_q3(lat_sd_port_raw(0., 1000., 1, 150.))
+            } else {
+                lat_q3(lat_sd_port_raw(0., 1000., 2, 150.))
+            }
+        }
+    }
+}
+
+fn lat_finv_inst_port(name: Int, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::rect_translate(lat_finv_port(name), dx, dy)
+}
+
+fn lat_nmos_inst_port(name: Int, dx: Float, dy: Float) -> Rect {
+    lib::columns::util::rect_translate(lat_nmos_port(name), dx, dy)
+}
+
+fn lat_finv_bbox(dx: Float, dy: Float) -> Rect {
+    lib::columns::util::rect_translate(lib::columns::util::cbox(-180., -2300., 1290., 540.), dx, dy)
+}
+
+fn lat_nmos_bbox(dx: Float, dy: Float) -> Rect {
+    lib::columns::util::rect_translate(lib::columns::util::cbox(-125., -1130., 1235., 540.), dx, dy)
+}
+
+fn lat_finv_layer_bbox(layer_id: Int, dx: Float, dy: Float) -> Rect {
+    if layer_id == 0 {
+        lib::columns::util::rect_translate(lat_q3(lib::columns::util::cbox(940., -180., 2300., 1290.)), dx, dy)
+    } else {
+        if layer_id == 1 {
+            lib::columns::util::rect_translate(lat_q3(lib::columns::util::cbox(-125., -125., 725., 1235.)), dx, dy)
+        } else {
+            lib::columns::util::rect_translate(lat_q3(lib::columns::util::cbox(995., -125., 2245., 1235.)), dx, dy)
+        }
+    }
+}
+
+fn lat_nmos_layer_bbox(dx: Float, dy: Float) -> Rect {
+    lib::columns::util::rect_translate(lat_q3(lib::columns::util::cbox(-125., -125., 1125., 1235.)), dx, dy)
+}
+
+cell folded_inv_exact() {
+    draw_lat_q3("nsdm.drawing", lib::columns::util::cbox(-125., -125., 725., 1235.));
+    draw_lat_q3("psdm.drawing", lib::columns::util::cbox(995., -125., 2245., 1235.));
+    draw_lat_q3("nwell.drawing", lib::columns::util::cbox(940., -180., 2300., 1290.));
+    draw_lat_q3("diff.drawing", lib::columns::util::cbox(0., 0., 600., 1110.));
+    draw_lat_q3("diff.drawing", lib::columns::util::cbox(1120., 0., 2120., 1110.));
+    draw_lat_q3("poly.drawing", lib::columns::util::cbox(-190., 265., 2250., 415.));
+    draw_lat_q3("poly.drawing", lib::columns::util::cbox(-190., 695., 2250., 845.));
+    let n0 = draw_lat_sd_contact(0., 600., 0, 150.);
+    let n1 = draw_lat_sd_contact(0., 600., 1, 150.);
+    let n2 = draw_lat_sd_contact(0., 600., 2, 150.);
+    let p0 = draw_lat_sd_contact(1120., 1000., 0, 150.);
+    let p1 = draw_lat_sd_contact(1120., 1000., 1, 150.);
+    let p2 = draw_lat_sd_contact(1120., 1000., 2, 150.);
+    let gate = draw_lat_q3("li1.drawing", lat_gate_raw());
+    draw_lat_q3("poly.drawing", lib::columns::util::cbox(-520., 265., -190., 845.));
+    draw_lat_q3("poly.drawing", lat_gate_poly());
+    draw_lat_q3("licon1.drawing", lat_gate_cut());
+    draw_lat_q3("npc.drawing", lat_gate_npc());
+    let yport = draw_lat_q3("li1.drawing", lat_finv_raw_y());
+    lib::columns::util::draw_box("li1.pin", gate);
+    lib::columns::util::draw_box("li1.pin", yport);
+    lib::columns::util::draw_box("li1.pin", n0);
+    lib::columns::util::draw_box("li1.pin", n2);
+    lib::columns::util::draw_box("li1.pin", p0);
+    lib::columns::util::draw_box("li1.pin", p2);
+}
+
+cell latch_nmos_exact() {
+    draw_lat_q3("nsdm.drawing", lib::columns::util::cbox(-125., -125., 1125., 1235.));
+    draw_lat_q3("diff.drawing", lib::columns::util::cbox(0., 0., 1000., 1110.));
+    draw_lat_q3("poly.drawing", lib::columns::util::cbox(-190., 265., 1130., 415.));
+    draw_lat_q3("poly.drawing", lib::columns::util::cbox(-190., 695., 1130., 845.));
+    let sd0 = draw_lat_sd_contact(0., 1000., 0, 150.);
+    let sd1 = draw_lat_sd_contact(0., 1000., 1, 150.);
+    let sd2 = draw_lat_sd_contact(0., 1000., 2, 150.);
+    let gate = draw_lat_q3("li1.drawing", lat_gate_raw());
+    draw_lat_q3("poly.drawing", lib::columns::util::cbox(-520., 265., -190., 845.));
+    draw_lat_q3("poly.drawing", lat_gate_poly());
+    draw_lat_q3("licon1.drawing", lat_gate_cut());
+    draw_lat_q3("npc.drawing", lat_gate_npc());
+    lib::columns::util::draw_box("li1.pin", gate);
+    lib::columns::util::draw_box("li1.pin", sd0);
+    lib::columns::util::draw_box("li1.pin", sd1);
+    lib::columns::util::draw_box("li1.pin", sd2);
+}
+
+fn lat_rect_with_vspan(r: Rect, span: (Float, Float)) -> Rect {
+    lib::columns::util::cbox(r.x0, span.0, r.x1, span.1)
+}
+
+fn lat_span_union(a: (Float, Float), b: (Float, Float)) -> (Float, Float) {
+    (lib::columns::util::fmin(a.0, b.0), lib::columns::util::fmax(a.1, b.1),)
+}
+
+fn lat_hspan(r: Rect) -> (Float, Float) {
+    (r.x0, r.x1,)
+}
+
+fn lat_vspan(r: Rect) -> (Float, Float) {
+    (r.y0, r.y1,)
+}
+
+fn lat_center_span(center: Float, length: Float) -> (Float, Float) {
+    let start = (((center - length / 2.) / 5.) as Int) as Float * 5.;
+    (start, start + length,)
+}
+
+fn draw_lat_li_met1(a: Rect, b: Rect) -> Rect {
+    lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", a, b, 0, 0, true).2
+}
+
+fn draw_lat_decoder_via(r: Rect) -> Rect {
+    let c0 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", r, r, 0, 0, true);
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c0.1, r, 0, 0, true).2
+}
+
+fn draw_lat_stitch(r1: Rect, r2: Rect) -> Rect {
+    lib::columns::util::draw_box("li1.drawing", lat_rect_with_vspan(r1, lat_span_union(lat_vspan(r1), lat_vspan(r2))))
+}
+
+fn draw_lat_center_tap_li_contact(area: Rect) -> Rect {
+    let short = lib::columns::util::rect_h(area) <= 700.;
+    let nx = if short { 3 } else { 2 };
+    let ny = if short { 1 } else { 3 };
+    let tap_dx = if short { 0. } else { 120. };
+    let tap_dy = if short { 120. } else { 0. };
+    let li_dx = if short { 0. } else { 80. };
+    let li_dy = if short { 80. } else { 0. };
+    let cut = 170.;
+    let pitch = 340.;
+    let aw = cut + pitch * (nx - 1) as Float;
+    let ah = cut + pitch * (ny - 1) as Float;
+    let x0 = lib::columns::util::snap5(lib::columns::util::rect_cx_i(area) - aw / 2.);
+    let y0 = lib::columns::util::snap5(lib::columns::util::rect_cy_i(area) - ah / 2.);
+    for ix in std::range(nx) {
+        for iy in std::range(ny) {
+            lib::columns::util::draw_box("licon1.drawing", lib::columns::util::cbox(x0 + ix as Float * pitch, y0 + iy as Float * pitch, x0 + ix as Float * pitch + cut, y0 + iy as Float * pitch + cut));
+        }
+    }
+    let cut_bbox = lib::columns::util::cbox(x0, y0, x0 + aw, y0 + ah);
+    let tap_bbox = lib::columns::util::cbox(cut_bbox.x0 - tap_dx, cut_bbox.y0 - tap_dy, cut_bbox.x1 + tap_dx, cut_bbox.y1 + tap_dy);
+    let li_bbox = lib::columns::util::cbox(cut_bbox.x0 - li_dx, cut_bbox.y0 - li_dy, cut_bbox.x1 + li_dx, cut_bbox.y1 + li_dy);
+    lib::columns::util::draw_box("tap.drawing", tap_bbox);
+    lib::columns::util::draw_box("li1.drawing", li_bbox);
+    tap_bbox
+}
+
+fn draw_lat_center_pair(span: (Float, Float), pspan: (Float, Float), is_vdd: Bool) -> Rect {
+    let tap_rect = lib::columns::mux::rect_shrink_all(lib::columns::util::rect_from_spans((0., 1300.,), span), 200.);
+    let power_stripe = lib::columns::util::rect_from_spans((0., 1300.,), pspan);
+    let tap_drawn = draw_lat_center_tap_li_contact(tap_rect);
+    if is_vdd {
+        lib::columns::util::draw_box("nsdm.drawing", lib::columns::mux::rect_expand_all(tap_drawn, 130.));
+    } else {
+        lib::columns::util::draw_box("psdm.drawing", lib::columns::mux::rect_expand_all(tap_drawn, 130.));
+    };
+    let tap_m1 = lib::columns::write_driver::draw_wdrv_li_met1_contact(tap_rect);
+    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", tap_m1.1, power_stripe, 0, 0, true);
+    lib::columns::util::draw_box("met2.drawing", power_stripe);
+    lib::columns::util::draw_box("met2.pin", power_stripe);
+    power_stripe
+}
+
+cell diff_latch() {
+    let fin0 = inst(folded_inv_exact(), x=0., y=0.);
+    let fin1 = inst(folded_inv_exact(), x=2070., y=0.);
+    let mn0 = inst(latch_nmos_exact(), x=0., y=-3010.);
+    let mn1 = inst(latch_nmos_exact(), x=2070., y=-3010.);
+    let fq0 = inst(folded_inv_exact(), x=0., y=-4890.);
+    let fq1 = inst(folded_inv_exact(), x=2070., y=-4890.);
+    let fo0 = inst(folded_inv_exact(), x=0., y=-7900.);
+    let fo1 = inst(folded_inv_exact(), x=2070., y=-7900.);
+
+    draw_lat_stitch(lat_finv_inst_port(1, 0., 0.), lat_nmos_inst_port(0, 0., -3010.));
+    draw_lat_stitch(lat_finv_inst_port(1, 2070., 0.), lat_nmos_inst_port(0, 2070., -3010.));
+    draw_lat_stitch(lat_nmos_inst_port(2, 0., -3010.), lat_finv_inst_port(0, 0., -4890.));
+    draw_lat_stitch(lat_nmos_inst_port(2, 2070., -3010.), lat_finv_inst_port(0, 2070., -4890.));
+    draw_lat_stitch(lat_finv_inst_port(1, 0., -4890.), lat_finv_inst_port(0, 0., -7900.));
+    draw_lat_stitch(lat_finv_inst_port(1, 2070., -4890.), lat_finv_inst_port(0, 2070., -7900.));
+
+    let al = lat_finv_inst_port(0, 0., -4890.);
+    let ar = lat_finv_inst_port(0, 2070., -4890.);
+    let m0_trackl = (al.y0, al.y0 + 170.,);
+    let m0_trackr = (m0_trackl.0 + 340., m0_trackl.1 + 340.,);
+    let vss_rectl = lat_finv_inst_port(3, 0., -4890.);
+    let vss_rectr = lat_finv_inst_port(2, 2070., -4890.);
+    let m1_trackl = (vss_rectl.x1 + 200., vss_rectl.x1 + 400.,);
+    let m1_trackr = (vss_rectr.x0 - 400., vss_rectr.x0 - 200.,);
+    let m0_track_final = (vss_rectl.y0 - 340., vss_rectl.y0 - 170.,);
+
+    let cc1 = lib::columns::util::rect_from_spans(lat_span_union(lat_hspan(al), m1_trackr), m0_trackl);
+    let cc2 = lib::columns::util::rect_from_spans(m1_trackr, lat_span_union(m0_trackl, m0_track_final));
+    let cc3 = lib::columns::util::rect_from_spans(lat_span_union(lat_hspan(ar), m1_trackr), m0_track_final);
+    lib::columns::util::draw_box("li1.drawing", cc1);
+    lib::columns::util::draw_box("met1.drawing", cc2);
+    lib::columns::util::draw_box("li1.drawing", cc3);
+    draw_lat_li_met1(cc1, cc2);
+    draw_lat_li_met1(cc3, cc2);
+
+    let cc4 = lib::columns::util::rect_from_spans(lat_span_union(lat_hspan(ar), m1_trackl), m0_trackr);
+    let cc5 = lib::columns::util::rect_from_spans(m1_trackl, lat_span_union(m0_trackr, m0_track_final));
+    let cc6 = lib::columns::util::rect_from_spans(lat_span_union(lat_hspan(al), m1_trackl), m0_track_final);
+    lib::columns::util::draw_box("li1.drawing", cc4);
+    lib::columns::util::draw_box("met1.drawing", cc5);
+    lib::columns::util::draw_box("li1.drawing", cc6);
+    draw_lat_li_met1(cc4, cc5);
+    draw_lat_li_met1(cc6, cc5);
+
+    let sa_left = -810.;
+    let sa_right = 3990.;
+    let din1_li = lat_finv_inst_port(0, 0., 0.);
+    let din1_m0 = lib::columns::util::cbox(lib::columns::util::fmin(din1_li.x0, -290.), din1_li.y0, lib::columns::util::fmax(din1_li.x1, -10.), din1_li.y1);
+    let din1 = lib::columns::util::cbox(-290., lib::columns::util::fmin(din1_li.y0, 870.), -10., lib::columns::util::fmax(din1_li.y1, 870.));
+    lib::columns::util::draw_box("li1.drawing", din1_m0);
+    lib::columns::util::draw_box("met1.drawing", din1);
+    lib::columns::util::draw_box("met1.pin", din1);
+    draw_lat_li_met1(din1_m0, din1);
+    let din2_li = lat_finv_inst_port(0, 2070., 0.);
+    let din2_m0 = lib::columns::util::cbox(lib::columns::util::fmin(din2_li.x0, 3190.), din2_li.y0, lib::columns::util::fmax(din2_li.x1, 3470.), din2_li.y1);
+    let din2 = lib::columns::util::cbox(3190., lib::columns::util::fmin(din2_li.y0, 870.), 3470., lib::columns::util::fmax(din2_li.y1, 870.));
+    lib::columns::util::draw_box("li1.drawing", din2_m0);
+    lib::columns::util::draw_box("met1.drawing", din2);
+    lib::columns::util::draw_box("met1.pin", din2);
+    draw_lat_li_met1(din2_m0, din2);
+
+    let hspan = (sa_left, sa_right,);
+    for row in std::range(3) {
+        let yvdd = lib::columns::util::rect_cy_i(lat_finv_inst_port(4, 0., if row == 0 { 0. } else { if row == 1 { -4890. } else { -7900. } }));
+        let vdd_span = lat_center_span(yvdd, 800.);
+        let vdd_stripe = lib::columns::util::rect_from_spans(hspan, vdd_span);
+        lib::columns::util::draw_box("met2.drawing", vdd_stripe);
+        lib::columns::util::draw_box("met2.pin", vdd_stripe);
+        let yoff = if row == 0 { 0. } else { if row == 1 { -4890. } else { -7900. } };
+        let p0 = lat_finv_inst_port(4, 0., yoff);
+        let p1 = lat_finv_inst_port(5, 0., yoff);
+        let p2 = lat_finv_inst_port(4, 2070., yoff);
+        let p3 = lat_finv_inst_port(5, 2070., yoff);
+        let c0 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p0, p0, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c0.1, vdd_stripe, 0, 0, true);
+        let c1 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p1, p1, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c1.1, vdd_stripe, 0, 0, true);
+        let c2 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p2, p2, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c2.1, vdd_stripe, 0, 0, true);
+        let c3 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", p3, p3, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", c3.1, vdd_stripe, 0, 0, true);
+
+        let yvss = lib::columns::util::rect_cy_i(lat_finv_inst_port(2, 0., yoff));
+        let vss_span = lat_center_span(yvss, 800.);
+        let vss_stripe = lib::columns::util::rect_from_spans(hspan, vss_span);
+        lib::columns::util::draw_box("met2.drawing", vss_stripe);
+        lib::columns::util::draw_box("met2.pin", vss_stripe);
+        let s0 = lat_finv_inst_port(2, 0., yoff);
+        let s1 = lat_finv_inst_port(3, 0., yoff);
+        let s2 = lat_finv_inst_port(2, 2070., yoff);
+        let s3 = lat_finv_inst_port(3, 2070., yoff);
+        let d0 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", s0, s0, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", d0.1, vss_stripe, 0, 0, true);
+        let d1 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", s1, s1, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", d1.1, vss_stripe, 0, 0, true);
+        let d2 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", s2, s2, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", d2.1, vss_stripe, 0, 0, true);
+        let d3 = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", s3, s3, 0, 0, true);
+        lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", d3.1, vss_stripe, 0, 0, true);
+    }
+
+    let mn_vss_span = lat_center_span(lib::columns::util::rect_cy_i(lat_nmos_inst_port(1, 0., -3010.)), 800.);
+    let mn_vss = lib::columns::util::rect_from_spans(hspan, mn_vss_span);
+    lib::columns::util::draw_box("met2.drawing", mn_vss);
+    lib::columns::util::draw_box("met2.pin", mn_vss);
+    draw_lat_decoder_via(lat_rect_with_vspan(lat_nmos_inst_port(1, 0., -3010.), mn_vss_span));
+    draw_lat_decoder_via(lat_rect_with_vspan(lat_nmos_inst_port(3, 0., -3010.), mn_vss_span));
+    draw_lat_decoder_via(lat_rect_with_vspan(lat_nmos_inst_port(1, 2070., -3010.), mn_vss_span));
+    draw_lat_decoder_via(lat_rect_with_vspan(lat_nmos_inst_port(3, 2070., -3010.), mn_vss_span));
+
+    for row in std::range(3) {
+        let yoff = if row == 0 { 0. } else { if row == 1 { -4890. } else { -7900. } };
+        let nw = lat_finv_layer_bbox(0, 0., yoff);
+        lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans(hspan, lat_vspan(nw)));
+        lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_union(lat_finv_layer_bbox(1, 0., yoff), lat_finv_layer_bbox(1, 2070., yoff)));
+        lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_union(lat_finv_layer_bbox(2, 0., yoff), lat_finv_layer_bbox(2, 2070., yoff)));
+    }
+
+    let dout1 = lat_finv_inst_port(1, 0., -7900.);
+    let dout2 = lat_finv_inst_port(1, 2070., -7900.);
+    lib::columns::util::draw_box("li1.pin", dout1);
+    lib::columns::util::draw_box("li1.pin", dout2);
+}
+
+cell diff_latch_cent() {
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(0., -10200., 1300., -8840.));
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(0., -7190., 1300., -5830.));
+    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(0., -2300., 1300., -940.));
+
+    let vss0 = draw_lat_center_pair((-8625., -7775.,), (-8600., -7800.,), false);
+    let vss1 = draw_lat_center_pair((-5615., -4765.,), (-5590., -4790.,), false);
+    let vss2 = draw_lat_center_pair((-4135., -2885.,), (-3910., -3110.,), false);
+    let vss3 = draw_lat_center_pair((-725., 125.,), (-700., 100.,), false);
+
+    let vdd0 = draw_lat_center_pair((-10145., -8895.,), (-9920., -9120.,), true);
+    let vdd1 = draw_lat_center_pair((-7135., -5885.,), (-6910., -6110.,), true);
+    let vdd2 = draw_lat_center_pair((-2245., -995.,), (-2020., -1220.,), true);
+
+    let outline = rect("layout_boundary.boundary", x0=0., y0=-10200., x1=1300., y1=870.);
+}

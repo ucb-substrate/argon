@@ -1280,9 +1280,8 @@ impl HierarchySideBar {
         count: usize,
         depth: usize,
     ) {
-        let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
-        let scope_path = &solved_cell.scope_paths[&scope];
-        let expanded = expanded_scopes.contains(scope_path);
+        let scope_state = &solved_cell.state[&scope];
+        let expanded = expanded_scopes.contains(&scope);
         if scope_state.name.to_lowercase().contains(filter) {
             rows.push(HierarchyRow {
                 scope,
@@ -1355,8 +1354,8 @@ impl HierarchySideBar {
                 .child(div().flex_1())
         };
         let tool = self.tool.clone();
-        let scope_state = &solved_cell.state[&solved_cell.scope_paths[&scope]];
-        let scope_path = solved_cell.scope_paths[&scope].clone();
+        let scope_state = &solved_cell.state[&scope];
+        let scope_path = scope;
         let expanded = self.state.read(cx).expanded_scopes.contains(&scope_path);
         let is_cell = solved_cell.output.cells[&scope.cell].root == scope.scope;
         let mut scope_name = div()
@@ -1373,7 +1372,6 @@ impl HierarchySideBar {
                 }
             ))
             .on_click({
-                let scope_path = scope_path.clone();
                 let solved_cell = solved_cell_entity.clone();
                 let canvas = self.canvas.clone();
                 move |_event, _window, cx| {
@@ -1384,7 +1382,7 @@ impl HierarchySideBar {
                         if state.selected_scope == scope_path {
                             return false;
                         }
-                        state.selected_scope = scope_path.clone();
+                        state.selected_scope = scope_path;
                         cx.notify();
                         true
                     });
@@ -1440,11 +1438,10 @@ impl HierarchySideBar {
                     .child(div().flex_1())
                     .id(SharedString::from(format!("scope_collapse_{scope:?}",)))
                     .on_click({
-                        let scope_path = scope_path.clone();
                         let state = self.state.clone();
                         move |_event, _window, cx| {
                             state.update(cx, |state, cx| {
-                                if !state.expanded_scopes.insert(scope_path.clone()) {
+                                if !state.expanded_scopes.insert(scope_path) {
                                     state.expanded_scopes.swap_remove(&scope_path);
                                 }
                                 state.rows_revision = state.rows_revision.wrapping_add(1);
@@ -1519,7 +1516,7 @@ impl HierarchySideBar {
                 .iter()
                 .enumerate()
                 .max_by_key(|(_, row)| {
-                    let name = &solved_cell.state[&solved_cell.scope_paths[&row.scope]].name;
+                    let name = &solved_cell.state[&row.scope].name;
                     let count_width = if row.count > 1 {
                         row.count.to_string().len() + 3
                     } else {
@@ -1594,7 +1591,7 @@ impl HierarchySideBar {
                     return scroll_area;
                 };
                 (
-                    cell.scopes[&cell.root].name.clone(),
+                    cell.scope_name(cell.root).to_owned(),
                     solved_cell.output.top == context_menu.cell,
                 )
             };
@@ -1953,7 +1950,7 @@ impl Render for HierarchySideBar {
                                     let mut scope_paths = IndexSet::new();
                                     if let Some(cell) = solved_cell.read(cx) {
                                         for path in cell.state.keys() {
-                                            scope_paths.insert(path.clone());
+                                            scope_paths.insert(*path);
                                         }
                                     }
                                     self_entity.read(cx).state.clone().update(cx, |state, cx| {

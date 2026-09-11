@@ -202,7 +202,6 @@ fn prepare(
             output: Arc::new(output),
             selected_scope: prepared.selected_scope,
             state: Arc::new(prepared.state),
-            scope_paths: Arc::new(prepared.scope_paths),
             hierarchy: prepared.hierarchy,
         },
         Arc::new(prepared.layers),
@@ -378,6 +377,7 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
         let spatial_index = Arc::new(RasterSpatialIndex::for_presentation(
             hierarchy_depth,
             Some(&solved.state),
+            false,
         ));
         assert!(!spatial_index.collapse_instances);
         let mut indexed = input(solved.clone(), layers.clone(), viewport, spatial_index);
@@ -586,23 +586,122 @@ fn interleaved_layers_coalesce_before_visiting_sram_leaf_shapes() {
         max_x: 33.,
         max_y: 33.,
     };
-    let (emits, occupancies) = index
+    let query = index
         .query_lod_ready_bounded(root, bounds, 8., &mut GeometryWorkBudget(256))
         .expect("zoomed-out work must follow screen detail")
         .unwrap();
-    assert!(emits.is_empty());
+    assert!(query.emits.is_empty());
     assert!(
-        occupancies.len() <= 64,
+        query.occupancies.len() <= 64,
         "interleaved layers must not force one occupancy per shape"
     );
-    assert!(occupancies.iter().all(|lod| lod.layers.len() == 1));
-    let (emits, occupancies) = index.query_lod(&solved, root, bounds, 2048, 0.);
+    assert!(query.occupancies.iter().all(|lod| lod.layers.len() == 1));
+    let query = index.query_lod(&solved, root, bounds, 2048, 0.);
     assert_eq!(
-        emits.len(),
+        query.emits.len(),
         2048,
         "zooming in must recover every original shape"
     );
-    assert!(occupancies.is_empty());
+    assert!(query.occupancies.is_empty());
+}
+
+#[gpui::test]
+fn fully_visible_render_index_skips_execution_scope_tree(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        r#"
+cell top() {
+    for row in std::range(8) {
+        for col in std::range(8) {
+            let shape = rect(
+                "met1",
+                x0=(col as Float) * 2.,
+                y0=(row as Float) * 2.,
+                x1=(col as Float) * 2. + 1.,
+                y1=(row as Float) * 2. + 1.,
+            );
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (solved, layers) = prepare(&source, &config);
+    let root = solved.state[&solved.selected_scope].address;
+    assert!(solved.output.cells[&root.cell].scopes.len() > 64);
+
+    let spatial_index = Arc::new(RasterSpatialIndex::default());
+    let cell_index = spatial_index.cell_index(&solved, root.cell);
+    let cell_index = cell_index.get().unwrap();
+    assert!(cell_index.scopes.is_empty());
+    assert!(cell_index.flattened.is_some());
+    let bounds = RasterBvhBounds {
+        min_x: -1.,
+        min_y: -1.,
+        max_x: 16.,
+        max_y: 16.,
+    };
+    let query = spatial_index.query_lod(&solved, root, bounds, 0, 0.);
+    assert!(query.flattened_scope_tree);
+    assert_eq!(query.emits.len(), 64);
+    assert!(query.emits.iter().all(|emit| emit.scope_depth > 0));
+
+    let viewport = ViewportTransform {
+        size: Size::new(px(64.), px(64.)),
+        screen_size: Size::new(px(64.), px(64.)),
+        scale: 3.,
+        offset: Point::new(px(4.), px(52.)),
+    };
+    let indexed = build_navigation_raster(input(
+        solved.clone(),
+        layers.clone(),
+        viewport,
+        spatial_index.clone(),
+    ))
+    .unwrap();
+    let mut linear_input = input(
+        solved.clone(),
+        layers.clone(),
+        viewport,
+        Arc::new(RasterSpatialIndex::default()),
+    );
+    linear_input.use_spatial_index = false;
+    let linear = build_navigation_raster(linear_input).unwrap();
+    assert_eq!(indexed.image.as_bytes(0), linear.image.as_bytes(0));
+
+    // The sparse/direct renderer uses the same flattened index, but preserves
+    // the original scope depth so nested geometry does not become root-editable.
+    let canvas = test_canvas(cx);
+    load_canvas(&canvas, solved, layers, cx);
+    let size = Size::new(px(400.), px(400.));
+    canvas.update(cx, |canvas, cx| {
+        canvas.update_raster_presentation(cx);
+        canvas.pending_init = false;
+        canvas.scale = 20.;
+        canvas.offset = Point::new(px(20.), px(320.));
+        canvas.raster_spatial_index = spatial_index;
+        canvas.raster_cache_enabled = false;
+        canvas.raster_prefetch_enabled = false;
+        canvas.raster_decision_refinement = None;
+    });
+    let cx = cx.add_empty_window();
+    cx.draw(
+        Point::default(),
+        size.map(gpui::AvailableSpace::Definite),
+        |_, _| CanvasElement {
+            inner: canvas.clone(),
+        },
+    );
+    canvas.update(cx, |canvas, _| {
+        assert_eq!(canvas.rects.len(), 64);
+        assert!(canvas.rects.iter().all(|(rect, _)| rect.cvars.is_none()));
+    });
 }
 
 #[test]
@@ -1352,7 +1451,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         },
         editor::CompilationPreparationContext {
             layers: layers.as_ref().clone(),
-            selected_scope: Some(before.selected_scope.clone()),
+            selected_scope: Some(before.selected_scope),
             scope_state: Some(before.state.clone()),
             previous: Some(before.clone()),
         },
@@ -1362,7 +1461,6 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         output: Arc::new(prepared.output.unwrap_valid()),
         selected_scope: metadata.selected_scope,
         state: Arc::new(metadata.state),
-        scope_paths: Arc::new(metadata.scope_paths),
         hierarchy: metadata.hierarchy,
     };
     let mut reused = RasterSpatialIndex::default();

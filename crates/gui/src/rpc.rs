@@ -11,7 +11,7 @@ use std::{
 
 use analyzer::ArgonConfig;
 use analyzer::rpc::{
-    CompilationSnapshot, CompilationUpdate, DimensionParams, FocusEditorParams, Gui,
+    CompilationSnapshot, CompressedCompilationUpdate, DimensionParams, FocusEditorParams, Gui,
     InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PathParams,
     PolygonParams, RectangleEditResult, ValueEdit,
 };
@@ -589,7 +589,18 @@ impl Gui for GuiServer {
             .unwrap();
     }
 
-    async fn update_cell(mut self, _: context::Context, update: CompilationUpdate) -> bool {
+    async fn update_cell(
+        mut self,
+        _: context::Context,
+        update: CompressedCompilationUpdate,
+    ) -> bool {
+        let update = match update.decode() {
+            Ok(update) => update,
+            Err(error) => {
+                error!("could not decode compilation update: {error}");
+                return false;
+            }
+        };
         let snapshot = {
             let mut previous = lock_unpoisoned(&self.snapshot);
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
@@ -613,8 +624,8 @@ impl Gui for GuiServer {
             return true;
         };
 
-        // Scope paths, bounding boxes, and layer usage can be expensive for a
-        // large cell. This RPC future runs on GPUI's background executor, so
+        // Hierarchy metadata, bounding boxes, and layer usage can be expensive
+        // for a large cell. This RPC future runs on GPUI's background executor, so
         // prepare the immutable presentation data here instead of blocking the
         // UI thread and freezing its activity animation.
         let snapshot = prepare_compilation_snapshot(snapshot, preparation_context);

@@ -1,0 +1,294 @@
+// SRAM22 uses a four-row body-contact pitch and a mux-ratio-wide column tile.
+// The fixed dimensions below are the published Sky130 SRAM macro boundaries.
+fn bitcell_width() -> Float { 1200. }
+fn bitcell_height() -> Float { 1580. }
+fn rowend_width() -> Float { 1300. }
+fn colend_height() -> Float { 2055. }
+fn hstrap_rows() -> Int { 4 }
+
+fn array_group_width(mux_ratio: Int) -> Float {
+    rowend_width() + mux_ratio as Float * bitcell_width()
+}
+
+fn array_center_height() -> Float {
+    (hstrap_rows() + 1) as Float * bitcell_height()
+}
+
+fn array_bottom_height() -> Float {
+    colend_height() + 2. * bitcell_height()
+}
+
+fn array_top_height() -> Float {
+    bitcell_height() + colend_height()
+}
+
+fn array_width(cols: Int, mux_ratio: Int) -> Float {
+    2. * rowend_width() + bitcell_width() + (cols / mux_ratio) as Float * array_group_width(mux_ratio)
+}
+
+fn array_height(rows: Int) -> Float {
+    array_bottom_height() + (rows / hstrap_rows()) as Float * array_center_height() + array_top_height()
+}
+
+fn bitcell_pair_x(pair: Int) -> Float {
+    rowend_width() + 2. * bitcell_width() * pair as Float
+}
+
+fn bitcell_pair_right_x(pair: Int) -> Float {
+    rowend_width() + 2. * bitcell_width() * (pair + 1) as Float
+}
+
+fn boundary_pair_x(pair: Int) -> Float {
+    rowend_width() + bitcell_width() + 2. * bitcell_width() * pair as Float
+}
+
+fn draw_regular_row(mux_ratio: Int, y: Float) -> Rect {
+    let wl = inst(lib::bitcells::macros::sp_wlstrap(), x=0., y=y);
+    for pair in std::range(mux_ratio / 2) {
+        let left = inst(lib::bitcells::macros::sp_cell(), x=bitcell_pair_x(pair), y=y, reflect=true, angle=180);
+        let right = inst(lib::bitcells::macros::sp_cell(), x=bitcell_pair_right_x(pair), y=y);
+    }
+    crect(x0=0., y0=y - bitcell_height(), x1=array_group_width(mux_ratio), y1=y)
+}
+
+fn draw_alternate_row(mux_ratio: Int, y: Float) -> Rect {
+    let wl = inst(lib::bitcells::macros::sp_wlstrap_a(), x=0., y=y, reflect=true);
+    for pair in std::range(mux_ratio / 2) {
+        let left = inst(lib::bitcells::macros::sp_cell_a(), x=bitcell_pair_x(pair), y=y, angle=180);
+        let right = inst(lib::bitcells::macros::sp_cell_a(), x=bitcell_pair_right_x(pair), y=y, reflect=true);
+    }
+    crect(x0=0., y0=y - bitcell_height(), x1=array_group_width(mux_ratio), y1=y)
+}
+
+fn draw_hstrap_row(mux_ratio: Int, y: Float) -> Rect {
+    let wl = inst(lib::bitcells::macros::sp_horiz_wlstrap(), x=0., y=y);
+    for pair in std::range(mux_ratio / 2) {
+        let left = inst(lib::bitcells::macros::sp_hstrap(), x=boundary_pair_x(pair), y=y);
+        let right = inst(lib::bitcells::macros::sp_hstrap(), x=boundary_pair_x(pair), y=y, reflect=true, angle=180);
+    }
+    crect(x0=0., y0=y - bitcell_height(), x1=array_group_width(mux_ratio), y1=y)
+}
+
+cell array_center(mux_ratio: Int) {
+    for pair in std::range(hstrap_rows() / 2) {
+        let y = bitcell_height() + 2. * bitcell_height() * pair as Float;
+        draw_alternate_row(mux_ratio, y);
+        draw_regular_row(mux_ratio, y);
+    }
+    draw_hstrap_row(mux_ratio, array_center_height());
+}
+
+cell array_bottom(mux_ratio: Int) {
+    let row_y = colend_height();
+    draw_alternate_row(mux_ratio, row_y);
+    let cent = inst(lib::bitcells::macros::sp_colend_a_p_cent(), x=0., y=row_y, reflect=true);
+    for pair in std::range(mux_ratio / 2) {
+        let left = inst(lib::bitcells::macros::sp_colend_a(), x=boundary_pair_x(pair), y=row_y, angle=180);
+        let right = inst(lib::bitcells::macros::sp_colend_a(), x=boundary_pair_x(pair), y=row_y, reflect=true);
+    }
+    draw_hstrap_row(mux_ratio, array_bottom_height());
+}
+
+cell array_top(mux_ratio: Int) {
+    let row_y = bitcell_height();
+    let cent = inst(lib::bitcells::macros::sp_colend_p_cent(), x=0., y=row_y);
+    for pair in std::range(mux_ratio / 2) {
+        let left = inst(lib::bitcells::macros::sp_colend(), x=boundary_pair_x(pair), y=row_y, reflect=true, angle=180);
+        let right = inst(lib::bitcells::macros::sp_colend(), x=boundary_pair_x(pair), y=row_y);
+    }
+    draw_regular_row(mux_ratio, row_y);
+}
+
+cell array_left() {
+    for pair in std::range(hstrap_rows() / 2) {
+        let y = bitcell_height() + 2. * bitcell_height() * pair as Float;
+        let alt_end = inst(lib::bitcells::macros::sp_rowend_a(), x=rowend_width(), y=y, reflect=true);
+        let alt_cell = inst(lib::bitcells::macros::sp_cell_a(), x=rowend_width() + bitcell_width(), y=y, reflect=true);
+        let end = inst(lib::bitcells::macros::sp_rowend(), x=rowend_width(), y=y);
+        let bitcell = inst(lib::bitcells::macros::sp_cell(), x=rowend_width() + bitcell_width(), y=y);
+    }
+    let strap_y = array_center_height();
+    let end = inst(lib::bitcells::macros::sp_rowend_hstrap(), x=rowend_width(), y=strap_y - bitcell_height(), reflect=true);
+    let strap = inst(lib::bitcells::macros::sp_hstrap(), x=rowend_width(), y=strap_y, reflect=true, angle=180);
+}
+
+cell array_right() {
+    for pair in std::range(hstrap_rows() / 2) {
+        let y = bitcell_height() + 2. * bitcell_height() * pair as Float;
+        let alt_wl = inst(lib::bitcells::macros::sp_wlstrap_a(), x=0., y=y, reflect=true);
+        let alt_cell = inst(lib::bitcells::macros::sp_cell_a(), x=rowend_width(), y=y, angle=180);
+        let alt_end = inst(lib::bitcells::macros::sp_rowend_a(), x=2. * rowend_width() - 100., y=y, angle=180);
+        let wl = inst(lib::bitcells::macros::sp_wlstrap(), x=0., y=y);
+        let bitcell = inst(lib::bitcells::macros::sp_cell(), x=rowend_width(), y=y, reflect=true, angle=180);
+        let end = inst(lib::bitcells::macros::sp_rowend(), x=2. * rowend_width() - 100., y=y, reflect=true, angle=180);
+    }
+    let strap_y = array_center_height();
+    let wl = inst(lib::bitcells::macros::sp_horiz_wlstrap(), x=0., y=strap_y);
+    let strap = inst(lib::bitcells::macros::sp_hstrap(), x=2. * rowend_width() - 100., y=strap_y);
+    let end = inst(lib::bitcells::macros::sp_rowend_hstrap(), x=2. * rowend_width() - 100., y=strap_y - bitcell_height(), angle=180);
+}
+
+cell corner_ul() {
+    let corner = inst(lib::bitcells::macros::sp_corner(), x=rowend_width(), y=bitcell_height());
+    let colend = inst(lib::bitcells::macros::sp_colend(), x=rowend_width(), y=bitcell_height());
+    let rowend = inst(lib::bitcells::macros::sp_rowend(), x=rowend_width(), y=bitcell_height());
+    let bitcell = inst(lib::bitcells::macros::sp_cell(), x=rowend_width() + bitcell_width(), y=bitcell_height());
+}
+
+cell corner_ur() {
+    let cent = inst(lib::bitcells::macros::sp_colend_p_cent(), x=0., y=bitcell_height());
+    let colend = inst(lib::bitcells::macros::sp_colend(), x=rowend_width() + bitcell_width(), y=bitcell_height(), reflect=true, angle=180);
+    let corner = inst(lib::bitcells::macros::sp_corner(), x=rowend_width() + bitcell_width(), y=bitcell_height(), reflect=true, angle=180);
+    let wl = inst(lib::bitcells::macros::sp_wlstrap(), x=0., y=bitcell_height());
+    let bitcell = inst(lib::bitcells::macros::sp_cell(), x=rowend_width(), y=bitcell_height(), reflect=true, angle=180);
+    let rowend = inst(lib::bitcells::macros::sp_rowend(), x=rowend_width() + bitcell_width(), y=bitcell_height(), reflect=true, angle=180);
+}
+
+cell corner_ll() {
+    let end_strap = inst(lib::bitcells::macros::sp_rowend_hstrap(), x=rowend_width(), y=array_bottom_height() - bitcell_height(), reflect=true);
+    let strap = inst(lib::bitcells::macros::sp_hstrap(), x=rowend_width(), y=array_bottom_height(), reflect=true, angle=180);
+    let end = inst(lib::bitcells::macros::sp_rowend_a(), x=rowend_width(), y=colend_height(), reflect=true);
+    let bitcell = inst(lib::bitcells::macros::sp_cell_a(), x=rowend_width() + bitcell_width(), y=colend_height(), reflect=true);
+    let corner = inst(lib::bitcells::macros::sp_corner_a(), x=rowend_width(), y=colend_height(), reflect=true);
+    let colend = inst(lib::bitcells::macros::sp_colend_a(), x=rowend_width(), y=colend_height(), reflect=true);
+}
+
+cell corner_lr() {
+    let strap_y = array_bottom_height();
+    let wl_strap = inst(lib::bitcells::macros::sp_horiz_wlstrap(), x=0., y=strap_y);
+    let strap = inst(lib::bitcells::macros::sp_hstrap(), x=rowend_width() + bitcell_width(), y=strap_y);
+    let end_strap = inst(lib::bitcells::macros::sp_rowend_hstrap(), x=rowend_width() + bitcell_width(), y=strap_y - bitcell_height(), angle=180);
+    let wl = inst(lib::bitcells::macros::sp_wlstrap_a(), x=0., y=colend_height(), reflect=true);
+    let bitcell = inst(lib::bitcells::macros::sp_cell_a(), x=rowend_width(), y=colend_height(), angle=180);
+    let end = inst(lib::bitcells::macros::sp_rowend_a(), x=rowend_width() + bitcell_width(), y=colend_height(), angle=180);
+    let cent = inst(lib::bitcells::macros::sp_colend_a_p_cent(), x=0., y=colend_height(), reflect=true);
+    let colend = inst(lib::bitcells::macros::sp_colend_a(), x=rowend_width() + bitcell_width(), y=colend_height(), angle=180);
+    let corner = inst(lib::bitcells::macros::sp_corner_a(), x=rowend_width() + bitcell_width(), y=colend_height(), angle=180);
+}
+
+cell sp_cell_array(rows: Int, cols: Int, mux_ratio: Int) {
+    let groups = cols / mux_ratio;
+    let row_groups = rows / hstrap_rows();
+    let left_width = rowend_width() + bitcell_width();
+    let group_width = array_group_width(mux_ratio);
+    let bottom_height = array_bottom_height();
+    let center_height = array_center_height();
+
+    let ll = inst(corner_ll(), x=0., y=0.);
+    for col in std::range(groups) {
+        let bottom = inst(array_bottom(mux_ratio), x=left_width + col as Float * group_width, y=0.);
+    }
+    let lr = inst(corner_lr(), x=left_width + groups as Float * group_width, y=0.);
+
+    for row in std::range(row_groups) {
+        let y = bottom_height + row as Float * center_height;
+        let left = inst(array_left(), x=0., y=y);
+        for col in std::range(groups) {
+            let center = inst(array_center(mux_ratio), x=left_width + col as Float * group_width, y=y);
+        }
+        let right = inst(array_right(), x=left_width + groups as Float * group_width, y=y);
+    }
+
+    let top_y = bottom_height + row_groups as Float * center_height;
+    let ul = inst(corner_ul(), x=0., y=top_y);
+    for col in std::range(groups) {
+        let top = inst(array_top(mux_ratio), x=left_width + col as Float * group_width, y=top_y);
+    }
+    let ur = inst(corner_ur(), x=left_width + groups as Float * group_width, y=top_y);
+    let outline = crect(x0=0., y0=0., x1=array_width(cols, mux_ratio), y1=array_height(rows));
+}
+
+// The replica array reuses the same foundry macros, but has its own two-column
+// tile and an extended substrate-tap cell along each side.
+fn replica_pair_width() -> Float { 2. * bitcell_width() }
+
+fn replica_row_groups(rows: Int) -> Int {
+    (rows - 2 + hstrap_rows() - 1) / hstrap_rows()
+}
+
+fn replica_right_origin(cols: Int) -> Float {
+    2. * rowend_width() + (cols / 2) as Float * replica_pair_width()
+}
+
+cell replica_tap_end() {
+    let tap = inst(lib::bitcells::macros::sp_rowtapend_replica(), x=2520., y=bitcell_height(), reflect=true, angle=180);
+    let end = inst(lib::bitcells::macros::sp_rowend_hstrap(), x=3820., y=0., reflect=true);
+}
+
+cell replica_center() {
+    let strap_left = inst(lib::bitcells::macros::sp_hstrap(), x=0., y=array_center_height(), reflect=true, angle=180);
+    let strap_right = inst(lib::bitcells::macros::sp_hstrap(), x=replica_pair_width(), y=array_center_height());
+    for pair in std::range(hstrap_rows() / 2) {
+        let y = bitcell_height() + 2. * bitcell_height() * pair as Float;
+        let alt_left = inst(lib::bitcells::macros::sp_cell_a_replica(), x=bitcell_width(), y=y, reflect=true);
+        let alt_right = inst(lib::bitcells::macros::sp_cell_a_replica(), x=bitcell_width(), y=y, angle=180);
+        let left = inst(lib::bitcells::macros::sp_cell_replica(), x=bitcell_width(), y=y);
+        let right = inst(lib::bitcells::macros::sp_cell_replica(), x=bitcell_width(), y=y, reflect=true, angle=180);
+    }
+}
+
+cell replica_top() {
+    let row_y = bitcell_height();
+    let col_left = inst(lib::bitcells::macros::sp_colend(), x=0., y=row_y);
+    let col_right = inst(lib::bitcells::macros::sp_colend(), x=replica_pair_width(), y=row_y, reflect=true, angle=180);
+    let left = inst(lib::bitcells::macros::sp_cell_replica(), x=bitcell_width(), y=row_y);
+    let right = inst(lib::bitcells::macros::sp_cell_replica(), x=bitcell_width(), y=row_y, reflect=true, angle=180);
+}
+
+cell replica_bottom() {
+    let row_y = colend_height();
+    let strap_left = inst(lib::bitcells::macros::sp_hstrap(), x=0., y=array_bottom_height(), reflect=true, angle=180);
+    let strap_right = inst(lib::bitcells::macros::sp_hstrap(), x=replica_pair_width(), y=array_bottom_height());
+    let left = inst(lib::bitcells::macros::sp_cell_a_replica(), x=bitcell_width(), y=row_y, reflect=true);
+    let right = inst(lib::bitcells::macros::sp_cell_a_replica(), x=bitcell_width(), y=row_y, angle=180);
+    let col_left = inst(lib::bitcells::macros::sp_colend_a(), x=0., y=row_y, reflect=true);
+    let col_right = inst(lib::bitcells::macros::sp_colend_a(), x=replica_pair_width(), y=row_y, angle=180);
+}
+
+cell replica_left() {
+    let tap = inst(replica_tap_end(), x=-2520., y=array_center_height() - bitcell_height());
+    for pair in std::range(hstrap_rows() / 2) {
+        let y = bitcell_height() + 2. * bitcell_height() * pair as Float;
+        let alt = inst(lib::bitcells::macros::sp_rowend_a_replica(), x=rowend_width(), y=y, reflect=true);
+        let regular = inst(lib::bitcells::macros::sp_rowend_replica(), x=rowend_width(), y=y);
+    }
+}
+
+cell replica_corner_top() {
+    let corner = inst(lib::bitcells::macros::sp_corner(), x=rowend_width(), y=bitcell_height());
+    let end = inst(lib::bitcells::macros::sp_rowend_replica(), x=rowend_width(), y=bitcell_height());
+}
+
+cell replica_corner_bottom() {
+    let tap = inst(replica_tap_end(), x=-2520., y=array_bottom_height() - bitcell_height());
+    let end = inst(lib::bitcells::macros::sp_rowend_a_replica(), x=rowend_width(), y=colend_height(), reflect=true);
+    let corner = inst(lib::bitcells::macros::sp_corner_a(), x=rowend_width(), y=colend_height(), reflect=true);
+}
+
+cell replica_cell_array(rows: Int, cols: Int) {
+    let groups = cols / 2;
+    let row_groups = replica_row_groups(rows);
+    let right_x = replica_right_origin(cols);
+
+    let ll = inst(replica_corner_bottom(), x=0., y=0.);
+    for col in std::range(groups) {
+        let bottom = inst(replica_bottom(), x=rowend_width() + col as Float * replica_pair_width(), y=0.);
+    }
+    let lr = inst(replica_corner_bottom(), x=right_x, y=0., reflect=true, angle=180);
+
+    for row in std::range(row_groups) {
+        let y = array_bottom_height() + row as Float * array_center_height();
+        let left = inst(replica_left(), x=0., y=y);
+        for col in std::range(groups) {
+            let center = inst(replica_center(), x=rowend_width() + col as Float * replica_pair_width(), y=y);
+        }
+        let right = inst(replica_left(), x=right_x, y=y, reflect=true, angle=180);
+    }
+
+    let top_y = array_bottom_height() + row_groups as Float * array_center_height();
+    let ul = inst(replica_corner_top(), x=0., y=top_y);
+    for col in std::range(groups) {
+        let top = inst(replica_top(), x=rowend_width() + col as Float * replica_pair_width(), y=top_y);
+    }
+    let ur = inst(replica_corner_top(), x=right_x, y=top_y, reflect=true, angle=180);
+}
