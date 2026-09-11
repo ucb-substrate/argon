@@ -5,6 +5,12 @@ use nalgebra::{CsMatrix, DMatrix, DVector};
 use serde::{Deserialize, Serialize};
 use sparse_linear_solver::{analyze as analyze_sparse_system, nullspace as sparse_nullspace};
 use std::collections::VecDeque;
+use std::hash::BuildHasherDefault;
+
+use fnv::FnvHasher;
+
+type FnvIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FnvHasher>>;
+type FnvIndexSet<T> = IndexSet<T, BuildHasherDefault<FnvHasher>>;
 
 /// Cumulative `solve()` accounting, for attributing compile time between
 /// evaluation and the linear solver.
@@ -73,19 +79,19 @@ pub struct Solver {
     grid: f64,
     next_var: u64,
     next_constraint: ConstraintId,
-    constraints: IndexMap<ConstraintId, LinearExpr>,
-    var_to_constraints: IndexMap<Var, IndexSet<ConstraintId>>,
+    constraints: FnvIndexMap<ConstraintId, LinearExpr>,
+    var_to_constraints: FnvIndexMap<Var, FnvIndexSet<ConstraintId>>,
     // Solved and unsolved vars are separate to reduce overhead of many solved variables.
-    solved_vars: IndexMap<Var, f64>,
-    unsolved_vars: IndexSet<Var>,
-    updated_vars: IndexSet<Var>,
+    solved_vars: FnvIndexMap<Var, f64>,
+    unsolved_vars: FnvIndexSet<Var>,
+    updated_vars: FnvIndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
-    inconsistent_constraints: IndexSet<ConstraintId>,
+    inconsistent_constraints: FnvIndexSet<ConstraintId>,
     /// Variables whose solved value missed the grid, with the value the
     /// solver computed. Rounding each variable in isolation can break a
     /// constraint that couples several of them, so the diagnostic needs the
     /// number, not just the fact that a miss happened.
-    off_grid_vars: IndexMap<Var, f64>,
+    off_grid_vars: FnvIndexMap<Var, f64>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
@@ -105,14 +111,14 @@ impl Default for Solver {
             grid: DEFAULT_GRID,
             next_var: 0,
             next_constraint: 0,
-            constraints: IndexMap::new(),
-            var_to_constraints: IndexMap::new(),
-            solved_vars: IndexMap::new(),
-            unsolved_vars: IndexSet::new(),
-            updated_vars: IndexSet::new(),
+            constraints: FnvIndexMap::default(),
+            var_to_constraints: FnvIndexMap::default(),
+            solved_vars: FnvIndexMap::default(),
+            unsolved_vars: FnvIndexSet::default(),
+            updated_vars: FnvIndexSet::default(),
             back_substitute_stack: Vec::new(),
-            inconsistent_constraints: IndexSet::new(),
-            off_grid_vars: IndexMap::new(),
+            inconsistent_constraints: FnvIndexSet::default(),
+            off_grid_vars: FnvIndexMap::default(),
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
@@ -157,8 +163,11 @@ impl Solver {
     /// its own label. That is what lets a caller apply several pending
     /// constraints in one round, as long as their variables carry disjoint
     /// labels.
-    pub fn unsolved_var_components(&self) -> IndexMap<Var, Var> {
-        let mut labels = IndexMap::with_capacity(self.unsolved_vars.len());
+    pub fn unsolved_var_components(&self) -> FnvIndexMap<Var, Var> {
+        let mut labels = FnvIndexMap::with_capacity_and_hasher(
+            self.unsolved_vars.len(),
+            BuildHasherDefault::default(),
+        );
         let mut queue = VecDeque::new();
         for &root in &self.unsolved_vars {
             if labels.contains_key(&root) {
@@ -196,7 +205,7 @@ impl Solver {
     pub fn unsolved_component_labels(
         &self,
         expr: &LinearExpr,
-        labels: &IndexMap<Var, Var>,
+        labels: &FnvIndexMap<Var, Var>,
     ) -> Vec<Var> {
         expr.coeffs
             .iter()
@@ -216,7 +225,7 @@ impl Solver {
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
             let labels = self.unsolved_var_components();
-            let mut claimed = IndexSet::new();
+            let mut claimed = FnvIndexSet::default();
             let mut pinned = false;
             // Collected rather than cloning the `IndexSet`, which would
             // rebuild its hash table for a list this only iterates.
@@ -246,12 +255,12 @@ impl Solver {
     }
 
     #[inline]
-    pub fn inconsistent_constraints(&self) -> &IndexSet<ConstraintId> {
+    pub fn inconsistent_constraints(&self) -> &FnvIndexSet<ConstraintId> {
         &self.inconsistent_constraints
     }
 
     #[inline]
-    pub fn updated_vars(&self) -> &IndexSet<Var> {
+    pub fn updated_vars(&self) -> &FnvIndexSet<Var> {
         &self.updated_vars
     }
 
@@ -261,7 +270,7 @@ impl Solver {
     }
 
     #[inline]
-    pub fn off_grid_vars(&self) -> &IndexMap<Var, f64> {
+    pub fn off_grid_vars(&self) -> &FnvIndexMap<Var, f64> {
         &self.off_grid_vars
     }
 
@@ -272,7 +281,7 @@ impl Solver {
         self.grid
     }
 
-    pub fn unsolved_vars(&self) -> &IndexSet<Var> {
+    pub fn unsolved_vars(&self) -> &FnvIndexSet<Var> {
         &self.unsolved_vars
     }
 
@@ -576,7 +585,7 @@ impl Solver {
         }
         let mut output = Vec::new();
         for component in self.constraint_components() {
-            let var_indices: IndexMap<Var, usize> = IndexMap::from_iter(
+            let var_indices: FnvIndexMap<Var, usize> = FnvIndexMap::from_iter(
                 component
                     .vars
                     .iter()
@@ -669,7 +678,7 @@ impl Solver {
         Some(crate::tech::snap(self.eval_expr_exact(expr)?, self.grid))
     }
 
-    fn solve_component(&mut self, vars: &IndexSet<Var>, constraints: &[ConstraintId]) {
+    fn solve_component(&mut self, vars: &FnvIndexSet<Var>, constraints: &[ConstraintId]) {
         let n_vars = vars.len();
         if n_vars == 0 || constraints.is_empty() {
             return;
@@ -685,8 +694,8 @@ impl Solver {
             return;
         }
         self.sparse_nullspace_cache = None;
-        let var_indices: IndexMap<Var, usize> =
-            IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let var_indices: FnvIndexMap<Var, usize> =
+            FnvIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(constraints.iter().enumerate().flat_map(|(row, id)| {
                 self.constraints[id].coeffs.iter().map({
@@ -737,11 +746,11 @@ impl Solver {
     /// variables are uniquely determined by the CGLS particular solution.
     fn try_solve_sparse_component(
         &mut self,
-        vars: &IndexSet<Var>,
+        vars: &FnvIndexSet<Var>,
         constraints: &[ConstraintId],
     ) -> bool {
-        let var_indices: IndexMap<Var, usize> =
-            IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let var_indices: FnvIndexMap<Var, usize> =
+            FnvIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let rows: Vec<Vec<(usize, f64)>> = constraints
             .iter()
             .map(|id| {
@@ -783,7 +792,7 @@ impl Solver {
 
     fn rowspace_component_vecs(
         &self,
-        vars: &IndexSet<Var>,
+        vars: &FnvIndexSet<Var>,
         constraints: &[ConstraintId],
     ) -> Vec<Vec<(f64, Var)>> {
         let n_vars = vars.len();
@@ -794,8 +803,8 @@ impl Solver {
         if !self.component_is_finite(constraints) {
             return Vec::new();
         }
-        let var_indices: IndexMap<Var, usize> =
-            IndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let var_indices: FnvIndexMap<Var, usize> =
+            FnvIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(constraints.iter().enumerate().flat_map(|(row, id)| {
                 self.constraints[id].coeffs.iter().map({
@@ -832,8 +841,8 @@ impl Solver {
     }
 
     fn constraint_components(&self) -> Vec<ConstraintComponent> {
-        let mut visited_vars = IndexSet::new();
-        let mut visited_constraints = IndexSet::new();
+        let mut visited_vars = FnvIndexSet::default();
+        let mut visited_constraints = FnvIndexSet::default();
         let mut components = Vec::new();
 
         for &root_var in &self.unsolved_vars {
@@ -841,7 +850,7 @@ impl Solver {
                 continue;
             }
             let mut queue = VecDeque::from([root_var]);
-            let mut vars = IndexSet::from([root_var]);
+            let mut vars = FnvIndexSet::from_iter([root_var]);
             let mut constraints = Vec::new();
 
             while let Some(var) = queue.pop_front() {
@@ -909,7 +918,7 @@ fn coalesce_terms(expr: &mut LinearExpr) {
 }
 
 struct ConstraintComponent {
-    vars: IndexSet<Var>,
+    vars: FnvIndexSet<Var>,
     constraints: Vec<ConstraintId>,
 }
 
@@ -938,7 +947,7 @@ impl LinearExpr {
     }
 
     /// Substitutes variables in `table` and removes entries with coefficient 0.
-    pub fn simplify(&mut self, table: &IndexMap<Var, f64>) {
+    fn simplify(&mut self, table: &FnvIndexMap<Var, f64>) {
         let (l, r): (Vec<f64>, Vec<_>) = self.coeffs.iter().partition_map(|a @ (coeff, var)| {
             if relative_eq!(*coeff, 0., epsilon = EPSILON) {
                 return Either::Left(0.);

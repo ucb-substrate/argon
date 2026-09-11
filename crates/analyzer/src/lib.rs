@@ -17,7 +17,7 @@ use std::{
         Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc::Library;
@@ -34,7 +34,10 @@ use argonc::{
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
-use rpc::{CompilationSnapshot, GuiClient, InstancePreview, LangServer, insert_statement};
+use rpc::{
+    CompilationSnapshot, CompressedCompilationUpdate, GuiClient, InstancePreview, LangServer,
+    insert_statement,
+};
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tokio::{
@@ -58,6 +61,19 @@ use crate::document::{Document, DocumentChange, PositionEncoding};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
+
+// tarpc gives every new context a ten-second deadline. A compilation update can
+// contain a complete native layout, and both transferring it and preparing its
+// GUI hierarchy are legitimately unbounded with respect to that default. tarpc
+// has no deadline-free context, so give snapshot delivery an effectively
+// unlimited horizon. Connection loss still fails the request immediately.
+const GUI_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn gui_snapshot_context() -> context::Context {
+    let mut context = context::current();
+    context.deadline = Instant::now() + GUI_SNAPSHOT_DEADLINE;
+    context
+}
 
 fn completion_trigger_characters() -> Vec<String> {
     // Neovim's native LSP completion uses the server's trigger characters for
@@ -966,6 +982,8 @@ impl Backend {
         &self,
         identity: &CompileIdentity,
         snapshot: CompilationSnapshot,
+        progress: &OngoingProgress<Unbounded, NotCancellable>,
+        pipeline_started: Instant,
     ) -> Option<GuiConnection> {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
@@ -974,6 +992,23 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
+        let geometry = match &snapshot.output {
+            CompileOutput::Valid(data) => Some(data),
+            CompileOutput::ExecErrors(output) => output.output.as_ref(),
+            CompileOutput::FatalParseErrors | CompileOutput::StaticErrors(_) => None,
+        };
+        let detail = geometry.map(|data| {
+            let scopes: usize = data.cells.values().map(|cell| cell.scopes.len()).sum();
+            let objects: usize = data.cells.values().map(|cell| cell.objects.len()).sum();
+            format!(" ({} scopes, {} objects)", scopes, objects)
+        });
+        progress
+            .report(format!(
+                "Compressing layout snapshot{}; compilation took {:.1}s",
+                detail.as_deref().unwrap_or_default(),
+                pipeline_started.elapsed().as_secs_f64(),
+            ))
+            .await;
         // Serialize updates per connection so each delta names an acknowledged
         // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
         let mut previous = connection.snapshot.lock().await;
@@ -981,23 +1016,86 @@ impl Backend {
             return None;
         }
         let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
+        let compression_started = Instant::now();
+        let update = self.compress_gui_update(update).await?;
+        let compressed_mib = update.encoded_len() as f64 / (1024. * 1024.);
+        progress
+            .report(format!(
+                "Transferring {:.1} MiB and preparing layout in GUI; compression took {:.1}s",
+                compressed_mib,
+                compression_started.elapsed().as_secs_f64(),
+            ))
+            .await;
+        let gui_started = Instant::now();
         let result = connection
             .client
-            .update_cell(context::current(), update)
+            .update_cell(gui_snapshot_context(), update)
             .await;
-        if !self.handle_gui_result(&connection, result).await? {
+        if self.handle_gui_result(&connection, result).await? {
+            progress
+                .report(format!(
+                    "Layout ready; GUI transfer/preparation took {:.1}s ({:.1}s total)",
+                    gui_started.elapsed().as_secs_f64(),
+                    pipeline_started.elapsed().as_secs_f64(),
+                ))
+                .await;
+        } else {
+            progress
+                .report("GUI requested a full snapshot; recompressing layout")
+                .await;
+            let retry_started = Instant::now();
             let full = rpc::CompilationUpdate::new(snapshot.clone(), None);
+            let full = self.compress_gui_update(full).await?;
+            progress
+                .report(format!(
+                    "Transferring {:.1} MiB full layout and preparing it in GUI",
+                    full.encoded_len() as f64 / (1024. * 1024.),
+                ))
+                .await;
             let result = connection
                 .client
-                .update_cell(context::current(), full)
+                .update_cell(gui_snapshot_context(), full)
                 .await;
             if !self.handle_gui_result(&connection, result).await? {
                 return None;
             }
+            progress
+                .report(format!(
+                    "Layout ready; full-snapshot retry took {:.1}s ({:.1}s total)",
+                    retry_started.elapsed().as_secs_f64(),
+                    pipeline_started.elapsed().as_secs_f64(),
+                ))
+                .await;
         }
         *previous = Some(snapshot);
         drop(previous);
         Some(connection)
+    }
+
+    async fn compress_gui_update(
+        &self,
+        update: rpc::CompilationUpdate,
+    ) -> Option<CompressedCompilationUpdate> {
+        match tokio::task::spawn_blocking(move || CompressedCompilationUpdate::encode(&update))
+            .await
+        {
+            Ok(Ok(update)) => Some(update),
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not encode the GUI snapshot: {error}"),
+                    )
+                    .await;
+                None
+            }
+        }
     }
 
     async fn handle_gui_result<T>(
@@ -1024,10 +1122,17 @@ impl Backend {
     }
 
     async fn update_cell(&self, identity: CompileIdentity) -> Option<GuiConnection> {
+        let pipeline_started = Instant::now();
         let activity = self.state.begin_compilation(&identity).await;
         let result = async {
             let snapshot = self.compile_snapshot(identity.clone()).await?;
-            self.send_cell_update(&identity, snapshot).await
+            self.send_cell_update(
+                &identity,
+                snapshot,
+                &activity.editor_progress,
+                pipeline_started,
+            )
+            .await
         }
         .await;
         self.state.finish_compilation(activity).await;
@@ -1378,7 +1483,7 @@ fn preview_instance_cell(
 ) -> Option<compile::CellId> {
     output.cells.values().find_map(|cell| {
         cell.scopes.values().find_map(|scope| {
-            scope.bindings.values().find_map(|(name, objects)| {
+            scope.bindings.iter().find_map(|(_, (name, objects))| {
                 if name != preview_binding {
                     return None;
                 }

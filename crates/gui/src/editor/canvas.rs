@@ -1284,7 +1284,7 @@ pub struct LayoutCanvas {
     /// Conservative world-space bounds for everything the active presentation
     /// can draw. If retained tiles contain this box, zooming out may expose
     /// uncovered background but cannot expose missing geometry.
-    raster_layout_bbox: Option<compile::Rect<f64>>,
+    raster_layout_bbox: Option<Arc<compile::Rect<f64>>>,
     raster_dark_mode: bool,
     cell_raster_tiles: Arc<Mutex<CellRasterTileCache>>,
     raster_spatial_index: Arc<RasterSpatialIndex>,
@@ -1889,128 +1889,224 @@ fn instance_fits_lod(pixel_bounds: Bounds<Pixels>, lod_size: f32) -> bool {
 }
 
 struct RasterCellSpatialIndex {
+    root: compile::ScopeId,
     scopes: HashMap<ScopeAddress, RasterScopeBvh>,
+    /// Render-only view of a fully expanded cell. Execution scopes are kept in
+    /// `CompiledCell` for editing, but their empty nodes are not part of the
+    /// renderer's traversal graph.
+    flattened: Option<RasterFlattenedCellIndex>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RasterEmitRef {
+    scope: compile::ScopeId,
+    emit_index: usize,
+    /// Number of execution-scope edges between the cell root and `scope`.
+    scope_depth: usize,
+}
+
+struct RasterFlattenedCellIndex {
+    bvh: RasterScopeBvh,
+    emits: Box<[RasterEmitRef]>,
+}
+
+struct RasterLodQuery {
+    emits: Vec<RasterEmitRef>,
+    occupancies: Vec<RasterLodOccupancy>,
+    /// The query covered every execution scope in the cell. Its caller must
+    /// not enqueue `CompiledScope::children` again.
+    flattened_scope_tree: bool,
+}
+
+fn append_raster_bvh_item(
+    solved: &CompileOutputState,
+    index: &RasterSpatialIndex,
+    cell: CellId,
+    object: ObjectId,
+    item_index: usize,
+    items: &mut IndexMap<Option<SharedString>, Vec<RasterBvhItem>>,
+    unbounded: &mut Vec<usize>,
+) {
+    let value = &solved.output.cells[&cell].objects[&object];
+    let lod_layer = match value {
+        SolvedValue::Rect(rect) if !rect.construction => rect
+            .layer
+            .as_ref()
+            .map(|layer| SharedString::from(layer.to_string())),
+        SolvedValue::Polygon(polygon) => Some(SharedString::from(polygon.layer.clone())),
+        SolvedValue::Path(path) => Some(SharedString::from(path.layer.clone())),
+        _ => None,
+    };
+    // The outer Option distinguishes an unbounded but render-relevant object
+    // (a dimension) from construction-only/non-rendered values.
+    let bounds = match value {
+        SolvedValue::Rect(rect) if !rect.construction => Some(Some(RasterBvhBounds {
+            min_x: rect.x0.0.min(rect.x1.0),
+            min_y: rect.y0.0.min(rect.y1.0),
+            max_x: rect.x0.0.max(rect.x1.0),
+            max_y: rect.y0.0.max(rect.y1.0),
+        })),
+        SolvedValue::Polygon(polygon) => Some(RasterBvhBounds::from_points(
+            polygon.points.iter().map(|(x, y)| (x.0, y.0)),
+        )),
+        SolvedValue::Path(path) => Some(path.bbox().map(|bbox| RasterBvhBounds {
+            min_x: bbox.x0.min(bbox.x1),
+            min_y: bbox.y0.min(bbox.y1),
+            max_x: bbox.x0.max(bbox.x1),
+            max_y: bbox.y0.max(bbox.y1),
+        })),
+        SolvedValue::Instance(instance) if !instance.construction => {
+            let child_scope = ScopeAddress {
+                cell: instance.cell,
+                scope: solved.output.cells[&instance.cell].root,
+            };
+            Some(
+                solved
+                    .state
+                    .get(&child_scope)
+                    .and_then(|scope| scope.bbox.as_ref())
+                    .map(|bbox| {
+                        let mut instance_mat = TransformationMatrix::identity();
+                        if instance.reflect {
+                            instance_mat = instance_mat.reflect_vert();
+                        }
+                        instance_mat = instance_mat.rotate(instance.angle);
+                        RasterBvhBounds {
+                            min_x: bbox.x0.min(bbox.x1),
+                            min_y: bbox.y0.min(bbox.y1),
+                            max_x: bbox.x0.max(bbox.x1),
+                            max_y: bbox.y0.max(bbox.y1),
+                        }
+                        .transformed(instance_mat, (instance.x, instance.y))
+                    }),
+            )
+        }
+        SolvedValue::Text(text) => Some(Some(RasterBvhBounds {
+            min_x: text.x,
+            min_y: text.y,
+            max_x: text.x,
+            max_y: text.y,
+        })),
+        SolvedValue::Dimension(_) => Some(None),
+        _ => None,
+    };
+    let Some(bounds) = bounds else { return };
+    let instance_layers = if index.collapse_instances
+        && let SolvedValue::Instance(instance) = value
+        && !instance.construction
+    {
+        Some(
+            index
+                .layer_extents(solved, instance.cell)
+                .iter()
+                .map(|(layer, _)| layer.clone())
+                .collect::<Arc<[SharedString]>>(),
+        )
+    } else {
+        None
+    };
+    if let Some(bounds) = bounds {
+        items
+            .entry(lod_layer.clone())
+            .or_default()
+            .push(RasterBvhItem {
+                emit_index: item_index,
+                bounds,
+                lod_layer,
+                instance_layers,
+            });
+    } else {
+        unbounded.push(item_index);
+    }
+}
+
+fn finish_raster_scope_bvh(
+    items: IndexMap<Option<SharedString>, Vec<RasterBvhItem>>,
+    unbounded: Vec<usize>,
+) -> RasterScopeBvh {
+    RasterScopeBvh {
+        roots: items
+            .into_values()
+            .filter_map(RasterBvhNode::build)
+            .collect(),
+        unbounded: unbounded.into_boxed_slice(),
+    }
 }
 
 impl RasterCellSpatialIndex {
     fn build(solved: &CompileOutputState, cell: CellId, index: &RasterSpatialIndex) -> Self {
-        let mut scopes = HashMap::new();
         let cell_info = &solved.output.cells[&cell];
-        for (&scope, scope_info) in &cell_info.scopes {
-            let mut items: IndexMap<Option<SharedString>, Vec<RasterBvhItem>> = IndexMap::new();
+        if index.flatten_execution_scopes {
+            let mut items = IndexMap::new();
             let mut unbounded = Vec::new();
-            for (emit_index, (object, _)) in scope_info.emit.iter().enumerate() {
-                let value = &cell_info.objects[object];
-                let lod_layer = match value {
-                    SolvedValue::Rect(rect) if !rect.construction => rect
-                        .layer
-                        .as_ref()
-                        .map(|layer| SharedString::from(layer.to_string())),
-                    SolvedValue::Polygon(polygon) => {
-                        Some(SharedString::from(polygon.layer.clone()))
-                    }
-                    SolvedValue::Path(path) => Some(SharedString::from(path.layer.clone())),
-                    _ => None,
-                };
-                let bounds = match value {
-                    SolvedValue::Rect(rect) if !rect.construction => Some(RasterBvhBounds {
-                        min_x: rect.x0.0.min(rect.x1.0),
-                        min_y: rect.y0.0.min(rect.y1.0),
-                        max_x: rect.x0.0.max(rect.x1.0),
-                        max_y: rect.y0.0.max(rect.y1.0),
-                    }),
-                    SolvedValue::Polygon(polygon) => {
-                        RasterBvhBounds::from_points(polygon.points.iter().map(|(x, y)| (x.0, y.0)))
-                    }
-                    SolvedValue::Path(path) => path.bbox().map(|bbox| RasterBvhBounds {
-                        min_x: bbox.x0.min(bbox.x1),
-                        min_y: bbox.y0.min(bbox.y1),
-                        max_x: bbox.x0.max(bbox.x1),
-                        max_y: bbox.y0.max(bbox.y1),
-                    }),
-                    SolvedValue::Instance(instance) if !instance.construction => {
-                        let child_scope = ScopeAddress {
-                            cell: instance.cell,
-                            scope: solved.output.cells[&instance.cell].root,
-                        };
-                        solved
-                            .scope_paths
-                            .get(&child_scope)
-                            .and_then(|path| solved.state.get(path))
-                            .and_then(|scope| scope.bbox.as_ref())
-                            .map(|bbox| {
-                                let mut instance_mat = TransformationMatrix::identity();
-                                if instance.reflect {
-                                    instance_mat = instance_mat.reflect_vert();
-                                }
-                                instance_mat = instance_mat.rotate(instance.angle);
-                                RasterBvhBounds {
-                                    min_x: bbox.x0.min(bbox.x1),
-                                    min_y: bbox.y0.min(bbox.y1),
-                                    max_x: bbox.x0.max(bbox.x1),
-                                    max_y: bbox.y0.max(bbox.y1),
-                                }
-                                .transformed(instance_mat, (instance.x, instance.y))
-                            })
-                    }
-                    SolvedValue::Text(text) => Some(RasterBvhBounds {
-                        min_x: text.x,
-                        min_y: text.y,
-                        max_x: text.x,
-                        max_y: text.y,
-                    }),
-                    // Dimensions belong to the editable cell's overlay and do
-                    // not have a useful world bbox. Keep them in the scope's
-                    // small unbounded list so direct painting need not scan
-                    // every object in the cell to discover them.
-                    SolvedValue::Dimension(_) => None,
-                    _ => continue,
-                };
-                let mut instance_layers = None;
-                if index.collapse_instances
-                    && let SolvedValue::Instance(instance) = value
-                    && !instance.construction
-                {
-                    let child_extents = index.layer_extents(solved, instance.cell);
-                    instance_layers = Some(
-                        child_extents
-                            .iter()
-                            .map(|(layer, _)| layer.clone())
-                            .collect::<Arc<[SharedString]>>(),
+            let mut emits = Vec::new();
+            // Preserve the renderer's established breadth-first execution
+            // order. Same-layer geometry is normally idempotent, but text and
+            // hit-order metadata must not change merely because it is indexed.
+            let mut queue = VecDeque::from_iter([(cell_info.root, 0_usize)]);
+            while let Some((scope, scope_depth)) = queue.pop_front() {
+                let scope_info = &cell_info.scopes[&scope];
+                for (emit_index, (object, _)) in scope_info.emit.iter().enumerate() {
+                    let item_index = emits.len();
+                    emits.push(RasterEmitRef {
+                        scope,
+                        emit_index,
+                        scope_depth,
+                    });
+                    append_raster_bvh_item(
+                        solved,
+                        index,
+                        cell,
+                        *object,
+                        item_index,
+                        &mut items,
+                        &mut unbounded,
                     );
                 }
-                if let Some(bounds) = bounds {
-                    items
-                        .entry(lod_layer.clone())
-                        .or_default()
-                        .push(RasterBvhItem {
-                            emit_index,
-                            bounds,
-                            lod_layer,
-                            instance_layers,
-                        });
-                } else {
-                    // An instance without a solved child bbox must remain
-                    // queryable; its descendants are clipped normally.
-                    unbounded.push(emit_index);
-                }
+                queue.extend(
+                    scope_info
+                        .children
+                        .iter()
+                        .map(|child| (*child, scope_depth + 1)),
+                );
+            }
+            return Self {
+                root: cell_info.root,
+                scopes: HashMap::new(),
+                flattened: Some(RasterFlattenedCellIndex {
+                    bvh: finish_raster_scope_bvh(items, unbounded),
+                    emits: emits.into_boxed_slice(),
+                }),
+            };
+        }
+
+        let mut scopes = HashMap::new();
+        for (&scope, scope_info) in &cell_info.scopes {
+            let mut items = IndexMap::new();
+            let mut unbounded = Vec::new();
+            for (emit_index, (object, _)) in scope_info.emit.iter().enumerate() {
+                append_raster_bvh_item(
+                    solved,
+                    index,
+                    cell,
+                    *object,
+                    emit_index,
+                    &mut items,
+                    &mut unbounded,
+                );
             }
             scopes.insert(
                 ScopeAddress { cell, scope },
-                RasterScopeBvh {
-                    roots: items
-                        .into_values()
-                        .filter_map(RasterBvhNode::build)
-                        .collect(),
-                    unbounded: unbounded.into_boxed_slice(),
-                },
+                finish_raster_scope_bvh(items, unbounded),
             );
         }
-        Self { scopes }
+        Self {
+            root: cell_info.root,
+            scopes,
+            flattened: None,
+        }
     }
 }
-
-type RasterLodQuery = (Vec<usize>, Vec<RasterLodOccupancy>);
 
 struct RasterSpatialIndex {
     cells: Mutex<HashMap<CellId, Arc<OnceLock<RasterCellSpatialIndex>>>>,
@@ -2020,6 +2116,10 @@ struct RasterSpatialIndex {
     /// Whole-instance footprints cannot represent hidden descendants or a
     /// finite hierarchy cutoff. Those presentations keep instance boundaries.
     collapse_instances: bool,
+    /// A fully expanded, fully visible presentation does not need execution
+    /// scopes in its render graph. Objects retain their emitting scope so
+    /// selection and source editing still resolve normally.
+    flatten_execution_scopes: bool,
 }
 
 impl Default for RasterSpatialIndex {
@@ -2028,6 +2128,7 @@ impl Default for RasterSpatialIndex {
             cells: Mutex::default(),
             footprints: Mutex::default(),
             collapse_instances: true,
+            flatten_execution_scopes: true,
         }
     }
 }
@@ -2036,16 +2137,22 @@ impl RasterSpatialIndex {
     fn for_presentation(
         hierarchy_depth: usize,
         scopes: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+        hide_external_geometry: bool,
     ) -> Self {
+        let fully_expanded = !hide_external_geometry
+            && hierarchy_depth == usize::MAX
+            && scopes.is_none_or(|scopes| scopes.values().all(|scope| scope.visible));
         Self {
-            collapse_instances: hierarchy_depth == usize::MAX
-                && scopes.is_none_or(|scopes| scopes.values().all(|scope| scope.visible)),
+            collapse_instances: fully_expanded,
+            flatten_execution_scopes: fully_expanded,
             ..Self::default()
         }
     }
 
     fn reuse_ready_cells(&mut self, previous: &Self, unchanged: impl Fn(CellId) -> bool) {
-        if self.collapse_instances != previous.collapse_instances {
+        if self.collapse_instances != previous.collapse_instances
+            || self.flatten_execution_scopes != previous.flatten_execution_scopes
+        {
             return;
         }
         // Clone ready handles under the map lock. Never wait for a OnceLock
@@ -2092,19 +2199,53 @@ impl RasterSpatialIndex {
         let Some(cell_index) = cell_index.get() else {
             return Ok(None);
         };
-        let Some(scope) = cell_index.scopes.get(&address) else {
-            return Ok(None);
+        let (scope, flattened) = if let Some(flattened) = cell_index
+            .flattened
+            .as_ref()
+            .filter(|_| address.scope == cell_index.root)
+        {
+            (&flattened.bvh, Some(flattened))
+        } else {
+            let Some(scope) = cell_index.scopes.get(&address) else {
+                return Ok(None);
+            };
+            (scope, None)
         };
-        let mut emits = Vec::new();
+        let mut emit_indices = Vec::new();
         let mut occupancies = Vec::new();
         for root in &scope.roots {
-            root.query_lod_bounded(bounds, max_lod_span, &mut emits, &mut occupancies, budget)
-                .ok_or(())?;
+            root.query_lod_bounded(
+                bounds,
+                max_lod_span,
+                &mut emit_indices,
+                &mut occupancies,
+                budget,
+            )
+            .ok_or(())?;
         }
         budget.spend(scope.unbounded.len()).ok_or(())?;
-        emits.extend_from_slice(&scope.unbounded);
-        emits.sort_unstable();
-        Ok(Some((emits, occupancies)))
+        emit_indices.extend_from_slice(&scope.unbounded);
+        emit_indices.sort_unstable();
+        let emits = if let Some(flattened) = flattened {
+            emit_indices
+                .into_iter()
+                .map(|index| flattened.emits[index])
+                .collect()
+        } else {
+            emit_indices
+                .into_iter()
+                .map(|emit_index| RasterEmitRef {
+                    scope: address.scope,
+                    emit_index,
+                    scope_depth: 0,
+                })
+                .collect()
+        };
+        Ok(Some(RasterLodQuery {
+            emits,
+            occupancies,
+            flattened_scope_tree: flattened.is_some(),
+        }))
     }
 
     /// Build one visible cell's index on a background thread. Its children's
@@ -2220,20 +2361,71 @@ impl RasterSpatialIndex {
         bounds: RasterBvhBounds,
         emit_len: usize,
         max_lod_span: f64,
-    ) -> (Vec<usize>, Vec<RasterLodOccupancy>) {
+    ) -> RasterLodQuery {
         let cell_index = self.cell_index(solved, address.cell);
         let cell_index = cell_index.get().expect("cell index initialized above");
-        let Some(scope) = cell_index.scopes.get(&address) else {
-            return ((0..emit_len).collect(), Vec::new());
+        let (scope, flattened) = if address.scope == solved.output.cells[&address.cell].root {
+            if let Some(flattened) = &cell_index.flattened {
+                (&flattened.bvh, Some(flattened))
+            } else {
+                let Some(scope) = cell_index.scopes.get(&address) else {
+                    return RasterLodQuery {
+                        emits: (0..emit_len)
+                            .map(|emit_index| RasterEmitRef {
+                                scope: address.scope,
+                                emit_index,
+                                scope_depth: 0,
+                            })
+                            .collect(),
+                        occupancies: Vec::new(),
+                        flattened_scope_tree: false,
+                    };
+                };
+                (scope, None)
+            }
+        } else {
+            let Some(scope) = cell_index.scopes.get(&address) else {
+                return RasterLodQuery {
+                    emits: (0..emit_len)
+                        .map(|emit_index| RasterEmitRef {
+                            scope: address.scope,
+                            emit_index,
+                            scope_depth: 0,
+                        })
+                        .collect(),
+                    occupancies: Vec::new(),
+                    flattened_scope_tree: false,
+                };
+            };
+            (scope, None)
         };
-        let mut emits = Vec::new();
+        let mut emit_indices = Vec::new();
         let mut occupancies = Vec::new();
         for root in &scope.roots {
-            root.query_lod(bounds, max_lod_span, &mut emits, &mut occupancies);
+            root.query_lod(bounds, max_lod_span, &mut emit_indices, &mut occupancies);
         }
-        emits.extend_from_slice(&scope.unbounded);
-        emits.sort_unstable();
-        (emits, occupancies)
+        emit_indices.extend_from_slice(&scope.unbounded);
+        emit_indices.sort_unstable();
+        let emits = if let Some(flattened) = flattened {
+            emit_indices
+                .into_iter()
+                .map(|index| flattened.emits[index])
+                .collect()
+        } else {
+            emit_indices
+                .into_iter()
+                .map(|emit_index| RasterEmitRef {
+                    scope: address.scope,
+                    emit_index,
+                    scope_depth: 0,
+                })
+                .collect()
+        };
+        RasterLodQuery {
+            emits,
+            occupancies,
+            flattened_scope_tree: flattened.is_some(),
+        }
     }
 }
 
@@ -2837,7 +3029,7 @@ fn build_cell_raster_tile(
     width: u16,
     height: u16,
 ) -> Option<CellRasterTile> {
-    let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
+    let scope_state = &input.solved_cell.state[&address];
     let bbox = scope_state.bbox.as_ref()?;
     let p0 = ifmatvec(orientation, (bbox.x0, bbox.y0));
     let p1 = ifmatvec(orientation, (bbox.x1, bbox.y1));
@@ -2860,7 +3052,7 @@ fn build_cell_raster_tile(
     let mut queue = VecDeque::from_iter([(address, orientation, (0., 0.))]);
 
     while let Some((address @ ScopeAddress { cell, scope }, mat, ofs)) = queue.pop_front() {
-        let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
+        let scope_state = &input.solved_cell.state[&address];
         if !scope_state.visible {
             continue;
         }
@@ -3735,7 +3927,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         }
         let cell_info = &input.solved_cell.output.cells[&cell];
         let scope_info = &cell_info.scopes[&scope];
-        let scope_state = &input.solved_cell.state[&input.solved_cell.scope_paths[&address]];
+        let scope_state = &input.solved_cell.state[&address];
 
         if let Some(bbox) = &scope_state.bbox {
             let p0 = ifmatvec(mat, (bbox.x0, bbox.y0));
@@ -3845,7 +4037,11 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         }
 
         let local_query = raster_scope_query_bounds(world_query, mat, ofs, query_margin);
-        let (emit_indices, lod_occupancies) = if input.use_spatial_index {
+        let RasterLodQuery {
+            emits,
+            occupancies: lod_occupancies,
+            flattened_scope_tree,
+        } = if input.use_spatial_index {
             input.spatial_index.query_lod(
                 &input.solved_cell,
                 address,
@@ -3854,7 +4050,17 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 f64::from(geometry_lod_size / raster_scale.abs().max(f32::EPSILON)),
             )
         } else {
-            ((0..scope_info.emit.len()).collect(), Vec::new())
+            RasterLodQuery {
+                emits: (0..scope_info.emit.len())
+                    .map(|emit_index| RasterEmitRef {
+                        scope,
+                        emit_index,
+                        scope_depth: 0,
+                    })
+                    .collect(),
+                occupancies: Vec::new(),
+                flattened_scope_tree: false,
+            }
         };
         for occupancy in lod_occupancies {
             let raster_bounds = raster_bounds_for_world(
@@ -3874,11 +4080,12 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 );
             }
         }
-        for (query_index, emit_index) in emit_indices.into_iter().enumerate() {
+        for (query_index, emit) in emits.into_iter().enumerate() {
             if query_index % 256 == 0 && navigation_raster_cancelled(&input) {
                 return None;
             }
-            let (object, _) = &scope_info.emit[emit_index];
+            let emitting_scope = &cell_info.scopes[&emit.scope];
+            let (object, _) = &emitting_scope.emit[emit.emit_index];
             match &cell_info.objects[object] {
                 SolvedValue::Rect(rect) if !rect.construction => {
                     let Some(layer) = rect
@@ -4083,7 +4290,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                         },
                         mat * instance_mat,
                         (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1),
-                        depth + 1,
+                        depth + emit.scope_depth + 1,
                     ));
                 }
                 SolvedValue::Text(text)
@@ -4123,16 +4330,18 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             }
         }
 
-        for child in &scope_info.children {
-            queue.push_back((
-                ScopeAddress {
-                    cell,
-                    scope: *child,
-                },
-                mat,
-                ofs,
-                depth + 1,
-            ));
+        if !flattened_scope_tree {
+            for child in &scope_info.children {
+                queue.push_back((
+                    ScopeAddress {
+                        cell,
+                        scope: *child,
+                    },
+                    mat,
+                    ofs,
+                    depth + 1,
+                ));
+            }
         }
     }
 
@@ -5117,10 +5326,7 @@ fn solved_geometry_reaches_threshold(
     let mut queue = VecDeque::from_iter([(root, 0_usize)]);
     let mut count = 0_usize;
     while let Some((address @ ScopeAddress { cell, scope }, depth)) = queue.pop_front() {
-        let Some(path) = solved.scope_paths.get(&address) else {
-            return true;
-        };
-        let Some(scope_state) = solved.state.get(path) else {
+        let Some(scope_state) = solved.state.get(&address) else {
             return true;
         };
         if depth >= hierarchy_depth || !scope_state.visible {
@@ -5198,8 +5404,7 @@ fn visible_geometry_render_decision_indexed(
         if budget.spend(1).is_none() {
             return exceeds_ui_budget;
         }
-        let scope_path = solved.scope_paths.get(&address)?;
-        let scope_state = solved.state.get(scope_path)?;
+        let scope_state = solved.state.get(&address)?;
         if let Some(bbox) = &scope_state.bbox {
             let bounds = RasterBvhBounds {
                 min_x: bbox.x0.min(bbox.x1),
@@ -5252,7 +5457,11 @@ fn visible_geometry_render_decision_indexed(
         if build_missing_indexes {
             spatial_index.cell_index(solved, cell);
         }
-        let (emit_indices, lod_occupancies) = match spatial_index.query_lod_ready_bounded(
+        let RasterLodQuery {
+            emits,
+            occupancies: lod_occupancies,
+            flattened_scope_tree,
+        } = match spatial_index.query_lod_ready_bounded(
             address,
             local_query,
             max_lod_span,
@@ -5275,11 +5484,12 @@ fn visible_geometry_render_decision_indexed(
         if visible >= RASTER_CACHE_GEOMETRY_THRESHOLD {
             return Some(visible_geometry_render_decision(visible));
         }
-        for emit_index in emit_indices {
+        for emit in emits {
             if budget.spend(1).is_none() {
                 return exceeds_ui_budget;
             }
-            let (object, _) = &scope_info.emit[emit_index];
+            let emitting_scope = &cell_info.scopes[&emit.scope];
+            let (object, _) = &emitting_scope.emit[emit.emit_index];
             match &cell_info.objects[object] {
                 SolvedValue::Rect(rect) if !rect.construction => {
                     if rect.layer.as_ref().is_some_and(|name| {
@@ -5324,7 +5534,7 @@ fn visible_geometry_render_decision_indexed(
                         },
                         mat * instance_mat,
                         (instance_ofs.0 + ofs.0, instance_ofs.1 + ofs.1),
-                        depth + 1,
+                        depth + emit.scope_depth + 1,
                     ));
                 }
                 _ => {}
@@ -5333,20 +5543,22 @@ fn visible_geometry_render_decision_indexed(
                 return Some(visible_geometry_render_decision(visible));
             }
         }
-        if budget.spend(scope_info.children.len()).is_none() {
-            return exceeds_ui_budget;
+        if !flattened_scope_tree {
+            if budget.spend(scope_info.children.len()).is_none() {
+                return exceeds_ui_budget;
+            }
+            queue.extend(scope_info.children.iter().map(|scope| {
+                (
+                    ScopeAddress {
+                        cell,
+                        scope: *scope,
+                    },
+                    mat,
+                    ofs,
+                    depth + 1,
+                )
+            }));
         }
-        queue.extend(scope_info.children.iter().map(|scope| {
-            (
-                ScopeAddress {
-                    cell,
-                    scope: *scope,
-                },
-                mat,
-                ofs,
-                depth + 1,
-            )
-        }));
     }
     Some(visible_geometry_render_decision(visible))
 }
@@ -5368,6 +5580,35 @@ fn raster_presentation_change(
         RasterPresentationChange::Presentation
     } else {
         RasterPresentationChange::None
+    }
+}
+
+fn same_scope_name_path(
+    old_state: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+    old_scope: Option<editor::ScopePath>,
+    new_state: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+    new_scope: Option<editor::ScopePath>,
+) -> bool {
+    let (Some(old_state), Some(mut old_scope), Some(new_state), Some(mut new_scope)) =
+        (old_state, old_scope, new_state, new_scope)
+    else {
+        return old_scope.is_none() && new_scope.is_none();
+    };
+    loop {
+        let (Some(old), Some(new)) = (old_state.get(&old_scope), new_state.get(&new_scope)) else {
+            return false;
+        };
+        if old.name != new.name {
+            return false;
+        }
+        match (old.parent, new.parent) {
+            (None, None) => return true,
+            (Some(old_parent), Some(new_parent)) => {
+                old_scope = old_parent;
+                new_scope = new_parent;
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -6006,7 +6247,7 @@ impl Element for CanvasElement {
                     budget.spend(1)?;
                     let cell_info = &solved_cell.output.cells[&cell];
                     let scope_info = &cell_info.scopes[&scope];
-                    let scope_state = &solved_cell.state[&solved_cell.scope_paths[&curr_address]];
+                    let scope_state = &solved_cell.state[&curr_address];
                     if shallow && depth > 0 && scope == cell_info.root {
                         // Retained tiles already show every expanded instance and
                         // the outlines of collapsed ones. Only the editable cell's
@@ -6023,7 +6264,7 @@ impl Element for CanvasElement {
                             y0: (p0p.1.min(p1p.1) + ofs.1) as f32,
                             x1: (p0p.0.max(p1p.0) + ofs.0) as f32,
                             y1: (p0p.1.max(p1p.1) + ofs.1) as f32,
-                            id: Some(scope_info.span.clone()),
+                            id: Some(cell_info.scope_span(scope).clone()),
                             object_path: Vec::new(),
                             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
                             border_styles: Edges::all(BorderStyle::Solid),
@@ -6046,7 +6287,7 @@ impl Element for CanvasElement {
                             if show {
                                 scope_rects.push(LabeledBbox {
                                     rect,
-                                    label: scope_info.name.clone().into(),
+                                    label: cell_info.scope_name(scope).to_owned().into(),
                                     origin: None,
                                 });
                             }
@@ -6078,11 +6319,25 @@ impl Element for CanvasElement {
                     // The same screen-space LOD applies whichever tool is active.
                     // Switching to exact geometry for a selection or a drawing tool
                     // repainted every dense layer in a different rendition.
-                    let (emit_indices, lod_occupancies) = if sse_dv.is_some() && depth == 0 {
+                    let RasterLodQuery {
+                        emits,
+                        occupancies: lod_occupancies,
+                        flattened_scope_tree,
+                    } = if sse_dv.is_some() && depth == 0 {
                         // A drag moves the editable cell's solved coordinates, so
                         // its static index cannot cull; every object is visited.
                         budget.spend(scope_info.emit.len())?;
-                        ((0..scope_info.emit.len()).collect(), Vec::new())
+                        RasterLodQuery {
+                            emits: (0..scope_info.emit.len())
+                                .map(|emit_index| RasterEmitRef {
+                                    scope,
+                                    emit_index,
+                                    scope_depth: 0,
+                                })
+                                .collect(),
+                            occupancies: Vec::new(),
+                            flattened_scope_tree: false,
+                        }
                     } else {
                         let local_query = raster_scope_query_bounds(
                             direct_world_query,
@@ -6103,7 +6358,17 @@ impl Element for CanvasElement {
                             .ok()?
                             .or_else(|| {
                                 budget.spend(scope_info.emit.len())?;
-                                Some(((0..scope_info.emit.len()).collect(), Vec::new()))
+                                Some(RasterLodQuery {
+                                    emits: (0..scope_info.emit.len())
+                                        .map(|emit_index| RasterEmitRef {
+                                            scope,
+                                            emit_index,
+                                            scope_depth: 0,
+                                        })
+                                        .collect(),
+                                    occupancies: Vec::new(),
+                                    flattened_scope_tree: false,
+                                })
                             })?
                     };
                     for occupancy in lod_occupancies.iter().filter(|_| show) {
@@ -6118,15 +6383,17 @@ impl Element for CanvasElement {
                             rects.push(lod_box(bounds, layer));
                         }
                     }
-                    for emit_index in emit_indices {
+                    for emit in emits {
                         budget.spend(1)?;
-                        let (obj, _) = &scope_info.emit[emit_index];
+                        let emitting_scope = &cell_info.scopes[&emit.scope];
+                        let (obj, _) = &emitting_scope.emit[emit.emit_index];
+                        let object_depth = depth + emit.scope_depth;
                         let mut object_path = path.clone();
                         object_path.push(*obj);
                         let value = &cell_info.objects[obj];
                         match value {
                             SolvedValue::Rect(rect) => {
-                                if depth == 0
+                                if object_depth == 0
                                     && let Some(span) = &rect.span
                                 {
                                     source_coordinates.insert(
@@ -6155,7 +6422,7 @@ impl Element for CanvasElement {
                                 {
                                     let (sse_dx0, sse_dx1, sse_dy0, sse_dy1) =
                                         if let Some(ref sse_dv) = sse_dv {
-                                            if depth == 0 {
+                                            if object_depth == 0 {
                                                 (
                                                     crate::sse::dot(
                                                         &SparseVec::from(&rect.x0.1),
@@ -6193,7 +6460,7 @@ impl Element for CanvasElement {
                                             &cell_info.unsolved_vars,
                                             mat,
                                         ),
-                                        cvars: (depth == 0).then(|| Edges {
+                                        cvars: (object_depth == 0).then(|| Edges {
                                             left: rect.x0.1.clone(),
                                             right: rect.x1.1.clone(),
                                             bottom: rect.y0.1.clone(),
@@ -6218,7 +6485,7 @@ impl Element for CanvasElement {
                             }
                             SolvedValue::Polygon(polygon) => {
                                 budget.spend(polygon.points.len())?;
-                                if depth == 0
+                                if object_depth == 0
                                     && let Some(span) = &polygon.span
                                 {
                                     source_coordinates.insert(
@@ -6239,7 +6506,7 @@ impl Element for CanvasElement {
                                 let Some(layer) = layers.layers.get(polygon.layer.as_str()) else {
                                     continue;
                                 };
-                                let edge_styles = if depth == 0 {
+                                let edge_styles = if object_depth == 0 {
                                     polygon_edge_styles(polygon.points.len(), |index| {
                                         let (x, y) = &polygon.points[index];
                                         x.1.coeffs
@@ -6254,7 +6521,7 @@ impl Element for CanvasElement {
                                     .points
                                     .iter()
                                     .map(|(x, y)| {
-                                        let (dx, dy) = if depth == 0 {
+                                        let (dx, dy) = if object_depth == 0 {
                                             sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
                                                 (
                                                     crate::sse::dot(&SparseVec::from(&x.1), sse_dv),
@@ -6276,7 +6543,7 @@ impl Element for CanvasElement {
                                     edge_styles,
                                     id: polygon.span.clone(),
                                     object_path,
-                                    cvars: (depth == 0).then(|| {
+                                    cvars: (object_depth == 0).then(|| {
                                         polygon
                                             .points
                                             .iter()
@@ -6291,7 +6558,7 @@ impl Element for CanvasElement {
                             }
                             SolvedValue::Path(path) => {
                                 budget.spend(path.points.len())?;
-                                if depth == 0
+                                if object_depth == 0
                                     && let Some(span) = &path.span
                                 {
                                     let mut coordinates = path
@@ -6326,7 +6593,7 @@ impl Element for CanvasElement {
                                     continue;
                                 };
                                 let mut displayed = path.clone();
-                                if depth == 0
+                                if object_depth == 0
                                     && let Some(sse_dv) = &sse_dv
                                 {
                                     displayed.width.0 +=
@@ -6351,7 +6618,7 @@ impl Element for CanvasElement {
                                 let Some(outline) = displayed.outline() else {
                                     continue;
                                 };
-                                let segment_styles = if depth == 0 {
+                                let segment_styles = if object_depth == 0 {
                                     path_segment_styles(path.points.len(), |index| {
                                         let (x, y) = &path.points[index];
                                         x.1.coeffs
@@ -6375,7 +6642,7 @@ impl Element for CanvasElement {
                                         })
                                         .collect(),
                                     segment_styles,
-                                    cvars: (depth == 0).then(|| {
+                                    cvars: (object_depth == 0).then(|| {
                                         path.points
                                             .iter()
                                             .map(|(x, y)| (x.1.clone(), y.1.clone()))
@@ -6407,7 +6674,7 @@ impl Element for CanvasElement {
                                 if inst.construction {
                                     continue;
                                 }
-                                if depth == 0 {
+                                if object_depth == 0 {
                                     source_coordinates.insert(
                                         inst.span.clone(),
                                         vec![
@@ -6421,7 +6688,7 @@ impl Element for CanvasElement {
                                     inst_mat = inst_mat.reflect_vert()
                                 }
                                 inst_mat = inst_mat.rotate(inst.angle);
-                                let (sse_dx, sse_dy) = if depth == 0 {
+                                let (sse_dx, sse_dy) = if object_depth == 0 {
                                     sse_dv.as_ref().map_or((0., 0.), |sse_dv| {
                                         (
                                             crate::sse::dot(&SparseVec::from(&inst.x_expr), sse_dv),
@@ -6439,18 +6706,18 @@ impl Element for CanvasElement {
                                 };
                                 let new_mat = mat * inst_mat;
                                 let new_ofs = (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1);
-                                let scope_state =
-                                    &solved_cell.state[&solved_cell.scope_paths[&inst_address]];
+                                let scope_state = &solved_cell.state[&inst_address];
                                 let mut show = show;
-                                if depth + 1 >= state.hierarchy_depth || !scope_state.visible {
+                                if object_depth + 1 >= state.hierarchy_depth || !scope_state.visible
+                                {
                                     if let Some(bbox) = &scope_state.bbox {
                                         let p0p = ifmatvec(new_mat, (bbox.x0, bbox.y0));
                                         let p1p = ifmatvec(new_mat, (bbox.x1, bbox.y1));
-                                        let x_unconstrained = depth == 0
+                                        let x_unconstrained = object_depth == 0
                                             && inst.x_expr.coeffs.iter().any(|(_, var)| {
                                                 cell_info.unsolved_vars.contains(var)
                                             });
-                                        let y_unconstrained = depth == 0
+                                        let y_unconstrained = object_depth == 0
                                             && inst.y_expr.coeffs.iter().any(|(_, var)| {
                                                 cell_info.unsolved_vars.contains(var)
                                             });
@@ -6497,7 +6764,7 @@ impl Element for CanvasElement {
                                             });
                                         }
                                         if show {
-                                            if depth == 0 {
+                                            if object_depth == 0 {
                                                 instance_sse_candidates.push((
                                                     rect.clone(),
                                                     inst.span.clone(),
@@ -6540,7 +6807,7 @@ impl Element for CanvasElement {
                                     inst_address,
                                     new_mat,
                                     new_ofs,
-                                    depth + 1,
+                                    object_depth + 1,
                                     show,
                                     object_path,
                                 ));
@@ -6571,13 +6838,22 @@ impl Element for CanvasElement {
                             }
                         }
                     }
-                    budget.spend(scope_info.children.len())?;
-                    for child in &scope_info.children {
-                        let scope_address = ScopeAddress {
-                            scope: *child,
-                            cell,
-                        };
-                        queue.push_back((scope_address, mat, ofs, depth + 1, show, path.clone()));
+                    if !flattened_scope_tree {
+                        budget.spend(scope_info.children.len())?;
+                        for child in &scope_info.children {
+                            let scope_address = ScopeAddress {
+                                scope: *child,
+                                cell,
+                            };
+                            queue.push_back((
+                                scope_address,
+                                mat,
+                                ofs,
+                                depth + 1,
+                                show,
+                                path.clone(),
+                            ));
+                        }
                     }
                 }
             }
@@ -8470,6 +8746,7 @@ impl LayoutCanvas {
                     let mut spatial_index = RasterSpatialIndex::for_presentation(
                         canvas.raster_hierarchy_depth,
                         canvas.raster_scope_state.as_deref(),
+                        canvas.raster_hide_external_geometry,
                     );
                     if change == RasterPresentationChange::Geometry
                         && let Some(output) = &canvas.raster_output
@@ -8652,14 +8929,13 @@ impl LayoutCanvas {
                         }
                     };
                     let layout_bbox = solved
-                        .scope_paths
+                        .state
                         .get(&displayed)
-                        .and_then(|path| solved.state.get(path))
                         .and_then(|scope| scope.bbox.clone());
                     (
                         Some(solved.output.clone()),
                         Some(solved.state.clone()),
-                        Some(solved.selected_scope.clone()),
+                        Some(solved.selected_scope),
                         Some(displayed.cell),
                         layout_bbox,
                     )
@@ -8694,9 +8970,34 @@ impl LayoutCanvas {
             (None, None) => true,
             _ => false,
         };
-        // Source recompilation can allocate a new ID for the same selected
-        // path. Keep its old frame until replacement geometry is complete.
-        let presentation_changed = self.raster_selected_scope != selected_scope
+        // Source recompilation can allocate a new address for the same selected
+        // name path. Keep its old frame until replacement geometry is complete.
+        let same_selected_scope = same_scope_name_path(
+            self.raster_scope_state.as_deref(),
+            self.raster_selected_scope,
+            scope_state.as_deref(),
+            selected_scope,
+        );
+        if let (Some(old_state), Some(new_state), Some(new_selected)) = (
+            self.raster_scope_state.as_deref(),
+            scope_state.as_deref(),
+            selected_scope,
+        ) {
+            // Rectangle RPCs carry the scope selected when the edit was sent.
+            // Follow that same semantic scope across content-derived address
+            // changes so the preview remains until replacement pixels arrive.
+            for pending in &mut self.pending_rectangles {
+                if same_scope_name_path(
+                    Some(old_state),
+                    Some(pending.scope_path),
+                    Some(new_state),
+                    Some(new_selected),
+                ) {
+                    pending.scope_path = new_selected;
+                }
+            }
+        }
+        let presentation_changed = !same_selected_scope
             || (same_output && self.raster_displayed_cell != displayed_cell)
             || self.raster_layer_visibility != layer_visibility
             || self.raster_hierarchy_depth != hierarchy_depth
@@ -9745,10 +10046,10 @@ impl LayoutCanvas {
         if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
                 let scope_address = &cell.state[&cell.selected_scope].address;
-                cell.state[&cell.scope_paths[&ScopeAddress {
+                cell.state[&ScopeAddress {
                     cell: scope_address.cell,
                     scope: cell.output.cells[&scope_address.cell].root,
-                }]]
+                }]
                     .bbox
                     .as_ref()
             })
@@ -9790,7 +10091,7 @@ impl LayoutCanvas {
             return;
         };
         let address = solved.state[&solved.selected_scope].address;
-        let scope = &solved.output.cells[&address.cell].scopes[&address.scope];
+        let cell = &solved.output.cells[&address.cell];
         let reachable = solved.output.reachable_objs(address.cell, address.scope);
         let names: HashSet<&str> = reachable
             .values()
@@ -9820,12 +10121,12 @@ impl LayoutCanvas {
             construction: false,
         };
         let client = state.lang_server_client.clone();
-        let scope_span = scope.span.clone();
+        let scope_span = cell.scope_span(address.scope).clone();
         let id = self.next_rectangle_id;
         self.next_rectangle_id = self.next_rectangle_id.wrapping_add(1);
         self.pending_rectangles.push(PendingRectangle {
             id,
-            scope_path: solved.selected_scope.clone(),
+            scope_path: solved.selected_scope,
             source_path: scope_span.path.clone(),
             name: name.clone(),
             rect: rect.clone(),
@@ -9892,8 +10193,8 @@ impl LayoutCanvas {
                     .is_some_and(|scope_state| {
                         let cell = &solved.output.cells[&scope_state.address.cell];
                         let scope = &cell.scopes[&scope_state.address.scope];
-                        scope.span.path == pending.source_path
-                            && scope.bindings.values().any(|(name, object)| {
+                        cell.scope_span(scope_state.address.scope).path == pending.source_path
+                            && scope.bindings.iter().any(|(_, (name, object))| {
                                 name == &pending.name
                                     && object
                                         .get_elem()
@@ -10502,9 +10803,8 @@ impl LayoutCanvas {
                             None
                         };
                         if let Some((params, value, preview)) = pending {
-                            let scope_span = cell.output.cells[&selected_scope_addr.cell].scopes
-                                [&selected_scope_addr.scope]
-                                .span
+                            let scope_span = cell.output.cells[&selected_scope_addr.cell]
+                                .scope_span(selected_scope_addr.scope)
                                 .clone();
                             *tool = ToolState::EditDim(EditDimToolState {
                                 dim: None,
@@ -10723,9 +11023,8 @@ impl LayoutCanvas {
                         .map(|index| format!("{name_prefix}{index}"))
                         .find(|name| !names.contains(name))
                         .unwrap();
-                    let scope_span = cell.output.cells[&scope_address.cell].scopes
-                        [&scope_address.scope]
-                        .span
+                    let scope_span = cell.output.cells[&scope_address.cell]
+                        .scope_span(scope_address.scope)
                         .clone();
                     let result = if is_path {
                         state.lang_server_client.draw_path(
@@ -11400,8 +11699,7 @@ fn exact_object_bounds(
                 };
 
                 if is_last {
-                    let scope_path = cell.scope_paths.get(&current_scope)?;
-                    let bbox = cell.state.get(scope_path)?.bbox.as_ref()?;
+                    let bbox = cell.state.get(&current_scope)?.bbox.as_ref()?;
                     return Some(ExactLayoutBounds::transformed(
                         bbox.x0, bbox.y0, bbox.x1, bbox.y1, mat, ofs,
                     ));
@@ -13366,20 +13664,17 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             output: &CompiledData,
             address: ScopeAddress,
             parent: Option<ScopeAddress>,
-            parent_path: &[String],
             state: &mut imbl::HashMap<editor::ScopePath, editor::ScopeState>,
-            scope_paths: &mut imbl::HashMap<ScopeAddress, editor::ScopePath>,
         ) -> (editor::ScopePath, Option<compile::Rect<f64>>) {
-            let scope_info = &output.cells[&address.cell].scopes[&address.scope];
-            let mut path = parent_path.to_vec();
-            path.push(scope_info.name.clone());
-            scope_paths.insert(address, path.clone());
+            let cell = &output.cells[&address.cell];
+            let scope_info = &cell.scopes[&address.scope];
+            let scope_name = cell.scope_name(address.scope).to_owned();
             let emit = scope_info
                 .emit
                 .iter()
                 .map(|(object, _)| *object)
                 .collect::<Vec<_>>();
-            let children = scope_info.children.iter().copied().collect::<Vec<_>>();
+            let children = scope_info.children.to_vec();
             let mut bbox = None;
             for object in emit {
                 let object = output.cells[&address.cell].objects[&object].clone();
@@ -13392,14 +13687,8 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                             cell: instance.cell,
                             scope: output.cells[&instance.cell].root,
                         };
-                        let (_, child_bbox) = visit_scope(
-                            output,
-                            child_address,
-                            Some(address),
-                            &path,
-                            state,
-                            scope_paths,
-                        );
+                        let (_, child_bbox) =
+                            visit_scope(output, child_address, Some(address), state);
                         child_bbox.map(|child_bbox| {
                             let mut mat = TransformationMatrix::identity();
                             if instance.reflect {
@@ -13441,27 +13730,20 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                     cell: address.cell,
                     scope: child,
                 };
-                let (_, child_bbox) = visit_scope(
-                    output,
-                    child_address,
-                    Some(address),
-                    &path,
-                    state,
-                    scope_paths,
-                );
+                let (_, child_bbox) = visit_scope(output, child_address, Some(address), state);
                 bbox = compile::bbox_union(bbox, child_bbox);
             }
             state.insert(
-                path.clone(),
+                address,
                 editor::ScopeState {
-                    name: scope_info.name.clone(),
+                    name: scope_name,
                     address,
                     visible: true,
-                    bbox: bbox.clone(),
+                    bbox: bbox.clone().map(Arc::new),
                     parent,
                 },
             );
-            (path, bbox)
+            (address, bbox)
         }
 
         let output = Arc::new(output);
@@ -13470,14 +13752,11 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             scope: output.cells[&output.top].root,
         };
         let mut state = imbl::HashMap::new();
-        let mut scope_paths = imbl::HashMap::new();
-        let (selected_scope, _) =
-            visit_scope(&output, root, None, &[], &mut state, &mut scope_paths);
+        let (selected_scope, _) = visit_scope(&output, root, None, &mut state);
         CompileOutputState {
             output,
             selected_scope,
             state: Arc::new(state),
-            scope_paths: Arc::new(scope_paths),
             hierarchy: Arc::default(),
         }
     }
@@ -14294,16 +14573,15 @@ cell top() {
             .values()
             .find_map(|object| object.get_rect().map(|rect| rect.id))
             .unwrap();
-        let state = CompileOutputState {
-            output: Arc::new(output),
-            selected_scope: Vec::new(),
-            state: Arc::default(),
-            scope_paths: Arc::default(),
-            hierarchy: Arc::default(),
-        };
         let scope = ScopeAddress {
             cell: top,
             scope: top_root,
+        };
+        let state = CompileOutputState {
+            output: Arc::new(output),
+            selected_scope: scope,
+            state: Arc::default(),
+            hierarchy: Arc::default(),
         };
 
         assert_eq!(

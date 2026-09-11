@@ -1,3 +1,5 @@
+use lib::params::DecoderParams;
+
 fn dec_total_x(nw: Int, pw: Int) -> Float {
     nw as Float + 520. + pw as Float
 }
@@ -759,77 +761,13 @@ cell dec_and2_gate(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int, filler:
     let y_out = inv.y_out;
 }
 
-// SRAM22 sizes the write-mask chain for the larger of the complementary
-// write-enable loads. These are the characterized input capacitances of one
-// default write driver and the 1x inverter used by the logical-effort model.
-fn dec_load_fanout(gran: Int, driver_width: Int) -> Float {
-    let write_enable_cap = 0.0000000000000120547;
-    let inverter_input_cap = 0.000000000000004482092764998187;
-    gran as Float * write_enable_cap * (driver_width as Float / 3000.) / inverter_input_cap
-}
+// Rust performs logical-effort and transistor sizing. These accessors only
+// expose the concrete stage record to the geometry below.
+fn dec_num_stages(p: DecoderParams) -> Int { p.num_stages }
 
-// buffer_chain_num_stages rounds log base 3 to an even stage count. Expressing
-// its decision boundaries directly avoids requiring transcendental builtins.
-fn dec_buffer_inverters(gran: Int, driver_width: Int) -> Int {
-    let fanout = dec_load_fanout(gran, driver_width);
-    if fanout < 27. { 2 } else { if fanout < 243. { 4 } else { 6 } }
-}
+fn dec_stage_ff(stage: Int, p: DecoderParams) -> Int { p.stages[stage].folds }
 
-fn dec_pow(value: Float, exponent: Int) -> Float {
-    if exponent == 0 { 1. } else { value * dec_pow(value, exponent - 1) }
-}
-
-fn dec_nth_root_iter(value: Float, degree: Int, estimate: Float, remaining: Int) -> Float {
-    if remaining == 0 {
-        estimate
-    } else {
-        let next = ((degree - 1) as Float * estimate + value / dec_pow(estimate, degree - 1)) / degree as Float;
-        dec_nth_root_iter(value, degree, next, remaining - 1)
-    }
-}
-
-fn dec_stage_effort(gran: Int, driver_width: Int) -> Float {
-    let nand_to_inv_resistance = 1478.364147093855 / 1422.118502462849;
-    let degree = dec_buffer_inverters(gran, driver_width) + 1;
-    dec_nth_root_iter(nand_to_inv_resistance * dec_load_fanout(gran, driver_width), degree, 3., 24)
-}
-
-fn dec_inv_scale(stage: Int, gran: Int, driver_width: Int) -> Float {
-    let nand_to_inv_resistance = 1478.364147093855 / 1422.118502462849;
-    let final_sized_stage = dec_buffer_inverters(gran, driver_width);
-    let sized_stage = lib::columns::util::imin(stage, final_sized_stage);
-    dec_pow(dec_stage_effort(gran, driver_width), sized_stage) / nand_to_inv_resistance
-}
-
-fn dec_num_stages(gran: Int, driver_width: Int) -> Int {
-    // One NAND, the optimized inverter chain, and a duplicate of the final
-    // inverter used to provide both polarities.
-    dec_buffer_inverters(gran, driver_width) + 2
-}
-
-fn dec_scale_width(width: Int, scale: Float, minimum: Int) -> Int {
-    let rounded = (width as Float * scale + 0.5) as Int;
-    let clamped = if rounded < minimum { minimum } else { rounded };
-    let remainder = clamped % 50;
-    if remainder <= 25 { clamped - remainder } else { clamped + 50 - remainder }
-}
-
-fn dec_base_nw(stage: Int, gran: Int, driver_width: Int) -> Int {
-    if stage == 0 { 2000 } else { dec_scale_width(1000, dec_inv_scale(stage, gran, driver_width), 500) }
-}
-
-fn dec_base_pw(stage: Int, gran: Int, driver_width: Int) -> Int {
-    if stage == 0 { 2500 } else { dec_scale_width(2500, dec_inv_scale(stage, gran, driver_width), 1250) }
-}
-
-fn dec_stage_ff(stage: Int, gran: Int, driver_width: Int) -> Int {
-    let fold_width = lib::columns::util::imin(dec_base_nw(stage, gran, driver_width), dec_base_pw(stage, gran, driver_width));
-    lib::columns::util::imax(fold_width / 1800, 1)
-}
-
-fn dec_max_ff(gran: Int, driver_width: Int) -> Int {
-    dec_stage_ff(dec_num_stages(gran, driver_width) - 1, gran, driver_width)
-}
+fn dec_max_ff(p: DecoderParams) -> Int { p.max_folds }
 
 fn dec_tap_period() -> Int { 4 }
 
@@ -837,17 +775,9 @@ fn dec_tap_groups(folding_factor: Int) -> Int {
     (folding_factor + dec_tap_period() - 1) / dec_tap_period()
 }
 
-fn dec_scaled_width(width: Int, ff: Int) -> Int {
-    (((width as Float / ff as Float / 10.) + 0.5) as Int) * 10
-}
+fn dec_stage_nw(stage: Int, p: DecoderParams) -> Int { p.stages[stage].nwidth }
 
-fn dec_stage_nw(stage: Int, gran: Int, driver_width: Int) -> Int {
-    dec_scaled_width(dec_base_nw(stage, gran, driver_width), dec_stage_ff(stage, gran, driver_width))
-}
-
-fn dec_stage_pw(stage: Int, gran: Int, driver_width: Int) -> Int {
-    dec_scaled_width(dec_base_pw(stage, gran, driver_width), dec_stage_ff(stage, gran, driver_width))
-}
+fn dec_stage_pw(stage: Int, p: DecoderParams) -> Int { p.stages[stage].pwidth }
 
 fn dec_gate_xf(r: Rect, nw: Int, pw: Int) -> Rect {
     lib::columns::mux::xf_q1(r, dec_gate_dx(nw, pw), 0.)
@@ -861,63 +791,63 @@ fn dec_inv_gate_xf(r: Rect, nw: Int, pw: Int) -> Rect {
     lib::columns::mux::xf_q1(r, dec_inv_gate_dx(nw, pw), 0.)
 }
 
-fn dec_gate_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_gate_span(stage: Int, p: DecoderParams) -> (Float, Float) {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     let raw = if stage == 0 { dec_raw_bbox(nw, pw) } else { dec_inv_raw_bbox(nw, pw) };
     lib::columns::util::rect_hspan(raw)
 }
 
-fn dec_tile_yoff(stage: Int, gran: Int, driver_width: Int) -> Float {
-    let span = dec_gate_span(stage, gran, driver_width);
+fn dec_tile_yoff(stage: Int, p: DecoderParams) -> Float {
+    let span = dec_gate_span(stage, p);
     -dec_span_center_i(span)
 }
 
-fn dec_group_h(stage: Int, gran: Int, driver_width: Int) -> Float {
-    let span = dec_gate_span(stage, gran, driver_width);
+fn dec_group_h(stage: Int, p: DecoderParams) -> Float {
+    let span = dec_gate_span(stage, p);
     span.1 - span.0
 }
 
-fn dec_group_bot(stage: Int, gran: Int, driver_width: Int) -> Float {
-    -dec_group_h(stage, gran, driver_width) / 2.
+fn dec_group_bot(stage: Int, p: DecoderParams) -> Float {
+    -dec_group_h(stage, p) / 2.
 }
 
-fn dec_group_top(stage: Int, gran: Int, driver_width: Int) -> Float {
-    dec_group_h(stage, gran, driver_width) / 2.
+fn dec_group_top(stage: Int, p: DecoderParams) -> Float {
+    dec_group_h(stage, p) / 2.
 }
 
-fn dec_group_w(gran: Int, driver_width: Int) -> Float {
-    let maxff = dec_max_ff(gran, driver_width);
+fn dec_group_w(p: DecoderParams) -> Float {
+    let maxff = dec_max_ff(p);
     (dec_tap_groups(maxff) + 1) as Float * 1000. + maxff as Float * 1580.
 }
 
-fn dec_group_xoff(gran: Int, driver_width: Int) -> Float {
-    -dec_group_w(gran, driver_width) / 2.
+fn dec_group_xoff(p: DecoderParams) -> Float {
+    -dec_group_w(p) / 2.
 }
 
-fn dec_group_abs_bot(stage: Int, gran: Int, driver_width: Int) -> Float {
+fn dec_group_abs_bot(stage: Int, p: DecoderParams) -> Float {
     if stage == 0 {
         300.
     } else {
-        dec_group_abs_bot(stage - 1, gran, driver_width) + dec_group_h(stage - 1, gran, driver_width) + 300.
+        dec_group_abs_bot(stage - 1, p) + dec_group_h(stage - 1, p) + 300.
     }
 }
 
-fn dec_group_yoff(stage: Int, gran: Int, driver_width: Int) -> Float {
-    dec_group_abs_bot(stage, gran, driver_width) - dec_group_bot(stage, gran, driver_width)
+fn dec_group_yoff(stage: Int, p: DecoderParams) -> Float {
+    dec_group_abs_bot(stage, p) - dec_group_bot(stage, p)
 }
 
-fn dec_tile_abs_x(stage: Int, gran: Int, driver_width: Int, tile: Int) -> Float {
-    dec_group_xoff(gran, driver_width) + 1000. + tile as Float * 1580. + (tile / dec_tap_period()) as Float * 1000.
+fn dec_tile_abs_x(stage: Int, p: DecoderParams, tile: Int) -> Float {
+    dec_group_xoff(p) + 1000. + tile as Float * 1580. + (tile / dec_tap_period()) as Float * 1000.
 }
 
-fn dec_tile_abs_y(stage: Int, gran: Int, driver_width: Int) -> Float {
-    dec_group_yoff(stage, gran, driver_width) + dec_tile_yoff(stage, gran, driver_width)
+fn dec_tile_abs_y(stage: Int, p: DecoderParams) -> Float {
+    dec_group_yoff(stage, p) + dec_tile_yoff(stage, p)
 }
 
-fn dec_gate_port_a_local(stage: Int, gran: Int, driver_width: Int) -> Rect {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_gate_port_a_local(stage: Int, p: DecoderParams) -> Rect {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         dec_gate_xf(dec_gate_contact_raw(0), nw, pw)
     } else {
@@ -925,9 +855,9 @@ fn dec_gate_port_a_local(stage: Int, gran: Int, driver_width: Int) -> Rect {
     }
 }
 
-fn dec_gate_port_b_local(stage: Int, gran: Int, driver_width: Int) -> Rect {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_gate_port_b_local(stage: Int, p: DecoderParams) -> Rect {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         dec_gate_xf(dec_gate_contact_raw(1), nw, pw)
     } else {
@@ -935,9 +865,9 @@ fn dec_gate_port_b_local(stage: Int, gran: Int, driver_width: Int) -> Rect {
     }
 }
 
-fn dec_gate_port_y_local(stage: Int, gran: Int, driver_width: Int) -> Rect {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_gate_port_y_local(stage: Int, p: DecoderParams) -> Rect {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         let p0 = nw as Float + 520.;
         dec_gate_xf(lib::columns::util::rect_union(dec_sd_port_raw(0., nw as Float, 2), dec_sd_port_raw(p0, pw as Float, 2)), nw, pw)
@@ -949,9 +879,9 @@ fn dec_gate_port_y_local(stage: Int, gran: Int, driver_width: Int) -> Rect {
     }
 }
 
-fn dec_region_nwell_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_region_nwell_span(stage: Int, p: DecoderParams) -> (Float, Float) {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         lib::columns::util::rect_vspan(dec_gate_xf(dec_nwell(nw, pw), nw, pw))
     } else {
@@ -961,9 +891,9 @@ fn dec_region_nwell_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Fl
     }
 }
 
-fn dec_region_nsdm_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_region_nsdm_span(stage: Int, p: DecoderParams) -> (Float, Float) {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         lib::columns::util::rect_vspan(dec_gate_xf(dec_nsdm(nw), nw, pw))
     } else {
@@ -972,9 +902,9 @@ fn dec_region_nsdm_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Flo
     }
 }
 
-fn dec_region_psdm_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_region_psdm_span(stage: Int, p: DecoderParams) -> (Float, Float) {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         lib::columns::util::rect_vspan(dec_gate_xf(dec_psdm(nw, pw), nw, pw))
     } else {
@@ -984,21 +914,21 @@ fn dec_region_psdm_span(stage: Int, gran: Int, driver_width: Int) -> (Float, Flo
     }
 }
 
-fn dec_stage_port_a(stage: Int, gran: Int, driver_width: Int, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_port_a_local(stage, gran, driver_width), dec_tile_abs_x(stage, gran, driver_width, tile), dec_tile_abs_y(stage, gran, driver_width))
+fn dec_stage_port_a(stage: Int, p: DecoderParams, tile: Int) -> Rect {
+    lib::columns::util::rect_translate(dec_gate_port_a_local(stage, p), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
 }
 
-fn dec_stage_port_b(stage: Int, gran: Int, driver_width: Int, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_port_b_local(stage, gran, driver_width), dec_tile_abs_x(stage, gran, driver_width, tile), dec_tile_abs_y(stage, gran, driver_width))
+fn dec_stage_port_b(stage: Int, p: DecoderParams, tile: Int) -> Rect {
+    lib::columns::util::rect_translate(dec_gate_port_b_local(stage, p), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
 }
 
-fn dec_stage_port_y(stage: Int, gran: Int, driver_width: Int, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_port_y_local(stage, gran, driver_width), dec_tile_abs_x(stage, gran, driver_width, tile), dec_tile_abs_y(stage, gran, driver_width))
+fn dec_stage_port_y(stage: Int, p: DecoderParams, tile: Int) -> Rect {
+    lib::columns::util::rect_translate(dec_gate_port_y_local(stage, p), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
 }
 
-fn dec_gate_sd_local(stage: Int, gran: Int, driver_width: Int, dev: Int, row: Int) -> Rect {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
+fn dec_gate_sd_local(stage: Int, p: DecoderParams, dev: Int, row: Int) -> Rect {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
     if stage == 0 {
         let p0 = nw as Float + 520.;
         if dev == 0 {
@@ -1018,22 +948,22 @@ fn dec_gate_sd_local(stage: Int, gran: Int, driver_width: Int, dev: Int, row: In
     }
 }
 
-fn dec_stage_sd(stage: Int, gran: Int, driver_width: Int, tile: Int, dev: Int, row: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_sd_local(stage, gran, driver_width, dev, row), dec_tile_abs_x(stage, gran, driver_width, tile), dec_tile_abs_y(stage, gran, driver_width))
+fn dec_stage_sd(stage: Int, p: DecoderParams, tile: Int, dev: Int, row: Int) -> Rect {
+    lib::columns::util::rect_translate(dec_gate_sd_local(stage, p, dev, row), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
 }
 
-fn draw_dec_stage_li_pins(stage: Int, gran: Int, driver_width: Int, tile: Int) -> Rect {
-    lib::columns::util::draw_box("li1.pin", dec_stage_port_a(stage, gran, driver_width, tile));
-    lib::columns::util::draw_box("li1.pin", dec_stage_port_y(stage, gran, driver_width, tile));
+fn draw_dec_stage_li_pins(stage: Int, p: DecoderParams, tile: Int) -> Rect {
+    lib::columns::util::draw_box("li1.pin", dec_stage_port_a(stage, p, tile));
+    lib::columns::util::draw_box("li1.pin", dec_stage_port_y(stage, p, tile));
     if stage == 0 {
-        lib::columns::util::draw_box("li1.pin", dec_stage_port_b(stage, gran, driver_width, tile));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, gran, driver_width, tile, 0, 0));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, gran, driver_width, tile, 1, 1))
+        lib::columns::util::draw_box("li1.pin", dec_stage_port_b(stage, p, tile));
+        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 0, 0));
+        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 1, 1))
     } else {
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, gran, driver_width, tile, 0, 0));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, gran, driver_width, tile, 0, 2));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, gran, driver_width, tile, 1, 0));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, gran, driver_width, tile, 1, 2))
+        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 0, 0));
+        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 0, 2));
+        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 1, 0));
+        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 1, 2))
     }
 }
 
@@ -1042,28 +972,28 @@ fn dec_uniform_track(tracks_start: Float, index: Int) -> (Float, Float) {
     (top - 320., top,)
 }
 
-fn dec_stage_logic_top(gran: Int, driver_width: Int) -> Float {
-    let final_stage = dec_num_stages(gran, driver_width) - 1;
-    let nominal = dec_group_abs_bot(final_stage, gran, driver_width) + dec_group_h(final_stage, gran, driver_width);
-    let final_ff = dec_stage_ff(final_stage, gran, driver_width);
+fn dec_stage_logic_top(p: DecoderParams) -> Float {
+    let final_stage = dec_num_stages(p) - 1;
+    let nominal = dec_group_abs_bot(final_stage, p) + dec_group_h(final_stage, p);
+    let final_ff = dec_stage_ff(final_stage, p);
     if final_ff > 1 {
-        let port = dec_stage_port_y(final_stage, gran, driver_width, 0);
+        let port = dec_stage_port_y(final_stage, p, 0);
         lib::columns::util::fmax(nominal, port.y1 + lib::columns::util::rect_w(port) + 170.)
     } else {
         nominal
     }
 }
 
-fn dec_stage_left(gran: Int, driver_width: Int) -> Float {
-    -dec_group_w(gran, driver_width) / 2.
+fn dec_stage_left(p: DecoderParams) -> Float {
+    -dec_group_w(p) / 2.
 }
 
-fn dec_stage_right(gran: Int, driver_width: Int) -> Float {
-    dec_group_w(gran, driver_width) / 2.
+fn dec_stage_right(p: DecoderParams) -> Float {
+    dec_group_w(p) / 2.
 }
 
-fn dec_stage_bbox(gran: Int, driver_width: Int) -> Rect {
-    lib::columns::util::cbox(dec_stage_left(gran, driver_width), -640., dec_stage_right(gran, driver_width), dec_stage_logic_top(gran, driver_width))
+fn dec_stage_bbox(p: DecoderParams) -> Rect {
+    lib::columns::util::cbox(dec_stage_left(p), -640., dec_stage_right(p), dec_stage_logic_top(p))
 }
 
 fn dec_offset_jog_r1(src: Rect, dst: Float, space: Float) -> Rect {
@@ -1667,52 +1597,46 @@ fn buffer_stage_ff(kind: Int, stage: Int) -> Int {
     }
 }
 
-fn buffer_base_nw(kind: Int, stage: Int) -> Int {
+// Concrete per-finger widths selected by the Rust/SRAM22 design pass for the
+// fixed 64-word control buffers. Argon only looks up and draws these values.
+fn buffer_stage_nw(kind: Int, stage: Int) -> Int {
     if stage == 0 {
         1000
     } else {
         if kind == 0 {
-            if stage == 1 { 2500 } else { if stage == 2 { 6350 } else { 16100 } }
+            if stage == 1 { 2500 } else { if stage == 2 { 2120 } else { 2680 } }
         } else {
             if kind == 1 {
                 2450
             } else {
                 if kind == 2 {
-                    if stage == 1 { 2850 } else { if stage == 2 { 8100 } else { 23100 } }
+                    if stage == 1 { 2850 } else { if stage == 2 { 2030 } else { 2570 } }
                 } else {
-                    3800
+                    1900
                 }
             }
         }
     }
 }
 
-fn buffer_base_pw(kind: Int, stage: Int) -> Int {
+fn buffer_stage_pw(kind: Int, stage: Int) -> Int {
     if stage == 0 {
         2500
     } else {
         if kind == 0 {
-            if stage == 1 { 6300 } else { if stage == 2 { 15950 } else { 40200 } }
+            if stage == 1 { 6300 } else { if stage == 2 { 5320 } else { 6700 } }
         } else {
             if kind == 1 {
                 6150
             } else {
                 if kind == 2 {
-                    if stage == 1 { 7100 } else { if stage == 2 { 20300 } else { 57750 } }
+                    if stage == 1 { 7100 } else { if stage == 2 { 5080 } else { 6420 } }
                 } else {
-                    9500
+                    4750
                 }
             }
         }
     }
-}
-
-fn buffer_stage_nw(kind: Int, stage: Int) -> Int {
-    dec_scaled_width(buffer_base_nw(kind, stage), buffer_stage_ff(kind, stage))
-}
-
-fn buffer_stage_pw(kind: Int, stage: Int) -> Int {
-    dec_scaled_width(buffer_base_pw(kind, stage), buffer_stage_ff(kind, stage))
 }
 
 fn buffer_stage_bottom(kind: Int, stage: Int) -> Float {
@@ -1803,10 +1727,10 @@ fn draw_buffer_stage(kind: Int, stage: Int) -> Rect {
     for fold in std::range(buffer_max_ff(kind)) {
         let filler = if fold < ff { 0 } else { 1 };
         if stage == 0 {
-            let gate = if kind == 3 {
-                inst(dec_inv_gate_vertical(1000, 2500, filler), x=buffer_gate_x(kind, fold), y=buffer_stage_y(kind, stage))
+            if kind == 3 {
+                inst(dec_inv_gate_vertical(1000, 2500, filler), x=buffer_gate_x(kind, fold), y=buffer_stage_y(kind, stage));
             } else {
-                inst(dec_inv_gate(1000, 2500, filler), x=buffer_gate_x(kind, fold), y=buffer_stage_y(kind, stage))
+                inst(dec_inv_gate(1000, 2500, filler), x=buffer_gate_x(kind, fold), y=buffer_stage_y(kind, stage));
             };
             if fold < ff {
                 let hn = dec_inv_half_nw(1000);
@@ -1898,12 +1822,12 @@ cell horizontal_fanout_buffer_64(kind: Int) {
     };
 }
 
-cell dec_tap(stage: Int, gran: Int, driver_width: Int) {
-    let span = dec_gate_span(stage, gran, driver_width);
-    let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., 1000.,), dec_region_nwell_span(stage, gran, driver_width)));
+cell dec_tap(stage: Int, p: DecoderParams) {
+    let span = dec_gate_span(stage, p);
+    let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., 1000.,), dec_region_nwell_span(stage, p)));
     let outline = rect("layout_boundary.boundary", x0=0., y0=span.0, x1=1000., y1=span.1);
-    let nsdm_span = dec_region_nsdm_span(stage, gran, driver_width);
-    let psdm_span = dec_region_psdm_span(stage, gran, driver_width);
+    let nsdm_span = dec_region_nsdm_span(stage, p);
+    let psdm_span = dec_region_psdm_span(stage, p);
     draw_dec_tap_for_span(false, nsdm_span);
     draw_dec_tap_for_span(true, psdm_span);
     let ncnt = dec_power_strap_count(nsdm_span);
@@ -1922,11 +1846,11 @@ cell dec_tap(stage: Int, gran: Int, driver_width: Int) {
     }
 }
 
-fn draw_dec_stage_tile(stage: Int, gran: Int, driver_width: Int, tile: Int, filler: Int) -> Rect {
-    let nw = dec_stage_nw(stage, gran, driver_width);
-    let pw = dec_stage_pw(stage, gran, driver_width);
-    let x = dec_tile_abs_x(stage, gran, driver_width, tile);
-    let yoff = dec_tile_abs_y(stage, gran, driver_width);
+fn draw_dec_stage_tile(stage: Int, p: DecoderParams, tile: Int, filler: Int) -> Rect {
+    let nw = dec_stage_nw(stage, p);
+    let pw = dec_stage_pw(stage, p);
+    let x = dec_tile_abs_x(stage, p, tile);
+    let yoff = dec_tile_abs_y(stage, p);
     if stage == 0 {
         let gate = inst(dec_nand2_gate(nw, pw, filler), x=x, y=yoff);
         gate.outline
@@ -1936,20 +1860,20 @@ fn draw_dec_stage_tile(stage: Int, gran: Int, driver_width: Int, tile: Int, fill
     }
 }
 
-fn draw_dec_stage_group(stage: Int, gran: Int, driver_width: Int) -> Rect {
-    let tap_y = dec_group_yoff(stage, gran, driver_width) + dec_tile_yoff(stage, gran, driver_width);
-    let tap0 = inst(dec_tap(stage, gran, driver_width), x=dec_group_xoff(gran, driver_width), y=tap_y);
-    let maxff = dec_max_ff(gran, driver_width);
-    let ff = dec_stage_ff(stage, gran, driver_width);
+fn draw_dec_stage_group(stage: Int, p: DecoderParams) -> Rect {
+    let tap_y = dec_group_yoff(stage, p) + dec_tile_yoff(stage, p);
+    let tap0 = inst(dec_tap(stage, p), x=dec_group_xoff(p), y=tap_y);
+    let maxff = dec_max_ff(p);
+    let ff = dec_stage_ff(stage, p);
     for tile in std::range(maxff) {
-        draw_dec_stage_tile(stage, gran, driver_width, tile, if tile < ff { 0 } else { 1 });
+        draw_dec_stage_tile(stage, p, tile, if tile < ff { 0 } else { 1 });
     }
     for group in std::range(dec_tap_groups(maxff)) {
         let tiles_before_tap = lib::columns::util::imin((group + 1) * dec_tap_period(), maxff);
-        let tap_x = dec_group_xoff(gran, driver_width) + 1000. + tiles_before_tap as Float * 1580. + group as Float * 1000.;
-        let tap = inst(dec_tap(stage, gran, driver_width), x=tap_x, y=tap_y);
+        let tap_x = dec_group_xoff(p) + 1000. + tiles_before_tap as Float * 1580. + group as Float * 1000.;
+        let tap = inst(dec_tap(stage, p), x=tap_x, y=tap_y);
     }
-    lib::columns::util::cbox(dec_stage_left(gran, driver_width), dec_group_abs_bot(stage, gran, driver_width), dec_stage_right(gran, driver_width), dec_group_abs_bot(stage, gran, driver_width) + dec_group_h(stage, gran, driver_width))
+    lib::columns::util::cbox(dec_stage_left(p), dec_group_abs_bot(stage, p), dec_stage_right(p), dec_group_abs_bot(stage, p) + dec_group_h(stage, p))
 }
 
 fn draw_dec_input_to_track(port: Rect, track: Rect) -> Rect {
@@ -1959,60 +1883,60 @@ fn draw_dec_input_to_track(port: Rect, track: Rect) -> Rect {
     lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), (li_vspan.0 - 30., li_vspan.1,)))
 }
 
-cell wmask_decoder_stage(mux: Int, gran: Int, driver_width: Int) {
-    let num_stages = dec_num_stages(gran, driver_width);
+cell wmask_decoder_stage(mux: Int, p: DecoderParams) {
+    let num_stages = dec_num_stages(p);
     for stage in std::range(num_stages) {
-        draw_dec_stage_group(stage, gran, driver_width);
-        let ff = dec_stage_ff(stage, gran, driver_width);
+        draw_dec_stage_group(stage, p);
+        let ff = dec_stage_ff(stage, p);
         for tile in std::range(ff) {
-            draw_dec_stage_li_pins(stage, gran, driver_width, tile);
+            draw_dec_stage_li_pins(stage, p, tile);
         }
     }
     for stage in std::range(num_stages - 1) {
-        let ff = dec_stage_ff(stage, gran, driver_width);
-        let next_ff = dec_stage_ff(stage + 1, gran, driver_width);
-        let first_dst = dec_stage_port_a(stage + 1, gran, driver_width, 0);
-        let gate_out = dec_stage_port_y(stage, gran, driver_width, 0);
+        let ff = dec_stage_ff(stage, p);
+        let next_ff = dec_stage_ff(stage + 1, p);
+        let first_dst = dec_stage_port_a(stage + 1, p, 0);
+        let gate_out = dec_stage_port_y(stage, p, 0);
         for tile in std::range(ff) {
-            draw_dec_li_jog(dec_stage_port_y(stage, gran, driver_width, tile), first_dst);
+            draw_dec_li_jog(dec_stage_port_y(stage, p, tile), first_dst);
         }
         for tile in std::range(next_ff) {
-            draw_dec_li_jog(gate_out, dec_stage_port_a(stage + 1, gran, driver_width, tile));
+            draw_dec_li_jog(gate_out, dec_stage_port_a(stage + 1, p, tile));
         }
     }
     let final_stage = num_stages - 1;
     let complement_stage = final_stage - 1;
-    let final_ff = dec_stage_ff(final_stage, gran, driver_width);
+    let final_ff = dec_stage_ff(final_stage, p);
     if final_ff > 1 {
-        let left_port = dec_stage_port_y(final_stage, gran, driver_width, 0);
+        let left_port = dec_stage_port_y(final_stage, p, 0);
         for tile in std::range(final_ff) {
-            draw_dec_final_fold_jog(dec_stage_port_y(final_stage, gran, driver_width, tile), left_port);
+            draw_dec_final_fold_jog(dec_stage_port_y(final_stage, p, tile), left_port);
         }
     } else {
         crect(x0=0., y0=0., x1=0., y1=0.);
     };
 
-    let pre_bbox = lib::columns::util::cbox(dec_stage_left(gran, driver_width), 300., dec_stage_right(gran, driver_width), dec_stage_logic_top(gran, driver_width));
+    let pre_bbox = lib::columns::util::cbox(dec_stage_left(p), 300., dec_stage_right(p), dec_stage_logic_top(p));
     let tracks_start = pre_bbox.y0 - 140.;
     let predecode0 = lib::columns::util::met1_port(pre_bbox.x0, dec_uniform_track(tracks_start, 0).0, pre_bbox.x1, dec_uniform_track(tracks_start, 0).1);
     let predecode1 = lib::columns::util::met1_port(pre_bbox.x0, dec_uniform_track(tracks_start, 1).0, pre_bbox.x1, dec_uniform_track(tracks_start, 1).1);
-    let ff0 = dec_stage_ff(0, gran, driver_width);
+    let ff0 = dec_stage_ff(0, p);
     for tile in std::range(ff0) {
-        draw_dec_input_to_track(dec_stage_port_a(0, gran, driver_width, tile), predecode0);
-        draw_dec_input_to_track(dec_stage_port_b(0, gran, driver_width, tile), predecode1);
+        draw_dec_input_to_track(dec_stage_port_a(0, p, tile), predecode0);
+        draw_dec_input_to_track(dec_stage_port_b(0, p, tile), predecode1);
     }
-    let y_port = dec_stage_port_y(final_stage, gran, driver_width, 0);
-    let y1 = if final_ff > 1 { dec_stage_port_y(final_stage, gran, driver_width, 1) } else { y_port };
-    let y2 = if final_ff > 2 { dec_stage_port_y(final_stage, gran, driver_width, 2) } else { y_port };
-    let y3 = if final_ff > 3 { dec_stage_port_y(final_stage, gran, driver_width, 3) } else { y_port };
-    let y_b_ff = dec_stage_ff(complement_stage, gran, driver_width);
-    let y_b = dec_stage_port_y(complement_stage, gran, driver_width, 0);
-    let y_b1 = if y_b_ff > 1 { dec_stage_port_y(complement_stage, gran, driver_width, 1) } else { y_b };
-    let y_b2 = if y_b_ff > 2 { dec_stage_port_y(complement_stage, gran, driver_width, 2) } else { y_b };
-    let y_b3 = if y_b_ff > 3 { dec_stage_port_y(complement_stage, gran, driver_width, 3) } else { y_b };
+    let y_port = dec_stage_port_y(final_stage, p, 0);
+    let y1 = if final_ff > 1 { dec_stage_port_y(final_stage, p, 1) } else { y_port };
+    let y2 = if final_ff > 2 { dec_stage_port_y(final_stage, p, 2) } else { y_port };
+    let y3 = if final_ff > 3 { dec_stage_port_y(final_stage, p, 3) } else { y_port };
+    let y_b_ff = dec_stage_ff(complement_stage, p);
+    let y_b = dec_stage_port_y(complement_stage, p, 0);
+    let y_b1 = if y_b_ff > 1 { dec_stage_port_y(complement_stage, p, 1) } else { y_b };
+    let y_b2 = if y_b_ff > 2 { dec_stage_port_y(complement_stage, p, 2) } else { y_b };
+    let y_b3 = if y_b_ff > 3 { dec_stage_port_y(complement_stage, p, 3) } else { y_b };
     let vdd = lib::columns::util::cbox(0., 0., 0., 0.);
     let vss = lib::columns::util::cbox(0., 0., 0., 0.);
-    let outline = crect(x0=dec_stage_left(gran, driver_width), y0=-640., x1=dec_stage_right(gran, driver_width), y1=dec_stage_logic_top(gran, driver_width));
+    let outline = crect(x0=dec_stage_left(p), y0=-640., x1=dec_stage_right(p), y1=dec_stage_logic_top(p));
 }
 
 fn wmask_dff_forced_left(mux: Int) -> Float {
@@ -2031,33 +1955,33 @@ fn wmask_dff_y() -> Float {
     1460.
 }
 
-fn wmask_full_right(bits: Int, mux: Int, gran: Int, driver_width: Int, unit_w: Float) -> Float {
-    (bits - 1) as Float * unit_w + lib::columns::util::fmax(wmask_dff_right(mux), dec_group_w(gran, driver_width))
+fn wmask_full_right(bits: Int, mux: Int, p: DecoderParams, unit_w: Float) -> Float {
+    (bits - 1) as Float * unit_w + lib::columns::util::fmax(wmask_dff_right(mux), dec_group_w(p))
 }
 
-fn wmask_stage_x(bit: Int, gran: Int, driver_width: Int, unit_w: Float) -> Float {
-    bit as Float * unit_w - dec_stage_left(gran, driver_width)
+fn wmask_stage_x(bit: Int, p: DecoderParams, unit_w: Float) -> Float {
+    bit as Float * unit_w - dec_stage_left(p)
 }
 
-fn wmask_stage_y(gran: Int, driver_width: Int) -> Float {
-    16840. - dec_stage_bbox(gran, driver_width).y0
+fn wmask_stage_y(p: DecoderParams) -> Float {
+    16840. - dec_stage_bbox(p).y0
 }
 
-fn wmask_stage_predecode(bit: Int, gran: Int, driver_width: Int, unit_w: Float, index: Int) -> Rect {
-    let sx = wmask_stage_x(bit, gran, driver_width, unit_w);
-    let sy = wmask_stage_y(gran, driver_width);
-    lib::columns::util::rect_translate(lib::columns::util::rect_from_spans((dec_stage_left(gran, driver_width), dec_stage_right(gran, driver_width),), dec_uniform_track(160., index)), sx, sy)
+fn wmask_stage_predecode(bit: Int, p: DecoderParams, unit_w: Float, index: Int) -> Rect {
+    let sx = wmask_stage_x(bit, p, unit_w);
+    let sy = wmask_stage_y(p);
+    lib::columns::util::rect_translate(lib::columns::util::rect_from_spans((dec_stage_left(p), dec_stage_right(p),), dec_uniform_track(160., index)), sx, sy)
 }
 
-fn wmask_stage_port_y(bit: Int, gran: Int, driver_width: Int, unit_w: Float, stage: Int, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_stage_port_y(stage, gran, driver_width, tile), wmask_stage_x(bit, gran, driver_width, unit_w), wmask_stage_y(gran, driver_width))
+fn wmask_stage_port_y(bit: Int, p: DecoderParams, unit_w: Float, stage: Int, tile: Int) -> Rect {
+    lib::columns::util::rect_translate(dec_stage_port_y(stage, p, tile), wmask_stage_x(bit, p, unit_w), wmask_stage_y(p))
 }
 
-fn draw_wmask_dff_to_stage(bit: Int, mux: Int, gran: Int, driver_width: Int, unit_w: Float) -> Rect {
+fn draw_wmask_dff_to_stage(bit: Int, mux: Int, p: DecoderParams, unit_w: Float) -> Rect {
     let dff_x = wmask_dff_x(bit, mux, unit_w);
     let dff_y = wmask_dff_y();
     let dff_out = lib::columns::util::cbox(dff_x - 2980., dff_y + 13135., dff_x - 330., dff_y + 13305.);
-    let wmask_in = wmask_stage_predecode(bit, gran, driver_width, unit_w, 1);
+    let wmask_in = wmask_stage_predecode(bit, p, unit_w, 1);
     let m1_track = lib::columns::util::center_span_gridded(lib::columns::util::rect_cx_i(dff_out), 280.);
     let m1_rect = lib::columns::util::rect_from_spans(m1_track, lib::columns::util::span_union(lib::columns::util::rect_vspan(dff_out), lib::columns::util::rect_vspan(wmask_in)));
     let m1_to_input = lib::columns::util::rect_with_hspan(wmask_in, lib::columns::util::span_union(lib::columns::util::rect_hspan(wmask_in), m1_track));
@@ -2066,50 +1990,50 @@ fn draw_wmask_dff_to_stage(bit: Int, mux: Int, gran: Int, driver_width: Int, uni
     lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", dff_out, m1_rect, 0, 0, true).2
 }
 
-fn draw_wmask_stage_power_full(bits: Int, mux: Int, gran: Int, driver_width: Int, unit_w: Float, is_vdd: Bool) -> Rect {
-    let full_hspan = (0., wmask_full_right(bits, mux, gran, driver_width, unit_w),);
-    for stage in std::range(dec_num_stages(gran, driver_width)) {
-        let device_span = if is_vdd { dec_region_psdm_span(stage, gran, driver_width) } else { dec_region_nsdm_span(stage, gran, driver_width) };
+fn draw_wmask_stage_power_full(bits: Int, mux: Int, p: DecoderParams, unit_w: Float, is_vdd: Bool) -> Rect {
+    let full_hspan = (0., wmask_full_right(bits, mux, p, unit_w),);
+    for stage in std::range(dec_num_stages(p)) {
+        let device_span = if is_vdd { dec_region_psdm_span(stage, p) } else { dec_region_nsdm_span(stage, p) };
         let cnt = dec_power_strap_count(device_span);
         for i in std::range(cnt) {
             let local = dec_power_strap_span(device_span, i);
-            let shifted = (local.0 + dec_tile_abs_y(stage, gran, driver_width) + wmask_stage_y(gran, driver_width), local.1 + dec_tile_abs_y(stage, gran, driver_width) + wmask_stage_y(gran, driver_width),);
+            let shifted = (local.0 + dec_tile_abs_y(stage, p) + wmask_stage_y(p), local.1 + dec_tile_abs_y(stage, p) + wmask_stage_y(p),);
             lib::columns::util::met1_port(full_hspan.0, shifted.0, full_hspan.1, shifted.1);
         }
     }
     crect(x0=0., y0=0., x1=0., y1=0.)
 }
 
-fn draw_wmask_stage_nwell_full(bits: Int, mux: Int, gran: Int, driver_width: Int, unit_w: Float) -> Rect {
-    let hspan = (0., (bits - 1) as Float * unit_w + dec_group_w(gran, driver_width),);
-    for stage in std::range(dec_num_stages(gran, driver_width)) {
-        let local = dec_region_nwell_span(stage, gran, driver_width);
-        let shifted = (local.0 + dec_tile_abs_y(stage, gran, driver_width) + wmask_stage_y(gran, driver_width), local.1 + dec_tile_abs_y(stage, gran, driver_width) + wmask_stage_y(gran, driver_width),);
+fn draw_wmask_stage_nwell_full(bits: Int, mux: Int, p: DecoderParams, unit_w: Float) -> Rect {
+    let hspan = (0., (bits - 1) as Float * unit_w + dec_group_w(p),);
+    for stage in std::range(dec_num_stages(p)) {
+        let local = dec_region_nwell_span(stage, p);
+        let shifted = (local.0 + dec_tile_abs_y(stage, p) + wmask_stage_y(p), local.1 + dec_tile_abs_y(stage, p) + wmask_stage_y(p),);
         lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans(hspan, shifted));
     }
     crect(x0=0., y0=0., x1=0., y1=0.)
 }
 
 
-cell wmask_peripherals_exact(cols: Int, mux: Int, gran: Int, driver_width: Int) {
+cell wmask_peripherals_exact(cols: Int, mux: Int, gran: Int, p: DecoderParams) {
     let words = cols / mux;
     let bits = words / gran;
     let unit_w = lib::columns::util::wmask_unit_w(cols, mux, gran);
-    let full_right = wmask_full_right(bits, mux, gran, driver_width, unit_w);
+    let full_right = wmask_full_right(bits, mux, p, unit_w);
     let full_hspan = (0., full_right,);
     for bit in std::range(bits) {
-        let stage = inst(wmask_decoder_stage(mux, gran, driver_width), x=wmask_stage_x(bit, gran, driver_width, unit_w), y=wmask_stage_y(gran, driver_width));
+        let stage = inst(wmask_decoder_stage(mux, p), x=wmask_stage_x(bit, p, unit_w), y=wmask_stage_y(p));
         let dff = inst(lib::columns::dff::dff_column(4), x=wmask_dff_x(bit, mux, unit_w), y=wmask_dff_y());
-        draw_wmask_dff_to_stage(bit, mux, gran, driver_width, unit_w);
+        draw_wmask_dff_to_stage(bit, mux, p, unit_w);
     }
-    let we_span = lib::columns::util::rect_vspan(wmask_stage_predecode(0, gran, driver_width, unit_w, 0));
+    let we_span = lib::columns::util::rect_vspan(wmask_stage_predecode(0, p, unit_w, 0));
     let we = lib::columns::util::met1_port(full_hspan.0, we_span.0, full_hspan.1, we_span.1);
-    draw_wmask_stage_power_full(bits, mux, gran, driver_width, unit_w, true);
-    draw_wmask_stage_power_full(bits, mux, gran, driver_width, unit_w, false);
+    draw_wmask_stage_power_full(bits, mux, p, unit_w, true);
+    draw_wmask_stage_power_full(bits, mux, p, unit_w, false);
     let vdd = lib::columns::util::met2_port(full_hspan.0, 5650., full_hspan.1, 7450.);
     let vss = lib::columns::util::met2_port(full_hspan.0, 9390., full_hspan.1, 11190.);
     let clk = lib::columns::util::met2_port(full_hspan.0, 8175., full_hspan.1, 8495.);
     let rstb = lib::columns::util::met2_port(full_hspan.0, 3940., full_hspan.1, 4260.);
-    draw_wmask_stage_nwell_full(bits, mux, gran, driver_width, unit_w);
-    let outline = crect(x0=0., y0=0., x1=full_right, y1=wmask_stage_y(gran, driver_width) + dec_stage_bbox(gran, driver_width).y1);
+    draw_wmask_stage_nwell_full(bits, mux, p, unit_w);
+    let outline = crect(x0=0., y0=0., x1=full_right, y1=wmask_stage_y(p) + dec_stage_bbox(p).y1);
 }

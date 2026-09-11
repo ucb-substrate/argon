@@ -1,6 +1,9 @@
 // Native replica-column devices. This follows SRAM22's capacitance-emulation
 // structure: three single-finger MOS devices share one vertical bitline.
 
+use lib::params::ReplicaColumnParams;
+use lib::params::ReplicaRoutingParams;
+
 fn mos_raw_right(width: Int) -> Float { width as Float + 130. }
 fn mos_raw_bot(pmos: Bool) -> Float { if pmos { -180. } else { -125. } }
 fn mos_raw_top(pmos: Bool) -> Float { if pmos { 860. } else { 805. } }
@@ -188,67 +191,31 @@ cell column_mos_tap(gate_width: Int, drain_n_width: Int, drain_p_width: Int) {
     lib::columns::util::draw_box("layout_boundary.boundary", lib::columns::util::cbox(0., -540., 1300., drain_p_y + 540.));
 }
 
-fn ceil_div(a: Int, b: Int) -> Int { (a + b - 1) / b }
-
-fn snap_50(value: Int) -> Int {
-    let remainder = value % 50;
-    if remainder <= 25 { value - remainder } else { value + 50 - remainder }
-}
-
-fn replica_unit_count(gate_target: Int, drain_n_target: Int, drain_p_target: Int, max_height: Int) -> Int {
-    ceil_div(gate_target + drain_n_target + drain_p_target, max_height)
-}
-
-fn replica_unit_width(target: Int, columns: Int) -> Int {
-    let divided = target / columns;
-    let minimum = if divided < 800 { 800 } else { divided };
-    let remainder = minimum % 50;
-    if remainder <= 25 { minimum - remainder } else { minimum + 50 - remainder }
-}
-
-fn replica_units(gate_target: Int, drain_n_target: Int, drain_p_target: Int, max_height: Int) -> Int {
-    let columns = replica_unit_count(gate_target, drain_n_target, drain_p_target, max_height);
-    let gate_width = replica_unit_width(gate_target, columns);
-    let drain_n_width = replica_unit_width(drain_n_target, columns);
-    let drain_p_width = replica_unit_width(drain_p_target, columns);
-    lib::columns::util::imax(ceil_div(gate_target, gate_width), lib::columns::util::imax(ceil_div(drain_n_target, drain_n_width), ceil_div(drain_p_target, drain_p_width)))
-}
-
-cell replica_column_mos(gate_target: Int, drain_n_target: Int, drain_p_target: Int, max_height: Int) {
-    let columns = replica_unit_count(gate_target, drain_n_target, drain_p_target, max_height);
-    let gate_width = replica_unit_width(gate_target, columns);
-    let drain_n_width = replica_unit_width(drain_n_target, columns);
-    let drain_p_width = replica_unit_width(drain_p_target, columns);
-    let units = replica_units(gate_target, drain_n_target, drain_p_target, max_height);
-    let offset_y = -column_mos_center_y(gate_width, drain_n_width, drain_p_width);
-    let first_tap = inst(column_mos_tap(gate_width, drain_n_width, drain_p_width), x=0., y=offset_y);
-    for unit in std::range(units) {
+cell replica_column_mos(p: ReplicaColumnParams) {
+    let offset_y = -column_mos_center_y(p.gate_width, p.drain_n_width, p.drain_p_width);
+    let first_tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=0., y=offset_y);
+    for unit in std::range(p.units) {
         let x = 1300. + unit as Float * 1200. + (unit / 8) as Float * 1300.;
-        let body = inst(column_mos(gate_width, drain_n_width, drain_p_width, unit * gate_width < gate_target, unit * drain_n_width < drain_n_target, unit * drain_p_width < drain_p_target), x=x, y=offset_y);
+        let body = inst(column_mos(p.gate_width, p.drain_n_width, p.drain_p_width, unit * p.gate_width < p.gate_target, unit * p.drain_n_width < p.drain_n_target, unit * p.drain_p_width < p.drain_p_target), x=x, y=offset_y);
         if unit % 8 == 7 {
-            let tap = inst(column_mos_tap(gate_width, drain_n_width, drain_p_width), x=x + 1200., y=offset_y);
+            let tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=x + 1200., y=offset_y);
         } else { crect(x0=0., y0=0., x1=0., y1=0.); };
     }
-    if units % 8 != 0 {
-        let final_tap = inst(column_mos_tap(gate_width, drain_n_width, drain_p_width), x=1300. + units as Float * 1200. + (units / 8) as Float * 1300., y=offset_y);
+    if p.units % 8 != 0 {
+        let final_tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=1300. + p.units as Float * 1200. + (p.units / 8) as Float * 1300., y=offset_y);
     } else { crect(x0=0., y0=0., x1=0., y1=0.); };
 }
 
 // Metal-only load used to make the replica bitline see the same first-order
 // interconnect capacitance as a main bitline. The sparse 680 nm track pitch is
 // intentional: it is the same routing pitch used by SRAM22's column tracks.
-cell replica_metal_routing(m0_area: Int, m1_area: Int, max_height: Int) {
-    let m1_width = snap_50(lib::columns::util::imax(320, m1_area / max_height));
-    let m0_width = snap_50(lib::columns::util::imax(320, m0_area / max_height));
-    let m1_height = snap_50(lib::columns::util::imax(1000, m1_area / m1_width));
-    let m0_height = snap_50(lib::columns::util::imax(1000, m0_area / m0_width));
-    let tracks = m1_width / 320;
-    let m0 = lib::columns::util::cbox(0., 0., m0_width as Float, m0_height as Float);
+cell replica_metal_routing(p: ReplicaRoutingParams) {
+    let m0 = lib::columns::util::cbox(0., 0., p.m0_width as Float, p.m0_height as Float);
     lib::columns::util::draw_box("li1.drawing", m0);
-    for track in std::range(tracks) {
-        let width = if track == tracks - 1 { 320 + m1_width % 320 } else { 320 };
+    for track in std::range(p.tracks) {
+        let width = if track == p.tracks - 1 { 320 + p.m1_width % 320 } else { 320 };
         let x0 = 680. * track as Float;
-        let m1 = lib::columns::util::cbox(x0, 0., x0 + width as Float, m1_height as Float);
+        let m1 = lib::columns::util::cbox(x0, 0., x0 + width as Float, p.m1_height as Float);
         lib::columns::util::draw_box("met1.drawing", m1);
         lib::columns::util::draw_box("met1.pin", m1);
         if lib::columns::util::band(m0.x1 > m1.x0, m1.x1 > m0.x0) {

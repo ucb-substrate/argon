@@ -4,7 +4,9 @@ use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 
 use analyzer::{
     ArgonConfig,
-    rpc::{CompilationSnapshot, CompilationUpdate, Gui, InstancePreview, LangServerClient},
+    rpc::{
+        CompilationSnapshot, CompressedCompilationUpdate, Gui, InstancePreview, LangServerClient,
+    },
 };
 use argonc::{
     ast::Span,
@@ -65,7 +67,10 @@ impl Gui for HeadlessGui {
             .expect("full-stack test should still be receiving GUI events");
     }
 
-    async fn update_cell(self, _: context::Context, update: CompilationUpdate) -> bool {
+    async fn update_cell(self, _: context::Context, update: CompressedCompilationUpdate) -> bool {
+        let Ok(update) = update.decode() else {
+            return false;
+        };
         let (kind, scope, rect_count, revision) = {
             let mut previous = self.snapshot.lock().unwrap();
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
@@ -146,7 +151,10 @@ fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize) {
     let Some(cell) = data.cells.get(&data.top) else {
         return (None, 0);
     };
-    let scope = cell.scopes.get(&cell.root).map(|scope| scope.span.clone());
+    let scope = cell
+        .scopes
+        .get(&cell.root)
+        .map(|_| cell.scope_span(cell.root).clone());
     let rect_count = cell
         .objects
         .values()

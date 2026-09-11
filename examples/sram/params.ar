@@ -36,6 +36,18 @@ struct WriteDriverParams {
     nwidth_driver: Int,
 }
 
+struct DecoderStageParams {
+    nwidth: Int,
+    pwidth: Int,
+    folds: Int,
+}
+
+struct DecoderParams {
+    stages: [DecoderStageParams],
+    num_stages: Int,
+    max_folds: Int,
+}
+
 struct ColParams {
     pc: PrechargeParams,
     mux: TGateMuxParams,
@@ -44,6 +56,7 @@ struct ColParams {
     cols: Int,
     include_wmask: Bool,
     wmask_granularity: Int,
+    wmask_decoder: DecoderParams,
 }
 
 struct SramParams {
@@ -51,4 +64,34 @@ struct SramParams {
     mux_ratio: Int,
     num_words: Int,
     data_width: Int,
+}
+
+struct ReplicaColumnParams {
+    gate_target: Int,
+    drain_n_target: Int,
+    drain_p_target: Int,
+    max_height: Int,
+    gate_width: Int,
+    drain_n_width: Int,
+    drain_p_width: Int,
+    units: Int,
+}
+
+struct ReplicaRoutingParams {
+    m0_width: Int,
+    m0_height: Int,
+    m1_width: Int,
+    m1_height: Int,
+    tracks: Int,
+}
+
+struct SramLayoutParams {
+    sram: SramParams,
+    col: ColParams,
+    standalone_col: ColParams,
+    replica_rows: Int,
+    address_dff_count: Int,
+    replica_precharge: PrechargeParams,
+    replica_column: ReplicaColumnParams,
+    replica_routing: ReplicaRoutingParams,
 }

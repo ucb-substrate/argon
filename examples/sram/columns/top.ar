@@ -1,4 +1,5 @@
 use lib::params::ColParams;
+use lib::params::DecoderParams;
 use lib::params::PrechargeParams;
 use lib::params::TGateMuxParams;
 use lib::params::WriteDriverParams;
@@ -290,34 +291,34 @@ fn col_offset_jog_r2(src: Rect, dst: Float, space: Float) -> Rect {
     lib::columns::util::cbox(lib::columns::util::fmin(src.x0, dst), lib::columns::util::fmin(p1, p2), lib::columns::util::fmax(src.x1, dst), lib::columns::util::fmax(p1, p2))
 }
 
-fn wmask_placed_y(cols: Int, mux: Int, gran: Int, driver_width: Int) -> Float {
-    -300. - (lib::columns::decoder::wmask_stage_y(gran, driver_width) + lib::columns::decoder::dec_stage_bbox(gran, driver_width).y1)
+fn wmask_placed_y(p: DecoderParams) -> Float {
+    -300. - (lib::columns::decoder::wmask_stage_y(p) + lib::columns::decoder::dec_stage_bbox(p).y1)
 }
 
-fn wmask_placed_right(cols: Int, mux: Int, gran: Int, driver_width: Int) -> Float {
+fn wmask_placed_right(cols: Int, mux: Int, gran: Int, p: DecoderParams) -> Float {
     let words = cols / mux;
     let bits = words / gran;
     let unit_w = lib::columns::util::wmask_unit_w(cols, mux, gran);
-    650. + lib::columns::decoder::wmask_full_right(bits, mux, gran, driver_width, unit_w)
+    650. + lib::columns::decoder::wmask_full_right(bits, mux, p, unit_w)
 }
 
-fn wmask_placed_we(cols: Int, mux: Int, gran: Int, driver_width: Int) -> Rect {
+fn wmask_placed_we(cols: Int, mux: Int, gran: Int, p: DecoderParams) -> Rect {
     let words = cols / mux;
     let bits = words / gran;
     let unit_w = lib::columns::util::wmask_unit_w(cols, mux, gran);
-    let y = wmask_placed_y(cols, mux, gran, driver_width);
-    let we_span = lib::columns::util::rect_vspan(lib::columns::decoder::wmask_stage_predecode(0, gran, driver_width, unit_w, 0));
-    lib::columns::util::cbox(650., y + we_span.0, 650. + lib::columns::decoder::wmask_full_right(bits, mux, gran, driver_width, unit_w), y + we_span.1)
+    let y = wmask_placed_y(p);
+    let we_span = lib::columns::util::rect_vspan(lib::columns::decoder::wmask_stage_predecode(0, p, unit_w, 0));
+    lib::columns::util::cbox(650., y + we_span.0, 650. + lib::columns::decoder::wmask_full_right(bits, mux, p, unit_w), y + we_span.1)
 }
 
-fn wmask_placed_y_port(bit: Int, gran: Int, driver_width: Int, unit_w: Float, tile: Int, y: Float) -> Rect {
-    let final_stage = lib::columns::decoder::dec_num_stages(gran, driver_width) - 1;
-    lib::columns::util::rect_translate(lib::columns::decoder::wmask_stage_port_y(bit, gran, driver_width, unit_w, final_stage, tile), 650., y)
+fn wmask_placed_y_port(bit: Int, p: DecoderParams, unit_w: Float, tile: Int, y: Float) -> Rect {
+    let final_stage = lib::columns::decoder::dec_num_stages(p) - 1;
+    lib::columns::util::rect_translate(lib::columns::decoder::wmask_stage_port_y(bit, p, unit_w, final_stage, tile), 650., y)
 }
 
-fn wmask_placed_yb_port(bit: Int, gran: Int, driver_width: Int, unit_w: Float, tile: Int, y: Float) -> Rect {
-    let complement_stage = lib::columns::decoder::dec_num_stages(gran, driver_width) - 2;
-    lib::columns::util::rect_translate(lib::columns::decoder::wmask_stage_port_y(bit, gran, driver_width, unit_w, complement_stage, tile), 650., y)
+fn wmask_placed_yb_port(bit: Int, p: DecoderParams, unit_w: Float, tile: Int, y: Float) -> Rect {
+    let complement_stage = lib::columns::decoder::dec_num_stages(p) - 2;
+    lib::columns::util::rect_translate(lib::columns::decoder::wmask_stage_port_y(bit, p, unit_w, complement_stage, tile), 650., y)
 }
 
 fn wmask_placed_d_port(bit: Int, mux: Int, unit_w: Float, y: Float) -> Rect {
@@ -424,12 +425,12 @@ fn column_select_ports_var(bit: Int, mux: Int, words: Int, complement: Bool) -> 
     }
 }
 
-fn draw_column_y_shapes(bit: Int, tile: Int, ff: Int, gran: Int, driver_width: Int, unit_w: Float, wmask_y: Float) -> Rect {
+fn draw_column_y_shapes(bit: Int, tile: Int, ff: Int, p: DecoderParams, unit_w: Float, wmask_y: Float) -> Rect {
     if tile == ff {
         crect(x0=0., y0=0., x1=0., y1=0.)
     } else {
-        lib::columns::util::draw_box("li1.drawing", rect_expand_top(wmask_placed_y_port(bit, gran, driver_width, unit_w, tile, wmask_y), 170.));
-        draw_column_y_shapes(bit, tile + 1, ff, gran, driver_width, unit_w, wmask_y)
+        lib::columns::util::draw_box("li1.drawing", rect_expand_top(wmask_placed_y_port(bit, p, unit_w, tile, wmask_y), 170.));
+        draw_column_y_shapes(bit, tile + 1, ff, p, unit_w, wmask_y)
     }
 }
 
@@ -455,22 +456,22 @@ fn draw_column_write_en_group(bit: Int, group: Int, gran: Int, words: Int, p: Co
     }
 }
 
-fn draw_column_write_en_routes(bit: Int, gran: Int, driver_width: Int, unit_w: Float, wmask_y: Float, words: Int, p: ColParams) -> Rect {
-    let final_stage = lib::columns::decoder::dec_num_stages(gran, driver_width) - 1;
+fn draw_column_write_en_routes(bit: Int, gran: Int, decoder: DecoderParams, unit_w: Float, wmask_y: Float, words: Int, p: ColParams) -> Rect {
+    let final_stage = lib::columns::decoder::dec_num_stages(decoder) - 1;
     let yb_stage = final_stage - 1;
-    let final_ff = lib::columns::decoder::dec_stage_ff(final_stage, gran, driver_width);
-    let yb_ff = lib::columns::decoder::dec_stage_ff(yb_stage, gran, driver_width);
-    let y_left = wmask_placed_y_port(bit, gran, driver_width, unit_w, 0, wmask_y);
-    let y_right = wmask_placed_y_port(bit, gran, driver_width, unit_w, final_ff - 1, wmask_y);
-    draw_column_y_shapes(bit, 0, final_ff, gran, driver_width, unit_w, wmask_y);
+    let final_ff = lib::columns::decoder::dec_stage_ff(final_stage, decoder);
+    let yb_ff = lib::columns::decoder::dec_stage_ff(yb_stage, decoder);
+    let y_left = wmask_placed_y_port(bit, decoder, unit_w, 0, wmask_y);
+    let y_right = wmask_placed_y_port(bit, decoder, unit_w, final_ff - 1, wmask_y);
+    draw_column_y_shapes(bit, 0, final_ff, decoder, unit_w, wmask_y);
     let y_jog1 = col_offset_jog_r1(y_left, 170.);
     let y_jog2 = col_offset_jog_r2(y_left, y_right.x1, 170.);
     lib::columns::util::draw_box("li1.drawing", y_jog1);
     lib::columns::util::draw_box("li1.drawing", y_jog2);
     let y_via = draw_col_li_met1_via(y_jog2, true);
 
-    let yb_left = wmask_placed_yb_port(bit, gran, driver_width, unit_w, 0, wmask_y);
-    let yb_right = wmask_placed_yb_port(bit, gran, driver_width, unit_w, yb_ff - 1, wmask_y);
+    let yb_left = wmask_placed_yb_port(bit, decoder, unit_w, 0, wmask_y);
+    let yb_right = wmask_placed_yb_port(bit, decoder, unit_w, yb_ff - 1, wmask_y);
     let yb_jog1 = col_offset_jog_r1(yb_left, 170.);
     let yb_jog2 = col_offset_jog_r2(yb_left, yb_right.x1, 170.);
     lib::columns::util::draw_box("li1.drawing", yb_jog1);
@@ -558,13 +559,13 @@ fn draw_row_m2_straps(rw: Float, p: ColParams, vdd_power: Bool) -> Rect {
     }
 }
 
-fn draw_wmask_power_straps_to_row(rw: Float, bits: Int, mux: Int, gran: Int, driver_width: Int, unit_w: Float, wmask_y: Float, vdd_power: Bool) -> Rect {
-    for stage in std::range(lib::columns::decoder::dec_num_stages(gran, driver_width)) {
-        let device_span = if vdd_power { lib::columns::decoder::dec_region_psdm_span(stage, gran, driver_width) } else { lib::columns::decoder::dec_region_nsdm_span(stage, gran, driver_width) };
+fn draw_wmask_power_straps_to_row(rw: Float, bits: Int, mux: Int, decoder: DecoderParams, unit_w: Float, wmask_y: Float, vdd_power: Bool) -> Rect {
+    for stage in std::range(lib::columns::decoder::dec_num_stages(decoder)) {
+        let device_span = if vdd_power { lib::columns::decoder::dec_region_psdm_span(stage, decoder) } else { lib::columns::decoder::dec_region_nsdm_span(stage, decoder) };
         let cnt = lib::columns::decoder::dec_power_strap_count(device_span);
         for i in std::range(cnt) {
             let local = lib::columns::decoder::dec_power_strap_span(device_span, i);
-            let shifted = (local.0 + lib::columns::decoder::dec_tile_abs_y(stage, gran, driver_width) + lib::columns::decoder::wmask_stage_y(gran, driver_width) + wmask_y, local.1 + lib::columns::decoder::dec_tile_abs_y(stage, gran, driver_width) + lib::columns::decoder::wmask_stage_y(gran, driver_width) + wmask_y,);
+            let shifted = (local.0 + lib::columns::decoder::dec_tile_abs_y(stage, decoder) + lib::columns::decoder::wmask_stage_y(decoder) + wmask_y, local.1 + lib::columns::decoder::dec_tile_abs_y(stage, decoder) + lib::columns::decoder::wmask_stage_y(decoder) + wmask_y,);
             lib::columns::util::met1_port(0., shifted.0, rw, shifted.1);
         }
     }
@@ -580,14 +581,14 @@ cell column_peripherals_exact(p: ColParams) {
     let cols = p.cols;
     let mux = p.mux.mux_ratio;
     let gran = p.wmask_granularity;
-    let driver_width = p.wrdriver.pwidth_driver;
+    let decoder = p.wmask_decoder;
     let words = lib::columns::util::word_length(cols, mux);
     let bits = lib::columns::util::wmask_bits(cols, mux, gran);
     let cw = lib::columns::util::column_w(mux);
     let rw = lib::columns::util::row_w(cols, mux);
     let unit_w = lib::columns::util::wmask_unit_w(cols, mux, gran);
-    let wmask_y = wmask_placed_y(cols, mux, gran, driver_width);
-    let wmask_we = wmask_placed_we(cols, mux, gran, driver_width);
+    let wmask_y = wmask_placed_y(decoder);
+    let wmask_we = wmask_placed_we(cols, mux, gran, decoder);
 
     let left = inst(column_cent_exact(p, true, false), x=0., y=0.);
     for group in std::range(words) {
@@ -600,10 +601,10 @@ cell column_peripherals_exact(p: ColParams) {
         };
     }
     let right = inst(column_cent_exact(p, true, false), x=rw, y=0., reflect=true, angle=180);
-    let wmask_inst = inst(lib::columns::decoder::wmask_peripherals_exact(cols, mux, gran, driver_width), x=650., y=wmask_y);
+    let wmask_inst = inst(lib::columns::decoder::wmask_peripherals_exact(cols, mux, gran, decoder), x=650., y=wmask_y);
 
     for bit in std::range(bits) {
-        draw_column_write_en_routes(bit, gran, driver_width, unit_w, wmask_y, words, p);
+        draw_column_write_en_routes(bit, gran, decoder, unit_w, wmask_y, words, p);
     }
 
     let din = column_din_ports_exact(0, words, mux, wmask_y, wmask_we);
@@ -620,14 +621,14 @@ cell column_peripherals_exact(p: ColParams) {
     );
     let clk = list(
         lib::columns::util::met2_port(0., 8175., rw, 8495.),
-        lib::columns::util::rect_translate(lib::columns::util::cbox(0., 8175., lib::columns::decoder::wmask_full_right(bits, mux, gran, driver_width, unit_w), 8495.), 650., wmask_y)
+        lib::columns::util::rect_translate(lib::columns::util::cbox(0., 8175., lib::columns::decoder::wmask_full_right(bits, mux, decoder, unit_w), 8495.), 650., wmask_y)
     );
     let rstb = list(
         lib::columns::util::met2_port(0., 3940., rw, 4260.),
-        lib::columns::util::rect_translate(lib::columns::util::cbox(0., 3940., lib::columns::decoder::wmask_full_right(bits, mux, gran, driver_width, unit_w), 4260.), 650., wmask_y)
+        lib::columns::util::rect_translate(lib::columns::util::cbox(0., 3940., lib::columns::decoder::wmask_full_right(bits, mux, decoder, unit_w), 4260.), 650., wmask_y)
     );
-    draw_wmask_power_straps_to_row(rw, bits, mux, gran, driver_width, unit_w, wmask_y, true);
-    draw_wmask_power_straps_to_row(rw, bits, mux, gran, driver_width, unit_w, wmask_y, false);
+    draw_wmask_power_straps_to_row(rw, bits, mux, decoder, unit_w, wmask_y, true);
+    draw_wmask_power_straps_to_row(rw, bits, mux, decoder, unit_w, wmask_y, false);
 
     let we = wmask_we;
     let write_en = we;

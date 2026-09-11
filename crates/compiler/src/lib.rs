@@ -1150,11 +1150,11 @@ mod tests {
         );
         let data = cell.unwrap_valid();
         let compiled = &data.cells[&data.top];
-        assert_eq!(compiled.scopes[&compiled.root].name, "cell scopes");
+        assert_eq!(compiled.scope_name(compiled.root), "cell scopes");
         let child_names = compiled.scopes[&compiled.root]
             .children
             .iter()
-            .map(|id| compiled.scopes[id].name.as_str())
+            .map(|id| compiled.scope_name(*id))
             .collect::<Vec<_>>();
         assert_eq!(child_names, ["0 block"]);
     }
@@ -1355,7 +1355,7 @@ mod tests {
         let scope_names = data
             .cells
             .values()
-            .flat_map(|cell| cell.scopes.values().map(|scope| scope.name.as_str()))
+            .flat_map(|cell| cell.scopes.keys().map(|scope| cell.scope_name(*scope)))
             .collect::<Vec<_>>();
         assert!(scope_names.contains(&"cell top"));
         assert!(scope_names.contains(&"0 cell middle"));

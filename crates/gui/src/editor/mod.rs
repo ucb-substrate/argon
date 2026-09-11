@@ -50,11 +50,11 @@ pub struct ScopeState {
     pub name: String,
     pub address: ScopeAddress,
     pub visible: bool,
-    pub bbox: Option<Rect<f64>>,
+    /// Shared because long chains of function/control-flow scopes commonly
+    /// have exactly the same bounds as their only child.
+    pub bbox: Option<Arc<Rect<f64>>>,
     pub parent: Option<ScopeAddress>,
 }
-
-pub type ScopePath = Vec<String>;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct ScopeAddress {
@@ -62,12 +62,15 @@ pub struct ScopeAddress {
     pub cell: CellId,
 }
 
+/// Compact UI scope identity within one compilation snapshot. Name paths are
+/// reconstructed only when a selection must be carried across changed IDs.
+pub type ScopePath = ScopeAddress;
+
 #[derive(Clone, Debug)]
 pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
     pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
-    pub scope_paths: Arc<imbl::HashMap<ScopeAddress, ScopePath>>,
     hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
@@ -173,7 +176,6 @@ fn shape_fill(
 struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
     state: imbl::HashMap<ScopePath, ScopeState>,
-    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
 }
 
 #[derive(Default)]
@@ -188,7 +190,6 @@ struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
     state: imbl::HashMap<ScopePath, ScopeState>,
-    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
     hierarchy: Arc<hierarchy::PreparedHierarchy>,
 }
 
@@ -266,7 +267,7 @@ impl EditorState {
         let old_cell = self.solved_cell.read(cx);
         CompilationPreparationContext {
             layers: self.layers.read(cx).layers.clone(),
-            selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope.clone()),
+            selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope),
             scope_state: old_cell.as_ref().map(|cell| cell.state.clone()),
             previous: old_cell.clone(),
         }
@@ -312,7 +313,6 @@ impl EditorState {
             layers,
             selected_scope,
             state,
-            scope_paths,
             hierarchy,
         }) = prepared_output
         else {
@@ -335,7 +335,6 @@ impl EditorState {
                 output: Arc::new(solved_cell),
                 selected_scope,
                 state: Arc::new(state),
-                scope_paths: Arc::new(scope_paths),
                 hierarchy,
             });
             cx.notify();
@@ -362,9 +361,6 @@ pub(crate) fn prepare_compilation_snapshot(
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
         };
-        let root_scope_name = solved_cell.cells[&root_scope.cell].scopes[&root_scope.scope]
-            .name
-            .clone();
         let mut state = ProcessScopeState::default();
         for layer in &solved_cell.tech.layers {
             let name = SharedString::from(layer.name.clone());
@@ -396,20 +392,26 @@ pub(crate) fn prepare_compilation_snapshot(
             context.scope_state.as_deref(),
             context.previous.as_ref(),
         );
-        let ProcessScopeState {
-            layers,
-            state,
-            scope_paths,
-        } = state;
+        let ProcessScopeState { layers, state } = state;
         let selected_scope = context
             .selected_scope
-            .filter(|selected_scope| state.contains_key(selected_scope))
-            .unwrap_or_else(|| vec![root_scope_name]);
+            .and_then(|selected_scope| {
+                state
+                    .contains_key(&selected_scope)
+                    .then_some(selected_scope)
+                    .or_else(|| {
+                        hierarchy.remap_path(
+                            root_scope,
+                            context.scope_state.as_deref()?,
+                            selected_scope,
+                        )
+                    })
+            })
+            .unwrap_or(root_scope);
         PreparedCompileOutput {
             layers,
             selected_scope,
             state,
-            scope_paths,
             hierarchy: Arc::new(hierarchy),
         }
     });
@@ -653,16 +655,9 @@ impl Editor {
         let solved = state.solved_cell.read(cx);
         let solved = solved.as_ref()?;
         let scope = solved.state.get(&solved.selected_scope)?.address;
-        Some(
-            solved
-                .output
-                .cells
-                .get(&scope.cell)?
-                .scopes
-                .get(&scope.scope)?
-                .span
-                .clone(),
-        )
+        let cell = solved.output.cells.get(&scope.cell)?;
+        cell.scopes.get(&scope.scope)?;
+        Some(cell.scope_span(scope.scope).clone())
     }
 
     fn on_mouse_move(

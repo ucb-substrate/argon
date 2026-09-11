@@ -521,7 +521,7 @@ mod tests {
         // The generated entry cell is an implementation detail and must not
         // reach the output, and the target keeps its own root scope name.
         assert_eq!(output.cells.len(), 1, "entry cell should not be emitted");
-        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.scope_name(top.root), "cell top");
         top.objects
             .values()
             .find_map(|object| object.get_rect())
@@ -710,7 +710,7 @@ mod tests {
             panic!("GDS import should compile successfully");
         };
         let top = &output.cells[&output.top];
-        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.scope_name(top.root), "cell top");
         assert_eq!(top.objects.len(), 2);
         let imported = top
             .objects

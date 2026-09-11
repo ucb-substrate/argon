@@ -1283,8 +1283,10 @@ mod tests {
         let data = compiled_data(output);
         let mut spans = Vec::new();
         for cell in data.cells.values() {
+            for scope in cell.scopes.keys() {
+                spans.push(cell.scope_span(*scope).clone());
+            }
             for scope in cell.scopes.values() {
-                spans.push(scope.span.clone());
                 spans.extend(scope.emit.iter().map(|(_, emit)| emit.span.clone()));
             }
             for object in cell.objects.values() {

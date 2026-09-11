@@ -2,186 +2,10 @@
 // All layout dimensions are in Sky130 nanometers.
 
 mod params;
+mod generated;
 
-use lib::params::PrimitiveGateParams;
-use lib::params::DiffLatchParams;
-use lib::params::PrechargeParams;
-use lib::params::TGateMuxParams;
-use lib::params::WriteDriverParams;
 use lib::params::ColParams;
-use lib::params::SramParams;
-
-fn default_precharge_params() -> PrechargeParams {
-    PrechargeParams {
-        length: 150,
-        pull_up_width: 2000,
-        equalizer_width: 1200,
-        en_b_width: 360,
-    }
-}
-
-fn default_mux_params(mux_ratio: Int) -> TGateMuxParams {
-    TGateMuxParams {
-        length: 150,
-        pwidth: 3600,
-        nwidth: 2400,
-        mux_ratio,
-        idx: mux_ratio / 2,
-        sel_width: 360,
-    }
-}
-
-fn default_write_driver_params() -> WriteDriverParams {
-    WriteDriverParams {
-        length: 150,
-        pwidth_driver: 3000,
-        nwidth_driver: 3000,
-    }
-}
-
-fn default_latch_params() -> DiffLatchParams {
-    let inv = PrimitiveGateParams { nwidth: 1200, pwidth: 2000, length: 150 };
-    DiffLatchParams {
-        inv_in: inv,
-        lch: 150,
-        inv_out: inv,
-        invq: inv,
-        nwidth: 2000,
-    }
-}
-
-fn default_col_params(cols: Int, mux_ratio: Int, include_wmask: Bool, wmask_granularity: Int) -> ColParams {
-    ColParams {
-        pc: default_precharge_params(),
-        mux: default_mux_params(mux_ratio),
-        wrdriver: default_write_driver_params(),
-        latch: default_latch_params(),
-        cols,
-        include_wmask,
-        wmask_granularity,
-    }
-}
-
-fn col_wmask_params() -> ColParams {
-    default_col_params(16, 4, true, 2)
-}
-
-fn col_params() -> ColParams {
-    default_col_params(128, 4, false, 8)
-}
-
-fn sram_params(wmask_granularity: Int, mux_ratio: Int, num_words: Int, data_width: Int) -> SramParams {
-    SramParams { wmask_granularity, mux_ratio, num_words, data_width }
-}
-
-fn round_positive(value: Float) -> Int {
-    (value + 0.5) as Int
-}
-
-// Matches geometry::snap_to_grid for the positive transistor dimensions used
-// by SRAM22. An exact half-grid remainder rounds toward the lower grid point.
-fn snap_width_50(value: Int) -> Int {
-    let remainder = value % 50;
-    if remainder <= 25 { value - remainder } else { value + 50 - remainder }
-}
-
-fn scale_width(width: Int, scale: Float, minimum: Int) -> Int {
-    let rounded = round_positive(width as Float * scale);
-    snap_width_50(if rounded < minimum { minimum } else { rounded })
-}
-
-// These are the characterized capacitances used by SramParams::col_params in
-// SRAM22. Keeping the derivation here makes arbitrary practical row counts use
-// the same load-based sizing policy rather than a table of known answers.
-fn practical_col_params(p: SramParams) -> ColParams {
-    let rows = p.num_words / p.mux_ratio;
-    let bitline_cap_per_cell = 0.00000000000008859364177937068 / 128.;
-    let pc_b_cap = 0.000000000000591432 / 130.;
-    let sel_cap = 0.000000000000186458 / 32.;
-    let we_cap = 0.000000000000036462 / 4.;
-    let bitline_cap = (rows + 4) as Float * bitline_cap_per_cell;
-    let pc_scale_raw = bitline_cap / pc_b_cap / 8.;
-    let mux_scale_raw = bitline_cap / sel_cap / 8.;
-    let wrdriver_scale_raw = bitline_cap / we_cap / 6.;
-    ColParams {
-        pc: PrechargeParams {
-            length: 150,
-            pull_up_width: scale_width(2000, pc_scale_raw, 800),
-            equalizer_width: scale_width(1200, pc_scale_raw, 500),
-            en_b_width: 360,
-        },
-        mux: TGateMuxParams {
-            length: 150,
-            pwidth: scale_width(3600, mux_scale_raw, 1800),
-            nwidth: scale_width(2400, mux_scale_raw, 1200),
-            mux_ratio: p.mux_ratio,
-            idx: p.mux_ratio / 2,
-            sel_width: 360,
-        },
-        wrdriver: WriteDriverParams {
-            length: 150,
-            pwidth_driver: scale_width(3000, wrdriver_scale_raw, 1200),
-            nwidth_driver: scale_width(3000, wrdriver_scale_raw, 1200),
-        },
-        latch: default_latch_params(),
-        cols: p.data_width * p.mux_ratio,
-        include_wmask: true,
-        wmask_granularity: p.wmask_granularity,
-    }
-}
-
-fn clamp_int(value: Int, minimum: Int, maximum: Int) -> Int {
-    if value < minimum { minimum } else { if value > maximum { maximum } else { value } }
-}
-
-fn pc_b_routing_tracks(p: SramParams) -> Int {
-    let col = practical_col_params(p);
-    clamp_int(ceil_div_positive((col.cols + 4) * col.pc.pull_up_width, 256 * 2000), 2, 8)
-}
-
-fn col_decoder_routing_tracks(p: SramParams) -> Int {
-    let col = practical_col_params(p);
-    let outputs = col.cols / col.mux.mux_ratio;
-    clamp_int(ceil_div_positive(outputs * col.mux.pwidth, 64 * 3600), 2, 4)
-}
-
-// The integrated SRAM widens the replicated control straps after device
-// sizing. Standalone column examples intentionally retain the original
-// 360 nm pins; the assembled SRAM uses this adjusted record.
-fn full_sram_col_params(p: SramParams) -> ColParams {
-    let col = practical_col_params(p);
-    ColParams {
-        pc: PrechargeParams {
-            length: col.pc.length,
-            pull_up_width: col.pc.pull_up_width,
-            equalizer_width: col.pc.equalizer_width,
-            en_b_width: 320 + 680 * (pc_b_routing_tracks(p) - 1),
-        },
-        mux: TGateMuxParams {
-            length: col.mux.length,
-            pwidth: col.mux.pwidth,
-            nwidth: col.mux.nwidth,
-            mux_ratio: col.mux.mux_ratio,
-            idx: col.mux.idx,
-            sel_width: 320 + 680 * (col_decoder_routing_tracks(p) - 1),
-        },
-        wrdriver: col.wrdriver,
-        latch: col.latch,
-        cols: col.cols,
-        include_wmask: col.include_wmask,
-        wmask_granularity: col.wmask_granularity,
-    }
-}
-
-fn practical_replica_precharge_params(p: SramParams) -> PrechargeParams {
-    let pc = practical_col_params(p).pc;
-    PrechargeParams {
-        length: pc.length,
-        pull_up_width: scale_width(pc.pull_up_width, 1. / 6., 800),
-        equalizer_width: scale_width(pc.equalizer_width, 1. / 6., 500),
-        en_b_width: 360,
-    }
-}
+use lib::params::SramLayoutParams;
 
 mod columns;
 mod bitcells;
@@ -207,20 +31,20 @@ cell col_peripherals(p: ColParams) {
     let br = native.br;
 }
 
-cell col_peripherals_for_sram(p: SramParams) {
-    let native = inst(col_peripherals(practical_col_params(p)), x=0., y=0.);
+cell col_peripherals_for_sram(p: SramLayoutParams) {
+    let native = inst(col_peripherals(p.standalone_col), x=0., y=0.);
 }
 
 cell example_col_peripherals() {
-    let native = inst(col_peripherals_for_sram(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(col_peripherals_for_sram(generated::sram()), x=0., y=0.);
 }
 
-cell bitcell_array(p: SramParams) {
+cell bitcell_array(p: SramLayoutParams) {
     let native = inst(
         bitcells::array::sp_cell_array(
-            p.num_words / p.mux_ratio,
-            p.data_width * p.mux_ratio,
-            p.mux_ratio,
+            p.sram.num_words / p.sram.mux_ratio,
+            p.sram.data_width * p.sram.mux_ratio,
+            p.sram.mux_ratio,
         ),
         x=0.,
         y=0.,
@@ -228,104 +52,47 @@ cell bitcell_array(p: SramParams) {
 }
 
 cell example_bitcell_array() {
-    let native = inst(bitcell_array(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(bitcell_array(generated::sram()), x=0., y=0.);
 }
 
-fn replica_rows(p: SramParams) -> Int {
-    let rows = p.num_words / p.mux_ratio;
-    ((rows + 2 + 23) / 24) * 4
-}
-
-cell replica_bitcell_array(p: SramParams) {
-    let native = inst(bitcells::array::replica_cell_array(replica_rows(p), 2), x=0., y=0.);
+cell replica_bitcell_array(p: SramLayoutParams) {
+    let native = inst(bitcells::array::replica_cell_array(p.replica_rows, 2), x=0., y=0.);
 }
 
 cell example_replica_bitcell_array() {
-    let native = inst(replica_bitcell_array(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(replica_bitcell_array(generated::sram()), x=0., y=0.);
 }
 
-cell address_dff_array(p: SramParams) {
-    let native = inst(logic::dff::dff_array(log2_power_of_two(p.num_words) + 2), x=0., y=0.);
-}
-
-fn log2_power_of_two(value: Int) -> Int {
-    if value == 1 { 0 } else { 1 + log2_power_of_two(value / 2) }
+cell address_dff_array(p: SramLayoutParams) {
+    let native = inst(logic::dff::dff_array(p.address_dff_count), x=0., y=0.);
 }
 
 cell example_address_dff_array() {
-    let native = inst(address_dff_array(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(address_dff_array(generated::sram()), x=0., y=0.);
 }
 
-cell replica_precharge(p: SramParams) {
-    let native = inst(columns::precharge::replica_precharge(practical_replica_precharge_params(p)), x=0., y=0.);
+cell replica_precharge(p: SramLayoutParams) {
+    let native = inst(columns::precharge::replica_precharge(p.replica_precharge), x=0., y=0.);
 }
 
 cell example_replica_precharge() {
-    let native = inst(replica_precharge(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(replica_precharge(generated::sram()), x=0., y=0.);
 }
 
-fn ceil_div_positive(a: Int, b: Int) -> Int { (a + b - 1) / b }
-
-fn replica_gate_width() -> Int { snap_width_50(ceil_div_positive(3360, 6)) }
-
-fn replica_drain_n_width(p: SramParams) -> Int {
-    let col = practical_col_params(p);
-    snap_width_50(ceil_div_positive(col.mux.nwidth * (p.mux_ratio + 1) + col.wrdriver.nwidth_driver, 6))
-}
-
-fn replica_drain_p_width(p: SramParams) -> Int {
-    let col = practical_col_params(p);
-    snap_width_50(ceil_div_positive(col.mux.pwidth * (p.mux_ratio + 1) + col.wrdriver.pwidth_driver, 6))
-}
-
-fn replica_device_max_height(p: SramParams) -> Int {
-    let pc = practical_replica_precharge_params(p);
-    // ReplicaPrecharge's lower rbr load track extends below the nominal
-    // precharge outline. Instance sizing in SRAM22 uses the full geometry
-    // bbox, whose height is cell_top + 2*en_b_width + 280 nm.
-    (columns::precharge::pc_outline_top(pc) + 2. * pc.en_b_width as Float + 280.) as Int
-}
-
-cell replica_column_devices(p: SramParams) {
-    let native = inst(logic::replica::replica_column_mos(replica_gate_width(), replica_drain_n_width(p), replica_drain_p_width(p), replica_device_max_height(p)), x=0., y=0.);
+cell replica_column_devices(p: SramLayoutParams) {
+    let native = inst(logic::replica::replica_column_mos(p.replica_column), x=0., y=0.);
 }
 
 cell example_replica_column_devices() {
-    let native = inst(replica_column_devices(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(replica_column_devices(generated::sram()), x=0., y=0.);
 }
 
-fn replica_column_height(p: SramParams) -> Int {
-    let gate_target = replica_gate_width();
-    let drain_n_target = replica_drain_n_width(p);
-    let drain_p_target = replica_drain_p_width(p);
-    let max_height = replica_device_max_height(p);
-    let columns = ceil_div_positive(gate_target + drain_n_target + drain_p_target, max_height);
-    let gate_width = logic::replica::replica_unit_width(gate_target, columns);
-    let drain_n_width = logic::replica::replica_unit_width(drain_n_target, columns);
-    let drain_p_width = logic::replica::replica_unit_width(drain_p_target, columns);
-    // column_mos_top is measured from its local origin; the device outline
-    // starts 540 nm below that origin.
-    (logic::replica::column_mos_top(gate_width, drain_n_width, drain_p_width) + 540.) as Int
-}
-
-fn replica_routing_m0_area(p: SramParams) -> Int {
-    let col = practical_col_params(p);
-    ceil_div_positive(col.wrdriver.pwidth_driver + col.wrdriver.nwidth_driver, 6) * 1080
-}
-
-fn replica_routing_m1_area(p: SramParams) -> Int {
-    let col = full_sram_col_params(p);
-    let mux_height = columns::mux::tgm_group_height(col.mux) as Int;
-    ceil_div_positive(mux_height * p.mux_ratio, 6) * 1080
-}
-
-cell replica_metal_routing(p: SramParams) {
-    let max_height = lib::columns::util::imax(replica_device_max_height(p), replica_column_height(p));
-    let native = inst(logic::replica::replica_metal_routing(replica_routing_m0_area(p), replica_routing_m1_area(p), max_height), x=0., y=0.);
+cell replica_metal_routing(p: SramLayoutParams) {
+    let native = inst(logic::replica::replica_metal_routing(p.replica_routing), x=0., y=0.);
 }
 
 cell example_replica_metal_routing() {
-    let native = inst(replica_metal_routing(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(replica_metal_routing(generated::sram()), x=0., y=0.);
 }
 
 cell example_guard_ring() {
@@ -400,13 +167,13 @@ cell example_wordline_enable_buffer() {
 // Native top-level assembly for the representative practical SRAM sizing.
 // These coordinates follow SRAM22's alignment policy. Routing is generated
 // below in Argon; there is no GDS import or reference-layout dependency.
-cell no_control_logic_components_64x24(p: SramParams) {
-    eq(p.num_words as Float, 64.);
-    eq(p.data_width as Float, 24.);
-    eq(p.mux_ratio as Float, 4.);
-    eq(p.wmask_granularity as Float, 8.);
+cell no_control_logic_components_64x24(p: SramLayoutParams) {
+    eq(p.sram.num_words as Float, 64.);
+    eq(p.sram.data_width as Float, 24.);
+    eq(p.sram.mux_ratio as Float, 4.);
+    eq(p.sram.wmask_granularity as Float, 8.);
     let bitcells = inst(bitcells::array::sp_cell_array(16, 96, 4), x=0., y=0.);
-    let cols = inst(columns::top::column_peripherals_exact(full_sram_col_params(p)), x=2500., y=-79240.);
+    let cols = inst(columns::top::column_peripherals_exact(p.col), x=2500., y=-79240.);
     let row_decoder = inst(columns::decoder::row_decoder_64(), x=-79160., y=3635., angle=270);
     let address_gate = inst(columns::decoder::address_gate_stage(8), x=-114390., y=23255., reflect=true, angle=90);
     let wordline_enable = inst(columns::decoder::horizontal_fanout_buffer_64(3), x=-104390., y=3795.);
@@ -416,25 +183,25 @@ cell no_control_logic_components_64x24(p: SramParams) {
     let write_enable = inst(columns::decoder::horizontal_fanout_buffer_64(1), x=-30910., y=-88890., angle=270);
     let dffs = inst(logic::dff::dff_array(8), x=-68800., y=-128215.);
     let replica_cells = inst(bitcells::array::replica_cell_array(4, 2), x=-92590., y=-30295.);
-    let replica_pc = inst(columns::precharge::replica_precharge(practical_replica_precharge_params(p)), x=-92590., y=-5740., reflect=true);
-    let replica_mos = inst(logic::replica::replica_column_mos(replica_gate_width(), replica_drain_n_width(p), replica_drain_p_width(p), replica_device_max_height(p)), x=-109390., y=-6455.);
-    let replica_routing = inst(logic::replica::replica_metal_routing(replica_routing_m0_area(p), replica_routing_m1_area(p), columns::util::imax(replica_device_max_height(p), replica_column_height(p))), x=-114390., y=-2365., reflect=true);
+    let replica_pc = inst(columns::precharge::replica_precharge(p.replica_precharge), x=-92590., y=-5740., reflect=true);
+    let replica_mos = inst(logic::replica::replica_column_mos(p.replica_column), x=-109390., y=-6455.);
+    let replica_routing = inst(logic::replica::replica_metal_routing(p.replica_routing), x=-114390., y=-2365., reflect=true);
 }
 
 cell example_no_control_logic_components() {
-    let native = inst(no_control_logic_components_64x24(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(no_control_logic_components_64x24(generated::sram()), x=0., y=0.);
 }
 
-cell no_control_logic_64x24(p: SramParams) {
+cell no_control_logic_64x24(p: SramLayoutParams) {
     let components = inst(no_control_logic_components_64x24(p), x=0., y=0.);
-    let routes = inst(logic::sram::core_routes_64x24(full_sram_col_params(p)), x=0., y=0.);
+    let routes = inst(logic::sram::core_routes_64x24(p.col), x=0., y=0.);
     let power = inst(logic::sram::dense_power_grid_64x24(), x=0., y=0.);
 }
 
-cell no_control_logic_guarded_64x24(p: SramParams) {
+cell no_control_logic_guarded_64x24(p: SramLayoutParams) {
     let inner = inst(no_control_logic_64x24(p), x=0., y=0.);
     let ring = inst(logic::guard_ring::guard_ring(-126960., -135120., 163000., 47400.), x=0., y=0.);
-    let connections = inst(logic::sram::guard_connections_64x24(full_sram_col_params(p)), x=0., y=0.);
+    let connections = inst(logic::sram::guard_connections_64x24(p.col), x=0., y=0.);
     let addr = connections.addr;
     let ce = connections.ce;
     let we = connections.we;
@@ -448,12 +215,12 @@ cell no_control_logic_guarded_64x24(p: SramParams) {
 }
 
 cell example_no_control_logic_inner() {
-    let native = inst(no_control_logic_64x24(sram_params(8, 4, 64, 24)), x=0., y=0.);
+    let native = inst(no_control_logic_64x24(generated::sram()), x=0., y=0.);
 }
 
 // Normalized guarded SRAM: the lower-left of the complete layout is at (0, 0).
 cell example_no_control_logic() {
-    let native = inst(no_control_logic_guarded_64x24(sram_params(8, 4, 64, 24)), x=131200., y=139360.);
+    let native = inst(no_control_logic_guarded_64x24(generated::sram()), x=131200., y=139360.);
     let addr = native.addr;
     let ce = native.ce;
     let we = native.we;
