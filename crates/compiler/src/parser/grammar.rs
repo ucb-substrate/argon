@@ -5,11 +5,11 @@
 //! text is borrowed straight from the source (`&'a str`); every node records a
 //! byte-offset `cfgrammar::Span` that indexes the original (untrimmed) input.
 //!
-//! Expression precedence/associativity: prefix unary binds tightest for its
-//! operand; the suffix cluster (`.field`, `.idx`, `[]`, `!`, `as`) binds tighter
-//! than the binary operators; `* / %` > `+ -` > comparisons; all binary
-//! operators are left-associative. Boolean operations are lower precedence than
-//! comparisons, as in Rust: comparisons > `&&` > `||`.
+//! Expression precedence/associativity, following Rust: the access suffixes
+//! (`.field`, `.idx`, `[]`) bind tightest, then prefix unary, then the trailing
+//! suffixes (`!`, `as`), then the binary operators; `* / %` > `+ -` >
+//! comparisons; all binary operators are left-associative. Boolean operations
+//! are lower precedence than comparisons: comparisons > `&&` > `||`.
 
 use std::str::FromStr;
 
@@ -36,9 +36,16 @@ type Md = ParseMetadata;
 // Binding powers for the Pratt loop. Higher binds tighter. The numbers only
 // need to preserve the ordering; the absolute values are arbitrary.
 //   `||`: 1/2   `&&`: 3/4   comparisons: 5/6   additive: 7/8
-//   multiplicative: 9/10   suffix cluster: 11   prefix unary operand: 13
-const SUFFIX_BP: u8 = 11;
+//   multiplicative: 9/10   trailing suffixes: 11   prefix unary operand: 13
+//   access suffixes: 15
+/// Binding power of the trailing suffixes `!` and `as`, which apply to a whole
+/// unary expression: `-x as Float` is `(-x) as Float`.
+const TRAILING_BP: u8 = 11;
+/// Binding power of a prefix operator's operand.
 const PREFIX_BP: u8 = 13;
+/// Binding power of the access suffixes `.field`, `.0` and `[i]`, which are
+/// part of a prefix operator's operand: `-r.x0` is `-(r.x0)`.
+const ACCESS_BP: u8 = 15;
 
 /// Recursion-depth guard for pathological nesting (real programs are shallow).
 const MAX_DEPTH: u32 = 256;
@@ -63,6 +70,18 @@ fn infix_op(k: TokenKind) -> Option<(BinOp, u8, u8)> {
         Star => (BinOp::Arith(ArithOp::Mul), 9, 10),
         Slash => (BinOp::Arith(ArithOp::Div), 9, 10),
         Percent => (BinOp::Arith(ArithOp::Rem), 9, 10),
+        _ => return None,
+    })
+}
+
+/// The left binding power of the suffix a token starts, or `None` if the token
+/// starts no suffix. Single source of truth for the suffix set.
+#[inline]
+fn suffix_bp(k: TokenKind) -> Option<u8> {
+    use TokenKind::*;
+    Some(match k {
+        Dot | LBrack => ACCESS_BP,
+        Bang | KwAs => TRAILING_BP,
         _ => return None,
     })
 }
@@ -1180,10 +1199,9 @@ impl<'a> Parser<'a> {
     /// power is `>= min_bp`, recursing with the operator's *right* binding power
     /// for the right operand. Higher power binds tighter; a right power strictly
     /// greater than the left power makes an operator left-associative (so
-    /// `a - b - c` parses as `(a - b) - c`). The powers live in one table,
-    /// [`infix_op`]; the suffix cluster (`.field`, `.idx`, `[]`, `!`, `as`) sits
-    /// at [`SUFFIX_BP`], tighter than any binary operator. A caller wanting a
-    /// full expression passes `min_bp == 0`.
+    /// `a - b - c` parses as `(a - b) - c`). The powers live in two tables,
+    /// [`infix_op`] and [`suffix_bp`]; both suffix levels are tighter than any
+    /// binary operator. A caller wanting a full expression passes `min_bp == 0`.
     fn parse_expr(&mut self, min_bp: u8) -> Expr<&'a str, Md> {
         self.record_completion_site(CompletionSite::Expression);
         if !self.enter_depth() {
@@ -1240,11 +1258,7 @@ impl<'a> Parser<'a> {
         let mut folds = 0u32;
         loop {
             let k = self.cur.kind;
-            let is_suffix = SUFFIX_BP >= min_bp
-                && matches!(
-                    k,
-                    TokenKind::Dot | TokenKind::LBrack | TokenKind::Bang | TokenKind::KwAs
-                );
+            let is_suffix = suffix_bp(k).is_some_and(|bp| bp >= min_bp);
             let infix = infix_op(k).filter(|(_, l_bp, _)| *l_bp >= min_bp);
             if !is_suffix && infix.is_none() {
                 break;
@@ -1312,6 +1326,7 @@ impl<'a> Parser<'a> {
 
     /// Apply one suffix (`.field`, `.idx`, `[index]`, postfix `!`, `as ty`).
     /// `lhs_start` is the lexical start of the whole expression (see `parse_expr`).
+    /// The caller has already checked the suffix binds here (see [`suffix_bp`]).
     fn parse_suffix(&mut self, lhs: Expr<&'a str, Md>, lhs_start: u32) -> Expr<&'a str, Md> {
         match self.cur.kind {
             TokenKind::Dot => {
