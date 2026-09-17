@@ -24,12 +24,18 @@ Build and take apart sequences with [`list`, `cons`, `head`, and `tail`](/langua
 
 ## Tuples
 
-`(A, B)` is a fixed-size tuple whose positions can have different types. Write a trailing comma to make the syntax unambiguous.
+`(A, B)` is a fixed-size tuple whose positions can have different types. A trailing comma is optional.
 
 ```argon
-let placement = (100., 200., true,);
+let placement = (100., 200., true);
 let x = placement.0;
 let reflected = placement.2;
+```
+
+The comma is what makes a one-element tuple: `(x)` is just `x`, and `(x,)` is a tuple holding it. The same goes for types, where `(A)` is `A` and `(A,)` is a one-element tuple.
+
+```argon
+let single: (Float,) = (100.,);
 ```
 
 The empty tuple `()` is the [unit type](./scalars#unit).
