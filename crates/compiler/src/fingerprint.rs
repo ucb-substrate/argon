@@ -517,7 +517,12 @@ impl Builder<'_> {
                     self.expr(base, out);
                 }
             }
-            Expr::SeqNil(e) => self.ty(&e.metadata, out),
+            Expr::Seq(e) => {
+                self.ty(&e.metadata, out);
+                for item in &e.items {
+                    self.expr(item, out);
+                }
+            }
             Expr::Nil(_)
             | Expr::FloatLiteral(_)
             | Expr::IntLiteral(_)

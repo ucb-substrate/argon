@@ -20,7 +20,7 @@ use crate::ast::{
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, EnumVariant, Expr,
     FieldAccessExpr, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath, IfExpr,
     IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr,
-    ModDecl, NilLiteral, Pattern, Scope, SeqNilLiteral, Statement, StringLiteral, StructDecl,
+    ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement, StringLiteral, StructDecl,
     StructField, StructLitExpr, StructLitField, TupleExpr, TyParam, TySpec, TySpecKind, UnaryOp,
     UnaryOpExpr, UseDecl,
 };
@@ -1387,7 +1387,7 @@ impl<'a> Parser<'a> {
 
     /// Parse a primary expression: the atomic operand at the head of an
     /// expression (the Pratt "null denotation"). Covers literals, identifier
-    /// paths and calls, the parenthesized/tuple/`nil` forms, sequence-nil `[]`,
+    /// paths and calls, the parenthesized/tuple/`nil` forms, sequence literals,
     /// and the block-form primaries `if`/`match`/`{…}` — which are themselves
     /// expressions in Argon, so [`Self::parse_expr`] can still extend them with
     /// trailing operators (e.g. `if c {a} else {b} + 1`). Trailing suffixes and
@@ -1395,7 +1395,7 @@ impl<'a> Parser<'a> {
     fn parse_primary(&mut self) -> Expr<&'a str, Md> {
         match self.cur.kind {
             TokenKind::LParen => self.parse_paren(),
-            TokenKind::LBrack => self.parse_seq_nil(),
+            TokenKind::LBrack => self.parse_seq_literal(),
             TokenKind::KwIf => {
                 let lo = self.cur.start;
                 let scope_order = self.next_scope_order();
@@ -1545,11 +1545,20 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `seqNilLiteral : LBRACK RBRACK` (a non-empty `[...]` is not an expression).
-    fn parse_seq_nil(&mut self) -> Expr<&'a str, Md> {
+    /// `seqLiteral : LBRACK (expr (COMMA expr)* COMMA?)? RBRACK`
+    ///
+    /// A struct literal is unambiguous inside the brackets, so it is allowed
+    /// there even where the enclosing head forbids one.
+    fn parse_seq_literal(&mut self) -> Expr<&'a str, Md> {
         let lb = self.bump();
+        let items = self.with_struct_literals(true, |p| {
+            p.separated_list(TokenKind::RBrack, CompletionSite::Expression, |p| {
+                p.parse_expr(0)
+            })
+        });
         let rb = self.expect(TokenKind::RBrack);
-        Expr::SeqNil(SeqNilLiteral {
+        Expr::Seq(SeqLiteral {
+            items,
             span: Span::new(lb.start as usize, rb.end as usize),
             metadata: (),
         })

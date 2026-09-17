@@ -8,24 +8,11 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
 
 # Collection built-ins
 
-These functions build and take apart [`[T]`](/language/types/collections#sequences) sequences.
-
-## `list`
-
-<ApiItem id="list" name="list" signature={'list(first: T, rest: T...) -> [T]'} summary={<>Builds a sequence from one or more values of the same type.</>}>
-
-<ParameterTable rows={[
-  {name: 'first', type: 'T', requirement: 'Required, positional', description: 'First element. Its type becomes the element type.'},
-  {name: 'rest', type: 'T...', requirement: 'Zero or more positional', description: 'Further elements, all of the same type as the first.'},
-]} />
-
-<Returns type="[T]" href="/language/types/collections#sequences">The values, in order.</Returns>
+These functions build and take apart [`[T]`](/language/types/collections#sequences) sequences. A sequence is written directly as a [literal](/language/types/collections#sequences), so there is no constructor function:
 
 ```argon
-let widths = list(80., 120., 160.);
+let widths = [80., 120., 160.];
 ```
-
-</ApiItem>
 
 ## `cons`
 
@@ -39,7 +26,7 @@ let widths = list(80., 120., 160.);
 <Returns type="[T]" href="/language/types/collections#sequences">A new sequence starting with value.</Returns>
 
 ```argon
-let values = cons(10., cons(20., []));
+let values = cons(10., [20., 30.]);
 ```
 
 </ApiItem>
