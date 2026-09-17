@@ -673,6 +673,10 @@ mod tests {
                 format!("({op}{})", shape(&e.operand))
             }
             Expr::Emit(e) => format!("({}!)", shape(&e.value)),
+            Expr::FieldAccess(e) => format!("({}.{})", shape(&e.base), e.field.name),
+            Expr::IndexFieldAccess(e) => format!("({}.{})", shape(&e.base), e.field.value),
+            Expr::Index(e) => format!("({}[{}])", shape(&e.base), shape(&e.index)),
+            Expr::Cast(e) => format!("({} as {})", shape(&e.value), ty_shape(&e.ty)),
             Expr::IdentPath(p) => p
                 .path
                 .iter()
@@ -684,6 +688,20 @@ mod tests {
             other => panic!(
                 "shape() does not render this expression kind (span {:?})",
                 other.span()
+            ),
+        }
+    }
+
+    /// Renders a type spec (only the forms `shape` needs).
+    fn ty_shape<S: std::fmt::Display, T: crate::ast::AstMetadata>(
+        ty: &crate::ast::TySpec<S, T>,
+    ) -> String {
+        use crate::ast::TySpecKind;
+        match &ty.kind {
+            TySpecKind::Path { name, args } if args.is_empty() => name.name.to_string(),
+            _ => panic!(
+                "ty_shape() does not render this type kind (span {:?})",
+                ty.span
             ),
         }
     }
@@ -724,6 +742,38 @@ mod tests {
             ("!a || !b && !c", "((!a) || ((!b) && (!c)))"),
             ("a && b!", "(a && (b!))"),
             ("!a!", "((!a)!)"),
+        ] {
+            assert_eq!(expr_shape(expr), expected, "parsing `{expr}`");
+        }
+    }
+
+    #[test]
+    fn prefix_operators_bind_looser_than_access_but_tighter_than_trailing_suffixes() {
+        // `.field`, `.0` and `[i]` are part of the operand a prefix operator
+        // applies to, while `!` and `as` apply to the whole unary expression --
+        // as in Rust, where field/index expressions bind tighter than unary and
+        // `as` binds looser.
+        for (expr, expected) in [
+            ("-r.x0", "(-(r.x0))"),
+            ("!f.flag", "(!(f.flag))"),
+            ("-r.p.x", "(-((r.p).x))"),
+            ("-t.0", "(-(t.0))"),
+            ("-s[i]", "(-(s[i]))"),
+            ("-s[i].x0", "(-((s[i]).x0))"),
+            ("-r.x0 + r.x1", "((-(r.x0)) + (r.x1))"),
+            ("-r.x0 * 2", "((-(r.x0)) * 2)"),
+            // `as` and `!` stay looser than the prefix operator.
+            ("-x as Float", "((-x) as Float)"),
+            ("-x!", "((-x)!)"),
+            ("!x!", "((!x)!)"),
+            ("-r.x0 as Float", "((-(r.x0)) as Float)"),
+            ("-r.x0!", "((-(r.x0))!)"),
+            // Suffixes never compete with one another: they apply in source
+            // order regardless of level.
+            ("r.x0!.y", "(((r.x0)!).y)"),
+            ("x as Float.y", "((x as Float).y)"),
+            ("-x as Float.y", "(((-x) as Float).y)"),
+            ("-x!.y", "(((-x)!).y)"),
         ] {
             assert_eq!(expr_shape(expr), expected, "parsing `{expr}`");
         }
