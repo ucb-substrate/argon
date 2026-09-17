@@ -90,10 +90,12 @@ pub struct NilLiteral {
     pub span: cfgrammar::Span,
 }
 
-#[derive_where(Debug, Clone, Serialize, Deserialize)]
-pub struct SeqNilLiteral<T: AstMetadata> {
+/// A sequence literal, `[a, b]`. The empty `[]` is the zero-item case.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct SeqLiteral<S, T: AstMetadata> {
+    pub items: Vec<Expr<S, T>>,
     pub span: cfgrammar::Span,
-    pub metadata: T::SeqNilExpr,
+    pub metadata: T::SeqExpr,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -294,7 +296,7 @@ pub enum Expr<S, T: AstMetadata> {
     Index(Box<IndexExpr<S, T>>),
     IdentPath(IdentPath<S, T>),
     Nil(NilLiteral),
-    SeqNil(SeqNilLiteral<T>),
+    Seq(SeqLiteral<S, T>),
     FloatLiteral(FloatLiteral),
     IntLiteral(IntLiteral),
     StringLiteral(StringLiteral<S>),
@@ -499,7 +501,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
             Self::IndexFieldAccess(x) => x.span,
             Self::Index(x) => x.span,
             Self::Nil(x) => x.span,
-            Self::SeqNil(x) => x.span,
+            Self::Seq(x) => x.span,
             Self::FloatLiteral(x) => x.span,
             Self::IntLiteral(x) => x.span,
             Self::StringLiteral(x) => x.span,
@@ -541,8 +543,8 @@ pub trait AstMetadata {
     type Typ: Debug + Clone + Serialize + DeserializeOwned;
     type CastExpr: Debug + Clone + Serialize + DeserializeOwned;
     type TupleExpr: Debug + Clone + Serialize + DeserializeOwned;
-    /// The type of an empty sequence literal, which its spelling leaves open.
-    type SeqNilExpr: Debug + Clone + Serialize + DeserializeOwned;
+    /// The sequence type the literal was inferred to have.
+    type SeqExpr: Debug + Clone + Serialize + DeserializeOwned;
     type StructLitExpr: Debug + Clone + Serialize + DeserializeOwned;
 }
 
@@ -660,10 +662,11 @@ pub trait AstTransformer {
         input: &TupleExpr<Self::InputS, Self::InputMetadata>,
         items: &[Expr<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr;
-    fn dispatch_seq_nil_expr(
+    fn dispatch_seq_expr(
         &mut self,
-        input: &SeqNilLiteral<Self::InputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr;
+        input: &SeqLiteral<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr;
     fn dispatch_struct_lit_expr(
         &mut self,
         input: &StructLitExpr<Self::InputS, Self::InputMetadata>,
@@ -1313,13 +1316,20 @@ pub trait AstTransformer {
         }
     }
 
-    fn transform_seq_nil_expr(
+    fn transform_seq_expr(
         &mut self,
-        input: &SeqNilLiteral<Self::InputMetadata>,
-    ) -> SeqNilLiteral<Self::OutputMetadata> {
-        SeqNilLiteral {
+        input: &SeqLiteral<Self::InputS, Self::InputMetadata>,
+    ) -> SeqLiteral<Self::OutputS, Self::OutputMetadata> {
+        let items = input
+            .items
+            .iter()
+            .map(|i| self.transform_expr(i))
+            .collect::<Vec<_>>();
+        let metadata = self.dispatch_seq_expr(input, &items);
+        SeqLiteral {
+            items,
             span: input.span,
-            metadata: self.dispatch_seq_nil_expr(input),
+            metadata,
         }
     }
 
@@ -1415,7 +1425,7 @@ pub trait AstTransformer {
             Expr::Index(index_expr) => Expr::Index(Box::new(self.transform_index_expr(index_expr))),
             Expr::IdentPath(ident_path) => Expr::IdentPath(self.transform_ident_path(ident_path)),
             Expr::Nil(nil) => Expr::Nil(*nil),
-            Expr::SeqNil(nil) => Expr::SeqNil(self.transform_seq_nil_expr(nil)),
+            Expr::Seq(seq) => Expr::Seq(self.transform_seq_expr(seq)),
             Expr::FloatLiteral(float_literal) => Expr::FloatLiteral(*float_literal),
             Expr::IntLiteral(int_literal) => Expr::IntLiteral(*int_literal),
             Expr::BoolLiteral(bool_literal) => Expr::BoolLiteral(*bool_literal),

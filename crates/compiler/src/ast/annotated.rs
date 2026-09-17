@@ -277,10 +277,11 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input.metadata.clone()
     }
 
-    fn dispatch_seq_nil_expr(
+    fn dispatch_seq_expr(
         &mut self,
-        input: &super::SeqNilLiteral<Self::InputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr {
+        input: &super::SeqLiteral<Self::InputS, Self::InputMetadata>,
+        _items: &[super::Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr {
         input.metadata.clone()
     }
 
